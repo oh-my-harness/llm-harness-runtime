@@ -86,6 +86,17 @@ pub trait FileOperations: Send + Sync {
     fn read_dir<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, Result<Vec<DirEntry>, ToolError>>;
     fn metadata<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, Result<FileMetadata, ToolError>>;
 }
+
+/// 用户交互后端（可替换为 CLI stdin、TUI 对话框、webhook）
+pub trait UserInteraction: Send + Sync {
+    /// 向用户展示问题，返回用户的回答字符串。
+    /// `options` 非空时表示多选题，实现可渲染选项列表；为空时为自由输入。
+    fn ask<'a>(
+        &'a self,
+        question: &'a str,
+        options: &'a [String],
+    ) -> BoxFuture<'a, Result<String, ToolError>>;
+}
 ```
 
 内置工具：
@@ -99,7 +110,7 @@ pub trait FileOperations: Send + Sync {
 | `grep` | 正则搜索文件内容 | `pattern`, `path?`, `glob?` |
 | `find` | 按名称模式搜索文件 | `pattern`, `path?` |
 | `ls` | 列出目录内容 | `path` |
-| `ask_user` | 暂停流程等待用户输入（`llm-interactive` 模式） | `question`, `options?` |
+| `ask_user` | 暂停流程等待用户输入（`llm-interactive` 模式），通过 `UserInteraction` 后端实现 | `question`, `options?` |
 
 > **为什么 Operations 接口要可替换？** EDA agent 需要在远端计算服务器上执行命令（PanGen 通过 SSH 提交），
 > coding-agent 在本地跑。通过替换 `BashOperations` / `FileOperations` 的后端实现，工具本身代码不变。
@@ -108,42 +119,81 @@ pub trait FileOperations: Send + Sync {
 > EDA 场景下，命令提交走 SSH（`SshBashOps`），结果文件读取走 NFS 挂载或 SFTP（`SshFileOps`）。
 > 两个 trait 各自独立可替换，允许"本地命令 + 远程文件"或"远程命令 + 远程文件"等混合模式。
 >
+> **`ask_user` 工具为什么需要 `UserInteraction` trait？**
+> CLI 场景读 stdin，TUI 场景弹对话框，headless/测试场景可能走 webhook 或预设回答。
+> 与 `BashOperations` / `FileOperations` 同理，通过可插拔后端让工具本身跨场景复用。
+> `AskUserTool` 在构造时接收 `Arc<dyn UserInteraction>`，标准实现 `StdinUserInteraction` 读 stdin。
+>
 > **`ask_user` 工具** 用于 `llm-interactive` 模式——LLM 提出参数建议后暂停，
 > 等用户确认再继续。EDA 场景价值尤其高：EDA 任务耗时数小时，
 > 用户希望在任务启动前审批参数，启动后可以离开。
 
 ---
 
-### 3.1.1 工具中间进度事件（`runtime-types`）
+### 3.1.1 工具中间进度事件（`runtime-types` + `runtime`）
 
 **背景：** EDA agent 的 `run_eda_job` 工具会轮询等待数小时，期间需要把
 `EdaIterationCompleted`、`EarlyConvergenceDetected` 等进度推送给 UI，
 但这些信息不应该发给 LLM（会污染上下文）。
 
-**方案：** 在 `ToolContext` 中增加可选的 `progress_tx` 通道：
+**方案：进度 sender 在构造时注入工具，runtime 层定义自己的事件枚举。**
 
 ```rust
-// runtime-types/src/tool_context_ext.rs
+// runtime-types/src/events.rs
 
 /// 工具向外推送中间进度事件（不发给 LLM，仅用于 UI/观测）。
 pub struct ToolProgressEvent {
     pub tool_name: String,
     pub payload: serde_json::Value,   // 工具自定义结构
 }
+```
 
-// ToolContext 扩展字段（在 llm-harness-types 的 ToolContext 之上）
-pub struct RuntimeToolContext {
-    pub base: ToolContext,            // harness-core 的 ToolContext
-    pub progress_tx: Option<mpsc::Sender<ToolProgressEvent>>,
+```rust
+// runtime/src/events.rs
+
+/// AgentRuntime 的完整事件流，包装 harness-core 事件 + runtime 层扩展。
+pub enum RuntimeEvent {
+    /// 来自 harness-core 的 AgentEvent（loop、turn、tool 执行状态）。
+    Agent(AgentEvent),
+    /// 工具推送的中间进度（不发给 LLM，仅供 UI 渲染）。
+    ToolProgress(ToolProgressEvent),
 }
 ```
 
-`AgentRuntime` 创建 `progress_tx` 通道，把 receiver 接入 `AgentHarnessEvent`
-广播（包装成 `AgentHarnessEvent::ToolProgress`），UI 订阅后渲染进度。
+`AgentRuntime::build` 在构造时创建 `(progress_tx, progress_rx)` 通道对，
+把 `progress_tx.clone()` 注入给需要推送进度的工具，
+同时在内部 spawn 一个转发 task，将 `progress_rx` 的消息包装成
+`RuntimeEvent::ToolProgress` 发到 `RuntimeEvent` 广播通道：
 
-> **为什么不放在 `llm-harness-types` 的 `ToolContext` 里？**
-> `ToolContext` 是 harness-core 的概念，应保持简洁。进度事件是 runtime 层的关切，
-> 通过 `RuntimeToolContext` 包装，不污染 core 的类型定义。
+```rust
+// AgentRuntime::build 内部示意
+let (progress_tx, mut progress_rx) = mpsc::channel::<ToolProgressEvent>(64);
+
+// 领域工具在构造时捕获 progress_tx
+let run_eda_job = Arc::new(RunEdaJobTool::new(progress_tx.clone()));
+
+// runtime 内部转发：progress_rx → RuntimeEvent broadcast
+let rt_event_tx = runtime_event_tx.clone();
+tokio::spawn(async move {
+    while let Some(ev) = progress_rx.recv().await {
+        let _ = rt_event_tx.send(Arc::new(RuntimeEvent::ToolProgress(ev)));
+    }
+});
+```
+
+`AgentRuntime::subscribe()` 返回 `broadcast::Receiver<Arc<RuntimeEvent>>`，
+而不是 harness-core 的 `AgentHarnessEvent`，UI 订阅一个通道即可收到全部事件。
+
+> **为什么不用 `RuntimeToolContext` 包装 `ToolContext`？**
+> `Tool::execute` 的签名由 harness-core 固定为 `ctx: &ToolContext`，
+> runtime 无法替换这个接口。如果改成 `RuntimeToolContext`，
+> 工具实现就必须依赖 runtime crate，违反"runtime-tools 不依赖 runtime"的依赖规则。
+> 构造时注入方案让工具对 runtime 完全无感知——sender 只是一个普通的 `mpsc::Sender`。
+>
+> **为什么不向 `AgentHarnessEvent` 添加 `ToolProgress` variant？**
+> `AgentHarnessEvent` 定义在 harness-core，runtime 不能修改 core 的枚举。
+> 用 `RuntimeEvent` 包装层替代，还能让 runtime 在未来自由扩展其他事件类型，
+> 不需要每次都改动 harness-core。
 
 ---
 
@@ -223,6 +273,9 @@ pub struct RuntimeSettings {
     // 工具行为
     pub bash_timeout_ms: Option<u64>,
     pub read_max_lines: Option<usize>,
+    /// 激活的工具名列表；缺省时使用 AgentRuntime 挂载的全部工具。
+    /// 可用于在配置层面禁用部分工具（如在只读环境中关闭 bash/write/edit）。
+    pub active_tools: Option<Vec<String>>,
 
     // 会话
     pub session_dir: Option<String>,
@@ -318,6 +371,8 @@ pub struct AgentRuntimeOptions {
     pub system_prompt: String,
     pub extra_extensions: Vec<Arc<dyn Extension>>,
     pub settings_override: Option<RuntimeSettings>,
+    /// 恢复历史会话；为 `None` 时开启新会话。
+    pub session_id: Option<String>,
 }
 
 impl AgentRuntime {
@@ -327,8 +382,8 @@ impl AgentRuntime {
     /// 发送 prompt，等待完成（自动处理 compaction、retry）。
     pub async fn prompt(&self, text: &str) -> Result<(), RuntimeError>;
 
-    /// 订阅事件流。
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<AgentHarnessEvent>>;
+    /// 订阅事件流（包含 harness-core AgentEvent 和 runtime 层 ToolProgressEvent）。
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<RuntimeEvent>>;
 
     /// 当前激活的模型 + provider 信息。
     pub fn active_model(&self) -> &ModelInfo;
