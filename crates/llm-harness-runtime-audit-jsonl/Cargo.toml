@@ -1,0 +1,20 @@
+[package]
+name    = "llm-harness-runtime-audit-jsonl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+llm-harness-runtime.workspace = true
+anyhow.workspace              = true
+futures.workspace             = true
+serde.workspace               = true
+serde_json.workspace          = true
+sha2.workspace                = true
+tokio.workspace               = true
+
+[dev-dependencies]
+tokio             = { workspace = true, features = ["macros", "rt-multi-thread"] }
+chrono.workspace  = true
+llm-harness-types.workspace = true
+tempfile          = "3"

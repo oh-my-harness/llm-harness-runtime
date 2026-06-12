@@ -1,0 +1,30 @@
+[package]
+name    = "llm-harness-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+llm-harness.workspace       = true
+llm-harness-types.workspace = true
+anyhow.workspace            = true
+async-trait.workspace       = true
+chrono.workspace            = true
+futures.workspace           = true
+serde.workspace             = true
+serde_json.workspace        = true
+sha2.workspace              = true
+thiserror.workspace         = true
+tokio.workspace             = true
+uuid.workspace              = true
+
+[dev-dependencies]
+llm-harness-runtime-sandbox-os  = { path = "../llm-harness-runtime-sandbox-os" }
+llm-harness-runtime-auth        = { path = "../llm-harness-runtime-auth" }
+llm-harness-runtime-audit-jsonl = { path = "../llm-harness-runtime-audit-jsonl" }
+llm-harness-runtime-trace-otel  = { path = "../llm-harness-runtime-trace-otel" }
+chrono.workspace  = true
+futures.workspace = true
+tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util = { workspace = true }
+tempfile  = "3"

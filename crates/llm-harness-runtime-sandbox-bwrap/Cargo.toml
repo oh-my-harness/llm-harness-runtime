@@ -1,0 +1,16 @@
+[package]
+name    = "llm-harness-runtime-sandbox-bwrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+llm-harness-runtime.workspace           = true
+llm-harness-runtime-sandbox-os          = { path = "../llm-harness-runtime-sandbox-os" }
+llm-harness-types.workspace             = true
+anyhow.workspace                        = true
+futures.workspace                       = true
+tokio  = { workspace = true, features = ["process", "fs"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

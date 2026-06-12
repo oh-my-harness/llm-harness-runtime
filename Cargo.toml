@@ -1,0 +1,40 @@
+[workspace]
+members = [
+    "crates/llm-harness-runtime",
+    "crates/llm-harness-runtime-sandbox-os",
+    "crates/llm-harness-runtime-sandbox-bwrap",
+    "crates/llm-harness-runtime-sandbox-seatbelt",
+    "crates/llm-harness-runtime-auth",
+    "crates/llm-harness-runtime-mcp",
+    "crates/llm-harness-runtime-audit-jsonl",
+    "crates/llm-harness-runtime-trace-otel",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.2.0"
+license = "MIT"
+
+[workspace.dependencies]
+# Runtime (within this workspace)
+llm-harness-runtime = { path = "crates/llm-harness-runtime" }
+
+# Core (path deps adjusted for this machine)
+llm-harness        = { path = "/data/leiqiaojie2/oh-my-harness/llm-harness-core/crates/llm-harness" }
+llm-harness-types  = { path = "/data/leiqiaojie2/oh-my-harness/llm-harness-core/crates/llm-harness-types" }
+llm-harness-loop   = { path = "/data/leiqiaojie2/oh-my-harness/llm-harness-core/crates/llm-harness-loop" }
+llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter.git", rev = "c1d2cb87cb2bb94803144cfc28133a394b7fca18" }
+
+# Infrastructure
+anyhow             = "1"
+async-trait        = "0.1"
+chrono             = { version = "0.4", features = ["serde"] }
+futures            = "0.3"
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+sha2               = "0.10"
+thiserror          = "2"
+tokio              = { version = "1", features = ["sync"] }
+tokio-util         = { version = "0.7" }
+uuid               = { version = "1", features = ["v4", "v7"] }
