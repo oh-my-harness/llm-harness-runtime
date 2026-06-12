@@ -274,6 +274,7 @@ pub struct HarnessHooks {
 ## Git 规则
 
 - **不自动提交**。修改文件后等用户明确要求再 commit。
+- **分阶段提交**。每完成一个独立的阶段或功能单元（如一个 Phase、一个 crate、一批测试），主动提示用户提交，不要累积多个阶段后一次性提交。这样 commit 粒度合理，review 和 bisect 都更容易。
 - Commit message 格式：`<type>(<scope>): <description>`
   - type：`feat` / `fix` / `docs` / `test` / `refactor` / `chore`
   - scope：crate 名，如 `traits`、`auth`、`budget`、`orchestration`
