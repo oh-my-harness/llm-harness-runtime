@@ -273,8 +273,11 @@ pub struct HarnessHooks {
 
 ## Git 规则
 
-- **每个阶段结束后自动提交**。每完成一个独立的阶段或功能单元（如一个 Phase、一个 crate、一批测试），在 `cargo test` 和 `cargo clippy` 通过后立即 commit，无需等用户明确要求。不要累积多个阶段后一次性提交。
-- **不自动推送**。commit 后等用户明确要求再 `git push`。
+- **每个阶段结束后自动提交并推送**。每完成一个独立的阶段或功能单元（如一个 Phase、一个 crate、一批测试），在 `cargo test` 和 `cargo clippy` 通过后：
+  1. 自行 review 本次改动（diff 正确、无多余文件、无调试代码）
+  2. `git commit`
+  3. `git push`
+  无需等用户明确要求。不要累积多个阶段后一次性提交推送。
 - Commit message 格式：`<type>(<scope>): <description>`
   - type：`feat` / `fix` / `docs` / `test` / `refactor` / `chore`
   - scope：crate 名，如 `traits`、`auth`、`budget`、`orchestration`
