@@ -3,9 +3,6 @@
 //! Verifies that all runtime crates compose without type errors and that the
 //! key integration points (sandbox I/O, audit recording, tracing spans) work
 //! end-to-end within a single test.
-//!
-//! AgentHarness run-loop integration is deferred to v0.2.1 (requires mock
-//! LlmClient from core test-utils).
 
 use std::sync::Arc;
 

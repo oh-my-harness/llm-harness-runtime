@@ -1,8 +1,7 @@
 //! Hook composition matrix tests (§8.1.4).
 //!
 //! Verifies that individual hooks and cross-hook combinations behave correctly
-//! without a full AgentHarness run loop (which requires mock LlmClient, deferred
-//! to v0.2.1).
+//! without a full AgentHarness run loop.
 
 use std::sync::Arc;
 

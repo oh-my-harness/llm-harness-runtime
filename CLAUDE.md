@@ -98,29 +98,23 @@ Strong success criteria let the LLM loop independently. Weak criteria ("make it 
 2. **核心编排**：`AgentHarness` 配置、`HarnessHooks` 组装、事件管道
 3. **基础设施接口**：文件系统、环境变量、CancellationToken 等运行时资源抽象
 
-不实现完整的 run loop（推迟至 v0.2.1），不写具体的认证/预算/基础设施实现（用户自实现 trait）。
+不写具体的认证/预算/基础设施实现（用户自实现 trait）。
 
 ## 工作流与决策
 
-### v0.2 时间框架
-
-v0.2 专注**trait 定义 + 静态配置 + 基础编排**，以下项目**明确推迟至 v0.2.1+**：
-
-- **Run loop 实现**：完整的 `prompt()` 迭代循环（目前仅有状态机框架）
-- **E2E 集成测试**：需要 mock LlmClient 的三个场景
-- **Dynamic tool scheduling**：`PrepareNextTurnHook` 动态控制激活工具集
-
 ### 范围边界
 
-**在 v0.2 内（实现）：**
-- trait 声明与语义定义
+**Runtime 提供（机制层）：**
+- Trait 声明与语义定义
 - CompositeHook 模式的三种合成语义
 - HarnessHooks 配置结构（11 个 hook 插槽）
+- TaskRunnerImpl 状态机（Pending→Running→Succeeded/Failed 等）
 - 单元测试（trait 实现示例，mock 对象）
 
-**在 v0.2 外（用户实现 / v0.2.1+）：**
+**业务层负责（策略层）：**
 - 具体 auth、budget、infrastructure provider（用户自实现 trait）
-- 完整 run loop 及分支管理
+- LlmClient 持有与实例化
+- AgentHarness 创建、hooks 组装、prompt() 驱动
 - 真实文件系统、环境变量、CancellationToken 的编排
 
 ## Crate 结构与依赖规则
@@ -219,7 +213,7 @@ pub struct HarnessHooks {
 ### Hook 与 Event 的分工
 
 - **Hook**（`HarnessHooks` 中的 trait）：参与框架流程、可影响行为，构造时注入，有类型安全的返回值。
-- **Event**（`AgentHarnessEvent` enum，v0.2.1+）：纯通知，运行时动态订阅，无返回值。
+- **Event**（`AgentHarnessEvent` enum）：纯通知，运行时动态订阅，无返回值。
 - 不要把 hook 调用点暴露为事件，也不要把纯通知实现为 hook。
 
 ### 并发与锁
@@ -289,8 +283,6 @@ pub struct HarnessHooks {
 在代码和注释中，v0.2 范围边界处用以下标记：
 
 - **`v0.2 明确不实现`**：代码中明确排除，v0.3+ 才支持（如 SubAgentSpawner）
-- **`v0.2.1 推迟`**：v0.2 框架已铺设，实现推迟到 v0.2.1（如 run loop、E2E 测试）
 - **`v0.3+ API 预览`**：代码注释中预示未来 API，当前代码中不实现
-- **`⚠️ v0.2 限制`**：v0.2 存在的已知限制（如 `AgentHarness` 无实际执行）
 
 这些标记帮助用户理解当前版本的范围，避免期望超出设计。

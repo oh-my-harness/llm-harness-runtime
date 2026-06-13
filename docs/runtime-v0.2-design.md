@@ -1401,21 +1401,6 @@ TracingHookAdapter         ← built into runtime（AfterProviderResponseHook + 
     - audit hash 链断裂检测（手动篡改一条 entry 后 validator 报错）
 ```
 
-> **v0.2 E2E 覆盖范围说明（重要）**
->
-> Phase 5 的集成测试覆盖基础 infrastructure assembly 场景（hook 注册 + 生命周期验证），
-> 不覆盖需要真实 LLM 调用的端到端场景。具体限制：
->
-> 1. **AgentHarness 实际执行循环**：`TaskRunnerImpl::start()` 在 Phase 3/5 中只创建
->    `AgentHarness` 实例，不执行 `prompt()` 循环。完整 run loop 集成推迟至 v0.2.1。
->
-> 2. **以下 3 个集成场景需要 mock LlmClient，计划在 v0.2.1 实现**：
->    - Budget + HumanApproval 联合短路（决策型 hook 组合）
->    - Tracing + Budget + HumanApproval 完整状态机端到端
->    - HumanApproval 超时 → `AwaitingHumanInput` 状态转换
->
-> 若要在 v0.2 环境验证上述场景，需自行在业务层实现 stub LlmClient。
-
 ---
 
 ## 8. 跨层关注点详述

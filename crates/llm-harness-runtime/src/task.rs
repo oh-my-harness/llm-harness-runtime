@@ -167,10 +167,6 @@ impl Default for RetryPolicy {
 }
 
 /// Concrete `TaskRunner` managing task lifecycle across one or more sessions.
-///
-/// In v0.2 this provides only the state-machine skeleton (Pending → Running →
-/// Paused / Cancelled etc.). The AgentHarness execution loop is deferred to
-/// v0.2.1.
 pub struct TaskRunnerImpl {
     #[allow(dead_code)]
     task_id: TaskId,
@@ -216,7 +212,6 @@ impl TaskRunnerImpl {
 impl TaskRunner for TaskRunnerImpl {
     fn start<'a>(&'a self, _prompt: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            // ⚠️ v0.2: state transition only; AgentHarness execution deferred to v0.2.1.
             *self.state.lock().unwrap() = TaskState::Running {
                 session_id: EntryId::new(),
                 started_at: Utc::now(),
