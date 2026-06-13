@@ -320,9 +320,20 @@ impl ExecutionEnv for OsEnv {
             if opts.abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let child = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
+            // Windows 没有 `sh`；用 `cmd.exe /C`。Unix 保持 `sh -c`。
+            #[cfg(target_os = "windows")]
+            let mut shell_cmd = {
+                let mut c = tokio::process::Command::new("cmd.exe");
+                c.args(["/C", cmd]);
+                c
+            };
+            #[cfg(not(target_os = "windows"))]
+            let mut shell_cmd = {
+                let mut c = tokio::process::Command::new("sh");
+                c.args(["-c", cmd]);
+                c
+            };
+            let child = shell_cmd
                 .current_dir(opts.cwd.unwrap_or(&self.working_dir))
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -385,6 +396,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, "hello");
+    }
+
+    #[tokio::test]
+    async fn execute_shell_echo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = OsEnv::new(tmp.path());
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let cmd = "echo hello";
+        #[cfg(target_os = "windows")]
+        let cmd = "echo hello";
+
+        let out = env.execute_shell(cmd, opts).await.unwrap();
+        assert_eq!(out.stdout.trim(), "hello");
+        assert_eq!(out.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn execute_shell_nonzero_exit_returns_err() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = OsEnv::new(tmp.path());
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let cmd = "exit 1";
+        #[cfg(target_os = "windows")]
+        let cmd = "exit /b 1";
+
+        let result = env.execute_shell(cmd, opts).await;
+        assert!(matches!(
+            result,
+            Err(EnvError::ShellFailed { exit_code: 1, .. })
+        ));
     }
 
     #[tokio::test]
