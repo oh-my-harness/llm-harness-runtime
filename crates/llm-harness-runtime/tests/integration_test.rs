@@ -11,16 +11,15 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use llm_harness::HarnessHooks;
+use llm_harness_runtime::TracingHookAdapter;
 use llm_harness_runtime::audit::{AuditDecision, AuditEntry, AuditEventType, AuditSink};
 use llm_harness_runtime::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_runtime::tracer::{CaptureLevel, SpanCaptureConfig, SpanStatus};
-use llm_harness_runtime::TracingHookAdapter;
 use llm_harness_runtime_audit_jsonl::JsonlAuditSink;
 use llm_harness_runtime_sandbox_os::OsEnvSandbox;
 use llm_harness_runtime_trace_otel::InMemoryTraceExporter;
 use llm_harness_types::{
-    AfterProviderResponseHook, AfterToolCallHook, AfterTurnHook, BeforeProviderRequestHook,
-    EntryId,
+    AfterProviderResponseHook, AfterToolCallHook, AfterTurnHook, BeforeProviderRequestHook, EntryId,
 };
 use tokio_util::sync::CancellationToken;
 

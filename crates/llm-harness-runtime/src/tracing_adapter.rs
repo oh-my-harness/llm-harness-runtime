@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use futures::future::BoxFuture;
 use llm_harness_types::{
-    AfterToolCallCtx, AfterToolCallDecision, AfterToolCallHook, AfterTurnCtx, AfterTurnHook,
-    AfterProviderResponseHook, BeforeProviderRequestHook, ProviderResponseInfo, StreamOptions,
+    AfterProviderResponseHook, AfterToolCallCtx, AfterToolCallDecision, AfterToolCallHook,
+    AfterTurnCtx, AfterTurnHook, BeforeProviderRequestHook, ProviderResponseInfo, StreamOptions,
 };
 
 use crate::tracer::{
@@ -203,13 +203,19 @@ impl AfterProviderResponseHook for TracingHookAdapter {
             attrs.insert(
                 "gen_ai.usage.input_tokens".into(),
                 AttributeValue::Int(
-                    info.usage.as_ref().map(|u| u.input_tokens as i64).unwrap_or(0),
+                    info.usage
+                        .as_ref()
+                        .map(|u| u.input_tokens as i64)
+                        .unwrap_or(0),
                 ),
             );
             attrs.insert(
                 "gen_ai.usage.output_tokens".into(),
                 AttributeValue::Int(
-                    info.usage.as_ref().map(|u| u.output_tokens as i64).unwrap_or(0),
+                    info.usage
+                        .as_ref()
+                        .map(|u| u.output_tokens as i64)
+                        .unwrap_or(0),
                 ),
             );
             attrs.insert(
@@ -227,10 +233,7 @@ impl AfterProviderResponseHook for TracingHookAdapter {
                 );
             }
             if let Some(code) = info.status_code {
-                attrs.insert(
-                    "http.status_code".into(),
-                    AttributeValue::Int(code as i64),
-                );
+                attrs.insert("http.status_code".into(), AttributeValue::Int(code as i64));
             }
             if self.capture_config.level == CaptureLevel::Full {
                 for (k, v) in &info.response_headers {
@@ -277,7 +280,10 @@ impl AfterProviderResponseHook for TracingHookAdapter {
 }
 
 impl AfterToolCallHook for TracingHookAdapter {
-    fn on_complete<'a>(&'a self, ctx: AfterToolCallCtx<'a>) -> BoxFuture<'a, AfterToolCallDecision> {
+    fn on_complete<'a>(
+        &'a self,
+        ctx: AfterToolCallCtx<'a>,
+    ) -> BoxFuture<'a, AfterToolCallDecision> {
         Box::pin(async move {
             let is_error = ctx.result.is_err();
             let mut attrs = HashMap::from([
@@ -390,8 +396,7 @@ mod tests {
     #[test]
     fn begin_task_does_not_export_prematurely() {
         let exporter = Arc::new(RecordingExporter::new());
-        let adapter =
-            TracingHookAdapter::new(exporter.clone(), SpanCaptureConfig::default());
+        let adapter = TracingHookAdapter::new(exporter.clone(), SpanCaptureConfig::default());
 
         adapter.begin_task("task-1");
         // begin_task only stores state — nothing is exported yet.
@@ -401,16 +406,12 @@ mod tests {
     #[test]
     fn end_task_moves_span_to_completed() {
         let exporter = Arc::new(RecordingExporter::new());
-        let adapter =
-            TracingHookAdapter::new(exporter.clone(), SpanCaptureConfig::default());
+        let adapter = TracingHookAdapter::new(exporter.clone(), SpanCaptureConfig::default());
 
         adapter.begin_task("task-1");
         adapter.end_task("task-1", SpanStatus::Ok);
         // Span is in completed; exported on the next hook drain, not immediately.
         assert!(exporter.exported_spans().is_empty());
-        assert_eq!(
-            adapter.active_spans.lock().unwrap().completed.len(),
-            1
-        );
+        assert_eq!(adapter.active_spans.lock().unwrap().completed.len(), 1);
     }
 }

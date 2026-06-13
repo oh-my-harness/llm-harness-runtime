@@ -1,0 +1,7 @@
+# Local development overrides for llm-harness-core.
+# Replace git-repo deps with local path for faster iteration.
+# Remove this file or comment these out for CI / other contributors.
+# [patch."https://github.com/oh-my-harness/llm-harness-core"]
+# llm-harness       = { path = "../llm-harness-core/crates/llm-harness" }
+# llm-harness-types = { path = "../llm-harness-core/crates/llm-harness-types" }
+# llm-harness-loop  = { path = "../llm-harness-core/crates/llm-harness-loop" }

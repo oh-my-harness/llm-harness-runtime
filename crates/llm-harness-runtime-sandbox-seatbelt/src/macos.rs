@@ -1,9 +1,9 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use llm_harness_runtime::error::Result;
 use llm_harness_runtime::sandbox::{Sandbox, SandboxConfig};
 use llm_harness_runtime_sandbox_os::OsEnv;
@@ -38,6 +38,7 @@ impl SeatbeltSandbox {
     /// Build a minimal `.sb` policy string from `SandboxConfig`.
     ///
     /// v0.2: minimal policy. v0.3: full `SandboxConfig` → `.sb` compilation.
+    #[allow(dead_code)]
     fn build_sandbox_profile(&self) -> String {
         let mut profile = String::from(
             "(version 1)\n\

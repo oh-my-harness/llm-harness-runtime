@@ -144,10 +144,7 @@ pub mod test_util {
     impl TraceExporter for RecordingExporter {
         fn export<'a>(&'a self, events: &'a [SpanEvent]) -> BoxFuture<'a, Result<()>> {
             Box::pin(async move {
-                self.spans
-                    .lock()
-                    .unwrap()
-                    .extend(events.iter().cloned());
+                self.spans.lock().unwrap().extend(events.iter().cloned());
                 Ok(())
             })
         }

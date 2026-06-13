@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use llm_harness::HarnessHooks;
+use llm_harness_runtime::TracingHookAdapter;
 use llm_harness_runtime::human_approval::{
     ApprovalDecision, ApprovalRequest, HumanApprovalWrapper, HumanApprover, TimeoutPolicy,
 };
 use llm_harness_runtime::tracer::{CaptureLevel, SpanCaptureConfig, SpanStatus};
-use llm_harness_runtime::TracingHookAdapter;
 use llm_harness_runtime_trace_otel::InMemoryTraceExporter;
 use llm_harness_types::BeforeToolCallHook;
 

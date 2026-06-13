@@ -192,7 +192,10 @@ mod tests {
     #[test]
     fn register_and_retrieve_tool() {
         let registry = InMemoryToolRegistry::new();
-        registry.register(Arc::new(StubTool { name: "read", desc: "Read a file" }));
+        registry.register(Arc::new(StubTool {
+            name: "read",
+            desc: "Read a file",
+        }));
         assert_eq!(registry.list().len(), 1);
         assert_eq!(registry.get("read").unwrap().name(), "read");
     }
@@ -200,7 +203,10 @@ mod tests {
     #[test]
     fn unregister_removes_tool() {
         let registry = InMemoryToolRegistry::new();
-        registry.register(Arc::new(StubTool { name: "t1", desc: "Tool 1" }));
+        registry.register(Arc::new(StubTool {
+            name: "t1",
+            desc: "Tool 1",
+        }));
         assert_eq!(registry.list().len(), 1);
         registry.unregister("t1");
         assert_eq!(registry.list().len(), 0);
@@ -210,9 +216,18 @@ mod tests {
     #[test]
     fn subset_filters_by_name() {
         let registry = InMemoryToolRegistry::new();
-        registry.register(Arc::new(StubTool { name: "read", desc: "..." }));
-        registry.register(Arc::new(StubTool { name: "write", desc: "..." }));
-        registry.register(Arc::new(StubTool { name: "search", desc: "..." }));
+        registry.register(Arc::new(StubTool {
+            name: "read",
+            desc: "...",
+        }));
+        registry.register(Arc::new(StubTool {
+            name: "write",
+            desc: "...",
+        }));
+        registry.register(Arc::new(StubTool {
+            name: "search",
+            desc: "...",
+        }));
 
         let subset = registry.subset(&["read", "write"]);
         assert_eq!(subset.len(), 2);
@@ -222,4 +237,3 @@ mod tests {
         assert!(!names.contains(&"search"));
     }
 }
-

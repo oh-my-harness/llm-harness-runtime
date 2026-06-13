@@ -113,7 +113,11 @@ fn budget_adapter_with_model_accepts_model_info() {
 #[test]
 fn pricing_provider_returns_none_for_unknown_model() {
     let provider = UnknownPricingProvider;
-    assert!(provider.price_for("unknown-model", "unknown-provider").is_none());
+    assert!(
+        provider
+            .price_for("unknown-model", "unknown-provider")
+            .is_none()
+    );
 }
 
 #[test]

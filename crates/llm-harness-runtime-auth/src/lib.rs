@@ -76,10 +76,15 @@ impl FileAuthHook {
         provider: impl Into<String>,
     ) -> Result<Self, FileAuthError> {
         let path: PathBuf = path.into();
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| FileAuthError::ReadFailed { path: path.clone(), source: e })?;
-        let config: AuthConfig = serde_json::from_str(&content)
-            .map_err(|e| FileAuthError::ParseFailed { path: path.clone(), source: e })?;
+        let content = std::fs::read_to_string(&path).map_err(|e| FileAuthError::ReadFailed {
+            path: path.clone(),
+            source: e,
+        })?;
+        let config: AuthConfig =
+            serde_json::from_str(&content).map_err(|e| FileAuthError::ParseFailed {
+                path: path.clone(),
+                source: e,
+            })?;
         Ok(Self {
             provider: provider.into(),
             config,
@@ -148,7 +153,10 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected error but got Ok"),
         };
-        assert!(err.to_string().contains("DEFINITELY_NONEXISTENT_VAR_XYZ_12345"));
+        assert!(
+            err.to_string()
+                .contains("DEFINITELY_NONEXISTENT_VAR_XYZ_12345")
+        );
     }
 
     #[tokio::test]

@@ -186,7 +186,12 @@ mod tests {
 
         let result = JsonlAuditSink::validate(&path).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("hash chain broken"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("hash chain broken")
+        );
     }
 
     #[tokio::test]

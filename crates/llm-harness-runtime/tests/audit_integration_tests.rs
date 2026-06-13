@@ -35,9 +35,13 @@ async fn full_audit_chain_write_and_validate() {
     let path = dir.path().join("full_chain.jsonl");
     let sink = JsonlAuditSink::new(&path);
 
-    sink.record(make_entry("trace-1", AuditEventType::Auth, AuditDecision::Allow))
-        .await
-        .unwrap();
+    sink.record(make_entry(
+        "trace-1",
+        AuditEventType::Auth,
+        AuditDecision::Allow,
+    ))
+    .await
+    .unwrap();
     sink.record(make_entry(
         "trace-1",
         AuditEventType::StateTransition,
@@ -80,11 +84,17 @@ async fn full_audit_chain_write_and_validate() {
     assert_eq!(lines.len(), 5);
 
     for (i, line) in lines.iter().enumerate() {
-        let parsed: serde_json::Value = serde_json::from_str(line)
-            .unwrap_or_else(|e| panic!("line {i} not valid JSON: {e}"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("line {i} not valid JSON: {e}"));
         assert!(parsed.get("hash").is_some(), "line {i} missing hash");
-        assert!(parsed.get("timestamp").is_some(), "line {i} missing timestamp");
-        assert!(parsed.get("event_type").is_some(), "line {i} missing event_type");
+        assert!(
+            parsed.get("timestamp").is_some(),
+            "line {i} missing timestamp"
+        );
+        assert!(
+            parsed.get("event_type").is_some(),
+            "line {i} missing event_type"
+        );
     }
 }
 
@@ -98,9 +108,13 @@ async fn hash_chain_is_sequential() {
     sink.record(make_entry("t1", AuditEventType::Auth, AuditDecision::Allow))
         .await
         .unwrap();
-    sink.record(make_entry("t1", AuditEventType::ToolCall, AuditDecision::Allow))
-        .await
-        .unwrap();
+    sink.record(make_entry(
+        "t1",
+        AuditEventType::ToolCall,
+        AuditDecision::Allow,
+    ))
+    .await
+    .unwrap();
     sink.flush().await.unwrap();
 
     let content = tokio::fs::read_to_string(&path).await.unwrap();
@@ -140,9 +154,13 @@ async fn corrupted_content_breaks_hash_chain() {
     sink.record(make_entry("t1", AuditEventType::Auth, AuditDecision::Allow))
         .await
         .unwrap();
-    sink.record(make_entry("t1", AuditEventType::ToolCall, AuditDecision::Allow))
-        .await
-        .unwrap();
+    sink.record(make_entry(
+        "t1",
+        AuditEventType::ToolCall,
+        AuditDecision::Allow,
+    ))
+    .await
+    .unwrap();
     sink.flush().await.unwrap();
 
     // Corrupt the second line without recomputing its hash.

@@ -20,11 +20,15 @@ license = "MIT"
 # Runtime (within this workspace)
 llm-harness-runtime = { path = "crates/llm-harness-runtime" }
 
-# Core (path deps adjusted for this machine)
-llm-harness        = { path = "/data/leiqiaojie2/oh-my-harness/llm-harness-core/crates/llm-harness" }
-llm-harness-types  = { path = "/data/leiqiaojie2/oh-my-harness/llm-harness-core/crates/llm-harness-types" }
-llm-harness-loop   = { path = "/data/leiqiaojie2/oh-my-harness/llm-harness-core/crates/llm-harness-loop" }
-llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter.git", rev = "c1d2cb87cb2bb94803144cfc28133a394b7fca18" }
+# Core — pin a specific commit for reproducibility.
+# For local development, override with path in .cargo/config.toml:
+#   [patch."https://github.com/oh-my-harness/llm-harness-core"]
+#   llm-harness       = { path = "../llm-harness-core/crates/llm-harness" }
+#   llm-harness-types = { path = "../llm-harness-core/crates/llm-harness-types" }
+#   llm-harness-loop  = { path = "../llm-harness-core/crates/llm-harness-loop" }
+llm-harness        = { git = "https://github.com/oh-my-harness/llm-harness-core", rev = "9ad7292c67c1d7828a907a7fd270a007b5d1f750" }
+llm-harness-types  = { git = "https://github.com/oh-my-harness/llm-harness-core", rev = "9ad7292c67c1d7828a907a7fd270a007b5d1f750" }
+llm-harness-loop   = { git = "https://github.com/oh-my-harness/llm-harness-core", rev = "9ad7292c67c1d7828a907a7fd270a007b5d1f750" }
 
 # Infrastructure
 anyhow             = "1"

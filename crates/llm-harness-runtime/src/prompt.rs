@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use futures::future::BoxFuture;
@@ -141,11 +141,7 @@ impl InMemoryPromptRegistry {
     }
 
     /// Invoke a registered template with positional arguments.
-    pub fn invoke(
-        &self,
-        name: &str,
-        args: &[String],
-    ) -> std::result::Result<String, InvokeError> {
+    pub fn invoke(&self, name: &str, args: &[String]) -> std::result::Result<String, InvokeError> {
         let template = self
             .get(name)
             .ok_or_else(|| InvokeError::NotFound(name.to_string()))?;
@@ -298,8 +294,9 @@ mod tests {
         let names = registry.ingest(&TestSource).await.unwrap();
         assert_eq!(names, vec!["test_tmpl"]);
 
-        let result = registry.invoke("test_tmpl", &["hello".to_string()]).unwrap();
+        let result = registry
+            .invoke("test_tmpl", &["hello".to_string()])
+            .unwrap();
         assert_eq!(result, "Say hello");
     }
 }
-

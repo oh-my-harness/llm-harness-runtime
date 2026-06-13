@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use chrono::DateTime;
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
 
@@ -86,13 +86,11 @@ impl ExecutionEnv for OsEnv {
                 return Err(EnvError::Aborted);
             }
             let full = self.resolve(path);
-            tokio::fs::read(&full)
-                .await
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::NotFound => EnvError::NotFound(full),
-                    std::io::ErrorKind::PermissionDenied => EnvError::PermissionDenied(full),
-                    _ => EnvError::Io(e),
-                })
+            tokio::fs::read(&full).await.map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => EnvError::NotFound(full),
+                std::io::ErrorKind::PermissionDenied => EnvError::PermissionDenied(full),
+                _ => EnvError::Io(e),
+            })
         }
         .boxed()
     }
@@ -302,13 +300,12 @@ impl ExecutionEnv for OsEnv {
         .boxed()
     }
 
-    fn create_temp_dir<'a>(
-        &'a self,
-        prefix: &'a str,
-    ) -> BoxFuture<'a, Result<PathBuf, EnvError>> {
+    fn create_temp_dir<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<PathBuf, EnvError>> {
         async move {
             let dir = std::env::temp_dir().join(format!("{prefix}_{}", uuid::Uuid::new_v4()));
-            tokio::fs::create_dir_all(&dir).await.map_err(EnvError::Io)?;
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .map_err(EnvError::Io)?;
             Ok(dir)
         }
         .boxed()

@@ -58,8 +58,7 @@ pub use task::{
 };
 pub use tool_adapter::ToolSourceAdapter;
 pub use tool_registry::{
-    InMemoryToolRegistry, ToolDefinition, ToolExecutionMode, ToolMetadata, ToolRegistry,
-    ToolSource,
+    InMemoryToolRegistry, ToolDefinition, ToolExecutionMode, ToolMetadata, ToolRegistry, ToolSource,
 };
 pub use tracer::{
     AttributeValue, CaptureLevel, SpanCaptureConfig, SpanEvent, SpanId, SpanKind, SpanRedactor,

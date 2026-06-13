@@ -72,8 +72,8 @@ impl Tool for ToolSourceAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::tool_registry::ToolExecutionMode as RuntimeExecMode;
+    use std::sync::Arc;
 
     #[test]
     fn tool_source_adapter_metadata() {

@@ -96,18 +96,14 @@ impl AfterProviderResponseHook for BudgetControlAdapter {
                 cost.total_cache_write_tokens += usage.cache_creation_tokens as u64;
 
                 if let Some(ref p) = price {
-                    let call_cost =
-                        (usage.input_tokens as f64 / 1_000_000.0) * p.input_per_mtok
-                            + (usage.output_tokens as f64 / 1_000_000.0) * p.output_per_mtok
-                            + (usage.cache_read_tokens as f64 / 1_000_000.0)
-                                * p.cache_read_per_mtok
-                            + (usage.cache_creation_tokens as f64 / 1_000_000.0)
-                                * p.cache_write_per_mtok;
+                    let call_cost = (usage.input_tokens as f64 / 1_000_000.0) * p.input_per_mtok
+                        + (usage.output_tokens as f64 / 1_000_000.0) * p.output_per_mtok
+                        + (usage.cache_read_tokens as f64 / 1_000_000.0) * p.cache_read_per_mtok
+                        + (usage.cache_creation_tokens as f64 / 1_000_000.0)
+                            * p.cache_write_per_mtok;
                     cost.total_cost += call_cost;
 
-                    if let (Some(m), Some(pr)) =
-                        (self.model.as_deref(), self.provider.as_deref())
-                    {
+                    if let (Some(m), Some(pr)) = (self.model.as_deref(), self.provider.as_deref()) {
                         let key = format!("{pr}/{m}");
                         let mc = cost.by_model.entry(key).or_default();
                         mc.input_tokens += usage.input_tokens as u64;

@@ -234,8 +234,9 @@ impl TaskRunner for TaskRunnerImpl {
             let current = self.state.lock().unwrap().clone();
             match current {
                 TaskState::Running { .. } => {
-                    *self.state.lock().unwrap() =
-                        TaskState::Paused { reason: reason.to_string() };
+                    *self.state.lock().unwrap() = TaskState::Paused {
+                        reason: reason.to_string(),
+                    };
                     Ok(())
                 }
                 _ => Err(anyhow::anyhow!("cannot pause: task is not running")),
@@ -261,8 +262,9 @@ impl TaskRunner for TaskRunnerImpl {
 
     fn cancel<'a>(&'a self, reason: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            *self.state.lock().unwrap() =
-                TaskState::Cancelled { reason: reason.to_string() };
+            *self.state.lock().unwrap() = TaskState::Cancelled {
+                reason: reason.to_string(),
+            };
             Ok(())
         })
     }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
 use futures::FutureExt;
+use futures::future::BoxFuture;
 use llm_harness_runtime::error::Result;
 use llm_harness_runtime::mcp::{McpClientHandle, McpError, McpToolDef};
 use llm_harness_runtime::prompt::{PromptSource, PromptSourceTemplate};
@@ -94,9 +94,7 @@ impl Tool for McpToolAdapter {
                         terminate: false,
                     })
                 }
-                Err(McpError::Protocol { source }) => {
-                    Err(ToolError::Execution(source.to_string()))
-                }
+                Err(McpError::Protocol { source }) => Err(ToolError::Execution(source.to_string())),
                 Err(McpError::ToolExecution { content }) => {
                     let text = content
                         .into_iter()
@@ -214,8 +212,8 @@ mod tests {
         assert_eq!(adapters[0].name(), "greet");
 
         // Build minimal ToolContext.
-        use std::sync::Arc;
         use llm_harness_types::{AssistantMessage, UnsupportedEnv};
+        use std::sync::Arc;
         use tokio_util::sync::CancellationToken;
 
         let ctx = ToolContext {
