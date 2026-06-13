@@ -286,3 +286,7 @@ pub struct HarnessHooks {
 - **`v0.3+ API 预览`**：代码注释中预示未来 API，当前代码中不实现
 
 这些标记帮助用户理解当前版本的范围，避免期望超出设计。
+
+## 收尾
+
+每次开发完成后：提交并推送本仓库变更；如有进度变化同步更新顶层 `STATUS.md` 并推送 `oh-my-harness/oh-my-harness`。
