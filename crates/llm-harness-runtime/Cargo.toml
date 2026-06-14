@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-llm-harness.workspace       = true
+llm-harness.workspace      = true
+llm-harness-loop.workspace = true
 llm-harness-types.workspace = true
 anyhow.workspace            = true
 async-trait.workspace       = true
@@ -19,6 +20,7 @@ tokio.workspace             = true
 uuid.workspace              = true
 
 [dev-dependencies]
+llm-harness-loop = { workspace = true, features = ["test-utils"] }
 llm-harness-runtime-sandbox-os  = { path = "../llm-harness-runtime-sandbox-os" }
 llm-harness-runtime-auth        = { path = "../llm-harness-runtime-auth" }
 llm-harness-runtime-audit-jsonl = { path = "../llm-harness-runtime-audit-jsonl" }

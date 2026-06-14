@@ -2,7 +2,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
-use llm_harness_types::EntryId;
+use llm_harness::{AgentHarness, AgentHarnessEvent, AgentHarnessOptions, HarnessHooks};
+use llm_harness_loop::LlmClient;
+use llm_harness_types::{AgentEvent, ContentBlock, EntryId};
 use serde_json::Value;
 
 use crate::budget::BudgetControlAdapter;
@@ -170,7 +172,6 @@ impl Default for RetryPolicy {
 pub struct TaskRunnerImpl {
     #[allow(dead_code)]
     task_id: TaskId,
-    #[allow(dead_code)]
     sandbox: Arc<dyn Sandbox>,
     #[allow(dead_code)]
     verifier: Option<Arc<dyn TaskVerifier>>,
@@ -180,6 +181,9 @@ pub struct TaskRunnerImpl {
     budget_adapter: Option<Arc<BudgetControlAdapter>>,
     #[allow(dead_code)]
     human_approval: Option<Arc<HumanApprovalWrapper>>,
+    client: Option<Arc<dyn LlmClient>>,
+    model: Option<String>,
+    harness_hooks: HarnessHooks,
     state: Mutex<TaskState>,
     cost: Mutex<CostAggregate>,
     checkpoints: Mutex<Vec<Checkpoint>>,
@@ -202,20 +206,90 @@ impl TaskRunnerImpl {
             retry_policy,
             budget_adapter,
             human_approval,
+            client: None,
+            model: None,
+            harness_hooks: HarnessHooks::none(),
             state: Mutex::new(TaskState::Pending),
             cost: Mutex::new(CostAggregate::default()),
             checkpoints: Mutex::new(Vec::new()),
         }
     }
+
+    /// Inject an LLM client and model; enables `start()` to drive a real `AgentHarness`.
+    pub fn with_harness(mut self, client: Arc<dyn LlmClient>, model: impl Into<String>) -> Self {
+        self.client = Some(client);
+        self.model = Some(model.into());
+        self
+    }
+
+    /// Inject hooks to wire into the `AgentHarness` created by `start()`.
+    pub fn with_hooks(mut self, hooks: HarnessHooks) -> Self {
+        self.harness_hooks = hooks;
+        self
+    }
 }
 
 impl TaskRunner for TaskRunnerImpl {
-    fn start<'a>(&'a self, _prompt: &'a str) -> BoxFuture<'a, Result<()>> {
+    fn start<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            // If no client is injected, only transition state (stub mode for unit tests).
+            let (Some(client), Some(model)) = (self.client.clone(), self.model.clone()) else {
+                *self.state.lock().unwrap() = TaskState::Running {
+                    session_id: EntryId::new(),
+                    started_at: Utc::now(),
+                };
+                return Ok(());
+            };
+
             *self.state.lock().unwrap() = TaskState::Running {
                 session_id: EntryId::new(),
                 started_at: Utc::now(),
             };
+
+            let env = self.sandbox.env();
+            let opts = AgentHarnessOptions {
+                model: model.clone(),
+                hooks: self.harness_hooks.clone(),
+                ..AgentHarnessOptions::new(model)
+            };
+
+            let harness = AgentHarness::new_in_memory(client, env, opts).await;
+            let mut rx = harness.subscribe();
+            harness
+                .prompt(prompt)
+                .await
+                .map_err(|e| anyhow::anyhow!("prompt error: {e}"))?;
+
+            let mut last_text = String::new();
+            let mut turns = 0u32;
+            while let Ok(event) = rx.recv().await {
+                match event.as_ref() {
+                    AgentHarnessEvent::Agent(AgentEvent::MessageEnd { message, .. }) => {
+                        turns += 1;
+                        for block in &message.content {
+                            if let ContentBlock::Text { text } = block {
+                                last_text = text.clone();
+                            }
+                        }
+                    }
+                    AgentHarnessEvent::Settled | AgentHarnessEvent::Aborted => break,
+                    _ => {}
+                }
+            }
+
+            *self.state.lock().unwrap() = TaskState::Succeeded {
+                result: TaskResult {
+                    cost: self.total_cost(),
+                    turns,
+                    final_message: if last_text.is_empty() {
+                        None
+                    } else {
+                        Some(last_text)
+                    },
+                },
+                ended_at: Utc::now(),
+            };
+
             Ok(())
         })
     }
