@@ -106,11 +106,11 @@ fn human_approval_wrapper_satisfies_before_tool_call_hook() {
 #[test]
 fn harness_hooks_none_has_no_slots_set() {
     let hooks = HarnessHooks::none();
-    assert!(hooks.before_tool_call.is_none());
-    assert!(hooks.after_turn.is_none());
-    assert!(hooks.before_provider_request.is_none());
-    assert!(hooks.after_provider_response.is_none());
-    assert!(hooks.should_stop.is_none());
+    assert!(hooks.before_tool_call.is_empty());
+    assert!(hooks.after_turn.is_empty());
+    assert!(hooks.before_provider_request.is_empty());
+    assert!(hooks.after_provider_response.is_empty());
+    assert!(hooks.should_stop.is_empty());
 }
 
 // ── Test 5: TracingHookAdapter can be wired into HarnessHooks ────────────────
@@ -130,14 +130,14 @@ fn tracing_adapter_wires_into_harness_hooks() {
     ));
 
     let hooks = HarnessHooks {
-        before_provider_request: Some(adapter.clone() as Arc<dyn BeforeProviderRequestHook>),
-        after_provider_response: Some(adapter.clone() as Arc<dyn AfterProviderResponseHook>),
-        after_tool_call: Some(adapter.clone() as Arc<dyn AfterToolCallHook>),
-        after_turn: Some(adapter.clone() as Arc<dyn AfterTurnHook>),
+        before_provider_request: vec![adapter.clone() as Arc<dyn BeforeProviderRequestHook>],
+        after_provider_response: vec![adapter.clone() as Arc<dyn AfterProviderResponseHook>],
+        after_tool_call: vec![adapter.clone() as Arc<dyn AfterToolCallHook>],
+        after_turn: vec![adapter.clone() as Arc<dyn AfterTurnHook>],
         ..HarnessHooks::none()
     };
 
-    // All other slots remain absent.
-    assert!(hooks.before_tool_call.is_none());
-    assert!(hooks.should_stop.is_none());
+    // All other slots remain empty.
+    assert!(hooks.before_tool_call.is_empty());
+    assert!(hooks.should_stop.is_empty());
 }

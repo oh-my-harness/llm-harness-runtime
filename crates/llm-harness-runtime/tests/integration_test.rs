@@ -104,13 +104,13 @@ async fn infrastructure_assembly_smoke_test() {
     adapter.end_task("smoke-task", SpanStatus::Ok);
 
     let hooks = HarnessHooks {
-        before_provider_request: Some(adapter.clone() as Arc<dyn BeforeProviderRequestHook>),
-        after_provider_response: Some(adapter.clone() as Arc<dyn AfterProviderResponseHook>),
-        after_tool_call: Some(adapter.clone() as Arc<dyn AfterToolCallHook>),
-        after_turn: Some(adapter.clone() as Arc<dyn AfterTurnHook>),
+        before_provider_request: vec![adapter.clone() as Arc<dyn BeforeProviderRequestHook>],
+        after_provider_response: vec![adapter.clone() as Arc<dyn AfterProviderResponseHook>],
+        after_tool_call: vec![adapter.clone() as Arc<dyn AfterToolCallHook>],
+        after_turn: vec![adapter.clone() as Arc<dyn AfterTurnHook>],
         ..HarnessHooks::none()
     };
-    assert!(hooks.before_tool_call.is_none());
+    assert!(hooks.before_tool_call.is_empty());
 
     // 5. Shutdown sandbox.
     Box::new(sandbox).shutdown().await.unwrap();
@@ -137,8 +137,8 @@ async fn dev_configuration_smoke_test() {
 
     // Dev: no hooks.
     let hooks = HarnessHooks::none();
-    assert!(hooks.before_provider_request.is_none());
-    assert!(hooks.after_turn.is_none());
+    assert!(hooks.before_provider_request.is_empty());
+    assert!(hooks.after_turn.is_empty());
 
     Box::new(sandbox).shutdown().await.unwrap();
 }
@@ -160,13 +160,13 @@ async fn staging_configuration_smoke_test() {
 
     // No human approval in staging (automated CI).
     let hooks = HarnessHooks {
-        before_provider_request: Some(adapter.clone() as Arc<dyn BeforeProviderRequestHook>),
-        after_provider_response: Some(adapter.clone() as Arc<dyn AfterProviderResponseHook>),
-        after_tool_call: Some(adapter.clone() as Arc<dyn AfterToolCallHook>),
-        after_turn: Some(adapter.clone() as Arc<dyn AfterTurnHook>),
+        before_provider_request: vec![adapter.clone() as Arc<dyn BeforeProviderRequestHook>],
+        after_provider_response: vec![adapter.clone() as Arc<dyn AfterProviderResponseHook>],
+        after_tool_call: vec![adapter.clone() as Arc<dyn AfterToolCallHook>],
+        after_turn: vec![adapter.clone() as Arc<dyn AfterTurnHook>],
         ..HarnessHooks::none()
     };
 
-    assert!(hooks.before_tool_call.is_none());
-    assert!(hooks.before_provider_request.is_some());
+    assert!(hooks.before_tool_call.is_empty());
+    assert!(!hooks.before_provider_request.is_empty());
 }

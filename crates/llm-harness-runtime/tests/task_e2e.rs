@@ -110,7 +110,7 @@ async fn task_runner_tracing_emits_spans() {
     ));
 
     let mut hooks = HarnessHooks::none();
-    hooks.after_turn = Some(adapter as Arc<dyn AfterTurnHook>);
+    hooks.after_turn = vec![adapter as Arc<dyn AfterTurnHook>];
 
     let runner = make_runner_with_hooks(vec![MockResponse::text("Hello from tracer.")], hooks);
     runner.start("trace me").await.unwrap();

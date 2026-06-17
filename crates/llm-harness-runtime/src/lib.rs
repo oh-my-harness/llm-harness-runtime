@@ -14,10 +14,12 @@
 //! - Authentication (`AuthHook`)
 //! - Human approval (`HumanApprover`, `HumanApprovalWrapper`)
 //! - Budget control (`BudgetExceededHook`, `BudgetControlAdapter`)
+//! - Harness construction (`HarnessBuilder`)
 
 pub mod audit;
 pub mod auth;
 pub mod budget;
+pub mod builder;
 pub mod composite;
 pub mod cost;
 pub mod error;
@@ -36,6 +38,7 @@ pub mod tracing_adapter;
 pub use audit::{AuditDecision, AuditEntry, AuditEventType, AuditSink, CostDelta};
 pub use auth::AuthHook;
 pub use budget::{BudgetControlAdapter, BudgetExceededHook};
+pub use builder::{HarnessBuildError, HarnessBuilder};
 pub use composite::{
     CompositeAfterProviderResponseHook, CompositeAfterToolCallHook, CompositeAfterTurnHook,
     CompositeBeforeProviderRequestHook, CompositeBeforeToolCallHook,
