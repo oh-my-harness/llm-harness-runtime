@@ -9,6 +9,7 @@
 //! runtime, testing loop behavior, or integrating at the framework layer.
 
 pub mod config;
+pub mod composite;
 pub mod convert;
 pub(crate) mod dispatch;
 pub mod hooked_tool;
@@ -21,6 +22,10 @@ mod type_bridge;
 pub mod test_utils;
 
 // Top-level re-exports
+pub use composite::{
+    CompositeAfterProviderResponseHook, CompositeAfterToolCallHook, CompositeAfterTurnHook,
+    CompositeBeforeProviderRequestHook, CompositeBeforeToolCallHook,
+};
 pub use config::{LoopConfig, ModelInfo, RetryConfig};
 pub use convert::{ConvertToLlmHook, CustomMessageConverter, DefaultConvertToLlm};
 pub use hooked_tool::HookedTool;
