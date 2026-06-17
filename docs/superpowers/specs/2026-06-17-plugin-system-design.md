@@ -8,7 +8,7 @@
 
 ## 背景与目标
 
-oh-my-harness 当前的 hook 和工具注册机制已经有良好的基础（13 个 hook trait、composite 组合器、ToolRegistry），但缺少让外部开发者以**声明式、可叠加**的方式组合这些能力的编排层。
+oh-my-harness 当前的 hook 和工具注册机制已经有良好的基础（12 个 hook trait、composite 组合器、ToolRegistry），但缺少让外部开发者以**声明式、可叠加**的方式组合这些能力的编排层。
 
 目标是补齐这层编排，使外部开发者可以：
 
@@ -193,15 +193,15 @@ pub trait StateProvider: Send + Sync {
 ## 七、文件变更索引
 
 ```
-修改  llm-harness-core/crates/llm-harness-types/src/hooks.rs
+修改  crates/llm-harness-types/src/hooks.rs
         HarnessHooks 字段 Option → Vec
 
-新增  llm-harness-core/crates/llm-harness-types/src/plugin.rs
+新增  crates/llm-harness-types/src/plugin.rs
         Plugin trait, StateProvider trait
 
-修改  llm-harness-runtime/crates/llm-harness-runtime/src/composite.rs
+修改  crates/llm-harness-runtime/src/composite.rs
         补齐 7 个 Composite + 修改 AfterToolCallHook 为链式
 
-新增  llm-harness-runtime/crates/llm-harness-runtime/src/builder.rs
+新增  crates/llm-harness-runtime/src/builder.rs
         HarnessBuilder
 ```
