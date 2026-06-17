@@ -15,6 +15,7 @@ pub mod compaction;
 #[cfg(test)]
 mod env;
 pub mod harness;
+pub mod plugin;
 pub mod session;
 pub mod skills;
 
@@ -24,6 +25,7 @@ pub use harness::{
     AgentHarness, AgentHarnessEvent, AgentHarnessOptions, CompactionStats, HarnessHooks,
     HarnessState, HarnessToolCallResult,
 };
+pub use plugin::{Plugin, StateProvider};
 pub use session::{
     BuiltContext, InMemorySessionRepo, JsonlSessionRepo, Session, SessionRepo, SessionStorage,
 };
@@ -43,8 +45,8 @@ pub mod prelude {
     pub use crate::{
         Agent, AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AgentOptions, AgentPhase,
         AgentState, BuiltContext, CompactionPreparation, CompactionSettings, CompactionStats,
-        InMemorySessionRepo, JsonlSessionRepo, ModelInfo, PromptTemplate, Session, SessionRepo,
-        SessionStorage, Skill, SkillDiagnostic, SourcedSkill,
+        InMemorySessionRepo, JsonlSessionRepo, ModelInfo, Plugin, PromptTemplate, Session,
+        SessionRepo, SessionStorage, Skill, SkillDiagnostic, SourcedSkill, StateProvider,
     };
     pub use llm_harness_types::{
         AgentError, AgentEvent, AgentMessage, AssistantMessage, AuthHook, BranchSummaryMessage,
