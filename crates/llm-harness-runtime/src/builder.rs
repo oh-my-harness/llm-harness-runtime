@@ -384,7 +384,10 @@ mod tests {
             &'a self,
             _args: serde_json::Value,
             _ctx: &'a llm_harness_types::ToolContext,
-        ) -> futures::future::BoxFuture<'a, Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>> {
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>,
+        > {
             Box::pin(async {
                 Ok(llm_harness_types::ToolResult {
                     content: vec![llm_harness_types::ContentBlock::Text {
