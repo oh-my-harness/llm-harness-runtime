@@ -6,7 +6,13 @@ use futures::StreamExt;
 use llm_harness_loop::{
     ChatRequest, ConvertToLlmHook, DefaultConvertToLlm, HookedTool, LlmClient, LlmMessage,
     LoopConfig, RequestContent, RetryConfig, agent_loop,
+    CompositeBeforeRunHook, CompositeBeforeTurnHook, CompositeAfterTurnHook,
+    CompositeBeforeToolCallHook, CompositeAfterToolCallHook,
+    CompositeTransformContextHook, CompositeShouldStopHook,
+    CompositeBeforeProviderRequestHook, CompositeAfterProviderResponseHook,
 };
+use llm_harness_loop::composite::CompositeBeforeCompactHook;
+use llm_harness_loop::CompositePreparePrepareNextTurnHook;
 use llm_harness_types::*;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -1141,7 +1147,7 @@ impl AgentHarness {
         if self.hooks.before_run.is_empty() {
             return Ok(initial);
         }
-        let hook = &self.hooks.before_run[0];
+        let composite = Arc::new(CompositeBeforeRunHook::new(self.hooks.before_run.clone()));
         let (skills, templates) = {
             let inner = self.inner.lock().unwrap();
             let snames: Vec<String> = inner.skills.iter().map(|s| s.name.clone()).collect();
@@ -1170,7 +1176,7 @@ impl AgentHarness {
             .unwrap_or_default();
 
         let mut system_prompt = self.inner.lock().unwrap().state.system_prompt.clone();
-        let result = hook
+        let result = composite
             .before_run(BeforeRunCtx {
                 prompt_text: &prompt_text,
                 initial_messages: &mut initial,
@@ -1198,9 +1204,11 @@ impl AgentHarness {
         let st = &inner.state;
         let retry = inner.retry.clone();
 
-        // Wrap tools with HookedTool if needed.
-        let before = self.hooks.before_tool_call.last().cloned();
-        let after = self.hooks.after_tool_call.last().cloned();
+        // Wrap tools with HookedTool if before/after tool call hooks exist.
+        let before = (!self.hooks.before_tool_call.is_empty())
+            .then(|| Arc::new(CompositeBeforeToolCallHook::new(self.hooks.before_tool_call.clone())) as Arc<dyn BeforeToolCallHook>);
+        let after = (!self.hooks.after_tool_call.is_empty())
+            .then(|| Arc::new(CompositeAfterToolCallHook::new(self.hooks.after_tool_call.clone())) as Arc<dyn AfterToolCallHook>);
         let tools: Vec<Arc<dyn Tool>> = if before.is_some() || after.is_some() {
             st.tools
                 .clone()
@@ -1220,7 +1228,8 @@ impl AgentHarness {
         // Build the default prepare_next_turn wrapper.
         let prepare_next_turn: Arc<dyn PrepareNextTurnHook> = Arc::new(DefaultPrepareNextTurn {
             inner: self.inner.clone(),
-            user_hook: self.hooks.prepare_next_turn.last().cloned(),
+            user_hook: (!self.hooks.prepare_next_turn.is_empty())
+                .then(|| Arc::new(CompositePreparePrepareNextTurnHook::new(self.hooks.prepare_next_turn.clone())) as Arc<dyn PrepareNextTurnHook>),
         });
 
         LoopConfig {
@@ -1235,11 +1244,15 @@ impl AgentHarness {
             abort,
             stream_options: self.stream_options.clone(),
             convert_to_llm: self.convert_to_llm.clone(),
-            transform_context: self.hooks.transform_context.last().cloned(),
+            transform_context: (!self.hooks.transform_context.is_empty())
+                .then(|| Arc::new(CompositeTransformContextHook::new(self.hooks.transform_context.clone())) as Arc<dyn TransformContextHook>),
             prepare_next_turn: Some(prepare_next_turn),
-            should_stop: self.hooks.should_stop.last().cloned(),
-            before_provider_request: self.hooks.before_provider_request.last().cloned(),
-            after_provider_response: self.hooks.after_provider_response.last().cloned(),
+            should_stop: (!self.hooks.should_stop.is_empty())
+                .then(|| Arc::new(CompositeShouldStopHook::new(self.hooks.should_stop.clone())) as Arc<dyn ShouldStopHook>),
+            before_provider_request: (!self.hooks.before_provider_request.is_empty())
+                .then(|| Arc::new(CompositeBeforeProviderRequestHook::new(self.hooks.before_provider_request.clone())) as Arc<dyn BeforeProviderRequestHook>),
+            after_provider_response: (!self.hooks.after_provider_response.is_empty())
+                .then(|| Arc::new(CompositeAfterProviderResponseHook::new(self.hooks.after_provider_response.clone())) as Arc<dyn AfterProviderResponseHook>),
             auth: self.auth.clone(),
             steer_rx: Some(steer_rx),
             follow_up_rx: Some(follow_up_rx),
@@ -1318,7 +1331,7 @@ impl AgentHarness {
                 }
                 AgentEvent::TurnStart { index } => {
                     if !self.hooks.before_turn.is_empty() {
-                        let h = &self.hooks.before_turn[0];
+                        let composite = Arc::new(CompositeBeforeTurnHook::new(self.hooks.before_turn.clone()));
                         let snapshot = {
                             let inner = self.inner.lock().unwrap();
                             TurnSnapshot {
@@ -1328,7 +1341,7 @@ impl AgentHarness {
                                 system_prompt: inner.state.system_prompt.clone(),
                             }
                         };
-                        h.before_turn(BeforeTurnCtx {
+                        composite.before_turn(BeforeTurnCtx {
                             turn_index: *index,
                             snapshot: &snapshot,
                         })
@@ -1423,8 +1436,8 @@ impl AgentHarness {
                 AgentEvent::TurnEnd { index, .. } => {
                     // Call after_turn hook before flush.
                     if !self.hooks.after_turn.is_empty() {
-                        let h = &self.hooks.after_turn[0];
-                        h.after_turn(AfterTurnCtx {
+                        let composite = Arc::new(CompositeAfterTurnHook::new(self.hooks.after_turn.clone()));
+                        composite.after_turn(AfterTurnCtx {
                             turn_index: *index,
                             new_messages: &turn_messages,
                         })
@@ -1473,13 +1486,13 @@ impl AgentHarness {
         // before_compact hook is called BEFORE prepare_compaction so that
         // BeforeCompactDecision::Override can bypass the token-threshold check entirely.
         if !self.hooks.before_compact.is_empty() {
-            let h = &self.hooks.before_compact[0];
+            let composite = Arc::new(CompositeBeforeCompactHook::new(self.hooks.before_compact.clone()));
             let built = self.session.build_context().await?;
             let estimated_tokens: usize = path
                 .iter()
                 .map(crate::compaction::estimate_tokens_for_entry)
                 .sum();
-            let decision = h
+            let decision = composite
                 .before_compact(BeforeCompactCtx {
                     estimated_tokens,
                     messages: &built.messages,
