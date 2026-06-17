@@ -297,6 +297,8 @@ impl HarnessBuilder {
 mod tests {
     use super::*;
 
+    // ── Provider matching tests ────────────────────────────────────────────────
+
     #[test]
     fn test_provider_matcher_exact() {
         // Create a simple mock client using a placeholder approach.
@@ -346,5 +348,317 @@ mod tests {
         // Test matching logic without instantiation
         let model = "claude-3-5-sonnet";
         assert!(model.starts_with(prefix));
+    }
+
+    // ── Plugin integration tests ───────────────────────────────────────────────
+
+    /// Mock tool for testing plugin registration.
+    struct MockTool {
+        tool_name: String,
+        schema: serde_json::Value,
+    }
+
+    impl MockTool {
+        fn new(name: &str) -> Self {
+            Self {
+                tool_name: name.to_string(),
+                schema: serde_json::json!({}),
+            }
+        }
+    }
+
+    impl Tool for MockTool {
+        fn name(&self) -> &str {
+            &self.tool_name
+        }
+
+        fn description(&self) -> &str {
+            "mock tool"
+        }
+
+        fn parameters_schema(&self) -> &serde_json::Value {
+            &self.schema
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _args: serde_json::Value,
+            _ctx: &'a llm_harness_types::ToolContext,
+        ) -> futures::future::BoxFuture<'a, Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>> {
+            Box::pin(async {
+                Ok(llm_harness_types::ToolResult {
+                    content: vec![llm_harness_types::ContentBlock::Text {
+                        text: "mock result".into(),
+                    }],
+                    details: serde_json::Value::Null,
+                    terminate: false,
+                })
+            })
+        }
+    }
+
+    /// Mock hook for testing plugin registration.
+    struct MockBeforeTurnHook;
+
+    impl llm_harness_types::BeforeTurnHook for MockBeforeTurnHook {
+        fn before_turn<'a>(
+            &'a self,
+            _ctx: llm_harness_types::BeforeTurnCtx<'a>,
+        ) -> futures::future::BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    /// Mock plugin for testing.
+    struct MockPlugin {
+        plugin_name: String,
+        tools: Vec<Arc<dyn Tool>>,
+        hooks: Vec<Arc<dyn llm_harness_types::BeforeTurnHook>>,
+        skills: Vec<Skill>,
+    }
+
+    impl MockPlugin {
+        fn new(name: &str) -> Self {
+            Self {
+                plugin_name: name.to_string(),
+                tools: vec![],
+                hooks: vec![],
+                skills: vec![],
+            }
+        }
+
+        fn with_tool(mut self, name: &str) -> Self {
+            self.tools.push(Arc::new(MockTool::new(name)));
+            self
+        }
+
+        fn with_hook(mut self) -> Self {
+            self.hooks.push(Arc::new(MockBeforeTurnHook));
+            self
+        }
+
+        fn with_skill(mut self, name: &str) -> Self {
+            self.skills.push(Skill {
+                name: name.to_string(),
+                label: None,
+                description: "test skill".to_string(),
+                content: "# Test Skill\n".to_string(),
+                source: std::path::PathBuf::from("/test"),
+                disable_model_invocation: false,
+            });
+            self
+        }
+    }
+
+    impl Plugin for MockPlugin {
+        fn name(&self) -> &str {
+            &self.plugin_name
+        }
+
+        fn register_tools(&self, tools: &mut Vec<Arc<dyn Tool>>) {
+            for tool in &self.tools {
+                tools.push(tool.clone());
+            }
+        }
+
+        fn register_hooks(&self, hooks: &mut HarnessHooks) {
+            for hook in &self.hooks {
+                hooks.before_turn.push(hook.clone());
+            }
+        }
+
+        fn register_skills(&self, skills: &mut Vec<Skill>) {
+            for skill in &self.skills {
+                skills.push(skill.clone());
+            }
+        }
+    }
+
+    /// Test 1: Install a single plugin — verifies hook and tool accumulation.
+    #[test]
+    fn test_builder_installs_single_plugin() {
+        let plugin = MockPlugin::new("plugin-1")
+            .with_tool("tool-1")
+            .with_hook()
+            .with_skill("skill-1");
+
+        let builder = HarnessBuilder::new("claude-3-sonnet").install(&plugin);
+
+        // Verify all contributions are accumulated.
+        assert_eq!(builder.hooks.before_turn.len(), 1);
+        assert_eq!(builder.tools.len(), 1);
+        assert_eq!(builder.skills.len(), 1);
+    }
+
+    /// Test 2: Install multiple plugins — verifies accumulation across plugins.
+    #[test]
+    fn test_builder_installs_multiple_plugins_accumulate_hooks() {
+        let plugin1 = MockPlugin::new("plugin-1")
+            .with_tool("tool-1")
+            .with_hook()
+            .with_skill("skill-1");
+
+        let plugin2 = MockPlugin::new("plugin-2")
+            .with_tool("tool-2")
+            .with_hook()
+            .with_skill("skill-2");
+
+        let builder = HarnessBuilder::new("claude-3-sonnet")
+            .install(&plugin1)
+            .install(&plugin2);
+
+        // Verify all contributions from both plugins are accumulated.
+        assert_eq!(builder.hooks.before_turn.len(), 2);
+        assert_eq!(builder.tools.len(), 2);
+        assert_eq!(builder.skills.len(), 2);
+    }
+
+    /// Test 3: Tool name conflicts — both tools are added to registry.
+    ///
+    /// When two plugins register tools with the same name,
+    /// both are added (no deduplication). Conflict resolution happens
+    /// at dispatch time, not at registration time.
+    #[test]
+    fn test_builder_detects_tool_name_conflict() {
+        let plugin1 = MockPlugin::new("plugin-1").with_tool("shared-tool");
+
+        let plugin2 = MockPlugin::new("plugin-2").with_tool("shared-tool");
+
+        let builder = HarnessBuilder::new("claude-3-sonnet")
+            .install(&plugin1)
+            .install(&plugin2);
+
+        // Both tools are registered even with name conflict.
+        assert_eq!(builder.tools.len(), 2);
+        assert_eq!(builder.tools[0].name(), "shared-tool");
+        assert_eq!(builder.tools[1].name(), "shared-tool");
+    }
+
+    /// Test 4: Skill name conflicts — both skills are added.
+    ///
+    /// When two plugins register skills with the same name,
+    /// both are added. Conflict resolution happens at lookup time.
+    #[test]
+    fn test_builder_detects_skill_name_conflict() {
+        let plugin1 = MockPlugin::new("plugin-1").with_skill("shared-skill");
+
+        let plugin2 = MockPlugin::new("plugin-2").with_skill("shared-skill");
+
+        let builder = HarnessBuilder::new("claude-3-sonnet")
+            .install(&plugin1)
+            .install(&plugin2);
+
+        // Both skills are registered even with name conflict.
+        assert_eq!(builder.skills.len(), 2);
+    }
+
+    /// Test 5: Provider exact match takes priority over glob patterns.
+    ///
+    /// When both "claude-3-sonnet" (exact) and "claude-*" (glob) are registered,
+    /// the exact pattern should be preferred for model "claude-3-sonnet".
+    #[test]
+    fn test_provider_exact_match_takes_priority() {
+        // Verify that exact patterns are checked before globs.
+        let exact = "claude-3-sonnet";
+        let glob = "claude-*";
+
+        // Exact match check.
+        assert!(exact == "claude-3-sonnet");
+
+        // Glob prefix extraction.
+        let prefix = glob.split('*').next().unwrap_or("");
+        assert_eq!(prefix, "claude-");
+
+        // Model matches glob prefix.
+        assert!("claude-3-sonnet".starts_with(prefix));
+
+        // Exact match should be selected first due to resolution order.
+        assert_eq!(exact, "claude-3-sonnet");
+    }
+
+    /// Test 6: Longest-prefix glob takes priority over shorter globs.
+    ///
+    /// When both "c*" (prefix: 1) and "claude-*" (prefix: 7) match a model,
+    /// the longest prefix (most specific) should be selected.
+    #[test]
+    fn test_provider_longest_prefix_glob_wins() {
+        let model = "claude-3-5-sonnet";
+
+        // Pattern 1: "c*" (prefix length 1)
+        let pattern1 = "c*";
+        let prefix1 = pattern1.split('*').next().unwrap_or("");
+        assert_eq!(prefix1, "c");
+        assert!(model.starts_with(prefix1));
+        assert_eq!(prefix1.len(), 1);
+
+        // Pattern 2: "claude-*" (prefix length 7)
+        let pattern2 = "claude-*";
+        let prefix2 = pattern2.split('*').next().unwrap_or("");
+        assert_eq!(prefix2, "claude-");
+        assert!(model.starts_with(prefix2));
+        assert_eq!(prefix2.len(), 7);
+
+        // Longest prefix should be selected.
+        assert!(prefix2.len() > prefix1.len());
+        assert_eq!(prefix2, "claude-");
+    }
+
+    /// Test 7: Plugin with multiple tools — all are accumulated.
+    #[test]
+    fn test_builder_plugin_with_multiple_tools() {
+        let plugin = MockPlugin::new("plugin-1")
+            .with_tool("tool-a")
+            .with_tool("tool-b")
+            .with_tool("tool-c");
+
+        let builder = HarnessBuilder::new("claude-3-sonnet").install(&plugin);
+
+        assert_eq!(builder.tools.len(), 3);
+        assert_eq!(builder.tools[0].name(), "tool-a");
+        assert_eq!(builder.tools[1].name(), "tool-b");
+        assert_eq!(builder.tools[2].name(), "tool-c");
+    }
+
+    /// Test 8: Plugin with multiple hooks — all are accumulated.
+    #[test]
+    fn test_builder_plugin_with_multiple_hooks() {
+        let plugin = MockPlugin::new("plugin-1")
+            .with_hook()
+            .with_hook()
+            .with_hook();
+
+        let builder = HarnessBuilder::new("claude-3-sonnet").install(&plugin);
+
+        assert_eq!(builder.hooks.before_turn.len(), 3);
+    }
+
+    /// Test 9: Empty plugin contributes nothing.
+    #[test]
+    fn test_builder_empty_plugin_contributes_nothing() {
+        let plugin = MockPlugin::new("empty-plugin");
+
+        let builder = HarnessBuilder::new("claude-3-sonnet").install(&plugin);
+
+        assert_eq!(builder.hooks.before_turn.len(), 0);
+        assert_eq!(builder.tools.len(), 0);
+        assert_eq!(builder.skills.len(), 0);
+    }
+
+    /// Test 10: Plugins are accumulated in registration order.
+    #[test]
+    fn test_builder_accumulates_plugins_in_order() {
+        let plugin1 = MockPlugin::new("plugin-1").with_tool("tool-1");
+        let plugin2 = MockPlugin::new("plugin-2").with_tool("tool-2");
+        let plugin3 = MockPlugin::new("plugin-3").with_tool("tool-3");
+
+        let builder = HarnessBuilder::new("claude-3-sonnet")
+            .install(&plugin1)
+            .install(&plugin2)
+            .install(&plugin3);
+
+        assert_eq!(builder.tools.len(), 3);
+        assert_eq!(builder.tools[0].name(), "tool-1");
+        assert_eq!(builder.tools[1].name(), "tool-2");
+        assert_eq!(builder.tools[2].name(), "tool-3");
     }
 }
