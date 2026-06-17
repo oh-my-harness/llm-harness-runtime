@@ -172,7 +172,7 @@ Runtime 支持用户注入多个 hook 的组合（CompositeHook 模式）。三�
 |------|------|------|
 | **All-Execute（观测型）** | 所有 hook 依次执行，返回第一个 hook 的结果 | `BeforeProviderRequestHook`、`AfterProviderResponseHook`、`AfterTurnHook` |
 | **First-Non-Allow（决策型）** | 顺序执行，第一个返回 `Allow` 以外的决策立即短路 | `BeforeToolCallHook`（返回 `Allow` / `Deny` / `Modify`） |
-| **Last-Non-Passthrough（修改型）** | 按序执行，每个 hook 可修改数据，返回最后一个非 passthrough 的结果 | `AfterToolCallHook`（返回 `Passthrough` / `Modify`） |
+| **Chain（链式修改型）** | 按序执行，每个 hook 看到前一个 hook 的修改结果；后续 hook 基于累积的修改继续处理 | `AfterToolCallHook`（返回 `Passthrough` / `Patch`） |
 
 不同类型的 hook 合成方式不同，实现时严格遵守对应语义。
 

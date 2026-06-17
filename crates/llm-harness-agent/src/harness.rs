@@ -56,48 +56,54 @@ pub struct HarnessState {
 
 // ── HarnessHooks ──────────────────────────────────────────────────────────────
 
-/// Collection of optional hooks injected into an [`AgentHarness`].
+/// Collection of hooks injected into an [`AgentHarness`].
+///
+/// Multiple hooks of the same trait accumulate in registration order and are
+/// composed at harness build time via `Composite*` wrappers from `llm-harness-loop`.
 #[derive(Clone)]
 pub struct HarnessHooks {
     /// Called once at the start of a `prompt()` run.
-    pub before_run: Option<Arc<dyn BeforeRunHook>>,
+    pub before_run: Vec<Arc<dyn BeforeRunHook>>,
     /// Called at the start of each turn.
-    pub before_turn: Option<Arc<dyn BeforeTurnHook>>,
+    pub before_turn: Vec<Arc<dyn BeforeTurnHook>>,
     /// Called at the end of each turn (before flush).
-    pub after_turn: Option<Arc<dyn AfterTurnHook>>,
+    pub after_turn: Vec<Arc<dyn AfterTurnHook>>,
     /// Called before each tool execution.
-    pub before_tool_call: Option<Arc<dyn BeforeToolCallHook>>,
+    pub before_tool_call: Vec<Arc<dyn BeforeToolCallHook>>,
     /// Called after each tool execution.
-    pub after_tool_call: Option<Arc<dyn AfterToolCallHook>>,
+    pub after_tool_call: Vec<Arc<dyn AfterToolCallHook>>,
     /// Called before each LLM request to transform the context.
-    pub transform_context: Option<Arc<dyn TransformContextHook>>,
+    pub transform_context: Vec<Arc<dyn TransformContextHook>>,
     /// Called after each turn to configure the next turn.
-    pub prepare_next_turn: Option<Arc<dyn PrepareNextTurnHook>>,
+    pub prepare_next_turn: Vec<Arc<dyn PrepareNextTurnHook>>,
     /// Called when LLM stops naturally to decide whether to continue.
-    pub should_stop: Option<Arc<dyn ShouldStopHook>>,
+    pub should_stop: Vec<Arc<dyn ShouldStopHook>>,
     /// Called before each LLM provider request.
-    pub before_provider_request: Option<Arc<dyn BeforeProviderRequestHook>>,
+    pub before_provider_request: Vec<Arc<dyn BeforeProviderRequestHook>>,
     /// Called after each LLM provider response.
-    pub after_provider_response: Option<Arc<dyn AfterProviderResponseHook>>,
+    pub after_provider_response: Vec<Arc<dyn AfterProviderResponseHook>>,
     /// Called before compaction to decide whether to proceed.
-    pub before_compact: Option<Arc<dyn BeforeCompactHook>>,
+    pub before_compact: Vec<Arc<dyn BeforeCompactHook>>,
+    /// Authentication hooks (last registered wins at build time).
+    pub auth: Vec<Arc<dyn AuthHook>>,
 }
 
 impl HarnessHooks {
     /// All hooks absent (default state).
     pub fn none() -> Self {
         Self {
-            before_run: None,
-            before_turn: None,
-            after_turn: None,
-            before_tool_call: None,
-            after_tool_call: None,
-            transform_context: None,
-            prepare_next_turn: None,
-            should_stop: None,
-            before_provider_request: None,
-            after_provider_response: None,
-            before_compact: None,
+            before_run: vec![],
+            before_turn: vec![],
+            after_turn: vec![],
+            before_tool_call: vec![],
+            after_tool_call: vec![],
+            transform_context: vec![],
+            prepare_next_turn: vec![],
+            should_stop: vec![],
+            before_provider_request: vec![],
+            after_provider_response: vec![],
+            before_compact: vec![],
+            auth: vec![],
         }
     }
 }
@@ -1132,9 +1138,10 @@ impl AgentHarness {
         &self,
         mut initial: Vec<AgentMessage>,
     ) -> Result<Vec<AgentMessage>, HarnessError> {
-        let Some(ref hook) = self.hooks.before_run else {
+        if self.hooks.before_run.is_empty() {
             return Ok(initial);
-        };
+        }
+        let hook = &self.hooks.before_run[0];
         let (skills, templates) = {
             let inner = self.inner.lock().unwrap();
             let snames: Vec<String> = inner.skills.iter().map(|s| s.name.clone()).collect();
@@ -1192,8 +1199,8 @@ impl AgentHarness {
         let retry = inner.retry.clone();
 
         // Wrap tools with HookedTool if needed.
-        let before = self.hooks.before_tool_call.clone();
-        let after = self.hooks.after_tool_call.clone();
+        let before = self.hooks.before_tool_call.last().cloned();
+        let after = self.hooks.after_tool_call.last().cloned();
         let tools: Vec<Arc<dyn Tool>> = if before.is_some() || after.is_some() {
             st.tools
                 .clone()
@@ -1213,7 +1220,7 @@ impl AgentHarness {
         // Build the default prepare_next_turn wrapper.
         let prepare_next_turn: Arc<dyn PrepareNextTurnHook> = Arc::new(DefaultPrepareNextTurn {
             inner: self.inner.clone(),
-            user_hook: self.hooks.prepare_next_turn.clone(),
+            user_hook: self.hooks.prepare_next_turn.last().cloned(),
         });
 
         LoopConfig {
@@ -1228,11 +1235,11 @@ impl AgentHarness {
             abort,
             stream_options: self.stream_options.clone(),
             convert_to_llm: self.convert_to_llm.clone(),
-            transform_context: self.hooks.transform_context.clone(),
+            transform_context: self.hooks.transform_context.last().cloned(),
             prepare_next_turn: Some(prepare_next_turn),
-            should_stop: self.hooks.should_stop.clone(),
-            before_provider_request: self.hooks.before_provider_request.clone(),
-            after_provider_response: self.hooks.after_provider_response.clone(),
+            should_stop: self.hooks.should_stop.last().cloned(),
+            before_provider_request: self.hooks.before_provider_request.last().cloned(),
+            after_provider_response: self.hooks.after_provider_response.last().cloned(),
             auth: self.auth.clone(),
             steer_rx: Some(steer_rx),
             follow_up_rx: Some(follow_up_rx),
@@ -1310,7 +1317,8 @@ impl AgentHarness {
                     self.emit(AgentHarnessEvent::Agent(event));
                 }
                 AgentEvent::TurnStart { index } => {
-                    if let Some(ref h) = self.hooks.before_turn {
+                    if !self.hooks.before_turn.is_empty() {
+                        let h = &self.hooks.before_turn[0];
                         let snapshot = {
                             let inner = self.inner.lock().unwrap();
                             TurnSnapshot {
@@ -1414,7 +1422,8 @@ impl AgentHarness {
                 }
                 AgentEvent::TurnEnd { index, .. } => {
                     // Call after_turn hook before flush.
-                    if let Some(ref h) = self.hooks.after_turn {
+                    if !self.hooks.after_turn.is_empty() {
+                        let h = &self.hooks.after_turn[0];
                         h.after_turn(AfterTurnCtx {
                             turn_index: *index,
                             new_messages: &turn_messages,
@@ -1463,7 +1472,8 @@ impl AgentHarness {
 
         // before_compact hook is called BEFORE prepare_compaction so that
         // BeforeCompactDecision::Override can bypass the token-threshold check entirely.
-        if let Some(ref h) = self.hooks.before_compact {
+        if !self.hooks.before_compact.is_empty() {
+            let h = &self.hooks.before_compact[0];
             let built = self.session.build_context().await?;
             let estimated_tokens: usize = path
                 .iter()
@@ -2010,7 +2020,7 @@ mod tests {
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("hello")]));
         let env = Arc::new(NoOpEnv);
         let mut opts = AgentHarnessOptions::new("test-model");
-        opts.hooks.before_compact = Some(Arc::new(BadOverrideHook));
+        opts.hooks.before_compact = vec![Arc::new(BadOverrideHook)];
         let h = futures::executor::block_on(AgentHarness::new_in_memory(client, env, opts));
 
         h.prompt("hello").await.unwrap();

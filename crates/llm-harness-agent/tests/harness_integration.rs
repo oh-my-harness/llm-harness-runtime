@@ -334,7 +334,7 @@ async fn compaction_via_hook_override_inserts_summary() {
     let env = Arc::new(NoOpEnv);
     let mut opts = AgentHarnessOptions::new("test-model");
     opts.hooks = HarnessHooks {
-        before_compact: Some(hook.clone()),
+        before_compact: vec![hook.clone()],
         ..HarnessHooks::none()
     };
     let h = AgentHarness::new_in_memory(client, env, opts).await;
