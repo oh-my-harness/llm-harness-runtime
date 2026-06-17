@@ -8,8 +8,8 @@
 //! `llm_harness_agent::AgentHarness`. Use this crate directly when building a custom
 //! runtime, testing loop behavior, or integrating at the framework layer.
 
-pub mod config;
 pub mod composite;
+pub mod config;
 pub mod convert;
 pub(crate) mod dispatch;
 pub mod hooked_tool;

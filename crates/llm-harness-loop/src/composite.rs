@@ -3,8 +3,11 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use llm_harness_types::{
     AfterProviderResponseHook, AfterToolCallCtx, AfterToolCallDecision, AfterToolCallHook,
-    AfterTurnCtx, AfterTurnHook, BeforeProviderRequestHook, BeforeToolCallCtx,
-    BeforeToolCallDecision, BeforeToolCallHook, ProviderResponseInfo, StreamOptions,
+    AfterTurnCtx, AfterTurnHook, AgentContext, AgentError, AuthHook, AuthInfo, BeforeCompactCtx,
+    BeforeCompactDecision, BeforeCompactHook, BeforeProviderRequestHook, BeforeRunCtx,
+    BeforeRunHook, BeforeRunResult, BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook,
+    BeforeTurnCtx, BeforeTurnHook, PrepareNextTurnCtx, PrepareNextTurnHook, ProviderResponseInfo,
+    ShouldStopCtx, ShouldStopHook, StreamOptions, TransformContextHook,
 };
 
 /// Chains multiple `AfterProviderResponseHook` implementations (all-execute semantics).
@@ -31,9 +34,10 @@ impl AfterProviderResponseHook for CompositeAfterProviderResponseHook {
     }
 }
 
-/// Chains multiple `AfterToolCallHook` implementations (last-non-passthrough semantics).
+/// Chains multiple `AfterToolCallHook` implementations (chain semantics).
 ///
-/// Hooks execute in order; each sees the original ctx. The last `Patch` decision wins.
+/// Each hook sees the result from the previous hook's patch applied.
+/// Patches are accumulated and applied in order.
 pub struct CompositeAfterToolCallHook {
     hooks: Vec<Arc<dyn AfterToolCallHook>>,
 }
@@ -51,9 +55,10 @@ impl AfterToolCallHook for CompositeAfterToolCallHook {
         ctx: AfterToolCallCtx<'a>,
     ) -> BoxFuture<'a, AfterToolCallDecision> {
         Box::pin(async move {
-            let mut decision = AfterToolCallDecision::Passthrough;
+            let mut final_decision = AfterToolCallDecision::Passthrough;
+
             for hook in &self.hooks {
-                // Reconstruct ctx for each hook (AfterToolCallCtx is not Clone).
+                // Each hook sees the original result or the last decision applied.
                 let hook_ctx = AfterToolCallCtx {
                     assistant_message: ctx.assistant_message,
                     tool_use_id: ctx.tool_use_id,
@@ -62,12 +67,15 @@ impl AfterToolCallHook for CompositeAfterToolCallHook {
                     result: ctx.result,
                     turn_index: ctx.turn_index,
                 };
-                let d = hook.on_complete(hook_ctx).await;
-                if !matches!(d, AfterToolCallDecision::Passthrough) {
-                    decision = d;
+
+                let decision = hook.on_complete(hook_ctx).await;
+
+                if let AfterToolCallDecision::Patch(_) = decision {
+                    final_decision = decision;
                 }
             }
-            decision
+
+            final_decision
         })
     }
 }
@@ -160,6 +168,267 @@ impl BeforeProviderRequestHook for CompositeBeforeProviderRequestHook {
     }
 }
 
+/// Chains multiple `BeforeRunHook` implementations (all-execute semantics).
+///
+/// All hooks execute in registration order. Additional messages accumulate;
+/// system_prompt from the last non-None result wins.
+pub struct CompositeBeforeRunHook {
+    hooks: Vec<Arc<dyn BeforeRunHook>>,
+}
+
+impl CompositeBeforeRunHook {
+    /// Create a composite from a list of hooks.
+    pub fn new(hooks: Vec<Arc<dyn BeforeRunHook>>) -> Self {
+        Self { hooks }
+    }
+}
+
+impl BeforeRunHook for CompositeBeforeRunHook {
+    fn before_run<'a>(
+        &'a self,
+        ctx: BeforeRunCtx<'a>,
+    ) -> BoxFuture<'a, Result<BeforeRunResult, AgentError>> {
+        Box::pin(async move {
+            let mut accumulated_messages = Vec::new();
+            let mut system_prompt_override = None;
+
+            for hook in &self.hooks {
+                let result = hook
+                    .before_run(BeforeRunCtx {
+                        prompt_text: ctx.prompt_text,
+                        initial_messages: ctx.initial_messages,
+                        system_prompt: ctx.system_prompt,
+                        resources: ctx.resources,
+                    })
+                    .await?;
+
+                accumulated_messages.extend(result.additional_messages);
+                if let Some(sp) = result.system_prompt {
+                    system_prompt_override = Some(sp);
+                }
+            }
+
+            Ok(BeforeRunResult {
+                additional_messages: accumulated_messages,
+                system_prompt: system_prompt_override,
+            })
+        })
+    }
+}
+
+/// Chains multiple `BeforeTurnHook` implementations (all-execute semantics).
+///
+/// All hooks execute in registration order (observing only, no return value).
+pub struct CompositeBeforeTurnHook {
+    hooks: Vec<Arc<dyn BeforeTurnHook>>,
+}
+
+impl CompositeBeforeTurnHook {
+    /// Create a composite from a list of hooks.
+    pub fn new(hooks: Vec<Arc<dyn BeforeTurnHook>>) -> Self {
+        Self { hooks }
+    }
+}
+
+impl BeforeTurnHook for CompositeBeforeTurnHook {
+    fn before_turn<'a>(&'a self, ctx: BeforeTurnCtx<'a>) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            for hook in &self.hooks {
+                let hook_ctx = BeforeTurnCtx {
+                    turn_index: ctx.turn_index,
+                    snapshot: ctx.snapshot,
+                };
+                hook.before_turn(hook_ctx).await;
+            }
+        })
+    }
+}
+
+/// Chains multiple `TransformContextHook` implementations (chain semantics).
+///
+/// Each hook sees the result from the previous hook's transformation.
+pub struct CompositeTransformContextHook {
+    hooks: Vec<Arc<dyn TransformContextHook>>,
+}
+
+impl CompositeTransformContextHook {
+    /// Create a composite from a list of hooks.
+    pub fn new(hooks: Vec<Arc<dyn TransformContextHook>>) -> Self {
+        Self { hooks }
+    }
+}
+
+impl TransformContextHook for CompositeTransformContextHook {
+    fn transform<'a>(
+        &'a self,
+        mut ctx: AgentContext,
+    ) -> BoxFuture<'a, Result<AgentContext, AgentError>> {
+        Box::pin(async move {
+            for hook in &self.hooks {
+                ctx = hook.transform(ctx).await?;
+            }
+            Ok(ctx)
+        })
+    }
+}
+
+/// Chains multiple `PrepareNextTurnHook` implementations (field-merge semantics).
+///
+/// All hooks execute in order. Each field takes the last non-None value.
+pub struct CompositePreparePrepareNextTurnHook {
+    hooks: Vec<Arc<dyn PrepareNextTurnHook>>,
+}
+
+impl CompositePreparePrepareNextTurnHook {
+    /// Create a composite from a list of hooks.
+    pub fn new(hooks: Vec<Arc<dyn PrepareNextTurnHook>>) -> Self {
+        Self { hooks }
+    }
+}
+
+impl PrepareNextTurnHook for CompositePreparePrepareNextTurnHook {
+    fn prepare<'a>(
+        &'a self,
+        ctx: PrepareNextTurnCtx<'a>,
+    ) -> BoxFuture<'a, Result<llm_harness_types::NextTurnDirective, AgentError>> {
+        Box::pin(async move {
+            let mut directive = llm_harness_types::NextTurnDirective {
+                context: None,
+                model: None,
+                thinking_level: None,
+                tools: None,
+                active_tools: None,
+            };
+
+            for hook in &self.hooks {
+                let result = hook
+                    .prepare(PrepareNextTurnCtx {
+                        turn_index: ctx.turn_index,
+                        last_message: ctx.last_message,
+                        last_tool_results: ctx.last_tool_results,
+                    })
+                    .await?;
+                if result.context.is_some() {
+                    directive.context = result.context;
+                }
+                if result.model.is_some() {
+                    directive.model = result.model;
+                }
+                if result.thinking_level.is_some() {
+                    directive.thinking_level = result.thinking_level;
+                }
+                if result.tools.is_some() {
+                    directive.tools = result.tools;
+                }
+                if result.active_tools.is_some() {
+                    directive.active_tools = result.active_tools;
+                }
+            }
+
+            Ok(directive)
+        })
+    }
+}
+
+/// Chains multiple `ShouldStopHook` implementations (any-true short-circuit semantics).
+///
+/// Hooks execute in order; returns `true` if any hook returns `true`.
+pub struct CompositeShouldStopHook {
+    hooks: Vec<Arc<dyn ShouldStopHook>>,
+}
+
+impl CompositeShouldStopHook {
+    /// Create a composite from a list of hooks.
+    pub fn new(hooks: Vec<Arc<dyn ShouldStopHook>>) -> Self {
+        Self { hooks }
+    }
+}
+
+impl ShouldStopHook for CompositeShouldStopHook {
+    fn should_stop<'a>(&'a self, ctx: ShouldStopCtx<'a>) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            for hook in &self.hooks {
+                let hook_ctx = ShouldStopCtx {
+                    last_assistant: ctx.last_assistant,
+                    stop_reason: ctx.stop_reason,
+                    turn_index: ctx.turn_index,
+                };
+                if hook.should_stop(hook_ctx).await {
+                    return true;
+                }
+            }
+            false
+        })
+    }
+}
+
+/// Chains multiple `BeforeCompactHook` implementations (first-non-proceed short-circuit semantics).
+///
+/// Hooks execute in order; the first `Skip` or `Override` decision short-circuits.
+pub struct CompositeBeforeCompactHook {
+    hooks: Vec<Arc<dyn BeforeCompactHook>>,
+}
+
+impl CompositeBeforeCompactHook {
+    /// Create a composite from a list of hooks.
+    pub fn new(hooks: Vec<Arc<dyn BeforeCompactHook>>) -> Self {
+        Self { hooks }
+    }
+}
+
+impl BeforeCompactHook for CompositeBeforeCompactHook {
+    fn before_compact<'a>(
+        &'a self,
+        ctx: BeforeCompactCtx<'a>,
+    ) -> BoxFuture<'a, BeforeCompactDecision> {
+        Box::pin(async move {
+            for hook in &self.hooks {
+                let hook_ctx = BeforeCompactCtx {
+                    estimated_tokens: ctx.estimated_tokens,
+                    messages: ctx.messages,
+                };
+                let decision = hook.before_compact(hook_ctx).await;
+                if !matches!(decision, BeforeCompactDecision::Proceed) {
+                    return decision; // short-circuit on first non-proceed
+                }
+            }
+            BeforeCompactDecision::Proceed
+        })
+    }
+}
+
+/// Chains multiple `AuthHook` implementations (last-wins semantics).
+///
+/// Hooks execute in order; the last non-error result wins.
+pub struct CompositeAuthHook {
+    hooks: Vec<Arc<dyn AuthHook>>,
+}
+
+impl CompositeAuthHook {
+    /// Create a composite from a list of hooks.
+    pub fn new(hooks: Vec<Arc<dyn AuthHook>>) -> Self {
+        Self { hooks }
+    }
+}
+
+impl AuthHook for CompositeAuthHook {
+    fn resolve<'a>(&'a self) -> BoxFuture<'a, Result<AuthInfo, AgentError>> {
+        Box::pin(async move {
+            let mut last_result = None;
+            for hook in &self.hooks {
+                match hook.resolve().await {
+                    Ok(info) => last_result = Some(Ok(info)),
+                    Err(e) => last_result = Some(Err(e)),
+                }
+            }
+            last_result.unwrap_or(Ok(AuthInfo {
+                api_key: None,
+                headers: vec![],
+            }))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +465,55 @@ mod tests {
     fn composite_before_provider_request_hook_is_object_safe() {
         fn _accept(_: &dyn BeforeProviderRequestHook) {}
         let composite = CompositeBeforeProviderRequestHook::new(vec![]);
+        _accept(&composite);
+    }
+
+    #[test]
+    fn composite_before_run_hook_is_object_safe() {
+        fn _accept(_: &dyn BeforeRunHook) {}
+        let composite = CompositeBeforeRunHook::new(vec![]);
+        _accept(&composite);
+    }
+
+    #[test]
+    fn composite_before_turn_hook_is_object_safe() {
+        fn _accept(_: &dyn BeforeTurnHook) {}
+        let composite = CompositeBeforeTurnHook::new(vec![]);
+        _accept(&composite);
+    }
+
+    #[test]
+    fn composite_transform_context_hook_is_object_safe() {
+        fn _accept(_: &dyn TransformContextHook) {}
+        let composite = CompositeTransformContextHook::new(vec![]);
+        _accept(&composite);
+    }
+
+    #[test]
+    fn composite_prepare_next_turn_hook_is_object_safe() {
+        fn _accept(_: &dyn PrepareNextTurnHook) {}
+        let composite = CompositePreparePrepareNextTurnHook::new(vec![]);
+        _accept(&composite);
+    }
+
+    #[test]
+    fn composite_should_stop_hook_is_object_safe() {
+        fn _accept(_: &dyn ShouldStopHook) {}
+        let composite = CompositeShouldStopHook::new(vec![]);
+        _accept(&composite);
+    }
+
+    #[test]
+    fn composite_before_compact_hook_is_object_safe() {
+        fn _accept(_: &dyn BeforeCompactHook) {}
+        let composite = CompositeBeforeCompactHook::new(vec![]);
+        _accept(&composite);
+    }
+
+    #[test]
+    fn composite_auth_hook_is_object_safe() {
+        fn _accept(_: &dyn AuthHook) {}
+        let composite = CompositeAuthHook::new(vec![]);
         _accept(&composite);
     }
 }
