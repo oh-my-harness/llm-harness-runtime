@@ -91,62 +91,52 @@ Strong success criteria let the LLM loop independently. Weak criteria ("make it 
 
 ## 项目简介
 
-`llm-harness-runtime` 是 `llm-harness-core` 之上的平台层，定义框架扩展点（trait）并提供核心编排引擎。
+本仓库是 oh-my-harness 的主 monorepo，包含从 API 适配层到运行时基础设施的全部 crate。`llm-api-adapter` 作为独立 git repo 引用。
 
 **核心职责：**
-1. **Trait 定义**：`AuthHook`、`BudgetExceededHook`、`InfrastructureHook` 等框架扩展接口
-2. **核心编排**：`AgentHarness` 配置、`HarnessHooks` 组装、事件管道
-3. **基础设施接口**：文件系统、环境变量、CancellationToken 等运行时资源抽象
-
-不写具体的认证/预算/基础设施实现（用户自实现 trait）。
-
-## 工作流与决策
-
-### 范围边界
-
-**Runtime 提供（机制层）：**
-- Trait 声明与语义定义
-- CompositeHook 模式的三种合成语义
-- HarnessHooks 配置结构（11 个 hook 插槽）
-- TaskRunnerImpl 状态机（Pending→Running→Succeeded/Failed 等）
-- 单元测试（trait 实现示例，mock 对象）
-
-**业务层负责（策略层）：**
-- 具体 auth、budget、infrastructure provider（用户自实现 trait）
-- LlmClient 持有与实例化
-- AgentHarness 创建、hooks 组装、prompt() 驱动
-- 真实文件系统、环境变量、CancellationToken 的编排
+1. **类型与 trait 定义**：Hook trait、Tool trait、Session/Message 类型（`llm-harness-types`）
+2. **Agent loop 引擎**：ReAct 循环、工具调度、streaming（`llm-harness-loop`）
+3. **高层 agent 抽象**：`AgentHarness`、session 树、compaction、skills（`llm-harness-agent`）
+4. **运行时基础设施**：CompositeHook、ToolRegistry、TaskRunner、Sandbox、MCP、Audit、Auth（`llm-harness-runtime` 及各 `-runtime-*` crate）
 
 ## Crate 结构与依赖规则
 
 ```
-llm-harness-runtime/
-├── Cargo.toml               (workspace)
+llm-harness-runtime/          ← 本仓库根
+├── Cargo.toml                (workspace)
 ├── crates/
-│   ├── llm-harness-traits/  (trait 声明，纯定义)
-│   ├── auth/                (AuthHook + EnvAuthHook, FileAuthHook 示例)
-│   ├── budget/              (BudgetExceededHook + BudgetControlAdapter)
-│   ├── infrastructure/      (InfrastructureHook + ExecutionEnv)
-│   └── orchestration/       (AgentHarness + HarnessHooks + 事件管道)
+│   ├── llm-harness-types/    (Hook/Tool trait + 所有共享类型)
+│   ├── llm-harness-loop/     (agent loop 引擎)
+│   ├── llm-harness-agent/    (AgentHarness, Session, skills)
+│   ├── llm-harness-runtime/  (CompositeHook, ToolRegistry, TaskRunner)
+│   ├── llm-harness-runtime-sandbox-os/
+│   ├── llm-harness-runtime-sandbox-bwrap/
+│   ├── llm-harness-runtime-sandbox-seatbelt/
+│   ├── llm-harness-runtime-auth/
+│   ├── llm-harness-runtime-mcp/
+│   ├── llm-harness-runtime-audit-jsonl/
+│   └── llm-harness-runtime-trace-otel/
 ├── docs/
-│   └── runtime-v0.2-design.md       (总体设计决策)
-│   └── superpowers/plans/*.md       (分阶段实现计划)
 └── CLAUDE.md
+
+外部依赖（独立 git repo）：
+  llm_adapter  ← git: github.com/oh-my-harness/llm-api-adapter
 ```
 
 依赖方向（A → B 表示 A 依赖 B）：
 
 ```
-orchestration → auth, budget, infrastructure → llm-harness-traits
-auth, budget, infrastructure → llm-harness-core::types
-orchestration → llm-harness-core (loop, harness)
+llm-harness-runtime-* → llm-harness-runtime
+llm-harness-runtime   → llm-harness-agent
+llm-harness-agent     → llm-harness-loop
+llm-harness-loop      → llm-harness-types, llm_adapter
+llm-harness-types     → (无内部依赖)
 ```
 
 **硬性规则：**
-- `llm-harness-traits` 不依赖任何外部 crate，保持纯 trait 声明。
-- auth / budget / infrastructure 不相互依赖（允许用户单独实现一个 hook）。
-- 所有 hook 实现遵循 `llm-harness-core` 的语义（如 `AuthHook::resolve()` 返回 `BoxFuture`）。
-- 违反依赖方向或语义的修改不允许。
+- `llm-harness-types` 不依赖其他内部 crate，保持纯类型/trait 声明。
+- `llm-harness-runtime-*` 各 crate 不相互依赖（可单独使用）。
+- 依赖方向不允许反转（下层不依赖上层）。
 
 ## 设计文档
 
@@ -247,8 +237,7 @@ pub struct HarnessHooks {
 每次实现完成后，在提交前自行检查以下维度。有 ❌ 项自行修复，有 ⚠️ 项列出后交用户判断：
 
 **架构合规**
-- ❌ trait 声明是否引入了外部 crate 依赖（应仅依赖 `llm-harness-core::types`）？
-- ❌ Hook 实现是否违反了 trait 签名（如 `AuthHook::resolve()` 必须返回 `BoxFuture`）？
+- ❌ trait 声明是否引入了不必要的外部 crate 依赖（`llm-harness-types` 应保持纯类型层）？
 - ❌ CompositeHook 合成是否遵循了对应的语义（all-execute / first-non-allow / last-non-passthrough）？
 
 **代码质量**
