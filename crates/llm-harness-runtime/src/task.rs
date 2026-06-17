@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
-use llm_harness::{AgentHarness, AgentHarnessEvent, AgentHarnessOptions, HarnessHooks};
+use llm_harness_agent::{AgentHarness, AgentHarnessEvent, AgentHarnessOptions, HarnessHooks};
 use llm_harness_loop::LlmClient;
 use llm_harness_types::{AgentEvent, ContentBlock, EntryId};
 use serde_json::Value;

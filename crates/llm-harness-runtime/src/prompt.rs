@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use futures::future::BoxFuture;
-use llm_harness::PromptTemplate;
+use llm_harness_agent::PromptTemplate;
 
 use crate::error::Result;
 
@@ -145,7 +145,7 @@ impl InMemoryPromptRegistry {
         let template = self
             .get(name)
             .ok_or_else(|| InvokeError::NotFound(name.to_string()))?;
-        Ok(llm_harness::invoke_template(&template, args))
+        Ok(llm_harness_agent::invoke_template(&template, args))
     }
 }
 
@@ -166,7 +166,7 @@ pub enum InvokeError {
 mod tests {
     use super::*;
     #[cfg(test)]
-    use llm_harness::invoke_template;
+    use llm_harness_agent::invoke_template;
 
     #[test]
     fn compile_basic_template() {

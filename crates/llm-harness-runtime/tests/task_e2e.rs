@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use llm_harness::HarnessHooks;
+use llm_harness_agent::HarnessHooks;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_runtime::TracingHookAdapter;
 use llm_harness_runtime::sandbox::{ResourceLimits, SandboxConfig};

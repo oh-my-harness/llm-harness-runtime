@@ -1,5 +1,10 @@
 [workspace]
 members = [
+    # core
+    "crates/llm-harness-types",
+    "crates/llm-harness-loop",
+    "crates/llm-harness-agent",
+    # runtime
     "crates/llm-harness-runtime",
     "crates/llm-harness-runtime-sandbox-os",
     "crates/llm-harness-runtime-sandbox-bwrap",
@@ -17,21 +22,19 @@ version = "0.2.0"
 license = "MIT"
 
 [workspace.dependencies]
+# Core (within this workspace)
+llm-harness-types  = { path = "crates/llm-harness-types" }
+llm-harness-loop   = { path = "crates/llm-harness-loop" }
+llm-harness-agent  = { path = "crates/llm-harness-agent" }
 # Runtime (within this workspace)
 llm-harness-runtime = { path = "crates/llm-harness-runtime" }
 
-# Core — pin a specific commit for reproducibility.
-# For local development, override with path in .cargo/config.toml:
-#   [patch."https://github.com/oh-my-harness/llm-harness-core"]
-#   llm-harness       = { path = "../llm-harness-core/crates/llm-harness" }
-#   llm-harness-types = { path = "../llm-harness-core/crates/llm-harness-types" }
-#   llm-harness-loop  = { path = "../llm-harness-core/crates/llm-harness-loop" }
-llm-harness        = { git = "https://github.com/oh-my-harness/llm-harness-core", rev = "9ad7292c67c1d7828a907a7fd270a007b5d1f750" }
-llm-harness-types  = { git = "https://github.com/oh-my-harness/llm-harness-core", rev = "9ad7292c67c1d7828a907a7fd270a007b5d1f750" }
-llm-harness-loop   = { git = "https://github.com/oh-my-harness/llm-harness-core", rev = "9ad7292c67c1d7828a907a7fd270a007b5d1f750" }
+# API adapter — separate repo, referenced by local path
+llm_adapter        = { path = "../llm-api-adapter" }
 
 # Infrastructure
 anyhow             = "1"
+async-stream       = "0.3"
 async-trait        = "0.1"
 chrono             = { version = "0.4", features = ["serde"] }
 futures            = "0.3"
@@ -40,5 +43,7 @@ serde_json         = "1"
 sha2               = "0.10"
 thiserror          = "2"
 tokio              = { version = "1", features = ["sync"] }
+tokio-stream       = "0.1"
 tokio-util         = { version = "0.7" }
 uuid               = { version = "1", features = ["v4", "v7"] }
+tempfile           = "3"

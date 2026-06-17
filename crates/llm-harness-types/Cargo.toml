@@ -1,0 +1,16 @@
+[package]
+name    = "llm-harness-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace     = true
+chrono.workspace     = true
+futures.workspace    = true
+serde.workspace      = true
+serde_json.workspace = true
+thiserror.workspace  = true
+tokio.workspace      = true
+tokio-util.workspace = true
+uuid.workspace       = true
