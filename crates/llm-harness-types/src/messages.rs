@@ -38,18 +38,24 @@ pub struct AssistantMessage {
     /// 消息内容块列表（含 Text、Thinking、ToolUse 等）。
     pub content: Vec<ContentBlock>,
     /// LLM 停止生成的原因。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<StopReason>,
     /// 消息创建时间。
     pub timestamp: DateTime<Utc>,
     /// 生成此消息的 LLM provider 名（如 `"anthropic"`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// 使用的 API 类型（如 `"messages"`、`"chat"`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
     /// 使用的模型 ID。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// 本次调用的 token 用量；compaction 估算依赖此字段。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsage>,
     /// LLM 返回错误时保存的错误文本快照。
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
 }
 
@@ -189,5 +195,46 @@ mod tests {
             cache_creation_tokens: 10,
         };
         assert_eq!(u.total_tokens(), 180);
+    }
+
+    #[test]
+    fn assistant_message_none_fields_omitted_in_json() {
+        let msg = AssistantMessage {
+            content: vec![text_block("hi")],
+            stop_reason: None,
+            timestamp: chrono::Utc::now(),
+            provider: None,
+            api: None,
+            model: None,
+            usage: None,
+            error_message: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        // 逐字段断言 None 值被省略，而非用 "null" 子串匹配（防误报）
+        assert!(
+            !json.contains(r#""stop_reason""#),
+            "stop_reason should be omitted: {json}"
+        );
+        assert!(
+            !json.contains(r#""provider""#),
+            "provider should be omitted: {json}"
+        );
+        assert!(!json.contains(r#""api""#), "api should be omitted: {json}");
+        assert!(
+            !json.contains(r#""model""#),
+            "model should be omitted: {json}"
+        );
+        assert!(
+            !json.contains(r#""usage""#),
+            "usage should be omitted: {json}"
+        );
+        assert!(
+            !json.contains(r#""error_message""#),
+            "error_message should be omitted: {json}"
+        );
+        // round-trip
+        let msg2: AssistantMessage = serde_json::from_str(&json).unwrap();
+        assert!(msg2.stop_reason.is_none());
+        assert!(msg2.provider.is_none());
     }
 }
