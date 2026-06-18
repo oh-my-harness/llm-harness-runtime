@@ -27,6 +27,7 @@ pub enum ContentBlock {
         /// 思考内容。
         thinking: String,
         /// Anthropic 特有的内容签名；其他 provider 置 `None`。
+        #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
     /// 图片内容。
@@ -80,5 +81,25 @@ mod tests {
         let json = serde_json::to_string(&cb).unwrap();
         let cb2: ContentBlock = serde_json::from_str(&json).unwrap();
         assert!(matches!(cb2, ContentBlock::Thinking { signature: Some(s), .. } if s == "sig123"));
+    }
+
+    #[test]
+    fn content_block_serde_thinking_none_signature() {
+        let cb = ContentBlock::Thinking {
+            thinking: "some thought".into(),
+            signature: None,
+        };
+        let json = serde_json::to_string(&cb).unwrap();
+        let cb2: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(
+                cb2,
+                ContentBlock::Thinking {
+                    signature: None,
+                    ..
+                }
+            ),
+            "expected signature to round-trip as None, got: {json}"
+        );
     }
 }

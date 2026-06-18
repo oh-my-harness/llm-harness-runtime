@@ -163,7 +163,10 @@ impl MockResponse {
                     kind: llm_adapter::types::ContentKind::Text,
                 }),
                 Ok(StreamEvent::TextDelta { index: 0, text: t }),
-                Ok(StreamEvent::ContentStop { index: 0 }),
+                Ok(StreamEvent::ContentStop {
+                    index: 0,
+                    signature: None,
+                }),
                 Ok(StreamEvent::MessageStop {
                     stop_reason: StopReason::EndTurn,
                     usage: Usage::default(),
@@ -188,7 +191,10 @@ impl MockResponse {
                     index: 0,
                     arguments: args,
                 }),
-                Ok(StreamEvent::ContentStop { index: 0 }),
+                Ok(StreamEvent::ContentStop {
+                    index: 0,
+                    signature: None,
+                }),
                 Ok(StreamEvent::MessageStop {
                     stop_reason: StopReason::ToolUse,
                     usage: Usage::default(),

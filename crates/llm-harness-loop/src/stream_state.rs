@@ -13,6 +13,7 @@ pub(crate) struct StreamingState {
     pub model: String,
     text_blocks: HashMap<usize, String>,
     reasoning_blocks: HashMap<usize, String>,
+    reasoning_signatures: HashMap<usize, String>,
     // index → (id, name, accumulated_args)
     tool_blocks: HashMap<usize, (String, String, String)>,
     block_order: Vec<(usize, BlockKind)>,
@@ -31,6 +32,7 @@ impl StreamingState {
             model,
             text_blocks: Default::default(),
             reasoning_blocks: Default::default(),
+            reasoning_signatures: Default::default(),
             tool_blocks: Default::default(),
             block_order: vec![],
         }
@@ -108,7 +110,10 @@ impl StreamingState {
                     vec![]
                 }
             }
-            AdapterEvent::ContentStop { index } => {
+            AdapterEvent::ContentStop { index, signature } => {
+                if let Some(sig) = signature {
+                    self.reasoning_signatures.insert(index, sig);
+                }
                 if let Some((id, _, args)) = self.tool_blocks.get(&index) {
                     let (parsed, parse_error) = parse_tool_args(id, args);
                     let mut events = Vec::new();
@@ -170,9 +175,10 @@ impl StreamingState {
                 }
                 BlockKind::Reasoning => {
                     let thinking = self.reasoning_blocks.get(idx).cloned().unwrap_or_default();
+                    let signature = self.reasoning_signatures.get(idx).cloned();
                     ContentBlock::Thinking {
                         thinking,
-                        signature: None,
+                        signature,
                     }
                 }
                 BlockKind::Tool => {
@@ -314,7 +320,10 @@ mod tests {
             index: 0,
             arguments: r#"{"cmd":"ls"}"#.into(),
         });
-        let events = s.process(AdapterEvent::ContentStop { index: 0 });
+        let events = s.process(AdapterEvent::ContentStop {
+            index: 0,
+            signature: None,
+        });
         assert!(
             matches!(&events[0], AgentEvent::ToolCallEnd { tool_use_id, args }
                 if tool_use_id == "c1" && args["cmd"] == "ls")
@@ -335,7 +344,10 @@ mod tests {
             index: 0,
             arguments: r#"{"cmd":"ls""#.into(),
         });
-        let events = s.process(AdapterEvent::ContentStop { index: 0 });
+        let events = s.process(AdapterEvent::ContentStop {
+            index: 0,
+            signature: None,
+        });
 
         assert!(
             matches!(&events[0], AgentEvent::Error(AgentError::Internal(msg))
@@ -373,6 +385,205 @@ mod tests {
         if let AgentEvent::MessageEnd { message, .. } = msg_end.unwrap() {
             assert!(matches!(message.stop_reason, Some(StopReason::EndTurn)));
             assert_eq!(message.usage.as_ref().unwrap().input_tokens, 5);
+        }
+    }
+
+    #[test]
+    fn reasoning_signature_captured_in_final_message() {
+        let mut s = make_state();
+        s.process(AdapterEvent::ContentStart {
+            index: 0,
+            kind: ContentKind::Reasoning,
+        });
+        s.process(AdapterEvent::ReasoningDelta {
+            index: 0,
+            text: "I think therefore I am".into(),
+        });
+        s.process(AdapterEvent::ContentStop {
+            index: 0,
+            signature: Some("test-signature-abc".into()),
+        });
+        let events = s.process(AdapterEvent::MessageStop {
+            stop_reason: AdapterStop::EndTurn,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        });
+        let msg_end = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::MessageEnd { .. }))
+            .unwrap();
+        if let AgentEvent::MessageEnd { message, .. } = msg_end {
+            let thinking_block = message
+                .content
+                .iter()
+                .find(|cb| matches!(cb, ContentBlock::Thinking { .. }));
+            assert!(thinking_block.is_some(), "expected a Thinking block");
+            if let ContentBlock::Thinking { signature, .. } = thinking_block.unwrap() {
+                assert_eq!(signature.as_deref(), Some("test-signature-abc"));
+            }
+        }
+    }
+
+    #[test]
+    fn reasoning_without_signature_stays_none() {
+        let mut s = make_state();
+        s.process(AdapterEvent::ContentStart {
+            index: 0,
+            kind: ContentKind::Reasoning,
+        });
+        s.process(AdapterEvent::ReasoningDelta {
+            index: 0,
+            text: "thinking...".into(),
+        });
+        s.process(AdapterEvent::ContentStop {
+            index: 0,
+            signature: None,
+        });
+        let events = s.process(AdapterEvent::MessageStop {
+            stop_reason: AdapterStop::EndTurn,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        });
+        let msg_end = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::MessageEnd { .. }))
+            .unwrap();
+        if let AgentEvent::MessageEnd { message, .. } = msg_end {
+            let thinking_block = message
+                .content
+                .iter()
+                .find(|cb| matches!(cb, ContentBlock::Thinking { .. }));
+            assert!(thinking_block.is_some(), "expected a Thinking block");
+            if let ContentBlock::Thinking { signature, .. } = thinking_block.unwrap() {
+                assert!(signature.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_reasoning_blocks_with_distinct_signatures() {
+        let mut s = make_state();
+        // Block 0: thinking with signature
+        s.process(AdapterEvent::ContentStart {
+            index: 0,
+            kind: ContentKind::Reasoning,
+        });
+        s.process(AdapterEvent::ReasoningDelta {
+            index: 0,
+            text: "first thought".into(),
+        });
+        s.process(AdapterEvent::ContentStop {
+            index: 0,
+            signature: Some("sig-a".into()),
+        });
+        // Block 1: text (no signature)
+        s.process(AdapterEvent::ContentStart {
+            index: 1,
+            kind: ContentKind::Text,
+        });
+        s.process(AdapterEvent::TextDelta {
+            index: 1,
+            text: "hello".into(),
+        });
+        s.process(AdapterEvent::ContentStop {
+            index: 1,
+            signature: None,
+        });
+        // Block 2: thinking without signature
+        s.process(AdapterEvent::ContentStart {
+            index: 2,
+            kind: ContentKind::Reasoning,
+        });
+        s.process(AdapterEvent::ReasoningDelta {
+            index: 2,
+            text: "second thought".into(),
+        });
+        s.process(AdapterEvent::ContentStop {
+            index: 2,
+            signature: None,
+        });
+
+        let events = s.process(AdapterEvent::MessageStop {
+            stop_reason: AdapterStop::EndTurn,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        });
+        if let Some(AgentEvent::MessageEnd { message, .. }) = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::MessageEnd { .. }))
+        {
+            // Block 0: Thinking with signature
+            let block0 = &message.content[0];
+            if let ContentBlock::Thinking {
+                thinking,
+                signature,
+            } = block0
+            {
+                assert_eq!(thinking, "first thought");
+                assert_eq!(signature.as_deref(), Some("sig-a"));
+            } else {
+                panic!("expected Thinking block at index 0");
+            }
+            // Block 1: Text
+            assert!(matches!(&message.content[1], ContentBlock::Text { text } if text == "hello"));
+            // Block 2: Thinking without signature
+            let block2 = &message.content[2];
+            if let ContentBlock::Thinking {
+                thinking,
+                signature,
+            } = block2
+            {
+                assert_eq!(thinking, "second thought");
+                assert!(signature.is_none());
+            } else {
+                panic!("expected Thinking block at index 2");
+            }
+        } else {
+            panic!("expected MessageEnd event");
+        }
+    }
+
+    #[test]
+    fn non_reasoning_block_with_signature_is_ignored() {
+        // 防御性测试：若上游适配器对非推理块错误地提供了签名，不应崩溃或串扰。
+        let mut s = make_state();
+        s.process(AdapterEvent::ContentStart {
+            index: 0,
+            kind: ContentKind::Text,
+        });
+        s.process(AdapterEvent::TextDelta {
+            index: 0,
+            text: "ok".into(),
+        });
+        // 异常：文本块的 ContentStop 携带了签名
+        s.process(AdapterEvent::ContentStop {
+            index: 0,
+            signature: Some("bogus-sig".into()),
+        });
+        let events = s.process(AdapterEvent::MessageStop {
+            stop_reason: AdapterStop::EndTurn,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+        });
+        // 文本块不应受签名影响，签名被静默忽略
+        if let Some(AgentEvent::MessageEnd { message, .. }) = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::MessageEnd { .. }))
+        {
+            assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "ok"));
+            // 不 crash 即通过
         }
     }
 }
