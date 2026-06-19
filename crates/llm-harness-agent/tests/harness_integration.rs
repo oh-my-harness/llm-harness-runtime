@@ -153,7 +153,6 @@ impl BeforeCompactHook for OverrideCompactHook {
             first_kept_entry: first_kept,
             tokens_before: 1000,
             tokens_after: 100,
-            file_operations: vec![],
         };
         Box::pin(async move { BeforeCompactDecision::Override(result) })
     }
