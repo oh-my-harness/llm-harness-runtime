@@ -4,6 +4,7 @@ use chrono::Utc;
 use llm_harness_loop::LlmMessage;
 use llm_harness_loop::{ChatRequest, LlmClient, RequestContent};
 use llm_harness_types::*;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::ModelInfo;
 use crate::session::types::{CompactionEntry, SessionEntry, SessionEntryPayload};
@@ -49,6 +50,26 @@ Create a structured context checkpoint summary using this format:\n\
 - [File paths, function names, error messages to preserve]\n";
 
 // ── CompactionSettings ────────────────────────────────────────────────────────
+
+/// Whether a file was read or modified during the compacted period.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FileOpKind {
+    /// File was read.
+    Read,
+    /// File was created or modified.
+    Modify,
+}
+
+/// A file operation recorded for inclusion in the compaction summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileOperation {
+    /// Absolute path of the file.
+    pub path: PathBuf,
+    /// Whether the file was read or modified.
+    pub kind: FileOpKind,
+    /// Session entry ID at which this operation occurred.
+    pub at_entry: EntryId,
+}
 
 /// Configuration for the compaction subsystem.
 #[derive(Debug, Clone)]
@@ -398,7 +419,6 @@ pub async fn compact(
         first_kept_entry: preparation.cut_point,
         tokens_before: preparation.estimated_tokens,
         tokens_after,
-        file_operations: preparation.file_operations,
     })
 }
 
@@ -824,5 +844,24 @@ mod tests {
         assert!(text.contains("hello"));
         assert!(text.contains("[Assistant]"));
         assert!(text.contains("world"));
+    }
+
+    #[test]
+    fn file_op_kind_serde_roundtrip() {
+        let k = FileOpKind::Modify;
+        let json = serde_json::to_string(&k).unwrap();
+        let k2: FileOpKind = serde_json::from_str(&json).unwrap();
+        assert!(matches!(k2, FileOpKind::Modify));
+    }
+
+    #[test]
+    fn file_operation_fields() {
+        let op = FileOperation {
+            path: PathBuf::from("/foo/bar.rs"),
+            kind: FileOpKind::Read,
+            at_entry: EntryId::new(),
+        };
+        assert!(op.path.ends_with("bar.rs"));
+        assert!(matches!(op.kind, FileOpKind::Read));
     }
 }

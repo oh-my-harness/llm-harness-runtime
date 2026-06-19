@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::ModelInfo;
-use crate::compaction::{CompactionSettings, compact, prepare_compaction};
+use crate::compaction::{CompactionSettings, FileOperation, compact, prepare_compaction};
 use crate::session::{Session, SessionRepo, repo::InMemorySessionRepo, types::*};
 use crate::skills::{
     PromptTemplate, Skill, SkillDiagnostic, format_skill_invocation, invoke_template,
@@ -1528,7 +1528,7 @@ impl AgentHarness {
                     return Err(CompactionError::InsufficientTokens.into());
                 }
                 BeforeCompactDecision::Override(result) => {
-                    return self.apply_compaction_result(result, &path).await;
+                    return self.apply_compaction_result(result, vec![], &path).await;
                 }
                 BeforeCompactDecision::Proceed => {}
             }
@@ -1565,6 +1565,7 @@ impl AgentHarness {
         };
 
         let estimated_tokens = prep.estimated_tokens;
+        let file_operations = prep.file_operations.clone(); // clone so compact() still has access for summary
         self.emit(AgentHarnessEvent::CompactionStart { estimated_tokens });
 
         let result = compact(
@@ -1576,12 +1577,14 @@ impl AgentHarness {
                 .map(|a| a.as_ref() as &(dyn AuthHook + Send + Sync)),
         )
         .await?;
-        self.apply_compaction_result(result, &path).await
+        self.apply_compaction_result(result, file_operations, &path)
+            .await
     }
 
     async fn apply_compaction_result(
         &self,
         result: CompactionResult,
+        file_operations: Vec<FileOperation>,
         path: &[SessionEntry],
     ) -> Result<CompactionStats, HarnessError> {
         if !path.iter().any(|e| e.id == result.first_kept_entry) {
@@ -1595,10 +1598,10 @@ impl AgentHarness {
             .position(|e| e.id == result.first_kept_entry)
             .expect("first_kept_entry validated before apply_compaction_result");
 
-        let details = if result.file_operations.is_empty() {
+        let details = if file_operations.is_empty() {
             None
         } else {
-            serde_json::to_value(&result.file_operations).ok()
+            serde_json::to_value(&file_operations).ok()
         };
 
         let entry = CompactionEntry {
@@ -2049,7 +2052,6 @@ mod tests {
                         first_kept_entry: EntryId::new(),
                         tokens_before: 100,
                         tokens_after: 10,
-                        file_operations: vec![],
                     })
                 })
             }
