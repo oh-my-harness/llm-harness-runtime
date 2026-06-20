@@ -85,6 +85,19 @@ pub enum AgentEvent {
 
     /// Loop 遇到不可恢复的错误；之后 `AgentEnd` 将立即到达。
     Error(AgentError),
+    /// LLM call encountered a retryable error; emitted before the backoff sleep.
+    ///
+    /// `attempt` is 0-based: first retry = 0. UI should display `attempt + 1`.
+    RetryAttempt {
+        /// 0-based index of the current retry (first retry = 0).
+        attempt: u32,
+        /// Total allowed retries (`RetryConfig::max_retries`).
+        max_retries: u32,
+        /// Actual sleep duration in milliseconds (after `max_retry_delay_ms` cap).
+        delay_ms: u64,
+        /// `Display` string of the triggering `LlmError`.
+        error: String,
+    },
 }
 
 #[cfg(test)]
@@ -140,5 +153,29 @@ mod tests {
     fn error_event() {
         let ev = AgentEvent::Error(AgentError::Aborted);
         assert!(matches!(ev, AgentEvent::Error(_)));
+    }
+
+    #[test]
+    fn retry_attempt_event_fields_are_accessible() {
+        let ev = AgentEvent::RetryAttempt {
+            attempt: 0,
+            max_retries: 3,
+            delay_ms: 2000,
+            error: "rate limited".into(),
+        };
+        match ev {
+            AgentEvent::RetryAttempt {
+                attempt,
+                max_retries,
+                delay_ms,
+                error,
+            } => {
+                assert_eq!(attempt, 0);
+                assert_eq!(max_retries, 3);
+                assert_eq!(delay_ms, 2000);
+                assert_eq!(error, "rate limited");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

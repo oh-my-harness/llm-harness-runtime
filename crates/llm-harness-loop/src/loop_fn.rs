@@ -219,6 +219,15 @@ fn run_loop(
                             if let Some(max_delay_ms) = stream_opts.max_retry_delay_ms {
                                 delay = delay.min(std::time::Duration::from_millis(max_delay_ms));
                             }
+                            yield AgentEvent::RetryAttempt {
+                                attempt,
+                                max_retries: retry.max_retries,
+                                delay_ms: delay.as_millis() as u64,
+                                error: e.to_string(),
+                            };
+                            // TODO: retry sleep 期间不响应 abort 信号，
+                            // 长 backoff 下取消延迟可能显著。
+                            // 后续可用 tokio::select! 在 sleep 上并发等待 abort。
                             tokio::time::sleep(delay).await;
                             attempt += 1;
                         }
@@ -1034,5 +1043,155 @@ mod tests {
         if let AgentEvent::AgentStart { initial_messages } = agent_start {
             assert!(initial_messages.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn retry_attempt_event_emitted_before_sleep() {
+        use crate::config::RetryConfig;
+
+        // Two rate-limit errors then a successful text response.
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::rate_limit_error(),
+            MockResponse::rate_limit_error(),
+            MockResponse::text("ok"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(3, 0)); // base_delay_ms=0 → no real wait
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        tokio::time::pause(); // make sleep instant
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        let retry_events: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+            .collect();
+        assert_eq!(retry_events.len(), 2, "expected two RetryAttempt events");
+
+        // First retry: attempt=0, max_retries=3
+        match &retry_events[0] {
+            AgentEvent::RetryAttempt {
+                attempt,
+                max_retries,
+                delay_ms: _,
+                error,
+            } => {
+                assert_eq!(*attempt, 0);
+                assert_eq!(*max_retries, 3);
+                assert!(!error.is_empty());
+            }
+            _ => unreachable!(),
+        }
+
+        // Second retry: attempt=1
+        match &retry_events[1] {
+            AgentEvent::RetryAttempt { attempt, .. } => assert_eq!(*attempt, 1),
+            _ => unreachable!(),
+        }
+
+        // After retries, loop must succeed: AgentEnd must be present
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
+            "loop should complete after successful retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_attempt_event_precedes_message_start() {
+        use crate::config::RetryConfig;
+
+        // One error then success: RetryAttempt must come before MessageStart.
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::rate_limit_error(),
+            MockResponse::text("ok"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        tokio::time::pause();
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        let retry_pos = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+            .expect("RetryAttempt must appear");
+        let msg_start_pos = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::MessageStart { .. }))
+            .expect("MessageStart must appear");
+        assert!(
+            retry_pos < msg_start_pos,
+            "RetryAttempt (pos {retry_pos}) must precede MessageStart (pos {msg_start_pos})"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_retryable_error_does_not_emit_retry_attempt() {
+        use crate::config::RetryConfig;
+        // InvalidRequest is not retryable → no RetryAttempt, loop emits Error.
+        // `Provider` is already imported at the top of the test module.
+        use llm_adapter::LlmError;
+
+        struct AlwaysInvalidClient;
+
+        #[async_trait::async_trait]
+        impl llm_adapter::provider::Provider for AlwaysInvalidClient {
+            fn capabilities(&self) -> llm_adapter::provider::ProviderCapabilities {
+                llm_adapter::provider::ProviderCapabilities::new(false, false, false)
+            }
+            async fn chat(
+                &self,
+                _: &llm_adapter::types::ChatRequest,
+            ) -> Result<llm_adapter::types::ChatResponse, LlmError> {
+                Err(LlmError::InvalidRequest("bad".into()))
+            }
+            async fn chat_stream(
+                &self,
+                _: &llm_adapter::types::ChatRequest,
+            ) -> Result<llm_adapter::stream_handle::StreamHandle, LlmError> {
+                Err(LlmError::InvalidRequest("bad".into()))
+            }
+        }
+
+        let (_, mut cfg) = make_config(vec![]);
+        cfg.retry = Some(RetryConfig::new(3, 0));
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> = agent_loop(Arc::new(AlwaysInvalidClient), ctx, cfg)
+            .collect()
+            .await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. })),
+            "non-retryable error must not emit RetryAttempt"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "non-retryable error must emit Error event"
+        );
     }
 }

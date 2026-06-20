@@ -145,10 +145,12 @@ impl ExecutionEnv for NoOpEnv {
 
 /// Preset response for `MockLlmClient`.
 pub struct MockResponse {
-    /// Stream events to emit in order.
+    /// Stream events to emit in order. Ignored when `stream_error` is set.
     pub events: Vec<Result<StreamEvent, LlmError>>,
-    /// Model name to set on the `StreamHandle`.
+    /// Model name to set on the `StreamHandle`. Ignored when `stream_error` is set.
     pub model: String,
+    /// If set, `chat_stream` returns this error instead of a `StreamHandle`.
+    pub stream_error: Option<LlmError>,
 }
 
 impl MockResponse {
@@ -157,6 +159,7 @@ impl MockResponse {
         let t = text.to_owned();
         Self {
             model: "mock-model".into(),
+            stream_error: None,
             events: vec![
                 Ok(StreamEvent::ContentStart {
                     index: 0,
@@ -182,6 +185,7 @@ impl MockResponse {
         let args = args_json.to_owned();
         Self {
             model: "mock-model".into(),
+            stream_error: None,
             events: vec![
                 Ok(StreamEvent::ContentStart {
                     index: 0,
@@ -200,6 +204,15 @@ impl MockResponse {
                     usage: Usage::default(),
                 }),
             ],
+        }
+    }
+
+    /// Preset that causes `chat_stream` to return a `RateLimit` error.
+    pub fn rate_limit_error() -> Self {
+        Self {
+            events: vec![],
+            model: String::new(),
+            stream_error: Some(LlmError::RateLimit { retry_after: None }),
         }
     }
 }
@@ -252,6 +265,10 @@ impl Provider for MockLlmClient {
                 guard.remove(0)
             }
         };
+        // Return an error directly if the preset is an error preset.
+        if let Some(e) = response.stream_error {
+            return Err(e);
+        }
         let inner: BoxStream<'static, Result<StreamEvent, LlmError>> =
             Box::pin(stream::iter(response.events));
         Ok(StreamHandle::from_raw_stream(response.model, inner))
@@ -276,6 +293,19 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Ok(StreamEvent::TextDelta { .. })))
         );
+    }
+
+    #[tokio::test]
+    async fn mock_client_returns_error_for_error_preset() {
+        let client = MockLlmClient::with_single(MockResponse::rate_limit_error());
+        let req = ChatRequest::builder("mock-model", 1024).build();
+        let result = client.chat_stream(&req).await;
+        assert!(result.is_err());
+        if let Err(LlmError::RateLimit { .. }) = result {
+            // Success
+        } else {
+            panic!("expected RateLimit error");
+        }
     }
 
     #[test]
