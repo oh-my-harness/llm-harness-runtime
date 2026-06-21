@@ -41,16 +41,27 @@ cargo run -- -i
 | 变量 | 说明 | 必填 |
 |------|------|------|
 | `ANTHROPIC_API_KEY` | Anthropic API 密钥 | 二选一 |
+| `ANTHROPIC_API_BASE` | Anthropic API 地址（默认 `https://api.anthropic.com`） | 可选 |
+| `ANTHROPIC_MODEL` | Anthropic 模型名，默认 `claude-sonnet-4-6` | 可选 |
 | `OPENAI_API_KEY` | OpenAI 兼容 API 密钥 | 二选一 |
 | `OPENAI_API_BASE` | OpenAI 兼容 API 地址（如 `https://api.siliconflow.cn/v1`） | 使用 OpenAI 时必填 |
 | `OPENAI_MODEL` | OpenAI 兼容模型名，默认 `gpt-4o` | 可选 |
-| `CODING_AGENT_MODEL` | 覆盖默认模型，默认 `claude-sonnet-4-6` | 可选 |
+| `CODING_AGENT_MODEL` | 覆盖所有 provider 的默认模型 | 可选 |
 
 ### 使用 Anthropic
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
 cargo run -- -p "分析当前项目结构"
+```
+
+使用自定义 Anthropic 兼容网关：
+
+```bash
+export ANTHROPIC_API_KEY="sk-..."
+export ANTHROPIC_API_BASE="https://your-gateway.com/anthropic"
+export ANTHROPIC_MODEL="claude-sonnet-4-6"
+cargo run -- -i
 ```
 
 ### 使用 OpenAI 兼容 API
