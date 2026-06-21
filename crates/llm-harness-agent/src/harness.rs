@@ -89,8 +89,6 @@ pub struct HarnessHooks {
     pub after_provider_response: Vec<Arc<dyn AfterProviderResponseHook>>,
     /// Called before compaction to decide whether to proceed.
     pub before_compact: Vec<Arc<dyn BeforeCompactHook>>,
-    /// Authentication hooks (last registered wins at build time).
-    pub auth: Vec<Arc<dyn AuthHook>>,
 }
 
 impl HarnessHooks {
@@ -108,7 +106,6 @@ impl HarnessHooks {
             before_provider_request: vec![],
             after_provider_response: vec![],
             before_compact: vec![],
-            auth: vec![],
         }
     }
 }
@@ -335,12 +332,6 @@ pub struct AgentHarnessOptions {
 impl AgentHarnessOptions {
     /// Minimal options with only model set.
     pub fn new(model: impl Into<String>) -> Self {
-        let cap = DEFAULT_QUEUE_CAPACITY;
-        let (steer_tx, _) = mpsc::channel::<AgentMessage>(cap);
-        let (follow_up_tx, _) = mpsc::channel::<AgentMessage>(cap);
-        // Dummy channels to satisfy borrow checker; overwritten in AgentHarness::new.
-        drop(steer_tx);
-        drop(follow_up_tx);
         Self {
             model: model.into(),
             model_info: None,
@@ -348,7 +339,7 @@ impl AgentHarnessOptions {
             tools: vec![],
             system_prompt: None,
             max_tokens: DEFAULT_MAX_TOKENS,
-            queue_capacity: cap,
+            queue_capacity: DEFAULT_QUEUE_CAPACITY,
             stream_options: StreamOptions::default(),
             hooks: HarnessHooks::none(),
             auth: None,
