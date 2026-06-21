@@ -100,7 +100,11 @@ pub enum EnvError {
     #[error("invalid utf-8 in {0}")]
     InvalidUtf8(PathBuf),
     #[error("shell command failed: exit {exit_code}")]
-    ShellFailed { exit_code: i32, stderr: String },
+    ShellFailed {
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("other: {0}")]
