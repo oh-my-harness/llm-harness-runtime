@@ -128,10 +128,15 @@ coding-agent -i                   # 同上
 
 ### 环境变量
 
-| 变量 | 必须 | 说明 |
-|------|------|------|
-| `ANTHROPIC_API_KEY` | 是 | Anthropic provider API key |
-| `CODING_AGENT_MODEL` | 否 | 覆盖默认模型（默认 `claude-sonnet-4-6`） |
+| 变量 | 说明 |
+|------|------|
+| `ANTHROPIC_API_KEY` | Anthropic provider API key |
+| `OPENAI_API_KEY` | OpenAI-compatible provider API key |
+| `OPENAI_API_BASE` | OpenAI-compatible provider base URL（如 `https://api.siliconflow.cn/v1`） |
+| `OPENAI_MODEL` | OpenAI-compatible provider 的模型名 |
+| `CODING_AGENT_MODEL` | 覆盖任何 provider 的默认模型（默认 `claude-sonnet-4-6`） |
+
+**Provider 选择逻辑：** 同时设置了 `OPENAI_API_KEY` + `OPENAI_API_BASE` → 用 OpenAI-compatible provider；否则用 Anthropic（`ANTHROPIC_API_KEY` 必须设置，否则报错退出）。
 
 不引入 clap，手动解析（3 个 flag，逻辑 < 40 行）。Phase 1 不含 `--session-id`、`--list-sessions`、`--audit-log`、`--budget` 等选项。
 
