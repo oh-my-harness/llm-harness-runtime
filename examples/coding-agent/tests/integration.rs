@@ -93,9 +93,9 @@ async fn text_delta_streamed_correctly() {
     let text_deltas: Vec<String> = events
         .iter()
         .filter_map(|e| match e.as_ref() {
-            llm_harness_agent::AgentHarnessEvent::Agent(AgentEvent::TextDelta {
-                text, ..
-            }) => Some(text.clone()),
+            llm_harness_agent::AgentHarnessEvent::Agent(AgentEvent::TextDelta { text, .. }) => {
+                Some(text.clone())
+            }
             _ => None,
         })
         .collect();

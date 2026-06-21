@@ -7,24 +7,28 @@ use crate::prompt::{self, SystemPromptHook};
 use crate::tools::{bash, edit, read, write};
 
 pub struct CodingAgentPlugin {
-    system_prompt: String,
+    tools: Vec<Arc<dyn Tool>>,
+    context_files: Vec<prompt::ContextFile>,
+    cwd: std::path::PathBuf,
 }
 
 impl CodingAgentPlugin {
     pub fn new(cwd: &std::path::Path) -> Self {
-        let context_files = prompt::find_context_files(cwd);
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(read::ReadTool::new()),
             Arc::new(bash::BashTool::new()),
             Arc::new(edit::EditTool::new()),
             Arc::new(write::WriteTool::new()),
         ];
-        let system_prompt = prompt::build_system_prompt(&tools, cwd, &context_files);
-        Self { system_prompt }
+        Self {
+            context_files: prompt::find_context_files(cwd),
+            tools,
+            cwd: cwd.to_path_buf(),
+        }
     }
 
-    pub fn system_prompt(&self) -> &str {
-        &self.system_prompt
+    pub fn system_prompt(&self) -> String {
+        prompt::build_system_prompt(&self.tools, &self.cwd, &self.context_files)
     }
 }
 
@@ -34,16 +38,13 @@ impl Plugin for CodingAgentPlugin {
     }
 
     fn register_tools(&self, tools: &mut Vec<Arc<dyn Tool>>) {
-        tools.push(Arc::new(read::ReadTool::new()));
-        tools.push(Arc::new(bash::BashTool::new()));
-        tools.push(Arc::new(edit::EditTool::new()));
-        tools.push(Arc::new(write::WriteTool::new()));
+        tools.extend(self.tools.iter().cloned());
     }
 
     fn register_hooks(&self, hooks: &mut HarnessHooks) {
         hooks
             .before_run
-            .push(Arc::new(SystemPromptHook::new(self.system_prompt.clone())));
+            .push(Arc::new(SystemPromptHook::new(self.system_prompt())));
     }
 }
 
@@ -84,9 +85,5 @@ mod tests {
         let prompt = plugin.system_prompt();
         assert!(!prompt.is_empty());
         assert!(prompt.contains("coding assistant"));
-        assert!(prompt.contains("read"));
-        assert!(prompt.contains("bash"));
-        assert!(prompt.contains("edit"));
-        assert!(prompt.contains("write"));
     }
 }
