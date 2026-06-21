@@ -1,0 +1,31 @@
+[package]
+name = "coding-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "coding-agent"
+path = "src/main.rs"
+
+[dependencies]
+llm-harness-agent    = { path = "../../crates/llm-harness-agent" }
+llm-harness-runtime  = { path = "../../crates/llm-harness-runtime" }
+llm-harness-types    = { path = "../../crates/llm-harness-types" }
+llm_adapter          = { workspace = true }
+
+tokio       = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+futures     = { workspace = true }
+thiserror   = { workspace = true }
+chrono      = { workspace = true }
+rustyline   = "14"
+atty        = "0.2"
+dirs-next   = "2"
+
+[dev-dependencies]
+llm-harness-loop = { workspace = true, features = ["test-utils"] }
+llm-harness-runtime-sandbox-os = { path = "../../crates/llm-harness-runtime-sandbox-os" }
+tokio     = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tempfile  = "3"

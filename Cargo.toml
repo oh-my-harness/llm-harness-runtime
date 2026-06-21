@@ -13,6 +13,8 @@ members = [
     "crates/llm-harness-runtime-mcp",
     "crates/llm-harness-runtime-audit-jsonl",
     "crates/llm-harness-runtime-trace-otel",
+    # examples
+    "examples/coding-agent",
 ]
 resolver = "2"
 
