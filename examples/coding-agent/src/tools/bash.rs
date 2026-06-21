@@ -84,8 +84,12 @@ async fn run_bash(args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolErro
     let output = ctx.env.execute_shell(command, opts).await;
     let output = match output {
         Ok(o) => o,
-        Err(EnvError::ShellFailed { exit_code, stderr }) => ShellOutput {
-            stdout: String::new(),
+        Err(EnvError::ShellFailed {
+            exit_code,
+            stdout,
+            stderr,
+        }) => ShellOutput {
+            stdout,
             stderr,
             exit_code,
         },

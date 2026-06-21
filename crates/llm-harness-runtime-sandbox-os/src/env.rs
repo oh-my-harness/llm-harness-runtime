@@ -345,6 +345,7 @@ impl ExecutionEnv for OsEnv {
                     .await
                     .map_err(|_| EnvError::ShellFailed {
                         exit_code: -1,
+                        stdout: String::new(),
                         stderr: "timeout".into(),
                     })?
                     .map_err(EnvError::Io)?
@@ -358,6 +359,7 @@ impl ExecutionEnv for OsEnv {
             if !output.status.success() {
                 Err(EnvError::ShellFailed {
                     exit_code: output.status.code().unwrap_or(-1),
+                    stdout,
                     stderr,
                 })
             } else {
