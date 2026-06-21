@@ -48,16 +48,6 @@ pub fn build_system_prompt(
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let cwd_str = cwd.to_string_lossy().replace('\\', "/");
 
-    let tool_list = if tools.is_empty() {
-        "(none)".to_string()
-    } else {
-        tools
-            .iter()
-            .map(|t| format!("- {}: {}", t.name(), t.description()))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
     let has_bash = tools.iter().any(|t| t.name() == "bash");
     let guidelines = if has_bash {
         "- Use bash for file operations like ls, grep, find\n\
@@ -71,7 +61,6 @@ pub fn build_system_prompt(
     let mut prompt = format!(
         "You are an expert coding assistant. \
          You help users by reading files, executing commands, editing code, and writing new files.\n\n\
-         Available tools:\n{tool_list}\n\n\
          Guidelines:\n{guidelines}"
     );
 
@@ -109,14 +98,13 @@ impl SystemPromptHook {
 impl BeforeRunHook for SystemPromptHook {
     fn before_run<'a>(
         &'a self,
-        ctx: BeforeRunCtx<'a>,
+        _ctx: BeforeRunCtx<'a>,
     ) -> BoxFuture<'a, Result<BeforeRunResult, AgentError>> {
         let prompt = self.prompt.clone();
         Box::pin(async move {
-            *ctx.system_prompt = Some(prompt);
             Ok(BeforeRunResult {
                 additional_messages: vec![],
-                system_prompt: None,
+                system_prompt: Some(prompt),
             })
         })
     }
@@ -155,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_contains_tool_names_and_descriptions() {
+    fn prompt_contains_guidelines_and_cwd() {
         let read = MockTool {
             name: "read",
             desc: "Read a file",
@@ -166,8 +154,7 @@ mod tests {
         };
         let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(read), Arc::new(bash)];
         let prompt = build_system_prompt(&tools, std::path::Path::new("/home/user/project"), &[]);
-        assert!(prompt.contains("read: Read a file"), "got: {prompt}");
-        assert!(prompt.contains("bash: Run a command"), "got: {prompt}");
+        assert!(prompt.contains("bash for file operations"), "got: {prompt}");
         assert!(prompt.contains("/home/user/project"), "got: {prompt}");
     }
 
@@ -202,9 +189,9 @@ mod tests {
     }
 
     #[test]
-    fn prompt_empty_tools_shows_none() {
+    fn prompt_empty_tools_omits_bash_guidelines() {
         let tools: Vec<Arc<dyn Tool>> = vec![];
         let prompt = build_system_prompt(&tools, std::path::Path::new("/tmp"), &[]);
-        assert!(prompt.contains("(none)"), "got: {prompt}");
+        assert!(!prompt.contains("bash for file"), "got: {prompt}");
     }
 }

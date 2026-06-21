@@ -23,6 +23,10 @@ impl BashTool {
                     "timeout": {
                         "type": "number",
                         "description": "Timeout in seconds (optional)"
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for the command (optional)"
                     }
                 },
                 "required": ["command"]
@@ -66,9 +70,10 @@ async fn run_bash(args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolErro
         .ok_or_else(|| ToolError::InvalidArguments("command required".into()))?;
 
     let timeout_secs = args["timeout"].as_f64();
+    let cwd = args["cwd"].as_str().map(std::path::Path::new);
 
     let opts = ShellOptions {
-        cwd: None,
+        cwd,
         env: vec![],
         timeout: timeout_secs.map(std::time::Duration::from_secs_f64),
         abort: ctx.abort.clone(),
@@ -99,11 +104,12 @@ async fn run_bash(args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolErro
 pub fn format_output(output: &ShellOutput) -> String {
     let combined = format!("{}{}", output.stdout, output.stderr);
     let truncated = if combined.len() > MAX_OUTPUT_BYTES {
-        let cut = &combined[..MAX_OUTPUT_BYTES];
+        let end = combined.floor_char_boundary(MAX_OUTPUT_BYTES);
+        let cut = &combined[..end];
         format!(
             "{}\n[Output truncated: {} bytes omitted]",
             cut,
-            combined.len() - MAX_OUTPUT_BYTES
+            combined.len() - end
         )
     } else {
         combined
