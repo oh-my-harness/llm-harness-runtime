@@ -9,10 +9,12 @@
 //!
 //! Environment:
 //!   ANTHROPIC_API_KEY          Required for Anthropic provider
+//!   ANTHROPIC_API_BASE         Base URL for Anthropic (default: https://api.anthropic.com)
+//!   ANTHROPIC_MODEL            Model name for Anthropic provider (default: claude-sonnet-4-6)
 //!   OPENAI_API_KEY             API key for OpenAI-compatible provider
 //!   OPENAI_API_BASE            Base URL (e.g. https://api.siliconflow.cn/v1)
-//!   OPENAI_MODEL               Model name for OpenAI-compatible provider
-//!   CODING_AGENT_MODEL         Override default model (else claude-sonnet-4-6)
+//!   OPENAI_MODEL               Model name for OpenAI-compatible provider (default: gpt-4o)
+//!   CODING_AGENT_MODEL         Override default model for any provider
 
 use std::sync::Arc;
 
@@ -118,10 +120,22 @@ async fn run() -> i32 {
                     return 1;
                 }
             };
-            (
-                Arc::new(AnthropicProvider::builder(api_key).build()),
-                DEFAULT_MODEL.to_string(),
-            )
+
+            let anthropic_base = std::env::var("ANTHROPIC_API_BASE")
+                .ok()
+                .filter(|s| !s.is_empty());
+            let anthropic_model = std::env::var("ANTHROPIC_MODEL")
+                .ok()
+                .filter(|s| !s.is_empty());
+
+            let mut builder = AnthropicProvider::builder(api_key);
+            if let Some(base) = anthropic_base {
+                builder = builder.base_url(base);
+            }
+            let provider = builder.build();
+
+            let model = anthropic_model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            (Arc::new(provider), model)
         };
 
     let model = std::env::var("CODING_AGENT_MODEL")
