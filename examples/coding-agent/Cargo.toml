@@ -27,6 +27,7 @@ clap        = { version = "4", features = ["derive"] }
 rustyline   = "14"
 atty        = "0.2"
 dirs-next   = "2"
+termimad    = "0.34.1"
 
 [dev-dependencies]
 llm-harness-loop = { workspace = true, features = ["test-utils"] }
