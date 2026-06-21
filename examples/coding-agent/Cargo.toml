@@ -10,7 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 llm-harness-agent    = { path = "../../crates/llm-harness-agent" }
+llm-harness-loop     = { path = "../../crates/llm-harness-loop" }
 llm-harness-runtime  = { path = "../../crates/llm-harness-runtime" }
+llm-harness-runtime-sandbox-os = { path = "../../crates/llm-harness-runtime-sandbox-os" }
 llm-harness-types    = { path = "../../crates/llm-harness-types" }
 llm_adapter          = { workspace = true }
 
