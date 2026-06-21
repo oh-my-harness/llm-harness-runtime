@@ -144,24 +144,16 @@ llm-harness-types     → (无内部依赖)
 
 | 文件 | 内容 |
 |---|---|
-| `runtime-v0.2-design.md` | 总纲：决策表、v0.2 范围、路线图 |
-| `superpowers/plans/2026-06-12-runtime-v0.2-phase0-*.md` | Core 阻塞项修复 |
-| `superpowers/plans/2026-06-12-runtime-v0.2-phase1a-*.md` | Trait 定义与 CompositeHook 模式 |
-| `superpowers/plans/2026-06-12-runtime-v0.2-phase1b-*.md` | Auth、Budget 基础设施 |
-| `superpowers/plans/2026-06-12-runtime-v0.2-phase2-*.md` | Tool 注册与发现 |
-| `superpowers/plans/2026-06-12-runtime-v0.2-phase3-*.md` | Orchestration（AgentHarness、HarnessHooks） |
-| `superpowers/plans/2026-06-12-runtime-v0.2-phase4-*.md` | Observability（TracingHookAdapter、TraceExporter） |
-| `superpowers/plans/2026-06-12-runtime-v0.2-phase5-*.md` | Integration（ExecutionEnv、CancellationToken） |
-| `coding-agent-on-runtime.md` | 使用 runtime 构建 coding agent 的指南 |
-
-实现前先读相关阶段的设计文档。每个 struct / trait 的设计理由在设计文档的 `>` 块引用中。
+| `gap-analysis-platform-vs-business.md` | 平台 vs 业务层 gap 分析，trait 引入决策框架 |
+| `reference-production-multi-agent-harness.md` | 外部参考文章（李维山博客） |
+| `superpowers/specs/2026-06-17-plugin-system-design.md` | Plugin 系统设计规范 |
 
 ## 核心开发原则
 
 ### Trait 与实现的分离
 
-- **trait 声明**（`llm-harness-traits` crate）：只定义签名、语义、错误类型，不含逻辑。
-- **trait 实现**（`auth`、`budget`、`infrastructure` crate）：提供示例实现（EnvAuthHook、FileAuthHook、BudgetControlAdapter 等），用户可覆盖。
+- **trait 声明**（`llm-harness-types` crate）：只定义签名、语义、错误类型，不含逻辑。
+- **实现**（如 `EnvAuthHook`、`BudgetControlAdapter` 等）：提供示例实现，用户可覆盖。
 - 不在 trait 中硬编码具体行为，所有行为可替换。
 
 ### CompositeHook 合成语义
@@ -178,27 +170,34 @@ Runtime 支持用户注入多个 hook 的组合（CompositeHook 模式）。三�
 
 ### HarnessHooks 配置
 
-`HarnessHooks` 结构体持有 11 个 hook 插槽（7 个命名 + 4 个预留）：
+`HarnessHooks` 持有 11 个 hook 插槽，每个插槽为 `Vec<Arc<dyn Hook>>`（支持多个同类型 hook 通过 Composite 合成）：
 
 ```rust
 pub struct HarnessHooks {
-    // 决策类
-    pub before_tool_call: Option<Arc<dyn BeforeToolCallHook>>,
-    pub should_stop: Option<Arc<dyn ShouldStopHook>>,
-    
-    // 观测类
-    pub before_provider_request: Option<Arc<dyn BeforeProviderRequestHook>>,
-    pub after_provider_response: Option<Arc<dyn AfterProviderResponseHook>>,
-    pub after_tool_call: Option<Arc<dyn AfterToolCallHook>>,
-    pub after_turn: Option<Arc<dyn AfterTurnHook>>,
-    pub prepare_next_turn: Option<Arc<dyn PrepareNextTurnHook>>,
-    
-    // 预留位置（v0.3+ 或用户扩展）
-    // ... 4 个预留位置
+    // 生命周期边界
+    pub before_run: Vec<Arc<dyn BeforeRunHook>>,
+    pub before_turn: Vec<Arc<dyn BeforeTurnHook>>,
+    pub after_turn: Vec<Arc<dyn AfterTurnHook>>,
+
+    // 工具执行
+    pub before_tool_call: Vec<Arc<dyn BeforeToolCallHook>>,
+    pub after_tool_call: Vec<Arc<dyn AfterToolCallHook>>,
+
+    // 转换与决策
+    pub transform_context: Vec<Arc<dyn TransformContextHook>>,
+    pub prepare_next_turn: Vec<Arc<dyn PrepareNextTurnHook>>,
+    pub should_stop: Vec<Arc<dyn ShouldStopHook>>,
+
+    // Provider 请求/响应
+    pub before_provider_request: Vec<Arc<dyn BeforeProviderRequestHook>>,
+    pub after_provider_response: Vec<Arc<dyn AfterProviderResponseHook>>,
+
+    // Compaction
+    pub before_compact: Vec<Arc<dyn BeforeCompactHook>>,
 }
 ```
 
-用户可为任何插槽注入自定义 hook，或留空（此时框架跳过该阶段）。
+用户可为任何插槽注入多个自定义 hook，或留空 `vec![]`（框架跳过该阶段）。多个 hook 的合成语义由各 Composite 包装器实现。
 
 ### Hook 与 Event 的分工
 
@@ -251,7 +250,7 @@ pub struct HarnessHooks {
 - ⚠️ 单元测试是否依赖真实外部服务（应使用 mock）？
 
 **文档同步**
-- ⚠️ 实现是否与设计文档有出入？若有，更新对应的 `docs/superpowers/plans/` 文件。
+- ⚠️ 实现是否与设计文档有出入？若有，更新对应的 `docs/` 或 `docs/superpowers/specs/` 文件。
 - ⚠️ 新增或修改了 trait 签名、HarnessHooks 插槽、CompositeHook 语义？更新本文件（CLAUDE.md）对应段落。
 
 ## Git 规则
