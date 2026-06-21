@@ -19,7 +19,6 @@
 pub mod audit;
 pub mod budget;
 pub mod builder;
-pub mod composite;
 pub mod cost;
 pub mod error;
 pub mod human_approval;
@@ -37,13 +36,13 @@ pub mod tracing_adapter;
 pub use audit::{AuditDecision, AuditEntry, AuditEventType, AuditSink, CostDelta};
 pub use budget::{BudgetControlAdapter, BudgetExceededHook};
 pub use builder::{HarnessBuildError, HarnessBuilder};
-pub use composite::{
-    CompositeAfterProviderResponseHook, CompositeAfterToolCallHook, CompositeAfterTurnHook,
-    CompositeBeforeProviderRequestHook, CompositeBeforeToolCallHook,
-};
 pub use cost::{CostAggregate, ModelCost, PricingProvider, TokenPrice};
 pub use human_approval::{
     ApprovalDecision, ApprovalRequest, HumanApprovalWrapper, HumanApprover, TimeoutPolicy,
+};
+pub use llm_harness_loop::composite::{
+    CompositeAfterProviderResponseHook, CompositeAfterToolCallHook, CompositeAfterTurnHook,
+    CompositeBeforeProviderRequestHook, CompositeBeforeToolCallHook,
 };
 pub use mcp::{McpClientHandle, McpContent, McpError, McpResult, McpToolDef};
 pub use prompt::{
