@@ -1470,7 +1470,14 @@ impl AgentHarness {
                     break;
                 }
                 AgentEvent::Error(e) => {
-                    self.inner.lock().unwrap().state.error_message = Some(e.to_string());
+                    {
+                        let mut inner = self.inner.lock().unwrap();
+                        inner.state.error_message = Some(e.to_string());
+                        // Clear pending writes so the failed turn's user message is not
+                        // flushed to the session on a future successful turn, which would
+                        // produce two consecutive user messages and cause Anthropic to reject.
+                        inner.state.pending_session_writes.clear();
+                    }
                     self.emit(AgentHarnessEvent::Agent(event));
                 }
                 _ => {
