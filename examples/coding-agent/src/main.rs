@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use clap::Parser;
 use llm_adapter::anthropic::AnthropicProvider;
 use llm_adapter::openai::OpenAIProvider;
 use llm_harness_loop::LlmClient;
@@ -27,6 +28,25 @@ use coding_agent::plugin::CodingAgentPlugin;
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
+#[derive(Parser)]
+#[command(
+    name = "coding-agent",
+    version,
+    about = "An LLM-powered coding assistant"
+)]
+struct Cli {
+    /// Prompt text (one-shot mode, positional)
+    prompt: Option<String>,
+
+    /// Prompt text (one-shot mode, explicit flag)
+    #[arg(short = 'p', long = "print")]
+    print: Option<String>,
+
+    /// Start interactive REPL
+    #[arg(short = 'i', long = "interactive")]
+    interactive: bool,
+}
+
 #[tokio::main]
 async fn main() {
     let code = run().await;
@@ -34,25 +54,28 @@ async fn main() {
 }
 
 async fn run() -> i32 {
-    let args: Vec<String> = std::env::args().collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
-    // ── --help / -h ─────────────────────────────────────────────────────────────
+    // ── Parse args ────────────────────────────────────────────────────────────────
 
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_help();
-        return 0;
-    }
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            // clap prints the error / help to stderr, exit with code 2
+            e.print().expect("Error writing to stderr");
+            return 2;
+        }
+    };
 
-    // ── Detect mode: interactive vs one-shot ────────────────────────────────────
+    // ── Detect mode: interactive vs one-shot ──────────────────────────────────────
 
-    let interactive = args.iter().any(|a| a == "--interactive" || a == "-i")
-        || (atty::is(atty::Stream::Stdin) && resolve_prompt_opt(&args).is_none());
+    let interactive = cli.interactive
+        || (atty::is(atty::Stream::Stdin) && cli.print.is_none() && cli.prompt.is_none());
 
     let prompt_opt = if interactive {
         None
     } else {
-        match resolve_prompt(&args) {
+        match resolve_prompt(&cli) {
             Ok(p) => Some(p),
             Err(msg) => {
                 eprintln!("Error: {msg}");
@@ -124,7 +147,7 @@ async fn run() -> i32 {
         }
     };
 
-    // ── Run ─────────────────────────────────────────────────────────────────────
+    // ── Run ────────────────────────────────────────────────────────────────────
 
     if interactive {
         run_repl(&harness).await
@@ -149,7 +172,7 @@ async fn run_one_shot(harness: &llm_harness_agent::AgentHarness, prompt: &str) -
     0
 }
 
-// ── Interactive REPL ───────────────────────────────────────────────────────────
+// ── Interactive REPL ─────────────────────────────────────────────────────────────
 
 async fn run_repl(harness: &llm_harness_agent::AgentHarness) -> i32 {
     use rustyline::DefaultEditor;
@@ -213,81 +236,27 @@ fn save_history(
     Ok(())
 }
 
-// ── Help ───────────────────────────────────────────────────────────────────────
+// ── Arg resolution (one-shot) ─────────────────────────────────────────────────
 
-fn print_help() {
-    println!(
-        "\
-Usage: coding-agent [OPTIONS] [PROMPT]
-
-One-shot mode (default):
-  coding-agent -p \"your prompt\"
-  coding-agent \"your prompt\"
-  echo \"prompt\" | coding-agent
-
-Interactive REPL:
-  coding-agent --interactive
-  coding-agent -i
-
-Options:
-  -p, --print <PROMPT>       Prompt text (one-shot)
-  -i, --interactive          Start interactive REPL
-  -h, --help                 Show this help
-
-Environment:
-  ANTHROPIC_API_KEY          Required API key (Anthropic)
-  OPENAI_API_KEY             API key for OpenAI-compatible provider
-  OPENAI_API_BASE            Base URL for OpenAI-compatible provider
-  OPENAI_MODEL               Model name for OpenAI-compatible provider
-  CODING_AGENT_MODEL         Override default model"
-    );
-}
-
-use std::io::Read;
-
-// ── Arg parsing ────────────────────────────────────────────────────────────────
-
-fn resolve_prompt(args: &[String]) -> Result<String, String> {
-    resolve_prompt_opt(args).ok_or_else(|| {
-        "No prompt provided. Use -p \"prompt\", pass text as argument, or pipe via stdin.".into()
-    })
-}
-
-fn resolve_prompt_opt(args: &[String]) -> Option<String> {
-    // -p "prompt" or --print "prompt"
-    for i in 0..args.len() {
-        if (args[i] == "-p" || args[i] == "--print") && i + 1 < args.len() {
-            return Some(args[i + 1].clone());
-        }
+fn resolve_prompt(cli: &Cli) -> Result<String, String> {
+    // -p / --print takes precedence over positional
+    if let Some(ref p) = cli.print {
+        return Ok(p.clone());
     }
-
-    // Positional arg: first non-flag, non-flag-value argument.
-    let mut skip_next = false;
-    for arg in args.iter().skip(1) {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if arg.starts_with('-') {
-            // Flags that take a value: skip their value.
-            if arg == "-p" || arg == "--print" {
-                skip_next = true;
-            }
-            continue;
-        }
-        return Some(arg.clone());
+    if let Some(ref p) = cli.prompt {
+        return Ok(p.clone());
     }
-
     // Stdin (non-TTY only)
     if !atty::is(atty::Stream::Stdin) {
         let mut buf = String::new();
         if std::io::stdin().read_to_string(&mut buf).is_ok() {
             let trimmed = buf.trim().to_string();
             if !trimmed.is_empty() {
-                return Some(trimmed);
+                return Ok(trimmed);
             }
         }
     }
-
-    None
+    Err("No prompt provided. Use -p \"prompt\", pass text as argument, or pipe via stdin.".into())
 }
+
+use std::io::Read;

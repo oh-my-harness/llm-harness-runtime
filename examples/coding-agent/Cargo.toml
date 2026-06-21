@@ -23,6 +23,7 @@ serde_json  = { workspace = true }
 futures     = { workspace = true }
 thiserror   = { workspace = true }
 chrono      = { workspace = true }
+clap        = { version = "4", features = ["derive"] }
 rustyline   = "14"
 atty        = "0.2"
 dirs-next   = "2"
