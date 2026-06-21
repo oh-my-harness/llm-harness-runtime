@@ -11,13 +11,12 @@
 //! - Tracing (`TraceExporter`)
 //! - Cost aggregation (`PricingProvider`, `CostAggregate`)
 //! - Audit logging (`AuditSink`)
-//! - Authentication (`AuthHook`)
+//! - Authentication (see `llm-harness-types` and `llm-harness-runtime-auth`)
 //! - Human approval (`HumanApprover`, `HumanApprovalWrapper`)
 //! - Budget control (`BudgetExceededHook`, `BudgetControlAdapter`)
 //! - Harness construction (`HarnessBuilder`)
 
 pub mod audit;
-pub mod auth;
 pub mod budget;
 pub mod builder;
 pub mod composite;
@@ -36,7 +35,6 @@ pub mod tracer;
 pub mod tracing_adapter;
 
 pub use audit::{AuditDecision, AuditEntry, AuditEventType, AuditSink, CostDelta};
-pub use auth::AuthHook;
 pub use budget::{BudgetControlAdapter, BudgetExceededHook};
 pub use builder::{HarnessBuildError, HarnessBuilder};
 pub use composite::{
