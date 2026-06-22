@@ -1,0 +1,3 @@
+[submodule "examples/llm-tutor"]
+	path = examples/llm-tutor
+	url = https://github.com/oh-my-harness/llm-tutor.git
