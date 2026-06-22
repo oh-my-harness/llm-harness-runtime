@@ -57,6 +57,12 @@ pub fn build_system_prompt(
     if has_bash && !has_grep && !has_find {
         guidelines.push_str("- Use bash for file operations like ls, grep, find\n");
     }
+    if has_grep {
+        guidelines.push_str("- Use the grep tool to search for patterns in files\n");
+    }
+    if has_find {
+        guidelines.push_str("- Use the find tool to locate files by name or type\n");
+    }
     guidelines.push_str(
         "- Be concise in your responses\n\
          - Show file paths clearly when working with files",
@@ -197,5 +203,26 @@ mod tests {
         let tools: Vec<Arc<dyn Tool>> = vec![];
         let prompt = build_system_prompt(&tools, std::path::Path::new("/tmp"), &[]);
         assert!(!prompt.contains("bash for file"), "got: {prompt}");
+    }
+
+    #[test]
+    fn prompt_with_grep_tool_mentions_grep() {
+        let grep = MockTool {
+            name: "grep",
+            desc: "Search files",
+        };
+        let bash = MockTool {
+            name: "bash",
+            desc: "Run a command",
+        };
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(grep), Arc::new(bash)];
+        let prompt = build_system_prompt(&tools, std::path::Path::new("/tmp"), &[]);
+        // When grep tool is registered, LLM should be guided to use it.
+        assert!(prompt.contains("grep tool"), "got: {prompt}");
+        // bash fallback guideline should be suppressed when grep is available.
+        assert!(
+            !prompt.contains("bash for file operations"),
+            "got: {prompt}"
+        );
     }
 }

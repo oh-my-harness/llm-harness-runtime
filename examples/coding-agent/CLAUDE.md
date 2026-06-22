@@ -152,6 +152,8 @@ llm-harness-types = { path = "../../crates/llm-harness-types" }
 
 ## Commit 规范
 
+不要自动提交，等待用户指令，确认后再 Commit
+
 Scope 统一用 `coding-agent`：
 
 ```

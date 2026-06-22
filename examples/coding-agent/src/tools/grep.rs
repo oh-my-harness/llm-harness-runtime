@@ -144,13 +144,15 @@ async fn run_grep(args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolErro
 
 /// Check whether ripgrep (`rg`) is available on PATH.
 ///
+/// Probes by running `rg --version` rather than relying on `which`, which may
+/// not be present in all environments (e.g. NixOS, minimal Docker images).
 /// Result is cached for the lifetime of the process via [`OnceLock`] so the
-/// `which rg` subprocess is only spawned once.
+/// subprocess is only spawned once.
 fn has_ripgrep() -> bool {
     static RG_AVAILABLE: OnceLock<bool> = OnceLock::new();
     *RG_AVAILABLE.get_or_init(|| {
-        std::process::Command::new("which")
-            .arg("rg")
+        std::process::Command::new("rg")
+            .arg("--version")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -436,13 +438,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn grep_fallback_to_standard_grep() {
-        // Verify that grep (not rg) works by temporarily "hiding" rg.
-        // We can't easily hide rg, but we can test that the grep command
-        // itself works by checking grep availability.
-        if std::process::Command::new("which")
-            .arg("grep")
+    #[test]
+    fn grep_fallback_to_standard_grep() {
+        // Verify that the grep command built by build_grep_command actually works.
+        // Uses `grep` directly (no rg), so no async needed.
+        if std::process::Command::new("grep")
+            .arg("--version")
             .output()
             .map(|o| !o.status.success())
             .unwrap_or(true)
@@ -477,8 +478,8 @@ mod tests {
             return;
         }
 
-        if std::process::Command::new("which")
-            .arg("grep")
+        if std::process::Command::new("grep")
+            .arg("--version")
             .output()
             .map(|o| !o.status.success())
             .unwrap_or(true)
