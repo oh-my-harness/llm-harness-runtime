@@ -209,7 +209,17 @@ pub async fn render_one_shot(mut rx: broadcast::Receiver<Arc<AgentHarnessEvent>>
                     print_retry(*attempt, *max_retries, *delay_ms, error);
                 }
                 AgentHarnessEvent::Agent(AgentEvent::Error(e)) => {
-                    eprintln!("\nAgent error: {e}");
+                    if is_abort_error(e) {
+                        // Ctrl-C abort — show a brief indicator, no error noise.
+                        let _ = write!(
+                            std::io::stderr(),
+                            "{}^C (aborted){}",
+                            ansi::YELLOW,
+                            ansi::RESET
+                        );
+                    } else {
+                        eprintln!("\nAgent error: {e}");
+                    }
                 }
                 AgentHarnessEvent::PhaseChange {
                     to: HarnessPhase::Idle,
@@ -227,6 +237,13 @@ pub async fn render_one_shot(mut rx: broadcast::Receiver<Arc<AgentHarnessEvent>>
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
         }
     }
+}
+
+// ── helpers ─────────────────────────────────────────────────────────────────────
+
+/// Check if an `AgentEvent::Error` is an abort signal (Ctrl-C).
+fn is_abort_error(e: &llm_harness_types::AgentError) -> bool {
+    matches!(e, llm_harness_types::AgentError::Aborted)
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

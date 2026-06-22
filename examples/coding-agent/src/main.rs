@@ -20,12 +20,14 @@ use std::io::Read;
 use std::sync::Arc;
 
 use clap::Parser;
+use llm_harness_agent::AgentHarness;
 use llm_harness_agent::SessionRepo;
 use llm_harness_agent::session::Session;
 use llm_harness_agent::session::jsonl::JsonlSessionRepo;
 use llm_harness_agent::session::types::CreateSessionOptions;
 use llm_harness_runtime::HarnessBuilder;
 use llm_harness_runtime_sandbox_os::OsEnv;
+use llm_harness_types::{AgentError, HarnessError};
 
 use coding_agent::plugin::CodingAgentPlugin;
 use coding_agent::provider;
@@ -97,14 +99,26 @@ async fn run() -> Result<(), i32> {
         1
     })?;
 
-    let harness = HarnessBuilder::new(&resolved.model)
-        .install(&plugin)
-        .provider(&resolved.model, resolved.client)
-        .build_with_session(env, session)
-        .map_err(|e| {
-            eprintln!("Error building agent: {e}");
-            1
-        })?;
+    let harness = Arc::new(
+        HarnessBuilder::new(&resolved.model)
+            .install(&plugin)
+            .provider(&resolved.model, resolved.client)
+            .build_with_session(env, session)
+            .map_err(|e| {
+                eprintln!("Error building agent: {e}");
+                1
+            })?,
+    );
+
+    // ── Wire Ctrl-C to abort the current turn instead of killing the process ──
+
+    let h = harness.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::signal::ctrl_c().await.ok();
+            h.abort();
+        }
+    });
 
     // ── Run ────────────────────────────────────────────────────────────────────
 
@@ -118,12 +132,18 @@ async fn run() -> Result<(), i32> {
 
 // ── One-shot mode ──────────────────────────────────────────────────────────────
 
-async fn run_one_shot(harness: &llm_harness_agent::AgentHarness, prompt: &str) -> Result<(), i32> {
+async fn run_one_shot(harness: &Arc<AgentHarness>, prompt: &str) -> Result<(), i32> {
     let events = harness.subscribe();
     let printer = tokio::spawn(ui::render_one_shot(events));
 
-    if let Err(e) = harness.prompt(prompt).await {
-        eprintln!("\nError: {e}");
+    match harness.prompt(prompt).await {
+        Err(HarnessError::Agent(AgentError::Aborted)) => {
+            // Ctrl-C was pressed — abort is expected, not an error.
+        }
+        Err(e) => {
+            eprintln!("\nError: {e}");
+        }
+        Ok(()) => {}
     }
 
     let _ = printer.await;
@@ -133,7 +153,7 @@ async fn run_one_shot(harness: &llm_harness_agent::AgentHarness, prompt: &str) -
 
 // ── Interactive REPL ─────────────────────────────────────────────────────────────
 
-async fn run_repl(harness: &llm_harness_agent::AgentHarness) -> Result<(), i32> {
+async fn run_repl(harness: &Arc<AgentHarness>) -> Result<(), i32> {
     use rustyline::DefaultEditor;
     use rustyline::error::ReadlineError;
 
