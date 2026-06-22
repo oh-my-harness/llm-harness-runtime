@@ -232,7 +232,6 @@ pub async fn render_one_shot(mut rx: broadcast::Receiver<Arc<AgentHarnessEvent>>
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 

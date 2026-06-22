@@ -1190,9 +1190,19 @@ impl AgentHarness {
         follow_up_rx: mpsc::Receiver<AgentMessage>,
         abort: CancellationToken,
     ) -> LoopConfig {
-        let inner = self.inner.lock().unwrap();
-        let st = &inner.state;
-        let retry = inner.retry.clone();
+        // ── Snapshot state (lock is held via `inner` until `drop(inner)`) ──
+        let (tools, retry, model, thinking_level, active_tools, max_tokens) = {
+            let inner = self.inner.lock().unwrap();
+            let st = &inner.state;
+            (
+                st.tools.clone(),
+                inner.retry.clone(),
+                st.model.clone(),
+                st.thinking_level,
+                st.active_tools.clone(),
+                inner.max_tokens,
+            )
+        };
 
         // Wrap tools with HookedTool if before/after tool call hooks exist.
         let before = (!self.hooks.before_tool_call.is_empty()).then(|| {
@@ -1206,8 +1216,7 @@ impl AgentHarness {
             )) as Arc<dyn AfterToolCallHook>
         });
         let tools: Vec<Arc<dyn Tool>> = if before.is_some() || after.is_some() {
-            st.tools
-                .clone()
+            let wrapped: Vec<Arc<dyn Tool>> = tools
                 .into_iter()
                 .map(|t| {
                     Arc::new(HookedTool {
@@ -1216,9 +1225,17 @@ impl AgentHarness {
                         after: after.clone(),
                     }) as Arc<dyn Tool>
                 })
-                .collect()
+                .collect();
+            // Persist wrapped tools to state so that `DefaultPrepareNextTurn`
+            // returns them on subsequent turns, preserving before/after hooks
+            // across the agent loop.
+            {
+                let mut inner = self.inner.lock().unwrap();
+                inner.state.tools.clone_from(&wrapped);
+            }
+            wrapped
         } else {
-            st.tools.clone()
+            tools
         };
 
         // Build the default prepare_next_turn wrapper.
@@ -1232,12 +1249,12 @@ impl AgentHarness {
         });
 
         LoopConfig {
-            model: st.model.clone(),
-            max_tokens: inner.max_tokens,
+            model,
+            max_tokens,
             temperature: None,
-            thinking_level: st.thinking_level,
+            thinking_level,
             tools,
-            active_tools: st.active_tools.clone(),
+            active_tools,
             default_execution_mode: ToolExecutionMode::Parallel,
             env: self.env.clone(),
             abort,
@@ -1272,7 +1289,7 @@ impl AgentHarness {
 
     async fn run_loop(&self, initial: Vec<AgentMessage>) -> Result<(), HarnessError> {
         // 1. Setup: channels, abort token, system prompt.
-        let (steer_rx, follow_up_rx, abort, system_prompt) = {
+        let (steer_rx, follow_up_rx, abort, system_prompt, original_tools) = {
             let mut inner = self.inner.lock().unwrap();
             inner.state.streaming_message = None;
             inner.state.pending_tool_calls.clear();
@@ -1280,7 +1297,8 @@ impl AgentHarness {
             let abort = CancellationToken::new();
             inner.current_abort = Some(abort.clone());
             let sp = inner.state.system_prompt.clone();
-            (steer_rx, follow_up_rx, abort, sp)
+            let ot = inner.state.tools.clone();
+            (steer_rx, follow_up_rx, abort, sp, ot)
         };
         self.set_phase(HarnessPhase::Turning);
 
@@ -1295,6 +1313,9 @@ impl AgentHarness {
             inner.state.pending_tool_calls.clear();
             inner.active_tool_names.clear();
             inner.current_abort = None;
+            // Restore original unwrapped tools so the next call to `build_loop_config`
+            // doesn't re-wrap already-HookedTool-wrapped tools (double-wrapping).
+            inner.state.tools = original_tools;
             if let Err(ref e) = result {
                 inner.state.error_message = Some(e.to_string());
                 inner.state.pending_session_writes.clear();

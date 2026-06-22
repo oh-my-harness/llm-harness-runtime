@@ -16,15 +16,22 @@
 //!   OPENAI_MODEL               Model name for OpenAI-compatible provider (default: gpt-4o)
 //!   CODING_AGENT_MODEL         Override default model for any provider
 
+use std::io::Read;
 use std::sync::Arc;
 
 use clap::Parser;
+use llm_harness_agent::SessionRepo;
+use llm_harness_agent::session::Session;
+use llm_harness_agent::session::jsonl::JsonlSessionRepo;
+use llm_harness_agent::session::types::CreateSessionOptions;
 use llm_harness_runtime::HarnessBuilder;
 use llm_harness_runtime_sandbox_os::OsEnv;
 
-use coding_agent::ui;
 use coding_agent::plugin::CodingAgentPlugin;
 use coding_agent::provider;
+use coding_agent::ui;
+
+const SESSION_DIR: &str = ".coding-agent/sessions";
 
 #[derive(Parser)]
 #[command(
@@ -83,13 +90,17 @@ async fn run() -> Result<(), i32> {
     // ── Build harness ───────────────────────────────────────────────────────────
 
     let plugin = CodingAgentPlugin::new(&cwd);
-    let env = Arc::new(OsEnv::new(cwd));
+    let env = Arc::new(OsEnv::new(&cwd));
+
+    let session = create_session(&cwd, &resolved.model).await.map_err(|e| {
+        eprintln!("Error creating session: {e}");
+        1
+    })?;
 
     let harness = HarnessBuilder::new(&resolved.model)
         .install(&plugin)
         .provider(&resolved.model, resolved.client)
-        .build(env)
-        .await
+        .build_with_session(env, session)
         .map_err(|e| {
             eprintln!("Error building agent: {e}");
             1
@@ -204,4 +215,28 @@ fn resolve_prompt(cli: &Cli) -> Result<String, String> {
     Err("No prompt provided. Use -p \"prompt\", pass text as argument, or pipe via stdin.".into())
 }
 
-use std::io::Read;
+// ── Session persistence ──────────────────────────────────────────────────────────
+
+/// Create a file-backed session in `.coding-agent/sessions/` under `cwd`.
+async fn create_session(cwd: &std::path::Path, model: &str) -> Result<Session, String> {
+    let session_dir = cwd.join(SESSION_DIR);
+    std::fs::create_dir_all(&session_dir).map_err(|e| {
+        format!(
+            "Failed to create session dir {}: {e}",
+            session_dir.display()
+        )
+    })?;
+
+    let repo = JsonlSessionRepo::new(&session_dir);
+    let storage = repo
+        .create(CreateSessionOptions {
+            name: None,
+            initial_model: Some(model.to_string()),
+            initial_thinking_level: None,
+            initial_tools: vec![],
+        })
+        .await
+        .map_err(|e| format!("Failed to create session: {e}"))?;
+
+    Ok(Session::new(storage))
+}
