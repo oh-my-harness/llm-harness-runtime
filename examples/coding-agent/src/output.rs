@@ -358,15 +358,19 @@ fn extract_text_from_content(blocks: &[ContentBlock], max_chars: usize) -> Strin
     truncate(&one_line, max_chars).to_string()
 }
 
-/// Build a compact result summary: char count + first line of content.
+/// Build a compact result summary: char count + preview of content.
+///
+/// The char count reflects the full (pre-truncation) combined text so the user
+/// can gauge the actual result size.  The preview is then truncated to
+/// `max_chars` for display.
 fn summarize_result(blocks: &[ContentBlock], max_chars: usize) -> String {
-    let text = extract_text_from_content(blocks, max_chars * 2);
-    if text.is_empty() {
+    // Collect the full text first (no truncation) to get the accurate count.
+    let full_text = extract_text_from_content(blocks, usize::MAX);
+    if full_text.is_empty() {
         return "(no output)".to_string();
     }
-    // Show char count so user can gauge result size, then a preview.
-    let char_count = text.chars().count();
-    let preview = truncate(&text, max_chars);
+    let char_count = full_text.chars().count();
+    let preview = truncate(&full_text, max_chars);
     if char_count <= max_chars {
         preview.to_string()
     } else {
@@ -580,8 +584,8 @@ mod tests {
         let long = "a".repeat(300);
         let blocks = vec![ContentBlock::Text { text: long }];
         let s = summarize_result(&blocks, 100);
-        // extract_text_from_content caps at max_chars*2=200, so char count is 200
-        assert!(s.starts_with("[200 chars]"), "got: {s}");
+        // char count reflects the full 300-char content, not the truncated preview.
+        assert!(s.starts_with("[300 chars]"), "got: {s}");
     }
 
     #[test]
