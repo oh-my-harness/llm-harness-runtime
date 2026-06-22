@@ -2,6 +2,8 @@ use futures::future::BoxFuture;
 use llm_harness_types::*;
 use serde_json::Value;
 
+use super::resolve_path;
+
 /// Maximum lines returned by a single Read call.
 pub const MAX_LINES: usize = 2000;
 /// Maximum bytes returned by a single Read call.
@@ -90,15 +92,6 @@ async fn read_file(args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolErr
     })
 }
 
-fn resolve_path(path: &str, cwd: &std::path::Path) -> std::path::PathBuf {
-    let p = std::path::Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        cwd.join(p)
-    }
-}
-
 /// Slice lines by offset/limit and apply MAX_LINES / MAX_BYTES truncation.
 pub fn format_text_output(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
     let all_lines: Vec<&str> = content.split('\n').collect();
@@ -165,34 +158,11 @@ pub fn format_text_output(content: &str, offset: Option<usize>, limit: Option<us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::test_helpers::make_ctx_with_rx;
     use llm_harness_loop::test_utils::NoOpEnv;
     use std::io::Write as IoWrite;
     use std::sync::Arc;
     use tempfile::NamedTempFile;
-    use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
-
-    fn make_ctx(env: Arc<dyn ExecutionEnv>) -> (ToolContext, mpsc::Receiver<ToolResult>) {
-        let (tx, rx) = mpsc::channel(4);
-        let ctx = ToolContext {
-            env,
-            abort: CancellationToken::new(),
-            tool_use_id: "test-id".into(),
-            turn_index: 0,
-            assistant_message: Arc::new(AssistantMessage {
-                content: vec![],
-                stop_reason: None,
-                timestamp: chrono::Utc::now(),
-                provider: None,
-                api: None,
-                model: None,
-                usage: None,
-                error_message: None,
-            }),
-            update_tx: tx,
-        };
-        (ctx, rx)
-    }
 
     #[test]
     fn format_returns_full_content_for_small_file() {
@@ -251,7 +221,7 @@ mod tests {
         let path = tmp.path().to_path_buf();
 
         let env = Arc::new(OsEnv::new(path.parent().unwrap().to_path_buf()));
-        let (ctx, _rx) = make_ctx(env);
+        let (ctx, _rx) = make_ctx_with_rx(env);
 
         let tool = ReadTool::new();
         let args = serde_json::json!({ "file_path": path.to_str().unwrap() });
@@ -269,7 +239,7 @@ mod tests {
         use llm_harness_runtime_sandbox_os::OsEnv;
 
         let env = Arc::new(OsEnv::new(std::path::PathBuf::from("/tmp")));
-        let (ctx, _rx) = make_ctx(env);
+        let (ctx, _rx) = make_ctx_with_rx(env);
 
         let tool = ReadTool::new();
         let args = serde_json::json!({ "file_path": "/tmp/nonexistent_file_xyz_12345.txt" });
@@ -280,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn execute_with_noop_env_returns_error() {
         let env = Arc::new(NoOpEnv);
-        let (ctx, _rx) = make_ctx(env);
+        let (ctx, _rx) = make_ctx_with_rx(env);
 
         let tool = ReadTool::new();
         let args = serde_json::json!({ "file_path": "/any/path" });

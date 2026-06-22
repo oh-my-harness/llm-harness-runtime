@@ -19,16 +19,12 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use llm_adapter::anthropic::AnthropicProvider;
-use llm_adapter::openai::OpenAIProvider;
-use llm_harness_loop::LlmClient;
 use llm_harness_runtime::HarnessBuilder;
 use llm_harness_runtime_sandbox_os::OsEnv;
 
-use coding_agent::output;
+use coding_agent::ui;
 use coding_agent::plugin::CodingAgentPlugin;
-
-const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+use coding_agent::provider;
 
 #[derive(Parser)]
 #[command(
@@ -51,23 +47,20 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
-    let code = run().await;
+    let code = run().await.err().unwrap_or(0);
     std::process::exit(code);
 }
 
-async fn run() -> i32 {
+async fn run() -> Result<(), i32> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
     // ── Parse args ────────────────────────────────────────────────────────────────
 
-    let cli = match Cli::try_parse() {
-        Ok(c) => c,
-        Err(e) => {
-            // clap prints the error / help to stderr, exit with code 2
-            e.print().expect("Error writing to stderr");
-            return 2;
-        }
-    };
+    let cli = Cli::try_parse().map_err(|e| {
+        // clap prints the error / help to stderr, exit with code 2
+        e.print().expect("Error writing to stderr");
+        2
+    })?;
 
     // ── Detect mode: interactive vs one-shot ──────────────────────────────────────
 
@@ -77,89 +70,30 @@ async fn run() -> i32 {
     let prompt_opt = if interactive {
         None
     } else {
-        match resolve_prompt(&cli) {
-            Ok(p) => Some(p),
-            Err(msg) => {
-                eprintln!("Error: {msg}");
-                return 1;
-            }
-        }
+        Some(resolve_prompt(&cli).map_err(|msg| {
+            eprintln!("Error: {msg}");
+            1
+        })?)
     };
 
     // ── Resolve provider ────────────────────────────────────────────────────────
 
-    let openai_key = std::env::var("OPENAI_API_KEY")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let openai_base = std::env::var("OPENAI_API_BASE")
-        .ok()
-        .filter(|s| !s.is_empty());
-
-    let (client, default_model): (Arc<dyn LlmClient>, String) =
-        if let (Some(key), Some(base)) = (openai_key, openai_base) {
-            let base_trimmed = base.trim_end_matches('/').to_string();
-            let (base_url, chat_path) = if base_trimmed.ends_with("/v1") {
-                (base_trimmed, "/chat/completions".to_string())
-            } else {
-                (base_trimmed, "/v1/chat/completions".to_string())
-            };
-            let provider = OpenAIProvider::builder(key)
-                .base_url(base_url)
-                .chat_path(chat_path)
-                .build();
-            let model = std::env::var("OPENAI_MODEL")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "gpt-4o".to_string());
-            (Arc::new(provider), model)
-        } else {
-            let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-                Ok(k) if !k.is_empty() => k,
-                _ => {
-                    eprintln!("Error: set ANTHROPIC_API_KEY or OPENAI_API_KEY + OPENAI_API_BASE");
-                    return 1;
-                }
-            };
-
-            let anthropic_base = std::env::var("ANTHROPIC_API_BASE")
-                .ok()
-                .filter(|s| !s.is_empty());
-            let anthropic_model = std::env::var("ANTHROPIC_MODEL")
-                .ok()
-                .filter(|s| !s.is_empty());
-
-            let mut builder = AnthropicProvider::builder(api_key);
-            if let Some(base) = anthropic_base {
-                builder = builder.base_url(base);
-            }
-            let provider = builder.build();
-
-            let model = anthropic_model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
-            (Arc::new(provider), model)
-        };
-
-    let model = std::env::var("CODING_AGENT_MODEL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(default_model);
+    let resolved = provider::resolve_provider().ok_or(1)?;
 
     // ── Build harness ───────────────────────────────────────────────────────────
 
     let plugin = CodingAgentPlugin::new(&cwd);
     let env = Arc::new(OsEnv::new(cwd));
 
-    let harness = match HarnessBuilder::new(&model)
+    let harness = HarnessBuilder::new(&resolved.model)
         .install(&plugin)
-        .provider(&model, client)
+        .provider(&resolved.model, resolved.client)
         .build(env)
         .await
-    {
-        Ok(h) => h,
-        Err(e) => {
+        .map_err(|e| {
             eprintln!("Error building agent: {e}");
-            return 1;
-        }
-    };
+            1
+        })?;
 
     // ── Run ────────────────────────────────────────────────────────────────────
 
@@ -173,9 +107,9 @@ async fn run() -> i32 {
 
 // ── One-shot mode ──────────────────────────────────────────────────────────────
 
-async fn run_one_shot(harness: &llm_harness_agent::AgentHarness, prompt: &str) -> i32 {
+async fn run_one_shot(harness: &llm_harness_agent::AgentHarness, prompt: &str) -> Result<(), i32> {
     let events = harness.subscribe();
-    let printer = tokio::spawn(output::render_one_shot(events));
+    let printer = tokio::spawn(ui::render_one_shot(events));
 
     if let Err(e) = harness.prompt(prompt).await {
         eprintln!("\nError: {e}");
@@ -183,12 +117,12 @@ async fn run_one_shot(harness: &llm_harness_agent::AgentHarness, prompt: &str) -
 
     let _ = printer.await;
     println!();
-    0
+    Ok(())
 }
 
 // ── Interactive REPL ─────────────────────────────────────────────────────────────
 
-async fn run_repl(harness: &llm_harness_agent::AgentHarness) -> i32 {
+async fn run_repl(harness: &llm_harness_agent::AgentHarness) -> Result<(), i32> {
     use rustyline::DefaultEditor;
     use rustyline::error::ReadlineError;
 
@@ -197,13 +131,10 @@ async fn run_repl(harness: &llm_harness_agent::AgentHarness) -> i32 {
         .join("coding-agent")
         .join("history");
 
-    let mut editor = match DefaultEditor::new() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Failed to initialize line editor: {e}");
-            return 1;
-        }
-    };
+    let mut editor = DefaultEditor::new().map_err(|e| {
+        eprintln!("Failed to initialize line editor: {e}");
+        1
+    })?;
 
     if history_path.exists() {
         let _ = editor.load_history(&history_path);
@@ -216,7 +147,7 @@ async fn run_repl(harness: &llm_harness_agent::AgentHarness) -> i32 {
             Err(e) => {
                 eprintln!("Error reading input: {e}");
                 let _ = save_history(&mut editor, &history_path);
-                return 1;
+                return Err(1);
             }
         };
 
@@ -229,14 +160,14 @@ async fn run_repl(harness: &llm_harness_agent::AgentHarness) -> i32 {
         }
         let _ = editor.add_history_entry(&line);
 
-        if run_one_shot(harness, &line).await != 0 {
+        if run_one_shot(harness, &line).await.is_err() {
             let _ = save_history(&mut editor, &history_path);
-            return 1;
+            return Err(1);
         }
     }
 
     let _ = save_history(&mut editor, &history_path);
-    0
+    Ok(())
 }
 
 fn save_history(
