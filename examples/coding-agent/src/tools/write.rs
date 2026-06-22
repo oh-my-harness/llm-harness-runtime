@@ -2,6 +2,8 @@ use futures::future::BoxFuture;
 use llm_harness_types::*;
 use serde_json::Value;
 
+use super::resolve_path;
+
 /// Write (create or overwrite) a file with given content.
 pub struct WriteTool {
     schema: Value,
@@ -88,50 +90,19 @@ async fn write_file(args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolEr
     })
 }
 
-fn resolve_path(path: &str, cwd: &std::path::Path) -> std::path::PathBuf {
-    let p = std::path::Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        cwd.join(p)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::test_helpers;
     use llm_harness_runtime_sandbox_os::OsEnv;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
-
-    fn make_ctx(env: Arc<dyn ExecutionEnv>) -> ToolContext {
-        let (tx, _rx) = mpsc::channel(4);
-        ToolContext {
-            env,
-            abort: CancellationToken::new(),
-            tool_use_id: "test-id".into(),
-            turn_index: 0,
-            assistant_message: Arc::new(AssistantMessage {
-                content: vec![],
-                stop_reason: None,
-                timestamp: chrono::Utc::now(),
-                provider: None,
-                api: None,
-                model: None,
-                usage: None,
-                error_message: None,
-            }),
-            update_tx: tx,
-        }
-    }
 
     #[tokio::test]
     async fn write_creates_new_file() {
         let dir = TempDir::new().unwrap();
         let env = Arc::new(OsEnv::new(dir.path().to_path_buf()));
-        let ctx = make_ctx(env);
+        let ctx = test_helpers::make_ctx(env);
 
         let target = dir.path().join("new_file.txt");
         let tool = WriteTool::new();
@@ -152,7 +123,7 @@ mod tests {
         std::fs::write(&target, "old content").unwrap();
 
         let env = Arc::new(OsEnv::new(dir.path().to_path_buf()));
-        let ctx = make_ctx(env);
+        let ctx = test_helpers::make_ctx(env);
 
         let tool = WriteTool::new();
         let args = serde_json::json!({
@@ -170,7 +141,7 @@ mod tests {
         let target = dir.path().join("a/b/c/file.txt");
 
         let env = Arc::new(OsEnv::new(dir.path().to_path_buf()));
-        let ctx = make_ctx(env);
+        let ctx = test_helpers::make_ctx(env);
 
         let tool = WriteTool::new();
         let args = serde_json::json!({

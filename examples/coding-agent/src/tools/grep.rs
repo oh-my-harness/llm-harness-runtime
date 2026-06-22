@@ -4,8 +4,7 @@ use futures::future::BoxFuture;
 use llm_harness_types::*;
 use serde_json::Value;
 
-/// Maximum combined stdout bytes returned by a single Grep call.
-pub const MAX_OUTPUT_BYTES: usize = 100 * 1024;
+use super::MAX_OUTPUT_BYTES;
 
 /// Search for a regex pattern in files using ripgrep (falls back to grep).
 ///
@@ -246,32 +245,10 @@ fn shell_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::test_helpers;
     use llm_harness_runtime_sandbox_os::OsEnv;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
-
-    fn make_ctx(env: Arc<dyn ExecutionEnv>) -> ToolContext {
-        let (tx, _rx) = mpsc::channel(4);
-        ToolContext {
-            env,
-            abort: CancellationToken::new(),
-            tool_use_id: "test-id".into(),
-            turn_index: 0,
-            assistant_message: Arc::new(AssistantMessage {
-                content: vec![],
-                stop_reason: None,
-                timestamp: chrono::Utc::now(),
-                provider: None,
-                api: None,
-                model: None,
-                usage: None,
-                error_message: None,
-            }),
-            update_tx: tx,
-        }
-    }
 
     #[test]
     fn build_rg_command_basic() {
@@ -357,7 +334,7 @@ mod tests {
         std::fs::write(dir.path().join("test.txt"), "hello world\nfoo bar\n").unwrap();
 
         let env = Arc::new(OsEnv::new(dir.path().to_path_buf()));
-        let ctx = make_ctx(env);
+        let ctx = test_helpers::make_ctx(env);
 
         let tool = GrepTool::new();
         let args = serde_json::json!({
@@ -384,7 +361,7 @@ mod tests {
         std::fs::write(dir.path().join("test.txt"), "hello world\n").unwrap();
 
         let env = Arc::new(OsEnv::new(dir.path().to_path_buf()));
-        let ctx = make_ctx(env);
+        let ctx = test_helpers::make_ctx(env);
 
         let tool = GrepTool::new();
         let args = serde_json::json!({
@@ -411,7 +388,7 @@ mod tests {
         std::fs::write(dir.path().join("test.txt"), "hello\n").unwrap();
 
         let env = Arc::new(OsEnv::new(dir.path().to_path_buf()));
-        let ctx = make_ctx(env);
+        let ctx = test_helpers::make_ctx(env);
 
         let tool = GrepTool::new();
         // An invalid regex causes rg to exit with code 2.
@@ -491,7 +468,7 @@ mod tests {
         std::fs::write(dir.path().join("test.txt"), "hello from grep fallback\n").unwrap();
 
         let env = Arc::new(OsEnv::new(dir.path().to_path_buf()));
-        let ctx = make_ctx(env);
+        let ctx = test_helpers::make_ctx(env);
 
         let tool = GrepTool::new();
         let args = serde_json::json!({

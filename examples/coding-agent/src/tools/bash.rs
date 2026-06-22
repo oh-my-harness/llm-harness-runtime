@@ -2,8 +2,7 @@ use futures::future::BoxFuture;
 use llm_harness_types::*;
 use serde_json::Value;
 
-/// Maximum combined stdout+stderr bytes returned by a single Bash call.
-pub const MAX_OUTPUT_BYTES: usize = 100 * 1024;
+use super::MAX_OUTPUT_BYTES;
 
 /// Bytes kept from the head of oversized output.
 pub const HEAD_BYTES: usize = 40 * 1024;
@@ -141,31 +140,9 @@ pub fn format_output(output: &ShellOutput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::test_helpers::make_ctx;
     use llm_harness_runtime_sandbox_os::OsEnv;
     use std::sync::Arc;
-    use tokio::sync::mpsc;
-    use tokio_util::sync::CancellationToken;
-
-    fn make_ctx(env: Arc<dyn ExecutionEnv>) -> ToolContext {
-        let (tx, _rx) = mpsc::channel(4);
-        ToolContext {
-            env,
-            abort: CancellationToken::new(),
-            tool_use_id: "test-id".into(),
-            turn_index: 0,
-            assistant_message: Arc::new(AssistantMessage {
-                content: vec![],
-                stop_reason: None,
-                timestamp: chrono::Utc::now(),
-                provider: None,
-                api: None,
-                model: None,
-                usage: None,
-                error_message: None,
-            }),
-            update_tx: tx,
-        }
-    }
 
     #[test]
     fn format_output_success() {

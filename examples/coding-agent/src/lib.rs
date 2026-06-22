@@ -4,7 +4,8 @@
 //! modes, and event-based terminal output rendering.
 
 pub mod hooks;
-pub mod output;
 pub mod plugin;
 pub mod prompt;
+pub mod provider;
 pub mod tools;
+pub mod ui;
