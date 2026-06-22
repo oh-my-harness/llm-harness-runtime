@@ -5,6 +5,11 @@ use serde_json::Value;
 /// Maximum combined stdout+stderr bytes returned by a single Bash call.
 pub const MAX_OUTPUT_BYTES: usize = 100 * 1024;
 
+/// Bytes kept from the head of oversized output.
+pub const HEAD_BYTES: usize = 40 * 1024;
+/// Bytes kept from the tail of oversized output.
+pub const TAIL_BYTES: usize = 40 * 1024;
+
 /// Execute a shell command and return its combined stdout + stderr.
 pub struct BashTool {
     schema: Value,
@@ -105,15 +110,22 @@ async fn run_bash(args: Value, ctx: &ToolContext) -> Result<ToolResult, ToolErro
 }
 
 /// Combine stdout + stderr, truncate to MAX_OUTPUT_BYTES, annotate exit code.
+///
+/// When output exceeds MAX_OUTPUT_BYTES, keeps the first HEAD_BYTES and the
+/// last TAIL_BYTES, inserting a "[... N bytes omitted ...]" marker in between.
+/// This ensures both the beginning of output (context) and the end (errors,
+/// test results) are always visible to the LLM.
 pub fn format_output(output: &ShellOutput) -> String {
     let combined = format!("{}{}", output.stdout, output.stderr);
     let truncated = if combined.len() > MAX_OUTPUT_BYTES {
-        let end = combined.floor_char_boundary(MAX_OUTPUT_BYTES);
-        let cut = &combined[..end];
+        let head_end = combined.floor_char_boundary(HEAD_BYTES);
+        let tail_start = combined.ceil_char_boundary(combined.len() - TAIL_BYTES);
+        let omitted = tail_start - head_end;
         format!(
-            "{}\n[Output truncated: {} bytes omitted]",
-            cut,
-            combined.len() - end
+            "{}\n[... {} bytes omitted ...]\n{}",
+            &combined[..head_end],
+            omitted,
+            &combined[tail_start..]
         )
     } else {
         combined
@@ -186,8 +198,35 @@ mod tests {
             exit_code: 0,
         };
         let text = format_output(&out);
-        assert!(text.contains("truncated"), "got: {:?}", &text[..100]);
-        assert!(text.len() <= MAX_OUTPUT_BYTES + 200);
+        assert!(text.contains("omitted"), "got: {:?}", &text[..100]);
+        // head + tail + marker overhead — well under 2 * MAX_OUTPUT_BYTES
+        assert!(text.len() <= HEAD_BYTES + TAIL_BYTES + 200);
+    }
+
+    #[test]
+    fn format_output_head_and_tail_both_preserved() {
+        // Build output that clearly exceeds MAX_OUTPUT_BYTES.
+        // Head: HEAD_BYTES of 'H', Middle: enough 'M' to exceed limit, Tail: TAIL_BYTES of 'T'.
+        let head = "H".repeat(HEAD_BYTES);
+        let middle = "M".repeat(MAX_OUTPUT_BYTES); // ensures total >> MAX_OUTPUT_BYTES
+        let tail = "T".repeat(TAIL_BYTES);
+        let big = format!("{}{}{}", head, middle, tail);
+
+        let out = ShellOutput {
+            stdout: big,
+            stderr: String::new(),
+            exit_code: 0,
+        };
+        let text = format_output(&out);
+
+        // Head content is present
+        assert!(text.starts_with(&"H".repeat(100)), "head missing");
+        // Tail content is present
+        assert!(text.ends_with(&"T".repeat(100)), "tail missing");
+        // Omission marker is present
+        assert!(text.contains("bytes omitted"), "omitted marker missing");
+        // Middle content is not in the output
+        assert!(!text.contains("MMM"), "middle should be omitted");
     }
 
     #[test]
