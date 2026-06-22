@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use llm_harness_agent::{HarnessHooks, Plugin};
+use llm_harness_runtime::human_approval::{HumanApprovalWrapper, TimeoutPolicy};
 use llm_harness_types::Tool;
 
+use crate::hooks::TtyHumanApprover;
 use crate::prompt::{self, SystemPromptHook};
 use crate::tools::{bash, edit, grep, read, write};
 
@@ -46,6 +48,16 @@ impl Plugin for CodingAgentPlugin {
         hooks
             .before_run
             .push(Arc::new(SystemPromptHook::new(self.system_prompt())));
+
+        let approver = Arc::new(TtyHumanApprover::new(vec!["bash", "edit", "write"]));
+        hooks
+            .before_tool_call
+            .push(Arc::new(HumanApprovalWrapper::new(
+                approver,
+                TimeoutPolicy::Deny {
+                    reason: "No response from user".into(),
+                },
+            )));
     }
 }
 
@@ -79,6 +91,14 @@ mod tests {
         let mut hooks = HarnessHooks::none();
         plugin.register_hooks(&mut hooks);
         assert_eq!(hooks.before_run.len(), 1);
+    }
+
+    #[test]
+    fn plugin_registers_before_tool_call_hook() {
+        let plugin = CodingAgentPlugin::new(std::path::Path::new("."));
+        let mut hooks = HarnessHooks::none();
+        plugin.register_hooks(&mut hooks);
+        assert_eq!(hooks.before_tool_call.len(), 1);
     }
 
     #[test]
