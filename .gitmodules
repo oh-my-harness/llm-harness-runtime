@@ -1,3 +1,6 @@
 [submodule "examples/llm-tutor"]
 	path = examples/llm-tutor
 	url = https://github.com/oh-my-harness/llm-tutor.git
+[submodule "examples/coding-agent"]
+	path = examples/coding-agent
+	url = git@github.com:oh-my-harness/coding-agent.git
