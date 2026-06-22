@@ -42,7 +42,7 @@ impl HumanApprover for TtyHumanApprover {
 
             let args_summary = format_args_summary(&tool_name, &args);
             let prompt = format!(
-                "\n[confirm] {} {}\nProceed? [y/N] ",
+                "\n[confirm] {} {}\nProceed? [Y/n] ",
                 tool_name, args_summary
             );
 
@@ -74,7 +74,12 @@ impl HumanApprover for TtyHumanApprover {
                 match BufReader::new(tty).read_line(&mut line) {
                     Ok(0) | Err(_) => None, // EOF or read error — let TimeoutPolicy decide
                     Ok(_) => {
-                        if line.trim().eq_ignore_ascii_case("y") {
+                        let trimmed = line.trim();
+                        // Empty (Enter) or "y"/"yes" → approve; anything else → deny
+                        if trimmed.is_empty()
+                            || trimmed.eq_ignore_ascii_case("y")
+                            || trimmed.eq_ignore_ascii_case("yes")
+                        {
                             Some(ApprovalDecision::Approve)
                         } else {
                             Some(ApprovalDecision::Deny {
