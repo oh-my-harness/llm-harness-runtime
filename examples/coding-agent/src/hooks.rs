@@ -46,7 +46,7 @@ impl HumanApprover for TtyHumanApprover {
                 tool_name, args_summary
             );
 
-            tokio::task::spawn_blocking(move || {
+            let decision = tokio::task::spawn_blocking(move || {
                 use std::io::{BufRead, BufReader, Write};
 
                 let mut tty = match std::fs::OpenOptions::new()
@@ -56,8 +56,6 @@ impl HumanApprover for TtyHumanApprover {
                 {
                     Ok(f) => f,
                     Err(e) => {
-                        // No controlling terminal (CI, Docker, piped). Approve and warn so
-                        // the agent is not silently blocked with a misleading "no response" error.
                         eprintln!("[warn] cannot open /dev/tty ({e}); auto-approving tool call");
                         return Some(ApprovalDecision::Approve);
                     }
@@ -72,10 +70,9 @@ impl HumanApprover for TtyHumanApprover {
 
                 let mut line = String::new();
                 match BufReader::new(tty).read_line(&mut line) {
-                    Ok(0) | Err(_) => None, // EOF or read error — let TimeoutPolicy decide
+                    Ok(0) | Err(_) => None,
                     Ok(_) => {
                         let trimmed = line.trim();
-                        // Empty (Enter) or "y"/"yes" → approve; anything else → deny
                         if trimmed.is_empty()
                             || trimmed.eq_ignore_ascii_case("y")
                             || trimmed.eq_ignore_ascii_case("yes")
@@ -91,7 +88,15 @@ impl HumanApprover for TtyHumanApprover {
             })
             .await
             .ok()
-            .flatten()
+            .flatten();
+
+            // After a deny, tell the user the current turn is ending
+            // so they can type a new instruction at the `> ` prompt.
+            if matches!(decision, Some(ApprovalDecision::Deny { .. })) {
+                eprintln!("\nOperation denied. You can now type what you'd like to do instead.\n");
+            }
+
+            decision
         })
     }
 }

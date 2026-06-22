@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use llm_harness_types::{
-    BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook, ToolResult,
+    BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook, ContentBlock, ToolResult,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -101,17 +101,27 @@ impl BeforeToolCallHook for HumanApprovalWrapper {
                 Some(ApprovalDecision::Approve) => BeforeToolCallDecision::Allow,
                 Some(ApprovalDecision::Deny { reason }) => {
                     BeforeToolCallDecision::Deny(ToolResult {
-                        content: vec![],
+                        content: vec![ContentBlock::Text {
+                            text: format!(
+                                "The operation was denied by the user.\nReason: {reason}\n\
+                                 Please ask the user what they would like to do instead."
+                            ),
+                        }],
                         details: serde_json::json!({"reason": reason}),
-                        terminate: false,
+                        terminate: true,
                     })
                 }
                 None => match &self.on_timeout {
                     TimeoutPolicy::Approve => BeforeToolCallDecision::Allow,
                     TimeoutPolicy::Deny { reason } => BeforeToolCallDecision::Deny(ToolResult {
-                        content: vec![],
+                        content: vec![ContentBlock::Text {
+                            text: format!(
+                                "The operation was denied by the user (timeout).\nReason: {reason}\n\
+                                 Please ask the user what they would like to do instead."
+                            ),
+                        }],
                         details: serde_json::json!({"reason": reason}),
-                        terminate: false,
+                        terminate: true,
                     }),
                 },
             }
