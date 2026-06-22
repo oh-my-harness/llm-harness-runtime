@@ -1,8 +1,7 @@
 //! Streaming Markdown renderer for incremental text deltas.
 //!
 //! Accumulates incoming `TextDelta`s and renders complete blocks
-//! (paragraphs and code blocks) via `termimad`, while printing
-//! in-progress text raw for a "typewriter" feel.
+//! (paragraphs and code blocks) via `termimad`.
 //!
 //! # Strategy
 //!
@@ -14,8 +13,9 @@
 //!   flush and render that paragraph via `termimad`.
 //! - When a **code fence** closes (paired ` ``` `), flush and render the whole
 //!   fenced block via `termimad`.
-//! - **Within** an in-progress block, print raw text so the user sees output
-//!   immediately (the "typewriter" feel).
+//! - Within an in-progress block, **do not print anything**.  This avoids
+//!   showing raw Markdown (e.g. table rows like `| col |`) to the user before
+//!   the block is ready.
 //! - On `PhaseChange → Idle`, flush whatever remains in the buffer.
 
 use std::io::Write;
@@ -24,15 +24,15 @@ use termimad::MadSkin;
 
 /// Stateful renderer that accepts incremental text deltas and emits
 /// formatted Markdown to stdout whenever a complete block is available.
+///
+/// Incomplete text (no paragraph boundary, unclosed fence) is silently
+/// accumulated until a complete block can be flushed.
 pub struct StreamingRenderer {
     skin: MadSkin,
     /// Accumulated text not yet rendered.
     buf: String,
     /// How many ``` fences are currently open (0 = outside code block).
     fence_depth: usize,
-    /// Characters printed raw (before the next rendered flush) that need
-    /// to be cleared before re-printing the rendered version.
-    raw_chars_printed: usize,
 }
 
 impl StreamingRenderer {
@@ -41,7 +41,6 @@ impl StreamingRenderer {
             skin: MadSkin::default(),
             buf: String::new(),
             fence_depth: 0,
-            raw_chars_printed: 0,
         }
     }
 
@@ -62,25 +61,17 @@ impl StreamingRenderer {
     /// Flush all remaining buffered content (called at end of stream).
     pub fn flush_all(&mut self) {
         if !self.buf.is_empty() {
-            self.clear_raw();
             let content = std::mem::take(&mut self.buf);
             self.render_block(&content);
-            self.raw_chars_printed = 0;
         }
         let _ = std::io::stdout().flush();
     }
 
-    /// Clear any raw-printed characters so an out-of-band line (e.g. a tool
-    /// annotation) can be printed without overlapping buffered text.
+    /// No-op since we no longer raw-print incomplete text.
     ///
-    /// The buffered content is NOT discarded; the next `push()` call will
-    /// raw-print it again from the beginning.
-    pub fn flush_raw(&mut self) {
-        if self.raw_chars_printed > 0 {
-            self.clear_raw();
-            // raw_chars_printed is reset to 0 inside clear_raw.
-        }
-    }
+    /// Provided for compatibility with callers that flush before out-of-band
+    /// lines (tool annotations, retry warnings).
+    pub fn flush_raw(&mut self) {}
 
     // ── private ───────────────────────────────────────────────────────────────
 
@@ -94,9 +85,7 @@ impl StreamingRenderer {
     fn try_flush_blocks(&mut self) {
         loop {
             if self.fence_depth > 0 {
-                // Inside a code block — nothing to flush yet, just raw-print
-                // any new chars so the user sees progress.
-                self.raw_print_tail();
+                // Inside a code block — wait for the closing fence.
                 break;
             }
 
@@ -107,50 +96,14 @@ impl StreamingRenderer {
                 if self.buf.starts_with("\n\n") {
                     self.buf.drain(..2);
                 }
-                self.clear_raw();
                 self.render_block(block.trim_end_matches('\n'));
-                self.raw_chars_printed = 0;
                 // Re-sync fence depth for the remaining buffer.
                 self.fence_depth = count_open_fences(&self.buf);
             } else {
-                // No complete paragraph yet — raw-print the tail for immediacy.
-                self.raw_print_tail();
+                // No complete block yet — wait for more text.
                 break;
             }
         }
-    }
-
-    /// Print any new characters added since last raw print.
-    fn raw_print_tail(&mut self) {
-        let already = self.raw_chars_printed;
-        let total: usize = self.buf.chars().count();
-        if total > already {
-            let new_part: String = self.buf.chars().skip(already).collect();
-            print!("{new_part}");
-            let _ = std::io::stdout().flush();
-            self.raw_chars_printed = total;
-        }
-    }
-
-    /// Clear the raw-printed characters by overwriting with spaces, then move
-    /// cursor back. This lets termimad re-render the block cleanly.
-    fn clear_raw(&mut self) {
-        if self.raw_chars_printed == 0 {
-            return;
-        }
-        // Count how many actual terminal lines the raw text occupied.
-        let raw_text: String = self.buf.chars().take(self.raw_chars_printed).collect();
-        let newline_count = raw_text.chars().filter(|&c| c == '\n').count();
-
-        // Move up `newline_count` lines, then clear from cursor to end.
-        if newline_count > 0 {
-            // Move up N lines
-            print!("\x1b[{newline_count}A");
-        }
-        // Clear from cursor to end of screen
-        print!("\x1b[J");
-        let _ = std::io::stdout().flush();
-        self.raw_chars_printed = 0;
     }
 
     /// Render a complete block via termimad and print a trailing newline.
@@ -285,14 +238,26 @@ mod tests {
     }
 
     #[test]
-    fn flush_raw_resets_printed_count() {
+    fn table_content_is_not_raw_printed_before_complete() {
+        // Table rows don't have a natural paragraph boundary (no \n\n).
+        // The renderer must NOT panic or crash while they accumulate.
         let mut r = StreamingRenderer::new();
-        // Push some text that goes to raw buffer (no paragraph boundary yet)
+        r.push("| Name | Age |\n");
+        r.push("|------|-----|\n");
+        r.push("| Alice | 30 |\n");
+        // No boundary reached yet — all accumulated silently.
+        r.push("\n");
+        r.push("After the table.\n");
+        r.flush_all();
+    }
+
+    #[test]
+    fn flush_raw_is_noop_after_removing_raw_print() {
+        let mut r = StreamingRenderer::new();
+        // Push some text that has no paragraph boundary — no raw print, no crash.
         r.push("partial line without newline");
-        // flush_raw should clear the raw counter without discarding the buffer
         r.flush_raw();
-        assert_eq!(r.raw_chars_printed, 0);
-        // Buffer still has content; flush_all should not panic
+        // Buffer still has content, flush_all should render it.
         r.flush_all();
     }
 }

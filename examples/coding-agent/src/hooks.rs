@@ -1,10 +1,16 @@
 use futures::future::BoxFuture;
 use llm_harness_runtime::human_approval::{ApprovalDecision, ApprovalRequest, HumanApprover};
+use tokio::sync::Mutex;
 
 /// Prompts the user via `/dev/tty` before executing a tool.
 ///
 /// Uses `/dev/tty` rather than stdin so it works even when stdin is held by
 /// rustyline or redirected from a pipe.
+///
+/// A global mutex serialises blocking I/O on `/dev/tty` so that parallel tool
+/// invocations (from a single assistant message with multiple `tool_use`
+/// blocks) show confirm prompts one at a time instead of racing on the shared
+/// terminal device.
 pub struct TtyHumanApprover {
     confirm_tools: Vec<String>,
 }
@@ -28,6 +34,11 @@ impl HumanApprover for TtyHumanApprover {
             if !needs_confirm {
                 return Some(ApprovalDecision::Approve);
             }
+
+            // Serialise concurrent confirm prompts so they don't race on
+            // `/dev/tty`. The lock is held at the async layer, before
+            // `spawn_blocking`, ensuring only one blocking I/O at a time.
+            let _guard = TTY_LOCK.lock().await;
 
             let args_summary = format_args_summary(&tool_name, &args);
             let prompt = format!(
@@ -79,6 +90,9 @@ impl HumanApprover for TtyHumanApprover {
         })
     }
 }
+
+/// Serialises `/dev/tty` access across concurrent `ask()` calls.
+static TTY_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn format_args_summary(tool_name: &str, args: &serde_json::Value) -> String {
     match tool_name {
