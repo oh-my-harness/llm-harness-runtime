@@ -16,7 +16,7 @@ llm-harness-runtime-sandbox-os = { path = "../../crates/llm-harness-runtime-sand
 llm-harness-types    = { path = "../../crates/llm-harness-types" }
 llm_adapter          = { workspace = true }
 
-tokio       = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio       = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util  = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
