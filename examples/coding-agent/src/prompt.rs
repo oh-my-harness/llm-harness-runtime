@@ -49,14 +49,18 @@ pub fn build_system_prompt(
     let cwd_str = cwd.to_string_lossy().replace('\\', "/");
 
     let has_bash = tools.iter().any(|t| t.name() == "bash");
-    let guidelines = if has_bash {
-        "- Use bash for file operations like ls, grep, find\n\
-         - Be concise in your responses\n\
-         - Show file paths clearly when working with files"
-    } else {
+    let has_grep = tools.iter().any(|t| t.name() == "grep");
+    let has_find = tools.iter().any(|t| t.name() == "find");
+
+    let mut guidelines = String::new();
+
+    if has_bash && !has_grep && !has_find {
+        guidelines.push_str("- Use bash for file operations like ls, grep, find\n");
+    }
+    guidelines.push_str(
         "- Be concise in your responses\n\
-         - Show file paths clearly when working with files"
-    };
+         - Show file paths clearly when working with files",
+    );
 
     let mut prompt = format!(
         "You are an expert coding assistant. \
