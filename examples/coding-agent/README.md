@@ -2,7 +2,32 @@
 
 基于 `llm-harness` 框架的 CLI 编程助手。
 
-**Phase 1** 提供 4 个工具（read / bash / edit / write）和三种运行模式。
+**Phase 1** 提供 5 个工具（read / grep / bash / edit / write）和三种运行模式。
+
+## 会话持久化
+
+coding-agent 自动将会话保存到 `.coding-agent/sessions/` 目录（JSONL 格式）：
+
+```bash
+# 每次运行自动创建/恢复会话
+cargo run -- -p "分析项目"
+
+# 会话文件位于
+ls -la .coding-agent/sessions/
+```
+
+会话文件已添加到 `.gitignore`，不会被提交到版本库。
+
+## 工具执行确认
+
+bash、edit、write 等修改性工具在执行前会在终端弹出确认提示：
+
+```text
+[confirm] bash `ls -la`
+Proceed? [y/N]
+```
+
+输入 `y` 确认执行，其他任意输入拒绝。这对防止意外执行危险命令提供了安全保障。
 
 ## 运行模式
 
@@ -82,9 +107,10 @@ cargo build --release
 
 ## 当前工具（Phase 1）
 
-| 工具 | 功能 |
-|------|------|
-| `read` | 读取文件内容 |
-| `bash` | 执行 shell 命令 |
-| `edit` | 编辑现有文件 |
-| `write` | 写入新文件 |
+| 工具 | 功能 | 需确认 |
+|------|------|--------|
+| `read` | 读取文件内容 | 否 |
+| `grep` | 全文搜索文件内容 | 否 |
+| `bash` | 执行 shell 命令 | 是 |
+| `edit` | 编辑现有文件 | 是 |
+| `write` | 写入新文件 | 是 |
