@@ -7,7 +7,6 @@
 //! - Resource injection (`ResourceProvider`, `ResourceInjector`)
 //! - Prompt template integration (`PromptSource`, `PromptTemplateCompiler`)
 //! - Task lifecycle management (`TaskRunner`)
-//! - Sub-agent spawning (`SubAgentSpawner`)
 //! - Tracing (`TraceExporter`)
 //! - Cost aggregation (`PricingProvider`, `CostAggregate`)
 //! - Audit logging (`AuditSink`)
@@ -26,7 +25,7 @@ pub mod mcp;
 pub mod prompt;
 pub mod resource;
 pub mod sandbox;
-pub mod subagent;
+pub mod spawner;
 pub mod task;
 pub mod tool_adapter;
 pub mod tool_registry;
@@ -51,7 +50,10 @@ pub use prompt::{
 };
 pub use resource::{ResourceContent, ResourceDescriptor, ResourceInjector, ResourceProvider};
 pub use sandbox::{NetRule, ResourceLimits, Sandbox, SandboxConfig};
-pub use subagent::{SubAgentResult, SubAgentSpawnOpts, SubAgentSpawner};
+pub use spawner::{
+    EnvFactory, HarnessSubAgentSpawner, JsonlSessionFactory, PluginFactory, SessionCreateResult,
+    SessionFactory,
+};
 pub use task::{
     Checkpoint, RetryPolicy, TaskError, TaskId, TaskResult, TaskRunner, TaskRunnerImpl, TaskState,
     TaskTrace, TaskVerdict, TaskVerifier,

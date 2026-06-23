@@ -1019,6 +1019,16 @@ impl AgentHarness {
         }
     }
 
+    /// 为下一次 `prompt()` 运行设置外部提供的 abort token。
+    ///
+    /// 设置后，此 token 将替代 `run_loop()` 内部创建的 token。
+    /// 适用于 sub-agent 派发场景（父 agent 控制 abort 信号）。
+    /// 此 token 在下次 `prompt()` 调用时被消费；后续未调用
+    /// 此方法的运行将恢复自行创建 token。
+    pub fn set_abort_token(&self, token: CancellationToken) {
+        self.inner.lock().unwrap().current_abort = Some(token);
+    }
+
     // ── Observation ───────────────────────────────────────────────────────
 
     /// Return a snapshot of the current harness state.
@@ -1294,7 +1304,7 @@ impl AgentHarness {
             inner.state.streaming_message = None;
             inner.state.pending_tool_calls.clear();
             let (steer_rx, follow_up_rx) = inner.reset_channels();
-            let abort = CancellationToken::new();
+            let abort = inner.current_abort.take().unwrap_or_default();
             inner.current_abort = Some(abort.clone());
             let sp = inner.state.system_prompt.clone();
             let ot = inner.state.tools.clone();

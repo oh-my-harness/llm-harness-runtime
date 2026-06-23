@@ -225,6 +225,8 @@ pub struct MockLlmClient {
     responses: Mutex<Vec<MockResponse>>,
     /// Tracks how many times `chat_stream` was called.
     pub call_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// All `ChatRequest` values passed to `chat_stream`, captured for test assertions.
+    pub captured_requests: Mutex<Vec<ChatRequest>>,
 }
 
 impl MockLlmClient {
@@ -233,6 +235,7 @@ impl MockLlmClient {
         Self {
             responses: Mutex::new(responses),
             call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            captured_requests: Mutex::new(Vec::new()),
         }
     }
 
@@ -254,9 +257,10 @@ impl Provider for MockLlmClient {
         ))
     }
 
-    async fn chat_stream(&self, _req: &ChatRequest) -> Result<StreamHandle, LlmError> {
+    async fn chat_stream(&self, req: &ChatRequest) -> Result<StreamHandle, LlmError> {
         self.call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.captured_requests.lock().unwrap().push(req.clone());
         let response = {
             let mut guard = self.responses.lock().unwrap();
             if guard.is_empty() {
