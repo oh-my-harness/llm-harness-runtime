@@ -163,6 +163,7 @@ mod tests {
     async fn assistant_message_with_tool_use_and_thinking() {
         let conv = DefaultConvertToLlm::new();
         let msg = AgentMessage::Assistant(AssistantMessage {
+            kind: AssistantMessageKind::Progress,
             content: vec![
                 ContentBlock::Thinking {
                     thinking: "plan".into(),
@@ -363,6 +364,7 @@ mod tests {
                 timestamp: Utc::now(),
             }),
             AgentMessage::Assistant(AssistantMessage {
+                kind: AssistantMessageKind::FinalAnswer,
                 content: vec![ContentBlock::Text {
                     text: "hello".into(),
                 }],

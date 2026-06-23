@@ -312,6 +312,7 @@ mod tests {
 
     fn assistant_msg(text: &str) -> AgentMessage {
         AgentMessage::Assistant(AssistantMessage {
+            kind: AssistantMessageKind::FinalAnswer,
             content: vec![ContentBlock::Text { text: text.into() }],
             stop_reason: Some(StopReason::EndTurn),
             timestamp: chrono::Utc::now(),

@@ -38,6 +38,18 @@ pub enum AgentEvent {
         message_id: String,
         message: AssistantMessage,
     },
+    /// User-visible progress/activity text, not the final answer bubble.
+    Progress {
+        turn_index: u32,
+        message_id: String,
+        text: String,
+    },
+    /// The final answer for the current user-facing turn.
+    FinalAnswer {
+        turn_index: u32,
+        message_id: String,
+        text: String,
+    },
 
     // === Token 级（字符流） ===
     /// 文本增量。
@@ -107,6 +119,7 @@ mod tests {
 
     fn make_assistant() -> AssistantMessage {
         AssistantMessage {
+            kind: crate::AssistantMessageKind::FinalAnswer,
             content: vec![ContentBlock::Text { text: "ok".into() }],
             stop_reason: Some(StopReason::EndTurn),
             timestamp: chrono::Utc::now(),
@@ -174,6 +187,27 @@ mod tests {
                 assert_eq!(max_retries, 3);
                 assert_eq!(delay_ms, 2000);
                 assert_eq!(error, "rate limited");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn final_answer_event_fields_are_accessible() {
+        let ev = AgentEvent::FinalAnswer {
+            turn_index: 2,
+            message_id: "m1".into(),
+            text: "done".into(),
+        };
+        match ev {
+            AgentEvent::FinalAnswer {
+                turn_index,
+                message_id,
+                text,
+            } => {
+                assert_eq!(turn_index, 2);
+                assert_eq!(message_id, "m1");
+                assert_eq!(text, "done");
             }
             _ => panic!("wrong variant"),
         }

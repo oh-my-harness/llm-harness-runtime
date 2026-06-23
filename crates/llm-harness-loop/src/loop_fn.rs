@@ -264,7 +264,7 @@ fn run_loop(
                 }
             }
 
-            let assistant_msg = match final_message {
+            let mut assistant_msg = match final_message {
                 Some(m) => m,
                 None => {
                     yield AgentEvent::Error(AgentError::Internal(
@@ -273,6 +273,8 @@ fn run_loop(
                     break 'main;
                 }
             };
+            let stop_reason = assistant_msg.stop_reason.unwrap_or(StopReason::EndTurn);
+            assistant_msg.kind = AssistantMessageKind::from_stop_reason(stop_reason);
 
             // AfterProviderResponseHook: observation hook for quota tracking, cost monitoring.
             if let Some(h) = &config.after_provider_response {
@@ -289,7 +291,27 @@ fn run_loop(
             ctx.messages.push(assistant_agent_msg.clone());
             new_messages.push(assistant_agent_msg);
 
-            let stop_reason = assistant_msg.stop_reason.unwrap_or(StopReason::EndTurn);
+            let display_text = assistant_msg.text();
+            match assistant_msg.kind {
+                AssistantMessageKind::Progress | AssistantMessageKind::ReasoningSummary => {
+                    if !display_text.is_empty() {
+                        yield AgentEvent::Progress {
+                            turn_index,
+                            message_id: message_id.clone(),
+                            text: display_text,
+                        };
+                    }
+                }
+                AssistantMessageKind::FinalAnswer => {
+                    if !display_text.is_empty() {
+                        yield AgentEvent::FinalAnswer {
+                            turn_index,
+                            message_id: message_id.clone(),
+                            text: display_text,
+                        };
+                    }
+                }
+            }
 
             if stop_reason == StopReason::ToolUse {
                 // Collect tool-use blocks from the assistant message
@@ -776,7 +798,12 @@ mod tests {
         });
 
         let (client_raw, mut cfg) = make_config(vec![
-            MockResponse::tool_use("c1", "echo", r#"{"x":1}"#),
+            MockResponse::progress_then_tool_use(
+                "I will search first.",
+                "c1",
+                "echo",
+                r#"{"x":1}"#,
+            ),
             MockResponse::text("Done!"),
         ]);
         cfg.tools = vec![tool];
@@ -800,6 +827,42 @@ mod tests {
             .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
             .count();
         assert_eq!(tool_exec_ends, 1);
+        assert!(events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::Progress { text, .. } if text == "I will search first."
+            )
+        }));
+        assert!(events.iter().any(|e| {
+            matches!(
+                e,
+                AgentEvent::FinalAnswer { text, .. } if text == "Done!"
+            )
+        }));
+
+        let agent_end = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+            .unwrap();
+        if let AgentEvent::AgentEnd { new_messages } = agent_end {
+            let assistant_kinds: Vec<_> = new_messages
+                .iter()
+                .filter_map(|message| {
+                    if let AgentMessage::Assistant(message) = message {
+                        Some(message.kind)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                assistant_kinds,
+                vec![
+                    AssistantMessageKind::Progress,
+                    AssistantMessageKind::FinalAnswer
+                ]
+            );
+        }
     }
 
     #[tokio::test]

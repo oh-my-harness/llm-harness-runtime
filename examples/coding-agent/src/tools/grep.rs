@@ -237,7 +237,17 @@ fn build_grep_command(
 }
 
 fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+    if cfg!(windows) {
+        if s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '\\' | '/' | '.' | '_' | '-'))
+        {
+            s.to_string()
+        } else {
+            format!("\"{}\"", s.replace('"', "\\\""))
+        }
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

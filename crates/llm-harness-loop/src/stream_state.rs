@@ -131,9 +131,11 @@ impl StreamingState {
             }
             AdapterEvent::MessageStop { stop_reason, usage } => {
                 let content = self.build_final_content();
+                let stop_reason = convert_stop_reason(stop_reason);
                 let message = AssistantMessage {
+                    kind: AssistantMessageKind::from_stop_reason(stop_reason),
                     content,
-                    stop_reason: Some(convert_stop_reason(stop_reason)),
+                    stop_reason: Some(stop_reason),
                     timestamp: Utc::now(),
                     // The current adapter stream does not expose provider/api metadata.
                     provider: None,
@@ -153,6 +155,7 @@ impl StreamingState {
     /// Build a partial `AssistantMessage` from the current accumulated state.
     pub(crate) fn partial_message(&self) -> AssistantMessage {
         AssistantMessage {
+            kind: AssistantMessageKind::Progress,
             content: self.build_final_content(),
             stop_reason: None,
             timestamp: Utc::now(),

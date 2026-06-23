@@ -32,9 +32,46 @@ pub struct UserMessage {
     pub timestamp: DateTime<Utc>,
 }
 
+/// Product-facing role for an assistant message.
+///
+/// `FinalAnswer` is the backward-compatible default for historical sessions
+/// where no display/finality metadata was recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantMessageKind {
+    /// Intermediate assistant text that should be rendered as activity/progress.
+    Progress,
+    /// Brief reasoning summary or transition text, separate from the user-visible answer.
+    ReasoningSummary,
+    /// The assistant response that should be shown as the primary answer bubble.
+    #[default]
+    FinalAnswer,
+}
+
+impl AssistantMessageKind {
+    /// Used by serde to keep the common/default JSON shape compact.
+    pub fn is_final_answer(&self) -> bool {
+        *self == Self::FinalAnswer
+    }
+
+    /// Default display semantics derived from the provider stop reason.
+    pub fn from_stop_reason(stop_reason: StopReason) -> Self {
+        match stop_reason {
+            StopReason::ToolUse => Self::Progress,
+            StopReason::EndTurn
+            | StopReason::MaxTokens
+            | StopReason::StopSequence
+            | StopReason::Other => Self::FinalAnswer,
+        }
+    }
+}
+
 /// LLM 助手消息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantMessage {
+    /// Product-facing display/finality semantics for this assistant message.
+    #[serde(default, skip_serializing_if = "AssistantMessageKind::is_final_answer")]
+    pub kind: AssistantMessageKind,
     /// 消息内容块列表（含 Text、Thinking、ToolUse 等）。
     pub content: Vec<ContentBlock>,
     /// LLM 停止生成的原因。
@@ -57,6 +94,22 @@ pub struct AssistantMessage {
     /// LLM 返回错误时保存的错误文本快照。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+}
+
+impl AssistantMessage {
+    /// Concatenate all text blocks in content order.
+    pub fn text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|block| {
+                if let ContentBlock::Text { text } = block {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 /// 工具执行结果消息。
@@ -142,6 +195,7 @@ mod tests {
     #[test]
     fn agent_message_serde_assistant() {
         let msg = AgentMessage::Assistant(AssistantMessage {
+            kind: AssistantMessageKind::FinalAnswer,
             content: vec![text_block("response")],
             stop_reason: Some(crate::StopReason::EndTurn),
             timestamp: chrono::Utc::now(),
@@ -200,6 +254,7 @@ mod tests {
     #[test]
     fn assistant_message_none_fields_omitted_in_json() {
         let msg = AssistantMessage {
+            kind: AssistantMessageKind::FinalAnswer,
             content: vec![text_block("hi")],
             stop_reason: None,
             timestamp: chrono::Utc::now(),
@@ -236,5 +291,37 @@ mod tests {
         let msg2: AssistantMessage = serde_json::from_str(&json).unwrap();
         assert!(msg2.stop_reason.is_none());
         assert!(msg2.provider.is_none());
+        assert_eq!(msg2.kind, AssistantMessageKind::FinalAnswer);
+    }
+
+    #[test]
+    fn assistant_message_kind_progress_round_trips() {
+        let msg = AssistantMessage {
+            kind: AssistantMessageKind::Progress,
+            content: vec![text_block("searching")],
+            stop_reason: Some(crate::StopReason::ToolUse),
+            timestamp: chrono::Utc::now(),
+            provider: None,
+            api: None,
+            model: None,
+            usage: None,
+            error_message: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""kind":"progress""#), "{json}");
+        let msg2: AssistantMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg2.kind, AssistantMessageKind::Progress);
+        assert_eq!(msg2.text(), "searching");
+    }
+
+    #[test]
+    fn assistant_message_missing_kind_defaults_to_final_answer() {
+        let json = serde_json::json!({
+            "content": [{"type": "text", "text": "legacy"}],
+            "timestamp": chrono::Utc::now(),
+        })
+        .to_string();
+        let msg: AssistantMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg.kind, AssistantMessageKind::FinalAnswer);
     }
 }

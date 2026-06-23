@@ -126,6 +126,7 @@ async fn edit_tool_rejects_non_unique_old_string() {
         tool_use_id: "test-id".into(),
         turn_index: 0,
         assistant_message: Arc::new(AssistantMessage {
+            kind: llm_harness_types::AssistantMessageKind::FinalAnswer,
             content: vec![],
             stop_reason: None,
             timestamp: chrono::Utc::now(),

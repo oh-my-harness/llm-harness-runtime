@@ -222,6 +222,7 @@ mod tests {
             tool_use_id: "t1".into(),
             turn_index: 0,
             assistant_message: Arc::new(AssistantMessage {
+                kind: llm_harness_types::AssistantMessageKind::FinalAnswer,
                 content: vec![],
                 stop_reason: None,
                 timestamp: chrono::Utc::now(),

@@ -207,6 +207,53 @@ impl MockResponse {
         }
     }
 
+    /// Tool-use response that also emits text before the tool call.
+    pub fn progress_then_tool_use(
+        progress_text: &str,
+        tool_use_id: &str,
+        tool_name: &str,
+        args_json: &str,
+    ) -> Self {
+        let progress = progress_text.to_owned();
+        let id = tool_use_id.to_owned();
+        let name = tool_name.to_owned();
+        let args = args_json.to_owned();
+        Self {
+            model: "mock-model".into(),
+            stream_error: None,
+            events: vec![
+                Ok(StreamEvent::ContentStart {
+                    index: 0,
+                    kind: llm_adapter::types::ContentKind::Text,
+                }),
+                Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: progress,
+                }),
+                Ok(StreamEvent::ContentStop {
+                    index: 0,
+                    signature: None,
+                }),
+                Ok(StreamEvent::ContentStart {
+                    index: 1,
+                    kind: llm_adapter::types::ContentKind::ToolInvocation { id, name },
+                }),
+                Ok(StreamEvent::ToolDelta {
+                    index: 1,
+                    arguments: args,
+                }),
+                Ok(StreamEvent::ContentStop {
+                    index: 1,
+                    signature: None,
+                }),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::ToolUse,
+                    usage: Usage::default(),
+                }),
+            ],
+        }
+    }
+
     /// Preset that causes `chat_stream` to return a `RateLimit` error.
     pub fn rate_limit_error() -> Self {
         Self {

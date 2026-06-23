@@ -578,6 +578,7 @@ mod tests {
                 timestamp: chrono::Utc::now(),
             }),
             AgentMessage::Assistant(AssistantMessage {
+                kind: AssistantMessageKind::FinalAnswer,
                 content: vec![ContentBlock::Text {
                     text: "reply".into(),
                 }],

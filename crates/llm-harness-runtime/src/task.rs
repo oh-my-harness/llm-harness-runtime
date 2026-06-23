@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use llm_harness_agent::{AgentHarness, AgentHarnessEvent, AgentHarnessOptions, HarnessHooks};
 use llm_harness_loop::LlmClient;
-use llm_harness_types::{AgentEvent, ContentBlock, EntryId};
+use llm_harness_types::{AgentEvent, EntryId};
 use serde_json::Value;
 
 use crate::budget::BudgetControlAdapter;
@@ -264,13 +264,11 @@ impl TaskRunner for TaskRunnerImpl {
             let mut turns = 0u32;
             while let Ok(event) = rx.recv().await {
                 match event.as_ref() {
-                    AgentHarnessEvent::Agent(AgentEvent::MessageEnd { message, .. }) => {
+                    AgentHarnessEvent::Agent(AgentEvent::MessageEnd { .. }) => {
                         turns += 1;
-                        for block in &message.content {
-                            if let ContentBlock::Text { text } = block {
-                                last_text = text.clone();
-                            }
-                        }
+                    }
+                    AgentHarnessEvent::Agent(AgentEvent::FinalAnswer { text, .. }) => {
+                        last_text = text.clone();
                     }
                     AgentHarnessEvent::Settled | AgentHarnessEvent::Aborted => break,
                     _ => {}

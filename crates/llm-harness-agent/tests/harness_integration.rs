@@ -255,6 +255,25 @@ async fn tool_call_writes_tool_result_to_session() {
         }
     });
     assert!(has_tool_result, "echo tool result not found in session");
+
+    let assistant_kinds: Vec<_> = ctx
+        .messages
+        .iter()
+        .filter_map(|message| {
+            if let AgentMessage::Assistant(message) = message {
+                Some(message.kind)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        assistant_kinds,
+        vec![
+            llm_harness_types::AssistantMessageKind::Progress,
+            llm_harness_types::AssistantMessageKind::FinalAnswer,
+        ]
+    );
 }
 
 #[tokio::test]
