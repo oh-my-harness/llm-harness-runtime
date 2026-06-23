@@ -190,23 +190,26 @@ impl SubAgentSpawner for HarnessSubAgentSpawner {
                 // 能到达 agent loop。
                 harness.set_abort_token(abort_clone);
 
-                // Bridge: broadcast → mpsc（消除 Lagged 数据丢失）。
+                // Bridge: broadcast → unbounded mpsc。
+                // event_task 从 mpsc 读，不会因 broadcast buffer 满而 Lagged。
+                // 但从 harness 到 bridge 这一跳仍可能 Lagged（buffer = 256）：
+                //   - Closed:  harness drop，正常退出。
+                //   - Lagged:  消息丢失。若丢失的恰好是 PhaseChange::Idle 哨兵，
+                //              event_task 会永久等待。这里直接退出让 mpsc_tx drop，
+                //              event_task 通过 mpsc_rx.recv() == None 自然收尾。
+                //              代价是 output / tool_count 可能缺失尾部事件，
+                //              但好过挂死。
                 let mut broadcast_rx = harness.subscribe();
                 let (mpsc_tx, mut mpsc_rx) =
                     tokio::sync::mpsc::unbounded_channel::<Arc<AgentHarnessEvent>>();
                 let bridge = tokio::spawn(async move {
-                    use tokio::sync::broadcast::error::RecvError;
-                    loop {
-                        match broadcast_rx.recv().await {
-                            Ok(ev) => {
-                                if mpsc_tx.send(ev).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(RecvError::Closed) => break,
-                            // The bridge is a fast no-op relay; Lagged here is extremely unlikely
-                            // but not recoverable — continue reading from the current position.
-                            Err(RecvError::Lagged(_)) => continue,
+                    // recv() 返回 Err（Closed 或 Lagged）都直接退出循环：
+                    //   - Closed:  harness drop，正常结束。
+                    //   - Lagged:  消息丢失（可能含 Idle 哨兵），退出让 mpsc_tx
+                    //              drop，消费方通过 recv() == None 收尾。
+                    while let Ok(ev) = broadcast_rx.recv().await {
+                        if mpsc_tx.send(ev).is_err() {
+                            break;
                         }
                     }
                 });
@@ -241,6 +244,11 @@ impl SubAgentSpawner for HarnessSubAgentSpawner {
                         other => AgentError::Internal(format!("sub-agent prompt failed: {other}")),
                     });
                 }
+
+                // prompt 返回后不再有新事件，主动关闭 bridge 让 mpsc_tx drop。
+                // event_task 的正常退出是看到 PhaseChange::Idle；若 Idle
+                // 因 broadcast Lagged 丢失，这就是 event_task 的唯一退出路径。
+                drop(bridge);
 
                 let (output, tool_calls_count) = event_task
                     .await
