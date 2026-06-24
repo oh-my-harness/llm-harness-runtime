@@ -14,7 +14,8 @@ members = [
     "crates/llm-harness-runtime-audit-jsonl",
     "crates/llm-harness-runtime-trace-otel",
     # examples
-    "examples/coding-agent",
+    # coding-agent is now a separate repo: https://github.com/oh-my-harness/coding-agent.git
+    # It depends on this workspace's crates via git rev.
 ]
 resolver = "2"
 
