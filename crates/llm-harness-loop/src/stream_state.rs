@@ -207,7 +207,9 @@ impl StreamingState {
 }
 
 fn parse_tool_args(tool_use_id: &str, args: &str) -> (serde_json::Value, Option<AgentEvent>) {
-    match serde_json::from_str(args) {
+    // Some LLMs send empty string for no-arg tools; treat as empty object.
+    let effective = if args.trim().is_empty() { "{}" } else { args };
+    match serde_json::from_str(effective) {
         Ok(value) => (value, None),
         Err(err) => (
             serde_json::Value::Null,
