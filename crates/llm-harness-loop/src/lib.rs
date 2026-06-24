@@ -35,9 +35,20 @@ pub use loop_fn::{agent_loop, agent_loop_continue};
 
 // Re-exports for downstream crates (harness must not depend directly on llm_adapter)
 pub use llm_adapter::LlmError;
+pub use llm_adapter::SearchError;
+pub use llm_adapter::duckduckgo::DuckDuckGoSearchProvider;
+pub use llm_adapter::provider::EmbeddingProvider;
 pub use llm_adapter::provider::Provider as LlmClient;
+pub use llm_adapter::provider::SearchProvider;
 pub use llm_adapter::types::ChatRequest;
 pub use llm_adapter::types::ChatResponse;
+pub use llm_adapter::types::EmbeddingRequest;
+pub use llm_adapter::types::EmbeddingResponse;
+pub use llm_adapter::types::EmbeddingUsage;
+pub use llm_adapter::types::EmbeddingVector;
 pub use llm_adapter::types::Message as LlmMessage;
 pub use llm_adapter::types::RequestContent;
+pub use llm_adapter::types::SearchRequest;
+pub use llm_adapter::types::SearchResponse;
+pub use llm_adapter::types::SearchResult;
 pub use llm_adapter::types::StreamEvent as AdapterStreamEvent;

@@ -116,6 +116,55 @@ async fn infrastructure_assembly_smoke_test() {
     Box::new(sandbox).shutdown().await.unwrap();
 }
 
+#[test]
+fn adapter_embedding_and_search_types_are_available_from_runtime_facade() {
+    use llm_harness_runtime::{
+        DuckDuckGoSearchProvider, EmbeddingProvider, EmbeddingRequest, EmbeddingResponse,
+        EmbeddingUsage, EmbeddingVector, SearchProvider, SearchRequest, SearchResponse,
+        SearchResult,
+    };
+
+    fn accepts_embedding_provider<T: EmbeddingProvider + ?Sized>(_provider: &T) {}
+    fn accepts_search_provider<T: SearchProvider + ?Sized>(_provider: &T) {}
+
+    let embedding_req = EmbeddingRequest::builder("text-embedding-3-small")
+        .input("hello")
+        .build();
+    assert_eq!(embedding_req.input(), &["hello".to_string()]);
+
+    let embedding_resp = EmbeddingResponse {
+        model: "text-embedding-3-small".into(),
+        vectors: vec![EmbeddingVector {
+            index: 0,
+            embedding: vec![0.1, 0.2],
+        }],
+        usage: Some(EmbeddingUsage {
+            input_tokens: 1,
+            total_tokens: 1,
+        }),
+    };
+    assert_eq!(embedding_resp.dimensions(), Some(2));
+
+    let search_req = SearchRequest::builder("rust async trait")
+        .max_results(2)
+        .build();
+    assert_eq!(search_req.max_results(), 2);
+
+    let search_resp = SearchResponse {
+        results: vec![SearchResult::new(
+            "Rust",
+            "https://www.rust-lang.org",
+            "Rust",
+        )],
+    };
+    assert_eq!(search_resp.results.len(), 1);
+
+    let duckduckgo = DuckDuckGoSearchProvider::builder().build();
+    accepts_search_provider(&duckduckgo);
+
+    let _accepts_embedding_provider = accepts_embedding_provider::<dyn EmbeddingProvider>;
+}
+
 /// Verify dev configuration baseline: OsEnvSandbox + empty hooks.
 #[tokio::test]
 async fn dev_configuration_smoke_test() {

@@ -43,6 +43,11 @@ pub use llm_harness_loop::composite::{
     CompositeAfterProviderResponseHook, CompositeAfterToolCallHook, CompositeAfterTurnHook,
     CompositeBeforeProviderRequestHook, CompositeBeforeToolCallHook,
 };
+pub use llm_harness_loop::{
+    DuckDuckGoSearchProvider, EmbeddingProvider, EmbeddingRequest, EmbeddingResponse,
+    EmbeddingUsage, EmbeddingVector, SearchError, SearchProvider, SearchRequest, SearchResponse,
+    SearchResult,
+};
 pub use mcp::{McpClientHandle, McpContent, McpError, McpResult, McpToolDef};
 pub use prompt::{
     ArgumentDef, InMemoryPromptRegistry, InvokeError, PromptSource, PromptSourceTemplate,
