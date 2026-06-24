@@ -4,3 +4,5 @@ Cargo.lock
 .cargo/config.toml
 .env
 .coding-agent/sessions/
+.DS_Store
+examples/coding-agent/
