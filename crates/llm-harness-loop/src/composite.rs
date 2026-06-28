@@ -330,9 +330,15 @@ impl PrepareNextTurnHook for CompositePreparePrepareNextTurnHook {
     }
 }
 
-/// Chains multiple `ShouldStopHook` implementations (any-true short-circuit semantics).
+/// Chains multiple `ShouldStopHook` implementations (all-execute semantics).
 ///
-/// Hooks execute in order; returns `true` if any hook returns `true`.
+/// All hooks execute in registration order; returns `true` if any hook returns
+/// `true`. Unlike short-circuit composites, every hook always runs — this is
+/// deliberate: `ShouldStopHook` is a query (not a decision gate), and hooks
+/// may carry side effects such as draining a follow-up channel
+/// (`AsyncSpawnHook`, `PeerMessageHook`) that must not be skipped just because
+/// an earlier hook (e.g. `BudgetControlAdapter`) already returned `true`.
+/// Short-circuiting would silently defer or drop pending follow-up messages.
 pub struct CompositeShouldStopHook {
     hooks: Vec<Arc<dyn ShouldStopHook>>,
 }
@@ -347,6 +353,7 @@ impl CompositeShouldStopHook {
 impl ShouldStopHook for CompositeShouldStopHook {
     fn should_stop<'a>(&'a self, ctx: ShouldStopCtx<'a>) -> BoxFuture<'a, bool> {
         Box::pin(async move {
+            let mut any_true = false;
             for hook in &self.hooks {
                 let hook_ctx = ShouldStopCtx {
                     last_assistant: ctx.last_assistant,
@@ -354,10 +361,10 @@ impl ShouldStopHook for CompositeShouldStopHook {
                     turn_index: ctx.turn_index,
                 };
                 if hook.should_stop(hook_ctx).await {
-                    return true;
+                    any_true = true;
                 }
             }
-            false
+            any_true
         })
     }
 }
@@ -501,6 +508,69 @@ mod tests {
         fn _accept(_: &dyn ShouldStopHook) {}
         let composite = CompositeShouldStopHook::new(vec![]);
         _accept(&composite);
+    }
+
+    #[tokio::test]
+    async fn composite_should_stop_hook_runs_all_hooks_despite_early_true() {
+        // Regression: CompositeShouldStopHook must NOT short-circuit.
+        // An earlier hook returning true (e.g. BudgetControlAdapter on
+        // budget exceeded) must not skip a later follow-up-injecting hook
+        // (e.g. AsyncSpawnHook), otherwise pending sub-agent results would
+        // be silently deferred. All hooks execute; result is the OR.
+        use llm_harness_types::{AssistantMessage, ContentBlock, StopReason};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Flagger {
+            flag: Arc<AtomicBool>,
+            ret: bool,
+        }
+        impl ShouldStopHook for Flagger {
+            fn should_stop<'a>(&'a self, _ctx: ShouldStopCtx<'a>) -> BoxFuture<'a, bool> {
+                Box::pin(async move {
+                    self.flag.store(true, Ordering::SeqCst);
+                    self.ret
+                })
+            }
+        }
+
+        let first_ran = Arc::new(AtomicBool::new(false));
+        let second_ran = Arc::new(AtomicBool::new(false));
+
+        let composite = CompositeShouldStopHook::new(vec![
+            Arc::new(Flagger {
+                flag: first_ran.clone(),
+                ret: true,
+            }),
+            Arc::new(Flagger {
+                flag: second_ran.clone(),
+                ret: false,
+            }),
+        ]);
+
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text { text: "x".into() }],
+            stop_reason: Some(StopReason::EndTurn),
+            timestamp: chrono::Utc::now(),
+            provider: None,
+            api: None,
+            model: None,
+            usage: None,
+            error_message: None,
+        };
+        let ctx = ShouldStopCtx {
+            last_assistant: &assistant,
+            stop_reason: StopReason::EndTurn,
+            turn_index: 0,
+        };
+
+        let result = composite.should_stop(ctx).await;
+        assert!(result, "OR of [true, false] must be true");
+        assert!(first_ran.load(Ordering::SeqCst), "first hook must run");
+        assert!(
+            second_ran.load(Ordering::SeqCst),
+            "second hook must run despite first returning true"
+        );
     }
 
     #[test]

@@ -23,8 +23,8 @@ pub mod sub_agent;
 pub use agent::{Agent, AgentOptions, AgentPhase, AgentState, ModelInfo};
 pub use compaction::{CompactionPreparation, CompactionSettings, compact, prepare_compaction};
 pub use harness::{
-    AgentHarness, AgentHarnessEvent, AgentHarnessOptions, CompactionStats, HarnessHooks,
-    HarnessState, HarnessToolCallResult,
+    AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AsyncSpawnHookHandle, CompactionStats,
+    FollowUpHandle, HarnessHooks, HarnessState, HarnessToolCallResult, IdleWatcherHook,
 };
 pub use plugin::{Plugin, StateProvider};
 pub use session::{
@@ -49,9 +49,10 @@ pub mod prelude {
     pub use crate::{
         Agent, AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AgentOptions, AgentPhase,
         AgentState, BuiltContext, CompactionPreparation, CompactionSettings, CompactionStats,
-        ContextMode, InMemorySessionRepo, JsonlSessionRepo, ModelInfo, Plugin, PromptTemplate,
-        ProviderSelection, Session, SessionRepo, SessionStorage, Skill, SkillDiagnostic,
-        SourcedSkill, SpawnOptions, StateProvider, SubAgentHandle, SubAgentResult, SubAgentSpawner,
+        ContextMode, FollowUpHandle, InMemorySessionRepo, JsonlSessionRepo, ModelInfo, Plugin,
+        PromptTemplate, ProviderSelection, Session, SessionRepo, SessionStorage, Skill,
+        SkillDiagnostic, SourcedSkill, SpawnOptions, StateProvider, SubAgentHandle, SubAgentResult,
+        SubAgentSpawner,
     };
     pub use llm_harness_types::{
         AgentError, AgentEvent, AgentMessage, AssistantMessage, AuthHook, BranchSummaryMessage,

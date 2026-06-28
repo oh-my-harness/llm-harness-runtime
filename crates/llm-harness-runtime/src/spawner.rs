@@ -12,11 +12,13 @@ use llm_harness_agent::{
         SubAgentSpawner,
     },
 };
+use crate::async_spawn::{AsyncCompletion, AsyncSpawnHandle, AsyncSpawnRegistry};
 use llm_harness_loop::LlmClient;
 use llm_harness_types::{AgentError, AgentEvent, ExecutionEnv, HarnessError, HarnessPhase};
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::{HarnessBuildError, HarnessBuilder};
+use crate::peer::{PeerCleanupGuard, PeerDirectory, PeerMessageHook, PeerMetadata, SharedPeerRx};
 
 // ── EnvFactory ────────────────────────────────────────────────────────────
 
@@ -50,7 +52,10 @@ pub trait SessionFactory: Send + Sync {
 // ── PluginFactory ──────────────────────────────────────────────────────────
 
 /// Sub-agent plugin 的工厂函数类型。
-pub type PluginFactory = Arc<dyn Fn(&Path) -> Box<dyn Plugin> + Send + Sync>;
+///
+/// 第二参数 `peer_rx`：peer 模式下为 `Some(rx)`（与 `PeerMessageHook` 共享同一
+/// `SharedPeerRx`），plugin 可据此注册 `WaitForPeerMessageTool`；非 peer 模式为 `None`。
+pub type PluginFactory = Arc<dyn Fn(&Path, Option<SharedPeerRx>) -> Box<dyn Plugin> + Send + Sync>;
 
 // ── ProviderAlias ─────────────────────────────────────────────────────────
 
@@ -72,6 +77,10 @@ pub struct HarnessSubAgentSpawner {
     env_factory: Arc<dyn EnvFactory>,
     session_factory: Arc<dyn SessionFactory>,
     session_base_dir: PathBuf,
+    /// 可选：peer 通讯录。None 则无 peer 通信。
+    peer_directory: Option<Arc<PeerDirectory>>,
+    /// 可选：异步投递 registry。None 则无异步投递（spawn_async 会返回错误）。
+    async_registry: Option<Arc<AsyncSpawnRegistry>>,
 }
 
 impl HarnessSubAgentSpawner {
@@ -79,11 +88,16 @@ impl HarnessSubAgentSpawner {
     ///
     /// `sub_plugin_factory` 在每次 spawn 时使用 sub-agent 的 cwd 调用。
     /// 必须返回不含 `SpawnAgentTool` 的 Plugin，以防止递归派发（v0.3+）。
+    /// 第二参数 `peer_rx`：peer 模式下 `Some(rx)`（与 `PeerMessageHook` 共享），
+    /// 非 peer 模式 `None`。plugin 可据此决定是否注册 `WaitForPeerMessageTool`。
     pub fn new(
         default_model: impl Into<String>,
         default_client: Arc<dyn LlmClient>,
         session_base_dir: PathBuf,
-        sub_plugin_factory: impl Fn(&Path) -> Box<dyn Plugin> + Send + Sync + 'static,
+        sub_plugin_factory: impl Fn(&Path, Option<SharedPeerRx>) -> Box<dyn Plugin>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             default_model: default_model.into(),
@@ -93,6 +107,8 @@ impl HarnessSubAgentSpawner {
             env_factory: Arc::new(NoOpEnvFactory),
             session_factory: Arc::new(NoOpSessionFactory),
             session_base_dir,
+            peer_directory: None,
+            async_registry: None,
         }
     }
 
@@ -119,10 +135,41 @@ impl HarnessSubAgentSpawner {
         self.session_factory = factory;
         self
     }
+
+    /// 启用 sub↔sub peer 通信。传入共享的 `PeerDirectory`。
+    ///
+    /// 启用后，`spawn_with_peer` / `spawn_async_with_peer` 会把 sub-agent
+    /// 注册进通讯录，使其能收发 peer 消息。
+    pub fn enable_peer_communication(mut self, directory: Arc<PeerDirectory>) -> Self {
+        self.peer_directory = Some(directory);
+        self
+    }
+
+    /// 启用 sub→主 异步投递。传入通过 `async_spawn_pair()` 创建的 registry。
+    ///
+    /// 启用后，`spawn_async` / `spawn_async_with_peer` 会把 sub-agent 的
+    /// completion 投递回主 agent 的 `AsyncSpawnHook`。
+    pub fn enable_async_delivery(mut self, registry: Arc<AsyncSpawnRegistry>) -> Self {
+        self.async_registry = Some(registry);
+        self
+    }
 }
 
-impl SubAgentSpawner for HarnessSubAgentSpawner {
-    fn spawn(&self, opts: SpawnOptions) -> BoxFuture<'_, Result<SubAgentHandle, AgentError>> {
+impl HarnessSubAgentSpawner {
+    /// 私有：构建 sub-agent harness + tokio task，返回 `SubAgentHandle` 和 session_id。
+    ///
+    /// `peer_meta` 决定是否往 `PeerDirectory` 注册：
+    /// - `Some(meta)` 且 spawner 已 `enable_peer_communication`：建 peer channel +
+    ///   `PeerMessageHook`（延迟注入 `FollowUpHandle`）+ `PeerCleanupGuard`（move 进 task）。
+    /// - `None` 或未启用 peer：普通 spawn。
+    ///
+    /// 返回 `(handle, session_id)`：`spawn_async*` 用 session_id 作 agent_id
+    /// （非 peer 模式，设计 §7.4）；peer 模式由调用方提供 agent_id。
+    fn spawn_inner(
+        &self,
+        opts: SpawnOptions,
+        peer_meta: Option<PeerMetadata>,
+    ) -> BoxFuture<'_, Result<(SubAgentHandle, String), AgentError>> {
         let default_model = self.default_model.clone();
         let default_client = self.default_client.clone();
         let aliases: Vec<(&str, &str, &Arc<dyn LlmClient>)> = self
@@ -134,6 +181,7 @@ impl SubAgentSpawner for HarnessSubAgentSpawner {
         let env_factory = self.env_factory.clone();
         let session_factory = self.session_factory.clone();
         let session_base_dir = self.session_base_dir.clone();
+        let peer_directory = self.peer_directory.clone();
 
         async move {
             // 1. 解析 provider。
@@ -155,25 +203,65 @@ impl SubAgentSpawner for HarnessSubAgentSpawner {
             let cwd = opts.cwd.unwrap_or(default_cwd);
             let env = env_factory.create(&cwd)?;
 
-            // 3. 创建 sub-agent plugin（不含 SpawnAgentTool）。
-            let sub_plugin = (sub_plugin_factory)(&cwd);
+            // 3. peer 注册（若 peer_meta + peer_directory 都有）。
+            //    先于 plugin 创建：register 建 channel + 返回 rx，rx 的克隆传给
+            //    plugin factory（供 WaitForPeerMessageTool 注册）和 PeerMessageHook。
+            //    register 早于 set_follow_up_handle——此时别的 peer 已能 send，
+            //    但 hook 的 follow_up_handle=None 时不取消息（Task 4 降级），
+            //    消息留 channel，set_follow_up_handle 后下次 should_stop 再取。
+            let peer_rx: Option<SharedPeerRx> = if let Some(meta) = peer_meta.as_ref() {
+                if let Some(dir) = peer_directory.as_ref() {
+                    let rx = dir
+                        .register(meta.clone())
+                        .map_err(|e| AgentError::Internal(format!("peer register failed: {e}")))?;
+                    Some(rx)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
-            // 4. 创建 session（通过 SessionFactory，不写死后端）。
+            // 4. 创建 sub-agent plugin（不含 SpawnAgentTool）。
+            //    传 peer_rx 克隆：plugin 可据此注册 WaitForPeerMessageTool。
+            let sub_plugin = (sub_plugin_factory)(&cwd, peer_rx.clone());
+
+            // 5. 创建 session（通过 SessionFactory，不写死后端）。
             // 注意：session 在磁盘上创建后，如果下一步构建 harness 失败，
             // 该 session 会成为孤儿（存在于磁盘但无引用）。
             // 未来可通过内存 storage 先构建 harness、确认成功后再持久化来避免。
             let (storage, session_id) = session_factory.create(&session_base_dir, &model).await?;
 
-            // 5. 构建 harness。
-            let harness = HarnessBuilder::new(&model)
+            // 6. 建 PeerMessageHook（持同一 peer_rx）。
+            let peer_hook: Option<Arc<PeerMessageHook>> =
+                peer_rx.map(|rx| Arc::new(PeerMessageHook::new(rx)));
+
+            // 6. 构建 harness（装 peer_hook 若有）。
+            let mut builder = HarnessBuilder::new(&model)
                 .install(sub_plugin.as_ref())
-                .provider(&model, client)
+                .provider(&model, client);
+            if let Some(ref hook) = peer_hook {
+                builder = builder.should_stop_hook(hook.clone());
+            }
+            let harness = builder
                 .build_with_session(env, Session::new(storage))
                 .map_err(|e: HarnessBuildError| {
                     AgentError::Internal(format!("failed to build sub-agent harness: {e}"))
                 })?;
 
-            // 6. 构建 prompt（可选的 context 注入）。
+            // 7. peer: set_follow_up_handle + guard。
+            //    guard 必须在 set_follow_up_handle 之后建，且 move 进执行 task。
+            let peer_guard: Option<PeerCleanupGuard> =
+                if let (Some(hook), Some(meta), Some(dir)) =
+                    (peer_hook.as_ref(), peer_meta.as_ref(), peer_directory.as_ref())
+                {
+                    hook.set_follow_up_handle(harness.follow_up_handle());
+                    Some(PeerCleanupGuard::new(dir.clone(), meta.agent_id.clone()))
+                } else {
+                    None
+                };
+
+            // 8. 构建 prompt（可选的 context 注入）。
             let prompt = match &opts.context {
                 ContextMode::None => opts.prompt,
                 ContextMode::Inject(ctx) => {
@@ -181,7 +269,7 @@ impl SubAgentSpawner for HarnessSubAgentSpawner {
                 }
             };
 
-            // 7. 启动 tokio task。
+            // 9. 启动 tokio task。
             let abort = CancellationToken::new();
             let abort_clone = abort.clone();
             let session_id_clone = session_id.clone();
@@ -189,6 +277,8 @@ impl SubAgentSpawner for HarnessSubAgentSpawner {
                 // 将 abort token 注入 harness，使 handle.abort()
                 // 能到达 agent loop。
                 harness.set_abort_token(abort_clone);
+                // peer_guard move 进 task：task 结束（success/error/panic）才 drop→unregister。
+                let _guard = peer_guard;
 
                 // Bridge: broadcast → unbounded mpsc。
                 // event_task 从 mpsc 读，不会因 broadcast buffer 满而 Lagged。
@@ -261,9 +351,81 @@ impl SubAgentSpawner for HarnessSubAgentSpawner {
                 })
             });
 
-            Ok(SubAgentHandle::new(join, abort))
+            Ok((SubAgentHandle::new(join, abort), session_id))
         }
         .boxed()
+    }
+
+    /// 同步、有 peer：`spawn_inner(opts, Some(meta))`，返回 `SubAgentHandle`。
+    /// 调用方自己 `join()`。
+    pub fn spawn_with_peer(
+        &self,
+        opts: SpawnOptions,
+        meta: PeerMetadata,
+    ) -> BoxFuture<'_, Result<SubAgentHandle, AgentError>> {
+        Box::pin(async move {
+            let (handle, _session_id) = self.spawn_inner(opts, Some(meta)).await?;
+            Ok(handle)
+        })
+    }
+
+    /// Spawn sub-agent 后台执行（task 异步跑），经 `registry.track` 返回
+    /// `(AsyncSpawnHandle, oneshot::Receiver)`。方法名 "async" 指 sub-agent
+    /// 不阻塞当前 tool execute，**不**指结果投递方式——`SpawnAgentTool` 的
+    /// wait=true / wait=false 都走此方法，由 `deliver_to_channel` 区分：
+    ///
+    /// - `deliver_to_channel=false`（wait=true / sync）：结果经 oneshot 直接
+    ///   回 tool，**不**投递 completion channel（避免双投递）。in_flight 计数
+    ///   此场景无实际作用（主 agent 在 tool execute 阻塞，不进 Idle），但保留
+    ///   以统一 task 生命周期管理。
+    /// - `deliver_to_channel=true`（wait=false / async）：tool 丢弃 oneshot，
+    ///   结果必须经 completion channel 投递给 hook/watcher。
+    ///
+    /// 需先 `enable_async_delivery`，否则返回错误。
+    /// agent_id 取 session_id（非 peer 模式，设计 §7.4）。
+    pub fn spawn_async(
+        &self,
+        opts: SpawnOptions,
+        deliver_to_channel: bool,
+    ) -> BoxFuture<'_, Result<(AsyncSpawnHandle, tokio::sync::oneshot::Receiver<AsyncCompletion>), AgentError>> {
+        let registry = self.async_registry.clone();
+        Box::pin(async move {
+            let registry = registry.ok_or_else(|| {
+                AgentError::Internal("async delivery not enabled on spawner".into())
+            })?;
+            let (handle, session_id) = self.spawn_inner(opts, None).await?;
+            Ok(registry.track(handle, session_id, deliver_to_channel))
+        })
+    }
+    /// Spawn sub-agent 后台执行（task 异步跑）+ peer 注册，经 `registry.track`
+    /// 返回 `(AsyncSpawnHandle, oneshot::Receiver)`。与 `spawn_async` 同构，
+    /// `deliver_to_channel` 语义见该方法文档。agent_id 取自 `PeerMetadata.agent_id`。
+    ///
+    /// 需先 `enable_async_delivery`，否则返回错误。
+    pub fn spawn_async_with_peer(
+        &self,
+        opts: SpawnOptions,
+        meta: PeerMetadata,
+        deliver_to_channel: bool,
+    ) -> BoxFuture<'_, Result<(AsyncSpawnHandle, tokio::sync::oneshot::Receiver<AsyncCompletion>), AgentError>> {
+        let registry = self.async_registry.clone();
+        Box::pin(async move {
+            let registry = registry.ok_or_else(|| {
+                AgentError::Internal("async delivery not enabled on spawner".into())
+            })?;
+            let agent_id = meta.agent_id.clone();
+            let (handle, _session_id) = self.spawn_inner(opts, Some(meta)).await?;
+            Ok(registry.track(handle, agent_id, deliver_to_channel))
+        })
+    }
+}
+
+impl SubAgentSpawner for HarnessSubAgentSpawner {
+    fn spawn(&self, opts: SpawnOptions) -> BoxFuture<'_, Result<SubAgentHandle, AgentError>> {
+        Box::pin(async move {
+            let (handle, _session_id) = self.spawn_inner(opts, None).await?;
+            Ok(handle)
+        })
     }
 }
 
@@ -341,6 +503,8 @@ impl SessionFactory for JsonlSessionFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::async_spawn_pair;
+    use crate::{PeerDirectory, PeerMetadata};
     use std::sync::Mutex;
 
     use llm_harness_agent::session::repo::InMemorySessionRepo;
@@ -437,7 +601,7 @@ mod tests {
             model.to_string(),
             client.clone(),
             dir.path().to_path_buf(),
-            |_| Box::new(NoopPlugin),
+            |_, _| Box::new(NoopPlugin),
         )
         .env_factory(Arc::new(NoopEnvFactory))
         .session_factory(factory.clone());
@@ -559,6 +723,171 @@ mod tests {
         assert!(
             user_text.contains("Context:\nrelevant context\n\n---\n\n"),
             "user message should contain context prefix, got: {user_text:?}"
+        );
+    }
+    // ── Peer / Async spawn tests (Task 9) ───────────────────────────────────────
+
+    /// 建一个可工作的 spawner：真实 SessionFactory + EnvFactory + NoopPlugin。
+    /// MockLlmClient 给一条 "ok" 文本响应，sub-agent 一轮即停。
+    fn make_peer_test_spawner() -> HarnessSubAgentSpawner {
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
+        let dir = tempfile::tempdir().unwrap();
+        HarnessSubAgentSpawner::new("test-model", client, dir.path().to_path_buf(), |_, _| {
+            Box::new(NoopPlugin)
+        })
+        .env_factory(Arc::new(NoopEnvFactory))
+        .session_factory(Arc::new(CaptureModelSessionFactory::new()))
+    }
+
+    #[tokio::test]
+    async fn spawn_async_returns_handle_and_tracks_in_flight() {
+        let spawner = make_peer_test_spawner();
+        let (registry, _hook) = async_spawn_pair();
+        let spawner = spawner.enable_async_delivery(registry.clone());
+
+        let opts = SpawnOptions {
+            prompt: "say hi".into(),
+            provider: ProviderSelection::Inherit,
+            cwd: None,
+            context: ContextMode::None,
+        };
+        let (handle, _sync_rx) = spawner
+            .spawn_async(opts, true)
+            .await
+            .expect("spawn_async should succeed");
+        assert!(!handle.agent_id().is_empty());
+        // 等 track task 完成（sub-agent 跑完 "say hi"）
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(registry.in_flight_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn spawn_with_peer_registers_in_directory() {
+        let spawner = make_peer_test_spawner();
+        let dir = Arc::new(PeerDirectory::new());
+        let spawner = spawner.enable_peer_communication(dir.clone());
+
+        let opts = SpawnOptions {
+            prompt: "hi".into(),
+            provider: ProviderSelection::Inherit,
+            cwd: None,
+            context: ContextMode::None,
+        };
+        let meta = PeerMetadata {
+            agent_id: "test-peer".into(),
+            capabilities: vec!["test".into()],
+            description: "test".into(),
+        };
+        let handle = spawner
+            .spawn_with_peer(opts, meta)
+            .await
+            .expect("spawn_with_peer should succeed");
+        // peer 注册期间在通讯录里
+        assert!(
+            dir.list_peers().iter().any(|p| p.agent_id == "test-peer"),
+            "peer should be registered while sub-agent is running"
+        );
+        // join 等 sub-agent 完成
+        let _result = handle.join().await.expect("sub-agent should complete");
+        // 完成后 unregister
+        assert!(
+            !dir.list_peers().iter().any(|p| p.agent_id == "test-peer"),
+            "peer should be unregistered after sub-agent completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_async_with_peer_tracks_and_registers() {
+        let spawner = make_peer_test_spawner();
+        let dir = Arc::new(PeerDirectory::new());
+        let (registry, _hook) = async_spawn_pair();
+        let spawner = spawner
+            .enable_peer_communication(dir.clone())
+            .enable_async_delivery(registry.clone());
+
+        let opts = SpawnOptions {
+            prompt: "hi".into(),
+            provider: ProviderSelection::Inherit,
+            cwd: None,
+            context: ContextMode::None,
+        };
+        let meta = PeerMetadata {
+            agent_id: "async-peer".into(),
+            capabilities: vec![],
+            description: "".into(),
+        };
+        let (handle, _sync_rx) = spawner
+            .spawn_async_with_peer(opts, meta, true)
+            .await
+            .expect("spawn_async_with_peer should succeed");
+        assert_eq!(handle.agent_id(), "async-peer");
+        assert!(
+            dir.list_peers().iter().any(|p| p.agent_id == "async-peer"),
+            "peer should be registered while sub-agent is running"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !dir.list_peers().iter().any(|p| p.agent_id == "async-peer"),
+            "peer should be unregistered after sub-agent completes"
+        );
+        assert_eq!(registry.in_flight_count(), 0);
+    }
+    /// peer 模式下 plugin factory 收到 `Some(rx)`，非 peer 模式收到 `None`。
+    /// 验证 `SharedPeerRx` 被正确传递给 plugin，使其能注册 `WaitForPeerMessageTool`。
+    #[tokio::test]
+    async fn plugin_factory_receives_peer_rx_in_peer_mode() {
+        use std::sync::Mutex as StdMutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        // 捕获 plugin factory 收到的 `peer_rx` 是 `Some` 还是 `None`。
+        let captured: Arc<StdMutex<Vec<bool>>> = Arc::new(StdMutex::new(vec![]));
+        let captured_clone = captured.clone();
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
+        let spawner = HarnessSubAgentSpawner::new(
+            "test-model",
+            client,
+            dir.path().to_path_buf(),
+            move |_cwd, peer_rx| {
+                captured_clone.lock().unwrap().push(peer_rx.is_some());
+                Box::new(NoopPlugin)
+            },
+        )
+        .env_factory(Arc::new(NoopEnvFactory))
+        .session_factory(Arc::new(CaptureModelSessionFactory::new()));
+
+        // 非 peer 模式：factory 收到 None
+        let opts = SpawnOptions {
+            prompt: "hi".into(),
+            provider: ProviderSelection::Inherit,
+            cwd: None,
+            context: ContextMode::None,
+        };
+        let _ = spawner.spawn(opts).await.unwrap();
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            &[false],
+            "non-peer spawn should pass None to plugin factory"
+        );
+
+        // peer 模式：factory 收到 Some(rx)
+        let peer_dir = Arc::new(PeerDirectory::new());
+        let spawner = spawner.enable_peer_communication(peer_dir.clone());
+        let opts = SpawnOptions {
+            prompt: "hi".into(),
+            provider: ProviderSelection::Inherit,
+            cwd: None,
+            context: ContextMode::None,
+        };
+        let meta = PeerMetadata {
+            agent_id: "rx-peer".into(),
+            capabilities: vec![],
+            description: "".into(),
+        };
+        let _ = spawner.spawn_with_peer(opts, meta).await.unwrap();
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            &[false, true],
+            "peer-mode spawn should pass Some(rx) to plugin factory"
         );
     }
 }

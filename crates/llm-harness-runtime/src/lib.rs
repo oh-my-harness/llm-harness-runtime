@@ -15,6 +15,7 @@
 //! - Budget control (`BudgetExceededHook`, `BudgetControlAdapter`)
 //! - Harness construction (`HarnessBuilder`)
 
+pub mod async_spawn;
 pub mod audit;
 pub mod budget;
 pub mod builder;
@@ -22,9 +23,11 @@ pub mod cost;
 pub mod error;
 pub mod human_approval;
 pub mod mcp;
+pub mod peer;
 pub mod prompt;
 pub mod resource;
 pub mod sandbox;
+pub mod spawn_tool;
 pub mod spawner;
 pub mod task;
 pub mod tool_adapter;
@@ -32,6 +35,10 @@ pub mod tool_registry;
 pub mod tracer;
 pub mod tracing_adapter;
 
+pub use async_spawn::{
+    AsyncCompletion, AsyncSpawnHandle, AsyncSpawnHook, AsyncSpawnRegistry, CompletionRxGuard,
+    IdleWatcher, async_spawn_pair,
+};
 pub use audit::{AuditDecision, AuditEntry, AuditEventType, AuditSink, CostDelta};
 pub use budget::{BudgetControlAdapter, BudgetExceededHook};
 pub use builder::{HarnessBuildError, HarnessBuilder};
@@ -44,12 +51,17 @@ pub use llm_harness_loop::composite::{
     CompositeBeforeProviderRequestHook, CompositeBeforeToolCallHook,
 };
 pub use mcp::{McpClientHandle, McpContent, McpError, McpResult, McpToolDef};
+pub use peer::{
+    ListPeersTool, PeerCleanupGuard, PeerDirectory, PeerError, PeerInfo, PeerMessageHook,
+    PeerMetadata, SendToPeerTool, SharedPeerRx, WaitForPeerMessageTool,
+};
 pub use prompt::{
     ArgumentDef, InMemoryPromptRegistry, InvokeError, PromptSource, PromptSourceTemplate,
     PromptTemplateCompiler,
 };
 pub use resource::{ResourceContent, ResourceDescriptor, ResourceInjector, ResourceProvider};
 pub use sandbox::{NetRule, ResourceLimits, Sandbox, SandboxConfig};
+pub use spawn_tool::SpawnAgentTool;
 pub use spawner::{
     EnvFactory, HarnessSubAgentSpawner, JsonlSessionFactory, PluginFactory, SessionCreateResult,
     SessionFactory,

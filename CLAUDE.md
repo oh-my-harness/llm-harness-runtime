@@ -209,7 +209,8 @@ pub struct HarnessHooks {
 
 - 用 `std::sync::Mutex` + 快照模式（lock → clone → drop lock → 操作快照）。不用 `RwLock`。
 - 不在持锁状态下跨 `.await`。
-- Hook 实现无内部状态，所有状态通过 `ToolContext`、`AgentHarness` 等外部传入。
+- **例外**：当 Mutex 保护一个必须在 `.await` 期间持有的异步资源（如 `mpsc::Receiver` 需 `recv().await`）时，用 `tokio::sync::Mutex`——`std::sync::Mutex` 在 `recv().await` 被 cancel 时会 poison。前提是确保不与其他 `Mutex` 构成死锁（如 `SharedPeerRx` 仅 hook `try_lock` + tool `lock().await`，且两者在 agent loop 单线程上不并发）。
+- Hook 实现无内部业务状态（计数器、缓存等影响行为的可变状态），所有业务状态通过 `ToolContext`、`AgentHarness` 等外部传入。**例外**：Hook 可持有资源句柄（如 channel receiver 的 `CompletionRxGuard`、`FollowUpHandle`）——这些是 RAII 所有权流转（借出/归还），非业务状态，且 `ShouldStopHook::should_stop` 的 `&self` 签名无法通过参数传入。此类资源句柄用 `Mutex` 保护（见上条例外）。
 
 ### 错误处理与失败语义
 
@@ -265,16 +266,3 @@ pub struct HarnessHooks {
   - scope：crate 名，如 `traits`、`auth`、`budget`、`orchestration`
   - 示例：`feat(auth): implement EnvAuthHook`、`test(orchestration): add CompositeHook tests`
 - description 说明 *为什么* 而非 *做了什么*。
-
-## v0.2 vs v0.3+ 边界标记
-
-在代码和注释中，v0.2 范围边界处用以下标记：
-
-- **`v0.2 明确不实现`**：代码中明确排除，v0.3+ 才支持（如 SubAgentSpawner）
-- **`v0.3+ API 预览`**：代码注释中预示未来 API，当前代码中不实现
-
-这些标记帮助用户理解当前版本的范围，避免期望超出设计。
-
-## 收尾
-
-每次开发完成后：提交并推送本仓库变更；如有进度变化同步更新顶层 `STATUS.md` 并推送 `oh-my-harness/oh-my-harness`。

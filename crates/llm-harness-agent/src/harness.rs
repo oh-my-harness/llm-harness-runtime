@@ -262,6 +262,31 @@ pub enum AgentHarnessEvent {
     Aborted,
 }
 
+// ── Idle watcher / async spawn hook decoupling traits ────────────────────────
+
+/// Idle watcher 解耦 trait（由 runtime crate 的 `IdleWatcher` 实现）。
+/// harness 在 `run_loop` 结束进入 Idle 后调 `on_idle`；在 `prompt_with_messages`
+/// 守卫通过后调 `cancel`。watcher 持 continue_run 回调而非 harness 引用。
+pub trait IdleWatcherHook: Send + Sync {
+    /// loop 结束进入 Idle 后调用。检查 in-flight count，>0 则启动 watcher。
+    fn on_idle(&self);
+    /// prompt() 启动前调用：取消已有 watcher，让其归还 completion_rx。
+    fn cancel(&self);
+}
+
+/// AsyncSpawnHook 解耦 trait（由 runtime crate 的 `AsyncSpawnHook` 实现）。
+/// harness 在 `run_loop` 开头 borrow、结尾 release completion_rx guard。
+pub trait AsyncSpawnHookHandle: Send + Sync {
+    /// loop 启动前：从 registry 借出 completion_rx guard 存入 hook。
+    fn borrow_completion_rx(&self);
+    /// loop 结束后：drop guard，归还 rx 到 registry，让 watcher 能 take。
+    fn release_completion_rx(&self);
+    /// 回填 `FollowUpHandle`。由 `set_async_spawn_hook` 自动调用，
+    /// 保证 should_stop 能注入 follow_up（修复 F-6：生产中 follow_up_handle
+    /// 从未 set 导致 should_stop 永远走 handle_ready=false 死循环）。
+    fn set_follow_up_handle(&self, handle: FollowUpHandle);
+}
+
 // ── Inner mutable state ───────────────────────────────────────────────────────
 
 struct HarnessInner {
@@ -278,6 +303,13 @@ struct HarnessInner {
     compaction_keep_recent_tokens: Option<u32>,
     /// Maps tool_use_id → tool_name for in-flight tool calls.
     active_tool_names: std::collections::HashMap<String, String>,
+    /// Idle watcher（opt-in）。harness 持 watcher 的 `Arc`，watcher 的
+    /// continue_run 闭包须捕获 `Weak<AgentHarness>` 而非 `Arc`，以打断
+    /// `Arc<AgentHarness>` → inner.idle_watcher → 闭包 → `Arc<AgentHarness>`
+    /// 的引用环。None 则无 watcher。
+    idle_watcher: Option<Arc<dyn IdleWatcherHook>>,
+    /// AsyncSpawnHook 引用（opt-in）。None 则无异步投递。
+    async_spawn_hook: Option<Arc<dyn AsyncSpawnHookHandle>>,
 }
 
 impl HarnessInner {
@@ -288,6 +320,40 @@ impl HarnessInner {
         self.steer_tx = steer_tx;
         self.follow_up_tx = follow_up_tx;
         (steer_rx, follow_up_rx)
+    }
+}
+
+// ── FollowUpHandle ────────────────────────────────────────────────────────────
+
+/// 对 `AgentHarness` follow_up channel 的可克隆句柄。
+///
+/// 持有与 `AgentHarness` 同一个 `Arc<Mutex<HarnessInner>>`，使外部组件
+/// （`AsyncSpawnHook`、`PeerMessageHook`、`IdleWatcher`）能在不持有整个
+/// harness 引用的前提下注入 follow_up 消息。
+///
+/// **不缓存** `follow_up_tx`——每次 `follow_up_message` 都重新 `lock()` 取
+/// 当前 sender，保证 `reset_channels()` 替换 sender 后总能拿到最新的。
+/// 持 `std::sync::Mutex` 期间不跨 await（`try_send` 非阻塞）。
+#[derive(Clone)]
+pub struct FollowUpHandle {
+    inner: std::sync::Weak<Mutex<HarnessInner>>,
+}
+
+impl FollowUpHandle {
+    /// 注入一条 follow_up 消息到 harness 当前的 follow_up channel。
+    ///
+    /// 与既有 `AgentHarness::follow_up_message`（`harness.rs:963`）语义一致：
+    /// 正常路径不会失败——should_stop 返回 true 后 loop 在 `loop_fn.rs:519`
+    /// 立即 `try_recv` 取走，`reset_channels` 在下一次 `prompt()` 才调。
+    ///
+    /// 持 `Weak` 而非 `Arc`：打断 `harness.inner → async_spawn_hook/peer_hook
+    /// → FollowUpHandle → harness.inner` 的引用环。harness drop 后 upgrade
+    /// 失败，静默 no-op（hook 的宿主已不存在）。
+    pub fn follow_up_message(&self, msg: AgentMessage) {
+        if let Some(inner) = self.inner.upgrade() {
+            let inner = inner.lock().unwrap();
+            let _ = inner.follow_up_tx.try_send(msg);
+        }
     }
 }
 
@@ -493,6 +559,8 @@ impl AgentHarness {
             compaction_reserve_tokens: opts.compaction_reserve_tokens,
             compaction_keep_recent_tokens: opts.compaction_keep_recent_tokens,
             active_tool_names: std::collections::HashMap::new(),
+            idle_watcher: None,
+            async_spawn_hook: None,
         };
 
         let convert_to_llm: Arc<dyn ConvertToLlmHook> = opts
@@ -531,15 +599,22 @@ impl AgentHarness {
         &self,
         messages: Vec<AgentMessage>,
     ) -> Result<(), HarnessError> {
-        // 1. Guard Idle phase; consume queued_next_turn.
-        let queued = {
+        // 1. Guard Idle phase; consume queued_next_turn; clone watcher.
+        let (queued, watcher) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.state.phase != HarnessPhase::Idle {
                 return Err(HarnessError::NotIdle(inner.state.phase));
             }
             inner.state.error_message = None;
-            std::mem::take(&mut inner.state.queued_next_turn)
+            let q = std::mem::take(&mut inner.state.queued_next_turn);
+            let w = inner.idle_watcher.clone();
+            (q, w)
         };
+        // 取消已有 watcher（让位给用户 prompt；watcher 在 cancel 分支 break，
+        // guard drop 归还 rx，run_loop 的 borrow_completion_rx 能取到）
+        if let Some(w) = &watcher {
+            w.cancel();
+        }
 
         // 2. Merge queued + initial.
         let initial: Vec<AgentMessage> = queued.into_iter().chain(messages).collect();
@@ -965,6 +1040,40 @@ impl AgentHarness {
         let _ = inner.follow_up_tx.try_send(msg);
     }
 
+    /// 返回一个可克隆的 `FollowUpHandle`，供外部组件注入 follow_up 消息。
+    ///
+    /// 持 `Weak` 引用（见 `FollowUpHandle` 文档），不延长 harness 生命周期。
+    pub fn follow_up_handle(&self) -> FollowUpHandle {
+        FollowUpHandle {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+    /// 配置 Idle watcher（opt-in）。不设则无自动唤醒（行为退化为旧设计）。
+    pub fn set_idle_watcher(&self, watcher: Arc<dyn IdleWatcherHook>) {
+        self.inner.lock().unwrap().idle_watcher = Some(watcher);
+    }
+
+    /// 配置 AsyncSpawnHook 引用（loop 启动时 borrow completion_rx）。
+    /// 自动回填 `FollowUpHandle`（修复 F-6：生产中 follow_up_handle 从未 set
+    /// 导致 should_stop 永远走 handle_ready=false 死循环）。
+    pub fn set_async_spawn_hook(&self, hook: Arc<dyn AsyncSpawnHookHandle>) {
+        hook.set_follow_up_handle(self.follow_up_handle());
+        self.inner.lock().unwrap().async_spawn_hook = Some(hook);
+    }
+
+    /// 不注入初始消息，驱动一轮 agent loop 直到再次 Idle。
+    /// 供 Idle watcher 收到 completion 后唤醒主 agent。
+    /// 自带 Idle 守卫（与 `prompt_with_messages` 对称）。
+    pub async fn continue_run(&self) -> Result<(), HarnessError> {
+        {
+            let inner = self.inner.lock().unwrap();
+            if inner.state.phase != HarnessPhase::Idle {
+                return Err(HarnessError::NotIdle(inner.state.phase));
+            }
+        }
+        self.run_loop(vec![]).await
+    }
+
     /// Buffer a text message to be injected at the start of the next `prompt()`.
     pub fn next_turn(&self, text: impl Into<String>) {
         self.next_turn_message(AgentMessage::User(UserMessage {
@@ -1298,8 +1407,8 @@ impl AgentHarness {
     }
 
     async fn run_loop(&self, initial: Vec<AgentMessage>) -> Result<(), HarnessError> {
-        // 1. Setup: channels, abort token, system prompt.
-        let (steer_rx, follow_up_rx, abort, system_prompt, original_tools) = {
+        // 1. Setup: channels, abort token, system prompt, hooks.
+        let (steer_rx, follow_up_rx, abort, system_prompt, original_tools, async_hook, watcher) = {
             let mut inner = self.inner.lock().unwrap();
             inner.state.streaming_message = None;
             inner.state.pending_tool_calls.clear();
@@ -1307,10 +1416,17 @@ impl AgentHarness {
             let abort = inner.current_abort.take().unwrap_or_default();
             inner.current_abort = Some(abort.clone());
             let sp = inner.state.system_prompt.clone();
+            // clone Vec<Arc<dyn Tool>>（浅拷贝指针，非工具本体），用于 loop 结束后
+            // 恢复未包装的 tools，避免下次 build_loop_config 二次包装 HookedTool。
             let ot = inner.state.tools.clone();
-            (steer_rx, follow_up_rx, abort, sp, ot)
+            let async_hook = inner.async_spawn_hook.clone();
+            let watcher = inner.idle_watcher.clone();
+            (steer_rx, follow_up_rx, abort, sp, ot, async_hook, watcher)
         };
         self.set_phase(HarnessPhase::Turning);
+        if let Some(h) = &async_hook {
+            h.borrow_completion_rx();
+        }
 
         let result = self
             .drive_loop(initial, steer_rx, follow_up_rx, abort, system_prompt)
@@ -1332,6 +1448,16 @@ impl AgentHarness {
             }
         }
         self.set_phase(HarnessPhase::Idle);
+
+        // 释放 hook 的 completion_rx guard，让 watcher 能从 registry take
+        if let Some(h) = &async_hook {
+            h.release_completion_rx();
+        }
+        // Idle 后：若配置了 watcher，让其检查 in-flight 并按需启动
+        if let Some(w) = &watcher {
+            w.on_idle();
+        }
+
         result
     }
 
@@ -1932,6 +2058,97 @@ mod tests {
         assert!(rx.try_recv().is_ok());
     }
 
+    /// A `ShouldStopHook` that coordinates with the test on its **first** call:
+    /// signals `entered`, waits for `inject` before returning `true`. On
+    /// subsequent calls it returns `true` immediately. This eliminates timing
+    /// races — the follow_up is injected while should_stop is held, exactly
+    /// how real hooks (`AsyncSpawnHook`, `PeerMessageHook`) behave.
+    struct CoordinatingShouldStop {
+        entered: Arc<tokio::sync::Notify>,
+        inject: Arc<tokio::sync::Notify>,
+        call_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ShouldStopHook for CoordinatingShouldStop {
+        fn should_stop<'a>(
+            &'a self,
+            _ctx: ShouldStopCtx<'a>,
+        ) -> futures::future::BoxFuture<'a, bool> {
+            let entered = self.entered.clone();
+            let inject = self.inject.clone();
+            let count = self.call_count.clone();
+            Box::pin(async move {
+                if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    entered.notify_one();
+                    inject.notified().await;
+                }
+                true
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn follow_up_handle_injects_message_into_loop() {
+        // The loop calls should_stop after the first assistant turn. Our
+        // coordinating hook signals entry, then waits for the test to inject
+        // a follow_up via FollowUpHandle before returning true. The loop then
+        // checks follow_up_rx, finds the message, and continues 'main —
+        // consuming the second mock response.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let inject = Arc::new(tokio::sync::Notify::new());
+        let hook = Arc::new(CoordinatingShouldStop {
+            entered: entered.clone(),
+            inject: inject.clone(),
+            call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+
+        let client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("first"),
+            MockResponse::text("saw follow-up"),
+        ]));
+        let env = Arc::new(NoOpEnv);
+        let opts = AgentHarnessOptions {
+            hooks: HarnessHooks {
+                should_stop: vec![hook],
+                ..HarnessHooks::none()
+            },
+            ..AgentHarnessOptions::new("test-model")
+        };
+        let h =
+            Arc::new(AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await);
+
+        let handle = h.follow_up_handle();
+        let prompt_task = tokio::spawn({
+            let h = h.clone();
+            async move { h.prompt("say first").await }
+        });
+
+        // Wait until the loop enters should_stop, then inject via the handle.
+        entered.notified().await;
+        handle.follow_up_message(AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::Text {
+                text: "please say 'saw follow-up'".into(),
+            }],
+            timestamp: chrono::Utc::now(),
+        }));
+        inject.notify_one();
+
+        prompt_task.await.unwrap().unwrap();
+
+        // The follow_up must have triggered a second turn consuming the second
+        // mock response — so the session now holds two assistant messages.
+        let ctx = h.session.build_context().await.unwrap();
+        let assistant_count = ctx
+            .messages
+            .iter()
+            .filter(|m| matches!(m, AgentMessage::Assistant(_)))
+            .count();
+        assert_eq!(
+            assistant_count, 2,
+            "follow_up should trigger a second turn consuming the second mock response"
+        );
+    }
+
     #[tokio::test]
     async fn wait_for_idle_returns_immediately_when_idle() {
         let h = make_harness(vec![]);
@@ -2104,5 +2321,39 @@ mod tests {
             ),
             "compact() must return InvalidFirstKeptEntry for a nonexistent entry: {err:?}"
         );
+    }
+    #[tokio::test]
+    async fn continue_run_returns_not_idle_when_turning() {
+        let h = make_harness(vec![]);
+        {
+            let mut inner = h.inner.lock().unwrap();
+            inner.state.phase = HarnessPhase::Turning;
+        }
+        let err = h.continue_run().await.unwrap_err();
+        assert!(matches!(err, HarnessError::NotIdle(_)));
+    }
+
+    #[tokio::test]
+    async fn continue_run_drives_loop_with_empty_initial() {
+        let h = make_harness(vec![
+            MockResponse::text("first"),
+            MockResponse::text("handled follow-up"),
+        ]);
+        h.prompt("initial").await.unwrap(); // 消费 "first"，phase 回到 Idle
+        // 注入 follow_up
+        h.follow_up_message(AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::Text {
+                text: "please respond".into(),
+            }],
+            timestamp: chrono::Utc::now(),
+        }));
+        h.continue_run().await.unwrap(); // 应消费 "handled follow-up"
+        let ctx = h.session.build_context().await.unwrap();
+        let assistant_count = ctx
+            .messages
+            .iter()
+            .filter(|m| matches!(m, AgentMessage::Assistant(_)))
+            .count();
+        assert_eq!(assistant_count, 2);
     }
 }
