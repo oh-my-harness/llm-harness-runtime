@@ -281,6 +281,8 @@ fn run_loop(
                     response_headers: vec![],
                     usage: assistant_msg.usage.clone(),
                     latency_ms: 0,
+                    model: assistant_msg.model.clone(),
+                    provider: assistant_msg.provider.clone(),
                 };
                 h.after_response(&info).await;
             }

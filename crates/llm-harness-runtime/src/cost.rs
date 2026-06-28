@@ -1,50 +1,8 @@
-use std::collections::HashMap;
+//! Cost types re-exported from `llm-harness-types`.
+//!
+//! Originally defined here; moved to `llm-harness-types` so the agent crate
+//! (which sits below runtime in the dependency chain) can hold
+//! `CostAggregate` / `PricingProvider` without reversing the dependency
+//! direction.
 
-/// Per-model token pricing.
-#[derive(Debug, Clone)]
-pub struct TokenPrice {
-    /// Input cost per million tokens (USD).
-    pub input_per_mtok: f64,
-    /// Output cost per million tokens (USD).
-    pub output_per_mtok: f64,
-    /// Cache read cost per million tokens (USD).
-    pub cache_read_per_mtok: f64,
-    /// Cache write cost per million tokens (USD).
-    pub cache_write_per_mtok: f64,
-}
-
-/// Pricing provider (business layer injects).
-pub trait PricingProvider: Send + Sync {
-    /// Return pricing for a model/provider combination. `None` if unknown.
-    fn price_for(&self, model: &str, provider: &str) -> Option<TokenPrice>;
-}
-
-/// Per-model cost breakdown.
-#[derive(Debug, Clone, Default)]
-pub struct ModelCost {
-    /// Total input tokens.
-    pub input_tokens: u64,
-    /// Total output tokens.
-    pub output_tokens: u64,
-    /// Estimated total cost in USD.
-    pub cost: f64,
-    /// Number of LLM calls.
-    pub call_count: u64,
-}
-
-/// Aggregated cost across all models in a session/task.
-#[derive(Debug, Clone, Default)]
-pub struct CostAggregate {
-    /// Total input tokens across all models.
-    pub total_input_tokens: u64,
-    /// Total output tokens across all models.
-    pub total_output_tokens: u64,
-    /// Total cache read tokens.
-    pub total_cache_read_tokens: u64,
-    /// Total cache write tokens.
-    pub total_cache_write_tokens: u64,
-    /// Total estimated cost in USD.
-    pub total_cost: f64,
-    /// Per-model breakdown.
-    pub by_model: HashMap<String, ModelCost>,
-}
+pub use llm_harness_types::{CostAggregate, ModelCost, PricingProvider, TokenPrice};

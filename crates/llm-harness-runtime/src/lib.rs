@@ -20,6 +20,7 @@ pub mod audit;
 pub mod budget;
 pub mod builder;
 pub mod cost;
+pub mod cost_hook;
 pub mod error;
 pub mod human_approval;
 pub mod mcp;
@@ -43,6 +44,7 @@ pub use audit::{AuditDecision, AuditEntry, AuditEventType, AuditSink, CostDelta}
 pub use budget::{BudgetControlAdapter, BudgetExceededHook};
 pub use builder::{HarnessBuildError, HarnessBuilder};
 pub use cost::{CostAggregate, ModelCost, PricingProvider, TokenPrice};
+pub use cost_hook::CostAccumulatorHook;
 pub use human_approval::{
     ApprovalDecision, ApprovalRequest, HumanApprovalWrapper, HumanApprover, TimeoutPolicy,
 };

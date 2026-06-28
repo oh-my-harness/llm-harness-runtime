@@ -18,13 +18,15 @@
 //!     .await?;
 //! ```
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use llm_harness_agent::{
     AgentHarness, AgentHarnessOptions, HarnessHooks, Plugin, PromptTemplate, Skill, StateProvider,
 };
 use llm_harness_loop::LlmClient;
-use llm_harness_types::{ExecutionEnv, ShouldStopHook, Tool};
+use llm_harness_types::{AfterProviderResponseHook, CostAggregate, ExecutionEnv, PricingProvider, ShouldStopHook, Tool};
+
+use crate::{BudgetControlAdapter, BudgetExceededHook, CostAccumulatorHook};
 use thiserror::Error;
 
 // ── Provider matching ─────────────────────────────────────────────────────────
@@ -111,6 +113,15 @@ pub struct HarnessBuilder {
     providers: Vec<ProviderMatcher>,
     /// Active state provider (last registered wins).
     state_provider: Option<Arc<dyn StateProvider>>,
+    /// 可选的 pricing provider，用于成本计算。
+    pricing: Option<Arc<dyn PricingProvider>>,
+    /// 可选的预算上限 + 超限 hook。设置后，一个 `BudgetControlAdapter`
+    /// 会被注入 `should_stop`，与 `CostAccumulatorHook` 共享同一 cost Arc。
+    budget: Option<(f64, Option<Arc<dyn BudgetExceededHook>>)>,
+    /// 共享成本状态。在 `build_options` 中惰性创建；由
+    /// `CostAccumulatorHook`、`BudgetControlAdapter` 和
+    /// `AgentHarnessOptions.cost` 共享。
+    cost: Option<Arc<Mutex<CostAggregate>>>,
 }
 
 impl HarnessBuilder {
@@ -129,6 +140,9 @@ impl HarnessBuilder {
             templates: vec![],
             providers: vec![],
             state_provider: None,
+            pricing: None,
+            budget: None,
+            cost: None,
         }
     }
 
@@ -190,6 +204,34 @@ impl HarnessBuilder {
     /// registration order does not affect correctness (every hook always runs).
     pub fn should_stop_hook(mut self, hook: Arc<dyn ShouldStopHook>) -> Self {
         self.hooks.should_stop.push(hook);
+        self
+    }
+
+    /// 设置 pricing provider，用于成本计算。
+    ///
+    /// 设置后，builder 注入一个 `CostAccumulatorHook`，计算每次调用的
+    /// USD 成本，填充 `CostAggregate.total_cost` 和 `by_model` 明细。
+    /// 不设置则只累积 token 计数。
+    pub fn pricing(mut self, pricing: Arc<dyn PricingProvider>) -> Self {
+        self.pricing = Some(pricing);
+        self
+    }
+
+    /// 配置预算上限和可选的超限 hook。
+    ///
+    /// - `limit` — 预算上限，单位 USD（如 `5.0` 表示 $5.00）。
+    /// - `exceeded_hook = None` → surveillance 模式：只统计成本，loop 永不
+    ///   因预算停止。
+    /// - `exceeded_hook = Some(h)` → 超限时由 `h` 决定继续/停止。
+    ///
+    /// builder 注入一个 `BudgetControlAdapter`（与 `CostAccumulatorHook`
+    /// 共享同一 cost Arc）到 `hooks.should_stop`。
+    pub fn budget(
+        mut self,
+        limit: f64,
+        exceeded_hook: Option<Arc<dyn BudgetExceededHook>>,
+    ) -> Self {
+        self.budget = Some((limit, exceeded_hook));
         self
     }
 
@@ -308,6 +350,31 @@ impl HarnessBuilder {
         opts.hooks = self.hooks.clone();
         opts.skills = self.skills.clone();
         opts.templates = self.templates.clone();
+
+        // 惰性创建共享 cost 状态。即使没有 pricing/budget，
+        // 也注入 CostAccumulatorHook，使 token 计数始终能通过
+        // AgentHarness::usage() 读取。
+        let cost = self
+            .cost
+            .clone()
+            .unwrap_or_else(|| Arc::new(Mutex::new(CostAggregate::default())));
+        opts.cost = cost.clone();
+
+        // 注入内置成本累积器（始终注入，使 usage() 可用）。
+        let accumulator: Arc<dyn AfterProviderResponseHook> =
+            Arc::new(CostAccumulatorHook::new(cost.clone(), self.pricing.clone()));
+        opts.hooks.after_provider_response.push(accumulator);
+
+        // 若配置了 budget，注入预算决策器。
+        if let Some((limit, exceeded_hook)) = &self.budget {
+            let budget_adapter: Arc<dyn ShouldStopHook> = Arc::new(BudgetControlAdapter::new(
+                cost.clone(),
+                *limit,
+                exceeded_hook.clone(),
+            ));
+            opts.hooks.should_stop.push(budget_adapter);
+        }
+
         opts
     }
 }
@@ -733,5 +800,50 @@ mod tests {
             .should_stop_hook(Arc::new(AlwaysStop))
             .should_stop_hook(Arc::new(AlwaysStop));
         assert_eq!(builder.hooks.should_stop.len(), 2);
+    }
+
+    #[test]
+    fn build_options_injects_accumulator_and_budget_hooks() {
+        use crate::cost::TokenPrice;
+
+        struct StubPricing;
+        impl crate::cost::PricingProvider for StubPricing {
+            fn price_for(&self, _model: &str, _provider: &str) -> Option<TokenPrice> {
+                None
+            }
+        }
+
+        let builder = HarnessBuilder::new("test-model")
+            .pricing(Arc::new(StubPricing) as Arc<dyn crate::cost::PricingProvider>)
+            .budget(5.0, None);
+
+        let opts = builder.build_options();
+        // 成本累积器始终注入。
+        assert!(
+            !opts.hooks.after_provider_response.is_empty(),
+            "CostAccumulatorHook must be injected"
+        );
+        // 仅在调用 budget() 时注入预算 adapter。
+        assert!(
+            !opts.hooks.should_stop.is_empty(),
+            "BudgetControlAdapter must be injected when budget() is called"
+        );
+        // 共享 cost Arc 是同一实例。
+        let cost_snapshot = opts.cost.lock().unwrap().clone();
+        assert_eq!(cost_snapshot.total_cost, 0.0);
+    }
+
+    #[test]
+    fn build_options_injects_accumulator_without_pricing() {
+        let builder = HarnessBuilder::new("test-model");
+        let opts = builder.build_options();
+        assert!(
+            !opts.hooks.after_provider_response.is_empty(),
+            "CostAccumulatorHook must be injected even without pricing"
+        );
+        assert!(
+            opts.hooks.should_stop.is_empty(),
+            "no budget() call → no BudgetControlAdapter"
+        );
     }
 }

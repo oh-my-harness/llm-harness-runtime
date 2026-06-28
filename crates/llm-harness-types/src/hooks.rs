@@ -173,6 +173,10 @@ pub struct ProviderResponseInfo {
     pub usage: Option<crate::TokenUsage>,
     /// 请求延迟（毫秒）。
     pub latency_ms: u64,
+    /// 本次响应的模型 ID（从 `AssistantMessage.model` 透传）。
+    pub model: Option<String>,
+    /// 生成本次响应的 provider 名（从 `AssistantMessage.provider` 透传）。
+    pub provider: Option<String>,
 }
 
 /// LLM provider 响应后的观测 hook；用于配额追踪、成本监控等。

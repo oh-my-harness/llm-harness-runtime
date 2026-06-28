@@ -6,3 +6,4 @@ Cargo.lock
 .coding-agent/sessions/
 .DS_Store
 examples/coding-agent/
+docs/superpowers/

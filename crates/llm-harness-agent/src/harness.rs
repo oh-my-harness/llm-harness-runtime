@@ -310,6 +310,10 @@ struct HarnessInner {
     idle_watcher: Option<Arc<dyn IdleWatcherHook>>,
     /// AsyncSpawnHook 引用（opt-in）。None 则无异步投递。
     async_spawn_hook: Option<Arc<dyn AsyncSpawnHookHandle>>,
+    /// Shared accumulated cost state. Populated by `CostAccumulatorHook`
+    /// (injected via `after_provider_response` by `HarnessBuilder`).
+    /// Read by `AgentHarness::usage()`.
+    cost: Arc<Mutex<CostAggregate>>,
 }
 
 impl HarnessInner {
@@ -389,6 +393,10 @@ pub struct AgentHarnessOptions {
     pub templates: Vec<PromptTemplate>,
     /// Retry config for transient provider errors; `None` disables retry.
     pub retry: Option<RetryConfig>,
+    /// 共享成本状态（`Arc<Mutex<CostAggregate>>`）。由 builder 创建，
+    /// 并注入共享同一 Arc 的 `CostAccumulatorHook` 到
+    /// `hooks.after_provider_response`。默认为空的全新 aggregate。
+    pub cost: Arc<Mutex<CostAggregate>>,
     /// Override tokens to reserve for the LLM response during compaction.
     pub compaction_reserve_tokens: Option<u32>,
     /// Override how many recent context tokens to always preserve during compaction.
@@ -411,6 +419,7 @@ impl AgentHarnessOptions {
             auth: None,
             convert_to_llm: None,
             skills: vec![],
+            cost: Arc::new(Mutex::new(CostAggregate::default())),
             templates: vec![],
             retry: None,
             compaction_reserve_tokens: None,
@@ -552,6 +561,7 @@ impl AgentHarness {
             templates: opts.templates,
             steer_tx,
             follow_up_tx,
+            cost: opts.cost,
             current_abort: None,
             queue_capacity: cap,
             max_tokens: opts.max_tokens,
@@ -1143,6 +1153,32 @@ impl AgentHarness {
     /// Return a snapshot of the current harness state.
     pub fn state(&self) -> HarnessState {
         self.inner.lock().unwrap().state.clone()
+    }
+
+
+    /// 返回当前累积的会话成本快照。
+    ///
+    /// 由内置的 `CostAccumulatorHook`（由 `HarnessBuilder` 注入）填充。
+    /// 若未配置 pricing provider，返回的 `CostAggregate` 中 cost 为 0
+    ///（token 计数仍会累积）。
+    pub fn usage(&self) -> CostAggregate {
+        // Clone the Arc out first, then lock the inner CostAggregate.
+        // This avoids holding the `inner` mutex while locking `cost`,
+        // keeping the lock-ordering contract simple: `cost` is only ever
+        // locked on its own (by CostAccumulatorHook / BudgetControlAdapter),
+        // never nested under `inner`.
+        let cost = self.inner.lock().unwrap().cost.clone();
+        cost.lock().unwrap().clone()
+    }
+
+    /// 重置累积的会话成本归零。
+    ///
+    /// 将共享的 `CostAggregate` 恢复为 `default()`。适用于长生命周期
+    /// harness 的周期性成本统计（如在新的任务开始时清零）。
+    /// 调用后 `usage()` 从 0 重新开始累积。
+    pub fn reset_usage(&self) {
+        let cost = self.inner.lock().unwrap().cost.clone();
+        *cost.lock().unwrap() = CostAggregate::default();
     }
 
     /// Return a copy of the current skill list.
@@ -2355,5 +2391,93 @@ mod tests {
             .filter(|m| matches!(m, AgentMessage::Assistant(_)))
             .count();
         assert_eq!(assistant_count, 2);
+    }
+}
+
+#[cfg(test)]
+mod cost_state_tests {
+    use super::*;
+
+    #[test]
+    fn usage_returns_default_when_no_accumulation() {
+        // 用默认 cost 构造 options。
+        let opts = AgentHarnessOptions::new("test-model");
+        // 模拟 harness 持有同一 Arc（不跑 loop）。
+        let cost_arc = opts.cost.clone();
+        // 没有 harness 实例也能验证共享状态契约：
+        // 修改 Arc 对持有同一 Arc 的读者可见。
+        {
+            let mut c = cost_arc.lock().unwrap();
+            c.total_input_tokens = 42;
+            c.total_cost = 1.5;
+        }
+        let snapshot = cost_arc.lock().unwrap().clone();
+        assert_eq!(snapshot.total_input_tokens, 42);
+        assert_eq!(snapshot.total_cost, 1.5);
+    }
+
+    #[test]
+    fn options_new_initializes_empty_cost() {
+        let opts = AgentHarnessOptions::new("test-model");
+        let c = opts.cost.lock().unwrap().clone();
+        assert_eq!(c.total_input_tokens, 0);
+        assert_eq!(c.total_cost, 0.0);
+        assert!(c.by_model.is_empty());
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "test-utils")]
+mod cost_reset_tests {
+    use super::*;
+    use llm_harness_loop::test_utils::{MockLlmClient, MockResponse, NoOpEnv};
+
+    #[test]
+    fn reset_usage_zeroes_accumulated_cost() {
+        let h = make_harness_for_cost(vec![]);
+        // Inject cost into the shared Arc that the harness holds.
+        {
+            let cost = h.inner.lock().unwrap().cost.clone();
+            let mut c = cost.lock().unwrap();
+            c.total_input_tokens = 100;
+            c.total_output_tokens = 50;
+            c.total_cost = 2.5;
+            c.by_model.insert(
+                "anthropic/claude".into(),
+                ModelCost {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cost: 2.5,
+                    call_count: 1,
+                },
+            );
+        }
+        // Precondition: usage reflects the injected values.
+        let before = h.usage();
+        assert_eq!(before.total_input_tokens, 100);
+        assert_eq!(before.total_cost, 2.5);
+        assert_eq!(before.by_model.len(), 1);
+
+        h.reset_usage();
+
+        let after = h.usage();
+        assert_eq!(after.total_input_tokens, 0);
+        assert_eq!(after.total_output_tokens, 0);
+        assert_eq!(after.total_cache_read_tokens, 0);
+        assert_eq!(after.total_cache_write_tokens, 0);
+        assert_eq!(after.total_cost, 0.0);
+        assert!(after.by_model.is_empty());
+    }
+
+    /// Minimal harness constructor (parallel to `tests::make_harness`).
+    fn make_harness_for_cost(responses: Vec<MockResponse>) -> AgentHarness {
+        let client = Arc::new(MockLlmClient::new(responses));
+        let env = Arc::new(NoOpEnv);
+        let opts = AgentHarnessOptions::new("test-model");
+        futures::executor::block_on(AgentHarness::new_in_memory(
+            client as Arc<dyn LlmClient>,
+            env,
+            opts,
+        ))
     }
 }
