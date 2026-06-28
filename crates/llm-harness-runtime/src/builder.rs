@@ -24,7 +24,7 @@ use llm_harness_agent::{
     AgentHarness, AgentHarnessOptions, HarnessHooks, Plugin, PromptTemplate, Skill, StateProvider,
 };
 use llm_harness_loop::LlmClient;
-use llm_harness_types::{ExecutionEnv, Tool};
+use llm_harness_types::{ExecutionEnv, ShouldStopHook, Tool};
 use thiserror::Error;
 
 // ── Provider matching ─────────────────────────────────────────────────────────
@@ -171,6 +171,25 @@ impl HarnessBuilder {
             self.state_provider = Some(provider);
         }
 
+        self
+    }
+
+    /// Register a single tool without wrapping it in a Plugin.
+    ///
+    /// Equivalent to `install(plugin)` for a plugin that contributes only this
+    /// tool. Appended to the tools list in registration order.
+    pub fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    /// Register a `ShouldStopHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.should_stop`. Call multiple times to
+    /// compose multiple hooks — `CompositeShouldStopHook` is all-execute, so
+    /// registration order does not affect correctness (every hook always runs).
+    pub fn should_stop_hook(mut self, hook: Arc<dyn ShouldStopHook>) -> Self {
+        self.hooks.should_stop.push(hook);
         self
     }
 
@@ -663,5 +682,56 @@ mod tests {
         assert_eq!(builder.tools[0].name(), "tool-1");
         assert_eq!(builder.tools[1].name(), "tool-2");
         assert_eq!(builder.tools[2].name(), "tool-3");
+    }
+
+    #[test]
+    fn builder_tool_appends_to_tools_list() {
+        use futures::future::BoxFuture;
+        use llm_harness_types::{Tool, ToolContext, ToolError, ToolResult};
+        use std::sync::Arc;
+
+        struct DummyTool;
+        impl Tool for DummyTool {
+            fn name(&self) -> &str {
+                "dummy"
+            }
+            fn description(&self) -> &str {
+                "dummy"
+            }
+            fn parameters_schema(&self) -> &serde_json::Value {
+                static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+                S.get_or_init(|| serde_json::json!({"type":"object","properties":{}}))
+            }
+            fn execute<'a>(
+                &'a self,
+                _args: serde_json::Value,
+                _ctx: &'a ToolContext,
+            ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+                Box::pin(async { unreachable!() })
+            }
+        }
+
+        let builder = HarnessBuilder::new("m").tool(Arc::new(DummyTool));
+        assert_eq!(builder.tools.len(), 1);
+        assert_eq!(builder.tools[0].name(), "dummy");
+    }
+
+    #[test]
+    fn builder_should_stop_hook_appends_to_hooks() {
+        use futures::future::BoxFuture;
+        use llm_harness_types::{ShouldStopCtx, ShouldStopHook};
+        use std::sync::Arc;
+
+        struct AlwaysStop;
+        impl ShouldStopHook for AlwaysStop {
+            fn should_stop<'a>(&'a self, _ctx: ShouldStopCtx<'a>) -> BoxFuture<'a, bool> {
+                Box::pin(async { true })
+            }
+        }
+
+        let builder = HarnessBuilder::new("m")
+            .should_stop_hook(Arc::new(AlwaysStop))
+            .should_stop_hook(Arc::new(AlwaysStop));
+        assert_eq!(builder.hooks.should_stop.len(), 2);
     }
 }

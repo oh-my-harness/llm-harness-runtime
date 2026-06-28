@@ -32,10 +32,13 @@ pub enum ContextMode {
     Inject(String),
 }
 
-/// 派发 sub-agent 的核心 trait。
+/// 派发 sub-agent 的核心 trait —— 仅定义**同步 spawn** 语义：
+/// `spawn()` 返回 `SubAgentHandle`，由调用方自行 `join()` 等待结果。
 ///
-/// spawn() 只做初始化（建 session、建 harness、起 tokio task），
-/// 实际执行在 handle.join() 处等待。
+/// 异步投递（结果通过 completion channel 回流主 agent）和 sub↔sub peer 通信
+/// 依赖 runtime 层的 `AsyncSpawnRegistry` / `PeerDirectory` 等基础设施，
+/// 不在本 trait 抽象范围内——见 `HarnessSubAgentSpawner`（llm-harness-runtime）
+/// 的 `spawn_async` / `spawn_async_with_peer` / `spawn_with_peer` 扩展方法。
 pub trait SubAgentSpawner: Send + Sync {
     /// 创建 sub-agent 的初始配置（session、harness、tokio task），不等待执行。
     /// 实际执行在返回的 `SubAgentHandle::join()` 中等待。
