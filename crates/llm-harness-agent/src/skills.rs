@@ -79,7 +79,7 @@ fn is_valid_skill_name(name: &str) -> bool {
 /// Returns `(fields, body)` where `fields` is a map of `kebab-case` keys to
 /// their string values. If there is no frontmatter the map is empty and `body`
 /// is the full input.
-fn parse_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
+pub fn parse_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
     let mut fields = HashMap::new();
 
     // Frontmatter must start with "---" on the first line.
@@ -198,7 +198,7 @@ pub async fn load_sourced_skills(
     (skills, diags)
 }
 
-fn parse_skill_file(source: &Path, content: &str, dir: &Path) -> Result<Skill, String> {
+pub fn parse_skill_file(source: &Path, content: &str, dir: &Path) -> Result<Skill, String> {
     let (fields, body) = parse_frontmatter(content);
 
     // Derive the name: frontmatter > parent directory name.
