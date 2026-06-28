@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use llm_harness_agent::HarnessHooks;
-use llm_harness_runtime::TracingHookAdapter;
+use llm_harness_runtime::tracing_adapter::TracingHookAdapter;
 use llm_harness_runtime::audit::{AuditDecision, AuditEntry, AuditEventType, AuditSink};
 use llm_harness_runtime::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_runtime::tracer::{CaptureLevel, SpanCaptureConfig, SpanStatus};

@@ -690,7 +690,7 @@ mod tests {
         let dir = Arc::new(PeerDirectory::new());
         let rx = dir.register(meta("remote")).unwrap();
         let hook = Arc::new(PeerMessageHook::new(rx));
-        let harness = crate::HarnessBuilder::new("m")
+        let harness = crate::builder::HarnessBuilder::new("m")
             .provider("m", client)
             .should_stop_hook(hook.clone())
             .build(env)
@@ -726,7 +726,7 @@ mod tests {
         let dir = Arc::new(PeerDirectory::new());
         let rx = dir.register(meta("remote")).unwrap();
         let hook = Arc::new(PeerMessageHook::new(rx));
-        let harness = crate::HarnessBuilder::new("m")
+        let harness = crate::builder::HarnessBuilder::new("m")
             .provider("m", client)
             .should_stop_hook(hook.clone())
             .build(env)

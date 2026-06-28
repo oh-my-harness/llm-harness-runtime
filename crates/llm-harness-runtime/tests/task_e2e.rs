@@ -9,11 +9,12 @@ use std::sync::Arc;
 
 use llm_harness_agent::HarnessHooks;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
-use llm_harness_runtime::TracingHookAdapter;
+use llm_harness_runtime::tracing_adapter::TracingHookAdapter;
 use llm_harness_runtime::sandbox::{ResourceLimits, SandboxConfig};
-use llm_harness_runtime::task::{RetryPolicy, TaskRunnerImpl, TaskState};
+use llm_harness_runtime::task::{
+    RetryPolicy, TaskId, TaskRunner, TaskRunnerImpl, TaskState,
+};
 use llm_harness_runtime::tracer::SpanCaptureConfig;
-use llm_harness_runtime::{TaskId, TaskRunner};
 use llm_harness_runtime_sandbox_os::OsEnvSandbox;
 use llm_harness_runtime_trace_otel::InMemoryTraceExporter;
 use llm_harness_types::AfterTurnHook;

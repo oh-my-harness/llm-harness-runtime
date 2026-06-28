@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use llm_harness_agent::HarnessHooks;
-use llm_harness_runtime::TracingHookAdapter;
+use llm_harness_runtime::tracing_adapter::TracingHookAdapter;
 use llm_harness_runtime::human_approval::{
     ApprovalDecision, ApprovalRequest, HumanApprovalWrapper, HumanApprover, TimeoutPolicy,
 };

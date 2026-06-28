@@ -503,8 +503,8 @@ impl SessionFactory for JsonlSessionFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::async_spawn_pair;
-    use crate::{PeerDirectory, PeerMetadata};
+    use crate::async_spawn::async_spawn_pair;
+    use crate::peer::{PeerDirectory, PeerMetadata};
     use std::sync::Mutex;
 
     use llm_harness_agent::session::repo::InMemorySessionRepo;

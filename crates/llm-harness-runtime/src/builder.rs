@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use llm_harness_runtime::HarnessBuilder;
+//! use llm_harness_runtime::builder::HarnessBuilder;
 //!
 //! let harness = HarnessBuilder::new("claude-3-5-sonnet-20241022")
 //!     .install(&my_auth_plugin)
@@ -26,7 +26,7 @@ use llm_harness_agent::{
 use llm_harness_loop::LlmClient;
 use llm_harness_types::{AfterProviderResponseHook, CostAggregate, ExecutionEnv, PricingProvider, ShouldStopHook, Tool};
 
-use crate::{BudgetControlAdapter, BudgetExceededHook, CostAccumulatorHook};
+use crate::{budget::BudgetControlAdapter, budget::BudgetExceededHook, cost_hook::CostAccumulatorHook};
 use thiserror::Error;
 
 // ── Provider matching ─────────────────────────────────────────────────────────
