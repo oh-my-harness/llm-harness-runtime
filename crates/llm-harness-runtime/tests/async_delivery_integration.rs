@@ -82,7 +82,7 @@ async fn async_delivery_running_period_sub_completes_during_loop() {
             "sub-model",
             sub_client,
             session_dir.join("sub-sessions"),
-            |_cwd, _peer_rx| Box::new(NoopPlugin),
+            |_cwd, _peer_rx, _agent_id| Box::new(NoopPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
         .env_factory(Arc::new(OsEnvFactory))
@@ -188,7 +188,7 @@ async fn async_delivery_idle_period_watcher_wakes_main() {
             "sub-model",
             sub_client,
             session_dir.join("sub-sessions"),
-            |_cwd, _peer_rx| Box::new(NoopPlugin),
+            |_cwd, _peer_rx, _agent_id| Box::new(NoopPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
         .env_factory(Arc::new(OsEnvFactory))

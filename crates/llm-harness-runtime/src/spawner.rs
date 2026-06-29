@@ -53,9 +53,14 @@ pub trait SessionFactory: Send + Sync {
 
 /// Sub-agent plugin 的工厂函数类型。
 ///
-/// 第二参数 `peer_rx`：peer 模式下为 `Some(rx)`（与 `PeerMessageHook` 共享同一
-/// `SharedPeerRx`），plugin 可据此注册 `WaitForPeerMessageTool`；非 peer 模式为 `None`。
-pub type PluginFactory = Arc<dyn Fn(&Path, Option<SharedPeerRx>) -> Box<dyn Plugin> + Send + Sync>;
+/// - `cwd`：sub-agent 工作目录。
+/// - `peer_rx`：peer 模式下为 `Some(rx)`（与 `PeerMessageHook` 共享同一
+///   `SharedPeerRx`），plugin 可据此注册 `WaitForPeerMessageTool`；非 peer 模式为 `None`。
+/// - `agent_id`：peer 模式下为 `Some(id)`（取自 `PeerMetadata.agent_id`），
+///   plugin 可据此在 `SendToPeerTool` 中标注发送者身份；非 peer 模式为 `None`。
+pub type PluginFactory = Arc<
+    dyn Fn(&Path, Option<SharedPeerRx>, Option<&str>) -> Box<dyn Plugin> + Send + Sync,
+>;
 
 // ── ProviderAlias ─────────────────────────────────────────────────────────
 
@@ -88,13 +93,16 @@ impl HarnessSubAgentSpawner {
     ///
     /// `sub_plugin_factory` 在每次 spawn 时使用 sub-agent 的 cwd 调用。
     /// 必须返回不含 `SpawnAgentTool` 的 Plugin，以防止递归派发（v0.3+）。
-    /// 第二参数 `peer_rx`：peer 模式下 `Some(rx)`（与 `PeerMessageHook` 共享），
-    /// 非 peer 模式 `None`。plugin 可据此决定是否注册 `WaitForPeerMessageTool`。
+    /// 参数：
+    /// - `peer_rx`：peer 模式下 `Some(rx)`（与 `PeerMessageHook` 共享），
+    ///   非 peer 模式 `None`。plugin 可据此决定是否注册 `WaitForPeerMessageTool`。
+    /// - `agent_id`：peer 模式下 `Some(id)`（取自 `PeerMetadata.agent_id`），
+    ///   非 peer 模式 `None`。plugin 可据此在 `SendToPeerTool` 中标注发送者。
     pub fn new(
         default_model: impl Into<String>,
         default_client: Arc<dyn LlmClient>,
         session_base_dir: PathBuf,
-        sub_plugin_factory: impl Fn(&Path, Option<SharedPeerRx>) -> Box<dyn Plugin>
+        sub_plugin_factory: impl Fn(&Path, Option<SharedPeerRx>, Option<&str>) -> Box<dyn Plugin>
         + Send
         + Sync
         + 'static,
@@ -229,7 +237,13 @@ impl HarnessSubAgentSpawner {
 
             // 4. 创建 sub-agent plugin（不含 SpawnAgentTool）。
             //    传 peer_rx 克隆：plugin 可据此注册 WaitForPeerMessageTool。
-            let sub_plugin = (sub_plugin_factory)(&cwd, peer_rx.clone());
+            //    传 agent_id：plugin 可据此在 SendToPeerTool 中标注发送者。
+            //    agent_id 借自 peer_meta，在下方 build_with_session 前即用毕。
+            let sub_plugin = (sub_plugin_factory)(
+                &cwd,
+                peer_rx.clone(),
+                peer_meta.as_ref().map(|m| m.agent_id.as_str()),
+            );
 
             // 5. 创建 session（通过 SessionFactory，不写死后端）。
             // 注意：session 在磁盘上创建后，如果下一步构建 harness 失败，
@@ -619,7 +633,7 @@ mod tests {
             model.to_string(),
             client.clone(),
             dir.path().to_path_buf(),
-            |_, _| Box::new(NoopPlugin),
+            |_, _, _| Box::new(NoopPlugin),
         )
         .env_factory(Arc::new(NoopEnvFactory))
         .session_factory(factory.clone());
@@ -750,7 +764,7 @@ mod tests {
     fn make_peer_test_spawner() -> HarnessSubAgentSpawner {
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
         let dir = tempfile::tempdir().unwrap();
-        HarnessSubAgentSpawner::new("test-model", client, dir.path().to_path_buf(), |_, _| {
+        HarnessSubAgentSpawner::new("test-model", client, dir.path().to_path_buf(), |_, _, _| {
             Box::new(NoopPlugin)
         })
         .env_factory(Arc::new(NoopEnvFactory))
@@ -865,7 +879,7 @@ mod tests {
             "test-model",
             client,
             dir.path().to_path_buf(),
-            move |_cwd, peer_rx| {
+            move |_cwd, peer_rx, _agent_id| {
                 captured_clone.lock().unwrap().push(peer_rx.is_some());
                 Box::new(NoopPlugin)
             },

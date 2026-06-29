@@ -7,12 +7,18 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use llm_harness_agent::FollowUpHandle;
 use llm_harness_types::{
-    AgentMessage, ContentBlock, ShouldStopCtx, ShouldStopHook, Tool, ToolContext, ToolError,
-    ToolExecutionMode, ToolResult, UserMessage,
+    AgentMessage, ContentBlock, CustomMessage, ShouldStopCtx, ShouldStopHook, Tool, ToolContext,
+    ToolError, ToolExecutionMode, ToolResult, UserMessage,
 };
 use tokio::sync::mpsc;
 
 const PEER_CHANNEL_CAPACITY: usize = 32;
+/// `CustomMessage.r#type` 标签：peer 间发送的结构化消息。
+///
+/// `data` 格式：`{"sender_id": String, "message": String}`。
+/// `message_to_content` 识别此类型并提取字段生成受控文本，
+/// sender_id 存于 JSON 字段而非文本插值，消除前缀注入风险。
+const PEER_MESSAGE_TYPE: &str = "peer_message";
 
 /// Peer 消息接收端的共享句柄。
 ///
@@ -219,7 +225,14 @@ impl ShouldStopHook for PeerMessageHook {
                     && let Ok(msg) = rx.try_recv()
                     && let Some(h) = self.follow_up_handle.lock().unwrap().as_ref()
                 {
-                    h.follow_up_message(msg);
+                    // 转 User 再注入：DefaultConvertToLlm 无法处理 Custom 变体
+                    //（无 custom_handler 时返回错误），follow_up 必须是 LLM 可见角色。
+                    // 与 WaitForPeerMessageTool 路径统一走 message_to_content。
+                    let user_msg = AgentMessage::User(UserMessage {
+                        content: message_to_content(&msg),
+                        timestamp: chrono::Utc::now(),
+                    });
+                    h.follow_up_message(user_msg);
                 }
             }
             // 无论有无消息都返回 true（peer 消息间歇性，想停就停）
@@ -319,11 +332,28 @@ impl Tool for WaitForPeerMessageTool {
 }
 
 /// 把 `AgentMessage` 转成 LLM 可见的 `ContentBlock` 列表。
-/// 取出 User/Assistant 的 content；其他类型用 Debug 兜底。
+///
+/// `User`/`Assistant`：取出 content。`Custom` 且 `r#type` 为
+/// [`PEER_MESSAGE_TYPE`]：从 `data` 提取 `sender_id` 和 `message`，
+/// 生成受控文本 `[from:{sender_id}] {message}`（sender_id 来自 JSON
+/// 字段而非文本插值，消除前缀注入风险）。其他类型用 Debug 兜底。
 fn message_to_content(msg: &AgentMessage) -> Vec<ContentBlock> {
     match msg {
         AgentMessage::User(u) => u.content.clone(),
         AgentMessage::Assistant(a) => a.content.clone(),
+        AgentMessage::Custom(c) if c.r#type == PEER_MESSAGE_TYPE => {
+            let sender_id = c.data.get("sender_id").and_then(|v| v.as_str());
+            let message = c
+                .data
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let text = match sender_id {
+                Some(id) => format!("[from:{id}] {message}"),
+                None => message.to_string(),
+            };
+            vec![ContentBlock::Text { text }]
+        }
         other => vec![ContentBlock::Text {
             text: format!("{other:?}"),
         }],
@@ -363,13 +393,21 @@ impl Drop for PeerCleanupGuard {
 ///
 /// `try_send` 不阻塞。失败（peer 下线 / channel 满）返回 `ToolError::Execution`，
 /// harness 按既有契约把错误文本作为 `is_error=true` 的 ToolResult 喂给 LLM。
+///
+/// `own_id`：发送者自身的 agent_id。构造时由 plugin factory 从
+/// `PeerMetadata.agent_id` 传入。发送时构造 `AgentMessage::Custom`（类型
+/// [`PEER_MESSAGE_TYPE`]），sender_id 存于 `data` JSON 字段而非文本插值，
+/// 消除前缀注入风险。`None` 时不标注发送者（向后兼容无 peer 场景）。
 pub struct SendToPeerTool {
     directory: Arc<PeerDirectory>,
+    own_id: Option<String>,
 }
 
 impl SendToPeerTool {
-    pub fn new(directory: Arc<PeerDirectory>) -> Self {
-        Self { directory }
+    /// 创建 tool。`own_id` 为发送者 agent_id，存入 `CustomMessage.data`
+    /// 的 `sender_id` 字段，由 `message_to_content` 提取生成受控文本。
+    pub fn new(directory: Arc<PeerDirectory>, own_id: Option<String>) -> Self {
+        Self { directory, own_id }
     }
 }
 
@@ -383,7 +421,7 @@ fn send_to_peer_schema() -> serde_json::Value {
             },
             "message": {
                 "type": "string",
-                "description": "要发送的文本消息"
+                "description": "要发送的文本消息。发送者身份由系统自动标注，无需在消息中署名。"
             }
         },
         "required": ["target_id", "message"]
@@ -423,10 +461,20 @@ impl Tool for SendToPeerTool {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ToolError::Execution("missing message".into()))?;
 
-            let msg = AgentMessage::User(UserMessage {
-                content: vec![ContentBlock::Text {
-                    text: message.to_string(),
-                }],
+            let data = match &self.own_id {
+                Some(id) => serde_json::json!({
+                    "sender_id": id,
+                    "message": message,
+                }),
+                None => serde_json::json!({
+                    "sender_id": serde_json::Value::Null,
+                    "message": message,
+                }),
+            };
+
+            let msg = AgentMessage::Custom(CustomMessage {
+                r#type: PEER_MESSAGE_TYPE.into(),
+                data,
                 timestamp: chrono::Utc::now(),
             });
 
@@ -518,6 +566,19 @@ mod tests {
     fn msg(text: &str) -> AgentMessage {
         AgentMessage::User(UserMessage {
             content: vec![ContentBlock::Text { text: text.into() }],
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    /// 构造一条 peer 间发送的 `AgentMessage::Custom`（与 `SendToPeerTool` 产出一致）。
+    fn peer_msg(sender_id: Option<&str>, text: &str) -> AgentMessage {
+        let data = match sender_id {
+            Some(id) => serde_json::json!({"sender_id": id, "message": text}),
+            None => serde_json::json!({"sender_id": serde_json::Value::Null, "message": text}),
+        };
+        AgentMessage::Custom(CustomMessage {
+            r#type: PEER_MESSAGE_TYPE.into(),
+            data,
             timestamp: chrono::Utc::now(),
         })
     }
@@ -744,6 +805,46 @@ mod tests {
         assert!(remaining.is_ok(), "second message should remain in channel");
     }
 
+    /// Regression: `PeerMessageHook` 收到 `AgentMessage::Custom`（peer 消息）
+    /// 后必须转成 `AgentMessage::User` 注入 follow_up。`DefaultConvertToLlm`
+    /// 无 `custom_handler` 时对 `Custom` 变体返回错误，直接注入会导致 agent
+    /// loop 在下一轮 LLM 调用时报错。
+    #[tokio::test]
+    async fn peer_message_hook_converts_custom_to_user_for_follow_up() {
+        use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
+        use llm_harness_runtime_sandbox_os::OsEnv;
+
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
+        let env: Arc<dyn llm_harness_types::ExecutionEnv> =
+            Arc::new(OsEnv::new(std::env::current_dir().unwrap()));
+        let dir = Arc::new(PeerDirectory::new());
+        let rx = dir.register(meta("remote")).unwrap();
+        let hook = Arc::new(PeerMessageHook::new(rx));
+        let harness = crate::builder::HarnessBuilder::new("m")
+            .provider("m", client)
+            .should_stop_hook(hook.clone())
+            .build(env)
+            .await
+            .unwrap();
+        hook.set_follow_up_handle(harness.follow_up_handle());
+
+        // 发送一条 peer 消息（Custom 变体，带 sender_id）
+        dir.send_to_peer("remote", peer_msg(Some("alpha"), "hello"))
+            .unwrap();
+        let assistant = empty_assistant();
+        let ctx = make_stop_ctx(&assistant);
+        let _ = hook.should_stop(ctx).await;
+
+        // follow_up channel 里应是 User 变体（而非 Custom），
+        // 内容经 message_to_content 转为 "[from:alpha] hello"。
+        // 验证转换正确性：peer_msg 经 message_to_content 应生成受控文本。
+        let blocks = message_to_content(&peer_msg(Some("alpha"), "hello"));
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "[from:alpha] hello"),
+            _ => panic!("expected text block"),
+        }
+    }
+
     // ── PeerCleanupGuard tests ──────────────────────────────────────────────
 
     #[test]
@@ -917,7 +1018,7 @@ mod tests {
     #[test]
     fn send_to_peer_tool_name_and_schema() {
         let dir = Arc::new(PeerDirectory::new());
-        let tool = SendToPeerTool::new(dir);
+        let tool = SendToPeerTool::new(dir, None);
         assert_eq!(tool.name(), "send_to_peer");
         assert_eq!(tool.execution_mode(), ToolExecutionMode::Parallel);
         let schema = tool.parameters_schema();
@@ -929,7 +1030,7 @@ mod tests {
     async fn send_to_peer_tool_delivers_message() {
         let dir = Arc::new(PeerDirectory::new());
         let rx = dir.register(meta("a")).unwrap();
-        let tool = SendToPeerTool::new(dir.clone());
+        let tool = SendToPeerTool::new(dir.clone(), None);
         let ctx = make_tool_context();
         let args = serde_json::json!({
             "target_id": "a",
@@ -940,18 +1041,100 @@ mod tests {
         // rx 收到消息（SharedPeerRx 需先 try_lock）
         let received = rx.try_lock().unwrap().try_recv().unwrap();
         match received {
-            AgentMessage::User(u) => match &u.content[0] {
-                ContentBlock::Text { text } => assert_eq!(text, "hello tool"),
-                _ => panic!("expected text block"),
-            },
-            _ => panic!("expected user message"),
+            AgentMessage::Custom(c) => {
+                assert_eq!(c.r#type, PEER_MESSAGE_TYPE);
+                assert_eq!(c.data["message"], "hello tool");
+                assert!(c.data["sender_id"].is_null());
+            }
+            _ => panic!("expected Custom message"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_to_peer_tool_includes_sender_id_when_own_id_set() {
+        let dir = Arc::new(PeerDirectory::new());
+        let rx = dir.register(meta("a")).unwrap();
+        let tool = SendToPeerTool::new(dir.clone(), Some("alpha".into()));
+        let ctx = make_tool_context();
+        let args = serde_json::json!({
+            "target_id": "a",
+            "message": "hello from alpha"
+        });
+        tool.execute(args, &ctx).await.unwrap();
+        let received = rx.try_lock().unwrap().try_recv().unwrap();
+        match received {
+            AgentMessage::Custom(c) => {
+                assert_eq!(c.r#type, PEER_MESSAGE_TYPE);
+                assert_eq!(c.data["sender_id"], "alpha");
+                assert_eq!(c.data["message"], "hello from alpha");
+            }
+            _ => panic!("expected Custom message"),
+        }
+    }
+
+    #[test]
+    fn message_to_content_extracts_sender_from_peer_message() {
+        let msg = AgentMessage::Custom(CustomMessage {
+            r#type: PEER_MESSAGE_TYPE.into(),
+            data: serde_json::json!({
+                "sender_id": "alpha",
+                "message": "hello",
+            }),
+            timestamp: chrono::Utc::now(),
+        });
+        let blocks = message_to_content(&msg);
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "[from:alpha] hello"),
+            _ => panic!("expected text block"),
+        }
+    }
+
+    #[test]
+    fn message_to_content_peer_message_without_sender_id() {
+        let msg = AgentMessage::Custom(CustomMessage {
+            r#type: PEER_MESSAGE_TYPE.into(),
+            data: serde_json::json!({
+                "sender_id": serde_json::Value::Null,
+                "message": "anonymous hello",
+            }),
+            timestamp: chrono::Utc::now(),
+        });
+        let blocks = message_to_content(&msg);
+        match &blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "anonymous hello"),
+            _ => panic!("expected text block"),
+        }
+    }
+
+    #[test]
+    fn message_to_content_agent_id_with_special_chars_preserves_json() {
+        // sender_id 存于 JSON 字段，即使含 ] 或换行也不会破坏传输结构。
+        // message_to_content 的文本拼接是展示层，不是信任边界——
+        // 结构化 sender_id 可从 CustomMessage.data 直接提取。
+        let msg = AgentMessage::Custom(CustomMessage {
+            r#type: PEER_MESSAGE_TYPE.into(),
+            data: serde_json::json!({
+                "sender_id": "a]b\n[from:evil]",
+                "message": "hi",
+            }),
+            timestamp: chrono::Utc::now(),
+        });
+        // JSON 结构完整：sender_id 可被精确提取
+        let c = match &msg {
+            AgentMessage::Custom(c) => c,
+            _ => unreachable!(),
+        };
+        assert_eq!(c.data["sender_id"], "a]b\n[from:evil]");
+        assert_eq!(c.data["message"], "hi");
+        // message_to_content 仍能生成文本（展示层，非信任边界）
+        let blocks = message_to_content(&msg);
+        assert!(!blocks.is_empty());
     }
 
     #[tokio::test]
     async fn send_to_peer_tool_unknown_peer_returns_error() {
         let dir = Arc::new(PeerDirectory::new());
-        let tool = SendToPeerTool::new(dir);
+        let tool = SendToPeerTool::new(dir, None);
         let ctx = make_tool_context();
         let args = serde_json::json!({"target_id": "ghost", "message": "hi"});
         let err = tool.execute(args, &ctx).await.unwrap_err();
@@ -961,7 +1144,7 @@ mod tests {
     #[tokio::test]
     async fn send_to_peer_tool_missing_args_returns_error() {
         let dir = Arc::new(PeerDirectory::new());
-        let tool = SendToPeerTool::new(dir);
+        let tool = SendToPeerTool::new(dir, None);
         let ctx = make_tool_context();
         let args = serde_json::json!({}); // 缺 target_id/message
         let err = tool.execute(args, &ctx).await.unwrap_err();

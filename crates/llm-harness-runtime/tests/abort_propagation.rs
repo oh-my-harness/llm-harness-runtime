@@ -105,7 +105,7 @@ async fn abort_cancels_inflight_subagent() {
             "sub-model",
             sub_client.clone(),
             session_dir.join("sub-sessions"),
-            |_cwd, _peer_rx| Box::new(BlockingToolPlugin),
+            |_cwd, _peer_rx, _agent_id| Box::new(BlockingToolPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
         .env_factory(Arc::new(OsEnvFactory))
@@ -216,7 +216,7 @@ async fn abort_does_not_affect_future_spawns() {
             "sub-model",
             sub_client.clone(),
             session_dir.join("sub-sessions"),
-            |_cwd, _peer_rx| Box::new(BlockingToolPlugin),
+            |_cwd, _peer_rx, _agent_id| Box::new(BlockingToolPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
         .env_factory(Arc::new(OsEnvFactory))
@@ -343,7 +343,7 @@ async fn idle_watcher_abort() {
             "sub-model",
             sub_client.clone(),
             session_dir.join("sub-sessions"),
-            |_cwd, _peer_rx| Box::new(BlockingToolPlugin),
+            |_cwd, _peer_rx, _agent_id| Box::new(BlockingToolPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
         .env_factory(Arc::new(OsEnvFactory))

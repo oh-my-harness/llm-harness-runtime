@@ -201,7 +201,7 @@ mod tests {
             "test-model",
             client,
             std::env::temp_dir().join("spawn-tool-test"),
-            |_cwd, _peer_rx| Box::new(NoopPlugin),
+            |_cwd, _peer_rx, _agent_id| Box::new(NoopPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
         .env_factory(Arc::new(NoopEnvFactory));
@@ -307,7 +307,7 @@ mod tests {
             "test-model",
             client,
             std::env::temp_dir().join("spawn-tool-peer-test"),
-            |_cwd, _peer_rx| Box::new(NoopPlugin),
+            |_cwd, _peer_rx, _agent_id| Box::new(NoopPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
         .env_factory(Arc::new(NoopEnvFactory));

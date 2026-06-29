@@ -26,9 +26,11 @@ use llm_harness_types::Tool;
 /// `SendToPeerTool` + `ListPeersTool` 只需 `PeerDirectory`；
 /// `WaitForPeerMessageTool` 需要与 `PeerMessageHook` 共享的 `SharedPeerRx`——
 /// 由 spawner 的 `spawn_inner` 在 peer 模式下通过 plugin factory 第二参数传入。
+/// `agent_id` 由 plugin factory 第三参数传入，用于 `SendToPeerTool` 标注发送者。
 struct PeerHandoffPlugin {
     directory: Arc<PeerDirectory>,
     peer_rx: Option<SharedPeerRx>,
+    agent_id: Option<String>,
 }
 
 impl Plugin for PeerHandoffPlugin {
@@ -37,7 +39,10 @@ impl Plugin for PeerHandoffPlugin {
     }
 
     fn register_tools(&self, tools: &mut Vec<Arc<dyn Tool>>) {
-        tools.push(Arc::new(SendToPeerTool::new(self.directory.clone())));
+        tools.push(Arc::new(SendToPeerTool::new(
+            self.directory.clone(),
+            self.agent_id.clone(),
+        )));
         tools.push(Arc::new(ListPeersTool::new(self.directory.clone())));
         if let Some(rx) = self.peer_rx.clone() {
             tools.push(Arc::new(WaitForPeerMessageTool::new(
@@ -94,10 +99,11 @@ async fn peer_handoff_a_to_b_and_back() {
     // sub-agent plugin factory：捕获 PeerDirectory，按 peer_rx 注册 Wait tool。
     let dir_for_plugin = directory.clone();
     let sub_plugin_factory =
-        move |_cwd: &std::path::Path, peer_rx: Option<SharedPeerRx>| -> Box<dyn Plugin> {
+        move |_cwd: &std::path::Path, peer_rx: Option<SharedPeerRx>, agent_id: Option<&str>| -> Box<dyn Plugin> {
             Box::new(PeerHandoffPlugin {
                 directory: dir_for_plugin.clone(),
                 peer_rx,
+                agent_id: agent_id.map(String::from),
             })
         };
 
@@ -234,10 +240,11 @@ async fn list_peers_shows_registered_peer() {
 
     let dir_for_plugin = directory.clone();
     let sub_plugin_factory =
-        move |_cwd: &std::path::Path, peer_rx: Option<SharedPeerRx>| -> Box<dyn Plugin> {
+        move |_cwd: &std::path::Path, peer_rx: Option<SharedPeerRx>, agent_id: Option<&str>| -> Box<dyn Plugin> {
             Box::new(PeerHandoffPlugin {
                 directory: dir_for_plugin.clone(),
                 peer_rx,
+                agent_id: agent_id.map(String::from),
             })
         };
 
