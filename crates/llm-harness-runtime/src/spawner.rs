@@ -165,10 +165,15 @@ impl HarnessSubAgentSpawner {
     ///
     /// 返回 `(handle, session_id)`：`spawn_async*` 用 session_id 作 agent_id
     /// （非 peer 模式，设计 §7.4）；peer 模式由调用方提供 agent_id。
+    /// `preregister_abort`：true 时将 abort token 预注册到 `async_registry`
+    /// （仅 `spawn_async*` 路径，它们会调 `track()`，track task 完成时移除 entry）。
+    /// 同步路径（`spawn`/`spawn_with_peer`）传 false——不调 track，预注册的 entry
+    /// 永不会被移除，会泄漏。
     fn spawn_inner(
         &self,
         opts: SpawnOptions,
         peer_meta: Option<PeerMetadata>,
+        preregister_abort: bool,
     ) -> BoxFuture<'_, Result<(SubAgentHandle, String), AgentError>> {
         let default_model = self.default_model.clone();
         let default_client = self.default_client.clone();
@@ -236,7 +241,7 @@ impl HarnessSubAgentSpawner {
             let peer_hook: Option<Arc<PeerMessageHook>> =
                 peer_rx.map(|rx| Arc::new(PeerMessageHook::new(rx)));
 
-            // 6. 构建 harness（装 peer_hook 若有）。
+            // 构建 harness（装 peer_hook 若有）。
             let mut builder = HarnessBuilder::new(&model)
                 .install(sub_plugin.as_ref())
                 .provider(&model, client);
@@ -268,10 +273,23 @@ impl HarnessSubAgentSpawner {
                     format!("Context:\n{ctx}\n\n---\n\n{}", opts.prompt)
                 }
             };
-
-            // 9. 启动 tokio task。
-            let abort = CancellationToken::new();
-            let abort_clone = abort.clone();
+            // 9. 创建 abort token。仅在调用方会 track() 时预注册到 registry
+            // （spawn_async* 路径）。同步路径（spawn/spawn_with_peer）不调 track，
+            // 预注册的 entry 永不会被 track task 移除，导致泄漏。
+            // 预注册消除竞态：cancel_all 可能在 spawn 后、track insert 前触发，
+            // 漏掉该 sub-agent。提前注册后 track() 的 insert 为幂等覆盖（同 token clone）。
+            // key：peer 模式用 meta.agent_id，非 peer 用 session_id。
+            let abort_token = CancellationToken::new();
+            if preregister_abort && let Some(ref registry) = self.async_registry {
+                let key = peer_meta
+                    .as_ref()
+                    .map(|m| m.agent_id.as_str())
+                    .unwrap_or(&session_id);
+                registry.register_subagent_abort(key, abort_token.clone());
+            }
+            // 10. 启动 tokio task。abort_token 注入 harness，使 handle.abort()
+            // 能到达 agent loop。
+            let abort_clone = abort_token.clone();
             let session_id_clone = session_id.clone();
             let join = tokio::spawn(async move {
                 // 将 abort token 注入 harness，使 handle.abort()
@@ -351,20 +369,20 @@ impl HarnessSubAgentSpawner {
                 })
             });
 
-            Ok((SubAgentHandle::new(join, abort), session_id))
+            Ok((SubAgentHandle::new(join, abort_token), session_id))
         }
         .boxed()
     }
 
-    /// 同步、有 peer：`spawn_inner(opts, Some(meta))`，返回 `SubAgentHandle`。
-    /// 调用方自己 `join()`。
+    /// 同步、有 peer：`spawn_inner(opts, Some(meta), false)`，返回 `SubAgentHandle`。
+    /// 调用方自己 `join()`。不预注册 abort token（不调 track，无需 cancel_all 覆盖）。
     pub fn spawn_with_peer(
         &self,
         opts: SpawnOptions,
         meta: PeerMetadata,
     ) -> BoxFuture<'_, Result<SubAgentHandle, AgentError>> {
         Box::pin(async move {
-            let (handle, _session_id) = self.spawn_inner(opts, Some(meta)).await?;
+            let (handle, _session_id) = self.spawn_inner(opts, Some(meta), false).await?;
             Ok(handle)
         })
     }
@@ -393,7 +411,7 @@ impl HarnessSubAgentSpawner {
             let registry = registry.ok_or_else(|| {
                 AgentError::Internal("async delivery not enabled on spawner".into())
             })?;
-            let (handle, session_id) = self.spawn_inner(opts, None).await?;
+            let (handle, session_id) = self.spawn_inner(opts, None, true).await?;
             Ok(registry.track(handle, session_id, deliver_to_channel))
         })
     }
@@ -414,7 +432,7 @@ impl HarnessSubAgentSpawner {
                 AgentError::Internal("async delivery not enabled on spawner".into())
             })?;
             let agent_id = meta.agent_id.clone();
-            let (handle, _session_id) = self.spawn_inner(opts, Some(meta)).await?;
+            let (handle, _session_id) = self.spawn_inner(opts, Some(meta), true).await?;
             Ok(registry.track(handle, agent_id, deliver_to_channel))
         })
     }
@@ -423,7 +441,7 @@ impl HarnessSubAgentSpawner {
 impl SubAgentSpawner for HarnessSubAgentSpawner {
     fn spawn(&self, opts: SpawnOptions) -> BoxFuture<'_, Result<SubAgentHandle, AgentError>> {
         Box::pin(async move {
-            let (handle, _session_id) = self.spawn_inner(opts, None).await?;
+            let (handle, _session_id) = self.spawn_inner(opts, None, false).await?;
             Ok(handle)
         })
     }

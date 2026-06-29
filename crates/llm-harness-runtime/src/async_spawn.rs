@@ -5,6 +5,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
@@ -58,6 +59,11 @@ pub struct AsyncSpawnRegistry {
     completion_tx: mpsc::Sender<AsyncCompletion>,
     completion_rx: Mutex<Option<mpsc::Receiver<AsyncCompletion>>>,
     in_flight: Arc<AtomicUsize>,
+    /// 所有 in-flight sub-agent 的 abort token。track 时存入，
+    /// completion 时移除（track task 的 send 之后）。
+    /// 亦由 `register_subagent_abort` 在 tokio::spawn 前预注册
+    /// （同 key 幂等覆盖，消除 spawn→track insert 间的 cancel_all 竞态窗口）。
+    subagent_aborts: Mutex<HashMap<String, CancellationToken>>,
 }
 
 impl AsyncSpawnRegistry {
@@ -69,12 +75,35 @@ impl AsyncSpawnRegistry {
             completion_tx,
             completion_rx: Mutex::new(Some(completion_rx)),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            subagent_aborts: Mutex::new(HashMap::new()),
         }
     }
 
     /// 当前在跑的 sub-agent 数。只用于 Idle watcher 启停决策。
     pub fn in_flight_count(&self) -> usize {
         self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// 取消所有 in-flight sub-agent（cancel 它们的 abort token）。
+    /// 由 harness `abort()` 经 `AbortCascadeHook` 调用。
+    /// 先 take 出 map 释放锁，再遍历 cancel——避免持锁调 cancel()
+    /// （cancel 内部唤醒 waker，非纯原子，O(N) 持锁）。
+    pub(crate) fn cancel_all(&self) {
+        let aborts = std::mem::take(&mut *self.subagent_aborts.lock().unwrap());
+        for token in aborts.values() {
+            token.cancel();
+        }
+    }
+
+    /// 预注册 sub-agent 的 abort token（在 tokio::spawn 之前调用）。
+    /// 消除 `track()` 调用晚于 `spawn_inner` 内 `tokio::spawn` 的竞态窗口：
+    /// `cancel_all()` 可能在 spawn 后、track insert 前触发，漏掉该 sub-agent。
+    /// 提前注册后，`track()` 内的 insert 为幂等覆盖（同 token clone）。
+    pub(crate) fn register_subagent_abort(&self, agent_id: &str, token: CancellationToken) {
+        self.subagent_aborts
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), token);
     }
 
     /// 借出 completion_rx。已借出时返回 None。
@@ -118,6 +147,13 @@ impl AsyncSpawnRegistry {
         let (sync_tx, sync_rx) = tokio::sync::oneshot::channel::<AsyncCompletion>();
         // fetch_add 在 spawn 之前：track 返回时 in_flight 必已 +1。
         in_flight.fetch_add(1, Ordering::Relaxed);
+        // 存 abort token 供 cancel_all() 取消；track task 完成后移除。
+        self.subagent_aborts
+            .lock()
+            .unwrap()
+            .insert(id.clone(), abort.clone());
+        let registry_clone = self.clone();
+        let id_for_remove = id.clone();
         tokio::spawn(async move {
             let result = handle.join().await;
             let completion = AsyncCompletion {
@@ -133,6 +169,12 @@ impl AsyncSpawnRegistry {
             if deliver_to_channel {
                 let _ = completion_tx.send(completion).await;
             }
+            // 移除自己的 abort token（已完成，不再需要 cancel_all 取消）。
+            registry_clone
+                .subagent_aborts
+                .lock()
+                .unwrap()
+                .remove(&id_for_remove);
             in_flight.fetch_sub(1, Ordering::Relaxed);
         });
 
@@ -307,6 +349,13 @@ impl ShouldStopHook for AsyncSpawnHook {
 /// `token.cancel()` 不 `handle.abort()` task，select 只在 recv 阶段响应
 /// cancel，`send().await` 不会被中断。
 ///
+/// **cancel 竞态（recv 与 cancel 同时就绪）**：`select!` 随机选分支。
+/// 若选了 recv，watcher 消费 completion 后检查 `cancel_token.is_cancelled()`。
+/// cancel 来源有二：主 agent `abort()`（completion 多为 aborted）或用户
+/// `prompt_with_messages()` 让位（completion 可能为正常完成）。watcher 无法
+/// 区分，统一 `try_send` re-send 回 channel 再 break——aborted 的由 should_stop
+/// 丢弃，正常的由下次 run_loop 的 should_stop 注入，不丢失。
+///
 /// `select! { recv() | cancel }` 避免 recv 死锁。
 /// **cancel 不 abort**（修复 F-2）：`handle.abort()` 会硬杀正在
 /// `continue_run().await` 的 task，破坏 harness 状态（phase 停 Turning、
@@ -355,6 +404,18 @@ impl IdleWatcherHook for IdleWatcher {
                     completion = guard.recv() => {
                         match completion {
                             Some(c) => {
+                                // cancel 竞态修复：watcher 被 cancel（主 agent
+                                // abort 或用户 prompt_with_messages 让位）后，
+                                // 此 completion 可能是正常的（prompt 竞态场景），
+                                // 也可能是 aborted（abort 场景）。不丢弃——
+                                // re-send 回 channel，让下次 run_loop 的 should_stop
+                                // 消费（aborted 的会被 should_stop 丢弃，正常的被注入）。
+                                // 用 try_send 而非 send().await：cancel 状态下不阻塞，
+                                // channel 满（256）时丢弃（极端场景，优于卡死 watcher）。
+                                if cancel_token.is_cancelled() {
+                                    let _ = registry.completion_tx.try_send(c);
+                                    break;
+                                }
                                 // 归还 rx，让 continue_run 的 should_stop 能 take。
                                 drop(guard);
                                 // re-send completion：watcher 只是唤醒信号，
@@ -415,6 +476,14 @@ impl AsyncSpawnHookHandle for AsyncSpawnHook {
 
     fn set_follow_up_handle(&self, handle: FollowUpHandle) {
         AsyncSpawnHook::set_follow_up_handle(self, handle);
+    }
+}
+
+// ── AbortCascadeHook impl ────────────────────────────────────────────────────
+
+impl llm_harness_agent::AbortCascadeHook for AsyncSpawnRegistry {
+    fn cancel_all_subagents(&self) {
+        self.cancel_all();
     }
 }
 
@@ -782,5 +851,27 @@ mod tests {
             registry.take_completion_rx().is_some(),
             "rx returned after cancel"
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_all_cancels_tracked_tokens() {
+        use llm_harness_agent::AbortCascadeHook;
+        let (tx, rx) = tokio::sync::mpsc::channel::<AsyncCompletion>(8);
+        let registry = Arc::new(AsyncSpawnRegistry::new(tx, rx));
+        let t1 = CancellationToken::new();
+        let t2 = CancellationToken::new();
+        registry
+            .subagent_aborts
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), t1.clone());
+        registry
+            .subagent_aborts
+            .lock()
+            .unwrap()
+            .insert("b".to_string(), t2.clone());
+        registry.cancel_all_subagents();
+        assert!(t1.is_cancelled(), "token a should be cancelled");
+        assert!(t2.is_cancelled(), "token b should be cancelled");
     }
 }
