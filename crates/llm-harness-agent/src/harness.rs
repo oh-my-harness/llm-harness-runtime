@@ -287,6 +287,20 @@ pub trait AsyncSpawnHookHandle: Send + Sync {
     fn set_follow_up_handle(&self, handle: FollowUpHandle);
 }
 
+/// Abort 级联 hook（由 runtime 层的 `AsyncSpawnRegistry` 实现）。
+/// harness `abort()` 时调用，取消所有通过本 harness 派发的 in-flight sub-agent。
+pub trait AbortCascadeHook: Send + Sync {
+    /// 取消所有通过本 harness 派发的 in-flight sub-agent。
+    ///
+    /// 调用时机：`AgentHarness::abort()` 中，cancel idle watcher 之后、
+    /// cancel 自身 abort token 之前。
+    /// 非阻塞：只 cancel token（置标志），不 join sub-agent task。
+    /// 幂等：对已 cancel 的 token 再调 cancel 无效；空 registry 无操作。
+    /// 生命周期持久：abort 不终止 agent 生命周期（可 re-prompt），
+    /// hook 应可重复调用（实现方不应 take/consume 自身）。
+    fn cancel_all_subagents(&self);
+}
+
 // ── Inner mutable state ───────────────────────────────────────────────────────
 
 struct HarnessInner {
@@ -310,6 +324,8 @@ struct HarnessInner {
     idle_watcher: Option<Arc<dyn IdleWatcherHook>>,
     /// AsyncSpawnHook 引用（opt-in）。None 则无异步投递。
     async_spawn_hook: Option<Arc<dyn AsyncSpawnHookHandle>>,
+    /// Abort 级联 hook（opt-in）。None 则 abort 不级联到 sub-agent。
+    abort_cascade_hook: Option<Arc<dyn AbortCascadeHook>>,
     /// Shared accumulated cost state. Populated by `CostAccumulatorHook`
     /// (injected via `after_provider_response` by `HarnessBuilder`).
     /// Read by `AgentHarness::usage()`.
@@ -571,6 +587,7 @@ impl AgentHarness {
             active_tool_names: std::collections::HashMap::new(),
             idle_watcher: None,
             async_spawn_hook: None,
+            abort_cascade_hook: None,
         };
 
         let convert_to_llm: Arc<dyn ConvertToLlmHook> = opts
@@ -1071,6 +1088,11 @@ impl AgentHarness {
         self.inner.lock().unwrap().async_spawn_hook = Some(hook);
     }
 
+    /// 配置 Abort 级联 hook（opt-in）。abort() 时取消所有 in-flight sub-agent。
+    pub fn set_abort_cascade_hook(&self, hook: Arc<dyn AbortCascadeHook>) {
+        self.inner.lock().unwrap().abort_cascade_hook = Some(hook);
+    }
+
     /// 不注入初始消息，驱动一轮 agent loop 直到再次 Idle。
     /// 供 Idle watcher 收到 completion 后唤醒主 agent。
     /// 自带 Idle 守卫（与 `prompt_with_messages` 对称）。
@@ -1130,8 +1152,31 @@ impl AgentHarness {
             || !inner.state.queued_next_turn.is_empty()
     }
 
-    /// Cancel the current run, if any.
+    /// Cancel the current run, idle watcher, and all in-flight sub-agents.
+    ///
+    /// 先取消 Idle watcher，再级联取消所有 in-flight sub-agent（通过
+    /// `AbortCascadeHook`），最后 cancel 自己的 abort token。顺序很重要：
+    /// 先 cancel watcher 使其在 aborted completion 到达前退出 recv 循环，
+    /// 避免 aborted completion 触发 continue_run 唤醒已 abort 的主 agent。
     pub fn abort(&self) {
+        // 先取 cascade hook 和 watcher（持锁），释放锁后再调用
+        // （hook/watcher 内部可能加自己的锁，避免死锁）。
+        let (cascade_hook, watcher) = {
+            let inner = self.inner.lock().unwrap();
+            let hook = inner.abort_cascade_hook.clone();
+            let w = inner.idle_watcher.clone();
+            (hook, w)
+        };
+        // 先取消 watcher，再级联取消 sub-agent。顺序很重要：
+        // 若先 cancel sub-agent，它们的 aborted completion 会被 watcher 接收并
+        // 触发 continue_run 唤醒已 abort 的主 agent。先 cancel watcher 使其在
+        // aborted completion 到达前退出 recv 循环。
+        if let Some(w) = watcher {
+            w.cancel();
+        }
+        if let Some(hook) = cascade_hook {
+            hook.cancel_all_subagents();
+        }
         let mut inner = self.inner.lock().unwrap();
         if let Some(token) = inner.current_abort.take() {
             token.cancel();
@@ -2200,6 +2245,75 @@ mod tests {
         h.inner.lock().unwrap().current_abort = Some(token.clone());
         h.abort();
         assert!(token.is_cancelled());
+    }
+    #[tokio::test]
+    async fn abort_invokes_cascade_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingHook(Arc<AtomicUsize>);
+        impl AbortCascadeHook for CountingHook {
+            fn cancel_all_subagents(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let h = make_harness(vec![]);
+        let counter = Arc::new(AtomicUsize::new(0));
+        h.set_abort_cascade_hook(Arc::new(CountingHook(counter.clone())));
+        h.abort();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "abort should call cascade hook once"
+        );
+    }
+    #[tokio::test]
+    async fn abort_invokes_cascade_hook_twice_after_reabort() {
+        // 回归测试：abort_cascade_hook 是生命周期持久配置（plan: "abort 不终止
+        // agent 生命周期，可再被 prompt"）。take() 会消耗 hook 导致第二次 abort
+        // 静默跳过级联；必须用 clone() 保留。
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingHook(Arc<AtomicUsize>);
+        impl AbortCascadeHook for CountingHook {
+            fn cancel_all_subagents(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let h = make_harness(vec![]);
+        let counter = Arc::new(AtomicUsize::new(0));
+        h.set_abort_cascade_hook(Arc::new(CountingHook(counter.clone())));
+        // 模拟一次运行中的 abort。
+        let token = CancellationToken::new();
+        h.inner.lock().unwrap().current_abort = Some(token.clone());
+        h.abort();
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "first abort should call cascade hook");
+        // re-prompt 后再次 abort（plan 支持的场景），hook 应仍被调用。
+        let token2 = CancellationToken::new();
+        h.inner.lock().unwrap().current_abort = Some(token2.clone());
+        h.abort();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "second abort should STILL call cascade hook (hook is lifetime-persistent)"
+        );
+    }
+    #[tokio::test]
+    async fn abort_cancels_idle_watcher() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountingWatcher(Arc<AtomicUsize>);
+        impl IdleWatcherHook for CountingWatcher {
+            fn on_idle(&self) {}
+            fn cancel(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let h = make_harness(vec![]);
+        let counter = Arc::new(AtomicUsize::new(0));
+        h.set_idle_watcher(Arc::new(CountingWatcher(counter.clone())));
+        h.abort();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "abort should cancel idle watcher"
+        );
     }
 
     #[tokio::test]

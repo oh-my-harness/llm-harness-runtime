@@ -116,6 +116,7 @@ async fn async_delivery_running_period_sub_completes_during_loop() {
     });
     harness.set_idle_watcher(Arc::new(watcher));
     harness.set_async_spawn_hook(async_hook.clone());
+    harness.set_abort_cascade_hook(registry.clone());
 
     // 启动主 agent
     harness
@@ -218,6 +219,7 @@ async fn async_delivery_idle_period_watcher_wakes_main() {
     });
     harness.set_idle_watcher(Arc::new(watcher));
     harness.set_async_spawn_hook(async_hook.clone());
+    harness.set_abort_cascade_hook(registry.clone());
 
     harness.prompt("spawn a sub-agent").await.unwrap();
 

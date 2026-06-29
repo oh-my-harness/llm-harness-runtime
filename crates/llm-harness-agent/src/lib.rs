@@ -23,8 +23,9 @@ pub mod sub_agent;
 pub use agent::{Agent, AgentOptions, AgentPhase, AgentState, ModelInfo};
 pub use compaction::{CompactionPreparation, CompactionSettings, compact, prepare_compaction};
 pub use harness::{
-    AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AsyncSpawnHookHandle, CompactionStats,
-    FollowUpHandle, HarnessHooks, HarnessState, HarnessToolCallResult, IdleWatcherHook,
+    AbortCascadeHook, AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AsyncSpawnHookHandle,
+    CompactionStats, FollowUpHandle, HarnessHooks, HarnessState, HarnessToolCallResult,
+    IdleWatcherHook,
 };
 pub use plugin::{Plugin, StateProvider};
 pub use session::{
