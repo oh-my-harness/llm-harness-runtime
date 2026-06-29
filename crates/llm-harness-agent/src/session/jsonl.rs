@@ -381,6 +381,13 @@ impl SessionStorage for JsonlSessionStorage {
             Ok(())
         })
     }
+    fn all_entries(&self) -> BoxFuture<'_, Result<Vec<SessionEntry>, SessionError>> {
+        Box::pin(async move {
+            let mut inner = self.inner.lock().await;
+            Self::ensure_loaded(&mut inner).await?;
+            Ok(inner.entry_map.values().cloned().collect())
+        })
+    }
 }
 
 // ── JsonlSessionRepo ───────────────────────────────────────────────────────────

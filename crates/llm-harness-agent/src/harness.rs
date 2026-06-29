@@ -941,6 +941,21 @@ impl AgentHarness {
     pub async fn list_branches(&self) -> Result<Vec<BranchInfo>, HarnessError> {
         Ok(self.session.list_branches().await?)
     }
+    /// Return all entries on the active cursor's path (root-first).
+    ///
+    /// UI calls this after `BranchSwitched` to reload the conversation.
+    pub async fn read_active_path(&self) -> Result<Vec<SessionEntry>, HarnessError> {
+        Ok(self.session.read_active_path().await?)
+    }
+
+    /// Return all session entries (every node in the tree, unordered).
+    ///
+    /// UI calls this with `/branch list` to reconstruct the full tree
+    /// for ASCII rendering. Entries carry `id` + `parent_id` for tree
+    /// reconstruction.
+    pub async fn read_all_entries(&self) -> Result<Vec<SessionEntry>, HarnessError> {
+        Ok(self.session.storage().all_entries().await?)
+    }
 
     /// Delete the branch ending at `leaf` (Idle only).
     pub async fn delete_branch(&self, leaf: EntryId) -> Result<(), HarnessError> {

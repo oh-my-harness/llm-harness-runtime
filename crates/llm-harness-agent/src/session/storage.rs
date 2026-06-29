@@ -79,6 +79,10 @@ pub trait SessionStorage: Send + Sync {
     ///
     /// If the active cursor is among the deleted IDs it is reset to `None`.
     fn delete_entries(&self, ids: Vec<EntryId>) -> BoxFuture<'_, Result<(), SessionError>>;
+    /// Return all entries in the session (unordered).
+    ///
+    /// UI uses this to reconstruct the full branch tree for ASCII rendering.
+    fn all_entries(&self) -> BoxFuture<'_, Result<Vec<SessionEntry>, SessionError>>;
 }
 
 // ── InMemorySessionStorage ─────────────────────────────────────────────────────
@@ -340,5 +344,9 @@ impl SessionStorage for InMemorySessionStorage {
             }
             Ok(())
         })
+    }
+
+    fn all_entries(&self) -> BoxFuture<'_, Result<Vec<SessionEntry>, SessionError>> {
+        Box::pin(async move { Ok(self.inner.lock().unwrap().entries.values().cloned().collect()) })
     }
 }
