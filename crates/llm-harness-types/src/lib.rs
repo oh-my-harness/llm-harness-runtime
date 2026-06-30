@@ -9,8 +9,8 @@
 //! and UI concerns belong in upper layers.
 
 pub mod compaction;
-pub mod cost;
 pub mod content;
+pub mod cost;
 pub mod env;
 pub mod errors;
 pub mod events;
@@ -23,6 +23,7 @@ pub mod tool;
 
 pub use compaction::*;
 pub use content::*;
+pub use cost::*;
 pub use env::*;
 pub use errors::*;
 pub use events::*;
@@ -32,4 +33,3 @@ pub use messages::*;
 pub use misc::*;
 pub use resources::*;
 pub use tool::*;
-pub use cost::*;

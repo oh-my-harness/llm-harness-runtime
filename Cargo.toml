@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    # core
     "crates/llm-harness-types",
     "crates/llm-harness-loop",
+    "crates/llm-harness-rules",
     "crates/llm-harness-agent",
     # runtime
     "crates/llm-harness-runtime",
@@ -28,6 +28,7 @@ license = "MIT"
 # Core (within this workspace)
 llm-harness-types  = { path = "crates/llm-harness-types" }
 llm-harness-loop   = { path = "crates/llm-harness-loop" }
+llm-harness-rules  = { path = "crates/llm-harness-rules" }
 llm-harness-agent  = { path = "crates/llm-harness-agent" }
 # Runtime (within this workspace)
 llm-harness-runtime = { path = "crates/llm-harness-runtime" }
@@ -41,6 +42,7 @@ async-stream       = "0.3"
 async-trait        = "0.1"
 chrono             = { version = "0.4", features = ["serde"] }
 futures            = "0.3"
+regex              = "1"
 serde              = { version = "1", features = ["derive"] }
 serde_json         = "1"
 sha2               = "0.10"

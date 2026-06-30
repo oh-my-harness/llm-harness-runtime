@@ -88,7 +88,7 @@ impl SpanContextMap {
 /// - `AfterTurnHook`             — finalizes the turn span
 ///
 /// Task and session spans are driven by `begin_task`/`end_task` and
-/// `begin_session`/`end_session`, called from `TaskRunner` (not from core hooks).
+/// `begin_session`/`end_session`, called from `WorkflowEngine` (not from core hooks).
 pub struct TracingHookAdapter {
     exporter: Arc<dyn TraceExporter>,
     capture_config: SpanCaptureConfig,
@@ -159,7 +159,7 @@ impl TracingHookAdapter {
         }
     }
 
-    /// Register the start of a turn (call before each turn from BeforeTurnHook or TaskRunner).
+/// Register the start of a turn (call before each turn from BeforeTurnHook or WorkflowEngine).
     /// `AfterTurnHook` finalizes it using the stored start time.
     pub fn begin_turn(&self, turn_index: u32) {
         let mut spans = self.active_spans.lock().unwrap();

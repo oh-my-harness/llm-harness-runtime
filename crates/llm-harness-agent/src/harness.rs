@@ -1215,7 +1215,6 @@ impl AgentHarness {
         self.inner.lock().unwrap().state.clone()
     }
 
-
     /// 返回当前累积的会话成本快照。
     ///
     /// 由内置的 `CostAccumulatorHook`（由 `HarnessBuilder` 注入）填充。
@@ -2299,7 +2298,11 @@ mod tests {
         let token = CancellationToken::new();
         h.inner.lock().unwrap().current_abort = Some(token.clone());
         h.abort();
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "first abort should call cascade hook");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "first abort should call cascade hook"
+        );
         // re-prompt 后再次 abort（plan 支持的场景），hook 应仍被调用。
         let token2 = CancellationToken::new();
         h.inner.lock().unwrap().current_abort = Some(token2.clone());

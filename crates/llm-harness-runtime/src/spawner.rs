@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::async_spawn::{AsyncCompletion, AsyncSpawnHandle, AsyncSpawnRegistry};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_agent::{
@@ -12,7 +13,6 @@ use llm_harness_agent::{
         SubAgentSpawner,
     },
 };
-use crate::async_spawn::{AsyncCompletion, AsyncSpawnHandle, AsyncSpawnRegistry};
 use llm_harness_loop::LlmClient;
 use llm_harness_types::{AgentError, AgentEvent, ExecutionEnv, HarnessError, HarnessPhase};
 use tokio_util::sync::CancellationToken;
@@ -58,9 +58,8 @@ pub trait SessionFactory: Send + Sync {
 ///   `SharedPeerRx`），plugin 可据此注册 `WaitForPeerMessageTool`；非 peer 模式为 `None`。
 /// - `agent_id`：peer 模式下为 `Some(id)`（取自 `PeerMetadata.agent_id`），
 ///   plugin 可据此在 `SendToPeerTool` 中标注发送者身份；非 peer 模式为 `None`。
-pub type PluginFactory = Arc<
-    dyn Fn(&Path, Option<SharedPeerRx>, Option<&str>) -> Box<dyn Plugin> + Send + Sync,
->;
+pub type PluginFactory =
+    Arc<dyn Fn(&Path, Option<SharedPeerRx>, Option<&str>) -> Box<dyn Plugin> + Send + Sync>;
 
 // ── ProviderAlias ─────────────────────────────────────────────────────────
 
@@ -376,10 +375,12 @@ impl HarnessSubAgentSpawner {
                     .await
                     .map_err(|_| AgentError::Internal("event collection task panicked".into()))?;
 
+                let cost = harness.usage();
                 Ok(SubAgentResult {
                     output,
                     tool_calls_count,
                     session_id: session_id_clone,
+                    cost,
                 })
             });
 
@@ -419,7 +420,16 @@ impl HarnessSubAgentSpawner {
         &self,
         opts: SpawnOptions,
         deliver_to_channel: bool,
-    ) -> BoxFuture<'_, Result<(AsyncSpawnHandle, tokio::sync::oneshot::Receiver<AsyncCompletion>), AgentError>> {
+    ) -> BoxFuture<
+        '_,
+        Result<
+            (
+                AsyncSpawnHandle,
+                tokio::sync::oneshot::Receiver<AsyncCompletion>,
+            ),
+            AgentError,
+        >,
+    > {
         let registry = self.async_registry.clone();
         Box::pin(async move {
             let registry = registry.ok_or_else(|| {
@@ -439,7 +449,16 @@ impl HarnessSubAgentSpawner {
         opts: SpawnOptions,
         meta: PeerMetadata,
         deliver_to_channel: bool,
-    ) -> BoxFuture<'_, Result<(AsyncSpawnHandle, tokio::sync::oneshot::Receiver<AsyncCompletion>), AgentError>> {
+    ) -> BoxFuture<
+        '_,
+        Result<
+            (
+                AsyncSpawnHandle,
+                tokio::sync::oneshot::Receiver<AsyncCompletion>,
+            ),
+            AgentError,
+        >,
+    > {
         let registry = self.async_registry.clone();
         Box::pin(async move {
             let registry = registry.ok_or_else(|| {

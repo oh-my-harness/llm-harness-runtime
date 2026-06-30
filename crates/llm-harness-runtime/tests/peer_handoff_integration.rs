@@ -16,7 +16,8 @@ use llm_harness_agent::{ContextMode, Plugin, ProviderSelection, SpawnOptions};
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_runtime::async_spawn::async_spawn_pair;
 use llm_harness_runtime::peer::{
-    ListPeersTool, PeerDirectory, PeerMetadata, SendToPeerTool, SharedPeerRx, WaitForPeerMessageTool,
+    ListPeersTool, PeerDirectory, PeerMetadata, SendToPeerTool, SharedPeerRx,
+    WaitForPeerMessageTool,
 };
 use llm_harness_runtime::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_types::Tool;
@@ -98,14 +99,16 @@ async fn peer_handoff_a_to_b_and_back() {
 
     // sub-agent plugin factory：捕获 PeerDirectory，按 peer_rx 注册 Wait tool。
     let dir_for_plugin = directory.clone();
-    let sub_plugin_factory =
-        move |_cwd: &std::path::Path, peer_rx: Option<SharedPeerRx>, agent_id: Option<&str>| -> Box<dyn Plugin> {
-            Box::new(PeerHandoffPlugin {
-                directory: dir_for_plugin.clone(),
-                peer_rx,
-                agent_id: agent_id.map(String::from),
-            })
-        };
+    let sub_plugin_factory = move |_cwd: &std::path::Path,
+                                   peer_rx: Option<SharedPeerRx>,
+                                   agent_id: Option<&str>|
+          -> Box<dyn Plugin> {
+        Box::new(PeerHandoffPlugin {
+            directory: dir_for_plugin.clone(),
+            peer_rx,
+            agent_id: agent_id.map(String::from),
+        })
+    };
 
     // spawner：default_client 用 main_client 占位；A 用 default（client_a 通过 alias
     // "a-client" 提供），B 用 alias "b-client"。
@@ -239,14 +242,16 @@ async fn list_peers_shows_registered_peer() {
     let main_client = Arc::new(MockLlmClient::new(vec![]));
 
     let dir_for_plugin = directory.clone();
-    let sub_plugin_factory =
-        move |_cwd: &std::path::Path, peer_rx: Option<SharedPeerRx>, agent_id: Option<&str>| -> Box<dyn Plugin> {
-            Box::new(PeerHandoffPlugin {
-                directory: dir_for_plugin.clone(),
-                peer_rx,
-                agent_id: agent_id.map(String::from),
-            })
-        };
+    let sub_plugin_factory = move |_cwd: &std::path::Path,
+                                   peer_rx: Option<SharedPeerRx>,
+                                   agent_id: Option<&str>|
+          -> Box<dyn Plugin> {
+        Box::new(PeerHandoffPlugin {
+            directory: dir_for_plugin.clone(),
+            peer_rx,
+            agent_id: agent_id.map(String::from),
+        })
+    };
 
     let (registry, _async_hook) = async_spawn_pair();
     let spawner = Arc::new(

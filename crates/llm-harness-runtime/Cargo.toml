@@ -8,6 +8,7 @@ license.workspace = true
 llm-harness-agent.workspace  = true
 llm-harness-loop.workspace = true
 llm-harness-types.workspace = true
+llm-harness-rules.workspace = true
 anyhow.workspace            = true
 async-trait.workspace       = true
 chrono.workspace            = true

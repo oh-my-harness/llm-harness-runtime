@@ -343,11 +343,7 @@ fn message_to_content(msg: &AgentMessage) -> Vec<ContentBlock> {
         AgentMessage::Assistant(a) => a.content.clone(),
         AgentMessage::Custom(c) if c.r#type == PEER_MESSAGE_TYPE => {
             let sender_id = c.data.get("sender_id").and_then(|v| v.as_str());
-            let message = c
-                .data
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let message = c.data.get("message").and_then(|v| v.as_str()).unwrap_or("");
             let text = match sender_id {
                 Some(id) => format!("[from:{id}] {message}"),
                 None => message.to_string(),

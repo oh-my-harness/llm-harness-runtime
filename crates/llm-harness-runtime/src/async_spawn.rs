@@ -2,10 +2,10 @@
 //! Async sub-agent delivery: registry, completion channel, track task,
 //! AsyncSpawnHandle, CompletionRxGuard.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
@@ -139,7 +139,10 @@ impl AsyncSpawnRegistry {
         handle: SubAgentHandle,
         agent_id: String,
         deliver_to_channel: bool,
-    ) -> (AsyncSpawnHandle, tokio::sync::oneshot::Receiver<AsyncCompletion>) {
+    ) -> (
+        AsyncSpawnHandle,
+        tokio::sync::oneshot::Receiver<AsyncCompletion>,
+    ) {
         let abort = handle.abort_token();
         let completion_tx = self.completion_tx.clone();
         let in_flight = self.in_flight.clone();
@@ -491,7 +494,7 @@ impl llm_harness_agent::AbortCascadeHook for AsyncSpawnRegistry {
 mod tests {
     use super::*;
     use llm_harness_types::{
-        AgentError, AssistantMessage, ShouldStopCtx, ShouldStopHook, StopReason,
+        AgentError, AssistantMessage, CostAggregate, ShouldStopCtx, ShouldStopHook, StopReason,
     };
 
     fn make_stop_ctx<'a>(assistant: &'a AssistantMessage) -> ShouldStopCtx<'a> {
@@ -529,6 +532,7 @@ mod tests {
                 output,
                 tool_calls_count: 0,
                 session_id: "test-session".into(),
+                cost: CostAggregate::default(),
             })
         });
         SubAgentHandle::new(join, abort)
@@ -559,6 +563,7 @@ mod tests {
                 output: "late".into(),
                 tool_calls_count: 0,
                 session_id: "s".into(),
+                cost: CostAggregate::default(),
             })
         });
         let handle = SubAgentHandle::new(join, abort);
@@ -593,6 +598,7 @@ mod tests {
                     output: "out".into(),
                     tool_calls_count: 0,
                     session_id: "s".into(),
+                    cost: CostAggregate::default(),
                 }),
             })
             .await
@@ -665,6 +671,7 @@ mod tests {
                     output: "result text".into(),
                     tool_calls_count: 3,
                     session_id: "sess-1".into(),
+                    cost: CostAggregate::default(),
                 }),
             })
             .await
@@ -742,6 +749,7 @@ mod tests {
                         output: format!("out-{i}"),
                         tool_calls_count: i,
                         session_id: format!("s-{i}"),
+                        cost: CostAggregate::default(),
                     }),
                 })
                 .await
@@ -775,11 +783,15 @@ mod tests {
         let (registry, _hook) = async_spawn_pair();
         let abort = tokio_util::sync::CancellationToken::new();
         let join = tokio::spawn(async {
+            // 保持 task 短暂 in-flight，使 IdleWatcher::on_idle 观察到 in_flight>0。
+            // 若立即返回，track() 与 on_idle() 之间存在竞态：task 完成使 in_flight 归零，
+            // on_idle() 提前返回，called 永不递增 → 测试 flaky。
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             Ok(SubAgentResult {
                 output: "done".into(),
                 tool_calls_count: 0,
                 session_id: "s".into(),
+                cost: CostAggregate::default(),
             })
         });
         let _ah = registry.track(SubAgentHandle::new(join, abort), "w".into(), true);

@@ -251,7 +251,6 @@ pub struct HarnessHooks {
 - ⚠️ 单元测试是否依赖真实外部服务（应使用 mock）？
 
 **文档同步**
-- ⚠️ 实现是否与设计文档有出入？若有，更新对应的 `docs/` 或 `docs/superpowers/specs/` 文件。
 - ⚠️ 新增或修改了 trait 签名、HarnessHooks 插槽、CompositeHook 语义？更新本文件（CLAUDE.md）对应段落。
 
 ## Git 规则

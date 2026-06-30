@@ -45,7 +45,10 @@ impl llm_harness_types::Tool for BlockingTool {
         &'a self,
         _args: serde_json::Value,
         ctx: &'a llm_harness_types::ToolContext,
-    ) -> futures::future::BoxFuture<'a, Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>> {
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>,
+    > {
         Box::pin(async move {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
@@ -79,13 +82,11 @@ impl Plugin for BlockingToolPlugin {
 /// 远短于 30s sleep，证明是 cancel 而非自然完成。
 #[tokio::test]
 async fn abort_cancels_inflight_subagent() {
-    let main_client = Arc::new(MockLlmClient::new(vec![
-        MockResponse::tool_use(
-            "call_1",
-            "spawn_agent",
-            r#"{"prompt":"compute","wait":false}"#,
-        ),
-    ]));
+    let main_client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
+        "call_1",
+        "spawn_agent",
+        r#"{"prompt":"compute","wait":false}"#,
+    )]));
 
     // sub-agent：第一条响应调用 block_forever tool（会阻塞直到被 cancel）
     let sub_client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
@@ -114,7 +115,10 @@ async fn abort_cancels_inflight_subagent() {
 
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
-        .tool(Arc::new(SpawnAgentTool::new(spawner.clone(), registry.clone())))
+        .tool(Arc::new(SpawnAgentTool::new(
+            spawner.clone(),
+            registry.clone(),
+        )))
         .should_stop_hook(async_hook.clone())
         .build(env.clone())
         .await
@@ -137,9 +141,7 @@ async fn abort_cancels_inflight_subagent() {
     harness.set_abort_cascade_hook(registry.clone());
 
     let h_clone = harness.clone();
-    let main_task = tokio::spawn(async move {
-        h_clone.prompt("please spawn a sub-agent").await
-    });
+    let main_task = tokio::spawn(async move { h_clone.prompt("please spawn a sub-agent").await });
 
     // 等待 sub-agent 启动并进入 BlockingTool（in_flight=1）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -153,7 +155,8 @@ async fn abort_cancels_inflight_subagent() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(
-        registry.in_flight_count(), 1,
+        registry.in_flight_count(),
+        1,
         "sub-agent should be in-flight (blocked in tool)"
     );
 
@@ -174,7 +177,8 @@ async fn abort_cancels_inflight_subagent() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(
-        registry.in_flight_count(), 0,
+        registry.in_flight_count(),
+        0,
         "sub-agent should have been cancelled (in_flight=0) well before the 30s sleep"
     );
 }
@@ -225,7 +229,10 @@ async fn abort_does_not_affect_future_spawns() {
 
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
-        .tool(Arc::new(SpawnAgentTool::new(spawner.clone(), registry.clone())))
+        .tool(Arc::new(SpawnAgentTool::new(
+            spawner.clone(),
+            registry.clone(),
+        )))
         .should_stop_hook(async_hook.clone())
         .build(env.clone())
         .await
@@ -249,9 +256,7 @@ async fn abort_does_not_affect_future_spawns() {
 
     // 第一轮：spawn 慢 sub-agent
     let h_clone = harness.clone();
-    let main_task = tokio::spawn(async move {
-        h_clone.prompt("please spawn a sub-agent").await
-    });
+    let main_task = tokio::spawn(async move { h_clone.prompt("please spawn a sub-agent").await });
 
     // 等待 sub-agent in-flight
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -264,7 +269,11 @@ async fn abort_does_not_affect_future_spawns() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(registry.in_flight_count(), 1, "first sub-agent should be in-flight");
+    assert_eq!(
+        registry.in_flight_count(),
+        1,
+        "first sub-agent should be in-flight"
+    );
 
     // abort —— 取消第一个 sub-agent
     harness.abort();
@@ -281,10 +290,17 @@ async fn abort_does_not_affect_future_spawns() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(registry.in_flight_count(), 0, "first sub-agent should be cancelled");
+    assert_eq!(
+        registry.in_flight_count(),
+        0,
+        "first sub-agent should be cancelled"
+    );
 
     // 第二轮：再次 prompt，spawn 第二个 sub-agent（快，直接返回文本）
-    harness.prompt("please spawn another sub-agent").await.unwrap();
+    harness
+        .prompt("please spawn another sub-agent")
+        .await
+        .unwrap();
 
     // 第二个 sub-agent 应正常完成（in_flight 归零因完成而非取消）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -298,12 +314,15 @@ async fn abort_does_not_affect_future_spawns() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(
-        registry.in_flight_count(), 0,
+        registry.in_flight_count(),
+        0,
         "second sub-agent should have completed normally"
     );
 
     // 第二个 sub-agent 的 LLM 被调用了（call_count >= 2：第一个 block_forever + 第二个 text）
-    let sub_calls = sub_client.call_count.load(std::sync::atomic::Ordering::SeqCst);
+    let sub_calls = sub_client
+        .call_count
+        .load(std::sync::atomic::Ordering::SeqCst);
     assert!(
         sub_calls >= 2,
         "second sub-agent should have run its LLM, but call_count={sub_calls}"
@@ -352,7 +371,10 @@ async fn idle_watcher_abort() {
 
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
-        .tool(Arc::new(SpawnAgentTool::new(spawner.clone(), registry.clone())))
+        .tool(Arc::new(SpawnAgentTool::new(
+            spawner.clone(),
+            registry.clone(),
+        )))
         .should_stop_hook(async_hook.clone())
         .build(env.clone())
         .await
@@ -375,9 +397,7 @@ async fn idle_watcher_abort() {
     harness.set_abort_cascade_hook(registry.clone());
 
     let h_clone = harness.clone();
-    let main_task = tokio::spawn(async move {
-        h_clone.prompt("please spawn a sub-agent").await
-    });
+    let main_task = tokio::spawn(async move { h_clone.prompt("please spawn a sub-agent").await });
 
     // 等待主 agent 进 Idle + sub-agent in-flight（watcher 应已启动）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -390,7 +410,11 @@ async fn idle_watcher_abort() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(registry.in_flight_count(), 1, "sub-agent should be in-flight");
+    assert_eq!(
+        registry.in_flight_count(),
+        1,
+        "sub-agent should be in-flight"
+    );
 
     // 此时主 agent 在 Idle（spawn tool 返回后 LLM 第二 turn 无响应 → Idle）
     // watcher 正在监听 completion channel。abort 应 cancel watcher + sub-agent。
@@ -408,7 +432,11 @@ async fn idle_watcher_abort() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(registry.in_flight_count(), 0, "sub-agent should be cancelled");
+    assert_eq!(
+        registry.in_flight_count(),
+        0,
+        "sub-agent should be cancelled"
+    );
 
     // 关键断言：主 agent 没有被 aborted completion 重新唤醒。
     // main_client 只有 1 条预设响应（spawn tool_use）。spawn tool 返回后
@@ -417,7 +445,9 @@ async fn idle_watcher_abort() {
     // continue_run），会有第三次 LLM 调用（call_count=3）。
     // 给一秒钟观察是否有延迟的 continue_run。
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let main_calls = main_client.call_count.load(std::sync::atomic::Ordering::SeqCst);
+    let main_calls = main_client
+        .call_count
+        .load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         main_calls, 2,
         "main agent should not be re-woken after abort (call_count={main_calls})"

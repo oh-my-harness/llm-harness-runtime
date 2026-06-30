@@ -24,9 +24,13 @@ use llm_harness_agent::{
     AgentHarness, AgentHarnessOptions, HarnessHooks, Plugin, PromptTemplate, Skill, StateProvider,
 };
 use llm_harness_loop::LlmClient;
-use llm_harness_types::{AfterProviderResponseHook, CostAggregate, ExecutionEnv, PricingProvider, ShouldStopHook, Tool};
+use llm_harness_types::{
+    AfterProviderResponseHook, CostAggregate, ExecutionEnv, PricingProvider, ShouldStopHook, Tool,
+};
 
-use crate::{budget::BudgetControlAdapter, budget::BudgetExceededHook, cost_hook::CostAccumulatorHook};
+use crate::{
+    budget::BudgetControlAdapter, budget::BudgetExceededHook, cost_hook::CostAccumulatorHook,
+};
 use thiserror::Error;
 
 // ── Provider matching ─────────────────────────────────────────────────────────

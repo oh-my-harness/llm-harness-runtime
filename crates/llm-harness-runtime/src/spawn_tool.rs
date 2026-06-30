@@ -318,8 +318,8 @@ mod tests {
                 .enable_async_delivery(registry.clone())
                 .enable_peer_communication(directory.clone()),
         );
-        let tool = SpawnAgentTool::new(spawner, registry.clone())
-            .with_peer_directory(directory.clone());
+        let tool =
+            SpawnAgentTool::new(spawner, registry.clone()).with_peer_directory(directory.clone());
         (tool, registry, directory)
     }
 
@@ -373,13 +373,11 @@ mod tests {
             "wait": true,
             "agent_id": "peer-sync",
         });
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tool.execute(args, &ctx),
-        )
-        .await
-        .expect("sync peer spawn should not hang")
-        .unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), tool.execute(args, &ctx))
+                .await
+                .expect("sync peer spawn should not hang")
+                .unwrap();
         match &result.content[0] {
             ContentBlock::Text { text } => {
                 assert!(text.contains("completed") || text.contains("ok"));

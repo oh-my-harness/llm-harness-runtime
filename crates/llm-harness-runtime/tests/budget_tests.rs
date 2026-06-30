@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 use llm_harness_runtime::budget::{BudgetControlAdapter, BudgetExceededHook};
-use llm_harness_types::{AssistantMessage, ShouldStopCtx, ShouldStopHook, StopReason};
 use llm_harness_runtime::cost::{CostAggregate, ModelCost, PricingProvider, TokenPrice};
+use llm_harness_types::{AssistantMessage, ShouldStopCtx, ShouldStopHook, StopReason};
 
 struct FixedPricingProvider {
     price: TokenPrice,
@@ -116,14 +116,24 @@ async fn budget_adapter_calls_hook_when_over_limit() {
     let assistant = make_assistant();
     let ctx = make_ctx(&assistant);
     let stop = adapter.should_stop(ctx).await;
-    assert!(hook.was_called(), "exceeded hook must be called when over limit");
-    assert!(!stop, "hook returned true (continue) → should_stop must be false");
+    assert!(
+        hook.was_called(),
+        "exceeded hook must be called when over limit"
+    );
+    assert!(
+        !stop,
+        "hook returned true (continue) → should_stop must be false"
+    );
 }
 
 #[test]
 fn pricing_provider_returns_none_for_unknown_model() {
     let provider = UnknownPricingProvider;
-    assert!(provider.price_for("unknown-model", "unknown-provider").is_none());
+    assert!(
+        provider
+            .price_for("unknown-model", "unknown-provider")
+            .is_none()
+    );
 }
 
 #[test]

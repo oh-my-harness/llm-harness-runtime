@@ -347,6 +347,15 @@ impl SessionStorage for InMemorySessionStorage {
     }
 
     fn all_entries(&self) -> BoxFuture<'_, Result<Vec<SessionEntry>, SessionError>> {
-        Box::pin(async move { Ok(self.inner.lock().unwrap().entries.values().cloned().collect()) })
+        Box::pin(async move {
+            Ok(self
+                .inner
+                .lock()
+                .unwrap()
+                .entries
+                .values()
+                .cloned()
+                .collect())
+        })
     }
 }

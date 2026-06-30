@@ -18,7 +18,7 @@ pub trait BudgetExceededHook: Send + Sync {
     /// transition the task to `Failed`.
     ///
     /// `cost` is the session-wide accumulated cost snapshot. The previous
-    /// `task_cost` parameter was always equal to `session_cost` in non-TaskRunner
+    /// `task_cost` parameter was always equal to `session_cost` in pre-WorkflowEngine
     /// scenarios and has been removed; callers needing task-scoped cost should
     /// track it separately.
     fn on_budget_exceeded<'a>(

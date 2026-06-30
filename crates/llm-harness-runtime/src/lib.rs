@@ -6,7 +6,7 @@
 //! - MCP adapter (`McpClientHandle`)
 //! - Resource injection (`ResourceProvider`, `ResourceInjector`)
 //! - Prompt template integration (`PromptSource`, `PromptTemplateCompiler`)
-//! - Task lifecycle management (`TaskRunner`)
+//! - Task lifecycle management (`WorkflowEngine`)
 //! - Tracing (`TraceExporter`)
 //! - Cost aggregation (`PricingProvider`, `CostAggregate`)
 //! - Audit logging (`AuditSink`)
@@ -31,7 +31,10 @@ pub mod sandbox;
 pub mod spawn_tool;
 pub mod spawner;
 pub mod task;
+pub mod task_store;
+pub mod event;
 pub mod tool_adapter;
 pub mod tool_registry;
 pub mod tracer;
 pub mod tracing_adapter;
+pub mod workflow;

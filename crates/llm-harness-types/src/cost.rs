@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Per-model token pricing.
@@ -20,7 +21,7 @@ pub trait PricingProvider: Send + Sync {
 }
 
 /// Per-model cost breakdown.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelCost {
     /// Total input tokens.
     pub input_tokens: u64,
@@ -33,7 +34,7 @@ pub struct ModelCost {
 }
 
 /// Aggregated cost across all models in a session/task.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CostAggregate {
     /// Total input tokens across all models.
     pub total_input_tokens: u64,

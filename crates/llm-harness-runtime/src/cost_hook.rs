@@ -69,8 +69,7 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
                 let call_cost = (usage.input_tokens as f64 / 1_000_000.0) * p.input_per_mtok
                     + (usage.output_tokens as f64 / 1_000_000.0) * p.output_per_mtok
                     + (usage.cache_read_tokens as f64 / 1_000_000.0) * p.cache_read_per_mtok
-                    + (usage.cache_creation_tokens as f64 / 1_000_000.0)
-                        * p.cache_write_per_mtok;
+                    + (usage.cache_creation_tokens as f64 / 1_000_000.0) * p.cache_write_per_mtok;
                 cost.total_cost += call_cost;
 
                 if let Some(m) = info.model.as_deref() {

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use futures::future::BoxFuture;
-use llm_harness_types::AgentError;
+use llm_harness_types::{AgentError, CostAggregate};
 use tokio_util::sync::CancellationToken;
 
 /// 启动 sub-agent 的完整配置。
@@ -93,7 +93,12 @@ impl SubAgentHandle {
 impl Drop for SubAgentHandle {
     fn drop(&mut self) {
         // Drop 时取消，防止孤儿 tokio task 继续消耗 LLM token。
+        // abort.cancel() 发信号；但若 task 阻塞在 LLM 请求中，信号不会立即生效。
+        // join.abort() 直接中止 tokio task，避免在 LLM 请求返回前泄漏。
         self.abort.cancel();
+        if let Some(join) = self.join.take() {
+            join.abort();
+        }
     }
 }
 
@@ -106,4 +111,24 @@ pub struct SubAgentResult {
     pub tool_calls_count: u32,
     /// Sub-agent 的 session ID（供调试和审计）。
     pub session_id: String,
+    /// 本次执行的 cost（由 spawn_inner 调 harness.usage() 填充）。
+    pub cost: CostAggregate,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sub_agent_result_has_cost_field() {
+        let r = SubAgentResult {
+            output: "hi".into(),
+            tool_calls_count: 1,
+            session_id: "s1".into(),
+            cost: CostAggregate::default(),
+        };
+        assert_eq!(r.output, "hi");
+        // CostAggregate 未 impl PartialEq，用 Debug 字符串断言默认值。
+        assert_eq!(format!("{:?}", r.cost), format!("{:?}", CostAggregate::default()));
+    }
 }
