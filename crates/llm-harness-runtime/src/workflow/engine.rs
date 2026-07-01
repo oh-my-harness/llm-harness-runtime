@@ -864,12 +864,20 @@ impl WorkflowEngine {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("executor '{}' not registered", executor_name))?;
         let started_at = chrono::Utc::now();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let env = self
+            .config
+            .env_factory
+            .create(&cwd)
+            .map_err(|e| anyhow::anyhow!("env_factory: {e}"))?;
         let history = self.workflow_state.lock().await.step_history.clone();
         let prev_result = history.last().and_then(|record| record.result.as_ref());
         let ctx = ExecutorCtx {
             current_step: step,
             prev_result,
             step_history: &history,
+            env,
+            abort: step_abort.clone(),
         };
         let mut result = tokio::select! {
             biased;

@@ -1,8 +1,9 @@
 # Non-LLM Step 支持设计
 
 > **状态：初版已实现**。当前已支持业务注入 `StepExecutor`，并由
-> `WorkflowEngine` 在 LLM step 与 executor step 之间分发。内置
-> `JsonTransformExecutor` 已可用；`HttpCall` / `Script` executor 仍属后续扩展。
+> `WorkflowEngine` 在 LLM step 与 executor step 之间分发。默认内置
+> `JsonTransformExecutor` 已可用；`ShellExecutor` 已提供但必须由业务层显式注册；
+> `HttpCall` executor 仍属后续扩展。
 
 ## 背景与动机
 
@@ -150,6 +151,10 @@ pub struct ExecutorCtx<'a> {
     pub prev_result: Option<&'a StepResult>,
     /// 已完成的步骤历史（审计链）。
     pub step_history: &'a [StepRecord],
+    /// 执行环境。需要文件系统或 shell 的 executor 必须经此访问 sandbox。
+    pub env: Arc<dyn ExecutionEnv>,
+    /// step 级 abort token。
+    pub abort: CancellationToken,
 }
 ```
 
@@ -186,10 +191,17 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
     let executor = self.step_executors.get(executor_name)
         .ok_or_else(|| anyhow!("executor '{}' not registered", executor_name))?;
 
-    // 2. 构造 ExecutorCtx（prev_result = 上一步的结果，第一步时为 None）
+    // 2. 构造 ExecutionEnv + ExecutorCtx
     let history = self.workflow_state.lock().await.step_history.clone();
     let prev_result = history.last().and_then(|r| r.result.as_ref());
-    let ctx = ExecutorCtx { current_step: step, prev_result, step_history: &history };
+    let env = self.config.env_factory.create(&std::env::current_dir()?)?;
+    let ctx = ExecutorCtx {
+        current_step: step,
+        prev_result,
+        step_history: &history,
+        env,
+        abort: abort.clone(),
+    };
 
     // 3. abort 感知：select! 包裹 executor.execute
     let started_at = chrono::Utc::now();
@@ -211,7 +223,7 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 
 ### 关键设计决策
 
-1. **abort 传播**：executor step 用 `select!` 包裹 `executor.execute()`。LLM step 的 abort 通过 `harness.set_abort_token` 实现；executor 没有该机制，用 select! 做外层取消。executor 内部做长 IO（如 HTTP 请求）时应自己感知 cancel 或用带 timeout 的 client。
+1. **abort 传播**：executor step 用 `select!` 包裹 `executor.execute()`；同时 `ExecutorCtx.abort` 会传入 executor。LLM step 的 abort 通过 `harness.set_abort_token` 实现；executor 内部做长 IO、shell 或 HTTP 请求时应继续传递 abort，或使用带 timeout 的 client。
 
 2. **executor 注册**：`WorkflowEngine` 新增字段 `step_executors: HashMap<String, Arc<dyn StepExecutor>>`。builder 方法：
    ```rust
@@ -226,14 +238,14 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 
 4. **cost 聚合**：executor step 的 `StepResult.cost` 为 `CostAggregate::default()`（无 LLM 费用）。`aggregate_cost` 函数不需要改。
 
-5. **事件流**：executor step 发 `WorkflowEvent::StepStarted` / `StepCompleted`（与 LLM step 一致），外部订阅者无需区分 step 类型。
+5. **事件流**：executor step 发 `WorkflowEvent::StepStarted` / `StepFinished`（与 LLM step 一致），外部订阅者无需区分 step 类型。
 
 ## 受影响的代码
 
 | 文件 | 变更 |
 |------|------|
 | `model.rs` | `Step` 结构体 → enum；新增辅助方法 `id()` / `name()` |
-| `executor.rs` | **新增**：`StepExecutor` trait |
+| `executor.rs` | **新增**：`StepExecutor` trait、`JsonTransformExecutor`、显式注册用 `ShellExecutor` |
 | `engine.rs` | `run_step` → `run_llm_step`（pattern match）；新增 `run_executor_step`；新增 `step_executors` 字段 + `with_executor` builder；`from_parts_with_state` 初始化 `step_executors`；`step_tools_cache` 构造 match；`new_free_task` 构造 `Step::Llm` |
 | `plan.rs` | `validate_workflow` 里 `s.id` → `s.id()`；`PlanWorkflowTool` 的 `PlanInput` 适配 enum |
 | `gate.rs` | `step_tools` 映射构造适配（executor step → 空 Vec） |
@@ -253,6 +265,9 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 - `WorkflowEngine::with_executor(name, executor)` 支持业务层注入 executor。
 - `json_transform` 是默认注册的内置 executor；业务层可以用
   `with_executor("json_transform", ...)` 覆盖。
+- `ShellExecutor` 已实现，但不在默认 executor 列表中；必须由业务层显式
+  `with_executor("shell", Arc::new(ShellExecutor::new([...])))` 注册，并建议配合
+  sandbox-backed `ExecutionEnv` 使用。
 - `WorkflowEngine::run_loop` 按 step 类型分发。
 - executor step 与 LLM step 共享：
   - `WorkflowEvent::StepStarted`
@@ -271,13 +286,16 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 - `json_transform_selects_pointer_from_config_input`
 - `json_transform_builds_fields_from_previous_structured_result`
 - `json_transform_rejects_missing_pointer_without_default`
+- `shell_executor_rejects_command_not_allowlisted`
+- `shell_executor_runs_allowed_command_through_env`
+- `shell_executor_rejects_parent_traversal_cwd`
 - `unregistered_executor_fails_task`
 - `cancel_executor_step_marks_task_cancelled`
 - `executor_step_requires_executor_name`
 
 ## 内置 Executor
 
-当前内置：
+默认注册：
 
 - **JsonTransformExecutor**（`executor_name = "json_transform"`）：纯 JSON
   变换，不构造 LLM harness，不产生 token cost。
@@ -311,10 +329,30 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 }
 ```
 
+可显式注册：
+
+- **ShellExecutor**（建议注册名 `shell`）：通过 `ExecutionEnv::execute_shell`
+  执行命令，不默认开放。业务层必须传入命令 allowlist，例如：
+  `ShellExecutor::new(["python", "node"])`。
+
+`shell` config：
+
+- `command`：必填，必须命中 `ShellExecutor` 构造时的 allowlist。
+- `args`：可选字符串数组，由 executor 进行 shell quoting 后拼接。
+- `cwd`：可选相对路径，禁止绝对路径和 `..` 父目录穿越。
+- `env`：可选对象，key 只允许 `[A-Za-z_][A-Za-z0-9_]*`，value 必须为字符串。
+- `timeout_ms`：可选，默认 30 秒。
+
+`ShellExecutor` 的生产约束：
+
+- 不加入 `builtin_executors()`，避免计划阶段生成 shell step 后直接执行。
+- 必须走 `ExecutorCtx.env`，所以可接入 OS / bwrap / seatbelt 等 sandbox backend。
+- 必须设置命令 allowlist；不支持任意 shell script 文本。
+- stdout/stderr 会按 executor 的 `max_output_bytes` 截断后写入 `StepResult.structured`。
+
 仍计划内置的实现，具体安全边界留待后续：
 
 - **HttpCallExecutor**：调 HTTP API，config 含 `url` / `method` / `headers` / `body`
-- **ScriptExecutor**：跑脚本，config 含 `command` / `args` / `env`
 
 ## 错误处理（待细化）
 
@@ -328,4 +366,5 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 1. ~~`StepCtx.last_result` 是 `&StepResult`（非 Option），workflow 第一步无前驱结果时如何处理？~~ **已解决**：引入 `ExecutorCtx`，`prev_result: Option<&StepResult>` 明确表达可能无前驱结果。LLM step 的 `StepCtx` 不变（`last_result` 语义是 "当前步执行完的结果"，在 `decide_transition` 中构造，此时已有结果）。
 2. ~~`PlanWorkflowTool` 是否需要支持 LLM 生成 executor step？~~ **已解决**：schema 支持 executor step；真正可执行的 executor 仍由业务层显式注册。
 3. ~~executor step 的 `WorkflowEvent` 是否需要区分类型（如 `ExecutorStepStarted`）？~~ **已决策**：初版不区分，统一使用 `StepStarted` / `StepFinished`。
-4. 内置 executor 的安全边界、超时与 sandbox 策略仍需单独设计。
+4. HttpCall executor 的 host allowlist、超时、响应大小上限与 header/body
+   redaction 策略仍需单独设计。
