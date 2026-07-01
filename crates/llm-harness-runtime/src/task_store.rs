@@ -349,12 +349,7 @@ mod tests {
     fn make_workflow() -> Workflow {
         Workflow {
             entry_step: "s1".into(),
-            steps: vec![Step {
-                id: "s1".into(),
-                name: "Step 1".into(),
-                prompt: "do step 1".into(),
-                allowed_tools: vec![],
-            }],
+            steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
             edges: vec![],
         }
     }

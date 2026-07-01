@@ -105,7 +105,11 @@ async fn workflow_engine_multi_turn_tool_then_text() {
     // 单步 workflow 的 turns = step_history.len() = 1（步数，非 LLM turn 数）。
     // ⚠ 注意：TaskResult.turns 在 WorkflowEngine 中是 step_history.len()，
     //   不是 LLM turn 数。此断言调整为步数。
-    assert!(result.turns >= 1, "expected >= 1 step, got {}", result.turns);
+    assert!(
+        result.turns >= 1,
+        "expected >= 1 step, got {}",
+        result.turns
+    );
 }
 
 // ── Test 3: tracing ───────────────────────────────────────────────────────────
@@ -113,12 +117,9 @@ async fn workflow_engine_multi_turn_tool_then_text() {
 /// TracingHookAdapter wired via with_hooks() exports spans to InMemoryTraceExporter.
 #[tokio::test]
 async fn workflow_engine_tracing_emits_spans() {
-    use llm_harness_runtime::tracing_adapter::TracingHookAdapter;
     use llm_harness_runtime::tracer::{CaptureLevel, SpanCaptureConfig, SpanStatus};
+    use llm_harness_runtime::tracing_adapter::TracingHookAdapter;
     use llm_harness_runtime_trace_otel::InMemoryTraceExporter;
-    use llm_harness_types::{
-        AfterProviderResponseHook, AfterToolCallHook, AfterTurnHook, BeforeProviderRequestHook,
-    };
 
     let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
         "Hello from tracer.",
@@ -151,5 +152,8 @@ async fn workflow_engine_tracing_emits_spans() {
 
     assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
     // 验证至少有一个 span 被 export。
-    assert!(!exporter.exported_spans().is_empty(), "expected at least one exported span");
+    assert!(
+        !exporter.exported_spans().is_empty(),
+        "expected at least one exported span"
+    );
 }

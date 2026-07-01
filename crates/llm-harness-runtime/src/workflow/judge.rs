@@ -34,7 +34,11 @@ impl StepTransitionJudge for NoopJudge {
     fn decide<'a>(&'a self, _ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
         // 自由 task 单步流程，run() 不会调到此处（无后继 step 自动结束）。
         // 若被调到，返回 Abort 防止无限循环。
-        Box::pin(async { Transition::Abort { reason: "NoopJudge has no transitions".into() } })
+        Box::pin(async {
+            Transition::Abort {
+                reason: "NoopJudge has no transitions".into(),
+            }
+        })
     }
 }
 
@@ -44,7 +48,7 @@ mod tests {
     use crate::cost::CostAggregate;
 
     fn make_step() -> Step {
-        Step { id: "s1".into(), name: "Step 1".into(), prompt: "do step 1".into(), allowed_tools: vec![] }
+        Step::llm("s1", "Step 1", "do step 1", vec![])
     }
 
     fn make_result() -> StepResult {
@@ -64,7 +68,11 @@ mod tests {
         let judge = NoopJudge;
         let step = make_step();
         let result = make_result();
-        let ctx = StepCtx { current_step: &step, last_result: &result, step_history: &[] };
+        let ctx = StepCtx {
+            current_step: &step,
+            last_result: &result,
+            step_history: &[],
+        };
         let t = judge.decide(&ctx).await;
         assert!(matches!(t, Transition::Abort { .. }));
     }

@@ -2,7 +2,7 @@
 //! 流程定义与运行时状态的纯数据模型。领域无关，可序列化（走 TaskStore 落盘）。
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::cost::CostAggregate;
 use crate::task::{TaskError, TaskId, TaskResult};
@@ -23,17 +23,182 @@ pub struct Workflow {
 }
 
 /// 单个步骤定义。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Step {
-    /// 步骤唯一标识。
-    pub id: StepId,
-    /// 人类可读名称。
-    pub name: String,
-    /// step agent 的指令（review-1）。run_step 用此字段作为 prompt，
-    /// 不再用 step.name。自由 task 的 prompt 经 new_free_task 传入并写入此字段。
-    pub prompt: String,
-    /// 本步允许的工具集。空 Vec = 不允许任何工具（字面语义，无 sentinel）。
-    pub allowed_tools: Vec<String>,
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Step {
+    /// LLM step: construct an AgentHarness and run one prompt.
+    Llm {
+        /// 步骤唯一标识。
+        id: StepId,
+        /// 人类可读名称。
+        name: String,
+        /// step agent 的指令。run_llm_step 用此字段作为 prompt。
+        prompt: String,
+        /// 本步允许的工具集。空 Vec = 不允许任何工具（字面语义，无 sentinel）。
+        #[serde(default)]
+        allowed_tools: Vec<String>,
+    },
+    /// Non-LLM step: execute a registered deterministic executor.
+    Executor {
+        /// 步骤唯一标识。
+        id: StepId,
+        /// 人类可读名称。
+        name: String,
+        /// Executor registry key.
+        executor_name: String,
+        /// Executor-specific JSON config.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config: Option<serde_json::Value>,
+    },
+}
+
+impl<'de> Deserialize<'de> for Step {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum TaggedStep {
+            Llm {
+                id: StepId,
+                name: String,
+                prompt: String,
+                #[serde(default)]
+                allowed_tools: Vec<String>,
+            },
+            Executor {
+                id: StepId,
+                name: String,
+                executor_name: String,
+                #[serde(default)]
+                config: Option<serde_json::Value>,
+            },
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyLlmStep {
+            id: StepId,
+            name: String,
+            prompt: String,
+            #[serde(default)]
+            allowed_tools: Vec<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StepCompat {
+            Tagged(TaggedStep),
+            LegacyLlm(LegacyLlmStep),
+        }
+
+        match StepCompat::deserialize(deserializer)? {
+            StepCompat::Tagged(TaggedStep::Llm {
+                id,
+                name,
+                prompt,
+                allowed_tools,
+            }) => Ok(Self::Llm {
+                id,
+                name,
+                prompt,
+                allowed_tools,
+            }),
+            StepCompat::Tagged(TaggedStep::Executor {
+                id,
+                name,
+                executor_name,
+                config,
+            }) => Ok(Self::Executor {
+                id,
+                name,
+                executor_name,
+                config,
+            }),
+            StepCompat::LegacyLlm(LegacyLlmStep {
+                id,
+                name,
+                prompt,
+                allowed_tools,
+            }) => Ok(Self::Llm {
+                id,
+                name,
+                prompt,
+                allowed_tools,
+            }),
+        }
+    }
+}
+
+impl Step {
+    pub fn llm(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        prompt: impl Into<String>,
+        allowed_tools: Vec<String>,
+    ) -> Self {
+        Self::Llm {
+            id: id.into(),
+            name: name.into(),
+            prompt: prompt.into(),
+            allowed_tools,
+        }
+    }
+
+    pub fn executor(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        executor_name: impl Into<String>,
+        config: Option<serde_json::Value>,
+    ) -> Self {
+        Self::Executor {
+            id: id.into(),
+            name: name.into(),
+            executor_name: executor_name.into(),
+            config,
+        }
+    }
+
+    pub fn id(&self) -> &StepId {
+        match self {
+            Self::Llm { id, .. } | Self::Executor { id, .. } => id,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Llm { name, .. } | Self::Executor { name, .. } => name,
+        }
+    }
+
+    pub fn allowed_tools(&self) -> &[String] {
+        match self {
+            Self::Llm { allowed_tools, .. } => allowed_tools.as_slice(),
+            Self::Executor { .. } => &[],
+        }
+    }
+
+    pub fn prompt(&self) -> Option<&str> {
+        match self {
+            Self::Llm { prompt, .. } => Some(prompt.as_str()),
+            Self::Executor { .. } => None,
+        }
+    }
+
+    pub fn executor_name(&self) -> Option<&str> {
+        match self {
+            Self::Executor { executor_name, .. } => Some(executor_name.as_str()),
+            Self::Llm { .. } => None,
+        }
+    }
+
+    pub fn executor_config(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Executor { config, .. } => config.as_ref(),
+            Self::Llm { .. } => None,
+        }
+    }
 }
 
 /// 步骤间的跳转边。
@@ -181,18 +346,58 @@ mod tests {
     fn workflow_roundtrip() {
         let wf = Workflow {
             entry_step: "a".into(),
-            steps: vec![Step {
-                id: "a".into(),
-                name: "Step A".into(),
-                prompt: "do step A".into(),
-                allowed_tools: vec!["tool1".into()],
-            }],
+            steps: vec![Step::llm("a", "Step A", "do step A", vec!["tool1".into()])],
             edges: vec![],
         };
         let json = serde_json::to_string(&wf).unwrap();
         let back: Workflow = serde_json::from_str(&json).unwrap();
         assert_eq!(back.entry_step, "a");
         assert_eq!(back.steps.len(), 1);
+    }
+
+    #[test]
+    fn legacy_llm_step_without_kind_deserializes() {
+        let json = r#"{
+            "entry_step": "a",
+            "steps": [{
+                "id": "a",
+                "name": "Step A",
+                "prompt": "do step A",
+                "allowed_tools": ["tool1"]
+            }],
+            "edges": []
+        }"#;
+        let wf: Workflow = serde_json::from_str(json).unwrap();
+        assert_eq!(wf.steps.len(), 1);
+        assert!(matches!(wf.steps[0], Step::Llm { .. }));
+        assert_eq!(wf.steps[0].id(), "a");
+    }
+
+    #[test]
+    fn executor_step_roundtrip() {
+        let step = Step::executor(
+            "exec",
+            "Executor",
+            "json_transform",
+            Some(serde_json::json!({ "path": "$.value" })),
+        );
+        let json = serde_json::to_string(&step).unwrap();
+        assert!(json.contains("\"kind\":\"executor\""));
+        let back: Step = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id(), "exec");
+        assert_eq!(back.executor_name(), Some("json_transform"));
+    }
+
+    #[test]
+    fn invalid_step_kind_is_rejected() {
+        let json = r#"{
+            "kind": "unknown",
+            "id": "a",
+            "name": "Step A",
+            "prompt": "do step A"
+        }"#;
+        let err = serde_json::from_str::<Step>(json).unwrap_err();
+        assert!(!err.to_string().is_empty());
     }
 
     #[test]

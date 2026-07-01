@@ -6,14 +6,13 @@ use std::sync::atomic::AtomicBool;
 
 use futures::future::BoxFuture;
 use llm_harness_agent::{
-    AgentHarnessEvent, HarnessHooks, Plugin, Session,
-    ContextMode, ProviderSelection, SpawnOptions, SubAgentResult,
-    sub_agent::SubAgentSpawner,
+    AgentHarnessEvent, ContextMode, HarnessHooks, Plugin, ProviderSelection, Session, SpawnOptions,
+    SubAgentResult, sub_agent::SubAgentSpawner,
 };
 use llm_harness_loop::LlmClient;
 use llm_harness_types::{
-    AgentError, AgentEvent, ContentBlock,
-    Tool, ToolContext, ToolError, ToolExecutionMode, ToolResult,
+    AgentError, AgentEvent, ContentBlock, Tool, ToolContext, ToolError, ToolExecutionMode,
+    ToolResult,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -25,6 +24,7 @@ use crate::error::Result;
 use crate::spawner::{EnvFactory, HarnessSubAgentSpawner, SessionFactory};
 use crate::task::{Checkpoint, TaskError, TaskId, TaskResult};
 use crate::task_store::TaskStore;
+use crate::workflow::executor::{ExecutorCtx, StepExecutor};
 use crate::workflow::judge::{NoopJudge, StepCtx, StepTransitionJudge};
 use crate::workflow::model::{
     Step, StepId, StepRecord, StepResult, Transition, Workflow, WorkflowState, WorkflowStatus,
@@ -69,7 +69,10 @@ pub struct SyncSpawnAgentTool {
 
 impl SyncSpawnAgentTool {
     pub fn new(spawner: Arc<HarnessSubAgentSpawner>, step_abort: CancellationToken) -> Self {
-        Self { spawner, step_abort }
+        Self {
+            spawner,
+            step_abort,
+        }
     }
 }
 
@@ -87,41 +90,66 @@ fn sync_spawn_schema() -> serde_json::Value {
 }
 
 impl Tool for SyncSpawnAgentTool {
-    fn name(&self) -> &str { SYNC_SPAWN_TOOL_NAME }
+    fn name(&self) -> &str {
+        SYNC_SPAWN_TOOL_NAME
+    }
 
     fn description(&self) -> &str {
         "派发一个 sub-agent 处理子任务，同步等待结果。结果作为 tool 结果返回。"
     }
 
     fn parameters_schema(&self) -> &'static serde_json::Value {
-        static SYNC_SPAWN_SCHEMA: LazyLock<serde_json::Value> =
-            LazyLock::new(sync_spawn_schema);
+        static SYNC_SPAWN_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(sync_spawn_schema);
         &SYNC_SPAWN_SCHEMA
     }
 
-    fn execution_mode(&self) -> ToolExecutionMode { ToolExecutionMode::Parallel }
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Parallel
+    }
 
-    fn execute<'a>(&'a self, args: Value, _ctx: &'a ToolContext) -> BoxFuture<'a, std::result::Result<ToolResult, ToolError>> {
+    fn execute<'a>(
+        &'a self,
+        args: Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolError>> {
         Box::pin(async move {
-            let prompt = args.get("prompt").and_then(|v| v.as_str())
-                .ok_or_else(|| ToolError::Execution("missing prompt".into()))?.to_string();
+            let prompt = args
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::Execution("missing prompt".into()))?
+                .to_string();
             if prompt.len() > SYNC_SPAWN_MAX_PROMPT_BYTES {
                 return Err(ToolError::Execution(format!(
                     "spawn_agent: prompt exceeds {} bytes",
                     SYNC_SPAWN_MAX_PROMPT_BYTES
                 )));
             }
-            let context = args.get("context").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-                .map(|s| ContextMode::Inject(s.to_string())).unwrap_or(ContextMode::None);
-            let provider = args.get("provider").and_then(|v| v.as_str())
-                .map(|s| ProviderSelection::Alias(s.to_string())).unwrap_or(ProviderSelection::Inherit);
+            let context = args
+                .get("context")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| ContextMode::Inject(s.to_string()))
+                .unwrap_or(ContextMode::None);
+            let provider = args
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(|s| ProviderSelection::Alias(s.to_string()))
+                .unwrap_or(ProviderSelection::Inherit);
             // wait 参数被忽略（schema 不含，但 LLM 可能传）
-            let opts = SpawnOptions { prompt, provider, cwd: None, context };
+            let opts = SpawnOptions {
+                prompt,
+                provider,
+                cwd: None,
+                context,
+            };
             // spawn 前检查 abort：若已 cancelled 则不浪费 spawn。
             if self.step_abort.is_cancelled() {
                 return Err(ToolError::Aborted);
             }
-            let handle = self.spawner.spawn(opts).await
+            let handle = self
+                .spawner
+                .spawn(opts)
+                .await
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
             // 取出 abort token：select! 的 cancel arm 不持 handle 所有权。
             let abort_token = handle.abort_token();
@@ -158,7 +186,9 @@ fn format_sub_agent_result(r: &SubAgentResult) -> String {
     let preview = if output.len() > 200 {
         // char 边界安全截取，避免 panic。
         let mut end = 200;
-        while !output.is_char_boundary(end) { end -= 1; }
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
         format!("{}...", &output[..end])
     } else {
         output.clone()
@@ -227,7 +257,9 @@ fn submit_step_result_schema() -> serde_json::Value {
 }
 
 impl Tool for SubmitStepResultTool {
-    fn name(&self) -> &str { SUBMIT_STEP_RESULT_TOOL_NAME }
+    fn name(&self) -> &str {
+        SUBMIT_STEP_RESULT_TOOL_NAME
+    }
     fn description(&self) -> &str {
         "提交本步的结构化结果（JSON）。judge 会直接读此结果做跳转决策。"
     }
@@ -235,7 +267,11 @@ impl Tool for SubmitStepResultTool {
         static S: LazyLock<serde_json::Value> = LazyLock::new(submit_step_result_schema);
         &S
     }
-    fn execute<'a>(&'a self, args: Value, _ctx: &'a ToolContext) -> BoxFuture<'a, std::result::Result<ToolResult, ToolError>> {
+    fn execute<'a>(
+        &'a self,
+        args: Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolError>> {
         let tx = self.tx.clone();
         Box::pin(async move {
             let result = args.get("result").cloned().unwrap_or(Value::Null);
@@ -257,7 +293,9 @@ impl Tool for SubmitStepResultTool {
             // last-write-wins：多次调用后者覆盖前者。
             *tx.lock().await = Some(result.clone());
             Ok(ToolResult {
-                content: vec![ContentBlock::Text { text: "Step result submitted.".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "Step result submitted.".into(),
+                }],
                 details: serde_json::json!({ "submitted": true }),
                 terminate: false,
             })
@@ -267,19 +305,32 @@ impl Tool for SubmitStepResultTool {
 
 /// 格式化 step_history 摘要，供步骤间上下文注入。
 fn format_step_history_summary(history: &[StepRecord]) -> String {
-    history.iter().map(|r| {
-        let output_preview = r.result.as_ref()
-            .map(|r| if r.output.len() > 200 {
-                // char 边界安全截取，避免 panic。
-                let mut end = 200;
-                while !r.output.is_char_boundary(end) { end -= 1; }
-                format!("{}...", &r.output[..end])
-            } else {
-                r.output.clone()
-            })
-            .unwrap_or_else(|| "(no result)".into());
-        format!("- step '{}' → {:?}\n  output: {}", r.step_id, r.transition, output_preview)
-    }).collect::<Vec<_>>().join("\n")
+    history
+        .iter()
+        .map(|r| {
+            let output_preview = r
+                .result
+                .as_ref()
+                .map(|r| {
+                    if r.output.len() > 200 {
+                        // char 边界安全截取，避免 panic。
+                        let mut end = 200;
+                        while !r.output.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        format!("{}...", &r.output[..end])
+                    } else {
+                        r.output.clone()
+                    }
+                })
+                .unwrap_or_else(|| "(no result)".into());
+            format!(
+                "- step '{}' → {:?}\n  output: {}",
+                r.step_id, r.transition, output_preview
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ── NoopPlugin（build_step_spawner 的 plugin factory 占位）───────────────────
@@ -288,7 +339,9 @@ fn format_step_history_summary(history: &[StepRecord]) -> String {
 /// 流程场景下 sub-agent 不需要额外 plugin（工具集由 step 的 allowed_tools 控制）。
 struct NoopPlugin;
 impl Plugin for NoopPlugin {
-    fn name(&self) -> &str { "workflow-noop" }
+    fn name(&self) -> &str {
+        "workflow-noop"
+    }
 }
 
 // ── WorkflowEngine ──────────────────────────────────────────────────────────
@@ -305,6 +358,8 @@ pub struct WorkflowEngine {
     judge: Arc<dyn StepTransitionJudge>,
     /// step_id → plugin 工厂闭包。引擎每步据此选 plugin。
     step_plugin_factories: HashMap<StepId, Box<dyn Fn() -> Box<dyn Plugin> + Send + Sync>>,
+    /// executor_name → deterministic non-LLM step executor.
+    step_executors: HashMap<String, Arc<dyn StepExecutor>>,
     /// 缓存：step_id → allowed_tools。构造时从 workflow 提取，避免每步重建。
     step_tools_cache: HashMap<StepId, Vec<String>>,
     /// 额外 tool（对 new/new_free_task 路径）。run() 内部构造每步 harness 时注册。
@@ -364,12 +419,7 @@ impl WorkflowEngine {
     ) -> Result<Self> {
         let workflow = Workflow {
             entry_step: "run".into(),
-            steps: vec![Step {
-                id: "run".into(),
-                name: "run".into(),
-                prompt,
-                allowed_tools,
-            }],
+            steps: vec![Step::llm("run", "run", prompt, allowed_tools)],
             edges: vec![],
         };
         Self::new(workflow, config, Arc::new(NoopJudge))
@@ -383,15 +433,24 @@ impl WorkflowEngine {
         config: WorkflowEngineConfig,
         judge: Arc<dyn StepTransitionJudge>,
     ) -> Result<Self> {
-        let workflow = store
-            .load_workflow(&task_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("restore: workflow not found in store for task {}", task_id.0))?;
+        let workflow = store.load_workflow(&task_id).await?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "restore: workflow not found in store for task {}",
+                task_id.0
+            )
+        })?;
         // 信任边界外数据：恢复后同样校验。
         validate_workflow(&workflow)?;
         let saved_state = store.load_workflow_state(&task_id).await?;
         let state = saved_state.unwrap_or_else(|| WorkflowState::new(workflow.entry_step.clone()));
-        let engine = Self::from_parts_with_state(workflow, config, judge, Some(store.clone()), task_id, state);
+        let engine = Self::from_parts_with_state(
+            workflow,
+            config,
+            judge,
+            Some(store.clone()),
+            task_id,
+            state,
+        );
         // 从 store 重载 checkpoints 到内存缓存。
         if let Ok(cps) = store.list_checkpoints(&engine.task_id).await {
             *engine.checkpoints.lock().await = cps;
@@ -422,14 +481,17 @@ impl WorkflowEngine {
         state: WorkflowState,
     ) -> Self {
         let (event_tx, _) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let step_tools_cache: HashMap<StepId, Vec<String>> = workflow.steps.iter()
-            .map(|s| (s.id.clone(), s.allowed_tools.clone()))
+        let step_tools_cache: HashMap<StepId, Vec<String>> = workflow
+            .steps
+            .iter()
+            .map(|s| (s.id().clone(), s.allowed_tools().to_vec()))
             .collect();
         Self {
             workflow,
             config,
             judge,
             step_plugin_factories: HashMap::new(),
+            step_executors: HashMap::new(),
             step_tools_cache,
             extra_tools: vec![],
             extra_hooks: HarnessHooks::none(),
@@ -471,7 +533,18 @@ impl WorkflowEngine {
         step_id: impl Into<String>,
         factory: impl Fn() -> Box<dyn Plugin> + Send + Sync + 'static,
     ) -> Self {
-        self.step_plugin_factories.insert(step_id.into(), Box::new(factory));
+        self.step_plugin_factories
+            .insert(step_id.into(), Box::new(factory));
+        self
+    }
+
+    #[must_use]
+    pub fn with_executor(
+        mut self,
+        name: impl Into<String>,
+        executor: Arc<dyn StepExecutor>,
+    ) -> Self {
+        self.step_executors.insert(name.into(), executor);
         self
     }
 
@@ -530,15 +603,27 @@ impl WorkflowEngine {
                     // 崩溃恢复：status 仍为 Running（上次进程异常退出未清理）。
                     // 回退 current_step 到最后一个有 result 的 step（已完成步），
                     // 或保持 entry_step（无已完成步时从头开始）。
-                    let last_completed = state.step_history.iter().rev()
+                    let last_completed = state
+                        .step_history
+                        .iter()
+                        .rev()
                         .find(|r| r.result.is_some())
                         .map(|r| r.step_id.clone());
                     if let Some(last_step) = last_completed {
                         // 找到 last_completed 之后的 To 跳转目标（即崩溃时正在执行的步）。
-                        let next = state.step_history.iter().rev()
-                        .find(|r| r.step_id == last_step && matches!(r.transition, Transition::To(_)))
+                        let next = state
+                            .step_history
+                            .iter()
+                            .rev()
+                            .find(|r| {
+                                r.step_id == last_step && matches!(r.transition, Transition::To(_))
+                            })
                             .and_then(|r| {
-                                if let Transition::To(ref t) = r.transition { Some(t.clone()) } else { None }
+                                if let Transition::To(ref t) = r.transition {
+                                    Some(t.clone())
+                                } else {
+                                    None
+                                }
                             });
                         if let Some(next) = next {
                             state.current_step = next;
@@ -546,8 +631,12 @@ impl WorkflowEngine {
                     }
                 }
                 _ => {
-                    self.running.store(false, std::sync::atomic::Ordering::SeqCst);
-                    anyhow::bail!("run: task is not Idle/Paused/Running (status={:?})", state.status);
+                    self.running
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    anyhow::bail!(
+                        "run: task is not Idle/Paused/Running (status={:?})",
+                        state.status
+                    );
                 }
             }
             // 持锁期间只构造快照，drop 锁后再做文件 I/O。
@@ -584,20 +673,22 @@ impl WorkflowEngine {
                 .workflow
                 .steps
                 .iter()
-                .find(|s| s.id == current_step_id)
-                .ok_or_else(|| anyhow::anyhow!("run: current_step '{}' not in workflow", current_step_id))?
+                .find(|s| s.id() == &current_step_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("run: current_step '{}' not in workflow", current_step_id)
+                })?
                 .clone();
 
             // max_steps 安全阀。
             if history_len >= self.max_steps {
-                return self.fail_task(
-                    format!("max_steps ({}) exceeded", self.max_steps),
-                ).await;
+                return self
+                    .fail_task(format!("max_steps ({}) exceeded", self.max_steps))
+                    .await;
             }
 
             let _ = self.event_tx.send(WorkflowEvent::StepStarted {
-                step_id: step.id.clone(),
-                step_name: step.name.clone(),
+                step_id: step.id().clone(),
+                step_name: step.name().to_string(),
             });
 
             // 3. 构造 abort token。
@@ -607,20 +698,37 @@ impl WorkflowEngine {
                 *ca = Some(step_abort.clone());
             }
 
-            // 4. 构造 harness + 跑 prompt。
+            // 4. Execute the step.
             let step_result = match self.run_step(&step, step_abort.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
+                    let state = self.workflow_state.lock().await;
+                    if state.status == WorkflowStatus::Cancelled {
+                        return Ok(state.result.clone().unwrap_or_else(|| TaskResult {
+                            cost: aggregate_cost(&state.step_history),
+                            turns: count_executed_turns(&state.step_history),
+                            final_message: None,
+                        }));
+                    }
+                    drop(state);
                     // step agent 失败 → task Failed。
-                    return self.fail_task(format!("step '{}' failed: {}", step.id, e)).await;
+                    return self
+                        .fail_task(format!("step '{}' failed: {}", step.id(), e))
+                        .await;
                 }
             };
+            let _ = self.event_tx.send(WorkflowEvent::StepFinished {
+                step_id: step.id().clone(),
+                result: step_result.clone(),
+            });
 
             // 5. 据 Transition 更新 state + 记录 step_history。
             //    apply_transition 内部检查 status==Cancelled 守卫：
             //    若 cancel() 已抢先置 Cancelled，则不推 record、不覆盖状态。
             let transition = self.decide_transition(&step, &step_result).await;
-            let next_step = self.apply_transition(&step, step_result, transition.clone()).await?;
+            let next_step = self
+                .apply_transition(&step, step_result, transition.clone())
+                .await?;
 
             // 6. 检查 cancel 守卫：cancel() 可能在 run_step 期间抢先置 Cancelled。
             //    apply_transition 已跳过 record 推入，此处确认并返回。
@@ -636,8 +744,13 @@ impl WorkflowEngine {
             }
 
             // 7. 检查 pause_requested。
-            if self.pause_requested.load(std::sync::atomic::Ordering::SeqCst) {
-                let reason = self.pause_reason.lock()
+            if self
+                .pause_requested
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let reason = self
+                    .pause_reason
+                    .lock()
                     .map(|r| r.clone().unwrap_or_else(|| "pause requested".into()))
                     .unwrap_or_else(|_| "pause requested".into());
                 let mut state = self.workflow_state.lock().await;
@@ -646,8 +759,11 @@ impl WorkflowEngine {
                 let snapshot = state.clone();
                 drop(state);
                 self.persist_state(&snapshot).await?;
-                self.pause_requested.store(false, std::sync::atomic::Ordering::SeqCst);
-                if let Ok(mut r) = self.pause_reason.lock() { *r = None; }
+                self.pause_requested
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut r) = self.pause_reason.lock() {
+                    *r = None;
+                }
                 let _ = self.event_tx.send(WorkflowEvent::Paused { reason });
                 anyhow::bail!("task paused at step boundary");
             }
@@ -658,7 +774,9 @@ impl WorkflowEngine {
                     // 流程终止（正常结束或 abort）。
                     let mut state = self.workflow_state.lock().await;
                     let cost = aggregate_cost(&state.step_history);
-                    let final_message = state.step_history.last()
+                    let final_message = state
+                        .step_history
+                        .last()
                         .and_then(|r| r.result.as_ref())
                         .map(|r| r.output.clone());
                     let result = TaskResult {
@@ -692,7 +810,9 @@ impl WorkflowEngine {
     async fn decide_transition(&self, step: &Step, step_result: &StepResult) -> Transition {
         let is_free_task = self.workflow.edges.is_empty() && self.workflow.steps.len() == 1;
         if is_free_task {
-            return Transition::Abort { reason: "free task complete".into() };
+            return Transition::Abort {
+                reason: "free task complete".into(),
+            };
         }
         let history = self.workflow_state.lock().await.step_history.clone();
         let ctx = StepCtx {
@@ -713,18 +833,81 @@ impl WorkflowEngine {
         let snapshot = state.clone();
         drop(state);
         self.persist_state(&snapshot).await?;
-        let _ = self.event_tx.send(WorkflowEvent::Failed { error: error_msg.clone() });
+        let _ = self.event_tx.send(WorkflowEvent::Failed {
+            error: error_msg.clone(),
+        });
         anyhow::bail!(error_msg)
     }
 
-    /// 跑单个 step：构造 harness + prompt + 收集结果。
+    /// Dispatch one workflow step by kind.
     async fn run_step(&self, step: &Step, step_abort: CancellationToken) -> Result<StepResult> {
+        match step {
+            Step::Llm { .. } => self.run_llm_step(step, step_abort).await,
+            Step::Executor { .. } => self.run_executor_step(step, step_abort).await,
+        }
+    }
+
+    /// Run a deterministic non-LLM executor step.
+    async fn run_executor_step(
+        &self,
+        step: &Step,
+        step_abort: CancellationToken,
+    ) -> Result<StepResult> {
+        let Step::Executor { executor_name, .. } = step else {
+            anyhow::bail!("run_executor_step called with non-executor step");
+        };
+        let executor = self
+            .step_executors
+            .get(executor_name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("executor '{}' not registered", executor_name))?;
+        let started_at = chrono::Utc::now();
+        let history = self.workflow_state.lock().await.step_history.clone();
+        let prev_result = history.last().and_then(|record| record.result.as_ref());
+        let ctx = ExecutorCtx {
+            current_step: step,
+            prev_result,
+            step_history: &history,
+        };
+        let mut result = tokio::select! {
+            biased;
+            _ = step_abort.cancelled() => {
+                anyhow::bail!("executor step aborted");
+            }
+            r = executor.execute(&ctx) => r?,
+        };
+        let ended_at = chrono::Utc::now();
+        if result.started_at.is_none() {
+            result.started_at = Some(started_at);
+        }
+        if result.ended_at.is_none() {
+            result.ended_at = Some(ended_at);
+        }
+        if result.session_id.is_empty() {
+            result.session_id = format!("executor:{}", step.id());
+        }
+        Ok(result)
+    }
+
+    /// 跑 LLM step：构造 harness + prompt + 收集结果。
+    async fn run_llm_step(&self, step: &Step, step_abort: CancellationToken) -> Result<StepResult> {
+        let Step::Llm {
+            prompt,
+            allowed_tools,
+            ..
+        } = step
+        else {
+            anyhow::bail!("run_llm_step called with non-LLM step");
+        };
         // 记录真实开始时间（用于 StepRecord）。
         let started_at = chrono::Utc::now();
 
         // a. 构造 env + session。
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let env = self.config.env_factory.create(&cwd)
+        let env = self
+            .config
+            .env_factory
+            .create(&cwd)
             .map_err(|e| anyhow::anyhow!("env_factory: {e}"))?;
         let (storage, session_id) = self
             .config
@@ -738,7 +921,7 @@ impl WorkflowEngine {
             .provider(&self.config.model, self.config.client.clone());
 
         // c. 注册 step plugin（若有）。
-        if let Some(factory) = self.step_plugin_factories.get(&step.id) {
+        if let Some(factory) = self.step_plugin_factories.get(step.id()) {
             let plugin = factory();
             builder = builder.install(plugin.as_ref());
         }
@@ -751,9 +934,12 @@ impl WorkflowEngine {
             injected_tool_names.insert(tool.name().to_string());
             builder = builder.tool(tool.clone());
         }
-        if step.allowed_tools.iter().any(|t| t == SYNC_SPAWN_TOOL_NAME) {
+        if allowed_tools.iter().any(|t| t == SYNC_SPAWN_TOOL_NAME) {
             let spawner = self.build_step_spawner();
-            let sync_tool = Arc::new(SyncSpawnAgentTool::new(Arc::new(spawner), step_abort.clone()));
+            let sync_tool = Arc::new(SyncSpawnAgentTool::new(
+                Arc::new(spawner),
+                step_abort.clone(),
+            ));
             builder = builder.tool(sync_tool);
         }
         // 每步注入 SubmitStepResultTool，让 step agent 能提交结构化结果。
@@ -770,9 +956,12 @@ impl WorkflowEngine {
         let injected_vec: Vec<String> = injected_tool_names.iter().cloned().collect();
         let gate_hook: Arc<dyn llm_harness_types::PrepareNextTurnHook> =
             Arc::new(crate::workflow::gate::WorkflowGateHook::new(
-                state_arc, step_tools, injected_tool_names,
+                state_arc,
+                step_tools,
+                injected_tool_names,
             ));
-        let approval_hook = crate::workflow::gate::build_gate_approval_hook(&step.allowed_tools, &injected_vec);
+        let approval_hook =
+            crate::workflow::gate::build_gate_approval_hook(allowed_tools, &injected_vec);
         let mut hook_state = self.extra_hooks.clone();
         hook_state.prepare_next_turn.push(gate_hook);
         hook_state.before_tool_call.push(approval_hook);
@@ -788,10 +977,10 @@ impl WorkflowEngine {
         let prompt_text = {
             let state = self.workflow_state.lock().await;
             if state.step_history.is_empty() {
-                step.prompt.clone()
+                prompt.clone()
             } else {
                 let ctx = format_step_history_summary(&state.step_history);
-                format!("Context:\n{ctx}\n\n---\n\n{}", step.prompt)
+                format!("Context:\n{ctx}\n\n---\n\n{}", prompt)
             }
         };
 
@@ -829,14 +1018,25 @@ impl WorkflowEngine {
         }
         if !settled {
             // channel 关闭但未收到 Settled：harness 异常退出。
-            anyhow::bail!("run_step: event stream closed before Settled (step '{}')", step.id);
+            anyhow::bail!(
+                "run_llm_step: event stream closed before Settled (step '{}')",
+                step.id()
+            );
         }
         let cost = harness.usage();
         let ended_at = chrono::Utc::now();
         // 从 SubmitStepResultTool 读取结构化结果。
         let structured = structured_rx.lock().await.take();
 
-        Ok(StepResult { output, structured, tool_calls_count, session_id, cost, started_at: Some(started_at), ended_at: Some(ended_at) })
+        Ok(StepResult {
+            output,
+            structured,
+            tool_calls_count,
+            session_id,
+            cost,
+            started_at: Some(started_at),
+            ended_at: Some(ended_at),
+        })
     }
 
     /// 构造 step 内部 fan-out 用的 spawner（局部对象，step 结束丢弃）。
@@ -879,7 +1079,7 @@ impl WorkflowEngine {
 
         let now = chrono::Utc::now();
         let record = StepRecord {
-            step_id: step.id.clone(),
+            step_id: step.id().clone(),
             started_at: step_result.started_at.unwrap_or(now),
             ended_at: step_result.ended_at.unwrap_or(now),
             result: Some(step_result),
@@ -891,7 +1091,7 @@ impl WorkflowEngine {
             Transition::To(next) => {
                 // 校验合法性：next 必须在 steps 里 + 从 current_step 可达（有 edge 或是 entry）。
                 // 注：To(entry_step) 无条件放行，允许流程返工重跑入口。
-                if !self.workflow.steps.iter().any(|s| s.id == next) {
+                if !self.workflow.steps.iter().any(|s| s.id() == &next) {
                     let msg = format!("InvalidTransition: step '{}' not in workflow", next);
                     state.status = WorkflowStatus::Failed;
                     state.error = Some(TaskError::Internal(msg.clone()));
@@ -901,10 +1101,18 @@ impl WorkflowEngine {
                     self.persist_state(&snapshot).await?;
                     anyhow::bail!(msg);
                 }
-                let reachable = self.workflow.edges.iter().any(|e| e.from == step.id && e.to == next)
+                let reachable = self
+                    .workflow
+                    .edges
+                    .iter()
+                    .any(|e| e.from.as_str() == step.id().as_str() && e.to == next)
                     || next == self.workflow.entry_step;
                 if !reachable {
-                    let msg = format!("InvalidTransition: no edge from '{}' to '{}'", step.id, next);
+                    let msg = format!(
+                        "InvalidTransition: no edge from '{}' to '{}'",
+                        step.id(),
+                        next
+                    );
                     state.status = WorkflowStatus::Failed;
                     state.error = Some(TaskError::Internal(msg.clone()));
                     state.ended_at = Some(now);
@@ -926,10 +1134,17 @@ impl WorkflowEngine {
                     .step_history
                     .iter()
                     .rev()
-                    .take_while(|r| r.step_id == step.id && matches!(r.transition, Transition::Retry))
+                    .take_while(|r| {
+                        r.step_id.as_str() == step.id().as_str()
+                            && matches!(r.transition, Transition::Retry)
+                    })
                     .count();
                 if retry_count > self.max_retries {
-                    let msg = format!("max_retries ({}) exceeded for step '{}'", self.max_retries, step.id);
+                    let msg = format!(
+                        "max_retries ({}) exceeded for step '{}'",
+                        self.max_retries,
+                        step.id()
+                    );
                     state.status = WorkflowStatus::Failed;
                     state.error = Some(TaskError::Internal(msg.clone()));
                     state.ended_at = Some(now);
@@ -974,7 +1189,8 @@ impl WorkflowEngine {
 
     /// 非阻塞：设 pause_requested 标志即返回。run() 在步边界检查并消费。
     pub fn pause(&self, reason: &str) -> Result<()> {
-        self.pause_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.pause_requested
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut r) = self.pause_reason.lock() {
             *r = Some(reason.to_string());
         }
@@ -1015,16 +1231,19 @@ impl WorkflowEngine {
         let cancelled_step_id = state.current_step.clone();
 
         // 检查 apply_transition 是否已为当前步推入 record。
-        let already_recorded = state.step_history.last().is_some_and(|r| {
-            r.step_id == cancelled_step_id && r.result.is_some()
-        });
+        let already_recorded = state
+            .step_history
+            .last()
+            .is_some_and(|r| r.step_id == cancelled_step_id && r.result.is_some());
         if !already_recorded {
             state.step_history.push(StepRecord {
                 step_id: cancelled_step_id,
                 started_at: now,
                 ended_at: now,
                 result: None,
-                transition: Transition::Abort { reason: format!("cancelled: {}", reason) },
+                transition: Transition::Abort {
+                    reason: format!("cancelled: {}", reason),
+                },
             });
         }
         state.status = WorkflowStatus::Cancelled;
@@ -1033,7 +1252,9 @@ impl WorkflowEngine {
         let snapshot = state.clone();
         drop(state);
         self.persist_state(&snapshot).await?;
-        let _ = self.event_tx.send(WorkflowEvent::Cancelled { reason: reason.to_string() });
+        let _ = self.event_tx.send(WorkflowEvent::Cancelled {
+            reason: reason.to_string(),
+        });
         Ok(())
     }
 
@@ -1102,19 +1323,43 @@ struct HookPlugin {
 }
 
 impl Plugin for HookPlugin {
-    fn name(&self) -> &str { "workflow-hook-bridge" }
+    fn name(&self) -> &str {
+        "workflow-hook-bridge"
+    }
     fn register_hooks(&self, target: &mut HarnessHooks) {
-        target.before_run.extend(self.hooks.before_run.iter().cloned());
-        target.before_turn.extend(self.hooks.before_turn.iter().cloned());
-        target.after_turn.extend(self.hooks.after_turn.iter().cloned());
-        target.before_tool_call.extend(self.hooks.before_tool_call.iter().cloned());
-        target.after_tool_call.extend(self.hooks.after_tool_call.iter().cloned());
-        target.transform_context.extend(self.hooks.transform_context.iter().cloned());
-        target.prepare_next_turn.extend(self.hooks.prepare_next_turn.iter().cloned());
-        target.should_stop.extend(self.hooks.should_stop.iter().cloned());
-        target.before_provider_request.extend(self.hooks.before_provider_request.iter().cloned());
-        target.after_provider_response.extend(self.hooks.after_provider_response.iter().cloned());
-        target.before_compact.extend(self.hooks.before_compact.iter().cloned());
+        target
+            .before_run
+            .extend(self.hooks.before_run.iter().cloned());
+        target
+            .before_turn
+            .extend(self.hooks.before_turn.iter().cloned());
+        target
+            .after_turn
+            .extend(self.hooks.after_turn.iter().cloned());
+        target
+            .before_tool_call
+            .extend(self.hooks.before_tool_call.iter().cloned());
+        target
+            .after_tool_call
+            .extend(self.hooks.after_tool_call.iter().cloned());
+        target
+            .transform_context
+            .extend(self.hooks.transform_context.iter().cloned());
+        target
+            .prepare_next_turn
+            .extend(self.hooks.prepare_next_turn.iter().cloned());
+        target
+            .should_stop
+            .extend(self.hooks.should_stop.iter().cloned());
+        target
+            .before_provider_request
+            .extend(self.hooks.before_provider_request.iter().cloned());
+        target
+            .after_provider_response
+            .extend(self.hooks.after_provider_response.iter().cloned());
+        target
+            .before_compact
+            .extend(self.hooks.before_compact.iter().cloned());
     }
 }
 
@@ -1126,11 +1371,18 @@ mod sync_tool_tests {
     use llm_harness_types::ExecutionEnv;
 
     struct NoopPlugin;
-    impl llm_harness_agent::Plugin for NoopPlugin { fn name(&self) -> &str { "noop" } }
+    impl llm_harness_agent::Plugin for NoopPlugin {
+        fn name(&self) -> &str {
+            "noop"
+        }
+    }
 
     struct NoopEnvFactory;
     impl crate::spawner::EnvFactory for NoopEnvFactory {
-        fn create(&self, _cwd: &std::path::Path) -> std::result::Result<Arc<dyn ExecutionEnv>, AgentError> {
+        fn create(
+            &self,
+            _cwd: &std::path::Path,
+        ) -> std::result::Result<Arc<dyn ExecutionEnv>, AgentError> {
             Ok(Arc::new(llm_harness_loop::test_utils::NoOpEnv))
         }
     }
@@ -1147,22 +1399,29 @@ mod sync_tool_tests {
         async fn chat(
             &self,
             _: &llm_harness_loop::ChatRequest,
-        ) -> std::result::Result<llm_harness_loop::ChatResponse, llm_harness_loop::LlmError> {
+        ) -> std::result::Result<llm_harness_loop::ChatResponse, llm_harness_loop::LlmError>
+        {
             std::future::pending().await
         }
         async fn chat_stream(
             &self,
             _: &llm_harness_loop::ChatRequest,
-        ) -> std::result::Result<llm_harness_loop::StreamHandle, llm_harness_loop::LlmError> {
+        ) -> std::result::Result<llm_harness_loop::StreamHandle, llm_harness_loop::LlmError>
+        {
             std::future::pending().await
         }
     }
 
     fn make_spawner(client: Arc<dyn llm_harness_loop::LlmClient>) -> Arc<HarnessSubAgentSpawner> {
         Arc::new(
-            HarnessSubAgentSpawner::new("test-model", client, std::env::temp_dir().join("sync-tool-test"), |_cwd, _rx, _id| Box::new(NoopPlugin))
-                .session_factory(Arc::new(JsonlSessionFactory))
-                .env_factory(Arc::new(NoopEnvFactory)),
+            HarnessSubAgentSpawner::new(
+                "test-model",
+                client,
+                std::env::temp_dir().join("sync-tool-test"),
+                |_cwd, _rx, _id| Box::new(NoopPlugin),
+            )
+            .session_factory(Arc::new(JsonlSessionFactory))
+            .env_factory(Arc::new(NoopEnvFactory)),
         )
     }
 
@@ -1180,19 +1439,30 @@ mod sync_tool_tests {
     fn empty_msg() -> llm_harness_types::AssistantMessage {
         use chrono::Utc;
         llm_harness_types::AssistantMessage {
-            content: vec![], stop_reason: None, timestamp: Utc::now(),
-            provider: None, api: None, model: None, usage: None, error_message: None,
+            content: vec![],
+            stop_reason: None,
+            timestamp: Utc::now(),
+            provider: None,
+            api: None,
+            model: None,
+            usage: None,
+            error_message: None,
         }
     }
 
     #[tokio::test]
     async fn sync_tool_returns_result_on_normal_join() {
-        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("sub-agent done")]));
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
+            "sub-agent done",
+        )]));
         let spawner = make_spawner(client);
         let step_abort = CancellationToken::new();
         let tool = SyncSpawnAgentTool::new(spawner, step_abort);
         let ctx = make_ctx(CancellationToken::new());
-        let result = tool.execute(serde_json::json!({"prompt": "do work"}), &ctx).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({"prompt": "do work"}), &ctx)
+            .await
+            .unwrap();
         assert!(!result.terminate);
         match &result.content[0] {
             ContentBlock::Text { text } => assert!(text.contains("Sub-agent completed")),
@@ -1212,7 +1482,9 @@ mod sync_tool_tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             abort_clone.cancel();
         });
-        let result = tool.execute(serde_json::json!({"prompt": "long work"}), &ctx).await;
+        let result = tool
+            .execute(serde_json::json!({"prompt": "long work"}), &ctx)
+            .await;
         assert!(matches!(result, Err(ToolError::Aborted)));
     }
 
@@ -1223,7 +1495,10 @@ mod sync_tool_tests {
         let step_abort = CancellationToken::new();
         let tool = SyncSpawnAgentTool::new(spawner, step_abort);
         let ctx = make_ctx(CancellationToken::new());
-        let result = tool.execute(serde_json::json!({"prompt": "work", "wait": true}), &ctx).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({"prompt": "work", "wait": true}), &ctx)
+            .await
+            .unwrap();
         assert!(!result.terminate);
     }
 }
@@ -1237,7 +1512,10 @@ mod engine_tests {
 
     struct TestEnvFactory;
     impl EnvFactory for TestEnvFactory {
-        fn create(&self, _cwd: &std::path::Path) -> std::result::Result<Arc<dyn ExecutionEnv>, AgentError> {
+        fn create(
+            &self,
+            _cwd: &std::path::Path,
+        ) -> std::result::Result<Arc<dyn ExecutionEnv>, AgentError> {
             Ok(Arc::new(llm_harness_loop::test_utils::NoOpEnv))
         }
     }
@@ -1245,7 +1523,9 @@ mod engine_tests {
     #[tokio::test]
     async fn free_task_smoke_succeeds() {
         let dir = tempfile::TempDir::new().unwrap();
-        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("The answer is 42.")]));
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
+            "The answer is 42.",
+        )]));
         let config = WorkflowEngineConfig {
             client,
             model: "mock-model".into(),
@@ -1264,11 +1544,47 @@ mod engine_tests {
     use crate::workflow::judge::NoopJudge;
     use crate::workflow::model::Edge;
 
+    struct FixedExecutor;
+    impl StepExecutor for FixedExecutor {
+        fn execute<'a>(&'a self, ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+            Box::pin(async move {
+                let prev = ctx
+                    .prev_result
+                    .expect("executor should see previous result");
+                let suffix = ctx
+                    .current_step
+                    .executor_config()
+                    .and_then(|config| config.get("suffix"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("done");
+                Ok(StepResult {
+                    output: format!("executor {suffix} after {}", prev.output),
+                    structured: Some(serde_json::json!({
+                        "executor": true,
+                        "previous_output": prev.output,
+                        "history_len": ctx.step_history.len(),
+                    })),
+                    tool_calls_count: 0,
+                    session_id: String::new(),
+                    cost: CostAggregate::default(),
+                    started_at: None,
+                    ended_at: None,
+                })
+            })
+        }
+    }
+
+    struct BlockingExecutor;
+    impl StepExecutor for BlockingExecutor {
+        fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+            Box::pin(async move { std::future::pending::<Result<StepResult>>().await })
+        }
+    }
+
     #[tokio::test]
     async fn free_task_crash_recovery() {
         let dir = tempfile::TempDir::new().unwrap();
-        let store: Arc<dyn TaskStore> =
-            Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
         let config = WorkflowEngineConfig {
             client: client.clone(),
@@ -1277,7 +1593,8 @@ mod engine_tests {
             session_factory: Arc::new(JsonlSessionFactory),
             session_base_dir: dir.path().join("sessions"),
         };
-        let engine = WorkflowEngine::new_free_task("do work".into(), vec![], config).unwrap()
+        let engine = WorkflowEngine::new_free_task("do work".into(), vec![], config)
+            .unwrap()
             .with_task_store(store.clone());
         let task_id = engine.task_id().clone();
         engine.run().await.unwrap();
@@ -1291,11 +1608,9 @@ mod engine_tests {
             session_factory: Arc::new(JsonlSessionFactory),
             session_base_dir: dir.path().join("sessions"),
         };
-        let restored = WorkflowEngine::restore(
-            store, task_id, config2, Arc::new(NoopJudge),
-        )
-        .await
-        .unwrap();
+        let restored = WorkflowEngine::restore(store, task_id, config2, Arc::new(NoopJudge))
+            .await
+            .unwrap();
         assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
     }
 
@@ -1310,21 +1625,28 @@ mod engine_tests {
         let workflow = Workflow {
             entry_step: "s1".into(),
             steps: vec![
-                Step { id: "s1".into(), name: "Step 1".into(), prompt: "do step 1".into(), allowed_tools: vec![] },
-                Step { id: "s2".into(), name: "Step 2".into(), prompt: "do step 2".into(), allowed_tools: vec![] },
+                Step::llm("s1", "Step 1", "do step 1", vec![]),
+                Step::llm("s2", "Step 2", "do step 2", vec![]),
             ],
             edges: vec![Edge {
-                from: "s1".into(), to: "s2".into(), condition: None,
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
             }],
         };
         // judge：s1 → s2 → Abort。
         struct LinearJudge;
         impl StepTransitionJudge for LinearJudge {
             fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
-                let cur = ctx.current_step.id.clone();
+                let cur = ctx.current_step.id().clone();
                 Box::pin(async move {
-                    if cur == "s1" { Transition::To("s2".into()) }
-                    else { Transition::Abort { reason: "done".into() } }
+                    if cur == "s1" {
+                        Transition::To("s2".into())
+                    } else {
+                        Transition::Abort {
+                            reason: "done".into(),
+                        }
+                    }
                 })
             }
         }
@@ -1335,12 +1657,135 @@ mod engine_tests {
             session_factory: Arc::new(JsonlSessionFactory),
             session_base_dir: dir.path().join("sessions"),
         };
-        let engine = WorkflowEngine::new(
-            workflow, config, Arc::new(LinearJudge),
-        )
-        .unwrap();
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge)).unwrap();
         let result = engine.run().await.unwrap();
         assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
         assert_eq!(result.turns, 2); // 2 步历史
+    }
+
+    #[tokio::test]
+    async fn mixed_llm_and_executor_workflow() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step1 done")]));
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::llm("s1", "Step 1", "do step 1", vec![]),
+                Step::executor(
+                    "s2",
+                    "Executor Step",
+                    "fixed",
+                    Some(serde_json::json!({"suffix": "done"})),
+                ),
+            ],
+            edges: vec![Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            }],
+        };
+        struct LinearJudge;
+        impl StepTransitionJudge for LinearJudge {
+            fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+                let cur = ctx.current_step.id().clone();
+                Box::pin(async move {
+                    if cur == "s1" {
+                        Transition::To("s2".into())
+                    } else {
+                        Transition::Abort {
+                            reason: "done".into(),
+                        }
+                    }
+                })
+            }
+        }
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge))
+            .unwrap()
+            .with_executor("fixed", Arc::new(FixedExecutor));
+
+        let result = engine.run().await.unwrap();
+
+        assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+        assert_eq!(result.turns, 2);
+        assert!(
+            result
+                .final_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("executor done after step1 done")
+        );
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unregistered_executor_fails_task() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let workflow = Workflow {
+            entry_step: "exec".into(),
+            steps: vec![Step::executor("exec", "Executor Step", "missing", None)],
+            edges: vec![],
+        };
+        let config = WorkflowEngineConfig {
+            client,
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+
+        let err = engine.run().await.unwrap_err();
+
+        assert_eq!(engine.state().await, WorkflowStatus::Failed);
+        assert!(
+            err.to_string()
+                .contains("executor 'missing' not registered")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_executor_step_marks_task_cancelled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let workflow = Workflow {
+            entry_step: "exec".into(),
+            steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+            edges: vec![],
+        };
+        let config = WorkflowEngineConfig {
+            client,
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = Arc::new(
+            WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+                .unwrap()
+                .with_executor("blocking", Arc::new(BlockingExecutor)),
+        );
+        let runner = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.run().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        engine.cancel("stop").await.unwrap();
+
+        let result = runner.await.unwrap().unwrap();
+
+        assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+        assert_eq!(result.turns, 0);
+        assert!(result.final_message.is_none());
     }
 }

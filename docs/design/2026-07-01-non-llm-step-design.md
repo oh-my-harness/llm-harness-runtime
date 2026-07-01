@@ -1,13 +1,14 @@
-# Non-LLM Step 支持设计（初步）
+# Non-LLM Step 支持设计
 
-> **状态：初步设计**。本文档记录 brainstorming 阶段的设计决策，尚未经过完整 spec review。
-> 部分细节（内置 executor 实现方案、错误处理边界、测试策略）留待后续补充。
+> **状态：初版已实现**。当前已支持业务注入 `StepExecutor`，并由
+> `WorkflowEngine` 在 LLM step 与 executor step 之间分发。内置
+> `HttpCall` / `Script` / `JsonTransform` executor 仍属后续扩展。
 
 ## 背景与动机
 
 ### 当前架构
 
-workflow 引擎（`crates/llm-harness-runtime/src/workflow/`）的执行模型：
+workflow 引擎（`crates/llm-harness-runtime/src/workflow/`）的初始执行模型：
 
 - `WorkflowEngine::run_loop` 遍历 step，每个 step 调 `run_step`
 - `run_step` 做的事：构造 `AgentHarness` → `harness.prompt()` → 收集事件流 → 产出 `StepResult`
@@ -24,7 +25,7 @@ workflow 引擎（`crates/llm-harness-runtime/src/workflow/`）的执行模型�
 
 ### 问题
 
-当前架构隐含假设：**每一步都需要 LLM 推理**。但真实 workflow 里很多步骤不需要：
+初始架构隐含假设：**每一步都需要 LLM 推理**。但真实 workflow 里很多步骤不需要：
 
 1. **纯数据变换**：提取/映射/聚合上一步的 `structured` 结果。让 LLM 做既浪费 token 又不可靠。
 2. **外部系统调用**：调 HTTP API、查 DB、跑脚本。确定性 IO，不需要 LLM 多轮工具选择。
@@ -93,7 +94,7 @@ pub enum Step {
 **关键点**：
 
 1. **`#[serde(tag = "kind")]`**：序列化带 `kind: "llm"` / `kind: "executor"` 标签。
-2. **Breaking change**：旧 `Step` 是结构体，新的是 enum，序列化格式不同。但 workflow 定义目前只在 TaskStore 落盘（崩溃恢复用），不是外部持久数据，适配范围可控。
+2. **兼容旧 LLM step**：新写出的 `Step` 会带 `kind`，但反序列化兼容旧的无 `kind` LLM step JSON，避免已有 TaskStore 存档和调用方计划直接失效。
 3. **executor step 不需要 `prompt` / `allowed_tools`**：enum 变体只携带自己需要的字段。
 4. **`config: Option<serde_json::Value>`**：executor 自定义 schema，引擎不需要知道参数细节，保持开放扩展。
 
@@ -239,6 +240,35 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 | `judge.rs` | `StepCtx.current_step: &Step` 类型不变，但实现可能需要 match |
 | `mod.rs` | 新增 `pub mod executor;` |
 
+## 当前实现状态
+
+已落地：
+
+- `Step` 已改为 `#[serde(tag = "kind")]` enum：
+  - `kind = "llm"`：构造 `AgentHarness` 并执行 prompt。
+  - `kind = "executor"`：查找注册的 `StepExecutor` 并执行确定性逻辑。
+- 反序列化兼容旧的无 `kind` LLM step JSON；新序列化格式统一输出带
+  `kind` 的 tagged enum。
+- 新增 `workflow::executor::{StepExecutor, ExecutorCtx}`。
+- `WorkflowEngine::with_executor(name, executor)` 支持业务层注入 executor。
+- `WorkflowEngine::run_loop` 按 step 类型分发。
+- executor step 与 LLM step 共享：
+  - `WorkflowEvent::StepStarted`
+  - `WorkflowEvent::StepFinished`
+  - `StepRecord`
+  - `StepTransitionJudge`
+  - `WorkflowState` 持久化
+- executor step 取消时不会把已取消任务覆盖为 `Failed`。
+- `PlanWorkflowTool` schema 支持 LLM 生成 `kind = "llm"` 或
+  `kind = "executor"` 的 step；运行时仍要求业务层注册对应 executor。
+
+已覆盖测试：
+
+- `mixed_llm_and_executor_workflow`
+- `unregistered_executor_fails_task`
+- `cancel_executor_step_marks_task_cancelled`
+- `executor_step_requires_executor_name`
+
 ## 内置 Executor（待设计）
 
 计划内置三个实现，具体方案留待后续：
@@ -254,15 +284,9 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 - executor 内部 IO 超时 → executor 自己处理，返回 `Err` 或部分结果
 - abort 传播 → `Err("executor step aborted")`
 
-## 测试策略（待细化）
-
-- unit：executor trait mock + run_executor_step 分发逻辑
-- 集成：混合 LLM + executor step 的 workflow 端到端
-- abort：executor step 执行中被 cancel
-- 恢复：executor step 后崩溃恢复
-
 ## 待解决问题
 
 1. ~~`StepCtx.last_result` 是 `&StepResult`（非 Option），workflow 第一步无前驱结果时如何处理？~~ **已解决**：引入 `ExecutorCtx`，`prev_result: Option<&StepResult>` 明确表达可能无前驱结果。LLM step 的 `StepCtx` 不变（`last_result` 语义是 "当前步执行完的结果"，在 `decide_transition` 中构造，此时已有结果）。
-2. `PlanWorkflowTool` 是否需要支持 LLM 生成 executor step？还是 executor step 只能由人类/代码构造？
-3. executor step 的 `WorkflowEvent` 是否需要区分类型（如 `ExecutorStepStarted`）？当前设计倾向不区分。
+2. ~~`PlanWorkflowTool` 是否需要支持 LLM 生成 executor step？~~ **已解决**：schema 支持 executor step；真正可执行的 executor 仍由业务层显式注册。
+3. ~~executor step 的 `WorkflowEvent` 是否需要区分类型（如 `ExecutorStepStarted`）？~~ **已决策**：初版不区分，统一使用 `StepStarted` / `StepFinished`。
+4. 内置 executor 的安全边界、超时与 sandbox 策略仍需单独设计。
