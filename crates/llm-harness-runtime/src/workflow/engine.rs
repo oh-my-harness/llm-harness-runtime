@@ -305,30 +305,45 @@ impl Tool for SubmitStepResultTool {
 }
 
 /// 格式化 step_history 摘要，供步骤间上下文注入。
+const STEP_HISTORY_OUTPUT_PREVIEW_CHARS: usize = 1_000;
+const STEP_HISTORY_STRUCTURED_PREVIEW_CHARS: usize = 4_000;
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn structured_preview(value: &Value) -> String {
+    let serialized = serde_json::to_string(value)
+        .unwrap_or_else(|err| format!("\"<failed to serialize structured result: {err}>\""));
+    truncate_chars(&serialized, STEP_HISTORY_STRUCTURED_PREVIEW_CHARS)
+}
+
 fn format_step_history_summary(history: &[StepRecord]) -> String {
     history
         .iter()
         .map(|r| {
-            let output_preview = r
-                .result
-                .as_ref()
-                .map(|r| {
-                    if r.output.len() > 200 {
-                        // char 边界安全截取，避免 panic。
-                        let mut end = 200;
-                        while !r.output.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        format!("{}...", &r.output[..end])
-                    } else {
-                        r.output.clone()
-                    }
-                })
-                .unwrap_or_else(|| "(no result)".into());
-            format!(
-                "- step '{}' → {:?}\n  output: {}",
-                r.step_id, r.transition, output_preview
-            )
+            let Some(result) = r.result.as_ref() else {
+                return format!(
+                    "- step '{}' → {:?}\n  output: (no result)",
+                    r.step_id, r.transition
+                );
+            };
+
+            let mut lines = vec![format!("- step '{}' → {:?}", r.step_id, r.transition)];
+            if let Some(structured) = result.structured.as_ref() {
+                lines.push(format!("  structured: {}", structured_preview(structured)));
+            }
+            lines.push(format!(
+                "  output: {}",
+                truncate_chars(&result.output, STEP_HISTORY_OUTPUT_PREVIEW_CHARS)
+            ));
+            lines.join("\n")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -746,32 +761,7 @@ impl WorkflowEngine {
                 }
             }
 
-            // 7. 检查 pause_requested。
-            if self
-                .pause_requested
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                let reason = self
-                    .pause_reason
-                    .lock()
-                    .map(|r| r.clone().unwrap_or_else(|| "pause requested".into()))
-                    .unwrap_or_else(|_| "pause requested".into());
-                let mut state = self.workflow_state.lock().await;
-                state.status = WorkflowStatus::Paused;
-                state.reason = Some(reason.clone());
-                let snapshot = state.clone();
-                drop(state);
-                self.persist_state(&snapshot).await?;
-                self.pause_requested
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                if let Ok(mut r) = self.pause_reason.lock() {
-                    *r = None;
-                }
-                let _ = self.event_tx.send(WorkflowEvent::Paused { reason });
-                anyhow::bail!("task paused at step boundary");
-            }
-
-            // 8. 流程走完？
+            // 7. 流程走完？
             match (transition, next_step) {
                 (Transition::Fail { reason }, _) => {
                     return self.fail_task(reason).await;
@@ -804,12 +794,44 @@ impl WorkflowEngine {
                     let snapshot = state.clone();
                     drop(state);
                     self.persist_state(&snapshot).await?;
+                    self.pause_if_requested().await?;
                 }
                 (Transition::Retry, _) => {
                     // current_step 不变，重跑。
+                    self.pause_if_requested().await?;
                 }
             }
         }
+    }
+
+    async fn pause_if_requested(&self) -> Result<()> {
+        if !self
+            .pause_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+
+        let reason = self
+            .pause_reason
+            .lock()
+            .map(|r| r.clone().unwrap_or_else(|| "pause requested".into()))
+            .unwrap_or_else(|_| "pause requested".into());
+        let mut state = self.workflow_state.lock().await;
+        state.status = WorkflowStatus::Paused;
+        state.reason = Some(reason.clone());
+        let snapshot = state.clone();
+        drop(state);
+        self.persist_state(&snapshot).await?;
+        self.pause_requested
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut r) = self.pause_reason.lock() {
+            *r = None;
+        }
+        let _ = self.event_tx.send(WorkflowEvent::Paused {
+            reason: reason.clone(),
+        });
+        Err(TaskError::Paused(reason).into())
     }
 
     /// 判断 transition：自由 task 直接 Abort，否则调 judge.decide。
@@ -1303,12 +1325,21 @@ impl WorkflowEngine {
         Ok(())
     }
 
+    /// Prepare a paused task for continuation.
+    ///
+    /// `run()` owns the `Paused -> Running` transition and drives execution.
+    /// Keeping that single state-machine entry point prevents an explicit
+    /// resume from being mistaken for crash recovery of an already-running task.
     pub async fn resume(&self) -> Result<()> {
         let mut state = self.workflow_state.lock().await;
         if state.status != WorkflowStatus::Paused {
             anyhow::bail!("resume: task is not Paused (status={:?})", state.status);
         }
-        state.status = WorkflowStatus::Running;
+        self.pause_requested
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut r) = self.pause_reason.lock() {
+            *r = None;
+        }
         state.reason = None;
         let snapshot = state.clone();
         drop(state);
@@ -1738,6 +1769,50 @@ mod engine_tests {
         }
     }
 
+    #[test]
+    fn step_history_summary_includes_structured_before_output() {
+        let mut record = completed_record(
+            "measure",
+            "measurement complete",
+            Transition::To("decide".into()),
+        );
+        record.result.as_mut().unwrap().structured = Some(serde_json::json!({
+            "voltage": 3.3,
+            "passed": true,
+        }));
+
+        let summary = format_step_history_summary(&[record]);
+
+        assert!(summary.contains("- step 'measure'"));
+        assert!(summary.contains("structured:"));
+        assert!(summary.contains("\"voltage\":3.3"));
+        assert!(summary.contains("\"passed\":true"));
+        assert!(summary.contains("output: measurement complete"));
+        assert!(
+            summary.find("structured:").unwrap() < summary.find("output:").unwrap(),
+            "structured result should be shown before output preview"
+        );
+    }
+
+    #[test]
+    fn step_history_summary_uses_longer_output_preview() {
+        let output = "x".repeat(350);
+        let record = completed_record(
+            "answer",
+            &output,
+            Transition::Abort {
+                reason: "done".into(),
+            },
+        );
+
+        let summary = format_step_history_summary(&[record]);
+
+        assert!(
+            summary.contains(&output),
+            "output under the 1000 character preview limit should not be truncated"
+        );
+    }
+
     struct BlockingTool;
 
     impl Tool for BlockingTool {
@@ -1762,6 +1837,23 @@ mod engine_tests {
             Box::pin(async move {
                 ctx.abort.cancelled().await;
                 Err(ToolError::Aborted)
+            })
+        }
+    }
+
+    struct TwoStepJudge;
+
+    impl StepTransitionJudge for TwoStepJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let cur = ctx.current_step.id().clone();
+            Box::pin(async move {
+                if cur == "s1" {
+                    Transition::To("s2".into())
+                } else {
+                    Transition::Abort {
+                        reason: "done".into(),
+                    }
+                }
             })
         }
     }
@@ -1992,6 +2084,113 @@ mod engine_tests {
         let result = engine.run().await.unwrap();
         assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
         assert_eq!(result.turns, 2); // 2 步历史
+    }
+
+    #[tokio::test]
+    async fn pause_then_run_continues_from_next_step() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("step1 done"),
+            MockResponse::text("step2 done"),
+        ]));
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::llm("s1", "Step 1", "do step 1", vec![]),
+                Step::llm("s2", "Step 2", "do step 2", vec![]),
+            ],
+            edges: vec![Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            }],
+        };
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(TwoStepJudge)).unwrap();
+        engine.pause("operator checkpoint").unwrap();
+
+        let err = engine.run().await.unwrap_err();
+        let paused = err
+            .downcast_ref::<TaskError>()
+            .expect("pause should return TaskError::Paused");
+
+        assert!(matches!(paused, TaskError::Paused(reason) if reason == "operator checkpoint"));
+        assert_eq!(engine.state().await, WorkflowStatus::Paused);
+        assert_eq!(engine.current_step().await, "s2");
+        assert_eq!(engine.step_history().await.len(), 1);
+
+        let result = engine.run().await.unwrap();
+        let history = engine.step_history().await;
+
+        assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            history
+                .iter()
+                .map(|record| record.step_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s1", "s2"]
+        );
+        assert_eq!(result.final_message.as_deref(), Some("step2 done"));
+    }
+
+    #[tokio::test]
+    async fn resume_then_run_does_not_enter_crash_recovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("step1 done"),
+            MockResponse::text("step2 done"),
+        ]));
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::llm("s1", "Step 1", "do step 1", vec![]),
+                Step::llm("s2", "Step 2", "do step 2", vec![]),
+            ],
+            edges: vec![Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            }],
+        };
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(TwoStepJudge)).unwrap();
+        engine.pause("operator checkpoint").unwrap();
+        engine.run().await.unwrap_err();
+
+        engine.resume().await.unwrap();
+
+        assert_eq!(
+            engine.state().await,
+            WorkflowStatus::Paused,
+            "resume should not pre-set Running; run() owns the transition"
+        );
+
+        let result = engine.run().await.unwrap();
+        let history = engine.step_history().await;
+
+        assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            history
+                .iter()
+                .map(|record| record.step_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s1", "s2"]
+        );
+        assert_eq!(result.final_message.as_deref(), Some("step2 done"));
     }
 
     #[tokio::test]
@@ -2294,6 +2493,64 @@ mod engine_tests {
         assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
         assert_eq!(result.turns, 0);
         assert!(result.final_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_then_restore_remains_cancelled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let workflow = Workflow {
+            entry_step: "exec".into(),
+            steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+            edges: vec![],
+        };
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = Arc::new(
+            WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+                .unwrap()
+                .with_task_store(store.clone())
+                .with_executor("blocking", Arc::new(BlockingExecutor)),
+        );
+        let task_id = engine.task_id().clone();
+        let runner = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.run().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        engine.cancel("stop").await.unwrap();
+
+        let result = runner.await.unwrap().unwrap();
+
+        assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+        assert_eq!(result.turns, 0);
+
+        let restored = WorkflowEngine::restore(
+            store,
+            task_id,
+            WorkflowEngineConfig {
+                client,
+                model: "mock-model".into(),
+                env_factory: Arc::new(TestEnvFactory),
+                session_factory: Arc::new(JsonlSessionFactory),
+                session_base_dir: dir.path().join("sessions-restore"),
+            },
+            Arc::new(NoopJudge),
+        )
+        .await
+        .unwrap();
+        let history = restored.step_history().await;
+
+        assert_eq!(restored.state().await, WorkflowStatus::Cancelled);
+        assert_eq!(history.len(), 1);
+        assert!(history[0].result.is_none());
+        assert!(matches!(history[0].transition, Transition::Abort { .. }));
     }
 
     #[tokio::test]

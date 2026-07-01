@@ -16,6 +16,8 @@ pub enum TaskError {
     AuthError(String),
     #[error("task cancelled: {0}")]
     Cancelled(String),
+    #[error("task paused: {0}")]
+    Paused(String),
     #[error("budget exceeded: limit={limit}, spent={spent}")]
     BudgetExceeded { limit: f64, spent: f64 },
     #[error("retries exhausted: max={max}")]
@@ -23,7 +25,6 @@ pub enum TaskError {
     #[error("internal: {0}")]
     Internal(String),
 }
-
 
 /// Task completion result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,5 +51,3 @@ pub struct Checkpoint {
     /// Arbitrary payload (JSON).
     pub payload: Value,
 }
-
-
