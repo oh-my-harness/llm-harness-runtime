@@ -1,6 +1,6 @@
 # Workflow Issue Closure Plan
 
-Updated: 2026-07-01 21:20 Asia/Shanghai
+Updated: 2026-07-01 21:34 Asia/Shanghai
 Task: Close the highest-impact workflow runtime issues from the latest AI review.
 
 ## Plan
@@ -10,6 +10,8 @@ Task: Close the highest-impact workflow runtime issues from the latest AI review
 - [x] Add pause/resume/cancel end-to-end coverage (#27/#32).
 - [x] Fix structured step-history propagation into downstream LLM prompts (#26/#33).
 - [x] Commit, push, and update issues.
+- [x] Fix terminal transition crash recovery and remove Fail double persist (#22/#23).
+- [x] Commit, push, and update #22/#23.
 
 ## Priority Rationale
 
@@ -26,6 +28,11 @@ steps need reliable data rather than truncated prose.
 Lower-priority items (#24/#25/#28/#29/#30) are either documented tradeoffs,
 workflow expressiveness improvements, or validation/documentation refinements.
 
+The next correctness risk is terminal transition recovery. A persisted
+`Running` state whose last completed record is `Fail` or `Abort` should converge
+to the corresponding terminal task state after restore, rather than re-running
+the already-completed step.
+
 ## Progress Log
 
 - 2026-07-01 20:55 Asia/Shanghai - Created plan and selected #31 as the first implementation target.
@@ -35,3 +42,6 @@ workflow expressiveness improvements, or validation/documentation refinements.
 - 2026-07-01 21:14 Asia/Shanghai - Added structured step-history prompt coverage and passed targeted workflow engine tests.
 - 2026-07-01 21:16 Asia/Shanghai - Passed `cargo test --workspace` and `cargo clippy --workspace --all-targets -- -D warnings`.
 - 2026-07-01 21:20 Asia/Shanghai - Pushed the workflow branch and closed GitHub issues #26, #27, #31, #32, and #33.
+- 2026-07-01 21:25 Asia/Shanghai - Started #22/#23; added terminal transition recovery logic and regression tests.
+- 2026-07-01 21:30 Asia/Shanghai - Passed targeted workflow tests, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` for #22/#23.
+- 2026-07-01 21:34 Asia/Shanghai - Pushed terminal recovery fix and closed GitHub issues #22 and #23.

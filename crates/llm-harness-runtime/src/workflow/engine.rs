@@ -595,6 +595,12 @@ impl WorkflowEngine {
 
     /// 启动/恢复执行。
     pub async fn run(&self) -> Result<TaskResult> {
+        enum StartupAction {
+            Continue,
+            Return(TaskResult),
+            Fail(String),
+        }
+
         // 重入守卫：防止并发 run() 覆盖写。
         if self.running.swap(true, std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("run: task is already running (concurrent run() detected)");
@@ -603,8 +609,9 @@ impl WorkflowEngine {
         // 1. 翻转 status → Running，落盘。
         //    允许 Running → Running：崩溃恢复场景下 status 仍为 Running（已落盘），
         //    重启后需从这里恢复。回退 current_step 到最后一个 completed step。
-        {
+        let startup_action = {
             let mut state = self.workflow_state.lock().await;
+            let mut action = StartupAction::Continue;
             // 将 planned_by（struct 字段）写入 state（若有）。
             if let Some(plan_id) = &self.planned_by {
                 state.planned_by = Some(plan_id.clone());
@@ -619,32 +626,37 @@ impl WorkflowEngine {
                 }
                 WorkflowStatus::Running => {
                     // 崩溃恢复：status 仍为 Running（上次进程异常退出未清理）。
-                    // 回退 current_step 到最后一个有 result 的 step（已完成步），
-                    // 或保持 entry_step（无已完成步时从头开始）。
-                    let last_completed = state
+                    // 对已落盘的 terminal transition 直接收敛到终态；对 To transition
+                    // 回退 current_step 到目标 step，避免重跑已完成步。
+                    if let Some(last_record) = state
                         .step_history
                         .iter()
                         .rev()
                         .find(|r| r.result.is_some())
-                        .map(|r| r.step_id.clone());
-                    if let Some(last_step) = last_completed {
-                        // 找到 last_completed 之后的 To 跳转目标（即崩溃时正在执行的步）。
-                        let next = state
-                            .step_history
-                            .iter()
-                            .rev()
-                            .find(|r| {
-                                r.step_id == last_step && matches!(r.transition, Transition::To(_))
-                            })
-                            .and_then(|r| {
-                                if let Transition::To(ref t) = r.transition {
-                                    Some(t.clone())
-                                } else {
-                                    None
-                                }
-                            });
-                        if let Some(next) = next {
-                            state.current_step = next;
+                        .cloned()
+                    {
+                        match last_record.transition {
+                            Transition::Fail { reason } => {
+                                state.status = WorkflowStatus::Failed;
+                                state.error = Some(TaskError::Internal(reason.clone()));
+                                state.ended_at = Some(chrono::Utc::now());
+                                action = StartupAction::Fail(reason);
+                            }
+                            Transition::Abort { .. } => {
+                                let result = TaskResult {
+                                    cost: aggregate_cost(&state.step_history),
+                                    turns: count_executed_turns(&state.step_history),
+                                    final_message: last_record.result.map(|r| r.output),
+                                };
+                                state.status = WorkflowStatus::Succeeded;
+                                state.result = Some(result.clone());
+                                state.ended_at = Some(chrono::Utc::now());
+                                action = StartupAction::Return(result);
+                            }
+                            Transition::To(next) => {
+                                state.current_step = next;
+                            }
+                            Transition::Retry => {}
                         }
                     }
                 }
@@ -661,7 +673,8 @@ impl WorkflowEngine {
             let snapshot = state.clone();
             drop(state);
             self.persist_state(&snapshot).await?;
-        }
+            action
+        };
         // 若有 task_store，保存 workflow 定义（供 restore 重建）。
         if let Some(store) = &self.task_store {
             store.save_workflow(&self.task_id, &self.workflow).await?;
@@ -676,7 +689,16 @@ impl WorkflowEngine {
         }
         let _guard = RunningGuard(&self.running);
 
-        self.run_loop().await
+        match startup_action {
+            StartupAction::Continue => self.run_loop().await,
+            StartupAction::Return(result) => Ok(result),
+            StartupAction::Fail(error) => {
+                let _ = self.event_tx.send(WorkflowEvent::Failed {
+                    error: error.clone(),
+                });
+                anyhow::bail!(error)
+            }
+        }
     }
 
     /// run() 的主循环。拆出以降低 run() 圈复杂度。
@@ -1281,9 +1303,7 @@ impl WorkflowEngine {
                 Ok(None)
             }
             Transition::Fail { .. } => {
-                let snapshot = state.clone();
                 drop(state);
-                self.persist_state(&snapshot).await?;
                 Ok(None)
             }
             Transition::Abort { .. } => {
@@ -2035,6 +2055,97 @@ mod engine_tests {
             vec!["s1", "s2", "s1"]
         );
         assert_eq!(result.final_message.as_deref(), Some("reworked step1"));
+    }
+
+    #[tokio::test]
+    async fn running_restore_terminal_fail_does_not_rerun_step() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        let task_id = TaskId("restore-fail".into());
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+            edges: vec![],
+        };
+        let mut state = WorkflowState::new("s1".into());
+        state.status = WorkflowStatus::Running;
+        state.started_at = Some(chrono::Utc::now());
+        state.step_history = vec![completed_record(
+            "s1",
+            "step1 done",
+            Transition::Fail {
+                reason: "route failed".into(),
+            },
+        )];
+        store.save_workflow(&task_id, &workflow).await.unwrap();
+        store.save_workflow_state(&task_id, &state).await.unwrap();
+
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let restored = WorkflowEngine::restore(store, task_id, config, Arc::new(NoopJudge))
+            .await
+            .unwrap();
+
+        let err = restored.run().await.unwrap_err();
+        let history = restored.step_history().await;
+
+        assert!(err.to_string().contains("route failed"));
+        assert_eq!(restored.state().await, WorkflowStatus::Failed);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(history.len(), 1);
+        assert!(matches!(history[0].transition, Transition::Fail { .. }));
+    }
+
+    #[tokio::test]
+    async fn running_restore_terminal_abort_does_not_rerun_step() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        let task_id = TaskId("restore-abort".into());
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+            edges: vec![],
+        };
+        let mut state = WorkflowState::new("s1".into());
+        state.status = WorkflowStatus::Running;
+        state.started_at = Some(chrono::Utc::now());
+        state.step_history = vec![completed_record(
+            "s1",
+            "final answer",
+            Transition::Abort {
+                reason: "done".into(),
+            },
+        )];
+        store.save_workflow(&task_id, &workflow).await.unwrap();
+        store.save_workflow_state(&task_id, &state).await.unwrap();
+
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let restored = WorkflowEngine::restore(store, task_id, config, Arc::new(NoopJudge))
+            .await
+            .unwrap();
+
+        let result = restored.run().await.unwrap();
+        let history = restored.step_history().await;
+
+        assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(history.len(), 1);
+        assert!(matches!(history[0].transition, Transition::Abort { .. }));
+        assert_eq!(result.turns, 1);
+        assert_eq!(result.final_message.as_deref(), Some("final answer"));
     }
 
     #[tokio::test]
