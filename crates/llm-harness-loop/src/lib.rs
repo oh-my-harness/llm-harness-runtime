@@ -12,6 +12,7 @@ pub mod composite;
 pub mod config;
 pub mod convert;
 pub(crate) mod dispatch;
+pub mod final_answer;
 pub mod hooked_tool;
 pub mod loop_fn;
 pub(crate) mod stream_state;
@@ -30,6 +31,10 @@ pub use composite::{
 };
 pub use config::{LoopConfig, ModelInfo, RetryConfig};
 pub use convert::{ConvertToLlmHook, CustomMessageConverter, DefaultConvertToLlm};
+pub use final_answer::{
+    DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior, FinalAnswerMode,
+    FinalAnswerToolConfig,
+};
 pub use hooked_tool::HookedTool;
 pub use loop_fn::{agent_loop, agent_loop_continue};
 

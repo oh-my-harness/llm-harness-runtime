@@ -2,7 +2,9 @@
 
 ## Status
 
-Implemented as a backward-compatible runtime protocol extension.
+Implemented as a backward-compatible runtime protocol extension. The default
+mode preserves legacy final-answer heuristics; products that need stronger
+guarantees can opt into the built-in final-answer tool contract.
 
 ## Problem
 
@@ -51,9 +53,39 @@ assistant answer.
 - Workflow LLM steps now prefer `FinalAnswer` for `StepResult.output` and fall
   back to raw text deltas only when no final-answer event is available.
 
-## Remaining Optional Extension
+## Optional Final-Answer Tool
 
-An opt-in `answer` or `final_answer` tool can be added later for products that
-want to force a model to call a specific tool before a turn is accepted as
-final. That should be configurable, because making it mandatory would change
-prompting and tool-choice behavior for existing integrations.
+`FinalAnswerMode::Tool` injects a built-in tool. By default its name is
+`final_answer` and its schema is:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": "string",
+      "description": "Final answer text to show to the user."
+    }
+  },
+  "required": ["text"],
+  "additionalProperties": false
+}
+```
+
+When the model calls this tool, the loop executes it as a terminal protocol
+tool, emits a synthetic `MessageEnd` containing an `AssistantMessage` with
+`kind = final_answer`, and emits `AgentEvent::FinalAnswer` with the tool's
+`text`. The tool call and execution events remain available for trace/activity
+views.
+
+The tool contract is opt-in to avoid breaking existing integrations:
+
+- `FinalAnswerMode::Heuristic` is the default and keeps existing behavior.
+- `FinalAnswerMode::required_tool()` treats plain terminal assistant text as
+  `progress` and emits an error if the model stops without calling the tool.
+- `FinalAnswerMode::tool_with_text_fallback()` makes the tool available but
+  preserves the legacy plain-text fallback.
+
+If an active-tool subset is configured, the built-in final-answer tool remains
+available while the contract is enabled. A name collision with a registered
+user tool is rejected before the provider request.

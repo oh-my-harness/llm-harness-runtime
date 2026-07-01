@@ -6,6 +6,12 @@ use llm_harness_types::*;
 use uuid::Uuid;
 
 use crate::config::LoopConfig;
+use crate::final_answer::{
+    FinalAnswerMissingBehavior, FinalAnswerMode, FinalAnswerToolConfig, builtin_final_answer_tool,
+};
+use crate::stream_state::TerminalTextClassification;
+
+type ToolSelection = (Vec<Arc<dyn Tool>>, Option<FinalAnswerToolConfig>);
 
 fn thinking_budget(level: ThinkingLevel) -> Option<u32> {
     match level {
@@ -42,6 +48,83 @@ fn active_tool_subset(
         .collect())
 }
 
+fn final_answer_tool_config(mode: &FinalAnswerMode) -> Option<&FinalAnswerToolConfig> {
+    match mode {
+        FinalAnswerMode::Heuristic => None,
+        FinalAnswerMode::Tool(cfg) => Some(cfg),
+    }
+}
+
+fn tools_for_turn(
+    tools: &[Arc<dyn Tool>],
+    active: &Option<HashSet<String>>,
+    final_answer_mode: &FinalAnswerMode,
+) -> Result<ToolSelection, AgentError> {
+    let Some(answer_cfg) = final_answer_tool_config(final_answer_mode).cloned() else {
+        return active_tool_subset(tools, active).map(|tools| (tools, None));
+    };
+
+    if answer_cfg.name.trim().is_empty() {
+        return Err(AgentError::Internal(
+            "final-answer tool name must not be empty".into(),
+        ));
+    }
+    if tools.iter().any(|tool| tool.name() == answer_cfg.name) {
+        return Err(AgentError::Internal(format!(
+            "final-answer tool name '{}' conflicts with a registered tool",
+            answer_cfg.name
+        )));
+    }
+
+    let builtin = builtin_final_answer_tool(&answer_cfg);
+    let mut registered = tools.to_vec();
+    registered.push(builtin.clone());
+
+    let mut selected = active_tool_subset(&registered, active)?;
+    if !selected.iter().any(|tool| tool.name() == answer_cfg.name) {
+        selected.push(builtin);
+    }
+
+    Ok((selected, Some(answer_cfg)))
+}
+
+fn terminal_text_classification(mode: &FinalAnswerMode) -> TerminalTextClassification {
+    match mode {
+        FinalAnswerMode::Tool(cfg) if cfg.missing_behavior == FinalAnswerMissingBehavior::Error => {
+            TerminalTextClassification::Progress
+        }
+        FinalAnswerMode::Heuristic | FinalAnswerMode::Tool(_) => {
+            TerminalTextClassification::FinalAnswer
+        }
+    }
+}
+
+fn final_answer_text_from_results(
+    tool_name: &str,
+    tool_calls: &[(String, String, serde_json::Value)],
+    results: &[(String, Result<ToolResult, ToolError>)],
+) -> Option<String> {
+    tool_calls
+        .iter()
+        .filter(|(_, name, _)| name == tool_name)
+        .filter_map(|(id, _, _)| {
+            results.iter().find_map(|(result_id, result)| {
+                if result_id != id {
+                    return None;
+                }
+                match result {
+                    Ok(tool_result) => tool_result
+                        .details
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    Err(_) => None,
+                }
+            })
+        })
+        .next_back()
+}
+
 fn apply_next_turn_directive(
     ctx: &mut AgentContext,
     config: &mut LoopConfig,
@@ -61,7 +144,7 @@ fn apply_next_turn_directive(
         config.tools = tools;
     }
     *active_tools = directive.active_tools;
-    active_tool_subset(&config.tools, active_tools).map(|_| ())
+    tools_for_turn(&config.tools, active_tools, &config.final_answer_mode).map(|_| ())
 }
 
 /// Start an agent loop from a new context.
@@ -153,8 +236,12 @@ fn run_loop(
                 }
             };
 
-            let current_tools = match active_tool_subset(&config.tools, &active_tools) {
-                Ok(tools) => tools,
+            let (current_tools, current_final_answer_tool) = match tools_for_turn(
+                &config.tools,
+                &active_tools,
+                &config.final_answer_mode,
+            ) {
+                Ok(result) => result,
                 Err(e) => {
                     yield AgentEvent::Error(e);
                     break 'main;
@@ -242,7 +329,11 @@ fn run_loop(
             };
 
             // Emit MessageStart
-            let mut state = StreamingState::new(handle.model().to_owned(), turn_id);
+            let mut state = StreamingState::new_with_terminal_text_classification(
+                handle.model().to_owned(),
+                turn_id,
+                terminal_text_classification(&config.final_answer_mode),
+            );
             let message_id = state.message_id.clone();
             yield AgentEvent::MessageStart { message_id: message_id.clone() };
 
@@ -446,10 +537,64 @@ fn run_loop(
                     new_messages.push(tool_result_msg);
                 }
 
-                let should_terminate = !results.is_empty()
-                    && results.iter().all(|(_, r)| {
-                        r.as_ref().map(|tr| tr.terminate).unwrap_or(false)
+                let final_answer_message = current_final_answer_tool
+                    .as_ref()
+                    .and_then(|cfg| {
+                        final_answer_text_from_results(&cfg.name, &tool_calls, &results)
+                    })
+                    .map(|text| {
+                        let turn_id = assistant_msg
+                            .turn_id
+                            .clone()
+                            .unwrap_or_else(|| Uuid::now_v7().to_string());
+                        let message_id = Uuid::now_v7().to_string();
+                        AssistantMessage {
+                            kind: AssistantMessageKind::FinalAnswer,
+                            message_id: Some(message_id),
+                            turn_id: Some(turn_id),
+                            content: vec![ContentBlock::Text { text }],
+                            stop_reason: Some(StopReason::EndTurn),
+                            timestamp: chrono::Utc::now(),
+                            provider: assistant_msg.provider.clone(),
+                            api: assistant_msg.api.clone(),
+                            model: assistant_msg.model.clone(),
+                            usage: None,
+                            error_message: None,
+                        }
                     });
+
+                if let Some(final_message) = &final_answer_message {
+                    let message_id = final_message
+                        .message_id
+                        .clone()
+                        .expect("synthetic final-answer message has an id");
+                    let turn_id = final_message
+                        .turn_id
+                        .clone()
+                        .expect("synthetic final-answer message has a turn id");
+                    let text = final_message.text_content();
+                    yield AgentEvent::MessageStart {
+                        message_id: message_id.clone(),
+                    };
+                    yield AgentEvent::MessageEnd {
+                        message_id: message_id.clone(),
+                        message: final_message.clone(),
+                    };
+                    yield AgentEvent::FinalAnswer {
+                        turn_id,
+                        message_id,
+                        text,
+                    };
+                    let final_agent_msg = AgentMessage::Assistant(final_message.clone());
+                    ctx.messages.push(final_agent_msg.clone());
+                    new_messages.push(final_agent_msg);
+                }
+
+                let should_terminate = !results.is_empty()
+                    && (final_answer_message.is_some()
+                        || results.iter().all(|(_, r)| {
+                            r.as_ref().map(|tr| tr.terminate).unwrap_or(false)
+                        }));
 
                 // Call PrepareNextTurnHook before consuming results into TurnEnd
                 if !should_terminate && let Some(h) = &config.prepare_next_turn {
@@ -488,7 +633,7 @@ fn run_loop(
 
                 yield AgentEvent::TurnEnd {
                     index: turn_index,
-                    message: assistant_msg,
+                    message: final_answer_message.unwrap_or(assistant_msg),
                     tool_results: results,
                 };
 
@@ -498,6 +643,16 @@ fn run_loop(
 
                 turn_index += 1;
                 continue 'main;
+            }
+
+            if let FinalAnswerMode::Tool(cfg) = &config.final_answer_mode
+                && cfg.missing_behavior == FinalAnswerMissingBehavior::Error
+            {
+                yield AgentEvent::Error(AgentError::Internal(format!(
+                    "final-answer tool '{}' was required but the model stopped without calling it",
+                    cfg.name
+                )));
+                break 'main;
             }
 
             // Non-tool stop
@@ -569,7 +724,9 @@ mod tests {
     use super::{active_tool_subset, apply_next_turn_directive};
 
     use crate::test_utils::{MockLlmClient, MockResponse, NoOpEnv};
-    use crate::{DefaultConvertToLlm, LoopConfig, agent_loop, agent_loop_continue};
+    use crate::{
+        DefaultConvertToLlm, FinalAnswerMode, LoopConfig, agent_loop, agent_loop_continue,
+    };
     use futures::StreamExt;
     use futures::future::BoxFuture;
     use llm_adapter::provider::Provider;
@@ -615,6 +772,7 @@ mod tests {
             tools: vec![],
             active_tools: None,
             default_execution_mode: ToolExecutionMode::Parallel,
+            final_answer_mode: crate::FinalAnswerMode::default(),
             env: Arc::new(NoOpEnv),
             abort: CancellationToken::new(),
             stream_options: StreamOptions::default(),
@@ -816,6 +974,164 @@ mod tests {
                 .any(|e| matches!(e, AgentEvent::FinalAnswer { text, .. } if text == "Done!")),
             "final text response should emit FinalAnswer"
         );
+    }
+
+    #[tokio::test]
+    async fn required_final_answer_tool_emits_synthetic_final_answer() {
+        let (client_raw, mut cfg) = make_config(vec![MockResponse::tool_use(
+            "answer_1",
+            "final_answer",
+            r#"{"text":"Done via tool."}"#,
+        )]);
+        cfg.final_answer_mode = FinalAnswerMode::required_tool();
+        cfg.active_tools = Some(HashSet::new());
+        let client: Arc<dyn Provider> = Arc::clone(&client_raw) as Arc<dyn Provider>;
+
+        let events: Vec<AgentEvent> = agent_loop(
+            client,
+            AgentContext {
+                system_prompt: None,
+                messages: vec![],
+            },
+            cfg,
+        )
+        .collect()
+        .await;
+
+        let captured = client_raw.captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0]
+                .tools()
+                .iter()
+                .any(|tool| tool.name == "final_answer"),
+            "built-in final_answer tool should be available even when active_tools is empty"
+        );
+        drop(captured);
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::FinalAnswer { text, .. } if text == "Done via tool."
+            )
+        }));
+
+        let turn_end = events
+            .iter()
+            .find(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+            .expect("missing TurnEnd");
+        if let AgentEvent::TurnEnd { message, .. } = turn_end {
+            assert_eq!(message.kind, AssistantMessageKind::FinalAnswer);
+            assert_eq!(message.text_content(), "Done via tool.");
+        }
+
+        let agent_end = events
+            .iter()
+            .find(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+            .expect("missing AgentEnd");
+        if let AgentEvent::AgentEnd { new_messages } = agent_end {
+            assert!(new_messages.iter().any(|message| matches!(
+                message,
+                AgentMessage::Assistant(assistant)
+                    if assistant.kind == AssistantMessageKind::FinalAnswer
+                        && assistant.text_content() == "Done via tool."
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn required_final_answer_tool_rejects_plain_terminal_text() {
+        let (client, mut cfg) = make_config(vec![MockResponse::text("plain answer")]);
+        cfg.final_answer_mode = FinalAnswerMode::required_tool();
+
+        let events: Vec<AgentEvent> = agent_loop(
+            Arc::clone(&client) as Arc<dyn Provider>,
+            AgentContext {
+                system_prompt: None,
+                messages: vec![],
+            },
+            cfg,
+        )
+        .collect()
+        .await;
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Progress { text, .. } if text == "plain answer"
+            )),
+            "plain text should be progress under a strict final-answer tool contract"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::FinalAnswer { .. })),
+            "strict final-answer tool contract should not accept plain text as final"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(AgentError::Internal(message))
+                if message.contains("required") && message.contains("final_answer")
+        )));
+    }
+
+    #[tokio::test]
+    async fn final_answer_tool_fallback_preserves_plain_text_final_answer() {
+        let (client, mut cfg) = make_config(vec![MockResponse::text("plain answer")]);
+        cfg.final_answer_mode = FinalAnswerMode::tool_with_text_fallback();
+
+        let events: Vec<AgentEvent> = agent_loop(
+            Arc::clone(&client) as Arc<dyn Provider>,
+            AgentContext {
+                system_prompt: None,
+                messages: vec![],
+            },
+            cfg,
+        )
+        .collect()
+        .await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::FinalAnswer { text, .. } if text == "plain answer"
+        )));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Error(AgentError::Internal(message))
+                    if message.contains("final-answer tool")
+            )),
+            "fallback mode should not error when the model answers with plain text"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_answer_tool_name_conflict_errors_before_provider_call() {
+        let (client, mut cfg) = make_config(vec![MockResponse::text("unused")]);
+        cfg.tools = vec![Arc::new(NamedTool("final_answer"))];
+        cfg.final_answer_mode = FinalAnswerMode::required_tool();
+
+        let events: Vec<AgentEvent> = agent_loop(
+            Arc::clone(&client) as Arc<dyn Provider>,
+            AgentContext {
+                system_prompt: None,
+                messages: vec![],
+            },
+            cfg,
+        )
+        .collect()
+        .await;
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(AgentError::Internal(message))
+                if message.contains("conflicts")
+                    && message.contains("final_answer")
+        )));
     }
 
     #[tokio::test]

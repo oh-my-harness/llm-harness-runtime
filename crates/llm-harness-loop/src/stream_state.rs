@@ -13,6 +13,7 @@ pub(crate) struct StreamingState {
     pub turn_id: String,
     /// Model name from the provider.
     pub model: String,
+    terminal_text_classification: TerminalTextClassification,
     text_blocks: HashMap<usize, String>,
     reasoning_blocks: HashMap<usize, String>,
     reasoning_signatures: HashMap<usize, String>,
@@ -27,12 +28,23 @@ enum BlockKind {
     Tool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalTextClassification {
+    FinalAnswer,
+    Progress,
+}
+
 impl StreamingState {
-    pub(crate) fn new(model: String, turn_id: String) -> Self {
+    pub(crate) fn new_with_terminal_text_classification(
+        model: String,
+        turn_id: String,
+        terminal_text_classification: TerminalTextClassification,
+    ) -> Self {
         Self {
             message_id: Uuid::now_v7().to_string(),
             turn_id,
             model,
+            terminal_text_classification,
             text_blocks: Default::default(),
             reasoning_blocks: Default::default(),
             reasoning_signatures: Default::default(),
@@ -138,7 +150,12 @@ impl StreamingState {
                 let kind = if stop_reason == StopReason::ToolUse {
                     AssistantMessageKind::Progress
                 } else {
-                    AssistantMessageKind::FinalAnswer
+                    match self.terminal_text_classification {
+                        TerminalTextClassification::FinalAnswer => {
+                            AssistantMessageKind::FinalAnswer
+                        }
+                        TerminalTextClassification::Progress => AssistantMessageKind::Progress,
+                    }
                 };
                 let message = AssistantMessage {
                     kind,
@@ -260,7 +277,11 @@ mod tests {
     use llm_adapter::types::{StopReason as AdapterStop, Usage};
 
     fn make_state() -> StreamingState {
-        StreamingState::new("test-model".into(), "turn_1".into())
+        StreamingState::new_with_terminal_text_classification(
+            "test-model".into(),
+            "turn_1".into(),
+            TerminalTextClassification::FinalAnswer,
+        )
     }
 
     #[test]

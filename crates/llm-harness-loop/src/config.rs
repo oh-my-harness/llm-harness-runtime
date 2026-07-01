@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::convert::ConvertToLlmHook;
+use crate::final_answer::FinalAnswerMode;
 
 // ── RetryConfig ───────────────────────────────────────────────────────────────
 
@@ -99,6 +100,9 @@ pub struct LoopConfig {
     pub active_tools: Option<HashSet<String>>,
     /// 工具的默认执行模式。
     pub default_execution_mode: ToolExecutionMode,
+    /// Final-answer classification mode. Defaults to the backward-compatible
+    /// heuristic unless callers opt into the built-in final-answer tool.
+    pub final_answer_mode: FinalAnswerMode,
 
     // === Execution environment ===
     /// 工具执行时使用的执行环境。
@@ -148,9 +152,9 @@ mod tests {
     #[test]
     #[cfg(feature = "test-utils")]
     fn loop_config_compiles() {
-        use crate::LoopConfig;
         use crate::convert::DefaultConvertToLlm;
         use crate::test_utils::NoOpEnv;
+        use crate::{FinalAnswerMode, LoopConfig};
         use llm_harness_types::{StreamOptions, ThinkingLevel, ToolExecutionMode};
         use std::sync::Arc;
         use tokio_util::sync::CancellationToken;
@@ -162,6 +166,7 @@ mod tests {
             tools: vec![],
             active_tools: None,
             default_execution_mode: ToolExecutionMode::Parallel,
+            final_answer_mode: FinalAnswerMode::default(),
             env: Arc::new(NoOpEnv),
             abort: CancellationToken::new(),
             stream_options: StreamOptions::default(),

@@ -27,6 +27,10 @@ pub use harness::{
     CompactionStats, FollowUpHandle, HarnessHooks, HarnessState, HarnessToolCallResult,
     IdleWatcherHook,
 };
+pub use llm_harness_loop::{
+    DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior, FinalAnswerMode,
+    FinalAnswerToolConfig,
+};
 pub use plugin::{Plugin, StateProvider};
 pub use session::{
     BuiltContext, InMemorySessionRepo, JsonlSessionRepo, Session, SessionRepo, SessionStorage,
@@ -50,8 +54,9 @@ pub mod prelude {
     pub use crate::{
         Agent, AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AgentOptions, AgentPhase,
         AgentState, BuiltContext, CompactionPreparation, CompactionSettings, CompactionStats,
-        ContextMode, FollowUpHandle, InMemorySessionRepo, JsonlSessionRepo, ModelInfo, Plugin,
-        PromptTemplate, ProviderSelection, Session, SessionRepo, SessionStorage, Skill,
+        ContextMode, DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior, FinalAnswerMode,
+        FinalAnswerToolConfig, FollowUpHandle, InMemorySessionRepo, JsonlSessionRepo, ModelInfo,
+        Plugin, PromptTemplate, ProviderSelection, Session, SessionRepo, SessionStorage, Skill,
         SkillDiagnostic, SourcedSkill, SpawnOptions, StateProvider, SubAgentHandle, SubAgentResult,
         SubAgentSpawner,
     };

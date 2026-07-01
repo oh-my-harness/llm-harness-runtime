@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
 use llm_harness_loop::{
-    DefaultConvertToLlm, LlmClient, LoopConfig, agent_loop, agent_loop_continue,
+    DefaultConvertToLlm, FinalAnswerMode, LlmClient, LoopConfig, agent_loop, agent_loop_continue,
 };
 use llm_harness_types::*;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -44,6 +44,8 @@ pub struct AgentState {
     pub thinking_level: ThinkingLevel,
     /// Active tool list.
     pub tools: Vec<Arc<dyn Tool>>,
+    /// Final-answer classification mode.
+    pub final_answer_mode: FinalAnswerMode,
     /// Full message transcript (persisted across turns).
     pub messages: Vec<AgentMessage>,
     /// System prompt; `None` means no system prompt is set.
@@ -99,6 +101,8 @@ pub struct AgentOptions {
     pub thinking_level: ThinkingLevel,
     /// Initial tools.
     pub tools: Vec<Arc<dyn Tool>>,
+    /// Final-answer classification mode.
+    pub final_answer_mode: FinalAnswerMode,
     /// Initial system prompt.
     pub system_prompt: Option<String>,
 }
@@ -114,6 +118,7 @@ impl AgentOptions {
             model_info: None,
             thinking_level: ThinkingLevel::Off,
             tools: vec![],
+            final_answer_mode: FinalAnswerMode::default(),
             system_prompt: None,
         }
     }
@@ -126,6 +131,12 @@ impl AgentOptions {
     /// Set the execution environment used by tools.
     pub fn with_env(mut self, env: Arc<dyn ExecutionEnv>) -> Self {
         self.env = env;
+        self
+    }
+
+    /// Set the final-answer classification mode.
+    pub fn with_final_answer_mode(mut self, mode: FinalAnswerMode) -> Self {
+        self.final_answer_mode = mode;
         self
     }
 }
@@ -161,6 +172,7 @@ impl Agent {
             model_info: opts.model_info,
             thinking_level: opts.thinking_level,
             tools: opts.tools,
+            final_answer_mode: opts.final_answer_mode,
             messages: vec![],
             system_prompt: opts.system_prompt,
             streaming_message: None,
@@ -245,6 +257,12 @@ impl Agent {
     pub fn set_tools(&self, tools: Vec<Arc<dyn Tool>>) {
         let mut inner = self.inner.lock().unwrap();
         inner.state.tools = tools;
+    }
+
+    /// Change final-answer classification mode; takes effect at the start of the next turn.
+    pub fn set_final_answer_mode(&self, mode: FinalAnswerMode) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.state.final_answer_mode = mode;
     }
 
     /// Set or clear the system prompt; takes effect at the start of the next turn.
@@ -387,6 +405,7 @@ impl Agent {
                 tools: inner.state.tools.clone(),
                 system_prompt: inner.state.system_prompt.clone(),
             };
+            let final_answer_mode = inner.state.final_answer_mode.clone();
             let messages = inner.state.messages.clone();
             let max_tokens = inner.max_tokens;
 
@@ -402,6 +421,7 @@ impl Agent {
                 tools: snapshot.tools,
                 active_tools: None,
                 default_execution_mode: ToolExecutionMode::Parallel,
+                final_answer_mode,
                 env: self.env.clone(),
                 abort,
                 stream_options: StreamOptions::default(),

@@ -9,8 +9,8 @@ use llm_harness_loop::{
     ChatRequest, CompositeAfterProviderResponseHook, CompositeAfterToolCallHook,
     CompositeAfterTurnHook, CompositeBeforeProviderRequestHook, CompositeBeforeRunHook,
     CompositeBeforeToolCallHook, CompositeBeforeTurnHook, CompositeShouldStopHook,
-    CompositeTransformContextHook, ConvertToLlmHook, DefaultConvertToLlm, HookedTool, LlmClient,
-    LlmMessage, LoopConfig, RequestContent, RetryConfig, agent_loop,
+    CompositeTransformContextHook, ConvertToLlmHook, DefaultConvertToLlm, FinalAnswerMode,
+    HookedTool, LlmClient, LlmMessage, LoopConfig, RequestContent, RetryConfig, agent_loop,
 };
 use llm_harness_types::*;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -45,6 +45,8 @@ pub struct HarnessState {
     pub tools: Vec<Arc<dyn Tool>>,
     /// Active tool subset; `None` means all tools are active.
     pub active_tools: Option<HashSet<String>>,
+    /// Final-answer classification mode.
+    pub final_answer_mode: FinalAnswerMode,
     /// System prompt.
     pub system_prompt: Option<String>,
     /// Streaming assistant message snapshot; `None` when not streaming.
@@ -389,6 +391,8 @@ pub struct AgentHarnessOptions {
     pub thinking_level: ThinkingLevel,
     /// Initial tools.
     pub tools: Vec<Arc<dyn Tool>>,
+    /// Final-answer classification mode.
+    pub final_answer_mode: FinalAnswerMode,
     /// Initial system prompt.
     pub system_prompt: Option<String>,
     /// Maximum output tokens per LLM call.
@@ -427,6 +431,7 @@ impl AgentHarnessOptions {
             model_info: None,
             thinking_level: ThinkingLevel::Off,
             tools: vec![],
+            final_answer_mode: FinalAnswerMode::default(),
             system_prompt: None,
             max_tokens: DEFAULT_MAX_TOKENS,
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
@@ -563,6 +568,7 @@ impl AgentHarness {
             thinking_level: opts.thinking_level,
             tools: opts.tools,
             active_tools: None,
+            final_answer_mode: opts.final_answer_mode,
             system_prompt: opts.system_prompt,
             streaming_message: None,
             pending_tool_calls: HashSet::new(),
@@ -851,6 +857,16 @@ impl AgentHarness {
             inner.state.active_tools = active.clone();
         }
         self.emit(AgentHarnessEvent::ActiveToolsUpdate { active });
+        Ok(())
+    }
+
+    /// Update final-answer classification mode; takes effect at the start of
+    /// the next turn.
+    pub async fn set_final_answer_mode(&self, mode: FinalAnswerMode) -> Result<(), HarnessError> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.state.final_answer_mode = mode;
+        }
         Ok(())
     }
 
@@ -1405,7 +1421,7 @@ impl AgentHarness {
         abort: CancellationToken,
     ) -> LoopConfig {
         // ── Snapshot state (lock is held via `inner` until `drop(inner)`) ──
-        let (tools, retry, model, thinking_level, active_tools, max_tokens) = {
+        let (tools, retry, model, thinking_level, active_tools, final_answer_mode, max_tokens) = {
             let inner = self.inner.lock().unwrap();
             let st = &inner.state;
             (
@@ -1414,6 +1430,7 @@ impl AgentHarness {
                 st.model.clone(),
                 st.thinking_level,
                 st.active_tools.clone(),
+                st.final_answer_mode.clone(),
                 inner.max_tokens,
             )
         };
@@ -1470,6 +1487,7 @@ impl AgentHarness {
             tools,
             active_tools,
             default_execution_mode: ToolExecutionMode::Parallel,
+            final_answer_mode,
             env: self.env.clone(),
             abort,
             stream_options: self.stream_options.clone(),
