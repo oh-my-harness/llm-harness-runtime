@@ -74,6 +74,15 @@ pub fn validate_workflow(wf: &Workflow) -> Result<()> {
             anyhow::bail!("validate_workflow: step '{}' has empty prompt", step.id);
         }
     }
+    // 安全阀：限制 step/edge 数量，防止恶意或失控的 workflow 定义。
+    const MAX_STEPS: usize = 1000;
+    const MAX_EDGES: usize = 5000;
+    if wf.steps.len() > MAX_STEPS {
+        anyhow::bail!("validate_workflow: too many steps ({}, max {})", wf.steps.len(), MAX_STEPS);
+    }
+    if wf.edges.len() > MAX_EDGES {
+        anyhow::bail!("validate_workflow: too many edges ({}, max {})", wf.edges.len(), MAX_EDGES);
+    }
     Ok(())
 }
 

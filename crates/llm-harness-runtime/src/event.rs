@@ -107,9 +107,10 @@ impl Tool for WaitForExternalEventTool {
          事件到达后作为结果返回。超时返回提示文本。"
     }
 
-    fn parameters_schema(&self) -> &serde_json::Value {
-        static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
-        S.get_or_init(wait_for_event_schema)
+    fn parameters_schema(&self) -> &'static serde_json::Value {
+        static S: std::sync::LazyLock<serde_json::Value> =
+            std::sync::LazyLock::new(wait_for_event_schema);
+        &S
     }
 
     fn execution_mode(&self) -> ToolExecutionMode {
@@ -123,11 +124,11 @@ impl Tool for WaitForExternalEventTool {
     ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
         Box::pin(async move {
             // 1. 落盘等待描述符（若注入了 task_store）。
-            if let Some(store) = &self.task_store {
-                if let Err(e) = store.save_event_wait(&self.task_id, &self.wait_descriptor).await {
-                    // 落盘失败不阻断 tool 本身的等待语义（最坏情况是重启后无法恢复该次等待）。
-                    eprintln!("[warn] failed to save event_wait descriptor: {e}");
-                }
+            if let Some(store) = &self.task_store
+                && let Err(e) = store.save_event_wait(&self.task_id, &self.wait_descriptor).await
+            {
+                // 落盘失败不阻断 tool 本身的等待语义（最坏情况是重启后无法恢复该次等待）。
+                eprintln!("[warn] failed to save event_wait descriptor: {e}");
             }
 
             // 2. select! 等待：abort / event / timeout
@@ -160,10 +161,10 @@ impl Tool for WaitForExternalEventTool {
 
             // 3. 清理等待状态（正常返回或 abort 后）。
             //    落盘失败不阻塞（同上）。
-            if let Some(store) = &self.task_store {
-                if let Err(e) = store.clear_event_wait(&self.task_id).await {
-                    eprintln!("[warn] failed to clear event_wait descriptor: {e}");
-                }
+            if let Some(store) = &self.task_store
+                && let Err(e) = store.clear_event_wait(&self.task_id).await
+            {
+                eprintln!("[warn] failed to clear event_wait descriptor: {e}");
             }
 
             result

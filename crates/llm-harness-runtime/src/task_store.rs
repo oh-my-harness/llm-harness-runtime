@@ -102,8 +102,27 @@ impl JsonlTaskStore {
     }
 
     /// 获取（或创建）指定 task 的目录。
-    fn task_dir(&self, task_id: &TaskId) -> PathBuf {
-        self.base_dir.join(&task_id.0)
+    /// 校验 task_id 不含路径分隔符或 `..`，防止路径遍历攻击。
+    fn task_dir(&self, task_id: &TaskId) -> Result<PathBuf> {
+        Self::validate_task_id(task_id)?;
+        Ok(self.base_dir.join(&task_id.0))
+    }
+
+    /// 校验 task_id.0 不含路径分隔符、`..` 或空字节。
+    fn validate_task_id(task_id: &TaskId) -> Result<()> {
+        if task_id.0.is_empty() {
+            anyhow::bail!("invalid task_id: empty");
+        }
+        if task_id.0.contains('/') || task_id.0.contains('\\') {
+            anyhow::bail!("invalid task_id: contains path separator");
+        }
+        if task_id.0.contains("..") {
+            anyhow::bail!("invalid task_id: contains path traversal");
+        }
+        if task_id.0.contains('\0') {
+            anyhow::bail!("invalid task_id: contains null byte");
+        }
+        Ok(())
     }
 
     /// 获取该 task 专属的 mutex（串行化写）。
@@ -133,8 +152,9 @@ impl TaskStore for JsonlTaskStore {
         &self,
         task_id: &TaskId,
     ) -> BoxFuture<'_, Result<Option<WorkflowState>>> {
-        let path = self.task_dir(task_id).join("workflow.json");
+        let task_id = task_id.clone();
         Box::pin(async move {
+            let path = self.task_dir(&task_id)?.join("workflow.json");
             match tokio::fs::read(&path).await {
                 Ok(bytes) => {
                     let state: WorkflowState = serde_json::from_slice(&bytes)?;
@@ -151,11 +171,12 @@ impl TaskStore for JsonlTaskStore {
         task_id: &TaskId,
         state: &WorkflowState,
     ) -> BoxFuture<'_, Result<()>> {
-        let path = self.task_dir(task_id).join("workflow.json");
-        let key = task_id.0.clone();
+        let task_id = task_id.clone();
         let state = state.clone();
         Box::pin(async move {
-            let content = serde_json::to_string_pretty(&state)?;
+            let path = self.task_dir(&task_id)?.join("workflow.json");
+            let key = task_id.0.clone();
+            let content = serde_json::to_string(&state)?;
             let lock = self.task_lock(key).await;
             let _g = lock.lock().await;
             Self::atomic_write(&path, &content).await
@@ -163,8 +184,9 @@ impl TaskStore for JsonlTaskStore {
     }
 
     fn load_workflow(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Option<Workflow>>> {
-        let path = self.task_dir(task_id).join("plan.json");
+        let task_id = task_id.clone();
         Box::pin(async move {
+            let path = self.task_dir(&task_id)?.join("plan.json");
             match tokio::fs::read(&path).await {
                 Ok(bytes) => {
                     let wf: Workflow = serde_json::from_slice(&bytes)?;
@@ -176,11 +198,12 @@ impl TaskStore for JsonlTaskStore {
         })
     }
     fn save_workflow(&self, task_id: &TaskId, workflow: &Workflow) -> BoxFuture<'_, Result<()>> {
-        let path = self.task_dir(task_id).join("plan.json");
-        let key = task_id.0.clone();
+        let task_id = task_id.clone();
         let workflow = workflow.clone();
         Box::pin(async move {
-            let content = serde_json::to_string_pretty(&workflow)?;
+            let path = self.task_dir(&task_id)?.join("plan.json");
+            let key = task_id.0.clone();
+            let content = serde_json::to_string(&workflow)?;
             let lock = self.task_lock(key).await;
             let _g = lock.lock().await;
             Self::atomic_write(&path, &content).await
@@ -188,8 +211,9 @@ impl TaskStore for JsonlTaskStore {
     }
 
     fn list_checkpoints(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Vec<Checkpoint>>> {
-        let path = self.task_dir(task_id).join("checkpoints.jsonl");
+        let task_id = task_id.clone();
         Box::pin(async move {
+            let path = self.task_dir(&task_id)?.join("checkpoints.jsonl");
             match tokio::fs::read_to_string(&path).await {
                 Ok(content) => {
                     let mut cps = Vec::new();
@@ -212,10 +236,11 @@ impl TaskStore for JsonlTaskStore {
         task_id: &TaskId,
         checkpoint: &Checkpoint,
     ) -> BoxFuture<'_, Result<()>> {
-        let path = self.task_dir(task_id).join("checkpoints.jsonl");
-        let key = task_id.0.clone();
+        let task_id = task_id.clone();
         let checkpoint = checkpoint.clone();
         Box::pin(async move {
+            let path = self.task_dir(&task_id)?.join("checkpoints.jsonl");
+            let key = task_id.0.clone();
             let line = serde_json::to_string(&checkpoint)?;
             let lock = self.task_lock(key).await;
             let _g = lock.lock().await;
@@ -238,8 +263,9 @@ impl TaskStore for JsonlTaskStore {
     }
 
     fn load_event_wait(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Option<EventWaitRecord>>> {
-        let path = self.task_dir(task_id).join("event_wait.json");
+        let task_id = task_id.clone();
         Box::pin(async move {
+            let path = self.task_dir(&task_id)?.join("event_wait.json");
             match tokio::fs::read(&path).await {
                 Ok(bytes) => {
                     let rec: EventWaitRecord = serde_json::from_slice(&bytes)?;
@@ -251,15 +277,16 @@ impl TaskStore for JsonlTaskStore {
         })
     }
     fn save_event_wait(&self, task_id: &TaskId, descriptor: &Value) -> BoxFuture<'_, Result<()>> {
-        let path = self.task_dir(task_id).join("event_wait.json");
-        let key = task_id.0.clone();
+        let task_id = task_id.clone();
         let descriptor = descriptor.clone();
         Box::pin(async move {
+            let path = self.task_dir(&task_id)?.join("event_wait.json");
+            let key = task_id.0.clone();
             let rec = EventWaitRecord {
                 descriptor,
                 saved_at: Utc::now(),
             };
-            let content = serde_json::to_string_pretty(&rec)?;
+            let content = serde_json::to_string(&rec)?;
             let lock = self.task_lock(key).await;
             let _g = lock.lock().await;
             Self::atomic_write(&path, &content).await
@@ -267,9 +294,10 @@ impl TaskStore for JsonlTaskStore {
     }
 
     fn clear_event_wait(&self, task_id: &TaskId) -> BoxFuture<'_, Result<()>> {
-        let path = self.task_dir(task_id).join("event_wait.json");
-        let key = task_id.0.clone();
+        let task_id = task_id.clone();
         Box::pin(async move {
+            let path = self.task_dir(&task_id)?.join("event_wait.json");
+            let key = task_id.0.clone();
             let lock = self.task_lock(key).await;
             let _g = lock.lock().await;
             match tokio::fs::remove_file(&path).await {
@@ -280,9 +308,10 @@ impl TaskStore for JsonlTaskStore {
         })
     }
     fn delete(&self, task_id: &TaskId) -> BoxFuture<'_, Result<()>> {
-        let dir = self.task_dir(task_id);
-        let key = task_id.0.clone();
+        let task_id = task_id.clone();
         Box::pin(async move {
+            let dir = self.task_dir(&task_id)?;
+            let key = task_id.0.clone();
             let lock = self.task_lock(key).await;
             let _g = lock.lock().await;
             match tokio::fs::remove_dir_all(&dir).await {

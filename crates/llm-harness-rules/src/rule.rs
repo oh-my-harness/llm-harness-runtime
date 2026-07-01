@@ -40,3 +40,10 @@ impl Rule {
         }
     }
 }
+
+impl Rule {
+    /// 创建一条规则。
+    pub fn new(tool_name: impl Into<String>, predicate: Box<dyn Predicate>, on_match: Decision) -> Self {
+        Self { tool_name: tool_name.into(), predicate, on_match }
+    }
+}

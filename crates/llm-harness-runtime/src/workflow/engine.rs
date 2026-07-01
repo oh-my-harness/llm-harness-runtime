@@ -50,6 +50,9 @@ const DEFAULT_MAX_RETRIES: usize = 5;
 /// SubmitStepResultTool 提交的 JSON payload 大小上限（bytes）。
 const SUBMIT_RESULT_MAX_BYTES: usize = 256 * 1024;
 
+/// SyncSpawnAgentTool prompt 长度上限（bytes）。
+const SYNC_SPAWN_MAX_PROMPT_BYTES: usize = 1024 * 1024;
+
 // ── SyncSpawnAgentTool ─────────────────────────────────────────────────────
 
 /// 流程场景专用的同步 spawn tool。走 `spawner.spawn()`（非 `spawn_async`）。
@@ -102,12 +105,22 @@ impl Tool for SyncSpawnAgentTool {
         Box::pin(async move {
             let prompt = args.get("prompt").and_then(|v| v.as_str())
                 .ok_or_else(|| ToolError::Execution("missing prompt".into()))?.to_string();
+            if prompt.len() > SYNC_SPAWN_MAX_PROMPT_BYTES {
+                return Err(ToolError::Execution(format!(
+                    "spawn_agent: prompt exceeds {} bytes",
+                    SYNC_SPAWN_MAX_PROMPT_BYTES
+                )));
+            }
             let context = args.get("context").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
                 .map(|s| ContextMode::Inject(s.to_string())).unwrap_or(ContextMode::None);
             let provider = args.get("provider").and_then(|v| v.as_str())
                 .map(|s| ProviderSelection::Alias(s.to_string())).unwrap_or(ProviderSelection::Inherit);
             // wait 参数被忽略（schema 不含，但 LLM 可能传）
             let opts = SpawnOptions { prompt, provider, cwd: None, context };
+            // spawn 前检查 abort：若已 cancelled 则不浪费 spawn。
+            if self.step_abort.is_cancelled() {
+                return Err(ToolError::Aborted);
+            }
             let handle = self.spawner.spawn(opts).await
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
             // 取出 abort token：select! 的 cancel arm 不持 handle 所有权。
@@ -226,6 +239,12 @@ impl Tool for SubmitStepResultTool {
         let tx = self.tx.clone();
         Box::pin(async move {
             let result = args.get("result").cloned().unwrap_or(Value::Null);
+            // 结构校验：result 必须是 object（结构化结果）。
+            if !result.is_object() {
+                return Err(ToolError::Execution(
+                    "submit_step_result: 'result' must be a JSON object".into(),
+                ));
+            }
             // 大小限制：防止 LLM 注入巨大 JSON 撑爆内存/落盘。
             let serialized = serde_json::to_string(&result)
                 .map_err(|e| ToolError::Execution(format!("invalid JSON: {e}")))?;
@@ -286,8 +305,12 @@ pub struct WorkflowEngine {
     judge: Arc<dyn StepTransitionJudge>,
     /// step_id → plugin 工厂闭包。引擎每步据此选 plugin。
     step_plugin_factories: HashMap<StepId, Box<dyn Fn() -> Box<dyn Plugin> + Send + Sync>>,
+    /// 缓存：step_id → allowed_tools。构造时从 workflow 提取，避免每步重建。
+    step_tools_cache: HashMap<StepId, Vec<String>>,
     /// 额外 tool（对 new/new_free_task 路径）。run() 内部构造每步 harness 时注册。
     extra_tools: Vec<Arc<dyn Tool>>,
+    /// 额外 hooks（对 new/new_free_task 路径）。run_step 内部构造每步 harness 时注册。
+    extra_hooks: HarnessHooks,
     task_store: Option<Arc<dyn TaskStore>>,
     /// task 标识。由引擎内部生成（uuid）。
     task_id: TaskId,
@@ -298,6 +321,8 @@ pub struct WorkflowEngine {
     checkpoints: Mutex<Vec<Checkpoint>>,
     /// pause 请求标志。pause() 设 true，run() 在步边界检查并消费。
     pause_requested: AtomicBool,
+    /// pause 请求的原因。pause() 设值，run() 在步边界消费。用 std Mutex（pause 是同步方法）。
+    pause_reason: std::sync::Mutex<Option<String>>,
     /// 当前步的 abort token（cancel() 用）。
     current_abort: Mutex<Option<CancellationToken>>,
     /// 引擎事件广播。subscribe() 返回 Receiver。
@@ -308,6 +333,9 @@ pub struct WorkflowEngine {
     max_retries: usize,
     /// run() 重入守卫。防止并发 run() 覆盖写。
     running: AtomicBool,
+    /// 规划此 workflow 的 task ID。由 with_planned_by 设置，
+    /// run() 启动时写入 workflow_state。避免 blocking_lock。
+    planned_by: Option<TaskId>,
 }
 
 impl WorkflowEngine {
@@ -363,7 +391,12 @@ impl WorkflowEngine {
         validate_workflow(&workflow)?;
         let saved_state = store.load_workflow_state(&task_id).await?;
         let state = saved_state.unwrap_or_else(|| WorkflowState::new(workflow.entry_step.clone()));
-        Ok(Self::from_parts_with_state(workflow, config, judge, Some(store), task_id, state))
+        let engine = Self::from_parts_with_state(workflow, config, judge, Some(store.clone()), task_id, state);
+        // 从 store 重载 checkpoints 到内存缓存。
+        if let Ok(cps) = store.list_checkpoints(&engine.task_id).await {
+            *engine.checkpoints.lock().await = cps;
+        }
+        Ok(engine)
     }
 
     /// 公共构造：从已校验的 workflow + config 组装 engine（new 路径，新 task_id）。
@@ -389,22 +422,29 @@ impl WorkflowEngine {
         state: WorkflowState,
     ) -> Self {
         let (event_tx, _) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let step_tools_cache: HashMap<StepId, Vec<String>> = workflow.steps.iter()
+            .map(|s| (s.id.clone(), s.allowed_tools.clone()))
+            .collect();
         Self {
             workflow,
             config,
             judge,
             step_plugin_factories: HashMap::new(),
+            step_tools_cache,
             extra_tools: vec![],
+            extra_hooks: HarnessHooks::none(),
             task_store,
             task_id,
             workflow_state: Arc::new(Mutex::new(state)),
             checkpoints: Mutex::new(vec![]),
             pause_requested: AtomicBool::new(false),
+            pause_reason: std::sync::Mutex::new(None),
             current_abort: Mutex::new(None),
             event_tx,
             max_steps: DEFAULT_MAX_STEPS,
             max_retries: DEFAULT_MAX_RETRIES,
             running: AtomicBool::new(false),
+            planned_by: None,
         }
     }
 
@@ -412,11 +452,20 @@ impl WorkflowEngine {
         &self.task_id
     }
 
+    #[must_use]
     pub fn with_tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.extra_tools.push(tool);
         self
     }
 
+    /// 注入额外 hooks。每步构造 harness 时，这些 hooks 会经 HookPlugin 桥接到 builder。
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: HarnessHooks) -> Self {
+        self.extra_hooks = hooks;
+        self
+    }
+
+    #[must_use]
     pub fn with_step_plugin(
         mut self,
         step_id: impl Into<String>,
@@ -426,31 +475,30 @@ impl WorkflowEngine {
         self
     }
 
+    #[must_use]
     pub fn with_task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
         self.task_store = Some(store);
         self
     }
 
-    /// 设置步骤数上限。默认 `DEFAULT_MAX_STEPS`，step_history.len() 超限 → Failed。
+    #[must_use]
     pub fn with_max_steps(mut self, max: usize) -> Self {
         self.max_steps = max;
         self
     }
 
     /// 设置 Retry 上限。默认 `DEFAULT_MAX_RETRIES`，连续 Retry 超限 → Failed。
+    #[must_use]
     pub fn with_max_retries(mut self, max: usize) -> Self {
         self.max_retries = max;
         self
     }
 
     /// 设置 planned_by。LLM 两阶段场景下记录 plan_task_id。
-    /// ⚠ 同步方法：用 blocking_lock。仅在 run() 启动前调用（构造期不会死锁）。
-    /// 在 async 上下文内调用会 panic（tokio runtime 不允许 blocking_lock）。
-    pub fn with_planned_by(self, plan_task_id: TaskId) -> Self {
-        {
-            let mut state = self.workflow_state.blocking_lock();
-            state.planned_by = Some(plan_task_id);
-        }
+    /// 存为 struct 字段，run() 启动时异步写入 workflow_state。避免 blocking_lock。
+    #[must_use]
+    pub fn with_planned_by(mut self, plan_task_id: TaskId) -> Self {
+        self.planned_by = Some(plan_task_id);
         self
     }
 
@@ -462,17 +510,45 @@ impl WorkflowEngine {
         }
 
         // 1. 翻转 status → Running，落盘。
+        //    允许 Running → Running：崩溃恢复场景下 status 仍为 Running（已落盘），
+        //    重启后需从这里恢复。回退 current_step 到最后一个 completed step。
         {
             let mut state = self.workflow_state.lock().await;
-            if state.status == WorkflowStatus::Idle || state.status == WorkflowStatus::Paused {
-                state.status = WorkflowStatus::Running;
-                state.reason = None;
-                if state.started_at.is_none() {
-                    state.started_at = Some(chrono::Utc::now());
+            // 将 planned_by（struct 字段）写入 state（若有）。
+            if let Some(plan_id) = &self.planned_by {
+                state.planned_by = Some(plan_id.clone());
+            }
+            match state.status {
+                WorkflowStatus::Idle | WorkflowStatus::Paused => {
+                    state.status = WorkflowStatus::Running;
+                    state.reason = None;
+                    if state.started_at.is_none() {
+                        state.started_at = Some(chrono::Utc::now());
+                    }
                 }
-            } else {
-                self.running.store(false, std::sync::atomic::Ordering::SeqCst);
-                anyhow::bail!("run: task is not Idle/Paused (status={:?})", state.status);
+                WorkflowStatus::Running => {
+                    // 崩溃恢复：status 仍为 Running（上次进程异常退出未清理）。
+                    // 回退 current_step 到最后一个有 result 的 step（已完成步），
+                    // 或保持 entry_step（无已完成步时从头开始）。
+                    let last_completed = state.step_history.iter().rev()
+                        .find(|r| r.result.is_some())
+                        .map(|r| r.step_id.clone());
+                    if let Some(last_step) = last_completed {
+                        // 找到 last_completed 之后的 To 跳转目标（即崩溃时正在执行的步）。
+                        let next = state.step_history.iter().rev()
+                        .find(|r| r.step_id == last_step && matches!(r.transition, Transition::To(_)))
+                            .and_then(|r| {
+                                if let Transition::To(ref t) = r.transition { Some(t.clone()) } else { None }
+                            });
+                        if let Some(next) = next {
+                            state.current_step = next;
+                        }
+                    }
+                }
+                _ => {
+                    self.running.store(false, std::sync::atomic::Ordering::SeqCst);
+                    anyhow::bail!("run: task is not Idle/Paused/Running (status={:?})", state.status);
+                }
             }
             // 持锁期间只构造快照，drop 锁后再做文件 I/O。
             let snapshot = state.clone();
@@ -484,19 +560,26 @@ impl WorkflowEngine {
             store.save_workflow(&self.task_id, &self.workflow).await?;
         }
 
-        let result = self.run_loop().await;
+        // RAII 守卫：无论 run_loop 正常返回、Err 还是 panic，都清除重入标志。
+        struct RunningGuard<'a>(&'a AtomicBool);
+        impl Drop for RunningGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _guard = RunningGuard(&self.running);
 
-        // 无论成功失败，清除重入守卫。
-        self.running.store(false, std::sync::atomic::Ordering::SeqCst);
-
-        result
+        self.run_loop().await
     }
 
     /// run() 的主循环。拆出以降低 run() 圈复杂度。
     async fn run_loop(&self) -> Result<TaskResult> {
         loop {
-            // 2. 取 current_step。
-            let current_step_id = self.workflow_state.lock().await.current_step.clone();
+            // 2. 取 current_step + 检查 max_steps（合并为一次锁获取）。
+            let (current_step_id, history_len) = {
+                let state = self.workflow_state.lock().await;
+                (state.current_step.clone(), state.step_history.len())
+            };
             let step = self
                 .workflow
                 .steps
@@ -506,13 +589,10 @@ impl WorkflowEngine {
                 .clone();
 
             // max_steps 安全阀。
-            {
-                let history_len = self.workflow_state.lock().await.step_history.len();
-                if history_len >= self.max_steps {
-                    return self.fail_task(
-                        format!("max_steps ({}) exceeded", self.max_steps),
-                    ).await;
-                }
+            if history_len >= self.max_steps {
+                return self.fail_task(
+                    format!("max_steps ({}) exceeded", self.max_steps),
+                ).await;
             }
 
             let _ = self.event_tx.send(WorkflowEvent::StepStarted {
@@ -545,9 +625,8 @@ impl WorkflowEngine {
             // 6. 检查 cancel 守卫：cancel() 可能在 run_step 期间抢先置 Cancelled。
             //    apply_transition 已跳过 record 推入，此处确认并返回。
             {
-                let status = self.workflow_state.lock().await.status.clone();
-                if status == WorkflowStatus::Cancelled {
-                    let state = self.workflow_state.lock().await;
+                let state = self.workflow_state.lock().await;
+                if state.status == WorkflowStatus::Cancelled {
                     return Ok(state.result.clone().unwrap_or_else(|| TaskResult {
                         cost: aggregate_cost(&state.step_history),
                         turns: count_executed_turns(&state.step_history),
@@ -558,14 +637,18 @@ impl WorkflowEngine {
 
             // 7. 检查 pause_requested。
             if self.pause_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                let reason = self.pause_reason.lock()
+                    .map(|r| r.clone().unwrap_or_else(|| "pause requested".into()))
+                    .unwrap_or_else(|_| "pause requested".into());
                 let mut state = self.workflow_state.lock().await;
                 state.status = WorkflowStatus::Paused;
-                state.reason = Some("pause requested".into());
+                state.reason = Some(reason.clone());
                 let snapshot = state.clone();
                 drop(state);
                 self.persist_state(&snapshot).await?;
                 self.pause_requested.store(false, std::sync::atomic::Ordering::SeqCst);
-                let _ = self.event_tx.send(WorkflowEvent::Paused { reason: "pause requested".into() });
+                if let Ok(mut r) = self.pause_reason.lock() { *r = None; }
+                let _ = self.event_tx.send(WorkflowEvent::Paused { reason });
                 anyhow::bail!("task paused at step boundary");
             }
 
@@ -683,15 +766,14 @@ impl WorkflowEngine {
         //    gate 的 active_tools = step.allowed_tools ∪ injected_tool_names，
         //    确保 submit_step_result 等内置 tool 不被门禁滤掉。
         let state_arc = self.workflow_state.clone();
-        let step_tools: HashMap<StepId, Vec<String>> = self.workflow.steps.iter()
-            .map(|s| (s.id.clone(), s.allowed_tools.clone()))
-            .collect();
+        let step_tools: HashMap<StepId, Vec<String>> = self.step_tools_cache.clone();
+        let injected_vec: Vec<String> = injected_tool_names.iter().cloned().collect();
         let gate_hook: Arc<dyn llm_harness_types::PrepareNextTurnHook> =
             Arc::new(crate::workflow::gate::WorkflowGateHook::new(
                 state_arc, step_tools, injected_tool_names,
             ));
-        let approval_hook = crate::workflow::gate::build_gate_approval_hook(&step.allowed_tools);
-        let mut hook_state = HarnessHooks::none();
+        let approval_hook = crate::workflow::gate::build_gate_approval_hook(&step.allowed_tools, &injected_vec);
+        let mut hook_state = self.extra_hooks.clone();
         hook_state.prepare_next_turn.push(gate_hook);
         hook_state.before_tool_call.push(approval_hook);
         builder = builder.install(&HookPlugin { hooks: hook_state });
@@ -700,7 +782,7 @@ impl WorkflowEngine {
         let harness = builder
             .build_with_session(env, Session::new(storage))
             .map_err(|e: HarnessBuildError| anyhow::anyhow!("build harness: {e}"))?;
-        harness.set_abort_token(step_abort);
+        harness.set_abort_token(step_abort.clone());
 
         // g. step 指令。步骤间上下文注入：在 step.prompt 前拼接 step_history 摘要。
         let prompt_text = {
@@ -722,15 +804,27 @@ impl WorkflowEngine {
         let mut output = String::new();
         let mut tool_calls_count = 0u32;
         let mut settled = false;
-        while let Ok(event) = rx.recv().await {
-            match event.as_ref() {
-                AgentHarnessEvent::Agent(AgentEvent::TextDelta { text, .. }) => output.push_str(text),
-                AgentHarnessEvent::ToolCallStart { .. } => tool_calls_count += 1,
-                AgentHarnessEvent::Settled | AgentHarnessEvent::Aborted => {
-                    settled = true;
+        loop {
+            tokio::select! {
+                biased;
+                _ = step_abort.cancelled() => {
+                    // abort：收到的部分 output 保留，但不标记 settled。
                     break;
                 }
-                _ => {}
+                event = rx.recv() => {
+                    match event {
+                        Ok(event) => match event.as_ref() {
+                            AgentHarnessEvent::Agent(AgentEvent::TextDelta { text, .. }) => output.push_str(text),
+                            AgentHarnessEvent::ToolCallStart { .. } => tool_calls_count += 1,
+                            AgentHarnessEvent::Settled | AgentHarnessEvent::Aborted => {
+                                settled = true;
+                                break;
+                            }
+                            _ => {}
+                        },
+                        Err(_) => break, // channel 关闭
+                    }
+                }
             }
         }
         if !settled {
@@ -826,16 +920,14 @@ impl WorkflowEngine {
             }
             Transition::Retry => {
                 // max_retries 安全阀。统计当前步连续 Retry 次数。
-                // 语义：max_retries=5 允许 5 次 Retry（第 6 次触发 Failed）。
-                // take_while 含刚 push 的这条，故 count > max_retries 时超限。
+                // 语义：max_retries=N 允许 N 次 Retry。count 含刚 push 的这条，
+                // 故 count > max_retries 时超限（第 N+1 次触发 Failed）。
                 let retry_count = state
                     .step_history
                     .iter()
                     .rev()
                     .take_while(|r| r.step_id == step.id && matches!(r.transition, Transition::Retry))
                     .count();
-                // 语义：max_retries=N 允许 N 次 Retry。count 含刚 push 的这条，
-                // 故 count > max_retries 时超限（第 N+1 次触发 Failed）。
                 if retry_count > self.max_retries {
                     let msg = format!("max_retries ({}) exceeded for step '{}'", self.max_retries, step.id);
                     state.status = WorkflowStatus::Failed;
@@ -881,8 +973,11 @@ impl WorkflowEngine {
     }
 
     /// 非阻塞：设 pause_requested 标志即返回。run() 在步边界检查并消费。
-    pub fn pause(&self, _reason: &str) -> Result<()> {
+    pub fn pause(&self, reason: &str) -> Result<()> {
         self.pause_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut r) = self.pause_reason.lock() {
+            *r = Some(reason.to_string());
+        }
         Ok(())
     }
 
@@ -905,26 +1000,33 @@ impl WorkflowEngine {
     /// cancel 后当前步的 StepRecord 记为 { result: None, transition: Abort }——
     /// partial 结果不保留（step agent 被 abort，输出不完整无意义）。
     /// step_history 里有这条记录（审计链完整），但 result: None 标明无完整结果。
-    /// 返工重跑时从 current_step 重新开始。
-    ///
-    /// 竞态处理：cancel() 推 record + 置 Cancelled 后，run() 的 apply_transition
-    /// 会检测到 status==Cancelled 守卫，跳过推入第二条 record（避免双写），
-    /// run_loop 检测到 Cancelled 后直接返回，不覆盖为 Succeeded。
+    /// 竞态处理：cancel() 与 apply_transition() 可能交错执行。
+    /// 若 apply_transition 已为 current_step 推入 record（result: Some），
+    /// cancel 不再推入第二条 record——审计链已有该步执行记录，
+    /// cancel 只需置 Cancelled 状态 + reason，避免双记录导致 cost 双计。
+    /// 若 apply_transition 尚未执行（record 最后一条不是 current_step），
+    /// cancel 推入 { result: None, transition: Abort } 记录保证审计链完整。
     pub async fn cancel(&self, reason: &str) -> Result<()> {
         if let Some(token) = self.current_abort.lock().await.take() {
             token.cancel();
         }
         let mut state = self.workflow_state.lock().await;
-        // 记录 cancel 的 StepRecord（result: None，partial 不保留）。
         let now = chrono::Utc::now();
         let cancelled_step_id = state.current_step.clone();
-        state.step_history.push(StepRecord {
-            step_id: cancelled_step_id,
-            started_at: now,
-            ended_at: now,
-            result: None,
-            transition: Transition::Abort { reason: format!("cancelled: {}", reason) },
+
+        // 检查 apply_transition 是否已为当前步推入 record。
+        let already_recorded = state.step_history.last().is_some_and(|r| {
+            r.step_id == cancelled_step_id && r.result.is_some()
         });
+        if !already_recorded {
+            state.step_history.push(StepRecord {
+                step_id: cancelled_step_id,
+                started_at: now,
+                ended_at: now,
+                result: None,
+                transition: Transition::Abort { reason: format!("cancelled: {}", reason) },
+            });
+        }
         state.status = WorkflowStatus::Cancelled;
         state.reason = Some(reason.to_string());
         state.ended_at = Some(now);
@@ -936,18 +1038,22 @@ impl WorkflowEngine {
     }
 
     pub async fn checkpoint(&self, description: &str, payload: Value) -> Result<()> {
-        let mut cps = self.checkpoints.lock().await;
-        let seq = cps.len();
-        let cp = Checkpoint {
-            seq,
-            saved_at: chrono::Utc::now(),
-            description: description.to_string(),
-            payload,
+        let cp = {
+            let mut cps = self.checkpoints.lock().await;
+            let seq = cps.len();
+            let cp = Checkpoint {
+                seq,
+                saved_at: chrono::Utc::now(),
+                description: description.to_string(),
+                payload,
+            };
+            cps.push(cp.clone());
+            cp
         };
+        // I/O 在锁外执行。
         if let Some(store) = &self.task_store {
             store.save_checkpoint(&self.task_id, &cp).await?;
         }
-        cps.push(cp);
         Ok(())
     }
 
@@ -998,8 +1104,17 @@ struct HookPlugin {
 impl Plugin for HookPlugin {
     fn name(&self) -> &str { "workflow-hook-bridge" }
     fn register_hooks(&self, target: &mut HarnessHooks) {
+        target.before_run.extend(self.hooks.before_run.iter().cloned());
+        target.before_turn.extend(self.hooks.before_turn.iter().cloned());
+        target.after_turn.extend(self.hooks.after_turn.iter().cloned());
         target.before_tool_call.extend(self.hooks.before_tool_call.iter().cloned());
+        target.after_tool_call.extend(self.hooks.after_tool_call.iter().cloned());
+        target.transform_context.extend(self.hooks.transform_context.iter().cloned());
         target.prepare_next_turn.extend(self.hooks.prepare_next_turn.iter().cloned());
+        target.should_stop.extend(self.hooks.should_stop.iter().cloned());
+        target.before_provider_request.extend(self.hooks.before_provider_request.iter().cloned());
+        target.after_provider_response.extend(self.hooks.after_provider_response.iter().cloned());
+        target.before_compact.extend(self.hooks.before_compact.iter().cloned());
     }
 }
 

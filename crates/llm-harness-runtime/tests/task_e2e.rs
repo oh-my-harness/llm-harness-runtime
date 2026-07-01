@@ -110,24 +110,46 @@ async fn workflow_engine_multi_turn_tool_then_text() {
 
 // ── Test 3: tracing ───────────────────────────────────────────────────────────
 
-/// TracingHookAdapter wired as after_turn exports spans to InMemoryTraceExporter.
-///
-/// ⚠ WorkflowEngine 当前无 with_hooks() 方法。tracing hook 需经 step plugin 注入，
-/// 待 WorkflowEngine 支持 hooks 后补齐断言。当前仅验证 run 不报错。
+/// TracingHookAdapter wired via with_hooks() exports spans to InMemoryTraceExporter.
 #[tokio::test]
 async fn workflow_engine_tracing_emits_spans() {
+    use llm_harness_runtime::tracing_adapter::TracingHookAdapter;
+    use llm_harness_runtime::tracer::{CaptureLevel, SpanCaptureConfig, SpanStatus};
+    use llm_harness_runtime_trace_otel::InMemoryTraceExporter;
+    use llm_harness_types::{
+        AfterProviderResponseHook, AfterToolCallHook, AfterTurnHook, BeforeProviderRequestHook,
+    };
+
     let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
         "Hello from tracer.",
     )]));
+    let exporter = Arc::new(InMemoryTraceExporter::new());
+    let adapter = Arc::new(TracingHookAdapter::new(
+        exporter.clone(),
+        SpanCaptureConfig {
+            level: CaptureLevel::Full,
+            redactor: None,
+        },
+    ));
+    adapter.begin_task("trace-test");
+
+    let mut hooks = llm_harness_agent::HarnessHooks::none();
+    hooks.before_provider_request.push(adapter.clone());
+    hooks.after_provider_response.push(adapter.clone());
+    hooks.after_tool_call.push(adapter.clone());
+    hooks.after_turn.push(adapter.clone());
+
     let engine = WorkflowEngine::new_free_task(
         "trace me".into(),
         vec![],
         make_config(client, "task-e2e-tracing"),
     )
-    .unwrap();
+    .unwrap()
+    .with_hooks(hooks);
     engine.run().await.unwrap();
+    adapter.end_task("trace-test", SpanStatus::Ok);
 
-    // tracing hook 注入待 WorkflowEngine 支持 hooks 后补。
-    // 暂时只验证 run 不报错。
     assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    // 验证至少有一个 span 被 export。
+    assert!(!exporter.exported_spans().is_empty(), "expected at least one exported span");
 }

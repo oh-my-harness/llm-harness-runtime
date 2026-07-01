@@ -1,6 +1,4 @@
 use chrono::{DateTime, Utc};
-use futures::future::BoxFuture;
-use llm_harness_types::EntryId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -32,7 +30,9 @@ pub enum TaskError {
 pub struct TaskResult {
     /// Aggregated cost across all sessions.
     pub cost: CostAggregate,
-    /// Total turns executed.
+    /// Number of completed steps (step_history entries with result: Some).
+    /// Note: in the workflow engine, this counts completed workflow steps,
+    /// not individual LLM turns within a step.
     pub turns: u32,
     /// Final assistant message, if any.
     pub final_message: Option<String>,
@@ -51,48 +51,4 @@ pub struct Checkpoint {
     pub payload: Value,
 }
 
-/// Task trace — summary data passed to `TaskVerifier`.
-#[derive(Debug, Clone)]
-pub struct TaskTrace {
-    /// Task identifier.
-    pub task_id: TaskId,
-    /// All session IDs that belonged to this task.
-    pub session_ids: Vec<EntryId>,
-    /// All checkpoints recorded during this task.
-    pub checkpoints: Vec<Checkpoint>,
-    /// Final state snapshot (JSON).
-    pub final_state: Value,
-}
-
-/// Verdict from a task verifier.
-#[derive(Debug, Clone)]
-pub enum TaskVerdict {
-    Pass,
-    Fail { reason: String },
-    Indeterminate { reason: String },
-}
-
-/// Task completion verifier (business layer implements).
-pub trait TaskVerifier: Send + Sync {
-    /// Verify task completion and return a verdict.
-    fn verify<'a>(&'a self, trace: &'a TaskTrace) -> BoxFuture<'a, TaskVerdict>;
-}
-
-/// Retry policy.
-#[derive(Debug, Clone)]
-pub struct RetryPolicy {
-    /// Maximum number of retries before marking the task as failed.
-    pub max_retries: usize,
-    /// Delay between retries in milliseconds.
-    pub backoff_ms: u64,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_retries: 3,
-            backoff_ms: 1000,
-        }
-    }
-}
 

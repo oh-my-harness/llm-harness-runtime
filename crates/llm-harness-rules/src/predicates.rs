@@ -8,11 +8,19 @@ use crate::predicate::Predicate;
 
 /// 集合包含：tool_name ∈ allowed_tools。
 /// P0-A 流程引擎越界兜底就用这个（tool_name 是否在当前步 allowed_tools 里）。
-pub struct Contains(pub Vec<String>);
+pub struct Contains {
+    pub allowed: Vec<String>,
+}
+
+impl Contains {
+    pub fn new(allowed: Vec<String>) -> Self {
+        Self { allowed }
+    }
+}
 
 impl Predicate for Contains {
     fn test(&self, tool_name: &str, _args: &Value) -> bool {
-        self.0.iter().any(|t| t == tool_name)
+        self.allowed.iter().any(|t| t == tool_name)
     }
 }
 
@@ -99,14 +107,23 @@ impl Predicate for RateLimit {
         };
         let now = std::time::Instant::now();
         let window = self.window;
-        let timestamps = calls.entry(tool_name.to_string()).or_default();
-        // 清理过期
-        timestamps.retain(|&t| now.duration_since(t) < window);
-        if timestamps.len() >= self.max as usize {
-            return false;
+        let (should_remove, result) = {
+            let timestamps = calls.entry(tool_name.to_string()).or_default();
+            // 清理过期
+            timestamps.retain(|&t| now.duration_since(t) < window);
+            if timestamps.len() >= self.max as usize {
+                // 超限：拒绝。若全部过期（len=0 且 max=0），标记可清理。
+                (timestamps.is_empty(), false)
+            } else {
+                timestamps.push(now);
+                (false, true)
+            }
+        };
+        // 清理空 entries 避免内存泄漏。
+        if should_remove {
+            calls.remove(tool_name);
         }
-        timestamps.push(now);
-        true
+        result
     }
 }
 #[cfg(test)]
@@ -115,20 +132,20 @@ mod tests {
 
     #[test]
     fn contains_matches_member() {
-        let c = Contains(vec!["tool_a".into(), "tool_b".into()]);
+        let c = Contains::new(vec!["tool_a".into(), "tool_b".into()]);
         assert!(c.test("tool_a", &Value::Null));
         assert!(c.test("tool_b", &Value::Null));
     }
 
     #[test]
     fn contains_rejects_non_member() {
-        let c = Contains(vec!["tool_a".into()]);
+        let c = Contains::new(vec!["tool_a".into()]);
         assert!(!c.test("tool_c", &Value::Null));
     }
 
     #[test]
     fn contains_empty_rejects_all() {
-        let c = Contains(vec![]);
+        let c = Contains::new(vec![]);
         assert!(!c.test("any", &Value::Null));
     }
 

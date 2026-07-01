@@ -76,7 +76,7 @@ mod tests {
         let chain = RuleChain::builder()
             .rule(Rule {
                 tool_name: "measure".into(),
-                predicate: Box::new(Contains(vec!["measure".into()])),
+                predicate: Box::new(Contains::new(vec!["measure".into()])),
                 on_match: Decision::Allow,
             })
             .fallback(Decision::Deny)

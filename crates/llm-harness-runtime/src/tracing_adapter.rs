@@ -159,7 +159,7 @@ impl TracingHookAdapter {
         }
     }
 
-/// Register the start of a turn (call before each turn from BeforeTurnHook or WorkflowEngine).
+    /// Register the start of a turn (call before each turn from BeforeTurnHook or WorkflowEngine).
     /// `AfterTurnHook` finalizes it using the stored start time.
     pub fn begin_turn(&self, turn_index: u32) {
         let mut spans = self.active_spans.lock().unwrap();

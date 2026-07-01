@@ -72,12 +72,12 @@ mod tests {
         let chain = RuleChain::builder()
             .rule(Rule {
                 tool_name: "measure".into(),
-                predicate: Box::new(Contains(vec!["measure".into()])),
+                predicate: Box::new(Contains::new(vec!["measure".into()])),
                 on_match: Decision::Allow,
             })
             .rule(Rule {
                 tool_name: "measure".into(),
-                predicate: Box::new(Contains(vec!["measure".into()])),
+                predicate: Box::new(Contains::new(vec!["measure".into()])),
                 on_match: Decision::Deny,
             })
             .fallback(Decision::Deny)
@@ -90,7 +90,7 @@ mod tests {
         let chain = RuleChain::builder()
             .rule(Rule {
                 tool_name: "measure".into(),
-                predicate: Box::new(Contains(vec!["measure".into()])),  // tool_name 在列表 → true
+                predicate: Box::new(Contains::new(vec!["measure".into()])),  // tool_name 在列表 → true
                 on_match: Decision::Allow,
             })
             .fallback(Decision::Deny)
@@ -119,7 +119,7 @@ mod tests {
         let chain = RuleChain::builder()
             .rule(Rule {
                 tool_name: "*".into(),
-                predicate: Box::new(Contains(vec!["any_tool".into()])),  // tool_name "any_tool" 在列表？
+                predicate: Box::new(Contains::new(vec!["any_tool".into()])),  // tool_name "any_tool" 在列表？
                 on_match: Decision::Allow,
             })
             .fallback(Decision::Deny)

@@ -63,12 +63,19 @@ impl PrepareNextTurnHook for WorkflowGateHook {
 }
 
 /// 构建第二道闸（越界兜底）的 `RuleBasedApprovalHook`。
-/// 规则：`tool_name ∈ 当前步 allowed_tools → Allow, fallback Deny`。
-pub fn build_gate_approval_hook(allowed_tools: &[String]) -> Arc<RuleBasedApprovalHook> {
+/// 规则：`tool_name ∈ (allowed_tools ∪ injected_tool_names) → Allow, fallback Deny`。
+/// `injected_tool_names` 是引擎每步注入的内置 tool（如 submit_step_result），
+/// 不受 step.allowed_tools 限制但必须放行，否则 step agent 无法提交结果。
+pub fn build_gate_approval_hook(
+    allowed_tools: &[String],
+    injected_tool_names: &[String],
+) -> Arc<RuleBasedApprovalHook> {
+    let mut all = allowed_tools.to_vec();
+    all.extend_from_slice(injected_tool_names);
     let chain = RuleChain::builder()
         .rule(Rule {
             tool_name: "*".into(),
-            predicate: Box::new(Contains(allowed_tools.to_vec())),
+            predicate: Box::new(Contains::new(all)),
             on_match: Decision::Allow,
         })
         .fallback(Decision::Deny)
