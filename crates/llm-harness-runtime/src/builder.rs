@@ -126,6 +126,8 @@ pub struct HarnessBuilder {
     /// `CostAccumulatorHook`、`BudgetControlAdapter` 和
     /// `AgentHarnessOptions.cost` 共享。
     cost: Option<Arc<Mutex<CostAggregate>>>,
+    /// Optional maximum output tokens per provider call.
+    max_tokens: Option<u32>,
 }
 
 impl HarnessBuilder {
@@ -147,6 +149,7 @@ impl HarnessBuilder {
             pricing: None,
             budget: None,
             cost: None,
+            max_tokens: None,
         }
     }
 
@@ -263,6 +266,12 @@ impl HarnessBuilder {
         self
     }
 
+    /// Set the maximum output tokens per provider call.
+    pub fn max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
     /// Build an [`AgentHarness`] with an in-memory session.
     ///
     /// Resolves the registered LLM provider for the model ID and constructs
@@ -354,6 +363,9 @@ impl HarnessBuilder {
         opts.hooks = self.hooks.clone();
         opts.skills = self.skills.clone();
         opts.templates = self.templates.clone();
+        if let Some(max_tokens) = self.max_tokens {
+            opts.max_tokens = max_tokens;
+        }
 
         // 惰性创建共享 cost 状态。即使没有 pricing/budget，
         // 也注入 CostAccumulatorHook，使 token 计数始终能通过
@@ -849,5 +861,13 @@ mod tests {
             opts.hooks.should_stop.is_empty(),
             "no budget() call → no BudgetControlAdapter"
         );
+    }
+
+    #[test]
+    fn build_options_applies_max_tokens_override() {
+        let opts = HarnessBuilder::new("test-model")
+            .max_tokens(2048)
+            .build_options();
+        assert_eq!(opts.max_tokens, 2048);
     }
 }
