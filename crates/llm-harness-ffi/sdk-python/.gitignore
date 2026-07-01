@@ -1,0 +1,6 @@
+/build/
+/dist/
+/*.egg-info/
+/.wheel-test-*/
+__pycache__/
+*.pyc

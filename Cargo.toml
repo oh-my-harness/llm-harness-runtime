@@ -4,6 +4,7 @@ members = [
     "crates/llm-harness-types",
     "crates/llm-harness-loop",
     "crates/llm-harness-agent",
+    "crates/llm-harness-ffi",
     # runtime
     "crates/llm-harness-runtime",
     "crates/llm-harness-runtime-sandbox-os",
@@ -33,7 +34,7 @@ llm-harness-agent  = { path = "crates/llm-harness-agent" }
 llm-harness-runtime = { path = "crates/llm-harness-runtime" }
 
 # API adapter — separate repo
-llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "6699fca0c2c0d1ea699b88145d591be8461cc28e" }
+llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "de6015de627eb847b08331241b1ec402b5e6720b" }
 
 # Infrastructure
 anyhow             = "1"
@@ -50,3 +51,4 @@ tokio-stream       = "0.1"
 tokio-util         = { version = "0.7" }
 uuid               = { version = "1", features = ["v4", "v7"] }
 tempfile           = "3"
+zeroize            = "1"
