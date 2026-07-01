@@ -581,6 +581,16 @@ WorkflowEngine::new(workflow, config, judge)?
 - 自定义 judge 返回 `Transition::Fail` → task Failed
 - abort 传播 → `Err("executor step aborted")`
 
+## 生产收尾核对
+
+本轮生产收尾项：
+
+- ~~`WorkflowStatus::AwaitingHumanInput` 目前没有任何 runtime 进入路径。~~ **已处理**：删除孤儿状态。当前 human approval 是 tool hook 层能力，不映射到 workflow 生命周期；后续如需 workflow 级人机交互，应以明确的暂停/恢复协议重新设计。
+- ~~崩溃恢复需要覆盖“多步 workflow 已完成中间步骤、状态仍为 Running、恢复后从下一步继续”的测试。~~ **已处理**：新增 `running_restore_continues_from_transition_target`。
+- ~~崩溃恢复需要覆盖“回跳/返工 transition 后恢复”的测试。~~ **已处理**：新增 `running_restore_continues_from_rework_target`，覆盖 `Transition::To(旧 step)` 后恢复。
+- ~~LLM step 中途 cancel 的 partial output 应丢弃。~~ **已处理**：新增 `cancel_llm_step_discards_partial_result`，覆盖 `{ result: None, transition: Abort }` 的审计语义。
+- 每次收尾提交前必须重新确认 `cargo clippy -p llm-harness-runtime --all-targets -- -D warnings` 干净。
+
 ## 待解决问题
 
 1. ~~`StepCtx.last_result` 是 `&StepResult`（非 Option），workflow 第一步无前驱结果时如何处理？~~ **已解决**：引入 `ExecutorCtx`，`prev_result: Option<&StepResult>` 明确表达可能无前驱结果。LLM step 的 `StepCtx` 不变（`last_result` 语义是 "当前步执行完的结果"，在 `decide_transition` 中构造，此时已有结果）。

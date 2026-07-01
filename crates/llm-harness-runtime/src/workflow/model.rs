@@ -328,7 +328,6 @@ pub enum WorkflowStatus {
     Idle,
     Running,
     Paused,
-    AwaitingHumanInput,
     Succeeded,
     Failed,
     Cancelled,

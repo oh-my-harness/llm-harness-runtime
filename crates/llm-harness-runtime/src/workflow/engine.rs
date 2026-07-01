@@ -1705,6 +1705,57 @@ mod engine_tests {
         }
     }
 
+    fn completed_result(output: &str) -> StepResult {
+        StepResult {
+            output: output.into(),
+            structured: None,
+            tool_calls_count: 0,
+            session_id: format!("session-{output}"),
+            cost: CostAggregate::default(),
+            started_at: Some(chrono::Utc::now()),
+            ended_at: Some(chrono::Utc::now()),
+        }
+    }
+
+    fn completed_record(step_id: &str, output: &str, transition: Transition) -> StepRecord {
+        let now = chrono::Utc::now();
+        StepRecord {
+            step_id: step_id.into(),
+            started_at: now,
+            ended_at: now,
+            result: Some(completed_result(output)),
+            transition,
+        }
+    }
+
+    struct BlockingTool;
+
+    impl Tool for BlockingTool {
+        fn name(&self) -> &str {
+            "block_forever"
+        }
+
+        fn description(&self) -> &str {
+            "blocks until the tool context is aborted"
+        }
+
+        fn parameters_schema(&self) -> &serde_json::Value {
+            static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| serde_json::json!({}));
+            &SCHEMA
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _args: serde_json::Value,
+            ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolError>> {
+            Box::pin(async move {
+                ctx.abort.cancelled().await;
+                Err(ToolError::Aborted)
+            })
+        }
+    }
+
     #[tokio::test]
     async fn free_task_crash_recovery() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1736,6 +1787,152 @@ mod engine_tests {
             .await
             .unwrap();
         assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn running_restore_continues_from_transition_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        let task_id = TaskId("restore-linear".into());
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::llm("s1", "Step 1", "do step 1", vec![]),
+                Step::llm("s2", "Step 2", "do step 2", vec![]),
+            ],
+            edges: vec![Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            }],
+        };
+        let mut state = WorkflowState::new("s1".into());
+        state.status = WorkflowStatus::Running;
+        state.started_at = Some(chrono::Utc::now());
+        // Simulates a crash after s1's transition record was persisted but
+        // before current_step was updated to s2.
+        state.current_step = "s1".into();
+        state.step_history = vec![completed_record(
+            "s1",
+            "step1 done",
+            Transition::To("s2".into()),
+        )];
+        store.save_workflow(&task_id, &workflow).await.unwrap();
+        store.save_workflow_state(&task_id, &state).await.unwrap();
+
+        struct RestoreJudge;
+        impl StepTransitionJudge for RestoreJudge {
+            fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+                let step_id = ctx.current_step.id().clone();
+                Box::pin(async move {
+                    if step_id == "s1" {
+                        Transition::To("s2".into())
+                    } else {
+                        Transition::Abort {
+                            reason: "done".into(),
+                        }
+                    }
+                })
+            }
+        }
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step2 done")]));
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let restored = WorkflowEngine::restore(store, task_id, config, Arc::new(RestoreJudge))
+            .await
+            .unwrap();
+
+        let result = restored.run().await.unwrap();
+        let history = restored.step_history().await;
+
+        assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].step_id, "s1");
+        assert_eq!(history[1].step_id, "s2");
+        assert_eq!(result.final_message.as_deref(), Some("step2 done"));
+    }
+
+    #[tokio::test]
+    async fn running_restore_continues_from_rework_target() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        let task_id = TaskId("restore-rework".into());
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::llm("s1", "Step 1", "do step 1", vec![]),
+                Step::llm("s2", "Step 2", "do step 2", vec![]),
+            ],
+            edges: vec![
+                Edge {
+                    from: "s1".into(),
+                    to: "s2".into(),
+                    condition: None,
+                },
+                Edge {
+                    from: "s2".into(),
+                    to: "s1".into(),
+                    condition: None,
+                },
+            ],
+        };
+        let mut state = WorkflowState::new("s1".into());
+        state.status = WorkflowStatus::Running;
+        state.started_at = Some(chrono::Utc::now());
+        // Simulates a crash after s2 decided to rework s1 but before
+        // current_step was persisted as s1.
+        state.current_step = "s2".into();
+        state.step_history = vec![
+            completed_record("s1", "step1 done", Transition::To("s2".into())),
+            completed_record("s2", "needs rework", Transition::To("s1".into())),
+        ];
+        store.save_workflow(&task_id, &workflow).await.unwrap();
+        store.save_workflow_state(&task_id, &state).await.unwrap();
+
+        struct AbortAfterRestoreJudge;
+        impl StepTransitionJudge for AbortAfterRestoreJudge {
+            fn decide<'a>(&'a self, _ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+                Box::pin(async {
+                    Transition::Abort {
+                        reason: "done".into(),
+                    }
+                })
+            }
+        }
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
+            "reworked step1",
+        )]));
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let restored =
+            WorkflowEngine::restore(store, task_id, config, Arc::new(AbortAfterRestoreJudge))
+                .await
+                .unwrap();
+
+        let result = restored.run().await.unwrap();
+        let history = restored.step_history().await;
+
+        assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            history
+                .iter()
+                .map(|record| record.step_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s1", "s2", "s1"]
+        );
+        assert_eq!(result.final_message.as_deref(), Some("reworked step1"));
     }
 
     #[tokio::test]
@@ -2087,5 +2284,64 @@ mod engine_tests {
         assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
         assert_eq!(result.turns, 0);
         assert!(result.final_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_llm_step_discards_partial_result() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut response = MockResponse::tool_use("block_1", "block_forever", "{}");
+        response.events.insert(
+            0,
+            Ok(llm_harness_loop::AdapterStreamEvent::TextDelta {
+                index: 0,
+                text: "partial output".into(),
+            }),
+        );
+        let client = Arc::new(MockLlmClient::new(vec![response]));
+        let call_count = client.call_count.clone();
+        let config = WorkflowEngineConfig {
+            client,
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = Arc::new(
+            WorkflowEngine::new_free_task(
+                "stream partial then block".into(),
+                vec!["block_forever".into()],
+                config,
+            )
+            .unwrap()
+            .with_tool(Arc::new(BlockingTool)),
+        );
+        let runner = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.run().await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while call_count.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        engine.cancel("stop").await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), runner)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let history = engine.step_history().await;
+
+        assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(result.turns, 0);
+        assert!(result.final_message.is_none());
+        assert_eq!(history.len(), 1);
+        assert!(history[0].result.is_none());
+        assert!(matches!(history[0].transition, Transition::Abort { .. }));
     }
 }
