@@ -93,7 +93,7 @@ impl ShouldStopHook for BudgetControlAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_types::{AssistantMessage, StopReason};
+    use llm_harness_types::{AssistantMessage, AssistantMessageKind, StopReason};
 
     struct NoExceededHook;
     impl BudgetExceededHook for NoExceededHook {
@@ -116,6 +116,9 @@ mod tests {
 
     fn make_assistant() -> AssistantMessage {
         AssistantMessage {
+            kind: AssistantMessageKind::FinalAnswer,
+            message_id: None,
+            turn_id: None,
             content: vec![],
             stop_reason: Some(StopReason::EndTurn),
             timestamp: chrono::Utc::now(),

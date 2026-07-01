@@ -2010,6 +2010,11 @@ mod tests {
         ) -> BoxFuture<'_, Result<(), llm_harness_types::SessionError>> {
             self.inner.delete_entries(ids)
         }
+        fn all_entries(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<SessionEntry>, llm_harness_types::SessionError>> {
+            self.inner.all_entries()
+        }
     }
 
     fn make_harness_failing_storage(
@@ -2065,6 +2070,31 @@ mod tests {
         let h = make_harness(vec![MockResponse::text("Hello!")]);
         h.prompt("hi").await.unwrap();
         assert_eq!(h.state().phase, HarnessPhase::Idle);
+    }
+
+    #[tokio::test]
+    async fn prompt_persists_final_answer_identity() {
+        let h = make_harness(vec![MockResponse::text("Hello!")]);
+        h.prompt("hi").await.unwrap();
+
+        let path = h.read_active_path().await.unwrap();
+        let assistant = path
+            .iter()
+            .find_map(|entry| {
+                if let SessionEntryPayload::Message(AgentMessage::Assistant(message)) =
+                    &entry.payload
+                {
+                    Some(message)
+                } else {
+                    None
+                }
+            })
+            .expect("assistant message should be persisted");
+
+        assert_eq!(assistant.kind, AssistantMessageKind::FinalAnswer);
+        assert_eq!(assistant.text_content(), "Hello!");
+        assert!(assistant.message_id.is_some());
+        assert!(assistant.turn_id.is_some());
     }
 
     #[tokio::test]

@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use llm_harness_runtime::budget::{BudgetControlAdapter, BudgetExceededHook};
 use llm_harness_runtime::cost::{CostAggregate, ModelCost, PricingProvider, TokenPrice};
-use llm_harness_types::{AssistantMessage, ShouldStopCtx, ShouldStopHook, StopReason};
+use llm_harness_types::{
+    AssistantMessage, AssistantMessageKind, ShouldStopCtx, ShouldStopHook, StopReason,
+};
 
 struct FixedPricingProvider {
     price: TokenPrice,
@@ -62,6 +64,9 @@ impl BudgetExceededHook for RecordingBudgetHook {
 
 fn make_assistant() -> AssistantMessage {
     AssistantMessage {
+        kind: AssistantMessageKind::FinalAnswer,
+        message_id: None,
+        turn_id: None,
         content: vec![],
         stop_reason: Some(StopReason::EndTurn),
         timestamp: chrono::Utc::now(),

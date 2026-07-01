@@ -23,6 +23,23 @@ impl TokenUsage {
     }
 }
 
+/// Assistant message display and persistence semantics.
+///
+/// UIs should render `FinalAnswer` as the durable assistant response for a
+/// user turn. `Progress` is model-visible context and may be shown in progress
+/// views, but should not be restored as the final assistant bubble.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantMessageKind {
+    /// Intermediate assistant text, usually followed by tool calls or another turn.
+    Progress,
+    /// A compact reasoning summary intended for product display, not raw chain of thought.
+    ReasoningSummary,
+    /// Durable user-visible answer for the turn.
+    #[default]
+    FinalAnswer,
+}
+
 /// 用户消息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessage {
@@ -35,6 +52,15 @@ pub struct UserMessage {
 /// LLM 助手消息。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantMessage {
+    /// UI/display semantics for this assistant message.
+    #[serde(default)]
+    pub kind: AssistantMessageKind,
+    /// Stable ID for this assistant message when produced by the runtime loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// Stable ID for the user turn that produced this assistant message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     /// 消息内容块列表（含 Text、Thinking、ToolUse 等）。
     pub content: Vec<ContentBlock>,
     /// LLM 停止生成的原因。
@@ -57,6 +83,19 @@ pub struct AssistantMessage {
     /// LLM 返回错误时保存的错误文本快照。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+}
+
+impl AssistantMessage {
+    /// Concatenate user-visible text blocks, excluding thinking and tool-use blocks.
+    pub fn text_content(&self) -> String {
+        let mut text = String::new();
+        for block in &self.content {
+            if let ContentBlock::Text { text: block_text } = block {
+                text.push_str(block_text);
+            }
+        }
+        text
+    }
 }
 
 /// 工具执行结果消息。
@@ -142,6 +181,9 @@ mod tests {
     #[test]
     fn agent_message_serde_assistant() {
         let msg = AgentMessage::Assistant(AssistantMessage {
+            kind: AssistantMessageKind::FinalAnswer,
+            message_id: None,
+            turn_id: None,
             content: vec![text_block("response")],
             stop_reason: Some(crate::StopReason::EndTurn),
             timestamp: chrono::Utc::now(),
@@ -200,6 +242,9 @@ mod tests {
     #[test]
     fn assistant_message_none_fields_omitted_in_json() {
         let msg = AssistantMessage {
+            kind: AssistantMessageKind::FinalAnswer,
+            message_id: None,
+            turn_id: None,
             content: vec![text_block("hi")],
             stop_reason: None,
             timestamp: chrono::Utc::now(),
@@ -234,7 +279,74 @@ mod tests {
         );
         // round-trip
         let msg2: AssistantMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg2.kind, AssistantMessageKind::FinalAnswer);
         assert!(msg2.stop_reason.is_none());
         assert!(msg2.provider.is_none());
+    }
+
+    #[test]
+    fn assistant_message_kind_and_ids_roundtrip() {
+        let msg = AssistantMessage {
+            kind: AssistantMessageKind::Progress,
+            message_id: Some("msg_1".into()),
+            turn_id: Some("turn_1".into()),
+            content: vec![text_block("checking")],
+            stop_reason: Some(crate::StopReason::ToolUse),
+            timestamp: chrono::Utc::now(),
+            provider: None,
+            api: None,
+            model: None,
+            usage: None,
+            error_message: None,
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""kind":"progress""#), "{json}");
+        assert!(json.contains(r#""message_id":"msg_1""#), "{json}");
+        assert!(json.contains(r#""turn_id":"turn_1""#), "{json}");
+
+        let decoded: AssistantMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.kind, AssistantMessageKind::Progress);
+        assert_eq!(decoded.message_id.as_deref(), Some("msg_1"));
+        assert_eq!(decoded.turn_id.as_deref(), Some("turn_1"));
+    }
+
+    #[test]
+    fn assistant_message_missing_kind_defaults_to_final_answer() {
+        let json = serde_json::json!({
+            "content": [{"type": "text", "text": "legacy"}],
+            "timestamp": chrono::Utc::now(),
+        });
+
+        let decoded: AssistantMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.kind, AssistantMessageKind::FinalAnswer);
+        assert!(decoded.message_id.is_none());
+        assert!(decoded.turn_id.is_none());
+    }
+
+    #[test]
+    fn assistant_message_text_content_concatenates_visible_text_only() {
+        let msg = AssistantMessage {
+            kind: AssistantMessageKind::FinalAnswer,
+            message_id: None,
+            turn_id: None,
+            content: vec![
+                text_block("hello "),
+                ContentBlock::Thinking {
+                    thinking: "hidden".into(),
+                    signature: None,
+                },
+                text_block("world"),
+            ],
+            stop_reason: Some(crate::StopReason::EndTurn),
+            timestamp: chrono::Utc::now(),
+            provider: None,
+            api: None,
+            model: None,
+            usage: None,
+            error_message: None,
+        };
+
+        assert_eq!(msg.text_content(), "hello world");
     }
 }

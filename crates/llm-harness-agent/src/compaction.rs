@@ -584,6 +584,9 @@ mod tests {
             parent_id: None,
             timestamp: Utc::now(),
             payload: SessionEntryPayload::Message(AgentMessage::Assistant(AssistantMessage {
+                kind: AssistantMessageKind::FinalAnswer,
+                message_id: None,
+                turn_id: None,
                 content: vec![ContentBlock::Text { text: text.into() }],
                 stop_reason: Some(StopReason::EndTurn),
                 timestamp: Utc::now(),

@@ -138,6 +138,9 @@ mod tests {
             tool_use_id: "c1".into(),
             turn_index: 0,
             assistant_message: Arc::new(AssistantMessage {
+                kind: AssistantMessageKind::FinalAnswer,
+                message_id: None,
+                turn_id: None,
                 content: vec![],
                 stop_reason: None,
                 timestamp: Utc::now(),

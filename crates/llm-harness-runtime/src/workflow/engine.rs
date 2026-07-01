@@ -1083,7 +1083,8 @@ impl WorkflowEngine {
         // h. 收集事件 → StepResult。
         //    哨兵：Settled（所有排队活动结束）或 Aborted（被 cancel）。
         //    channel 关闭（harness 异常退出）视为失败而非成功。
-        let mut output = String::new();
+        let mut text_delta_output = String::new();
+        let mut final_answer_output: Option<String> = None;
         let mut tool_calls_count = 0u32;
         let mut settled = false;
         loop {
@@ -1096,7 +1097,12 @@ impl WorkflowEngine {
                 event = rx.recv() => {
                     match event {
                         Ok(event) => match event.as_ref() {
-                            AgentHarnessEvent::Agent(AgentEvent::TextDelta { text, .. }) => output.push_str(text),
+                            AgentHarnessEvent::Agent(AgentEvent::TextDelta { text, .. }) => {
+                                text_delta_output.push_str(text);
+                            }
+                            AgentHarnessEvent::Agent(AgentEvent::FinalAnswer { text, .. }) => {
+                                final_answer_output = Some(text.clone());
+                            }
                             AgentHarnessEvent::ToolCallStart { .. } => tool_calls_count += 1,
                             AgentHarnessEvent::Settled | AgentHarnessEvent::Aborted => {
                                 settled = true;
@@ -1120,6 +1126,7 @@ impl WorkflowEngine {
         let ended_at = chrono::Utc::now();
         // 从 SubmitStepResultTool 读取结构化结果。
         let structured = structured_rx.lock().await.take();
+        let output = final_answer_output.unwrap_or(text_delta_output);
 
         Ok(StepResult {
             output,
@@ -1538,6 +1545,9 @@ mod sync_tool_tests {
     fn empty_msg() -> llm_harness_types::AssistantMessage {
         use chrono::Utc;
         llm_harness_types::AssistantMessage {
+            kind: llm_harness_types::AssistantMessageKind::FinalAnswer,
+            message_id: None,
+            turn_id: None,
             content: vec![],
             stop_reason: None,
             timestamp: Utc::now(),

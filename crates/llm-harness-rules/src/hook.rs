@@ -45,7 +45,7 @@ mod tests {
     use crate::predicates::Contains;
     use crate::rule::Rule;
     use chrono::Utc;
-    use llm_harness_types::AssistantMessage;
+    use llm_harness_types::{AssistantMessage, AssistantMessageKind};
 
     /// 构造一个最小的 ctx。`msg` 必须比 ctx 活得久——调用方持有 msg。
     fn make_ctx<'a>(msg: &'a AssistantMessage, tool_name: &'a str) -> BeforeToolCallCtx<'a> {
@@ -60,6 +60,9 @@ mod tests {
 
     fn empty_message() -> AssistantMessage {
         AssistantMessage {
+            kind: AssistantMessageKind::FinalAnswer,
+            message_id: None,
+            turn_id: None,
             content: vec![],
             stop_reason: None,
             timestamp: Utc::now(),
@@ -90,9 +93,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_when_no_match() {
-        let chain = RuleChain::builder()
-            .fallback(Decision::Deny)
-            .build();
+        let chain = RuleChain::builder().fallback(Decision::Deny).build();
         let hook = RuleBasedApprovalHook::new(chain);
         let msg = empty_message();
         let ctx = make_ctx(&msg, "dangerous_tool");

@@ -38,6 +38,31 @@ pub enum AgentEvent {
         message_id: String,
         message: AssistantMessage,
     },
+    /// Intermediate, non-final user-visible assistant text for a turn.
+    ///
+    /// This event is emitted for assistant messages classified as progress,
+    /// for example text produced before a tool-use turn. UIs may show it in a
+    /// progress panel, but should not persist it as the final assistant answer.
+    Progress {
+        /// Stable user-turn ID.
+        turn_id: String,
+        /// Stable assistant message ID.
+        message_id: String,
+        /// Full visible text for the progress message.
+        text: String,
+    },
+    /// Durable user-visible final answer for a turn.
+    ///
+    /// Consumers should prefer this event over inferring finality from raw
+    /// `TextDelta` or `MessageEnd` events.
+    FinalAnswer {
+        /// Stable user-turn ID.
+        turn_id: String,
+        /// Stable assistant message ID.
+        message_id: String,
+        /// Full visible answer text.
+        text: String,
+    },
 
     // === Token 级（字符流） ===
     /// 文本增量。
@@ -107,6 +132,9 @@ mod tests {
 
     fn make_assistant() -> AssistantMessage {
         AssistantMessage {
+            kind: crate::AssistantMessageKind::FinalAnswer,
+            message_id: Some("msg_1".into()),
+            turn_id: Some("turn_1".into()),
             content: vec![ContentBlock::Text { text: "ok".into() }],
             stop_reason: Some(StopReason::EndTurn),
             timestamp: chrono::Utc::now(),
@@ -174,6 +202,50 @@ mod tests {
                 assert_eq!(max_retries, 3);
                 assert_eq!(delay_ms, 2000);
                 assert_eq!(error, "rate limited");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn final_answer_event_fields_are_accessible() {
+        let ev = AgentEvent::FinalAnswer {
+            turn_id: "turn_1".into(),
+            message_id: "msg_1".into(),
+            text: "done".into(),
+        };
+
+        match ev {
+            AgentEvent::FinalAnswer {
+                turn_id,
+                message_id,
+                text,
+            } => {
+                assert_eq!(turn_id, "turn_1");
+                assert_eq!(message_id, "msg_1");
+                assert_eq!(text, "done");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn progress_event_fields_are_accessible() {
+        let ev = AgentEvent::Progress {
+            turn_id: "turn_1".into(),
+            message_id: "msg_1".into(),
+            text: "checking".into(),
+        };
+
+        match ev {
+            AgentEvent::Progress {
+                turn_id,
+                message_id,
+                text,
+            } => {
+                assert_eq!(turn_id, "turn_1");
+                assert_eq!(message_id, "msg_1");
+                assert_eq!(text, "checking");
             }
             _ => panic!("wrong variant"),
         }

@@ -494,7 +494,8 @@ impl llm_harness_agent::AbortCascadeHook for AsyncSpawnRegistry {
 mod tests {
     use super::*;
     use llm_harness_types::{
-        AgentError, AssistantMessage, CostAggregate, ShouldStopCtx, ShouldStopHook, StopReason,
+        AgentError, AssistantMessage, AssistantMessageKind, CostAggregate, ShouldStopCtx,
+        ShouldStopHook, StopReason,
     };
 
     fn make_stop_ctx<'a>(assistant: &'a AssistantMessage) -> ShouldStopCtx<'a> {
@@ -507,6 +508,9 @@ mod tests {
 
     fn empty_assistant() -> AssistantMessage {
         AssistantMessage {
+            kind: AssistantMessageKind::FinalAnswer,
+            message_id: None,
+            turn_id: None,
             content: vec![],
             stop_reason: Some(StopReason::EndTurn),
             timestamp: chrono::Utc::now(),

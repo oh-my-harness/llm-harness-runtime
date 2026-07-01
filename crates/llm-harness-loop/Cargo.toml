@@ -11,7 +11,7 @@ async-stream.workspace      = true
 async-trait.workspace       = true
 futures.workspace           = true
 serde_json.workspace        = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["macros", "time"] }
 tokio-stream.workspace      = true
 tokio-util.workspace        = true
 uuid.workspace              = true

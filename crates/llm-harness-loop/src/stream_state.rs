@@ -9,6 +9,8 @@ use uuid::Uuid;
 pub(crate) struct StreamingState {
     /// Stable message ID generated at stream start.
     pub message_id: String,
+    /// Stable user-turn ID owning this message.
+    pub turn_id: String,
     /// Model name from the provider.
     pub model: String,
     text_blocks: HashMap<usize, String>,
@@ -26,9 +28,10 @@ enum BlockKind {
 }
 
 impl StreamingState {
-    pub(crate) fn new(model: String) -> Self {
+    pub(crate) fn new(model: String, turn_id: String) -> Self {
         Self {
             message_id: Uuid::now_v7().to_string(),
+            turn_id,
             model,
             text_blocks: Default::default(),
             reasoning_blocks: Default::default(),
@@ -131,9 +134,18 @@ impl StreamingState {
             }
             AdapterEvent::MessageStop { stop_reason, usage } => {
                 let content = self.build_final_content();
+                let stop_reason = convert_stop_reason(stop_reason);
+                let kind = if stop_reason == StopReason::ToolUse {
+                    AssistantMessageKind::Progress
+                } else {
+                    AssistantMessageKind::FinalAnswer
+                };
                 let message = AssistantMessage {
+                    kind,
+                    message_id: Some(mid.clone()),
+                    turn_id: Some(self.turn_id.clone()),
                     content,
-                    stop_reason: Some(convert_stop_reason(stop_reason)),
+                    stop_reason: Some(stop_reason),
                     timestamp: Utc::now(),
                     // The current adapter stream does not expose provider/api metadata.
                     provider: None,
@@ -142,10 +154,29 @@ impl StreamingState {
                     usage: Some(convert_usage(usage)),
                     error_message: None,
                 };
-                vec![AgentEvent::MessageEnd {
+                let visible_text = message.text_content();
+                let mut events = vec![AgentEvent::MessageEnd {
                     message_id: mid,
-                    message,
-                }]
+                    message: message.clone(),
+                }];
+                if !visible_text.is_empty() {
+                    match message.kind {
+                        AssistantMessageKind::Progress => events.push(AgentEvent::Progress {
+                            turn_id: self.turn_id.clone(),
+                            message_id: self.message_id.clone(),
+                            text: visible_text,
+                        }),
+                        AssistantMessageKind::FinalAnswer => {
+                            events.push(AgentEvent::FinalAnswer {
+                                turn_id: self.turn_id.clone(),
+                                message_id: self.message_id.clone(),
+                                text: visible_text,
+                            });
+                        }
+                        AssistantMessageKind::ReasoningSummary => {}
+                    }
+                }
+                events
             }
         }
     }
@@ -153,6 +184,9 @@ impl StreamingState {
     /// Build a partial `AssistantMessage` from the current accumulated state.
     pub(crate) fn partial_message(&self) -> AssistantMessage {
         AssistantMessage {
+            kind: AssistantMessageKind::Progress,
+            message_id: Some(self.message_id.clone()),
+            turn_id: Some(self.turn_id.clone()),
             content: self.build_final_content(),
             stop_reason: None,
             timestamp: Utc::now(),
@@ -226,7 +260,7 @@ mod tests {
     use llm_adapter::types::{StopReason as AdapterStop, Usage};
 
     fn make_state() -> StreamingState {
-        StreamingState::new("test-model".into())
+        StreamingState::new("test-model".into(), "turn_1".into())
     }
 
     #[test]
@@ -385,9 +419,55 @@ mod tests {
             .find(|e| matches!(e, AgentEvent::MessageEnd { .. }));
         assert!(msg_end.is_some());
         if let AgentEvent::MessageEnd { message, .. } = msg_end.unwrap() {
+            assert_eq!(message.kind, AssistantMessageKind::FinalAnswer);
+            assert_eq!(message.turn_id.as_deref(), Some("turn_1"));
+            assert!(message.message_id.is_some());
             assert!(matches!(message.stop_reason, Some(StopReason::EndTurn)));
             assert_eq!(message.usage.as_ref().unwrap().input_tokens, 5);
         }
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::FinalAnswer { turn_id, message_id, text }
+                if turn_id == "turn_1" && !message_id.is_empty() && text == "done"
+        )));
+    }
+
+    #[test]
+    fn tool_use_text_emits_progress_not_final_answer() {
+        let mut s = make_state();
+        s.process(AdapterEvent::ContentStart {
+            index: 0,
+            kind: ContentKind::Text,
+        });
+        s.process(AdapterEvent::TextDelta {
+            index: 0,
+            text: "checking first".into(),
+        });
+        let events = s.process(AdapterEvent::MessageStop {
+            stop_reason: AdapterStop::ToolUse,
+            usage: Usage::default(),
+        });
+
+        let msg_end = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::MessageEnd { .. }))
+            .unwrap();
+        if let AgentEvent::MessageEnd { message, .. } = msg_end {
+            assert_eq!(message.kind, AssistantMessageKind::Progress);
+            assert_eq!(message.turn_id.as_deref(), Some("turn_1"));
+            assert!(message.message_id.is_some());
+        }
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Progress { turn_id, message_id, text }
+                if turn_id == "turn_1" && !message_id.is_empty() && text == "checking first"
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::FinalAnswer { .. }))
+        );
     }
 
     #[test]

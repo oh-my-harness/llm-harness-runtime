@@ -559,6 +559,9 @@ mod tests {
     fn empty_msg() -> llm_harness_types::AssistantMessage {
         use chrono::Utc;
         llm_harness_types::AssistantMessage {
+            kind: llm_harness_types::AssistantMessageKind::FinalAnswer,
+            message_id: None,
+            turn_id: None,
             content: vec![],
             stop_reason: None,
             timestamp: Utc::now(),

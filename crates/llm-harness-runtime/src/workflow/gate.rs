@@ -33,12 +33,19 @@ impl WorkflowGateHook {
         step_tools: HashMap<StepId, Vec<String>>,
         extra_tool_names: HashSet<String>,
     ) -> Self {
-        Self { engine_state, step_tools, extra_tool_names }
+        Self {
+            engine_state,
+            step_tools,
+            extra_tool_names,
+        }
     }
 }
 
 impl PrepareNextTurnHook for WorkflowGateHook {
-    fn prepare<'a>(&'a self, _ctx: PrepareNextTurnCtx<'a>) -> BoxFuture<'a, Result<NextTurnDirective, AgentError>> {
+    fn prepare<'a>(
+        &'a self,
+        _ctx: PrepareNextTurnCtx<'a>,
+    ) -> BoxFuture<'a, Result<NextTurnDirective, AgentError>> {
         Box::pin(async move {
             let state = self.engine_state.lock().await;
             let allowed = self.step_tools.get(&state.current_step);
@@ -95,9 +102,15 @@ mod tests {
         tools.insert("s1".to_string(), vec![]);
         let hook = WorkflowGateHook::new(state, tools, HashSet::new());
         let msg = make_empty_msg();
-        let ctx = PrepareNextTurnCtx { turn_index: 0, last_message: &msg, last_tool_results: &[] };
+        let ctx = PrepareNextTurnCtx {
+            turn_index: 0,
+            last_message: &msg,
+            last_tool_results: &[],
+        };
         let d = hook.prepare(ctx).await.unwrap();
-        let set = d.active_tools.expect("empty allowed must yield Some(empty set), not None");
+        let set = d
+            .active_tools
+            .expect("empty allowed must yield Some(empty set), not None");
         assert!(set.is_empty());
     }
 
@@ -108,9 +121,15 @@ mod tests {
         let tools = HashMap::new();
         let hook = WorkflowGateHook::new(state, tools, HashSet::new());
         let msg = make_empty_msg();
-        let ctx = PrepareNextTurnCtx { turn_index: 0, last_message: &msg, last_tool_results: &[] };
+        let ctx = PrepareNextTurnCtx {
+            turn_index: 0,
+            last_message: &msg,
+            last_tool_results: &[],
+        };
         let d = hook.prepare(ctx).await.unwrap();
-        let set = d.active_tools.expect("unknown step must yield Some(empty set), not None");
+        let set = d
+            .active_tools
+            .expect("unknown step must yield Some(empty set), not None");
         assert!(set.is_empty());
     }
 
@@ -121,7 +140,11 @@ mod tests {
         tools.insert("s1".to_string(), vec!["tool_a".into(), "tool_b".into()]);
         let hook = WorkflowGateHook::new(state, tools, HashSet::new());
         let msg = make_empty_msg();
-        let ctx = PrepareNextTurnCtx { turn_index: 0, last_message: &msg, last_tool_results: &[] };
+        let ctx = PrepareNextTurnCtx {
+            turn_index: 0,
+            last_message: &msg,
+            last_tool_results: &[],
+        };
         let d = hook.prepare(ctx).await.unwrap();
         let set = d.active_tools.unwrap();
         assert!(set.contains("tool_a"));
@@ -138,7 +161,11 @@ mod tests {
         let extra: HashSet<String> = ["submit_step_result".into()].into_iter().collect();
         let hook = WorkflowGateHook::new(state, tools, extra);
         let msg = make_empty_msg();
-        let ctx = PrepareNextTurnCtx { turn_index: 0, last_message: &msg, last_tool_results: &[] };
+        let ctx = PrepareNextTurnCtx {
+            turn_index: 0,
+            last_message: &msg,
+            last_tool_results: &[],
+        };
         let d = hook.prepare(ctx).await.unwrap();
         let set = d.active_tools.unwrap();
         assert!(set.contains("tool_a"));
@@ -148,8 +175,17 @@ mod tests {
     fn make_empty_msg() -> llm_harness_types::AssistantMessage {
         use chrono::Utc;
         llm_harness_types::AssistantMessage {
-            content: vec![], stop_reason: None, timestamp: Utc::now(),
-            provider: None, api: None, model: None, usage: None, error_message: None,
+            kind: llm_harness_types::AssistantMessageKind::FinalAnswer,
+            message_id: None,
+            turn_id: None,
+            content: vec![],
+            stop_reason: None,
+            timestamp: Utc::now(),
+            provider: None,
+            api: None,
+            model: None,
+            usage: None,
+            error_message: None,
         }
     }
 }

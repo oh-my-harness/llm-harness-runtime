@@ -3,6 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use futures::{Stream, StreamExt};
 use llm_adapter::provider::Provider;
 use llm_harness_types::*;
+use uuid::Uuid;
 
 use crate::config::LoopConfig;
 
@@ -135,6 +136,7 @@ fn run_loop(
                 }
             }
 
+            let turn_id = Uuid::now_v7().to_string();
             yield AgentEvent::TurnStart { index: turn_index };
 
             // Build message list (with optional system message prepended)
@@ -240,7 +242,7 @@ fn run_loop(
             };
 
             // Emit MessageStart
-            let mut state = StreamingState::new(handle.model().to_owned());
+            let mut state = StreamingState::new(handle.model().to_owned(), turn_id);
             let message_id = state.message_id.clone();
             yield AgentEvent::MessageStart { message_id: message_id.clone() };
 
@@ -729,6 +731,12 @@ mod tests {
         assert!(
             events
                 .iter()
+                .any(|e| matches!(e, AgentEvent::FinalAnswer { text, .. } if text == "Hello!")),
+            "missing FinalAnswer"
+        );
+        assert!(
+            events
+                .iter()
                 .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
             "missing AgentEnd"
         );
@@ -802,6 +810,12 @@ mod tests {
             .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
             .count();
         assert_eq!(tool_exec_ends, 1);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::FinalAnswer { text, .. } if text == "Done!")),
+            "final text response should emit FinalAnswer"
+        );
     }
 
     #[tokio::test]

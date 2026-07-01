@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use llm_harness_types::{ContentBlock, Tool, ToolContext, ToolError, ToolExecutionMode, ToolResult};
+use llm_harness_types::{
+    ContentBlock, Tool, ToolContext, ToolError, ToolExecutionMode, ToolResult,
+};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
@@ -125,7 +127,9 @@ impl Tool for WaitForExternalEventTool {
         Box::pin(async move {
             // 1. 落盘等待描述符（若注入了 task_store）。
             if let Some(store) = &self.task_store
-                && let Err(e) = store.save_event_wait(&self.task_id, &self.wait_descriptor).await
+                && let Err(e) = store
+                    .save_event_wait(&self.task_id, &self.wait_descriptor)
+                    .await
             {
                 // 落盘失败不阻断 tool 本身的等待语义（最坏情况是重启后无法恢复该次等待）。
                 eprintln!("[warn] failed to save event_wait descriptor: {e}");
@@ -175,9 +179,9 @@ impl Tool for WaitForExternalEventTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_types::ContentBlock;
     use crate::task::TaskId;
     use crate::task_store::JsonlTaskStore;
+    use llm_harness_types::ContentBlock;
     use llm_harness_types::{Tool, ToolContext, ToolError};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -198,13 +202,21 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         let mut stream = ChannelStream { rx };
         tx.send(Event {
-            content: vec![ContentBlock::Text { text: "first".into() }],
+            content: vec![ContentBlock::Text {
+                text: "first".into(),
+            }],
             details: serde_json::json!({"n": 1}),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         tx.send(Event {
-            content: vec![ContentBlock::Text { text: "second".into() }],
+            content: vec![ContentBlock::Text {
+                text: "second".into(),
+            }],
             details: serde_json::json!({"n": 2}),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         drop(tx);
 
         let e1 = stream.next().await.unwrap();
@@ -237,6 +249,9 @@ mod tests {
     fn empty_assistant_message() -> llm_harness_types::AssistantMessage {
         use chrono::Utc;
         llm_harness_types::AssistantMessage {
+            kind: llm_harness_types::AssistantMessageKind::FinalAnswer,
+            message_id: None,
+            turn_id: None,
             content: vec![],
             stop_reason: None,
             timestamp: Utc::now(),
@@ -263,9 +278,13 @@ mod tests {
 
         // 发送一个事件
         tx.send(Event {
-            content: vec![ContentBlock::Text { text: "done".into() }],
+            content: vec![ContentBlock::Text {
+                text: "done".into(),
+            }],
             details: serde_json::json!({"status": "ok"}),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let abort = CancellationToken::new();
         let ctx = make_tool_ctx(abort);
@@ -283,20 +302,18 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         let stream: Arc<Mutex<Box<dyn EventStream>>> =
             Arc::new(Mutex::new(Box::new(ChannelStream { rx })));
-        let tool = WaitForExternalEventTool::new(
-            stream,
-            serde_json::json!({}),
-            None,
-            TaskId("t1".into()),
-        )
-        .with_timeout(Duration::from_millis(50));
+        let tool =
+            WaitForExternalEventTool::new(stream, serde_json::json!({}), None, TaskId("t1".into()))
+                .with_timeout(Duration::from_millis(50));
 
         let abort = CancellationToken::new();
         let ctx = make_tool_ctx(abort);
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         // 超时返回提示文本（非错误）
         match &result.content[0] {
-            ContentBlock::Text { text } => assert!(text.contains("timeout") || text.contains("no ")),
+            ContentBlock::Text { text } => {
+                assert!(text.contains("timeout") || text.contains("no "))
+            }
             _ => panic!("expected text"),
         }
     }
@@ -306,13 +323,9 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         let stream: Arc<Mutex<Box<dyn EventStream>>> =
             Arc::new(Mutex::new(Box::new(ChannelStream { rx })));
-        let tool = WaitForExternalEventTool::new(
-            stream,
-            serde_json::json!({}),
-            None,
-            TaskId("t1".into()),
-        )
-        .with_timeout(Duration::from_secs(60));
+        let tool =
+            WaitForExternalEventTool::new(stream, serde_json::json!({}), None, TaskId("t1".into()))
+                .with_timeout(Duration::from_secs(60));
 
         let abort = CancellationToken::new();
         let ctx = make_tool_ctx(abort.clone());
@@ -325,8 +338,7 @@ mod tests {
     #[tokio::test]
     async fn tool_persists_event_wait_descriptor() {
         let dir = TempDir::new().unwrap();
-        let store: Arc<dyn TaskStore> =
-            Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
         let (tx, rx) = tokio::sync::mpsc::channel::<Event>(1);
         let stream: Arc<Mutex<Box<dyn EventStream>>> =
             Arc::new(Mutex::new(Box::new(ChannelStream { rx })));
@@ -343,7 +355,9 @@ mod tests {
         tx.send(Event {
             content: vec![ContentBlock::Text { text: "ok".into() }],
             details: serde_json::json!({}),
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         let abort = CancellationToken::new();
         let ctx = make_tool_ctx(abort);
@@ -352,7 +366,10 @@ mod tests {
         // tool 执行期间应已落盘 descriptor
         let rec = store.load_event_wait(&task_id).await.unwrap();
         // 正常返回后 clear_event_wait 清理了 → None
-        assert!(rec.is_none(), "event_wait should be cleared after normal return");
+        assert!(
+            rec.is_none(),
+            "event_wait should be cleared after normal return"
+        );
     }
 
     #[tokio::test]
@@ -362,13 +379,9 @@ mod tests {
         drop(tx);
         let stream: Arc<Mutex<Box<dyn EventStream>>> =
             Arc::new(Mutex::new(Box::new(ChannelStream { rx })));
-        let tool = WaitForExternalEventTool::new(
-            stream,
-            serde_json::json!({}),
-            None,
-            TaskId("t1".into()),
-        )
-        .with_timeout(Duration::from_secs(60));
+        let tool =
+            WaitForExternalEventTool::new(stream, serde_json::json!({}), None, TaskId("t1".into()))
+                .with_timeout(Duration::from_secs(60));
 
         let abort = CancellationToken::new();
         let ctx = make_tool_ctx(abort);
