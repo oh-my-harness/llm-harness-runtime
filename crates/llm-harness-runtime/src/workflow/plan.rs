@@ -13,7 +13,11 @@ use serde::Deserialize;
 use crate::error::Result;
 use crate::task::TaskId;
 use crate::task_store::TaskStore;
-use crate::workflow::model::{Edge, Step, StepId, Workflow};
+use crate::workflow::model::{Edge, Step, StepExecutionPolicy, StepId, Workflow};
+
+const MAX_STEP_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+const MAX_STEP_ATTEMPTS: u32 = 10;
+const MAX_STEP_RETRY_BACKOFF_MS: u64 = 5 * 60 * 1000;
 
 /// 校验 workflow 定义。任何来源（人类/LLM/外部）的 plan 都过此校验。
 ///
@@ -73,6 +77,7 @@ pub fn validate_workflow(wf: &Workflow) -> Result<()> {
         }
     }
     for step in &wf.steps {
+        validate_step_policy(step.id(), step.policy())?;
         match step {
             Step::Llm {
                 prompt,
@@ -121,6 +126,40 @@ pub fn validate_workflow(wf: &Workflow) -> Result<()> {
     Ok(())
 }
 
+fn validate_step_policy(step_id: &str, policy: Option<&StepExecutionPolicy>) -> Result<()> {
+    let Some(policy) = policy else {
+        return Ok(());
+    };
+    if let Some(timeout_ms) = policy.timeout_ms
+        && (timeout_ms == 0 || timeout_ms > MAX_STEP_TIMEOUT_MS)
+    {
+        anyhow::bail!(
+            "validate_workflow: step '{}' policy.timeout_ms must be between 1 and {}",
+            step_id,
+            MAX_STEP_TIMEOUT_MS
+        );
+    }
+    if let Some(max_attempts) = policy.max_attempts
+        && (max_attempts == 0 || max_attempts > MAX_STEP_ATTEMPTS)
+    {
+        anyhow::bail!(
+            "validate_workflow: step '{}' policy.max_attempts must be between 1 and {}",
+            step_id,
+            MAX_STEP_ATTEMPTS
+        );
+    }
+    if let Some(retry_backoff_ms) = policy.retry_backoff_ms
+        && retry_backoff_ms > MAX_STEP_RETRY_BACKOFF_MS
+    {
+        anyhow::bail!(
+            "validate_workflow: step '{}' policy.retry_backoff_ms must be <= {}",
+            step_id,
+            MAX_STEP_RETRY_BACKOFF_MS
+        );
+    }
+    Ok(())
+}
+
 /// LLM 提交 workflow 计划的 tool。注入到规划阶段的自由 task。
 ///
 /// LLM 调用：`submit_workflow(steps, edges, entry_step)` → 校验 + 落盘 + 返回 task_id。
@@ -156,7 +195,8 @@ fn plan_workflow_schema() -> serde_json::Value {
                             "id": { "type": "string" },
                             "name": { "type": "string" },
                             "prompt": { "type": "string", "description": "step agent 的指令（必填）" },
-                            "allowed_tools": { "type": "array", "items": { "type": "string" } }
+                            "allowed_tools": { "type": "array", "items": { "type": "string" } },
+                            "policy": step_policy_schema()
                         },
                         "required": ["kind", "id", "name", "prompt"]
                     },
@@ -167,7 +207,8 @@ fn plan_workflow_schema() -> serde_json::Value {
                             "id": { "type": "string" },
                             "name": { "type": "string" },
                             "executor_name": { "type": "string" },
-                            "config": { "type": "object" }
+                            "config": { "type": "object" },
+                            "policy": step_policy_schema()
                         },
                         "required": ["kind", "id", "name", "executor_name"]
                     }
@@ -185,6 +226,32 @@ fn plan_workflow_schema() -> serde_json::Value {
             "entry_step": { "type": "string" }
         },
         "required": ["steps", "edges", "entry_step"]
+    })
+}
+
+fn step_policy_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_STEP_TIMEOUT_MS,
+                "description": "Per-attempt timeout in milliseconds"
+            },
+            "max_attempts": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_STEP_ATTEMPTS,
+                "description": "Maximum execution attempts for step failures, including the first attempt"
+            },
+            "retry_backoff_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": MAX_STEP_RETRY_BACKOFF_MS,
+                "description": "Fixed delay before retrying a failed attempt"
+            }
+        }
     })
 }
 
@@ -337,6 +404,25 @@ mod tests {
             edges: vec![],
         };
         assert!(validate_workflow(&wf).is_err());
+    }
+
+    #[test]
+    fn invalid_step_policy_fails() {
+        let wf = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::executor("s1", "Executor", "json_transform", None).with_policy(
+                    StepExecutionPolicy {
+                        timeout_ms: Some(1_000),
+                        max_attempts: Some(0),
+                        retry_backoff_ms: Some(0),
+                    },
+                ),
+            ],
+            edges: vec![],
+        };
+        let err = validate_workflow(&wf).unwrap_err();
+        assert!(err.to_string().contains("policy.max_attempts"));
     }
 
     // ── PlanWorkflowTool 测试 ──────────────────────────────────────────────

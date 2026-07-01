@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use llm_harness_agent::{
@@ -701,7 +702,7 @@ impl WorkflowEngine {
             }
 
             // 4. Execute the step.
-            let step_result = match self.run_step(&step, step_abort.clone()).await {
+            let step_result = match self.run_step_with_policy(&step, step_abort.clone()).await {
                 Ok(r) => r,
                 Err(e) => {
                     let state = self.workflow_state.lock().await;
@@ -846,6 +847,85 @@ impl WorkflowEngine {
         match step {
             Step::Llm { .. } => self.run_llm_step(step, step_abort).await,
             Step::Executor { .. } => self.run_executor_step(step, step_abort).await,
+        }
+    }
+
+    /// Run a step with its optional runtime execution policy.
+    ///
+    /// Policy retries cover step execution failures only. A judge-produced
+    /// `Transition::Retry` remains a workflow transition and is still governed
+    /// by `with_max_retries`.
+    async fn run_step_with_policy(
+        &self,
+        step: &Step,
+        step_abort: CancellationToken,
+    ) -> Result<StepResult> {
+        let policy = step.policy().cloned().unwrap_or_default();
+        let max_attempts = policy.max_attempts.unwrap_or(1).max(1);
+        let timeout = policy.timeout_ms.map(Duration::from_millis);
+        let retry_backoff = Duration::from_millis(policy.retry_backoff_ms.unwrap_or(0));
+
+        for attempt in 1..=max_attempts {
+            if step_abort.is_cancelled() {
+                anyhow::bail!("step '{}' aborted", step.id());
+            }
+            let attempt_abort = step_abort.child_token();
+            let result = self
+                .run_step_attempt(step, attempt_abort.clone(), timeout)
+                .await;
+            match result {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    attempt_abort.cancel();
+                    if step_abort.is_cancelled() {
+                        return Err(err);
+                    }
+                    if attempt >= max_attempts {
+                        if max_attempts == 1 {
+                            return Err(err);
+                        }
+                        anyhow::bail!(
+                            "step '{}' failed after {} attempts: {}",
+                            step.id(),
+                            max_attempts,
+                            err
+                        );
+                    }
+                    if !retry_backoff.is_zero() {
+                        tokio::select! {
+                            biased;
+                            _ = step_abort.cancelled() => anyhow::bail!("step '{}' aborted", step.id()),
+                            _ = tokio::time::sleep(retry_backoff) => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        unreachable!("attempt loop must return on success or final failure")
+    }
+
+    async fn run_step_attempt(
+        &self,
+        step: &Step,
+        attempt_abort: CancellationToken,
+        timeout: Option<Duration>,
+    ) -> Result<StepResult> {
+        let Some(timeout) = timeout else {
+            return self.run_step(step, attempt_abort).await;
+        };
+        tokio::select! {
+            biased;
+            _ = attempt_abort.cancelled() => anyhow::bail!("step '{}' aborted", step.id()),
+            result = self.run_step(step, attempt_abort.clone()) => result,
+            _ = tokio::time::sleep(timeout) => {
+                attempt_abort.cancel();
+                anyhow::bail!(
+                    "step '{}' timed out after {} ms",
+                    step.id(),
+                    timeout.as_millis()
+                )
+            }
         }
     }
 
@@ -1519,6 +1599,7 @@ mod engine_tests {
     use crate::spawner::JsonlSessionFactory;
     use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
     use llm_harness_types::ExecutionEnv;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TestEnvFactory;
     impl EnvFactory for TestEnvFactory {
@@ -1588,6 +1669,30 @@ mod engine_tests {
     impl StepExecutor for BlockingExecutor {
         fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
             Box::pin(async move { std::future::pending::<Result<StepResult>>().await })
+        }
+    }
+
+    struct FlakyExecutor {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl StepExecutor for FlakyExecutor {
+        fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+            Box::pin(async move {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    anyhow::bail!("transient executor failure");
+                }
+                Ok(StepResult {
+                    output: format!("ok on attempt {attempt}"),
+                    structured: Some(serde_json::json!({ "attempt": attempt })),
+                    tool_calls_count: 0,
+                    session_id: String::new(),
+                    cost: CostAggregate::default(),
+                    started_at: None,
+                    ended_at: None,
+                })
+            })
         }
     }
 
@@ -1788,6 +1893,85 @@ mod engine_tests {
             client.call_count.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn step_policy_retries_executor_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let workflow = Workflow {
+            entry_step: "flaky".into(),
+            steps: vec![Step::executor("flaky", "Flaky", "flaky", None).with_policy(
+                crate::workflow::model::StepExecutionPolicy {
+                    timeout_ms: Some(1_000),
+                    max_attempts: Some(2),
+                    retry_backoff_ms: Some(0),
+                },
+            )],
+            edges: vec![],
+        };
+        let config = WorkflowEngineConfig {
+            client,
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+            .unwrap()
+            .with_executor(
+                "flaky",
+                Arc::new(FlakyExecutor {
+                    attempts: attempts.clone(),
+                }),
+            );
+
+        let result = engine.run().await.unwrap();
+        let history = engine.step_history().await;
+
+        assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].result.as_ref().unwrap().output,
+            "ok on attempt 2"
+        );
+        assert_eq!(result.turns, 1);
+    }
+
+    #[tokio::test]
+    async fn step_policy_times_out_blocking_executor() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let workflow = Workflow {
+            entry_step: "blocked".into(),
+            steps: vec![
+                Step::executor("blocked", "Blocked", "blocking", None).with_policy(
+                    crate::workflow::model::StepExecutionPolicy {
+                        timeout_ms: Some(20),
+                        max_attempts: Some(1),
+                        retry_backoff_ms: Some(0),
+                    },
+                ),
+            ],
+            edges: vec![],
+        };
+        let config = WorkflowEngineConfig {
+            client,
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+            .unwrap()
+            .with_executor("blocking", Arc::new(BlockingExecutor));
+
+        let err = engine.run().await.unwrap_err();
+
+        assert_eq!(engine.state().await, WorkflowStatus::Failed);
+        assert!(err.to_string().contains("timed out"));
     }
 
     #[tokio::test]

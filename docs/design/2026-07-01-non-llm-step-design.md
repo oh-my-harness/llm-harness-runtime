@@ -77,6 +77,8 @@ pub enum Step {
         name: String,
         prompt: String,
         allowed_tools: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<StepExecutionPolicy>,
     },
     /// Non-LLM step：调用注入的 executor，不构造 harness。
     Executor {
@@ -88,7 +90,18 @@ pub enum Step {
         /// 序列化友好，executor 自己解析。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<StepExecutionPolicy>,
     },
+}
+
+pub struct StepExecutionPolicy {
+    /// 单次执行尝试的 runtime 超时。None 表示不由 workflow runtime 统一超时。
+    pub timeout_ms: Option<u64>,
+    /// 执行失败后的最大尝试次数，包含第一次执行。None 等价于 1。
+    pub max_attempts: Option<u32>,
+    /// 每次失败重试前的固定等待时间。None 等价于 0。
+    pub retry_backoff_ms: Option<u64>,
 }
 ```
 
@@ -98,6 +111,7 @@ pub enum Step {
 2. **兼容旧 LLM step**：新写出的 `Step` 会带 `kind`，但反序列化兼容旧的无 `kind` LLM step JSON，避免已有 TaskStore 存档和调用方计划直接失效。
 3. **executor step 不需要 `prompt` / `allowed_tools`**：enum 变体只携带自己需要的字段。
 4. **`config: Option<serde_json::Value>`**：executor 自定义 schema，引擎不需要知道参数细节，保持开放扩展。
+5. **`policy: Option<StepExecutionPolicy>`**：LLM step 和 executor step 共用同一套 runtime 执行策略，旧 plan 不带该字段时保持原行为。
 
 ### 辅助方法
 
@@ -240,14 +254,18 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 
 5. **事件流**：executor step 发 `WorkflowEvent::StepStarted` / `StepFinished`（与 LLM step 一致），外部订阅者无需区分 step 类型。
 
+6. **执行策略**：step 可选 `policy` 由 runtime 统一执行，覆盖 LLM step 与 executor step。
+   `timeout_ms` 是单次 attempt 超时；`max_attempts` 只针对 step 执行错误重试，不改变
+   judge 返回 `Transition::Retry` 的语义；`retry_backoff_ms` 是失败 attempt 之间的固定等待。
+
 ## 受影响的代码
 
 | 文件 | 变更 |
 |------|------|
 | `model.rs` | `Step` 结构体 → enum；新增辅助方法 `id()` / `name()` |
 | `executor.rs` | **新增**：`StepExecutor` trait、`JsonTransformExecutor`、显式注册用 `ShellExecutor` / `HttpCallExecutor` |
-| `engine.rs` | `run_step` → `run_llm_step`（pattern match）；新增 `run_executor_step`；新增 `step_executors` 字段 + `with_executor` builder；`from_parts_with_state` 初始化 `step_executors`；`step_tools_cache` 构造 match；`new_free_task` 构造 `Step::Llm` |
-| `plan.rs` | `validate_workflow` 里 `s.id` → `s.id()`；`PlanWorkflowTool` 的 `PlanInput` 适配 enum |
+| `engine.rs` | `run_step` → `run_llm_step`（pattern match）；新增 `run_executor_step`；新增 `step_executors` 字段 + `with_executor` builder；`from_parts_with_state` 初始化 `step_executors`；`step_tools_cache` 构造 match；`new_free_task` 构造 `Step::Llm`；统一执行 `StepExecutionPolicy` |
+| `plan.rs` | `validate_workflow` 里 `s.id` → `s.id()`；`PlanWorkflowTool` 的 `PlanInput` 适配 enum；校验 step `policy` 上限 |
 | `gate.rs` | `step_tools` 映射构造适配（executor step → 空 Vec） |
 | `judge.rs` | `StepCtx.current_step: &Step` 类型不变，但实现可能需要 match |
 | `mod.rs` | 新增 `pub mod executor;` |
@@ -262,6 +280,8 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 - 反序列化兼容旧的无 `kind` LLM step JSON；新序列化格式统一输出带
   `kind` 的 tagged enum。
 - 新增 `workflow::executor::{StepExecutor, ExecutorCtx}`。
+- 新增 `StepExecutionPolicy`，支持 step 级 `timeout_ms`、`max_attempts`、
+  `retry_backoff_ms`；runtime 对 LLM step 和 executor step 统一执行该策略。
 - `WorkflowEngine::with_executor(name, executor)` 支持业务层注入 executor。
 - `json_transform` 是默认注册的内置 executor；业务层可以用
   `with_executor("json_transform", ...)` 覆盖。
@@ -305,6 +325,39 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 - `unregistered_executor_fails_task`
 - `cancel_executor_step_marks_task_cancelled`
 - `executor_step_requires_executor_name`
+- `step_execution_policy_roundtrip`
+- `invalid_step_policy_fails`
+- `step_policy_retries_executor_failure`
+- `step_policy_times_out_blocking_executor`
+
+## 运行时执行策略
+
+每个 step 可选配置 `policy`：
+
+```json
+{
+  "policy": {
+    "timeout_ms": 30000,
+    "max_attempts": 3,
+    "retry_backoff_ms": 500
+  }
+}
+```
+
+语义：
+
+- `timeout_ms`：单次 attempt 的 runtime 超时。超时会取消当前 attempt。
+- `max_attempts`：执行失败后的最大尝试次数，包含第一次执行。缺省为 1。
+- `retry_backoff_ms`：失败 attempt 之间的固定等待时间，缺省为 0。
+- 该策略同时适用于 LLM step 和 executor step。
+- 该策略只处理 step 执行错误；业务 judge 返回的 `Transition::Retry` 仍由
+  `WorkflowEngine::with_max_retries` 管控。
+
+校验上限：
+
+- `timeout_ms`: `1..=86_400_000`。
+- `max_attempts`: `1..=10`。
+- `retry_backoff_ms`: `0..=300_000`。
 
 ## 内置 Executor
 
@@ -444,7 +497,9 @@ WorkflowEngine::new(workflow, config, judge)?
 ## 错误处理
 
 - executor 未注册 → `Err`，step 失败 → task Failed（与 LLM step 失败一致）
-- executor.execute 返回 `Err` → step 失败 → task Failed
+- executor.execute 返回 `Err` → 若 step 配置了 `policy.max_attempts > 1`，runtime 自动重试；最终仍失败则 task Failed
+- LLM step 执行返回 `Err` → 与 executor step 一样受 `policy.max_attempts` 管控；最终仍失败则 task Failed
+- step `policy.timeout_ms` 超时 → 当前 attempt 被取消；若还有剩余 attempt 则重试，否则 task Failed
 - executor 内部 IO 超时 → executor 自己处理，返回 `Err` 或部分结果
 - abort 传播 → `Err("executor step aborted")`
 
@@ -454,3 +509,4 @@ WorkflowEngine::new(workflow, config, judge)?
 2. ~~`PlanWorkflowTool` 是否需要支持 LLM 生成 executor step？~~ **已解决**：schema 支持 executor step；真正可执行的 executor 仍由业务层显式注册。
 3. ~~executor step 的 `WorkflowEvent` 是否需要区分类型（如 `ExecutorStepStarted`）？~~ **已决策**：初版不区分，统一使用 `StepStarted` / `StepFinished`。
 4. ~~HttpCall executor 的安全策略、代码实现和本地网络边界测试是否落地？~~ **已解决**：`HttpCallExecutor` 已提供显式注册实现，并覆盖 host/scheme/method allowlist、redirect 复验、响应截断、敏感 header 脱敏、body 互斥和非预期状态。DNS 解析后的私网 IP 复验仍属于部署层网络隔离范围。
+5. ~~生产 runtime 是否需要 step 级超时和执行失败重试？~~ **已解决**：`StepExecutionPolicy` 已落地，LLM step 与 executor step 共用同一套 `timeout_ms` / `max_attempts` / `retry_backoff_ms` 语义。

@@ -37,6 +37,9 @@ pub enum Step {
         /// 本步允许的工具集。空 Vec = 不允许任何工具（字面语义，无 sentinel）。
         #[serde(default)]
         allowed_tools: Vec<String>,
+        /// Optional runtime execution policy for this step.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<StepExecutionPolicy>,
     },
     /// Non-LLM step: execute a registered deterministic executor.
     Executor {
@@ -49,7 +52,24 @@ pub enum Step {
         /// Executor-specific JSON config.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config: Option<serde_json::Value>,
+        /// Optional runtime execution policy for this step.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<StepExecutionPolicy>,
     },
+}
+
+/// Runtime policy applied uniformly to LLM and executor steps.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepExecutionPolicy {
+    /// Per-attempt timeout in milliseconds. Absent means no runtime step timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Maximum execution attempts for step execution failures. Includes the first attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    /// Fixed delay before retrying a failed attempt, in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_backoff_ms: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for Step {
@@ -66,6 +86,8 @@ impl<'de> Deserialize<'de> for Step {
                 prompt: String,
                 #[serde(default)]
                 allowed_tools: Vec<String>,
+                #[serde(default)]
+                policy: Option<StepExecutionPolicy>,
             },
             Executor {
                 id: StepId,
@@ -73,6 +95,8 @@ impl<'de> Deserialize<'de> for Step {
                 executor_name: String,
                 #[serde(default)]
                 config: Option<serde_json::Value>,
+                #[serde(default)]
+                policy: Option<StepExecutionPolicy>,
             },
         }
 
@@ -99,22 +123,26 @@ impl<'de> Deserialize<'de> for Step {
                 name,
                 prompt,
                 allowed_tools,
+                policy,
             }) => Ok(Self::Llm {
                 id,
                 name,
                 prompt,
                 allowed_tools,
+                policy,
             }),
             StepCompat::Tagged(TaggedStep::Executor {
                 id,
                 name,
                 executor_name,
                 config,
+                policy,
             }) => Ok(Self::Executor {
                 id,
                 name,
                 executor_name,
                 config,
+                policy,
             }),
             StepCompat::LegacyLlm(LegacyLlmStep {
                 id,
@@ -126,6 +154,7 @@ impl<'de> Deserialize<'de> for Step {
                 name,
                 prompt,
                 allowed_tools,
+                policy: None,
             }),
         }
     }
@@ -143,6 +172,7 @@ impl Step {
             name: name.into(),
             prompt: prompt.into(),
             allowed_tools,
+            policy: None,
         }
     }
 
@@ -157,7 +187,18 @@ impl Step {
             name: name.into(),
             executor_name: executor_name.into(),
             config,
+            policy: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_policy(mut self, policy: StepExecutionPolicy) -> Self {
+        match &mut self {
+            Self::Llm { policy: slot, .. } | Self::Executor { policy: slot, .. } => {
+                *slot = Some(policy);
+            }
+        }
+        self
     }
 
     pub fn id(&self) -> &StepId {
@@ -169,6 +210,12 @@ impl Step {
     pub fn name(&self) -> &str {
         match self {
             Self::Llm { name, .. } | Self::Executor { name, .. } => name,
+        }
+    }
+
+    pub fn policy(&self) -> Option<&StepExecutionPolicy> {
+        match self {
+            Self::Llm { policy, .. } | Self::Executor { policy, .. } => policy.as_ref(),
         }
     }
 
@@ -386,6 +433,30 @@ mod tests {
         let back: Step = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id(), "exec");
         assert_eq!(back.executor_name(), Some("json_transform"));
+    }
+
+    #[test]
+    fn step_execution_policy_roundtrip() {
+        let step = Step::executor("exec", "Executor", "json_transform", None).with_policy(
+            StepExecutionPolicy {
+                timeout_ms: Some(1_000),
+                max_attempts: Some(3),
+                retry_backoff_ms: Some(25),
+            },
+        );
+        let json = serde_json::to_string(&step).unwrap();
+        assert!(json.contains("\"policy\""));
+
+        let back: Step = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            back.policy(),
+            Some(&StepExecutionPolicy {
+                timeout_ms: Some(1_000),
+                max_attempts: Some(3),
+                retry_backoff_ms: Some(25),
+            })
+        );
     }
 
     #[test]
