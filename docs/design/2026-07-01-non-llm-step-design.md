@@ -60,7 +60,7 @@ workflow 引擎（`crates/llm-harness-runtime/src/workflow/`）的初始执行�
 ### Executor 定义模型
 
 - 定义 `StepExecutor` trait，业务层实现。
-- 内置几个常用实现（HttpCall、Script、JsonTransform）开箱即用。
+- 提供常用 executor：`json_transform` 默认可用；`shell` 需业务层显式注册；`http_call` 仍待实现，必须先定义安全边界。
 - executor 通过 `config: Option<serde_json::Value>` 携带参数，executor 自己解析 schema。
 
 ## 数据模型设计
@@ -350,9 +350,87 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 - 必须设置命令 allowlist；不支持任意 shell script 文本。
 - stdout/stderr 会按 executor 的 `max_output_bytes` 截断后写入 `StepResult.structured`。
 
-仍计划内置的实现，具体安全边界留待后续：
+仍计划实现的 executor：
 
 - **HttpCallExecutor**：调 HTTP API，config 含 `url` / `method` / `headers` / `body`
+
+### HttpCallExecutor 设计（待实现）
+
+`HttpCallExecutor` 不应默认注册。HTTP 调用具备 SSRF、凭据外泄、响应过大和
+审计脱敏风险，应采用与 `ShellExecutor` 类似的显式注册策略：
+
+```rust
+WorkflowEngine::new(workflow, config, judge)?
+    .with_executor("http_call", Arc::new(HttpCallExecutor::new(policy)));
+```
+
+建议的 `HttpCallPolicy`：
+
+- `allowed_hosts`：必填，精确 host allowlist。初版不支持通配符。
+- `allowed_schemes`：默认仅 `https`；`http` 必须显式开启。
+- `allowed_methods`：默认 `GET` / `POST`。
+- `max_timeout_ms`：请求超时上限，默认建议 30 秒。
+- `max_request_bytes`：请求 body 上限，默认建议 1 MiB。
+- `max_response_bytes`：响应 body 上限，默认建议 1 MiB。
+- `allow_redirects`：默认 `false`；若开启，每次 redirect 后必须重新校验 scheme/host。
+- `redact_headers`：默认包含 `authorization`、`cookie`、`set-cookie`、`x-api-key`。
+- `allow_private_ip_targets`：默认 `false`。如果实现层无法可靠校验 DNS 解析后的
+  private/link-local/loopback 地址，则文档和错误信息必须明确说明 SSRF 防护只覆盖
+  scheme/host allowlist，不应宣称完整网络边界隔离。
+
+`http_call` config：
+
+- `url`：必填，必须是绝对 URL，且 scheme/host 命中 policy。
+- `method`：可选，默认 `GET`，必须命中 policy。
+- `headers`：可选对象，key/value 均为字符串；写入 `StepResult.structured`
+  前必须按 policy 脱敏。
+- `query`：可选对象，key/value 支持字符串、数字、布尔值。
+- `body_json`：可选 JSON body。
+- `body_text`：可选文本 body。
+- `timeout_ms`：可选，不能超过 policy 上限。
+- `expect_status`：可选数组或范围；默认接受 `200..299`。
+- `response_format`：可选，`json` / `text` / `bytes_base64`，默认按
+  `content-type` 自动判断，未知类型按文本截断。
+
+互斥规则：
+
+- `body_json` 与 `body_text` 不能同时存在。
+- `GET` / `HEAD` 不允许 body。
+- `headers` 中不允许注入 hop-by-hop header，例如 `connection`、`transfer-encoding`。
+
+`StepResult` 建议结构：
+
+```json
+{
+  "status": 200,
+  "url": "https://api.example.com/v1/items",
+  "method": "GET",
+  "headers": {"content-type": "application/json"},
+  "body": {"items": []},
+  "body_truncated": false,
+  "elapsed_ms": 123
+}
+```
+
+错误处理：
+
+- host/scheme/method 不在 allowlist → `Err`，step 失败。
+- timeout → `Err`，step 失败。
+- 响应超过 `max_response_bytes` → 截断并设置 `body_truncated = true`；
+  如果业务要求完整响应，可由 policy 改成直接 `Err`。
+- `expect_status` 不匹配 → `Err`，错误中只包含脱敏后的摘要。
+- redirect 目标不合法 → `Err`。
+
+测试要求：
+
+- allowlist 命中和不命中。
+- 禁止 `http` 默认访问。
+- 禁止 redirect 到未授权 host。
+- timeout。
+- response size 截断。
+- sensitive header 脱敏。
+- `body_json` / `body_text` 互斥。
+- 非 2xx 或 `expect_status` 不匹配。
 
 ## 错误处理（待细化）
 
@@ -366,5 +444,4 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 1. ~~`StepCtx.last_result` 是 `&StepResult`（非 Option），workflow 第一步无前驱结果时如何处理？~~ **已解决**：引入 `ExecutorCtx`，`prev_result: Option<&StepResult>` 明确表达可能无前驱结果。LLM step 的 `StepCtx` 不变（`last_result` 语义是 "当前步执行完的结果"，在 `decide_transition` 中构造，此时已有结果）。
 2. ~~`PlanWorkflowTool` 是否需要支持 LLM 生成 executor step？~~ **已解决**：schema 支持 executor step；真正可执行的 executor 仍由业务层显式注册。
 3. ~~executor step 的 `WorkflowEvent` 是否需要区分类型（如 `ExecutorStepStarted`）？~~ **已决策**：初版不区分，统一使用 `StepStarted` / `StepFinished`。
-4. HttpCall executor 的 host allowlist、超时、响应大小上限与 header/body
-   redaction 策略仍需单独设计。
+4. HttpCall executor 的安全策略已在本文补充；代码实现、依赖选择和网络边界测试仍待落地。
