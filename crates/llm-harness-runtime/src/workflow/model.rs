@@ -255,9 +255,70 @@ pub struct Edge {
     pub from: StepId,
     /// 目标步骤 ID。
     pub to: StepId,
-    /// 跳转条件标识（judge 识别，如 "thickness_ok"）。None = 无条件顺序跳转。
-    /// 注意：这是 judge 识别的标识，不是 runtime 求值的表达式。
-    pub condition: Option<String>,
+    /// Optional transition condition. A string is a legacy/custom judge label;
+    /// an object is a runtime-evaluable declarative condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<EdgeCondition>,
+}
+
+/// Edge condition. String labels remain supported for custom judges; structured
+/// expressions can be evaluated by the built-in `EdgeConditionJudge`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EdgeCondition {
+    Label(String),
+    Expr(ConditionExpr),
+}
+
+/// Declarative condition evaluated against `StepResult.structured`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ConditionExpr {
+    Exists {
+        pointer: String,
+    },
+    Missing {
+        pointer: String,
+    },
+    Eq {
+        pointer: String,
+        value: serde_json::Value,
+    },
+    Ne {
+        pointer: String,
+        value: serde_json::Value,
+    },
+    Gt {
+        pointer: String,
+        value: f64,
+    },
+    Gte {
+        pointer: String,
+        value: f64,
+    },
+    Lt {
+        pointer: String,
+        value: f64,
+    },
+    Lte {
+        pointer: String,
+        value: f64,
+    },
+}
+
+impl ConditionExpr {
+    pub fn pointer(&self) -> &str {
+        match self {
+            Self::Exists { pointer }
+            | Self::Missing { pointer }
+            | Self::Eq { pointer, .. }
+            | Self::Ne { pointer, .. }
+            | Self::Gt { pointer, .. }
+            | Self::Gte { pointer, .. }
+            | Self::Lt { pointer, .. }
+            | Self::Lte { pointer, .. } => pointer,
+        }
+    }
 }
 
 /// task 生命周期状态（原 TaskState enum 的变体降为此枚举）。
@@ -371,6 +432,8 @@ pub enum Transition {
     To(StepId),
     /// 重跑当前步（step agent 重新 spawn，新建 harness）。
     Retry,
+    /// Fail the workflow with a reason.
+    Fail { reason: String },
     /// 终止流程。
     Abort { reason: String },
 }
@@ -400,6 +463,45 @@ mod tests {
         let back: Workflow = serde_json::from_str(&json).unwrap();
         assert_eq!(back.entry_step, "a");
         assert_eq!(back.steps.len(), 1);
+    }
+
+    #[test]
+    fn edge_condition_legacy_label_roundtrip() {
+        let edge = Edge {
+            from: "a".into(),
+            to: "b".into(),
+            condition: Some(EdgeCondition::Label("ok".into())),
+        };
+        let json = serde_json::to_string(&edge).unwrap();
+        assert!(json.contains("\"condition\":\"ok\""));
+
+        let back: Edge = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.condition, Some(EdgeCondition::Label("ok".into())));
+    }
+
+    #[test]
+    fn edge_condition_expression_roundtrip() {
+        let edge = Edge {
+            from: "a".into(),
+            to: "b".into(),
+            condition: Some(EdgeCondition::Expr(ConditionExpr::Eq {
+                pointer: "/status".into(),
+                value: serde_json::json!("ok"),
+            })),
+        };
+        let json = serde_json::to_string(&edge).unwrap();
+        assert!(json.contains("\"op\":\"eq\""));
+
+        let back: Edge = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            back.condition,
+            Some(EdgeCondition::Expr(ConditionExpr::Eq {
+                pointer: "/status".into(),
+                value: serde_json::json!("ok"),
+            }))
+        );
     }
 
     #[test]
@@ -481,6 +583,11 @@ mod tests {
         };
         let json2 = serde_json::to_string(&t2).unwrap();
         assert!(json2.contains("\"abort\""));
+        let t3 = Transition::Fail {
+            reason: "bad".into(),
+        };
+        let json3 = serde_json::to_string(&t3).unwrap();
+        assert!(json3.contains("\"fail\""));
     }
 
     #[test]

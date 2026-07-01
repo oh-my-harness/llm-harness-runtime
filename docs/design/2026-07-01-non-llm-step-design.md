@@ -56,6 +56,7 @@ workflow 引擎（`crates/llm-harness-runtime/src/workflow/`）的初始执行�
 - executor 产出 `StepResult` 后，**仍由 `judge.decide` 决定跳转**。
 - executor 不返回 `Transition`，职责单一：执行 + 产出结果。
 - judge 可以是纯函数逻辑（确定性路由）或 LLM 逻辑，保持现有 trait 接口不变。
+- runtime 提供内置 `EdgeConditionJudge`，可直接按 `edges.condition` 中的结构化条件路由；复杂业务仍可注入自定义 judge。
 
 ### Executor 定义模型
 
@@ -103,6 +104,32 @@ pub struct StepExecutionPolicy {
     /// 每次失败重试前的固定等待时间。None 等价于 0。
     pub retry_backoff_ms: Option<u64>,
 }
+
+pub struct Edge {
+    pub from: StepId,
+    pub to: StepId,
+    pub condition: Option<EdgeCondition>,
+}
+
+#[serde(untagged)]
+pub enum EdgeCondition {
+    /// 兼容旧 plan：字符串标签仍交给自定义 judge 解释。
+    Label(String),
+    /// runtime 内置可求值条件。
+    Expr(ConditionExpr),
+}
+
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ConditionExpr {
+    Exists { pointer: String },
+    Missing { pointer: String },
+    Eq { pointer: String, value: serde_json::Value },
+    Ne { pointer: String, value: serde_json::Value },
+    Gt { pointer: String, value: f64 },
+    Gte { pointer: String, value: f64 },
+    Lt { pointer: String, value: f64 },
+    Lte { pointer: String, value: f64 },
+}
 ```
 
 **关键点**：
@@ -112,6 +139,7 @@ pub struct StepExecutionPolicy {
 3. **executor step 不需要 `prompt` / `allowed_tools`**：enum 变体只携带自己需要的字段。
 4. **`config: Option<serde_json::Value>`**：executor 自定义 schema，引擎不需要知道参数细节，保持开放扩展。
 5. **`policy: Option<StepExecutionPolicy>`**：LLM step 和 executor step 共用同一套 runtime 执行策略，旧 plan 不带该字段时保持原行为。
+6. **`Edge.condition` 向后兼容**：旧字符串条件仍是自定义 judge 标签；对象条件由内置 `EdgeConditionJudge` 根据 `StepResult.structured` 求值。
 
 ### 辅助方法
 
@@ -258,16 +286,20 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
    `timeout_ms` 是单次 attempt 超时；`max_attempts` 只针对 step 执行错误重试，不改变
    judge 返回 `Transition::Retry` 的语义；`retry_backoff_ms` 是失败 attempt 之间的固定等待。
 
+7. **声明式条件路由**：内置 `EdgeConditionJudge` 按 edge 顺序求值结构化条件，命中第一个条件即
+   `Transition::To(edge.to)`；若没有条件命中但存在唯一无条件边，则走该 fallback；若没有匹配也没有 fallback，则
+   返回 `Transition::Fail`，task 进入 Failed。
+
 ## 受影响的代码
 
 | 文件 | 变更 |
 |------|------|
-| `model.rs` | `Step` 结构体 → enum；新增辅助方法 `id()` / `name()` |
+| `model.rs` | `Step` 结构体 → enum；新增辅助方法 `id()` / `name()`；新增 `EdgeCondition` / `ConditionExpr` / `Transition::Fail` |
 | `executor.rs` | **新增**：`StepExecutor` trait、`JsonTransformExecutor`、显式注册用 `ShellExecutor` / `HttpCallExecutor` |
 | `engine.rs` | `run_step` → `run_llm_step`（pattern match）；新增 `run_executor_step`；新增 `step_executors` 字段 + `with_executor` builder；`from_parts_with_state` 初始化 `step_executors`；`step_tools_cache` 构造 match；`new_free_task` 构造 `Step::Llm`；统一执行 `StepExecutionPolicy` |
-| `plan.rs` | `validate_workflow` 里 `s.id` → `s.id()`；`PlanWorkflowTool` 的 `PlanInput` 适配 enum；校验 step `policy` 上限 |
+| `plan.rs` | `validate_workflow` 里 `s.id` → `s.id()`；`PlanWorkflowTool` 的 `PlanInput` 适配 enum；校验 step `policy` 上限和 edge 条件格式 |
 | `gate.rs` | `step_tools` 映射构造适配（executor step → 空 Vec） |
-| `judge.rs` | `StepCtx.current_step: &Step` 类型不变，但实现可能需要 match |
+| `judge.rs` | `StepCtx.current_step: &Step` 类型不变；新增内置 `EdgeConditionJudge` |
 | `mod.rs` | 新增 `pub mod executor;` |
 
 ## 当前实现状态
@@ -282,6 +314,9 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 - 新增 `workflow::executor::{StepExecutor, ExecutorCtx}`。
 - 新增 `StepExecutionPolicy`，支持 step 级 `timeout_ms`、`max_attempts`、
   `retry_backoff_ms`；runtime 对 LLM step 和 executor step 统一执行该策略。
+- 新增 `EdgeCondition` / `ConditionExpr`，支持 runtime 内置声明式条件路由。
+- 新增 `EdgeConditionJudge`，可按 `StepResult.structured` 和 edge 条件决定跳转；复杂业务仍可继续使用自定义 `StepTransitionJudge`。
+- 新增 `Transition::Fail`，用于路由失败、声明式条件无匹配等明确失败场景，区别于正常终止用的 `Transition::Abort`。
 - `WorkflowEngine::with_executor(name, executor)` 支持业务层注入 executor。
 - `json_transform` 是默认注册的内置 executor；业务层可以用
   `with_executor("json_transform", ...)` 覆盖。
@@ -329,6 +364,14 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 - `invalid_step_policy_fails`
 - `step_policy_retries_executor_failure`
 - `step_policy_times_out_blocking_executor`
+- `edge_condition_legacy_label_roundtrip`
+- `edge_condition_expression_roundtrip`
+- `invalid_edge_condition_pointer_fails`
+- `edge_condition_judge_takes_first_matching_condition`
+- `edge_condition_judge_falls_back_to_unconditional_edge`
+- `edge_condition_judge_fails_when_no_condition_matches`
+- `edge_condition_judge_fails_legacy_label_without_custom_judge`
+- `transition_fail_marks_task_failed`
 
 ## 运行时执行策略
 
@@ -358,6 +401,39 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 - `timeout_ms`: `1..=86_400_000`。
 - `max_attempts`: `1..=10`。
 - `retry_backoff_ms`: `0..=300_000`。
+
+## 声明式条件路由
+
+对于常见分支，可以不用业务层手写 judge，而是使用内置 `EdgeConditionJudge`：
+
+```rust
+let judge = Arc::new(EdgeConditionJudge::from_workflow(&workflow));
+let engine = WorkflowEngine::new(workflow, config, judge)?;
+```
+
+edge 条件示例：
+
+```json
+{
+  "from": "inspect",
+  "to": "approve",
+  "condition": { "op": "eq", "pointer": "/status", "value": "ok" }
+}
+```
+
+支持的 `op`：
+
+- `exists` / `missing`：判断 `StepResult.structured` 中 JSON Pointer 是否存在。
+- `eq` / `ne`：按 JSON 值比较。
+- `gt` / `gte` / `lt` / `lte`：按数字比较。
+
+路由规则：
+
+- 只读取 `StepResult.structured`，不解析自然语言 `output`。
+- 按 workflow 中 edge 顺序求值，命中第一个结构化条件就跳转到该 edge 的 `to`。
+- 若结构化条件都不匹配，但存在唯一无条件 edge，则使用该 edge 作为 fallback。
+- 若没有匹配也没有 fallback，则返回 `Transition::Fail`，task 标记为 Failed。
+- 旧字符串 `condition` 仍保留为自定义 judge 标签；内置 `EdgeConditionJudge` 不猜测字符串标签语义，遇到仅有字符串条件时会返回 `Transition::Fail`。
 
 ## 内置 Executor
 
@@ -501,6 +577,8 @@ WorkflowEngine::new(workflow, config, judge)?
 - LLM step 执行返回 `Err` → 与 executor step 一样受 `policy.max_attempts` 管控；最终仍失败则 task Failed
 - step `policy.timeout_ms` 超时 → 当前 attempt 被取消；若还有剩余 attempt 则重试，否则 task Failed
 - executor 内部 IO 超时 → executor 自己处理，返回 `Err` 或部分结果
+- `EdgeConditionJudge` 无匹配条件且无 fallback → `Transition::Fail` → task Failed
+- 自定义 judge 返回 `Transition::Fail` → task Failed
 - abort 传播 → `Err("executor step aborted")`
 
 ## 待解决问题
@@ -510,3 +588,4 @@ WorkflowEngine::new(workflow, config, judge)?
 3. ~~executor step 的 `WorkflowEvent` 是否需要区分类型（如 `ExecutorStepStarted`）？~~ **已决策**：初版不区分，统一使用 `StepStarted` / `StepFinished`。
 4. ~~HttpCall executor 的安全策略、代码实现和本地网络边界测试是否落地？~~ **已解决**：`HttpCallExecutor` 已提供显式注册实现，并覆盖 host/scheme/method allowlist、redirect 复验、响应截断、敏感 header 脱敏、body 互斥和非预期状态。DNS 解析后的私网 IP 复验仍属于部署层网络隔离范围。
 5. ~~生产 runtime 是否需要 step 级超时和执行失败重试？~~ **已解决**：`StepExecutionPolicy` 已落地，LLM step 与 executor step 共用同一套 `timeout_ms` / `max_attempts` / `retry_backoff_ms` 语义。
+6. ~~常见条件分支是否必须业务层手写 judge？~~ **已解决**：内置 `EdgeConditionJudge` 已落地，支持基于 `StepResult.structured` 的声明式 edge 条件；复杂业务仍可注入自定义 judge。

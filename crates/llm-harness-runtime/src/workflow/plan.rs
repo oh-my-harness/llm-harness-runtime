@@ -13,7 +13,9 @@ use serde::Deserialize;
 use crate::error::Result;
 use crate::task::TaskId;
 use crate::task_store::TaskStore;
-use crate::workflow::model::{Edge, Step, StepExecutionPolicy, StepId, Workflow};
+use crate::workflow::model::{
+    ConditionExpr, Edge, EdgeCondition, Step, StepExecutionPolicy, StepId, Workflow,
+};
 
 const MAX_STEP_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_STEP_ATTEMPTS: u32 = 10;
@@ -66,6 +68,7 @@ pub fn validate_workflow(wf: &Workflow) -> Result<()> {
         if !step_ids.contains(edge.to.as_str()) {
             anyhow::bail!("validate_workflow: edge to '{}' not in steps", edge.to);
         }
+        validate_edge_condition(edge)?;
     }
     let has_incoming = |id: &str| wf.edges.iter().any(|e| e.to == id);
     for step in &wf.steps {
@@ -160,6 +163,53 @@ fn validate_step_policy(step_id: &str, policy: Option<&StepExecutionPolicy>) -> 
     Ok(())
 }
 
+fn validate_edge_condition(edge: &Edge) -> Result<()> {
+    let Some(condition) = &edge.condition else {
+        return Ok(());
+    };
+    match condition {
+        EdgeCondition::Label(label) => {
+            if label.is_empty() {
+                anyhow::bail!(
+                    "validate_workflow: edge '{} -> {}' has empty condition label",
+                    edge.from,
+                    edge.to
+                );
+            }
+        }
+        EdgeCondition::Expr(expr) => {
+            validate_condition_pointer(edge, expr.pointer())?;
+            match expr {
+                ConditionExpr::Gt { value, .. }
+                | ConditionExpr::Gte { value, .. }
+                | ConditionExpr::Lt { value, .. }
+                | ConditionExpr::Lte { value, .. }
+                    if !value.is_finite() =>
+                {
+                    anyhow::bail!(
+                        "validate_workflow: edge '{} -> {}' numeric condition value must be finite",
+                        edge.from,
+                        edge.to
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_condition_pointer(edge: &Edge, pointer: &str) -> Result<()> {
+    if pointer.is_empty() || pointer.starts_with('/') {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "validate_workflow: edge '{} -> {}' condition pointer must be empty or start with '/'",
+        edge.from,
+        edge.to
+    )
+}
+
 /// LLM 提交 workflow 计划的 tool。注入到规划阶段的自由 task。
 ///
 /// LLM 调用：`submit_workflow(steps, edges, entry_step)` → 校验 + 落盘 + 返回 task_id。
@@ -214,18 +264,72 @@ fn plan_workflow_schema() -> serde_json::Value {
                     }
                 ]
             }},
-            "edges": { "type": "array", "items": {
-                "type": "object",
-                "properties": {
-                    "from": { "type": "string" },
-                    "to": { "type": "string" },
-                    "condition": { "type": "string" }
-                },
-                "required": ["from", "to"]
-            }},
+            "edges": { "type": "array", "items": edge_schema() },
             "entry_step": { "type": "string" }
         },
         "required": ["steps", "edges", "entry_step"]
+    })
+}
+
+fn edge_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "from": { "type": "string" },
+            "to": { "type": "string" },
+            "condition": condition_schema()
+        },
+        "required": ["from", "to"]
+    })
+}
+
+fn condition_schema() -> serde_json::Value {
+    serde_json::json!({
+        "oneOf": [
+            {
+                "type": "string",
+                "description": "Legacy/custom judge condition label"
+            },
+            condition_expr_schema()
+        ]
+    })
+}
+
+fn condition_expr_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "oneOf": [
+            {
+                "properties": {
+                    "op": { "type": "string", "const": "exists" },
+                    "pointer": { "type": "string" }
+                },
+                "required": ["op", "pointer"]
+            },
+            {
+                "properties": {
+                    "op": { "type": "string", "const": "missing" },
+                    "pointer": { "type": "string" }
+                },
+                "required": ["op", "pointer"]
+            },
+            {
+                "properties": {
+                    "op": { "type": "string", "enum": ["eq", "ne"] },
+                    "pointer": { "type": "string" },
+                    "value": {}
+                },
+                "required": ["op", "pointer", "value"]
+            },
+            {
+                "properties": {
+                    "op": { "type": "string", "enum": ["gt", "gte", "lt", "lte"] },
+                    "pointer": { "type": "string" },
+                    "value": { "type": "number" }
+                },
+                "required": ["op", "pointer", "value"]
+            }
+        ]
     })
 }
 
@@ -407,6 +511,16 @@ mod tests {
     }
 
     #[test]
+    fn invalid_edge_condition_pointer_fails() {
+        let mut wf = make_valid_workflow();
+        wf.edges[0].condition = Some(EdgeCondition::Expr(ConditionExpr::Exists {
+            pointer: "status".into(),
+        }));
+        let err = validate_workflow(&wf).unwrap_err();
+        assert!(err.to_string().contains("condition pointer"));
+    }
+
+    #[test]
     fn invalid_step_policy_fails() {
         let wf = Workflow {
             entry_step: "s1".into(),
@@ -467,13 +581,17 @@ mod tests {
                 {"kind": "llm", "id": "s1", "name": "A", "prompt": "do A", "allowed_tools": ["t1"]},
                 {"kind": "llm", "id": "s2", "name": "B", "prompt": "do B", "allowed_tools": []}
             ],
-            "edges": [{"from": "s1", "to": "s2"}],
+            "edges": [{"from": "s1", "to": "s2", "condition": {"op": "eq", "pointer": "/status", "value": "ok"}}],
             "entry_step": "s1"
         });
         let result = tool.execute(args, &make_tool_ctx()).await.unwrap();
         assert!(!result.terminate);
         let wf = store.load_workflow(&task_id).await.unwrap().unwrap();
         assert_eq!(wf.entry_step, "s1");
+        assert!(matches!(
+            wf.edges[0].condition,
+            Some(EdgeCondition::Expr(ConditionExpr::Eq { .. }))
+        ));
     }
 
     #[tokio::test]

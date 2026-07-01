@@ -773,6 +773,9 @@ impl WorkflowEngine {
 
             // 8. 流程走完？
             match (transition, next_step) {
+                (Transition::Fail { reason }, _) => {
+                    return self.fail_task(reason).await;
+                }
                 (Transition::Abort { .. }, _) => {
                     // 流程终止（正常结束或 abort）。
                     let mut state = self.workflow_state.lock().await;
@@ -1243,6 +1246,12 @@ impl WorkflowEngine {
                     self.persist_state(&snapshot).await?;
                     anyhow::bail!(msg);
                 }
+                let snapshot = state.clone();
+                drop(state);
+                self.persist_state(&snapshot).await?;
+                Ok(None)
+            }
+            Transition::Fail { .. } => {
                 let snapshot = state.clone();
                 drop(state);
                 self.persist_state(&snapshot).await?;
@@ -1776,6 +1785,50 @@ mod engine_tests {
         let result = engine.run().await.unwrap();
         assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
         assert_eq!(result.turns, 2); // 2 步历史
+    }
+
+    #[tokio::test]
+    async fn transition_fail_marks_task_failed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step1 done")]));
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::llm("s1", "Step 1", "do step 1", vec![]),
+                Step::llm("s2", "Step 2", "do step 2", vec![]),
+            ],
+            edges: vec![Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            }],
+        };
+        struct FailingJudge;
+        impl StepTransitionJudge for FailingJudge {
+            fn decide<'a>(&'a self, _ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+                Box::pin(async {
+                    Transition::Fail {
+                        reason: "route failed".into(),
+                    }
+                })
+            }
+        }
+        let config = WorkflowEngineConfig {
+            client,
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(FailingJudge)).unwrap();
+
+        let err = engine.run().await.unwrap_err();
+        let history = engine.step_history().await;
+
+        assert_eq!(engine.state().await, WorkflowStatus::Failed);
+        assert!(err.to_string().contains("route failed"));
+        assert_eq!(history.len(), 1);
+        assert!(matches!(history[0].transition, Transition::Fail { .. }));
     }
 
     #[tokio::test]
