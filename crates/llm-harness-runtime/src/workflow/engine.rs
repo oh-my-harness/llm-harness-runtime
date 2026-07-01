@@ -24,7 +24,7 @@ use crate::error::Result;
 use crate::spawner::{EnvFactory, HarnessSubAgentSpawner, SessionFactory};
 use crate::task::{Checkpoint, TaskError, TaskId, TaskResult};
 use crate::task_store::TaskStore;
-use crate::workflow::executor::{ExecutorCtx, StepExecutor};
+use crate::workflow::executor::{ExecutorCtx, StepExecutor, builtin_executors};
 use crate::workflow::judge::{NoopJudge, StepCtx, StepTransitionJudge};
 use crate::workflow::model::{
     Step, StepId, StepRecord, StepResult, Transition, Workflow, WorkflowState, WorkflowStatus,
@@ -491,7 +491,9 @@ impl WorkflowEngine {
             config,
             judge,
             step_plugin_factories: HashMap::new(),
-            step_executors: HashMap::new(),
+            step_executors: builtin_executors()
+                .map(|(name, executor)| (name.to_string(), executor))
+                .collect(),
             step_tools_cache,
             extra_tools: vec![],
             extra_hooks: HarnessHooks::none(),
@@ -1724,6 +1726,59 @@ mod engine_tests {
         assert_eq!(
             client.call_count.load(std::sync::atomic::Ordering::SeqCst),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn builtin_json_transform_executor_runs_without_manual_registration() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let workflow = Workflow {
+            entry_step: "transform".into(),
+            steps: vec![Step::executor(
+                "transform",
+                "Transform",
+                "json_transform",
+                Some(serde_json::json!({
+                    "source": "config.input",
+                    "input": {
+                        "measurement": {
+                            "voltage": 3.3,
+                            "unit": "V"
+                        }
+                    },
+                    "fields": {
+                        "voltage": "/measurement/voltage",
+                        "unit": "/measurement/unit"
+                    }
+                })),
+            )],
+            edges: vec![],
+        };
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+
+        let result = engine.run().await.unwrap();
+        let history = engine.step_history().await;
+
+        assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+        assert_eq!(result.turns, 1);
+        assert_eq!(
+            history[0]
+                .result
+                .as_ref()
+                .and_then(|r| r.structured.clone()),
+            Some(serde_json::json!({"unit": "V", "voltage": 3.3}))
+        );
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0
         );
     }
 

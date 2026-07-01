@@ -2,7 +2,7 @@
 
 > **状态：初版已实现**。当前已支持业务注入 `StepExecutor`，并由
 > `WorkflowEngine` 在 LLM step 与 executor step 之间分发。内置
-> `HttpCall` / `Script` / `JsonTransform` executor 仍属后续扩展。
+> `JsonTransformExecutor` 已可用；`HttpCall` / `Script` executor 仍属后续扩展。
 
 ## 背景与动机
 
@@ -251,6 +251,8 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
   `kind` 的 tagged enum。
 - 新增 `workflow::executor::{StepExecutor, ExecutorCtx}`。
 - `WorkflowEngine::with_executor(name, executor)` 支持业务层注入 executor。
+- `json_transform` 是默认注册的内置 executor；业务层可以用
+  `with_executor("json_transform", ...)` 覆盖。
 - `WorkflowEngine::run_loop` 按 step 类型分发。
 - executor step 与 LLM step 共享：
   - `WorkflowEvent::StepStarted`
@@ -265,17 +267,54 @@ async fn run_executor_step(&self, step: &Step, abort: CancellationToken) -> Resu
 已覆盖测试：
 
 - `mixed_llm_and_executor_workflow`
+- `builtin_json_transform_executor_runs_without_manual_registration`
+- `json_transform_selects_pointer_from_config_input`
+- `json_transform_builds_fields_from_previous_structured_result`
+- `json_transform_rejects_missing_pointer_without_default`
 - `unregistered_executor_fails_task`
 - `cancel_executor_step_marks_task_cancelled`
 - `executor_step_requires_executor_name`
 
-## 内置 Executor（待设计）
+## 内置 Executor
 
-计划内置三个实现，具体方案留待后续：
+当前内置：
+
+- **JsonTransformExecutor**（`executor_name = "json_transform"`）：纯 JSON
+  变换，不构造 LLM harness，不产生 token cost。
+
+`json_transform` config：
+
+- `source`：可选，`auto` / `config.input` / `prev_result.structured` /
+  `prev_result.output`，默认 `auto`。
+- `input`：当 `source = "config.input"` 或 `auto` 优先使用时的 JSON 输入。
+- `pointer`：可选 RFC 6901 JSON Pointer，例如 `/device/voltage`。
+- `fields`：可选对象，输出字段名映射到 pointer 字符串、
+  `{ "pointer": "...", "default": ... }` 或 `{ "value": ... }` 常量。
+- `include_nulls`：可选 bool，默认 `true`。为 `false` 时跳过 null 字段。
+
+示例：
+
+```json
+{
+  "kind": "executor",
+  "id": "extract_voltage",
+  "name": "Extract voltage",
+  "executor_name": "json_transform",
+  "config": {
+    "source": "config.input",
+    "input": { "measurement": { "voltage": 3.3, "unit": "V" } },
+    "fields": {
+      "voltage": "/measurement/voltage",
+      "unit": "/measurement/unit"
+    }
+  }
+}
+```
+
+仍计划内置的实现，具体安全边界留待后续：
 
 - **HttpCallExecutor**：调 HTTP API，config 含 `url` / `method` / `headers` / `body`
 - **ScriptExecutor**：跑脚本，config 含 `command` / `args` / `env`
-- **JsonTransformExecutor**：JSON 变换（字段提取、映射、过滤），config 含 transform 规则
 
 ## 错误处理（待细化）
 
