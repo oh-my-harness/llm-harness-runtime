@@ -26,9 +26,10 @@ use crate::spawner::{EnvFactory, HarnessSubAgentSpawner, SessionFactory};
 use crate::task::{Checkpoint, TaskError, TaskId, TaskResult};
 use crate::task_store::TaskStore;
 use crate::workflow::executor::{ExecutorCtx, StepExecutor, builtin_executors};
-use crate::workflow::judge::{NoopJudge, StepCtx, StepTransitionJudge};
+use crate::workflow::judge::{EdgeConditionJudge, NoopJudge, StepCtx, StepTransitionJudge};
 use crate::workflow::model::{
-    Step, StepId, StepRecord, StepResult, Transition, Workflow, WorkflowState, WorkflowStatus,
+    EdgeCondition, Step, StepId, StepRecord, StepResult, Transition, Workflow, WorkflowState,
+    WorkflowStatus,
 };
 use crate::workflow::plan::validate_workflow;
 
@@ -53,6 +54,21 @@ const SUBMIT_RESULT_MAX_BYTES: usize = 256 * 1024;
 
 /// SyncSpawnAgentTool prompt 长度上限（bytes）。
 const SYNC_SPAWN_MAX_PROMPT_BYTES: usize = 1024 * 1024;
+
+fn default_declarative_judge(
+    workflow: &Workflow,
+    judge: Arc<dyn StepTransitionJudge>,
+) -> Arc<dyn StepTransitionJudge> {
+    let has_declarative_edges = workflow
+        .edges
+        .iter()
+        .any(|edge| matches!(edge.condition, Some(EdgeCondition::Expr(_))));
+    if has_declarative_edges && judge.is_noop() {
+        Arc::new(EdgeConditionJudge::from_workflow(workflow))
+    } else {
+        judge
+    }
+}
 
 // ── SyncSpawnAgentTool ─────────────────────────────────────────────────────
 
@@ -419,6 +435,7 @@ impl WorkflowEngine {
         judge: Arc<dyn StepTransitionJudge>,
     ) -> Result<Self> {
         validate_workflow(&workflow)?;
+        let judge = default_declarative_judge(&workflow, judge);
         Ok(Self::from_parts(workflow, config, judge, None))
     }
 
@@ -457,6 +474,7 @@ impl WorkflowEngine {
         })?;
         // 信任边界外数据：恢复后同样校验。
         validate_workflow(&workflow)?;
+        let judge = default_declarative_judge(&workflow, judge);
         let saved_state = store.load_workflow_state(&task_id).await?;
         let state = saved_state.unwrap_or_else(|| WorkflowState::new(workflow.entry_step.clone()));
         let engine = Self::from_parts_with_state(
@@ -1703,7 +1721,7 @@ mod engine_tests {
 
     use crate::task_store::JsonlTaskStore;
     use crate::workflow::judge::NoopJudge;
-    use crate::workflow::model::Edge;
+    use crate::workflow::model::{ConditionExpr, Edge, EdgeCondition};
 
     struct FixedExecutor;
     impl StepExecutor for FixedExecutor {
@@ -1725,6 +1743,23 @@ mod engine_tests {
                         "previous_output": prev.output,
                         "history_len": ctx.step_history.len(),
                     })),
+                    tool_calls_count: 0,
+                    session_id: String::new(),
+                    cost: CostAggregate::default(),
+                    started_at: None,
+                    ended_at: None,
+                })
+            })
+        }
+    }
+
+    struct StructuredExecutor;
+    impl StepExecutor for StructuredExecutor {
+        fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+            Box::pin(async move {
+                Ok(StepResult {
+                    output: "structured ok".into(),
+                    structured: Some(serde_json::json!({"status": "ok"})),
                     tool_calls_count: 0,
                     session_id: String::new(),
                     cost: CostAggregate::default(),
@@ -2195,6 +2230,101 @@ mod engine_tests {
         let result = engine.run().await.unwrap();
         assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
         assert_eq!(result.turns, 2); // 2 步历史
+    }
+
+    #[tokio::test]
+    async fn noop_judge_uses_declarative_edge_conditions_by_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step2 done")]));
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::executor("s1", "Structured Step", "structured", None),
+                Step::llm("s2", "Step 2", "do step 2", vec![]),
+            ],
+            edges: vec![Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: Some(EdgeCondition::Expr(ConditionExpr::Eq {
+                    pointer: "/status".into(),
+                    value: serde_json::json!("ok"),
+                })),
+            }],
+        };
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+            .unwrap()
+            .with_executor("structured", Arc::new(StructuredExecutor));
+
+        let result = engine.run().await.unwrap();
+        let history = engine.step_history().await;
+
+        assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            history
+                .iter()
+                .map(|record| record.step_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s1", "s2"]
+        );
+        assert_eq!(result.final_message.as_deref(), Some("step2 done"));
+    }
+
+    #[tokio::test]
+    async fn restore_noop_judge_uses_declarative_edge_conditions_by_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        let task_id = TaskId("restore-declarative".into());
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::executor("s1", "Structured Step", "structured", None),
+                Step::llm("s2", "Step 2", "do step 2", vec![]),
+            ],
+            edges: vec![Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: Some(EdgeCondition::Expr(ConditionExpr::Eq {
+                    pointer: "/status".into(),
+                    value: serde_json::json!("ok"),
+                })),
+            }],
+        };
+        store.save_workflow(&task_id, &workflow).await.unwrap();
+
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step2 done")]));
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let restored = WorkflowEngine::restore(store, task_id, config, Arc::new(NoopJudge))
+            .await
+            .unwrap()
+            .with_executor("structured", Arc::new(StructuredExecutor));
+
+        let result = restored.run().await.unwrap();
+        let history = restored.step_history().await;
+
+        assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            history
+                .iter()
+                .map(|record| record.step_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s1", "s2"]
+        );
+        assert_eq!(result.final_message.as_deref(), Some("step2 done"));
     }
 
     #[tokio::test]

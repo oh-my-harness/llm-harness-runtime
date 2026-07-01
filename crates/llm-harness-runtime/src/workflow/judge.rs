@@ -27,6 +27,15 @@ pub struct StepCtx<'a> {
 pub trait StepTransitionJudge: Send + Sync {
     /// 判断这步做完后的跳转决策。
     fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition>;
+
+    /// Whether this judge is the built-in no-op placeholder.
+    ///
+    /// WorkflowEngine uses this to preserve custom judge behavior while
+    /// allowing declarative workflows to opt into the built-in edge judge by
+    /// passing the default `NoopJudge`.
+    fn is_noop(&self) -> bool {
+        false
+    }
 }
 
 /// 空 judge：永不跳转。自由 task（单步 workflow）用。
@@ -42,6 +51,10 @@ impl StepTransitionJudge for NoopJudge {
                 reason: "NoopJudge has no transitions".into(),
             }
         })
+    }
+
+    fn is_noop(&self) -> bool {
+        true
     }
 }
 

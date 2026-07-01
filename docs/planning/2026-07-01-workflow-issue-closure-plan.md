@@ -1,6 +1,6 @@
 # Workflow Issue Closure Plan
 
-Updated: 2026-07-01 21:34 Asia/Shanghai
+Updated: 2026-07-01 21:50 Asia/Shanghai
 Task: Close the highest-impact workflow runtime issues from the latest AI review.
 
 ## Plan
@@ -12,6 +12,8 @@ Task: Close the highest-impact workflow runtime issues from the latest AI review
 - [x] Commit, push, and update issues.
 - [x] Fix terminal transition crash recovery and remove Fail double persist (#22/#23).
 - [x] Commit, push, and update #22/#23.
+- [x] Auto-select the declarative edge judge for expression-based workflows (#24).
+- [x] Commit, push, and update #24.
 
 ## Priority Rationale
 
@@ -33,6 +35,11 @@ The next correctness risk is terminal transition recovery. A persisted
 to the corresponding terminal task state after restore, rather than re-running
 the already-completed step.
 
+After correctness fixes, the lowest-risk usability improvement is #24: when a
+workflow declares `EdgeCondition::Expr` edges and the caller supplies the default
+`NoopJudge`, the engine should use `EdgeConditionJudge` automatically instead
+of silently ignoring declarative routing.
+
 ## Progress Log
 
 - 2026-07-01 20:55 Asia/Shanghai - Created plan and selected #31 as the first implementation target.
@@ -45,3 +52,6 @@ the already-completed step.
 - 2026-07-01 21:25 Asia/Shanghai - Started #22/#23; added terminal transition recovery logic and regression tests.
 - 2026-07-01 21:30 Asia/Shanghai - Passed targeted workflow tests, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` for #22/#23.
 - 2026-07-01 21:34 Asia/Shanghai - Pushed terminal recovery fix and closed GitHub issues #22 and #23.
+- 2026-07-01 21:40 Asia/Shanghai - Started #24 default declarative judge wiring.
+- 2026-07-01 21:47 Asia/Shanghai - Added default declarative judge wiring for new and restored workflows; passed workflow tests, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings`.
+- 2026-07-01 21:50 Asia/Shanghai - Pushed default declarative judge fix and closed GitHub issue #24.
