@@ -67,7 +67,7 @@ jobs:
           python -m pip install cffi pytest
 
       - name: Fetch dependencies
-        run: cargo fetch --locked
+        run: cargo fetch
 
       - name: Rust format
         run: cargo fmt -p llm-harness-ffi -- --check
