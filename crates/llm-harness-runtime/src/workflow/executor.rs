@@ -14,11 +14,12 @@ use llm_harness_types::{ExecutionEnv, ShellOptions};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION};
 use reqwest::{Method, StatusCode, Url};
 use serde_json::{Map, Value};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::cost::CostAggregate;
 use crate::error::Result;
-use crate::workflow::model::{Step, StepRecord, StepResult};
+use crate::workflow::model::{Step, StepRecord, StepResult, WorkflowContext};
 
 pub const JSON_TRANSFORM_EXECUTOR_NAME: &str = "json_transform";
 pub const SHELL_EXECUTOR_NAME: &str = "shell";
@@ -36,6 +37,8 @@ pub struct ExecutorCtx<'a> {
     pub env: Arc<dyn ExecutionEnv>,
     /// Step-level abort token.
     pub abort: CancellationToken,
+    /// 共享可变上下文。executor 可读写 KV，跨 step 传递业务数据。
+    pub context: Arc<Mutex<WorkflowContext>>,
 }
 
 /// Deterministic executor for a non-LLM workflow step.
@@ -1143,6 +1146,7 @@ mod tests {
             step_history: &[],
             env: noop_env(),
             abort: CancellationToken::new(),
+            context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
         }
     }
 
@@ -1484,6 +1488,7 @@ mod tests {
             step_history: &[],
             env: env.clone(),
             abort: CancellationToken::new(),
+            context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
         };
         let executor = ShellExecutor::new(["python"]);
 

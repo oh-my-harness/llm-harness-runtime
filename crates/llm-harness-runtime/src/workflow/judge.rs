@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::workflow::model::{
     ConditionExpr, Edge, EdgeCondition, Step, StepRecord, StepResult, Transition, Workflow,
+    WorkflowContext,
 };
 
 /// 传递给 `StepTransitionJudge::decide` 的上下文。
@@ -17,6 +18,8 @@ pub struct StepCtx<'a> {
     pub last_result: &'a StepResult,
     /// 已完成的步骤历史（审计链）。
     pub step_history: &'a [StepRecord],
+    /// 共享可变上下文（只读快照）。judge 可读 context 做路由决策。
+    pub context: &'a WorkflowContext,
 }
 
 /// 业务层实现。如"膜厚合格→下一步,不合格→返工 step_1"。
@@ -227,6 +230,7 @@ mod tests {
             current_step: &step,
             last_result: &result,
             step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
         };
         let t = judge.decide(&ctx).await;
         assert!(matches!(t, Transition::Abort { .. }));
@@ -256,6 +260,7 @@ mod tests {
             current_step: &step,
             last_result: &result,
             step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
         };
 
         let transition = judge.decide(&ctx).await;
@@ -281,6 +286,7 @@ mod tests {
             current_step: &step,
             last_result: &result,
             step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
         };
 
         let transition = judge.decide(&ctx).await;
@@ -302,6 +308,7 @@ mod tests {
             current_step: &step,
             last_result: &result,
             step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
         };
 
         let transition = judge.decide(&ctx).await;
@@ -323,6 +330,7 @@ mod tests {
             current_step: &step,
             last_result: &result,
             step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
         };
 
         let transition = judge.decide(&ctx).await;

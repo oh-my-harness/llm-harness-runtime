@@ -3,12 +3,31 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 use crate::cost::CostAggregate;
 use crate::task::{TaskError, TaskId, TaskResult};
 
 /// 步骤标识。
 pub type StepId = String;
+
+/// 共享可变上下文（纯数据）。等价于 LangGraph 的 State：所有 step 可读写的 KV 黑板。
+///
+/// 序列化为 `WorkflowState.context` 字段，随 `WorkflowState` 一起持久化。
+/// 运行时由 `WorkflowEngine` 包装为 `Arc<tokio::sync::Mutex<WorkflowContext>>` 共享。
+/// 不参与状态机决策（transition 由 judge 决定），只承载业务数据传递。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowContext {
+    /// 共享变量表。key → 任意 JSON 值。
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub variables: serde_json::Map<String, Value>,
+}
+
+impl WorkflowContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// 流程定义（单层）。纯数据，可序列化（走 TaskStore 落盘）。
 /// 来源无关：人类规划 / LLM 生成（PlanWorkflowTool）/ 外部系统产出，都走此结构。
@@ -364,6 +383,9 @@ pub struct WorkflowState {
     /// 业务层恢复时不用自己维护两张 ID 表。人类规划场景为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_by: Option<TaskId>,
+    /// 共享可变上下文。所有 step 可读写的 KV 黑板，随 WorkflowState 持久化。
+    #[serde(default)]
+    pub context: WorkflowContext,
 }
 
 impl WorkflowState {
@@ -379,6 +401,7 @@ impl WorkflowState {
             current_step: entry_step,
             step_history: vec![],
             planned_by: None,
+            context: WorkflowContext::new(),
         }
     }
 }

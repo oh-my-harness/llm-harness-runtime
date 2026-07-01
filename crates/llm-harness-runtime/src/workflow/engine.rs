@@ -28,8 +28,8 @@ use crate::task_store::TaskStore;
 use crate::workflow::executor::{ExecutorCtx, StepExecutor, builtin_executors};
 use crate::workflow::judge::{EdgeConditionJudge, NoopJudge, StepCtx, StepTransitionJudge};
 use crate::workflow::model::{
-    EdgeCondition, Step, StepId, StepRecord, StepResult, Transition, Workflow, WorkflowState,
-    WorkflowStatus,
+    EdgeCondition, Step, StepId, StepRecord, StepResult, Transition, Workflow, WorkflowContext,
+    WorkflowState, WorkflowStatus,
 };
 use crate::workflow::plan::validate_workflow;
 
@@ -365,6 +365,20 @@ fn format_step_history_summary(history: &[StepRecord]) -> String {
         .join("\n")
 }
 
+/// 把共享 context 的 KV 格式化为 prompt 摘要。空 context 返回空字符串。
+fn format_context_vars(context: &WorkflowContext) -> String {
+    if context.variables.is_empty() {
+        return String::new();
+    }
+    let mut entries: Vec<(&String, &Value)> = context.variables.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+        .iter()
+        .map(|(k, v)| format!("  {k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ── NoopPlugin（build_step_spawner 的 plugin factory 占位）───────────────────
 
 /// 空实现 Plugin：build_step_spawner 构建 step 内 spawner 时的 sub-agent plugin factory 占位。
@@ -404,6 +418,9 @@ pub struct WorkflowEngine {
     /// workflow 状态（步骤推进 + 生命周期状态，统一表达）。
     /// Arc<Mutex<...>>：gate hook 需共享同一份 state。
     workflow_state: Arc<Mutex<WorkflowState>>,
+    /// 共享可变上下文。executor 写入、judge/LLM step 读取。
+    /// 持久化时 snapshot 合并进 workflow_state.context。
+    context: Arc<Mutex<WorkflowContext>>,
     /// task 级 checkpoint 的内存缓存（仅运行时快速访问，非权威源）。
     checkpoints: Mutex<Vec<Checkpoint>>,
     /// pause 请求标志。pause() 设 true，run() 在步边界检查并消费。
@@ -515,6 +532,7 @@ impl WorkflowEngine {
         state: WorkflowState,
     ) -> Self {
         let (event_tx, _) = tokio::sync::broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let context = Arc::new(Mutex::new(state.context.clone()));
         let step_tools_cache: HashMap<StepId, Vec<String>> = workflow
             .steps
             .iter()
@@ -534,6 +552,7 @@ impl WorkflowEngine {
             task_store,
             task_id,
             workflow_state: Arc::new(Mutex::new(state)),
+            context,
             checkpoints: Mutex::new(vec![]),
             pause_requested: AtomicBool::new(false),
             pause_reason: std::sync::Mutex::new(None),
@@ -883,10 +902,12 @@ impl WorkflowEngine {
             };
         }
         let history = self.workflow_state.lock().await.step_history.clone();
+        let context = self.context.lock().await.clone();
         let ctx = StepCtx {
             current_step: step,
             last_result: step_result,
             step_history: &history,
+            context: &context,
         };
         self.judge.decide(&ctx).await
     }
@@ -1023,6 +1044,7 @@ impl WorkflowEngine {
             step_history: &history,
             env,
             abort: step_abort.clone(),
+            context: self.context.clone(),
         };
         let mut result = tokio::select! {
             biased;
@@ -1129,13 +1151,27 @@ impl WorkflowEngine {
         harness.set_abort_token(step_abort.clone());
 
         // g. step 指令。步骤间上下文注入：在 step.prompt 前拼接 step_history 摘要。
+        //    若共享 context 非空，也注入 KV 摘要，让 LLM step 能读到上游 executor 写入的变量。
         let prompt_text = {
             let state = self.workflow_state.lock().await;
-            if state.step_history.is_empty() {
+            let context_snapshot = self.context.lock().await.clone();
+            let history_ctx = if state.step_history.is_empty() {
+                String::new()
+            } else {
+                format_step_history_summary(&state.step_history)
+            };
+            let vars_ctx = format_context_vars(&context_snapshot);
+            if history_ctx.is_empty() && vars_ctx.is_empty() {
                 prompt.clone()
             } else {
-                let ctx = format_step_history_summary(&state.step_history);
-                format!("Context:\n{ctx}\n\n---\n\n{}", prompt)
+                let mut parts = Vec::new();
+                if !vars_ctx.is_empty() {
+                    parts.push(vars_ctx);
+                }
+                if !history_ctx.is_empty() {
+                    parts.push(history_ctx);
+                }
+                format!("Context:\n{}\n\n---\n\n{}", parts.join("\n"), prompt)
             }
         };
 
@@ -1216,8 +1252,11 @@ impl WorkflowEngine {
     /// 持久化 WorkflowState（若有 task_store）。
     /// 调用方应在 drop 锁后调用（传入 snapshot），避免持锁 await I/O。
     async fn persist_state(&self, state: &WorkflowState) -> Result<()> {
+        // 同步共享 context 快照进 state，保证落盘的是最新 context。
+        let mut state = state.clone();
+        state.context = self.context_snapshot().await;
         if let Some(store) = &self.task_store {
-            store.save_workflow_state(&self.task_id, state).await?;
+            store.save_workflow_state(&self.task_id, &state).await?;
         }
         Ok(())
     }
@@ -1456,6 +1495,16 @@ impl WorkflowEngine {
     pub async fn total_cost(&self) -> CostAggregate {
         let state = self.workflow_state.lock().await;
         aggregate_cost(&state.step_history)
+    }
+
+    /// 共享 context 的 Arc 句柄。executor / 外部代码可通过此句柄读写 KV。
+    pub fn context(&self) -> Arc<Mutex<WorkflowContext>> {
+        self.context.clone()
+    }
+
+    /// 取 context 快照（用于持久化）。
+    async fn context_snapshot(&self) -> WorkflowContext {
+        self.context.lock().await.clone()
     }
 }
 
@@ -2851,5 +2900,199 @@ mod engine_tests {
         assert_eq!(history.len(), 1);
         assert!(history[0].result.is_none());
         assert!(matches!(history[0].transition, Transition::Abort { .. }));
+    }
+
+    // ── WorkflowContext 共享状态测试 ──────────────────────────────
+
+    /// executor 写 context，后续 executor 读到写入的值。
+    struct ContextWriter;
+    impl StepExecutor for ContextWriter {
+        fn execute<'a>(&'a self, ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+            Box::pin(async move {
+                let mut ctx_data = ctx.context.lock().await;
+                ctx_data
+                    .variables
+                    .insert("focus".into(), serde_json::json!(0.42));
+                ctx_data
+                    .variables
+                    .insert("metro_p".into(), serde_json::json!(1.5));
+                drop(ctx_data);
+                Ok(StepResult {
+                    output: "wrote context".into(),
+                    structured: None,
+                    tool_calls_count: 0,
+                    session_id: String::new(),
+                    cost: CostAggregate::default(),
+                    started_at: None,
+                    ended_at: None,
+                })
+            })
+        }
+    }
+
+    /// executor 读 context，验证上游 executor 写入的值。
+    struct ContextReader;
+    impl StepExecutor for ContextReader {
+        fn execute<'a>(&'a self, ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+            Box::pin(async move {
+                let ctx_data = ctx.context.lock().await;
+                let focus = ctx_data.variables.get("focus").cloned();
+                let metro_p = ctx_data.variables.get("metro_p").cloned();
+                drop(ctx_data);
+                Ok(StepResult {
+                    output: format!("focus={focus:?} metro_p={metro_p:?}"),
+                    structured: Some(serde_json::json!({
+                        "focus": focus,
+                        "metro_p": metro_p,
+                    })),
+                    tool_calls_count: 0,
+                    session_id: String::new(),
+                    cost: CostAggregate::default(),
+                    started_at: None,
+                    ended_at: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn executor_writes_context_and_downstream_reads_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let workflow = Workflow {
+            entry_step: "writer".into(),
+            steps: vec![
+                Step::executor("writer", "Writer", "ctx_writer", None),
+                Step::executor("reader", "Reader", "ctx_reader", None),
+            ],
+            edges: vec![Edge {
+                from: "writer".into(),
+                to: "reader".into(),
+                condition: None,
+            }],
+        };
+        struct LinearJudge;
+        impl StepTransitionJudge for LinearJudge {
+            fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+                let id = ctx.current_step.id().clone();
+                Box::pin(async move {
+                    if id == "writer" {
+                        Transition::To("reader".into())
+                    } else {
+                        Transition::Abort {
+                            reason: "done".into(),
+                        }
+                    }
+                })
+            }
+        }
+        let config = WorkflowEngineConfig {
+            client,
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge))
+            .unwrap()
+            .with_executor("ctx_writer", Arc::new(ContextWriter))
+            .with_executor("ctx_reader", Arc::new(ContextReader));
+
+        let result = engine.run().await.unwrap();
+        let history = engine.step_history().await;
+
+        assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+        // reader 的 structured 应包含 writer 写入的值。
+        use serde_json::Value;
+        let reader_structured: Value = history[1]
+            .result
+            .as_ref()
+            .and_then(|r| r.structured.clone())
+            .unwrap();
+        assert_eq!(reader_structured["focus"], serde_json::json!(0.42));
+        assert_eq!(reader_structured["metro_p"], serde_json::json!(1.5));
+        assert!(result.final_message.unwrap().contains("focus"));
+    }
+
+    #[tokio::test]
+    async fn context_survives_crash_recovery() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let workflow = Workflow {
+            entry_step: "writer".into(),
+            steps: vec![
+                Step::executor("writer", "Writer", "ctx_writer", None),
+                Step::executor("reader", "Reader", "ctx_reader", None),
+            ],
+            edges: vec![Edge {
+                from: "writer".into(),
+                to: "reader".into(),
+                condition: None,
+            }],
+        };
+        struct LinearJudge;
+        impl StepTransitionJudge for LinearJudge {
+            fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+                let id = ctx.current_step.id().clone();
+                Box::pin(async move {
+                    if id == "writer" {
+                        Transition::To("reader".into())
+                    } else {
+                        Transition::Abort {
+                            reason: "done".into(),
+                        }
+                    }
+                })
+            }
+        }
+        let config = WorkflowEngineConfig {
+            client,
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge))
+            .unwrap()
+            .with_executor("ctx_writer", Arc::new(ContextWriter))
+            .with_executor("ctx_reader", Arc::new(ContextReader))
+            .with_task_store(store.clone());
+        let task_id = engine.task_id().clone();
+
+        // 從獨立 context 寫入，再手動觸發 persist。
+        // persist_state 內部會從 self.context 取 snapshot 覆蓋 state.context。
+        engine
+            .context()
+            .lock()
+            .await
+            .variables
+            .insert("survives".into(), serde_json::json!(true));
+        // save_workflow + persist_state（模拟 run() 启动时的落盘）。
+        store
+            .save_workflow(&task_id, &engine.workflow)
+            .await
+            .unwrap();
+        // 手动触发一次 persist（模拟 run() 启动时的 persist）。
+        let snapshot = engine.workflow_state.lock().await.clone();
+        engine.persist_state(&snapshot).await.unwrap();
+
+        // restore 后 context 应包含写入的值。
+        let config2 = WorkflowEngineConfig {
+            client: Arc::new(MockLlmClient::new(vec![])),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let restored = WorkflowEngine::restore(store, task_id, config2, Arc::new(LinearJudge))
+            .await
+            .unwrap();
+        let ctx_arc = restored.context();
+        let ctx = ctx_arc.lock().await;
+        assert_eq!(
+            ctx.variables.get("survives"),
+            Some(&serde_json::json!(true))
+        );
     }
 }
