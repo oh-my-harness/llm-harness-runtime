@@ -562,19 +562,12 @@ fn run_loop(
 
                 if let Some(final_message) = &final_answer_message {
                     let message_id = final_message.message_id.clone();
-                    let turn_id = final_message.turn_id.clone();
-                    let text = final_message.text_content();
                     yield AgentEvent::MessageStart {
                         message_id: message_id.clone(),
                     };
                     yield AgentEvent::MessageEnd {
-                        message_id: message_id.clone(),
-                        message: final_message.clone(),
-                    };
-                    yield AgentEvent::FinalAnswer {
-                        turn_id,
                         message_id,
-                        text,
+                        message: final_message.clone(),
                     };
                     let final_agent_msg = AgentMessage::Assistant(final_message.clone());
                     ctx.messages.push(final_agent_msg.clone());
@@ -878,9 +871,10 @@ mod tests {
             "missing TurnEnd"
         );
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::FinalAnswer { text, .. } if text == "Hello!")),
+            events.iter().any(|e| e
+                .as_final_answer()
+                .map(|(_, _, t)| t == "Hello!")
+                .unwrap_or(false)),
             "missing FinalAnswer"
         );
         assert!(
@@ -960,9 +954,10 @@ mod tests {
             .count();
         assert_eq!(tool_exec_ends, 1);
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::FinalAnswer { text, .. } if text == "Done!")),
+            events.iter().any(|e| e
+                .as_final_answer()
+                .map(|(_, _, t)| t == "Done!")
+                .unwrap_or(false)),
             "final text response should emit FinalAnswer"
         );
     }
@@ -1000,11 +995,10 @@ mod tests {
         );
         drop(captured);
 
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                AgentEvent::FinalAnswer { text, .. } if text == "Done via tool."
-            )
+        assert!(events.iter().any(|e| {
+            e.as_final_answer()
+                .map(|(_, _, t)| t == "Done via tool.")
+                .unwrap_or(false)
         }));
 
         let turn_end = events
@@ -1046,17 +1040,13 @@ mod tests {
         .collect()
         .await;
 
+        assert!(events.iter().any(|e| {
+            e.as_progress()
+                .map(|(_, _, t)| t == "plain answer")
+                .unwrap_or(false)
+        }));
         assert!(
-            events.iter().any(|event| matches!(
-                event,
-                AgentEvent::Progress { text, .. } if text == "plain answer"
-            )),
-            "plain text should be progress under a strict final-answer tool contract"
-        );
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::FinalAnswer { .. })),
+            !events.iter().any(|e| e.as_final_answer().is_some()),
             "strict final-answer tool contract should not accept plain text as final"
         );
         assert!(events.iter().any(|event| matches!(
@@ -1082,10 +1072,11 @@ mod tests {
         .collect()
         .await;
 
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AgentEvent::FinalAnswer { text, .. } if text == "plain answer"
-        )));
+        assert!(events.iter().any(|e| {
+            e.as_final_answer()
+                .map(|(_, _, t)| t == "plain answer")
+                .unwrap_or(false)
+        }));
         assert!(
             !events.iter().any(|event| matches!(
                 event,

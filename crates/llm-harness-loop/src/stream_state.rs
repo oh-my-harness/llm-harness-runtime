@@ -171,27 +171,10 @@ impl StreamingState {
                     usage: Some(convert_usage(usage)),
                     error_message: None,
                 };
-                let visible_text = message.text_content();
-                let mut events = vec![AgentEvent::MessageEnd {
+                let events = vec![AgentEvent::MessageEnd {
                     message_id: mid,
                     message: message.clone(),
                 }];
-                if !visible_text.is_empty() {
-                    match message.kind {
-                        AssistantMessageKind::Progress => events.push(AgentEvent::Progress {
-                            turn_id: self.turn_id.clone(),
-                            message_id: self.message_id.clone(),
-                            text: visible_text,
-                        }),
-                        AssistantMessageKind::FinalAnswer => {
-                            events.push(AgentEvent::FinalAnswer {
-                                turn_id: self.turn_id.clone(),
-                                message_id: self.message_id.clone(),
-                                text: visible_text,
-                            });
-                        }
-                    }
-                }
                 events
             }
         }
@@ -445,13 +428,14 @@ mod tests {
             assert!(matches!(message.stop_reason, Some(StopReason::EndTurn)));
             assert_eq!(message.usage.as_ref().unwrap().input_tokens, 5);
         }
-        assert!(events.iter().any(|e| matches!(
-            e,
-            AgentEvent::FinalAnswer { turn_id, message_id, text }
-                if turn_id == "turn_1" && !message_id.is_empty() && text == "done"
-        )));
+        assert!(events.iter().any(|e| {
+            if let Some((_id, turn, text)) = e.as_final_answer() {
+                turn == "turn_1" && text == "done"
+            } else {
+                false
+            }
+        }));
     }
-
     #[test]
     fn tool_use_text_emits_progress_not_final_answer() {
         let mut s = make_state();
@@ -478,18 +462,15 @@ mod tests {
             assert!(!message.message_id.is_empty());
         }
 
-        assert!(events.iter().any(|e| matches!(
-            e,
-            AgentEvent::Progress { turn_id, message_id, text }
-                if turn_id == "turn_1" && !message_id.is_empty() && text == "checking first"
-        )));
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::FinalAnswer { .. }))
-        );
+        assert!(events.iter().any(|e| {
+            if let Some((_id, turn, text)) = e.as_progress() {
+                turn == "turn_1" && text == "checking first"
+            } else {
+                false
+            }
+        }));
+        assert!(!events.iter().any(|e| e.as_final_answer().is_some()));
     }
-
     #[test]
     fn reasoning_signature_captured_in_final_message() {
         let mut s = make_state();

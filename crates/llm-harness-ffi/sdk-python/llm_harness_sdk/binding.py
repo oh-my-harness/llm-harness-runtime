@@ -210,11 +210,9 @@ class _AsyncCallbackRunner:
 
 def _aggregate_final_response(events):
     text_parts = []
-    final_text = None
     message = None
     usage = None
     errors = []
-    progress = []
     tool_calls = []
     tool_calls_by_id = {}
 
@@ -222,10 +220,6 @@ def _aggregate_final_response(events):
         event_type = event.get("type")
         if event_type == "text_delta":
             text_parts.append(event.get("text", ""))
-        elif event_type == "progress":
-            progress.append(event.get("text", ""))
-        elif event_type == "final_answer":
-            final_text = event.get("text", "")
         elif event_type == "message_end":
             message = event.get("message")
             if isinstance(message, dict):
@@ -255,7 +249,7 @@ def _aggregate_final_response(events):
         elif event_type == "error":
             errors.append(event)
 
-    text = final_text if final_text is not None else "".join(text_parts)
+    text = "".join(text_parts)
     if not text and isinstance(message, dict):
         for block in message.get("content", []):
             if isinstance(block, dict) and block.get("type") == "text":
@@ -267,7 +261,6 @@ def _aggregate_final_response(events):
         "usage": usage,
         "tool_calls": tool_calls,
         "errors": errors,
-        "progress": progress,
         "events": events,
     }
 

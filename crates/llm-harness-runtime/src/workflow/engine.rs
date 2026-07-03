@@ -1198,8 +1198,10 @@ impl WorkflowEngine {
                             AgentHarnessEvent::Agent(AgentEvent::TextDelta { text, .. }) => {
                                 text_delta_output.push_str(text);
                             }
-                            AgentHarnessEvent::Agent(AgentEvent::FinalAnswer { text, .. }) => {
-                                final_answer_output = Some(text.clone());
+                            AgentHarnessEvent::Agent(ev) => {
+                                if let Some((_, _, text)) = ev.as_final_answer() {
+                                    final_answer_output = Some(text);
+                                }
                             }
                             AgentHarnessEvent::ToolCallStart { .. } => tool_calls_count += 1,
                             AgentHarnessEvent::Settled | AgentHarnessEvent::Aborted => {

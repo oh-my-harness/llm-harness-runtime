@@ -1,4 +1,6 @@
-use crate::{AgentError, AgentMessage, AssistantMessage, ToolError, ToolResult};
+use crate::{
+    AgentError, AgentMessage, AssistantMessage, AssistantMessageKind, ToolError, ToolResult,
+};
 
 /// Agent 产生的完整事件流。
 ///
@@ -37,31 +39,6 @@ pub enum AgentEvent {
     MessageEnd {
         message_id: String,
         message: AssistantMessage,
-    },
-    /// Intermediate, non-final user-visible assistant text for a turn.
-    ///
-    /// This event is emitted for assistant messages classified as progress,
-    /// for example text produced before a tool-use turn. UIs may show it in a
-    /// progress panel, but should not persist it as the final assistant answer.
-    Progress {
-        /// Stable user-turn ID.
-        turn_id: String,
-        /// Stable assistant message ID.
-        message_id: String,
-        /// Full visible text for the progress message.
-        text: String,
-    },
-    /// Durable user-visible final answer for a turn.
-    ///
-    /// Consumers should prefer this event over inferring finality from raw
-    /// `TextDelta` or `MessageEnd` events.
-    FinalAnswer {
-        /// Stable user-turn ID.
-        turn_id: String,
-        /// Stable assistant message ID.
-        message_id: String,
-        /// Full visible answer text.
-        text: String,
     },
 
     // === Token 级（字符流） ===
@@ -123,6 +100,38 @@ pub enum AgentEvent {
         /// `Display` string of the triggering `LlmError`.
         error: String,
     },
+}
+
+impl AgentEvent {
+    /// 若此事件是最终回答（`MessageEnd` 且 `message.kind == FinalAnswer`），
+    /// 返回 `(message_id, turn_id, text)`。
+    pub fn as_final_answer(&self) -> Option<(&str, &str, String)> {
+        if let AgentEvent::MessageEnd {
+            message_id,
+            message,
+        } = self
+        {
+            if message.kind == AssistantMessageKind::FinalAnswer {
+                return Some((message_id, &message.turn_id, message.text_content()));
+            }
+        }
+        None
+    }
+
+    /// 若此事件是进度消息（`MessageEnd` 且 `message.kind == Progress`），
+    /// 返回 `(message_id, turn_id, text)`。
+    pub fn as_progress(&self) -> Option<(&str, &str, String)> {
+        if let AgentEvent::MessageEnd {
+            message_id,
+            message,
+        } = self
+        {
+            if message.kind == AssistantMessageKind::Progress {
+                return Some((message_id, &message.turn_id, message.text_content()));
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -208,46 +217,51 @@ mod tests {
     }
 
     #[test]
-    fn final_answer_event_fields_are_accessible() {
-        let ev = AgentEvent::FinalAnswer {
-            turn_id: "turn_1".into(),
+    fn as_final_answer_extracts_text_from_message_end() {
+        let msg = make_assistant();
+        let ev = AgentEvent::MessageEnd {
             message_id: "msg_1".into(),
-            text: "done".into(),
+            message: msg,
         };
-
-        match ev {
-            AgentEvent::FinalAnswer {
-                turn_id,
-                message_id,
-                text,
-            } => {
-                assert_eq!(turn_id, "turn_1");
-                assert_eq!(message_id, "msg_1");
-                assert_eq!(text, "done");
-            }
-            _ => panic!("wrong variant"),
-        }
+        let (id, turn, text) = ev.as_final_answer().unwrap();
+        assert_eq!(id, "msg_1");
+        assert_eq!(turn, "turn_1");
+        assert_eq!(text, "ok");
     }
 
     #[test]
-    fn progress_event_fields_are_accessible() {
-        let ev = AgentEvent::Progress {
-            turn_id: "turn_1".into(),
+    fn as_final_answer_returns_none_for_progress_kind() {
+        let mut msg = make_assistant();
+        msg.kind = crate::AssistantMessageKind::Progress;
+        let ev = AgentEvent::MessageEnd {
             message_id: "msg_1".into(),
-            text: "checking".into(),
+            message: msg,
         };
+        assert!(ev.as_final_answer().is_none());
+        assert!(ev.as_progress().is_some());
+    }
 
-        match ev {
-            AgentEvent::Progress {
-                turn_id,
-                message_id,
-                text,
-            } => {
-                assert_eq!(turn_id, "turn_1");
-                assert_eq!(message_id, "msg_1");
-                assert_eq!(text, "checking");
-            }
-            _ => panic!("wrong variant"),
-        }
+    #[test]
+    fn as_progress_extracts_text_from_message_end() {
+        let mut msg = make_assistant();
+        msg.kind = crate::AssistantMessageKind::Progress;
+        let ev = AgentEvent::MessageEnd {
+            message_id: "msg_1".into(),
+            message: msg,
+        };
+        let (id, turn, text) = ev.as_progress().unwrap();
+        assert_eq!(id, "msg_1");
+        assert_eq!(turn, "turn_1");
+        assert_eq!(text, "ok");
+    }
+
+    #[test]
+    fn as_final_answer_returns_none_for_non_message_end() {
+        let ev = AgentEvent::TextDelta {
+            message_id: "msg_1".into(),
+            text: "hello".into(),
+        };
+        assert!(ev.as_final_answer().is_none());
+        assert!(ev.as_progress().is_none());
     }
 }
