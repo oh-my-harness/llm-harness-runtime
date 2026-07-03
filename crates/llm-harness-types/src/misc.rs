@@ -22,6 +22,8 @@ pub enum ThinkingLevel {
     High,
     /// 最高推理深度（仅部分模型支持）。
     XHigh,
+    /// 自定义 token 预算；用于需要精确控制而非固定档位的场景。
+    Custom(u32),
 }
 
 /// Agent loop 的输入上下文。

@@ -21,6 +21,7 @@ fn thinking_budget(level: ThinkingLevel) -> Option<u32> {
         ThinkingLevel::Medium => Some(8_192),
         ThinkingLevel::High => Some(32_000),
         ThinkingLevel::XHigh => Some(64_000),
+        ThinkingLevel::Custom(n) => Some(n),
     }
 }
 
