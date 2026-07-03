@@ -519,7 +519,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::env::OsEnv;
+    use llm_harness_runtime_sandbox_os::OsEnv;
 
     // ── parse_command_args ────────────────────────────────────────────────────
 

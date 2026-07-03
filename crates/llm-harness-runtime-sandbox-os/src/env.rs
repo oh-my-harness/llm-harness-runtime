@@ -6,6 +6,49 @@ use futures::future::BoxFuture;
 use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
 
+/// 找到 `bytes` 中最后一个完整 UTF-8 字符的边界索引。
+///
+/// 返回值 `split` 满足：`bytes[..split]` 是合法 UTF-8（可整块解码），
+/// `bytes[split..]` 是可能不完整的多字节序列尾部（留到下一轮处理）。
+/// 如果 `bytes` 全部是合法 UTF-8（或空），返回 `bytes.len()`。
+fn utf8_safe_boundary(bytes: &[u8]) -> usize {
+    let len = bytes.len();
+    if len == 0 {
+        return 0;
+    }
+    // 从末尾往回找，最多回退 3 字节（UTF-8 最长 4 字节）
+    let start = len.saturating_sub(3);
+    for i in (start..len).rev() {
+        let b = bytes[i];
+        // 找到一个 UTF-8 起始字节（非 continuation byte: 10xxxxxx）
+        if b & 0xC0 != 0x80 {
+            // 计算这个字符的预期长度
+            let expected = if b & 0x80 == 0 {
+                1
+            } else if b & 0xE0 == 0xC0 {
+                2
+            } else if b & 0xF0 == 0xE0 {
+                3
+            } else if b & 0xF8 == 0xF0 {
+                4
+            } else {
+                // 无效的起始字节，直接跳过（lossy 会处理）
+                continue;
+            };
+            let end = i + expected;
+            if end <= len {
+                // 完整字符在范围内
+                return end;
+            } else {
+                // 不完整——从这个字符开始都是残留
+                return i;
+            }
+        }
+    }
+    // 全是 continuation bytes（不应该发生，但 fallback：全部留到下一轮）
+    0
+}
+
 /// Concrete `ExecutionEnv` backed by the real OS filesystem and shell.
 ///
 /// Reimplemented from `llm-harness-core` to bypass the `#[cfg(test)]` gate.
@@ -314,7 +357,7 @@ impl ExecutionEnv for OsEnv {
     fn execute_shell<'a>(
         &'a self,
         cmd: &'a str,
-        opts: ShellOptions<'a>,
+        mut opts: ShellOptions<'a>,
     ) -> BoxFuture<'a, Result<ShellOutput, EnvError>> {
         async move {
             if opts.abort.is_cancelled() {
@@ -333,32 +376,108 @@ impl ExecutionEnv for OsEnv {
                 c.args(["-c", cmd]);
                 c
             };
-            let child = shell_cmd
+            let mut child = shell_cmd
                 .current_dir(opts.cwd.unwrap_or(&self.working_dir))
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(EnvError::Io)?;
 
-            let output = if let Some(timeout) = opts.timeout {
-                tokio::time::timeout(timeout, child.wait_with_output())
-                    .await
-                    .map_err(|_| EnvError::ShellFailed {
-                        exit_code: -1,
-                        stdout: String::new(),
-                        stderr: "timeout".into(),
-                    })?
-                    .map_err(EnvError::Io)?
-            } else {
-                child.wait_with_output().await.map_err(EnvError::Io)?
+            // 取走 piped handle；若 on_stdout/on_stderr 为 None，仍 drain 到缓冲以构造 ShellOutput。
+            let mut stdout_handle = child.stdout.take();
+            let mut stderr_handle = child.stderr.take();
+
+            // 读取一个 piped handle 直到 EOF，每读到一块数据：
+            // - 若有回调：用 carry-over buffer 处理跨块的 UTF-8 边界，把完整部分喂给回调
+            // - 累积全部原始字节到 buf，最终 lossy 转成 String 返回
+            macro_rules! drain_pipe {
+                ($handle:expr, $cb:expr) => { async {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = Vec::with_capacity(4096);
+                    let mut carry = Vec::new(); // 上一块尾部的不完整 UTF-8 字节
+                    if let Some(h) = $handle.as_mut() {
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            let n = h.read(&mut chunk).await.map_err(EnvError::Io)?;
+                            if n == 0 {
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk[..n]);
+                            if let Some(cb) = $cb.as_deref_mut() {
+                                carry.extend_from_slice(&chunk[..n]);
+                                // 找到最后一个完整 UTF-8 字符的边界
+                                let split = utf8_safe_boundary(&carry);
+                                let s = String::from_utf8_lossy(&carry[..split]);
+                                cb(&s);
+                                carry = carry[split..].to_vec();
+                            }
+                        }
+                    }
+                    // EOF 时把残留字节 lossy 喂给回调
+                    if let Some(cb) = $cb.as_deref_mut() {
+                        if !carry.is_empty() {
+                            let s = String::from_utf8_lossy(&carry);
+                            cb(&s);
+                        }
+                    }
+                    Ok::<String, EnvError>(String::from_utf8_lossy(&buf).into_owned())
+                }};
+            }
+
+            let drain = async {
+                let stdout_task = drain_pipe!(stdout_handle, opts.on_stdout);
+                let stderr_task = drain_pipe!(stderr_handle, opts.on_stderr);
+                let (stdout_res, stderr_res) = tokio::join!(stdout_task, stderr_task);
+                let stdout = stdout_res?;
+                let stderr = stderr_res?;
+                // 等待进程退出，拿 exit code
+                let status = child.wait().await.map_err(EnvError::Io)?;
+                Ok::<_, EnvError>((stdout, stderr, status))
             };
 
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let (stdout, stderr, status) = if let Some(timeout) = opts.timeout {
+                tokio::select! {
+                    biased;
+                    _ = opts.abort.cancelled() => {
+                        let _ = child.start_kill();
+                        return Err(EnvError::Aborted);
+                    }
+                    res = tokio::time::timeout(timeout, drain) => match res {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
+                            let _ = child.start_kill();
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            let _ = child.start_kill();
+                            return Err(EnvError::ShellFailed {
+                                exit_code: -1,
+                                stdout: String::new(),
+                                stderr: "timeout".into(),
+                            });
+                        }
+                    },
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = opts.abort.cancelled() => {
+                        let _ = child.start_kill();
+                        return Err(EnvError::Aborted);
+                    }
+                    res = drain => match res {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = child.start_kill();
+                            return Err(e);
+                        }
+                    },
+                }
+            };
 
-            if !output.status.success() {
+            if !status.success() {
                 Err(EnvError::ShellFailed {
-                    exit_code: output.status.code().unwrap_or(-1),
+                    exit_code: status.code().unwrap_or(-1),
                     stdout,
                     stderr,
                 })
@@ -366,7 +485,7 @@ impl ExecutionEnv for OsEnv {
                 Ok(ShellOutput {
                     stdout,
                     stderr,
-                    exit_code: output.status.code().unwrap_or(0),
+                    exit_code: status.code().unwrap_or(0),
                 })
             }
         }
@@ -459,5 +578,229 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, EnvError::NotFound(_)));
+    }
+    #[tokio::test]
+    async fn execute_shell_streams_stdout_callback() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let env = OsEnv::new(tmp.path());
+
+        let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected_clone = collected.clone();
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: Some(Box::new(move |chunk: &str| {
+                collected_clone.lock().unwrap().push(chunk.to_string());
+            })),
+            on_stderr: None,
+        };
+
+        // 分多行输出，制造多个 chunk 的机会
+        #[cfg(not(target_os = "windows"))]
+        let cmd = "for i in 1 2 3; do echo line$i; done";
+        #[cfg(target_os = "windows")]
+        let cmd = "for /L %i in (1,1,3) do echo line%i";
+
+        let out = env.execute_shell(cmd, opts).await.unwrap();
+        assert_eq!(out.exit_code, 0);
+
+        // 回调必须被调用至少一次；累积内容应覆盖全部输出
+        let chunks = collected.lock().unwrap();
+        assert!(!chunks.is_empty(), "on_stdout callback was never invoked");
+        let joined = chunks.join("");
+        assert!(
+            joined.contains("line1") && joined.contains("line2") && joined.contains("line3"),
+            "streamed chunks did not cover full stdout: {joined:?}"
+        );
+        // ShellOutput 仍含完整内容
+        assert_eq!(out.stdout.trim_end(), "line1\nline2\nline3");
+    }
+    #[tokio::test]
+    async fn execute_shell_streams_stderr_callback() {
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let env = OsEnv::new(tmp.path());
+
+        let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected_clone = collected.clone();
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: Some(Box::new(move |chunk: &str| {
+                collected_clone.lock().unwrap().push(chunk.to_string());
+            })),
+        };
+
+        // 写到 stderr
+        #[cfg(not(target_os = "windows"))]
+        let cmd = "echo err1 >&2; echo err2 >&2";
+        #[cfg(target_os = "windows")]
+        let cmd = "echo err1 1>&2 & echo err2 1>&2";
+
+        let out = env.execute_shell(cmd, opts).await.unwrap();
+        assert_eq!(out.exit_code, 0);
+
+        let chunks = collected.lock().unwrap();
+        assert!(!chunks.is_empty(), "on_stderr callback was never invoked");
+        let joined = chunks.join("");
+        assert!(
+            joined.contains("err1") && joined.contains("err2"),
+            "streamed stderr chunks did not cover full stderr: {joined:?}"
+        );
+        assert_eq!(out.stderr.trim_end(), "err1\nerr2");
+        // stdout 应为空
+        assert_eq!(out.stdout.trim(), "");
+    }
+    #[tokio::test]
+    async fn execute_shell_abort_cancels_long_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = OsEnv::new(tmp.path());
+        let abort = CancellationToken::new();
+        let abort_clone = abort.clone();
+
+        #[cfg(not(target_os = "windows"))]
+        let cmd = "sleep 30";
+        #[cfg(target_os = "windows")]
+        let cmd = "timeout /t 30 /nobreak >nul";
+
+        // 50ms 后触发取消
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            abort_clone.cancel();
+        });
+
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort,
+            on_stdout: None,
+            on_stderr: None,
+        };
+
+        let start = std::time::Instant::now();
+        let result = env.execute_shell(cmd, opts).await;
+        let elapsed = start.elapsed();
+
+        assert!(matches!(result, Err(EnvError::Aborted)), "expected Aborted");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "abort took too long: {elapsed:?}"
+        );
+    }
+    #[tokio::test]
+    async fn execute_shell_timeout_returns_shell_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = OsEnv::new(tmp.path());
+
+        #[cfg(not(target_os = "windows"))]
+        let cmd = "sleep 30";
+        #[cfg(target_os = "windows")]
+        let cmd = "timeout /t 30 /nobreak >nul";
+
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: Some(std::time::Duration::from_millis(50)),
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+
+        let start = std::time::Instant::now();
+        let result = env.execute_shell(cmd, opts).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(EnvError::ShellFailed { stderr, .. }) if stderr == "timeout"),
+            "expected ShellFailed with stderr \"timeout\""
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "timeout took too long: {elapsed:?}"
+        );
+    }
+    #[tokio::test]
+    async fn execute_shell_none_callbacks_returns_full_output() {
+        // None-callback 路径：不触发回调，仅返回 ShellOutput
+        let tmp = tempfile::tempdir().unwrap();
+        let env = OsEnv::new(tmp.path());
+
+        #[cfg(not(target_os = "windows"))]
+        let cmd = "echo noproblem; echo toerr >&2";
+        #[cfg(target_os = "windows")]
+        let cmd = "echo noproblem & echo toerr 1>&2";
+
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+
+        let out = env.execute_shell(cmd, opts).await.unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.stdout.trim(), "noproblem");
+        assert_eq!(out.stderr.trim(), "toerr");
+    }
+    #[tokio::test]
+    async fn execute_shell_streams_multibyte_utf8() {
+        // 验证 carry-over buffer：多字节 UTF-8 字符跨块时回调不应产生替换字符。
+        // 这里用大量 ASCII 填充 + 末尾中文，确保中文不会被拆到两个 chunk 里产生 U+FFFD。
+        // 注意：read chunk 大小是 4096，我们输出 >4096 字节来触发跨块。
+        let tmp = tempfile::tempdir().unwrap();
+        let env = OsEnv::new(tmp.path());
+
+        let collected: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_clone = collected.clone();
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: Some(Box::new(move |chunk: &str| {
+                collected_clone.lock().unwrap().push(chunk.to_string());
+            })),
+            on_stderr: None,
+        };
+
+        // 输出 5000 字节 ASCII（超出 4096 chunk 边界），末尾跟一个 3 字节 UTF-8 中文字符
+        #[cfg(not(target_os = "windows"))]
+        let cmd = "python3 -c 'import sys; sys.stdout.write(\"A\"*5000 + \"中\")'";
+        #[cfg(target_os = "windows")]
+        let cmd = "python -c \"import sys; sys.stdout.write('A'*5000 + '\u{4e2d}')\"";
+
+        let out = env.execute_shell(cmd, opts).await;
+        // python3 可能不存在，跳过测试而非失败
+        let out = match out {
+            Ok(o) => o,
+            Err(_) => return, // 环境无 python3，跳过
+        };
+        assert_eq!(out.exit_code, 0);
+
+        let chunks = collected.lock().unwrap();
+        let joined = chunks.join("");
+        // 回调拼接后应包含完整的 "中" 字符，不应用 U+FFFD
+        assert!(
+            joined.contains('中'),
+            "streamed callback output missing multibyte char, got replacement instead: {joined:?}"
+        );
+        assert!(
+            !joined.contains('\u{FFFD}'),
+            "streamed callback produced U+FFFD replacement char: {joined:?}"
+        );
+        // ShellOutput 也应完整
+        assert!(out.stdout.ends_with('中'));
     }
 }

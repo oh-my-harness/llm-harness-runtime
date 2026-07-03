@@ -12,8 +12,6 @@
 
 pub mod agent;
 pub mod compaction;
-#[cfg(test)]
-mod env;
 pub mod harness;
 pub mod plugin;
 pub mod session;
