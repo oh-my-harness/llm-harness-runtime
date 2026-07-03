@@ -223,19 +223,14 @@ fn run_loop(
             let turn_id = Uuid::now_v7().to_string();
             yield AgentEvent::TurnStart { index: turn_index };
 
-            // Build message list (with optional system message prepended)
-            let llm_messages = if let Some(sp) = &ctx.system_prompt {
-                let mut v = vec![AMsg::System(sp.clone())];
-                match config.convert_to_llm.convert(&ctx.messages).await {
-                    Ok(m) => { v.extend(m); v }
-                    Err(e) => { yield AgentEvent::Error(e); break 'main; }
-                }
-            } else {
-                match config.convert_to_llm.convert(&ctx.messages).await {
-                    Ok(m) => m,
-                    Err(e) => { yield AgentEvent::Error(e); break 'main; }
-                }
+            // Build message list, prepending system message if present.
+            let mut llm_messages = match config.convert_to_llm.convert(&ctx.messages).await {
+                Ok(m) => m,
+                Err(e) => { yield AgentEvent::Error(e); break 'main; }
             };
+            if let Some(sp) = &ctx.system_prompt {
+                llm_messages.insert(0, AMsg::System(sp.clone()));
+            }
 
             let (current_tools, current_final_answer_tool) = match tools_for_turn(
                 &config.tools,
@@ -315,10 +310,14 @@ fn run_loop(
                                 delay_ms: delay.as_millis() as u64,
                                 error: e.to_string(),
                             };
-                            // TODO: retry sleep 期间不响应 abort 信号，
-                            // 长 backoff 下取消延迟可能显著。
-                            // 后续可用 tokio::select! 在 sleep 上并发等待 abort。
-                            tokio::time::sleep(delay).await;
+                            tokio::select! {
+                                biased;
+                                _ = config.abort.cancelled() => {
+                                    yield AgentEvent::Error(AgentError::Aborted);
+                                    break 'main;
+                                }
+                                _ = tokio::time::sleep(delay) => {}
+                            }
                             attempt += 1;
                         }
                         Err(e) => {
@@ -842,9 +841,7 @@ mod tests {
                 .await;
 
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::AgentStart)),
+            events.iter().any(|e| matches!(e, AgentEvent::AgentStart)),
             "missing AgentStart"
         );
         assert!(
@@ -1504,6 +1501,85 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
             "non-retryable error must emit Error event"
+        );
+    }
+    #[tokio::test]
+    async fn abort_during_retry_sleep_stops_loop() {
+        use crate::config::RetryConfig;
+
+        // A rate-limit error triggers retry backoff; abort during the sleep
+        // must interrupt the loop with Error(Aborted), not wait for backoff.
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::rate_limit_error(),
+            MockResponse::text("ok"), // never reached
+        ]);
+        cfg.retry = Some(RetryConfig::new(3, 10_000)); // 10s backoff
+        let abort = cfg.abort.clone();
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+
+        tokio::time::pause();
+
+        let stream = agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg);
+        futures::pin_mut!(stream);
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let is_retry = matches!(ev, AgentEvent::RetryAttempt { .. });
+            events.push(ev);
+            if is_retry {
+                abort.cancel();
+            }
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::Aborted))),
+            "expected Error(Aborted) after abort during retry sleep"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::MessageStart { .. })),
+            "no MessageStart should appear after abort during retry sleep"
+        );
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "provider should be called exactly once before abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_prompt_prepended_to_provider_messages() {
+        let (client, cfg) = make_config(vec![MockResponse::text("hi")]);
+        let ctx = AgentContext {
+            system_prompt: Some("You are a test assistant.".into()),
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hello".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let _events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        let captured = client.captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 1, "provider should be called exactly once");
+        let messages = captured[0].messages();
+        assert!(
+            matches!(
+                messages.first(),
+                Some(llm_adapter::types::Message::System(s)) if s == "You are a test assistant."
+            ),
+            "system prompt must be the first message sent to the provider"
         );
     }
 }
