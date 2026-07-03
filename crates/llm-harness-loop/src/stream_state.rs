@@ -159,8 +159,8 @@ impl StreamingState {
                 };
                 let message = AssistantMessage {
                     kind,
-                    message_id: Some(mid.clone()),
-                    turn_id: Some(self.turn_id.clone()),
+                    message_id: mid.clone(),
+                    turn_id: self.turn_id.clone(),
                     content,
                     stop_reason: Some(stop_reason),
                     timestamp: Utc::now(),
@@ -190,7 +190,6 @@ impl StreamingState {
                                 text: visible_text,
                             });
                         }
-                        AssistantMessageKind::ReasoningSummary => {}
                     }
                 }
                 events
@@ -202,8 +201,8 @@ impl StreamingState {
     pub(crate) fn partial_message(&self) -> AssistantMessage {
         AssistantMessage {
             kind: AssistantMessageKind::Progress,
-            message_id: Some(self.message_id.clone()),
-            turn_id: Some(self.turn_id.clone()),
+            message_id: self.message_id.clone(),
+            turn_id: self.turn_id.clone(),
             content: self.build_final_content(),
             stop_reason: None,
             timestamp: Utc::now(),
@@ -441,8 +440,8 @@ mod tests {
         assert!(msg_end.is_some());
         if let AgentEvent::MessageEnd { message, .. } = msg_end.unwrap() {
             assert_eq!(message.kind, AssistantMessageKind::FinalAnswer);
-            assert_eq!(message.turn_id.as_deref(), Some("turn_1"));
-            assert!(message.message_id.is_some());
+            assert_eq!(message.turn_id, "turn_1");
+            assert!(!message.message_id.is_empty());
             assert!(matches!(message.stop_reason, Some(StopReason::EndTurn)));
             assert_eq!(message.usage.as_ref().unwrap().input_tokens, 5);
         }
@@ -475,8 +474,8 @@ mod tests {
             .unwrap();
         if let AgentEvent::MessageEnd { message, .. } = msg_end {
             assert_eq!(message.kind, AssistantMessageKind::Progress);
-            assert_eq!(message.turn_id.as_deref(), Some("turn_1"));
-            assert!(message.message_id.is_some());
+            assert_eq!(message.turn_id, "turn_1");
+            assert!(!message.message_id.is_empty());
         }
 
         assert!(events.iter().any(|e| matches!(

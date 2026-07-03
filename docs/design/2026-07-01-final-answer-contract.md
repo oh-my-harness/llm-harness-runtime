@@ -22,7 +22,7 @@ later turn. The first text is progress, not the final user-visible answer.
 
 `AssistantMessage` now carries display semantics and stable runtime identity:
 
-- `kind`: `progress`, `reasoning_summary`, or `final_answer`.
+- `kind`: `progress` or `final_answer`.
 - `message_id`: stable ID for the assistant message when produced by the loop.
 - `turn_id`: stable ID for the user turn that produced the assistant message.
 

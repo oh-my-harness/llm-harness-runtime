@@ -517,7 +517,7 @@ mod tests {
         // budget exceeded) must not skip a later follow-up-injecting hook
         // (e.g. AsyncSpawnHook), otherwise pending sub-agent results would
         // be silently deferred. All hooks execute; result is the OR.
-        use llm_harness_types::{AssistantMessage, AssistantMessageKind, ContentBlock, StopReason};
+        use llm_harness_types::{ContentBlock, StopReason};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -548,18 +548,12 @@ mod tests {
             }),
         ]);
 
-        let assistant = AssistantMessage {
-            kind: AssistantMessageKind::FinalAnswer,
-            message_id: None,
-            turn_id: None,
-            content: vec![ContentBlock::Text { text: "x".into() }],
-            stop_reason: Some(StopReason::EndTurn),
-            timestamp: chrono::Utc::now(),
-            provider: None,
-            api: None,
-            model: None,
-            usage: None,
-            error_message: None,
+        let assistant = {
+            let mut m = crate::test_utils::test_assistant_message(vec![ContentBlock::Text {
+                text: "x".into(),
+            }]);
+            m.stop_reason = Some(StopReason::EndTurn);
+            m
         };
         let ctx = ShouldStopCtx {
             last_assistant: &assistant,

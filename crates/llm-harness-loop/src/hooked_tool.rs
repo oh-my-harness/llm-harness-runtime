@@ -91,7 +91,6 @@ impl Tool for HookedTool {
 #[cfg(feature = "test-utils")]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -137,19 +136,7 @@ mod tests {
             abort: CancellationToken::new(),
             tool_use_id: "c1".into(),
             turn_index: 0,
-            assistant_message: Arc::new(AssistantMessage {
-                kind: AssistantMessageKind::FinalAnswer,
-                message_id: None,
-                turn_id: None,
-                content: vec![],
-                stop_reason: None,
-                timestamp: Utc::now(),
-                provider: None,
-                api: None,
-                model: None,
-                usage: None,
-                error_message: None,
-            }),
+            assistant_message: Arc::new(crate::test_utils::test_assistant_message(vec![])),
             update_tx: tx,
         }
     }

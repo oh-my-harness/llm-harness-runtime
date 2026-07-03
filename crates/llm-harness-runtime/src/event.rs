@@ -247,20 +247,7 @@ mod tests {
     }
 
     fn empty_assistant_message() -> llm_harness_types::AssistantMessage {
-        use chrono::Utc;
-        llm_harness_types::AssistantMessage {
-            kind: llm_harness_types::AssistantMessageKind::FinalAnswer,
-            message_id: None,
-            turn_id: None,
-            content: vec![],
-            stop_reason: None,
-            timestamp: Utc::now(),
-            provider: None,
-            api: None,
-            model: None,
-            usage: None,
-            error_message: None,
-        }
+        llm_harness_loop::test_utils::test_assistant_message(vec![])
     }
 
     #[tokio::test]

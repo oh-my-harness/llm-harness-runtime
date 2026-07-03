@@ -671,9 +671,7 @@ mod tests {
     }
     // ── PeerMessageHook tests ───────────────────────────────────────────────
 
-    use llm_harness_types::{
-        AssistantMessage, AssistantMessageKind, ShouldStopCtx, ShouldStopHook, StopReason,
-    };
+    use llm_harness_types::{AssistantMessage, ShouldStopCtx, ShouldStopHook, StopReason};
 
     fn make_stop_ctx<'a>(assistant: &'a AssistantMessage) -> ShouldStopCtx<'a> {
         ShouldStopCtx {
@@ -684,19 +682,9 @@ mod tests {
     }
 
     fn empty_assistant() -> AssistantMessage {
-        AssistantMessage {
-            kind: AssistantMessageKind::FinalAnswer,
-            message_id: None,
-            turn_id: None,
-            content: vec![],
-            stop_reason: Some(StopReason::EndTurn),
-            timestamp: chrono::Utc::now(),
-            provider: None,
-            api: None,
-            model: None,
-            usage: None,
-            error_message: None,
-        }
+        let mut m = llm_harness_loop::test_utils::test_assistant_message(vec![]);
+        m.stop_reason = Some(StopReason::EndTurn);
+        m
     }
 
     /// should_stop always returns true, even with an empty channel and no
@@ -891,19 +879,9 @@ mod tests {
             abort: tokio_util::sync::CancellationToken::new(),
             tool_use_id: "test".into(),
             turn_index: 0,
-            assistant_message: Arc::new(llm_harness_types::AssistantMessage {
-                kind: llm_harness_types::AssistantMessageKind::FinalAnswer,
-                message_id: None,
-                turn_id: None,
-                content: vec![],
-                stop_reason: None,
-                timestamp: chrono::Utc::now(),
-                provider: None,
-                api: None,
-                model: None,
-                usage: None,
-                error_message: None,
-            }),
+            assistant_message: Arc::new(llm_harness_loop::test_utils::test_assistant_message(
+                vec![],
+            )),
             update_tx,
         }
     }

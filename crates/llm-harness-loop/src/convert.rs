@@ -162,11 +162,8 @@ mod tests {
     #[tokio::test]
     async fn assistant_message_with_tool_use_and_thinking() {
         let conv = DefaultConvertToLlm::new();
-        let msg = AgentMessage::Assistant(AssistantMessage {
-            kind: AssistantMessageKind::Progress,
-            message_id: None,
-            turn_id: None,
-            content: vec![
+        let msg = AgentMessage::Assistant({
+            let mut m = crate::test_utils::test_assistant_message(vec![
                 ContentBlock::Thinking {
                     thinking: "plan".into(),
                     signature: None,
@@ -179,14 +176,10 @@ mod tests {
                     name: "bash".into(),
                     input: serde_json::json!({}),
                 },
-            ],
-            stop_reason: Some(StopReason::ToolUse),
-            timestamp: Utc::now(),
-            provider: None,
-            api: None,
-            model: None,
-            usage: None,
-            error_message: None,
+            ]);
+            m.kind = AssistantMessageKind::Progress;
+            m.stop_reason = Some(StopReason::ToolUse);
+            m
         });
         let result = conv.convert(&[msg]).await.unwrap();
         assert_eq!(result.len(), 1);
@@ -365,20 +358,12 @@ mod tests {
                 content: vec![text_block("hi")],
                 timestamp: Utc::now(),
             }),
-            AgentMessage::Assistant(AssistantMessage {
-                kind: AssistantMessageKind::FinalAnswer,
-                message_id: None,
-                turn_id: None,
-                content: vec![ContentBlock::Text {
+            AgentMessage::Assistant({
+                let mut m = crate::test_utils::test_assistant_message(vec![ContentBlock::Text {
                     text: "hello".into(),
-                }],
-                stop_reason: Some(StopReason::EndTurn),
-                timestamp: Utc::now(),
-                provider: None,
-                api: None,
-                model: None,
-                usage: None,
-                error_message: None,
+                }]);
+                m.stop_reason = Some(StopReason::EndTurn);
+                m
             }),
             AgentMessage::User(UserMessage {
                 content: vec![text_block("again")],

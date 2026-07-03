@@ -44,8 +44,7 @@ mod tests {
     use super::*;
     use crate::predicates::Contains;
     use crate::rule::Rule;
-    use chrono::Utc;
-    use llm_harness_types::{AssistantMessage, AssistantMessageKind};
+    use llm_harness_types::AssistantMessage;
 
     /// 构造一个最小的 ctx。`msg` 必须比 ctx 活得久——调用方持有 msg。
     fn make_ctx<'a>(msg: &'a AssistantMessage, tool_name: &'a str) -> BeforeToolCallCtx<'a> {
@@ -59,19 +58,7 @@ mod tests {
     }
 
     fn empty_message() -> AssistantMessage {
-        AssistantMessage {
-            kind: AssistantMessageKind::FinalAnswer,
-            message_id: None,
-            turn_id: None,
-            content: vec![],
-            stop_reason: None,
-            timestamp: Utc::now(),
-            provider: None,
-            api: None,
-            model: None,
-            usage: None,
-            error_message: None,
-        }
+        llm_harness_loop::test_utils::test_assistant_message(vec![])
     }
 
     #[tokio::test]

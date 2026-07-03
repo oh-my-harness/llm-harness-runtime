@@ -33,8 +33,6 @@ impl TokenUsage {
 pub enum AssistantMessageKind {
     /// Intermediate assistant text, usually followed by tool calls or another turn.
     Progress,
-    /// A compact reasoning summary intended for product display, not raw chain of thought.
-    ReasoningSummary,
     /// Durable user-visible answer for the turn.
     #[default]
     FinalAnswer,
@@ -56,11 +54,9 @@ pub struct AssistantMessage {
     #[serde(default)]
     pub kind: AssistantMessageKind,
     /// Stable ID for this assistant message when produced by the runtime loop.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message_id: Option<String>,
+    pub message_id: String,
     /// Stable ID for the user turn that produced this assistant message.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_id: Option<String>,
+    pub turn_id: String,
     /// 消息内容块列表（含 Text、Thinking、ToolUse 等）。
     pub content: Vec<ContentBlock>,
     /// LLM 停止生成的原因。
@@ -182,8 +178,8 @@ mod tests {
     fn agent_message_serde_assistant() {
         let msg = AgentMessage::Assistant(AssistantMessage {
             kind: AssistantMessageKind::FinalAnswer,
-            message_id: None,
-            turn_id: None,
+            message_id: "test_msg".into(),
+            turn_id: "test_turn".into(),
             content: vec![text_block("response")],
             stop_reason: Some(crate::StopReason::EndTurn),
             timestamp: chrono::Utc::now(),
@@ -243,8 +239,8 @@ mod tests {
     fn assistant_message_none_fields_omitted_in_json() {
         let msg = AssistantMessage {
             kind: AssistantMessageKind::FinalAnswer,
-            message_id: None,
-            turn_id: None,
+            message_id: "test_msg".into(),
+            turn_id: "test_turn".into(),
             content: vec![text_block("hi")],
             stop_reason: None,
             timestamp: chrono::Utc::now(),
@@ -288,8 +284,8 @@ mod tests {
     fn assistant_message_kind_and_ids_roundtrip() {
         let msg = AssistantMessage {
             kind: AssistantMessageKind::Progress,
-            message_id: Some("msg_1".into()),
-            turn_id: Some("turn_1".into()),
+            message_id: "msg_1".into(),
+            turn_id: "turn_1".into(),
             content: vec![text_block("checking")],
             stop_reason: Some(crate::StopReason::ToolUse),
             timestamp: chrono::Utc::now(),
@@ -307,8 +303,8 @@ mod tests {
 
         let decoded: AssistantMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.kind, AssistantMessageKind::Progress);
-        assert_eq!(decoded.message_id.as_deref(), Some("msg_1"));
-        assert_eq!(decoded.turn_id.as_deref(), Some("turn_1"));
+        assert_eq!(decoded.message_id, "msg_1");
+        assert_eq!(decoded.turn_id, "turn_1");
     }
 
     #[test]
@@ -316,20 +312,20 @@ mod tests {
         let json = serde_json::json!({
             "content": [{"type": "text", "text": "legacy"}],
             "timestamp": chrono::Utc::now(),
+            "message_id": "msg_1",
+            "turn_id": "turn_1",
         });
 
         let decoded: AssistantMessage = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.kind, AssistantMessageKind::FinalAnswer);
-        assert!(decoded.message_id.is_none());
-        assert!(decoded.turn_id.is_none());
     }
 
     #[test]
     fn assistant_message_text_content_concatenates_visible_text_only() {
         let msg = AssistantMessage {
             kind: AssistantMessageKind::FinalAnswer,
-            message_id: None,
-            turn_id: None,
+            message_id: "test_msg".into(),
+            turn_id: "test_turn".into(),
             content: vec![
                 text_block("hello "),
                 ContentBlock::Thinking {

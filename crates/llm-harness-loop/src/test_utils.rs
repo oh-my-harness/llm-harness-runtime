@@ -13,7 +13,10 @@ use llm_adapter::{
     stream_handle::StreamHandle,
     types::{ChatRequest, ChatResponse, StopReason, StreamEvent, Usage},
 };
-use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
+use llm_harness_types::{
+    AssistantMessage, AssistantMessageKind, ContentBlock, EnvError, ExecutionEnv, FileInfo,
+    ShellOptions, ShellOutput,
+};
 use tokio_util::sync::CancellationToken;
 
 // ── NoOpEnv ──────────────────────────────────────────────────────────────────
@@ -276,6 +279,30 @@ impl Provider for MockLlmClient {
         let inner: BoxStream<'static, Result<StreamEvent, LlmError>> =
             Box::pin(stream::iter(response.events));
         Ok(StreamHandle::from_raw_stream(response.model, inner))
+    }
+}
+
+// ── AssistantMessage test helper ─────────────────────────────────────────────
+
+/// Construct an `AssistantMessage` for tests with sensible defaults.
+/// ID/turn_id are filled with stable test values; caller provides content.
+/// For variants needing different `kind` or `stop_reason`, modify the
+/// returned struct's fields at the call site.
+pub fn test_assistant_message(content: Vec<ContentBlock>) -> AssistantMessage {
+    use chrono::Utc;
+
+    AssistantMessage {
+        kind: AssistantMessageKind::FinalAnswer,
+        message_id: "test_msg".into(),
+        turn_id: "test_turn".into(),
+        content,
+        stop_reason: None,
+        timestamp: Utc::now(),
+        provider: None,
+        api: None,
+        model: None,
+        usage: None,
+        error_message: None,
     }
 }
 

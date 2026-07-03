@@ -2111,8 +2111,8 @@ mod tests {
 
         assert_eq!(assistant.kind, AssistantMessageKind::FinalAnswer);
         assert_eq!(assistant.text_content(), "Hello!");
-        assert!(assistant.message_id.is_some());
-        assert!(assistant.turn_id.is_some());
+        assert!(!assistant.message_id.is_empty());
+        assert!(!assistant.turn_id.is_empty());
     }
 
     #[tokio::test]

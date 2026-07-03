@@ -597,21 +597,11 @@ mod tests {
                 }],
                 timestamp: chrono::Utc::now(),
             }),
-            AgentMessage::Assistant(AssistantMessage {
-                kind: AssistantMessageKind::FinalAnswer,
-                message_id: None,
-                turn_id: None,
-                content: vec![ContentBlock::Text {
+            AgentMessage::Assistant(llm_harness_loop::test_utils::test_assistant_message(vec![
+                ContentBlock::Text {
                     text: "reply".into(),
-                }],
-                stop_reason: Some(StopReason::EndTurn),
-                timestamp: chrono::Utc::now(),
-                provider: None,
-                api: None,
-                model: None,
-                usage: None,
-                error_message: None,
-            }),
+                },
+            ])),
         ];
         agent.prompt_with_messages(msgs).await.unwrap();
         let state = agent.state();

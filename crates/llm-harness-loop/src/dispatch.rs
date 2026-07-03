@@ -79,7 +79,6 @@ pub(crate) async fn execute_tool_batch(
 #[cfg(feature = "test-utils")]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -191,19 +190,7 @@ mod tests {
         let t1 = parallel_tool("t1");
         let t2 = parallel_tool("t2");
         let env: Arc<dyn ExecutionEnv> = Arc::new(crate::test_utils::NoOpEnv);
-        let assistant_message = Arc::new(AssistantMessage {
-            kind: AssistantMessageKind::FinalAnswer,
-            message_id: None,
-            turn_id: None,
-            content: vec![],
-            stop_reason: None,
-            timestamp: Utc::now(),
-            provider: None,
-            api: None,
-            model: None,
-            usage: None,
-            error_message: None,
-        });
+        let assistant_message = Arc::new(crate::test_utils::test_assistant_message(vec![]));
         let calls = vec![
             ("c1".to_string(), serde_json::json!({}), t1),
             ("c2".to_string(), serde_json::json!({}), t2),

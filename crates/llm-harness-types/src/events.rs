@@ -133,8 +133,8 @@ mod tests {
     fn make_assistant() -> AssistantMessage {
         AssistantMessage {
             kind: crate::AssistantMessageKind::FinalAnswer,
-            message_id: Some("msg_1".into()),
-            turn_id: Some("turn_1".into()),
+            message_id: "msg_1".into(),
+            turn_id: "turn_1".into(),
             content: vec![ContentBlock::Text { text: "ok".into() }],
             stop_reason: Some(StopReason::EndTurn),
             timestamp: chrono::Utc::now(),

@@ -543,15 +543,12 @@ fn run_loop(
                         final_answer_text_from_results(&cfg.name, &tool_calls, &results)
                     })
                     .map(|text| {
-                        let turn_id = assistant_msg
-                            .turn_id
-                            .clone()
-                            .unwrap_or_else(|| Uuid::now_v7().to_string());
+                        let turn_id = assistant_msg.turn_id.clone();
                         let message_id = Uuid::now_v7().to_string();
                         AssistantMessage {
                             kind: AssistantMessageKind::FinalAnswer,
-                            message_id: Some(message_id),
-                            turn_id: Some(turn_id),
+                            message_id,
+                            turn_id,
                             content: vec![ContentBlock::Text { text }],
                             stop_reason: Some(StopReason::EndTurn),
                             timestamp: chrono::Utc::now(),
@@ -564,14 +561,8 @@ fn run_loop(
                     });
 
                 if let Some(final_message) = &final_answer_message {
-                    let message_id = final_message
-                        .message_id
-                        .clone()
-                        .expect("synthetic final-answer message has an id");
-                    let turn_id = final_message
-                        .turn_id
-                        .clone()
-                        .expect("synthetic final-answer message has a turn id");
+                    let message_id = final_message.message_id.clone();
+                    let turn_id = final_message.turn_id.clone();
                     let text = final_message.text_content();
                     yield AgentEvent::MessageStart {
                         message_id: message_id.clone(),

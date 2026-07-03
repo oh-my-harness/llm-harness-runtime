@@ -212,7 +212,7 @@ mod tests {
         assert_eq!(adapters[0].name(), "greet");
 
         // Build minimal ToolContext.
-        use llm_harness_types::{AssistantMessage, AssistantMessageKind, UnsupportedEnv};
+        use llm_harness_types::UnsupportedEnv;
         use std::sync::Arc;
         use tokio_util::sync::CancellationToken;
 
@@ -221,19 +221,9 @@ mod tests {
             abort: CancellationToken::new(),
             tool_use_id: "t1".into(),
             turn_index: 0,
-            assistant_message: Arc::new(AssistantMessage {
-                kind: AssistantMessageKind::FinalAnswer,
-                message_id: None,
-                turn_id: None,
-                content: vec![],
-                stop_reason: None,
-                timestamp: chrono::Utc::now(),
-                provider: None,
-                api: None,
-                model: None,
-                usage: None,
-                error_message: None,
-            }),
+            assistant_message: Arc::new(llm_harness_loop::test_utils::test_assistant_message(
+                vec![],
+            )),
             update_tx: tokio::sync::mpsc::channel(1).0,
         };
 

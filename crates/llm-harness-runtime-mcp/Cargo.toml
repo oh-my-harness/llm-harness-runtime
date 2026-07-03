@@ -11,6 +11,6 @@ futures.workspace             = true
 serde_json.workspace          = true
 
 [dev-dependencies]
-chrono    = { workspace = true }
 tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-util = { workspace = true }
+llm-harness-loop = { workspace = true, features = ["test-utils"] }

@@ -311,19 +311,12 @@ mod tests {
     }
 
     fn assistant_msg(text: &str) -> AgentMessage {
-        AgentMessage::Assistant(AssistantMessage {
-            kind: AssistantMessageKind::FinalAnswer,
-            message_id: None,
-            turn_id: None,
-            content: vec![ContentBlock::Text { text: text.into() }],
-            stop_reason: Some(StopReason::EndTurn),
-            timestamp: chrono::Utc::now(),
-            provider: None,
-            api: None,
-            model: None,
-            usage: None,
-            error_message: None,
-        })
+        let mut m =
+            llm_harness_loop::test_utils::test_assistant_message(vec![ContentBlock::Text {
+                text: text.into(),
+            }]);
+        m.stop_reason = Some(StopReason::EndTurn);
+        AgentMessage::Assistant(m)
     }
 
     #[tokio::test]

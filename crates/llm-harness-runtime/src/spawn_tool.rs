@@ -193,7 +193,7 @@ mod tests {
     use crate::async_spawn::async_spawn_pair;
     use crate::spawner::JsonlSessionFactory;
     use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
-    use llm_harness_types::{AssistantMessage, AssistantMessageKind, ExecutionEnv};
+    use llm_harness_types::ExecutionEnv;
 
     fn make_tool() -> (SpawnAgentTool, Arc<crate::async_spawn::AsyncSpawnRegistry>) {
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
@@ -397,19 +397,9 @@ mod tests {
             abort: tokio_util::sync::CancellationToken::new(),
             tool_use_id: "test".into(),
             turn_index: 0,
-            assistant_message: Arc::new(AssistantMessage {
-                kind: AssistantMessageKind::FinalAnswer,
-                message_id: None,
-                turn_id: None,
-                content: vec![],
-                stop_reason: None,
-                timestamp: chrono::Utc::now(),
-                provider: None,
-                api: None,
-                model: None,
-                usage: None,
-                error_message: None,
-            }),
+            assistant_message: Arc::new(llm_harness_loop::test_utils::test_assistant_message(
+                vec![],
+            )),
             update_tx,
         }
     }
