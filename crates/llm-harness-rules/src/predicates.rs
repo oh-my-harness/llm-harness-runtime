@@ -55,7 +55,6 @@ impl Predicate for NumberRangeField {
     }
 }
 
-
 /// 正则匹配：args[arg_path] 匹配 pattern。
 pub struct RegexField {
     pub arg_path: String,
@@ -151,7 +150,11 @@ mod tests {
 
     #[test]
     fn number_range_in_bounds() {
-        let p = NumberRangeField { arg_path: "value".into(), min: 0.0, max: 5.0 };
+        let p = NumberRangeField {
+            arg_path: "value".into(),
+            min: 0.0,
+            max: 5.0,
+        };
         assert!(p.test("set_voltage", &serde_json::json!({"value": 2.5})));
         assert!(p.test("set_voltage", &serde_json::json!({"value": 0.0})));
         assert!(p.test("set_voltage", &serde_json::json!({"value": 5.0})));
@@ -159,20 +162,32 @@ mod tests {
 
     #[test]
     fn number_range_out_of_bounds() {
-        let p = NumberRangeField { arg_path: "value".into(), min: 0.0, max: 5.0 };
+        let p = NumberRangeField {
+            arg_path: "value".into(),
+            min: 0.0,
+            max: 5.0,
+        };
         assert!(!p.test("set_voltage", &serde_json::json!({"value": 5.1})));
         assert!(!p.test("set_voltage", &serde_json::json!({"value": -0.1})));
     }
 
     #[test]
     fn number_range_missing_path() {
-        let p = NumberRangeField { arg_path: "value".into(), min: 0.0, max: 5.0 };
+        let p = NumberRangeField {
+            arg_path: "value".into(),
+            min: 0.0,
+            max: 5.0,
+        };
         assert!(!p.test("set_voltage", &serde_json::json!({"other": 1.0})));
     }
 
     #[test]
     fn number_range_nested_path() {
-        let p = NumberRangeField { arg_path: "config.threshold".into(), min: 0.0, max: 10.0 };
+        let p = NumberRangeField {
+            arg_path: "config.threshold".into(),
+            min: 0.0,
+            max: 10.0,
+        };
         assert!(p.test("x", &serde_json::json!({"config": {"threshold": 7.0}})));
         assert!(!p.test("x", &serde_json::json!({"config": {"threshold": 11.0}})));
     }

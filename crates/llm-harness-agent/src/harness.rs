@@ -2629,6 +2629,7 @@ mod cost_reset_tests {
                     output_tokens: 50,
                     cost: 2.5,
                     call_count: 1,
+                    ..Default::default()
                 },
             );
         }

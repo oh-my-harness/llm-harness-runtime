@@ -1523,6 +1523,8 @@ fn aggregate_cost(history: &[StepRecord]) -> CostAggregate {
                 let entry = total.by_model.entry(k.clone()).or_default();
                 entry.input_tokens += v.input_tokens;
                 entry.output_tokens += v.output_tokens;
+                entry.cache_read_tokens += v.cache_read_tokens;
+                entry.cache_write_tokens += v.cache_write_tokens;
                 entry.cost += v.cost;
                 entry.call_count += v.call_count;
             }
@@ -3094,5 +3096,72 @@ mod engine_tests {
             ctx.variables.get("survives"),
             Some(&serde_json::json!(true))
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_cost_merges_per_model_cache_tokens() {
+        use crate::workflow::model::{StepRecord, StepResult, Transition};
+        use llm_harness_types::{CostAggregate, ModelCost};
+
+        let now = chrono::Utc::now();
+        let mk_record = |read: u64, write: u64| StepRecord {
+            step_id: "s1".to_string(),
+            started_at: now,
+            ended_at: now,
+            result: Some(StepResult {
+                output: String::new(),
+                structured: None,
+                tool_calls_count: 0,
+                session_id: String::new(),
+                cost: CostAggregate {
+                    total_cache_read_tokens: read,
+                    total_cache_write_tokens: write,
+                    by_model: {
+                        let mut m = std::collections::HashMap::new();
+                        m.insert(
+                            "anthropic/claude-sonnet".to_string(),
+                            ModelCost {
+                                input_tokens: 0,
+                                output_tokens: 0,
+                                cache_read_tokens: read,
+                                cache_write_tokens: write,
+                                cost: 0.0,
+                                call_count: 1,
+                            },
+                        );
+                        m
+                    },
+                    ..Default::default()
+                },
+                started_at: None,
+                ended_at: None,
+            }),
+            transition: Transition::To("s2".to_string()),
+        };
+
+        let history = vec![mk_record(200, 100), mk_record(300, 50)];
+        let total = aggregate_cost(&history);
+
+        let mc = total
+            .by_model
+            .get("anthropic/claude-sonnet")
+            .expect("merged by_model entry");
+        assert_eq!(
+            mc.cache_read_tokens, 500,
+            "per-model cache_read must sum across steps"
+        );
+        assert_eq!(
+            mc.cache_write_tokens, 150,
+            "per-model cache_write must sum across steps"
+        );
+        assert_eq!(mc.call_count, 2);
+        // Top-level totals must also reflect the merge.
+        assert_eq!(total.total_cache_read_tokens, 500);
+        assert_eq!(total.total_cache_write_tokens, 150);
     }
 }

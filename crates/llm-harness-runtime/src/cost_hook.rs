@@ -82,6 +82,8 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
                     let mc = cost.by_model.entry(key).or_default();
                     mc.input_tokens += usage.input_tokens as u64;
                     mc.output_tokens += usage.output_tokens as u64;
+                    mc.cache_read_tokens += usage.cache_read_tokens as u64;
+                    mc.cache_write_tokens += usage.cache_creation_tokens as u64;
                     mc.cost += call_cost;
                     mc.call_count += 1;
                 }
@@ -255,5 +257,39 @@ mod tests {
         assert_eq!(mc.input_tokens, 1_000_000);
         assert_eq!(mc.call_count, 1);
         assert!((mc.cost - 3.0).abs() < 1e-9);
+    }
+    /// Regression: per-model `ModelCost` must record cache tokens, not just
+    /// input/output. Otherwise `mc.cost` (which includes cache fees) cannot be
+    /// reconciled against the token dimensions.
+    #[tokio::test]
+    async fn per_model_accumulates_cache_tokens() {
+        let cost = Arc::new(Mutex::new(CostAggregate::default()));
+        let hook = CostAccumulatorHook::new(cost.clone(), Some(Arc::new(FixedPricing)));
+
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: 200,
+            cache_creation_tokens: 100,
+        };
+        hook.after_response(&make_info(usage, "claude-sonnet", "anthropic"))
+            .await;
+
+        let c = hook.current_cost();
+        let mc = c
+            .by_model
+            .get("anthropic/claude-sonnet")
+            .expect("by_model entry");
+        assert_eq!(mc.input_tokens, 100);
+        assert_eq!(mc.output_tokens, 50);
+        assert_eq!(
+            mc.cache_read_tokens, 200,
+            "cache_read must land in by_model"
+        );
+        assert_eq!(
+            mc.cache_write_tokens, 100,
+            "cache_write must land in by_model"
+        );
+        assert_eq!(mc.call_count, 1);
     }
 }

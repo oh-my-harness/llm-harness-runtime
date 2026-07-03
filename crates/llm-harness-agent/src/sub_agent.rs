@@ -129,6 +129,9 @@ mod tests {
         };
         assert_eq!(r.output, "hi");
         // CostAggregate 未 impl PartialEq，用 Debug 字符串断言默认值。
-        assert_eq!(format!("{:?}", r.cost), format!("{:?}", CostAggregate::default()));
+        assert_eq!(
+            format!("{:?}", r.cost),
+            format!("{:?}", CostAggregate::default())
+        );
     }
 }

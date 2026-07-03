@@ -391,37 +391,39 @@ impl ExecutionEnv for OsEnv {
             // - 若有回调：用 carry-over buffer 处理跨块的 UTF-8 边界，把完整部分喂给回调
             // - 累积全部原始字节到 buf，最终 lossy 转成 String 返回
             macro_rules! drain_pipe {
-                ($handle:expr, $cb:expr) => { async {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = Vec::with_capacity(4096);
-                    let mut carry = Vec::new(); // 上一块尾部的不完整 UTF-8 字节
-                    if let Some(h) = $handle.as_mut() {
-                        let mut chunk = [0u8; 4096];
-                        loop {
-                            let n = h.read(&mut chunk).await.map_err(EnvError::Io)?;
-                            if n == 0 {
-                                break;
+                ($handle:expr, $cb:expr) => {
+                    async {
+                        use tokio::io::AsyncReadExt;
+                        let mut buf = Vec::with_capacity(4096);
+                        let mut carry = Vec::new(); // 上一块尾部的不完整 UTF-8 字节
+                        if let Some(h) = $handle.as_mut() {
+                            let mut chunk = [0u8; 4096];
+                            loop {
+                                let n = h.read(&mut chunk).await.map_err(EnvError::Io)?;
+                                if n == 0 {
+                                    break;
+                                }
+                                buf.extend_from_slice(&chunk[..n]);
+                                if let Some(cb) = $cb.as_deref_mut() {
+                                    carry.extend_from_slice(&chunk[..n]);
+                                    // 找到最后一个完整 UTF-8 字符的边界
+                                    let split = utf8_safe_boundary(&carry);
+                                    let s = String::from_utf8_lossy(&carry[..split]);
+                                    cb(&s);
+                                    carry = carry[split..].to_vec();
+                                }
                             }
-                            buf.extend_from_slice(&chunk[..n]);
-                            if let Some(cb) = $cb.as_deref_mut() {
-                                carry.extend_from_slice(&chunk[..n]);
-                                // 找到最后一个完整 UTF-8 字符的边界
-                                let split = utf8_safe_boundary(&carry);
-                                let s = String::from_utf8_lossy(&carry[..split]);
+                        }
+                        // EOF 时把残留字节 lossy 喂给回调
+                        if let Some(cb) = $cb.as_deref_mut() {
+                            if !carry.is_empty() {
+                                let s = String::from_utf8_lossy(&carry);
                                 cb(&s);
-                                carry = carry[split..].to_vec();
                             }
                         }
+                        Ok::<String, EnvError>(String::from_utf8_lossy(&buf).into_owned())
                     }
-                    // EOF 时把残留字节 lossy 喂给回调
-                    if let Some(cb) = $cb.as_deref_mut() {
-                        if !carry.is_empty() {
-                            let s = String::from_utf8_lossy(&carry);
-                            cb(&s);
-                        }
-                    }
-                    Ok::<String, EnvError>(String::from_utf8_lossy(&buf).into_owned())
-                }};
+                };
             }
 
             let drain = async {
