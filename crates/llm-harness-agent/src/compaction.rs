@@ -643,6 +643,7 @@ mod tests {
             output_tokens: n,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            reasoning_tokens: 0,
         }
     }
 

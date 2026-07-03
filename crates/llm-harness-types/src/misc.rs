@@ -1,30 +1,11 @@
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-
 use crate::{AgentMessage, Tool};
 
-/// Provider 推理深度级别。
-///
-/// 各 provider 的实际映射由 `llm-api-adapter` 负责（如 Anthropic → `budget_tokens`，
-/// OpenAI → `reasoning_effort`）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ThinkingLevel {
-    /// 禁用推理（节省 token）。
-    Off,
-    /// 最小推理深度。
-    Minimal,
-    /// 低推理深度。
-    Low,
-    /// 中等推理深度。
-    Medium,
-    /// 高推理深度。
-    High,
-    /// 最高推理深度（仅部分模型支持）。
-    XHigh,
-    /// 自定义 token 预算；用于需要精确控制而非固定档位的场景。
-    Custom(u32),
-}
+// ThinkingLevel 直接沿用 llm-api-adapter 的定义（单一来源）。
+// adapter 的 ThinkingLevel 带 Copy/Eq/Serialize/Deserialize，满足 harness
+// session 持久化与状态快照需求。
+pub use llm_adapter::types::ThinkingLevel;
 
 /// Agent loop 的输入上下文。
 pub struct AgentContext {

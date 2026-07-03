@@ -64,6 +64,7 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
             cost.total_output_tokens += usage.output_tokens as u64;
             cost.total_cache_read_tokens += usage.cache_read_tokens as u64;
             cost.total_cache_write_tokens += usage.cache_creation_tokens as u64;
+            cost.total_reasoning_tokens += usage.reasoning_tokens as u64;
 
             if let Some(p) = price {
                 let call_cost = (usage.input_tokens as f64 / 1_000_000.0) * p.input_per_mtok
@@ -84,6 +85,7 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
                     mc.output_tokens += usage.output_tokens as u64;
                     mc.cache_read_tokens += usage.cache_read_tokens as u64;
                     mc.cache_write_tokens += usage.cache_creation_tokens as u64;
+                    mc.reasoning_tokens += usage.reasoning_tokens as u64;
                     mc.cost += call_cost;
                     mc.call_count += 1;
                 }
@@ -143,6 +145,7 @@ mod tests {
             output_tokens: 500,
             cache_read_tokens: 200,
             cache_creation_tokens: 100,
+            reasoning_tokens: 300,
         };
         hook.after_response(&make_info(usage, "claude-sonnet", "anthropic"))
             .await;
@@ -152,6 +155,7 @@ mod tests {
         assert_eq!(c.total_output_tokens, 500);
         assert_eq!(c.total_cache_read_tokens, 200);
         assert_eq!(c.total_cache_write_tokens, 100);
+        assert_eq!(c.total_reasoning_tokens, 300);
         assert_eq!(c.total_cost, 0.0, "no pricing → no cost");
         assert!(c.by_model.is_empty());
     }
@@ -166,6 +170,7 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            reasoning_tokens: 0,
         };
         hook.after_response(&make_info(usage, "claude-sonnet", "anthropic"))
             .await;
@@ -242,6 +247,7 @@ mod tests {
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            reasoning_tokens: 0,
         };
         hook.after_response(&make_info_no_provider(usage, "claude-sonnet"))
             .await;
@@ -271,6 +277,7 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 200,
             cache_creation_tokens: 100,
+            reasoning_tokens: 50,
         };
         hook.after_response(&make_info(usage, "claude-sonnet", "anthropic"))
             .await;
@@ -290,6 +297,7 @@ mod tests {
             mc.cache_write_tokens, 100,
             "cache_write must land in by_model"
         );
+        assert_eq!(mc.reasoning_tokens, 50);
         assert_eq!(mc.call_count, 1);
     }
 }

@@ -14,12 +14,19 @@ pub struct TokenUsage {
     pub cache_read_tokens: u32,
     /// Anthropic prompt cache 新写入的 token 数。
     pub cache_creation_tokens: u32,
+    /// Reasoning/thinking token 数（DeepSeek thinking、Anthropic extended
+    /// thinking、OpenAI o-series）。非推理模型为 0。
+    pub reasoning_tokens: u32,
 }
 
 impl TokenUsage {
     /// 所有 token 的合计。
     pub fn total_tokens(&self) -> u32 {
-        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_creation_tokens
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_creation_tokens
+            + self.reasoning_tokens
     }
 }
 
@@ -191,6 +198,7 @@ mod tests {
                 output_tokens: 5,
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
+                reasoning_tokens: 0,
             }),
             error_message: None,
         });
@@ -231,8 +239,9 @@ mod tests {
             output_tokens: 50,
             cache_read_tokens: 20,
             cache_creation_tokens: 10,
+            reasoning_tokens: 20,
         };
-        assert_eq!(u.total_tokens(), 180);
+        assert_eq!(u.total_tokens(), 200);
     }
 
     #[test]

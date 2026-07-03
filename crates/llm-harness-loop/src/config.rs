@@ -70,7 +70,7 @@ pub struct LoopConfig {
     pub max_tokens: u32,
     /// 采样温度。
     pub temperature: Option<f32>,
-    /// 推理深度级别；通过 `thinking_budget` 映射为 extended thinking token budget。
+    /// 推理深度级别；通过 canonical `thinking` 字段传递，由各 provider converter 翻译。
     pub thinking_level: ThinkingLevel,
 
     // === Tools ===

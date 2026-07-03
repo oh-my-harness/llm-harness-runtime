@@ -31,12 +31,13 @@ pub struct ModelCost {
     pub cache_read_tokens: u64,
     /// Total cache write tokens.
     pub cache_write_tokens: u64,
+    /// Total reasoning/thinking tokens.
+    pub reasoning_tokens: u64,
     /// Estimated total cost in USD.
     pub cost: f64,
     /// Number of LLM calls.
     pub call_count: u64,
 }
-
 /// Aggregated cost across all models in a session/task.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CostAggregate {
@@ -48,6 +49,8 @@ pub struct CostAggregate {
     pub total_cache_read_tokens: u64,
     /// Total cache write tokens.
     pub total_cache_write_tokens: u64,
+    /// Total reasoning/thinking tokens.
+    pub total_reasoning_tokens: u64,
     /// Total estimated cost in USD.
     pub total_cost: f64,
     /// Per-model breakdown.
@@ -64,6 +67,7 @@ mod tests {
         assert_eq!(mc.cache_write_tokens, 0);
         assert_eq!(mc.input_tokens, 0);
         assert_eq!(mc.output_tokens, 0);
+        assert_eq!(mc.reasoning_tokens, 0);
         assert_eq!(mc.call_count, 0);
         assert_eq!(mc.cost, 0.0);
     }
@@ -75,11 +79,13 @@ mod tests {
             output_tokens: 5,
             cache_read_tokens: 200,
             cache_write_tokens: 100,
+            reasoning_tokens: 50,
             cost: 0.01,
             call_count: 1,
         };
         let json = serde_json::to_string(&mc).expect("serialize");
         assert!(json.contains("\"cache_read_tokens\":200"), "got {json}");
         assert!(json.contains("\"cache_write_tokens\":100"), "got {json}");
+        assert!(json.contains("\"reasoning_tokens\":50"), "got {json}");
     }
 }

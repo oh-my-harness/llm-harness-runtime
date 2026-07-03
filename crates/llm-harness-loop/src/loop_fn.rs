@@ -13,18 +13,6 @@ use crate::stream_state::TerminalTextClassification;
 
 type ToolSelection = (Vec<Arc<dyn Tool>>, Option<FinalAnswerToolConfig>);
 
-fn thinking_budget(level: ThinkingLevel) -> Option<u32> {
-    match level {
-        ThinkingLevel::Off => None,
-        ThinkingLevel::Minimal => Some(512),
-        ThinkingLevel::Low => Some(1_024),
-        ThinkingLevel::Medium => Some(8_192),
-        ThinkingLevel::High => Some(32_000),
-        ThinkingLevel::XHigh => Some(64_000),
-        ThinkingLevel::Custom(n) => Some(n),
-    }
-}
-
 fn active_tool_subset(
     tools: &[Arc<dyn Tool>],
     active: &Option<HashSet<String>>,
@@ -254,9 +242,10 @@ fn run_loop(
             if let Some(t) = config.temperature {
                 req_b = req_b.temperature(t);
             }
-            if let Some(budget) = thinking_budget(config.thinking_level) {
-                req_b = req_b.extended_thinking_budget(budget);
-            }
+            // harness ThinkingLevel 现在就是 adapter ThinkingLevel，直接传。
+            // 无条件注入：Off → Some(Off) 显式禁用（DeepSeek 注入 disabled），
+            // 其他档位按 provider converter 翻译为 wire format。
+            req_b = req_b.thinking(config.thinking_level);
             let req = req_b.build();
 
             // BeforeProviderRequestHook: allow callers to modify stream options.
@@ -1562,7 +1551,9 @@ mod tests {
         let ctx = AgentContext {
             system_prompt: Some("You are a test assistant.".into()),
             messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
-                content: vec![ContentBlock::Text { text: "hello".into() }],
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
                 timestamp: chrono::Utc::now(),
             })],
         };

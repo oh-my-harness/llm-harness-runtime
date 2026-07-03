@@ -130,11 +130,11 @@ llm-harness-runtime-* → llm-harness-runtime
 llm-harness-runtime   → llm-harness-agent
 llm-harness-agent     → llm-harness-loop
 llm-harness-loop      → llm-harness-types, llm_adapter
-llm-harness-types     → (无内部依赖)
+llm-harness-types     → llm_adapter (外部 git 依赖，非内部 crate)
 ```
 
 **硬性规则：**
-- `llm-harness-types` 不依赖其他内部 crate，保持纯类型/trait 声明。
+- `llm-harness-types` 不依赖其他内部 crate，保持纯类型/trait 声明。可依赖外部 git crate（如 `llm_adapter`）用于 re-export 共享类型。
 - `llm-harness-runtime-*` 各 crate 不相互依赖（可单独使用）。
 - 依赖方向不允许反转（下层不依赖上层）。
 
