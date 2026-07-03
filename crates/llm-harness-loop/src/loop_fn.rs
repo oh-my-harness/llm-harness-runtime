@@ -183,7 +183,7 @@ fn run_loop(
         use llm_adapter::types::{ChatRequest, Message as AMsg, ToolChoice};
         use tokio::sync::mpsc;
 
-        yield AgentEvent::AgentStart { initial_messages: vec![] };
+        yield AgentEvent::AgentStart;
 
         // Drain stale steer messages for agent_loop_continue
         if drain_steer_first && let Some(ref mut rx) = config.steer_rx {
@@ -844,7 +844,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::AgentStart { .. })),
+                .any(|e| matches!(e, AgentEvent::AgentStart)),
             "missing AgentStart"
         );
         assert!(
@@ -1340,7 +1340,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_loop_continue_agent_start_has_empty_initial_messages() {
+    async fn agent_loop_continue_emits_agent_start() {
         let (client, cfg) = make_config(vec![MockResponse::text("hi")]);
         let ctx = AgentContext {
             system_prompt: None,
@@ -1351,13 +1351,10 @@ mod tests {
                 .collect()
                 .await;
 
-        let agent_start = events
-            .iter()
-            .find(|e| matches!(e, AgentEvent::AgentStart { .. }))
-            .unwrap();
-        if let AgentEvent::AgentStart { initial_messages } = agent_start {
-            assert!(initial_messages.is_empty());
-        }
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::AgentStart)),
+            "missing AgentStart"
+        );
     }
 
     #[tokio::test]

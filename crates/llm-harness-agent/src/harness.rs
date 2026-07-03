@@ -1596,7 +1596,7 @@ impl AgentHarness {
         let config = self.build_loop_config(steer_rx, follow_up_rx, abort.clone());
 
         // 4. Drive the stream. Push initial messages to pending before the loop starts
-        //    (agent_loop emits AgentStart with empty initial_messages, so we write them here).
+        //    (AgentStart is a signal-only event; initial messages are persisted here).
         for msg in &initial {
             self.push_pending_write(SessionEntryPayload::Message(msg.clone()));
         }
@@ -1606,7 +1606,7 @@ impl AgentHarness {
 
         while let Some(event) = stream.next().await {
             match &event {
-                AgentEvent::AgentStart { .. } => {
+                AgentEvent::AgentStart => {
                     self.emit(AgentHarnessEvent::Agent(event));
                 }
                 AgentEvent::TurnStart { index } => {

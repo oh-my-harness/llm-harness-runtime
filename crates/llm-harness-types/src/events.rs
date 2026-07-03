@@ -9,8 +9,8 @@ use crate::{
 #[derive(Debug)]
 pub enum AgentEvent {
     // === Agent 生命周期 ===
-    /// Agent 开始一次完整运行；携带本次注入的初始消息。
-    AgentStart { initial_messages: Vec<AgentMessage> },
+    /// Agent 开始一次完整运行。
+    AgentStart,
     /// Agent 完成本次运行；携带本次新增的全部消息（Harness 的关键接口契约）。
     AgentEnd { new_messages: Vec<AgentMessage> },
 
@@ -154,11 +154,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_start_event_has_messages() {
-        let ev = AgentEvent::AgentStart {
-            initial_messages: vec![],
-        };
-        assert!(matches!(ev, AgentEvent::AgentStart { .. }));
+    fn agent_start_event() {
+        let ev = AgentEvent::AgentStart;
+        assert!(matches!(ev, AgentEvent::AgentStart));
     }
 
     #[test]
