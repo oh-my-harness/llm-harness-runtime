@@ -16,6 +16,10 @@ pub(crate) fn convert_stop_reason(r: AdapterStop) -> StopReason {
     }
 }
 
+/// Convert adapter `Usage` to harness `TokenUsage`.
+///
+/// Note: `reasoning_tokens` (only reported by DeepSeek models) is intentionally
+/// dropped — `TokenUsage` does not track it.
 pub(crate) fn convert_usage(u: Usage) -> TokenUsage {
     TokenUsage {
         input_tokens: u.input_tokens,

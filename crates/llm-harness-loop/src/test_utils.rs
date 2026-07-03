@@ -331,12 +331,7 @@ mod tests {
         let client = MockLlmClient::with_single(MockResponse::rate_limit_error());
         let req = ChatRequest::builder("mock-model", 1024).build();
         let result = client.chat_stream(&req).await;
-        assert!(result.is_err());
-        if let Err(LlmError::RateLimit { .. }) = result {
-            // Success
-        } else {
-            panic!("expected RateLimit error");
-        }
+        assert!(matches!(result, Err(LlmError::RateLimit { .. })));
     }
 
     #[test]

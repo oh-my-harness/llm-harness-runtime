@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
-use llm_harness_loop::CompositePreparePrepareNextTurnHook;
+use llm_harness_loop::CompositePrepareNextTurnHook;
 use llm_harness_loop::composite::CompositeBeforeCompactHook;
 use llm_harness_loop::{
     ChatRequest, CompositeAfterProviderResponseHook, CompositeAfterToolCallHook,
@@ -1473,7 +1473,7 @@ impl AgentHarness {
         let prepare_next_turn: Arc<dyn PrepareNextTurnHook> = Arc::new(DefaultPrepareNextTurn {
             inner: self.inner.clone(),
             user_hook: (!self.hooks.prepare_next_turn.is_empty()).then(|| {
-                Arc::new(CompositePreparePrepareNextTurnHook::new(
+                Arc::new(CompositePrepareNextTurnHook::new(
                     self.hooks.prepare_next_turn.clone(),
                 )) as Arc<dyn PrepareNextTurnHook>
             }),

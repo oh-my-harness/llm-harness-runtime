@@ -26,10 +26,10 @@ pub mod test_utils;
 pub use composite::{
     CompositeAfterProviderResponseHook, CompositeAfterToolCallHook, CompositeAfterTurnHook,
     CompositeBeforeCompactHook, CompositeBeforeProviderRequestHook, CompositeBeforeRunHook,
-    CompositeBeforeToolCallHook, CompositeBeforeTurnHook, CompositePreparePrepareNextTurnHook,
+    CompositeBeforeToolCallHook, CompositeBeforeTurnHook, CompositePrepareNextTurnHook,
     CompositeShouldStopHook, CompositeTransformContextHook,
 };
-pub use config::{LoopConfig, ModelInfo, RetryConfig};
+pub use config::{LoopConfig, RetryConfig};
 pub use convert::{ConvertToLlmHook, CustomMessageConverter, DefaultConvertToLlm};
 pub use final_answer::{
     DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior, FinalAnswerMode,

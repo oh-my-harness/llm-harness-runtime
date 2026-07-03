@@ -217,4 +217,12 @@ mod tests {
         assert!(results[0].1.is_ok());
         assert!(results[1].1.is_ok());
     }
+    #[test]
+    fn group_default_sequential_treats_parallel_tools_as_sequential() {
+        // default_mode = Sequential forces Parallel tools into separate groups.
+        // [P1, P2] with default Sequential → [[0], [1]]
+        let tools: Vec<Arc<dyn Tool>> = vec![parallel_tool("p1"), parallel_tool("p2")];
+        let groups = group_by_sequential(&tools, ToolExecutionMode::Sequential);
+        assert_eq!(groups, vec![vec![0], vec![1]]);
+    }
 }

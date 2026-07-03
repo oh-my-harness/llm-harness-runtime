@@ -75,9 +75,9 @@ pub enum FinalAnswerMissingBehavior {
 }
 
 pub(crate) fn builtin_final_answer_tool(cfg: &FinalAnswerToolConfig) -> Arc<dyn Tool> {
-    Arc::new(BuiltinFinalAnswerTool {
-        name: cfg.name.clone(),
-        schema: serde_json::json!({
+    static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let schema = SCHEMA.get_or_init(|| {
+        serde_json::json!({
             "type": "object",
             "properties": {
                 "text": {
@@ -87,13 +87,17 @@ pub(crate) fn builtin_final_answer_tool(cfg: &FinalAnswerToolConfig) -> Arc<dyn 
             },
             "required": ["text"],
             "additionalProperties": false
-        }),
+        })
+    });
+    Arc::new(BuiltinFinalAnswerTool {
+        name: cfg.name.clone(),
+        schema,
     })
 }
 
 struct BuiltinFinalAnswerTool {
     name: String,
-    schema: serde_json::Value,
+    schema: &'static serde_json::Value,
 }
 
 impl Tool for BuiltinFinalAnswerTool {
@@ -110,7 +114,7 @@ impl Tool for BuiltinFinalAnswerTool {
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
-        &self.schema
+        self.schema
     }
 
     fn execute<'a>(
@@ -125,12 +129,13 @@ impl Tool for BuiltinFinalAnswerTool {
                 .ok_or_else(|| ToolError::InvalidArguments("missing string field 'text'".into()))?
                 .to_string();
 
+            let details = serde_json::json!({
+                "kind": "final_answer",
+                "text": text,
+            });
             Ok(ToolResult {
-                content: vec![ContentBlock::Text { text: text.clone() }],
-                details: serde_json::json!({
-                    "kind": "final_answer",
-                    "text": text,
-                }),
+                content: vec![ContentBlock::Text { text }],
+                details,
                 terminate: true,
             })
         })

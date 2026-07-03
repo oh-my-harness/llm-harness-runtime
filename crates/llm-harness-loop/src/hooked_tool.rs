@@ -325,7 +325,6 @@ mod tests {
                     AfterToolCallDecision::Patch(ToolResultPatch {
                         content: None,
                         details: None,
-                        is_error: None,
                         terminate: Some(true),
                     })
                 })

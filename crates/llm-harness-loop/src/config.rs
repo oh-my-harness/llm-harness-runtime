@@ -9,26 +9,6 @@ use tokio_util::sync::CancellationToken;
 use crate::convert::ConvertToLlmHook;
 use crate::final_answer::FinalAnswerMode;
 
-// ── RetryConfig ───────────────────────────────────────────────────────────────
-
-/// Static metadata about an LLM model.
-///
-/// Runtime and harness layers use this for context-window and compaction
-/// decisions without depending directly on the provider adapter crate.
-#[derive(Debug, Clone)]
-pub struct ModelInfo {
-    /// Provider name, for example `"deepseek"` or `"openai"`.
-    pub provider: Option<String>,
-    /// Provider API family, for example `"openai-compatible"`.
-    pub api: Option<String>,
-    /// Provider-specific model identifier.
-    pub model_id: Option<String>,
-    /// Total context window size in tokens.
-    pub context_window: u32,
-    /// Maximum output tokens supported by this model.
-    pub max_tokens: u32,
-}
-
 /// Retry configuration for transient LLM provider errors.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -90,7 +70,7 @@ pub struct LoopConfig {
     pub max_tokens: u32,
     /// 采样温度。
     pub temperature: Option<f32>,
-    /// 推理深度级别（目前仅保存，adapter 映射未实现）。
+    /// 推理深度级别；通过 `thinking_budget` 映射为 extended thinking token budget。
     pub thinking_level: ThinkingLevel,
 
     // === Tools ===
@@ -125,7 +105,7 @@ pub struct LoopConfig {
     // === Optional hooks ===
     /// LLM 调用前的上下文转换（例如 compaction）。
     pub transform_context: Option<Arc<dyn TransformContextHook>>,
-    /// 每个转轮后决定下一转轮的配置。
+    /// 每个 turn 后决定下一 turn 的配置。
     pub prepare_next_turn: Option<Arc<dyn PrepareNextTurnHook>>,
     /// 当 LLM 自然停止时，判断是否继续循环。
     pub should_stop: Option<Arc<dyn ShouldStopHook>>,
@@ -137,7 +117,7 @@ pub struct LoopConfig {
     pub auth: Option<Arc<dyn AuthHook>>,
 
     // === Reactive injection ===
-    /// 在转轮间注入的消息（转向）。
+    /// 在 turn 间注入的消息（转向）。
     pub steer_rx: Option<mpsc::Receiver<AgentMessage>>,
     /// loop 自然停止后逐个处理的后续消息。
     pub follow_up_rx: Option<mpsc::Receiver<AgentMessage>>,

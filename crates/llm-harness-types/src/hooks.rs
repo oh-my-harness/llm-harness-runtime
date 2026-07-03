@@ -110,8 +110,6 @@ pub struct ToolResultPatch {
     pub content: Option<Vec<ContentBlock>>,
     /// 覆盖扩展数据。
     pub details: Option<serde_json::Value>,
-    /// 覆盖错误标志。
-    pub is_error: Option<bool>,
     /// 覆盖终止标志。
     pub terminate: Option<bool>,
 }
@@ -317,7 +315,6 @@ mod tests {
         let p = ToolResultPatch {
             content: None,
             details: None,
-            is_error: None,
             terminate: None,
         };
         assert!(p.content.is_none());
