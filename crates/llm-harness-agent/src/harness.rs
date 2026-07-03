@@ -687,7 +687,7 @@ impl AgentHarness {
                 .templates
                 .iter()
                 .find(|t| t.name == name)
-                .ok_or_else(|| HarnessError::TemplateNotFound(name.to_string()))?
+                .ok_or_else(|| TemplateError::NotFound(name.to_string()))?
                 .clone();
             drop(inner);
             invoke_template(&tmpl, &args)
@@ -2190,7 +2190,7 @@ mod tests {
     async fn template_not_found_returns_error() {
         let h = make_harness(vec![]);
         let err = h.prompt_from_template("nonexistent", vec![]).await;
-        assert!(matches!(err, Err(HarnessError::TemplateNotFound(_))));
+        assert!(matches!(err, Err(HarnessError::Template(TemplateError::NotFound(_)))));
     }
 
     #[tokio::test]

@@ -173,8 +173,6 @@ pub enum HarnessError {
     NotIdle(HarnessPhase),
     #[error("skill not found: {0}")]
     SkillNotFound(String),
-    #[error("template not found: {0}")]
-    TemplateNotFound(String),
     #[error(transparent)]
     Agent(#[from] AgentError),
     #[error(transparent)]
