@@ -393,6 +393,9 @@ impl BeforeCompactHook for CompositeBeforeCompactHook {
                 let hook_ctx = BeforeCompactCtx {
                     estimated_tokens: ctx.estimated_tokens,
                     messages: ctx.messages,
+                    context_window: ctx.context_window,
+                    reserve_tokens: ctx.reserve_tokens,
+                    keep_recent_tokens: ctx.keep_recent_tokens,
                 };
                 let decision = hook.before_compact(hook_ctx).await;
                 if !matches!(decision, BeforeCompactDecision::Proceed) {

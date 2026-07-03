@@ -110,10 +110,9 @@ impl AgentEvent {
             message_id,
             message,
         } = self
+            && message.kind == AssistantMessageKind::FinalAnswer
         {
-            if message.kind == AssistantMessageKind::FinalAnswer {
-                return Some((message_id, &message.turn_id, message.text_content()));
-            }
+            return Some((message_id, &message.turn_id, message.text_content()));
         }
         None
     }
@@ -125,10 +124,9 @@ impl AgentEvent {
             message_id,
             message,
         } = self
+            && message.kind == AssistantMessageKind::Progress
         {
-            if message.kind == AssistantMessageKind::Progress {
-                return Some((message_id, &message.turn_id, message.text_content()));
-            }
+            return Some((message_id, &message.turn_id, message.text_content()));
         }
         None
     }

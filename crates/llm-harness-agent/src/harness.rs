@@ -1774,34 +1774,8 @@ impl AgentHarness {
             }
         });
 
-        // before_compact hook is called BEFORE prepare_compaction so that
-        // BeforeCompactDecision::Override can bypass the token-threshold check entirely.
-        if !self.hooks.before_compact.is_empty() {
-            let composite = Arc::new(CompositeBeforeCompactHook::new(
-                self.hooks.before_compact.clone(),
-            ));
-            let built = self.session.build_context().await?;
-            let estimated_tokens: usize = path
-                .iter()
-                .map(crate::compaction::estimate_tokens_for_entry)
-                .sum();
-            let decision = composite
-                .before_compact(BeforeCompactCtx {
-                    estimated_tokens,
-                    messages: &built.messages,
-                })
-                .await;
-            match decision {
-                BeforeCompactDecision::Skip => {
-                    return Err(CompactionError::InsufficientTokens.into());
-                }
-                BeforeCompactDecision::Override(result) => {
-                    return self.apply_compaction_result(result, vec![], &path).await;
-                }
-                BeforeCompactDecision::Proceed => {}
-            }
-        }
-
+        // Read config and assemble CompactionSettings BEFORE the hook so the
+        // hook receives context_window / reserve_tokens / keep_recent_tokens.
         let (model_info, model, max_tokens, reserve_tokens, keep_recent_tokens) = {
             let inner = self.inner.lock().unwrap();
             (
@@ -1825,6 +1799,37 @@ impl AgentHarness {
             summary_model: model.clone(),
             summary_model_info: m_info.clone(),
         };
+
+        // before_compact hook is called BEFORE prepare_compaction so that
+        // BeforeCompactDecision::Override can bypass the token-threshold check entirely.
+        if !self.hooks.before_compact.is_empty() {
+            let composite = Arc::new(CompositeBeforeCompactHook::new(
+                self.hooks.before_compact.clone(),
+            ));
+            let built = self.session.build_context().await?;
+            let estimated_tokens: usize = path
+                .iter()
+                .map(crate::compaction::estimate_tokens_for_entry)
+                .sum();
+            let decision = composite
+                .before_compact(BeforeCompactCtx {
+                    estimated_tokens,
+                    messages: &built.messages,
+                    context_window: m_info.context_window,
+                    reserve_tokens: settings.reserve_tokens,
+                    keep_recent_tokens: settings.keep_recent_tokens,
+                })
+                .await;
+            match decision {
+                BeforeCompactDecision::Skip => {
+                    return Err(CompactionError::InsufficientTokens.into());
+                }
+                BeforeCompactDecision::Override(result) => {
+                    return self.apply_compaction_result(result, vec![], &path).await;
+                }
+                BeforeCompactDecision::Proceed => {}
+            }
+        }
 
         let prep = prepare_compaction(&path, last_compaction.as_ref(), &settings, &m_info);
         let prep = match prep {
@@ -2190,7 +2195,10 @@ mod tests {
     async fn template_not_found_returns_error() {
         let h = make_harness(vec![]);
         let err = h.prompt_from_template("nonexistent", vec![]).await;
-        assert!(matches!(err, Err(HarnessError::Template(TemplateError::NotFound(_)))));
+        assert!(matches!(
+            err,
+            Err(HarnessError::Template(TemplateError::NotFound(_)))
+        ));
     }
 
     #[tokio::test]

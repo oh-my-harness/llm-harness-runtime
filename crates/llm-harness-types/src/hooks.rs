@@ -268,6 +268,12 @@ pub struct BeforeCompactCtx<'a> {
     pub estimated_tokens: usize,
     /// 当前消息列表。
     pub messages: &'a [AgentMessage],
+    /// 模型上下文窗口大小（token 数）。
+    pub context_window: u32,
+    /// 压缩时预留给 LLM 回复的 token 数。
+    pub reserve_tokens: usize,
+    /// 压缩时保留的近期历史 token 数。
+    pub keep_recent_tokens: usize,
 }
 
 /// `BeforeCompactHook::before_compact` 的返回决策。
