@@ -848,6 +848,26 @@ impl AgentHarness {
         Ok(())
     }
 
+    /// Set or clear the system prompt; takes effect at the start of the next turn.
+    ///
+    /// Note: this change is NOT persisted to the session log. On session restore
+    /// the system prompt reverts to the `AgentHarnessOptions.system_prompt` initial
+    /// value. If a `before_run` hook returns a system_prompt, it overrides this
+    /// value for that turn.
+    pub fn set_system_prompt(&self, prompt: Option<String>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.state.system_prompt = prompt;
+    }
+
+    /// Set the maximum output tokens per LLM call; takes effect at the next turn.
+    ///
+    /// Note: this change is NOT persisted to the session log. On session restore
+    /// `max_tokens` reverts to the `AgentHarnessOptions.max_tokens` initial value.
+    pub fn set_max_tokens(&self, max_tokens: u32) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.max_tokens = max_tokens;
+    }
+
     /// Replace the registered tool list.
     pub async fn set_tools(&self, tools: Vec<Arc<dyn Tool>>) -> Result<(), HarnessError> {
         let (added, removed, pending) = {
@@ -2224,6 +2244,37 @@ mod tests {
         let h = make_harness(vec![]);
         h.set_model("claude-opus-4-7".into(), None).await.unwrap();
         assert_eq!(h.state().model, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn set_system_prompt_sets_value() {
+        let h = make_harness(vec![]);
+        h.set_system_prompt(Some("new prompt".into()));
+        assert_eq!(h.state().system_prompt.as_deref(), Some("new prompt"));
+    }
+
+    #[test]
+    fn set_system_prompt_clears_value() {
+        let h = make_harness(vec![]);
+        h.set_system_prompt(Some("initial".into()));
+        h.set_system_prompt(None);
+        assert_eq!(h.state().system_prompt, None);
+    }
+
+    #[test]
+    fn set_max_tokens_updates_inner() {
+        let h = make_harness(vec![]);
+        h.set_max_tokens(2048);
+        assert_eq!(h.inner.lock().unwrap().max_tokens, 2048);
+    }
+
+    #[test]
+    fn set_max_tokens_persists_across_reads() {
+        let h = make_harness(vec![]);
+        h.set_max_tokens(4096);
+        // Read twice — verifies the value sticks (not a one-shot injection).
+        assert_eq!(h.inner.lock().unwrap().max_tokens, 4096);
+        assert_eq!(h.inner.lock().unwrap().max_tokens, 4096);
     }
 
     #[tokio::test]
