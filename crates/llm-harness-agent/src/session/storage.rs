@@ -11,8 +11,13 @@ use super::types::{SessionEntry, SessionEntryKind, SessionMetadata};
 
 /// Low-level storage backend for a single session.
 ///
-/// Implementations must serialize all writes internally so callers can share
-/// `Arc<dyn SessionStorage>` freely.
+/// Concurrency: implementations guarantee that each individual method is
+/// thread-safe (an `Arc<dyn SessionStorage>` can be shared and called
+/// concurrently). However, the trait does **not** make multi-method
+/// composite operations atomic. Callers that need a read-modify-write
+/// sequence (e.g. `active_cursor` → `append_entry` → `set_active_cursor`,
+/// as in `Session::append`) must serialize the whole sequence themselves —
+/// `AgentHarness` does this via its `phase != Idle` guard.
 pub trait SessionStorage: Send + Sync {
     /// Return the current session metadata snapshot.
     fn metadata(&self) -> BoxFuture<'_, Result<SessionMetadata, SessionError>>;

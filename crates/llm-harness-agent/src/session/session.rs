@@ -10,7 +10,10 @@ use super::types::*;
 /// and manages branch operations.
 ///
 /// Wraps a `SessionStorage` and provides the tree semantics on top.
-/// All methods take `&self` — concurrent access is serialized inside the storage.
+/// All methods take `&self`. Single storage calls are thread-safe, but
+/// multi-step operations like [`Session::append`] and [`Session::fork_branch`]
+/// are NOT atomic — concurrent callers must serialize themselves (e.g. via
+/// `AgentHarness`'s phase guard). See `SessionStorage` docs.
 pub struct Session {
     storage: Arc<dyn SessionStorage>,
 }
