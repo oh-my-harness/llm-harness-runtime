@@ -307,8 +307,9 @@ pub async fn load_prompt_templates(
                     .find(|l| !l.trim().is_empty())
                     .unwrap_or("")
                     .trim();
-                if first_line.len() > 60 {
-                    format!("{}...", &first_line[..60])
+                let chars: Vec<char> = first_line.chars().collect();
+                if chars.len() > 60 {
+                    format!("{}...", chars.iter().take(60).collect::<String>())
                 } else {
                     first_line.to_string()
                 }
@@ -699,5 +700,23 @@ mod tests {
         let env = OsEnv::new(tmp.path());
         let (templates, _) = load_prompt_templates(&env, &[tmp.path().to_path_buf()]).await;
         assert_eq!(templates[0].description, "Run the hello task");
+    }
+
+    #[tokio::test]
+    async fn load_template_description_truncates_multibyte_without_panic() {
+        // 61 multi-byte chars (183 bytes); byte 60 falls inside a char.
+        // Byte-slicing at [..60] would panic; char-based truncation must not.
+        let body = "中".repeat(61);
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("zh.md"), &body).unwrap();
+
+        let env = OsEnv::new(tmp.path());
+        let (templates, _) = load_prompt_templates(&env, &[tmp.path().to_path_buf()]).await;
+        let desc = &templates[0].description;
+        assert!(desc.ends_with("..."));
+        // Truncated to 60 chars (not bytes), each "中" is 1 char.
+        assert_eq!(desc.trim_end_matches("...").chars().count(), 60);
+        // No partial char — all chars are valid Unicode scalars by construction.
+        assert!(!desc.contains('\u{FFFD}'));
     }
 }
