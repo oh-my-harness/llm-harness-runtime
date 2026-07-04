@@ -80,8 +80,20 @@ impl JsonlSessionStorage {
             if line.is_empty() {
                 continue;
             }
-            let entry: SessionEntry = serde_json::from_str(line)
-                .map_err(|e| SessionError::Serialization(e.to_string()))?;
+            let entry: SessionEntry = match serde_json::from_str(line) {
+                Ok(e) => e,
+                Err(e) => {
+                    // Skip malformed/unknown lines instead of failing the whole
+                    // session. Forward-compat: a newer binary may have written
+                    // an entry_type this binary doesn't recognize. The entry
+                    // is lost to this binary but the session remains usable.
+                    eprintln!(
+                        "warn: session {:?}: skipping unparseable entry line: {e}",
+                        inner.entries_path
+                    );
+                    continue;
+                }
+            };
             inner
                 .children_map
                 .entry(entry.parent_id)
@@ -539,5 +551,68 @@ mod tests {
         let id = storage.metadata().await.unwrap().id;
         repo.delete(&id).await.unwrap();
         assert!(repo.open(&id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn jsonl_unknown_entry_type_skipped_not_fatal() {
+        // Simulate a newer binary writing an entry_type this binary doesn't
+        // know. The line should be skipped (warned), not abort the session.
+        let tmp = TempDir::new().unwrap();
+        let repo = JsonlSessionRepo::new(tmp.path());
+        let storage = repo.create(CreateSessionOptions::default()).await.unwrap();
+        let session = Session::new(storage.clone());
+        session.append_message(user_msg("before")).await.unwrap();
+        session.append_message(user_msg("after")).await.unwrap();
+
+        let meta = session.metadata().await.unwrap();
+        let id = meta.id.clone();
+        drop(session);
+        repo.cache.lock().await.remove(&id);
+
+        // Inject a line with an unknown entry_type between the two valid ones.
+        let entries_path = tmp.path().join(&id).join("entries.jsonl");
+        let content = tokio::fs::read_to_string(&entries_path).await.unwrap();
+        let mut lines: Vec<&str> = content.lines().collect();
+        let unknown = serde_json::json!({
+            "id": "019f2b12-61dc-7000-9e6a-ee60f3b64df9",
+            "parent_id": null,
+            "timestamp": "2026-07-04T00:00:00Z",
+            "entry_type": "some_future_variant",
+            "payload_field": 42,
+        })
+        .to_string();
+        lines.insert(1, &unknown);
+        tokio::fs::write(&entries_path, lines.join("\n")).await.unwrap();
+
+        let storage2 = repo.open(&id).await.unwrap();
+        let session2 = Session::new(storage2);
+        let ctx = session2.build_context().await.unwrap();
+        // Two known messages survive; the unknown line is skipped.
+        assert_eq!(ctx.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn jsonl_malformed_line_skipped_not_fatal() {
+        // A corrupt JSON line should not abort the whole session.
+        let tmp = TempDir::new().unwrap();
+        let repo = JsonlSessionRepo::new(tmp.path());
+        let storage = repo.create(CreateSessionOptions::default()).await.unwrap();
+        let session = Session::new(storage.clone());
+        session.append_message(user_msg("ok")).await.unwrap();
+
+        let meta = session.metadata().await.unwrap();
+        let id = meta.id.clone();
+        drop(session);
+        repo.cache.lock().await.remove(&id);
+
+        let entries_path = tmp.path().join(&id).join("entries.jsonl");
+        let content = tokio::fs::read_to_string(&entries_path).await.unwrap();
+        let corrupted = format!("{content}\nthis is not json\n");
+        tokio::fs::write(&entries_path, corrupted).await.unwrap();
+
+        let storage2 = repo.open(&id).await.unwrap();
+        let session2 = Session::new(storage2);
+        let ctx = session2.build_context().await.unwrap();
+        assert_eq!(ctx.messages.len(), 1);
     }
 }

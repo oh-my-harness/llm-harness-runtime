@@ -52,6 +52,13 @@ pub enum SessionEntryPayload {
     },
     /// AI-generated summary of a branch.
     BranchSummary(BranchSummaryEntry),
+    /// Fallback for unknown entry types written by a newer binary.
+    ///
+    /// Produced only by deserialization (via `#[serde(other)]`) when the
+    /// stored `entry_type` does not match any known variant. Such entries
+    /// are preserved in the tree but contribute nothing to the built context.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Compaction data stored in a session entry.
@@ -232,6 +239,8 @@ pub enum SessionEntryKind {
     Label,
     /// A session naming event.
     SessionInfo,
+    /// An unknown entry type from a newer binary.
+    Unknown,
     /// An application-layer custom entry.
     Custom,
     /// A branch point annotation.
@@ -256,6 +265,7 @@ impl SessionEntry {
             SessionEntryPayload::Custom { .. } => SessionEntryKind::Custom,
             SessionEntryPayload::BranchPoint { .. } => SessionEntryKind::BranchPoint,
             SessionEntryPayload::BranchSummary(_) => SessionEntryKind::BranchSummary,
+            SessionEntryPayload::Unknown => SessionEntryKind::Unknown,
         }
     }
 }
