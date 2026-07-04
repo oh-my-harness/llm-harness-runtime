@@ -49,7 +49,9 @@ impl JsonlSessionStorage {
         } else {
             let bytes = serde_json::to_vec_pretty(&metadata)
                 .map_err(|e| SessionError::Serialization(e.to_string()))?;
-            tokio::fs::write(&meta_path, &bytes).await?;
+            let tmp = meta_path.with_extension("tmp");
+            tokio::fs::write(&tmp, &bytes).await?;
+            tokio::fs::rename(&tmp, &meta_path).await?;
             metadata
         };
 
@@ -108,7 +110,18 @@ impl JsonlSessionStorage {
     async fn persist_meta(inner: &JsonlInner) -> Result<(), SessionError> {
         let bytes = serde_json::to_vec_pretty(&inner.metadata)
             .map_err(|e| SessionError::Serialization(e.to_string()))?;
-        tokio::fs::write(&inner.meta_path, &bytes).await?;
+        Self::atomic_write(&inner.meta_path, &bytes).await?;
+        Ok(())
+    }
+
+    /// Atomic write: write to a temp file then rename over the target.
+    ///
+    /// Avoids leaving a partially-written file if the process crashes
+    /// mid-write (POSIX rename is atomic within the same filesystem).
+    async fn atomic_write(path: &Path, content: &[u8]) -> Result<(), SessionError> {
+        let tmp = path.with_extension("tmp");
+        tokio::fs::write(&tmp, content).await?;
+        tokio::fs::rename(&tmp, path).await?;
         Ok(())
     }
 }
@@ -290,7 +303,7 @@ impl SessionStorage for JsonlSessionStorage {
                 content.push_str(&line);
                 content.push('\n');
             }
-            tokio::fs::write(&inner.entries_path, content.as_bytes()).await?;
+            Self::atomic_write(&inner.entries_path, content.as_bytes()).await?;
 
             if cursor_reset {
                 Self::persist_meta(&inner).await?;
@@ -614,5 +627,37 @@ mod tests {
         let session2 = Session::new(storage2);
         let ctx = session2.build_context().await.unwrap();
         assert_eq!(ctx.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn jsonl_delete_uses_atomic_write_no_tmp_residue() {
+        let tmp = TempDir::new().unwrap();
+        let repo = JsonlSessionRepo::new(tmp.path());
+        let storage = repo.create(CreateSessionOptions::default()).await.unwrap();
+        let session = Session::new(storage.clone());
+        let id1 = session.append_message(user_msg("keep")).await.unwrap();
+        let id2 = session.append_message(user_msg("delete")).await.unwrap();
+        let meta = session.metadata().await.unwrap();
+        let id = meta.id.clone();
+        drop(session);
+
+        // delete_entries rewrites entries.jsonl atomically.
+        storage.delete_entries(vec![id2]).await.unwrap();
+
+        let dir = tmp.path().join(&id);
+        // No leftover .tmp file in the session directory.
+        let mut entries = tokio::fs::read_dir(&dir).await.unwrap();
+        while let Some(e) = entries.next_entry().await.unwrap() {
+            let name = e.file_name();
+            assert_ne!(
+                name.to_string_lossy(),
+                "entries.tmp",
+                "atomic write left a .tmp residue"
+            );
+        }
+        // The surviving entry is still readable from disk (file not truncated).
+        let storage2 = repo.open(&id).await.unwrap();
+        let entry = storage2.get_entry(id1).await.unwrap();
+        assert!(entry.is_some(), "surviving entry should still be on disk");
     }
 }
