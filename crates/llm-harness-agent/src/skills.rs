@@ -184,9 +184,16 @@ pub async fn load_sourced_skills(
             let abort = CancellationToken::new();
             let content = match env.read_text_file(&skill_file, abort).await {
                 Ok(c) => c,
-                Err(_) => continue, // No SKILL.md in this subdirectory — skip silently.
+                Err(llm_harness_types::EnvError::NotFound(_)) => continue,
+                Err(err) => {
+                    diags.push(SkillDiagnostic {
+                        source: skill_file.clone(),
+                        level: DiagnosticLevel::Warn,
+                        message: format!("failed to read skill file: {err}"),
+                    });
+                    continue;
+                }
             };
-
             match parse_skill_file(&skill_file, &content, &entry.path) {
                 Ok(skill) => skills.push(SourcedSkill {
                     skill,
@@ -678,6 +685,43 @@ mod tests {
             !diags.is_empty(),
             "should have a diagnostic for missing description"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn load_skill_unreadable_file_produces_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("locked-skill");
+        std::fs::create_dir(&skill_dir).unwrap();
+        let skill_file = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &skill_file,
+            "---\nname: locked-skill\ndescription: secret\n---\nBody.",
+        )
+        .unwrap();
+        // Strip read permission so read_text_file returns PermissionDenied.
+        let mut perms = std::fs::metadata(&skill_file).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&skill_file, perms).unwrap();
+
+        let env = OsEnv::new(tmp.path());
+        let (skills, diags) = load_skills(&env, &[tmp.path().to_path_buf()]).await;
+        assert!(skills.is_empty(), "unreadable skill should not load");
+        assert!(
+            !diags.is_empty(),
+            "unreadable SKILL.md should produce a diagnostic"
+        );
+        assert!(
+            diags[0].message.contains("permission denied") || diags[0].message.contains("denied"),
+            "diagnostic should mention permission: {}",
+            diags[0].message
+        );
+
+        // Restore perms so TempDir cleanup can delete the file.
+        let mut perms = std::fs::metadata(&skill_file).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&skill_file, perms).unwrap();
     }
 
     #[tokio::test]
