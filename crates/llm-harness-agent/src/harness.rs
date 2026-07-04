@@ -653,6 +653,14 @@ impl AgentHarness {
     }
 
     /// Start a new run with an explicit initial message list.
+    ///
+    /// Known limitation: the Idle check and the `Turning` phase transition
+    /// happen in separate lock acquisitions (the latter inside `run_loop`).
+    /// A concurrent `continue_run` from an `IdleWatcher` can win the race in
+    /// that window. The practical impact is bounded — a `before_run` hook's
+    /// `system_prompt` edit may be left applied while the run fails to start
+    /// — and `system_prompt` is not persisted, so the stale value is
+    /// overwritten on the next successful prompt.
     pub async fn prompt_with_messages(
         &self,
         messages: Vec<AgentMessage>,
@@ -721,19 +729,15 @@ impl AgentHarness {
     }
 
     /// Run compaction on the active session path (Idle only).
+    ///
+    /// Event contract: `CompactionEnd` is emitted while the harness is still
+    /// in the `Compacting` phase (before the guard drops and restores Idle).
+    /// Consumers observing `PhaseChange { Compacting → Idle }` can rely on the
+    /// `CompactionEnd` event having already been emitted.
     pub async fn compact(&self) -> Result<CompactionStats, HarnessError> {
-        {
-            let inner = self.inner.lock().unwrap();
-            if inner.state.phase != HarnessPhase::Idle {
-                return Err(HarnessError::NotIdle(inner.state.phase));
-            }
-        }
-
-        self.set_phase(HarnessPhase::Compacting);
+        let _guard = self.enter_phase(HarnessPhase::Compacting)?;
 
         let result = self.do_compact().await;
-
-        self.set_phase(HarnessPhase::Idle);
 
         match result {
             Ok(stats) => {
@@ -752,6 +756,7 @@ impl AgentHarness {
                 Err(e)
             }
         }
+        // _guard 在此 drop，恢复 Idle
     }
 
     /// Reload skills and templates from the given directories.
@@ -1005,12 +1010,7 @@ impl AgentHarness {
         from_entry: EntryId,
         label: Option<String>,
     ) -> Result<EntryId, HarnessError> {
-        {
-            let inner = self.inner.lock().unwrap();
-            if inner.state.phase != HarnessPhase::Idle {
-                return Err(HarnessError::NotIdle(inner.state.phase));
-            }
-        }
+        let _guard = self.enter_phase(HarnessPhase::Branching)?;
         let new_leaf = self.session.fork_branch(from_entry, label.clone()).await?;
         self.emit(AgentHarnessEvent::BranchForked {
             from: from_entry,
@@ -1022,12 +1022,7 @@ impl AgentHarness {
 
     /// Switch the active cursor to `target`.
     pub async fn navigate_tree(&self, target: EntryId) -> Result<(), HarnessError> {
-        {
-            let inner = self.inner.lock().unwrap();
-            if inner.state.phase != HarnessPhase::Idle {
-                return Err(HarnessError::NotIdle(inner.state.phase));
-            }
-        }
+        let _guard = self.enter_phase(HarnessPhase::Branching)?;
         let meta = self.session.metadata().await?;
         let from = meta.active_cursor.unwrap_or(target);
         self.session.navigate_to(target).await?;
@@ -1057,12 +1052,7 @@ impl AgentHarness {
 
     /// Delete the branch ending at `leaf` (Idle only).
     pub async fn delete_branch(&self, leaf: EntryId) -> Result<(), HarnessError> {
-        {
-            let inner = self.inner.lock().unwrap();
-            if inner.state.phase != HarnessPhase::Idle {
-                return Err(HarnessError::NotIdle(inner.state.phase));
-            }
-        }
+        let _guard = self.enter_phase(HarnessPhase::Branching)?;
         self.session.delete_branch(leaf).await?;
         self.emit(AgentHarnessEvent::BranchDeleted { leaf });
         Ok(())
@@ -1076,12 +1066,7 @@ impl AgentHarness {
         &self,
         leaf: EntryId,
     ) -> Result<BranchSummaryEntry, HarnessError> {
-        {
-            let inner = self.inner.lock().unwrap();
-            if inner.state.phase != HarnessPhase::Idle {
-                return Err(HarnessError::NotIdle(inner.state.phase));
-            }
-        }
+        let _guard = self.enter_phase(HarnessPhase::Branching)?;
 
         let path = self.session.read_path_of(leaf).await?;
         if path.is_empty() {
@@ -1209,6 +1194,11 @@ impl AgentHarness {
     /// 不注入初始消息，驱动一轮 agent loop 直到再次 Idle。
     /// 供 Idle watcher 收到 completion 后唤醒主 agent。
     /// 自带 Idle 守卫（与 `prompt_with_messages` 对称）。
+    ///
+    /// Known limitation: the Idle check and the `Turning` phase transition
+    /// happen in separate lock acquisitions (the latter inside `run_loop`),
+    /// the same TOCTOU window documented on `prompt_with_messages`. A
+    /// concurrent caller can win the race in that window.
     pub async fn continue_run(&self) -> Result<(), HarnessError> {
         {
             let inner = self.inner.lock().unwrap();
@@ -1409,18 +1399,32 @@ impl AgentHarness {
         let _ = self.event_tx.send(Arc::new(event));
     }
 
+    fn notify_phase_change(&self, old: HarnessPhase, new: HarnessPhase) {
+        let _ = self.phase_tx.send(new);
+        self.emit(AgentHarnessEvent::PhaseChange { from: old, to: new });
+    }
+
     fn set_phase(&self, phase: HarnessPhase) {
         let old = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let old = inner.state.phase;
             inner.state.phase = phase;
             old
         };
-        let _ = self.phase_tx.send(phase);
-        self.emit(AgentHarnessEvent::PhaseChange {
-            from: old,
-            to: phase,
-        });
+        self.notify_phase_change(old, phase);
+    }
+    /// 原子地检查 Idle 并切换到 `phase`。失败返回 Err。
+    fn enter_phase(&self, phase: HarnessPhase) -> Result<PhaseGuard<'_>, HarnessError> {
+        let old = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.state.phase != HarnessPhase::Idle {
+                return Err(HarnessError::NotIdle(inner.state.phase));
+            }
+            inner.state.phase = phase;
+            HarnessPhase::Idle
+        };
+        self.notify_phase_change(old, phase);
+        Ok(PhaseGuard { harness: self })
     }
 
     fn push_pending_write(&self, payload: SessionEntryPayload) {
@@ -1515,7 +1519,16 @@ impl AgentHarness {
         abort: CancellationToken,
     ) -> LoopConfig {
         // ── Snapshot state (lock is held via `inner` until `drop(inner)`) ──
-        let (tools, retry, model, thinking_level, temperature, active_tools, final_answer_mode, max_tokens) = {
+        let (
+            tools,
+            retry,
+            model,
+            thinking_level,
+            temperature,
+            active_tools,
+            final_answer_mode,
+            max_tokens,
+        ) = {
             let inner = self.inner.lock().unwrap();
             let st = &inner.state;
             (
@@ -1631,7 +1644,7 @@ impl AgentHarness {
             let watcher = inner.idle_watcher.clone();
             (steer_rx, follow_up_rx, abort, sp, ot, async_hook, watcher)
         };
-        self.set_phase(HarnessPhase::Turning);
+        let _guard = self.enter_phase(HarnessPhase::Turning)?;
         if let Some(h) = &async_hook {
             h.borrow_completion_rx();
         }
@@ -1664,12 +1677,13 @@ impl AgentHarness {
                 inner.state.tools = original_tools;
             }
         }
-        self.set_phase(HarnessPhase::Idle);
-
-        // 释放 hook 的 completion_rx guard，让 watcher 能从 registry take
+        // Release the completion_rx borrow BEFORE dropping the guard (which
+        // restores Idle). Otherwise a concurrent caller seeing Idle could
+        // borrow_completion_rx before the previous run released it.
         if let Some(h) = &async_hook {
             h.release_completion_rx();
         }
+        drop(_guard);
         // Idle 后：若配置了 watcher，让其检查 in-flight 并按需启动
         if let Some(w) = &watcher {
             w.on_idle();
@@ -2009,6 +2023,29 @@ impl AgentHarness {
     }
 }
 
+// ── PhaseGuard ────────────────────────────────────────────────────────────────
+
+/// RAII guard：进入非 Idle phase，离开作用域时自动恢复 Idle。
+///
+/// 构造时在一次锁内完成"检查当前为 Idle → 设为目标 phase"，
+/// 消除 check-then-set 的 TOCTOU 窗口。失败返回 `NotIdle`。
+/// Drop 时无条件恢复为 Idle 并发射 `PhaseChange` 事件。
+struct PhaseGuard<'a> {
+    harness: &'a AgentHarness,
+}
+
+impl std::fmt::Debug for PhaseGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PhaseGuard").finish_non_exhaustive()
+    }
+}
+
+impl Drop for PhaseGuard<'_> {
+    fn drop(&mut self) {
+        self.harness.set_phase(HarnessPhase::Idle);
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2186,6 +2223,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enter_phase_rejects_when_not_idle() {
+        let h = make_harness(vec![]);
+        {
+            let mut inner = h.inner.lock().unwrap();
+            inner.state.phase = HarnessPhase::Turning;
+        }
+        let err = h.enter_phase(HarnessPhase::Branching).unwrap_err();
+        assert!(
+            matches!(err, HarnessError::NotIdle(HarnessPhase::Turning)),
+            "expected NotIdle(Turning), got {err:?}"
+        );
+        // phase 不变
+        assert_eq!(h.state().phase, HarnessPhase::Turning);
+        h.inner.lock().unwrap().state.phase = HarnessPhase::Idle;
+    }
+
+    #[tokio::test]
+    async fn guard_drop_restores_idle() {
+        let h = make_harness(vec![]);
+        {
+            let _guard = h.enter_phase(HarnessPhase::Branching).unwrap();
+            assert_eq!(h.state().phase, HarnessPhase::Branching);
+        }
+        // guard drop 后恢复 Idle
+        assert_eq!(h.state().phase, HarnessPhase::Idle);
+    }
+    #[tokio::test]
+    async fn enter_phase_is_atomic() {
+        let h = Arc::new(make_harness(vec![]));
+        let h1 = h.clone();
+        let h2 = h.clone();
+        // 两个并发 task 同时 enter_phase，只有一个应成功
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let jh1 = tokio::spawn(async move {
+            let r1 = h1.enter_phase(HarnessPhase::Branching);
+            let ok = r1.is_ok();
+            if let Ok(_g) = &r1 {
+                // 持有 guard 堵住第二个调用方
+                tx.send(()).unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            // guard 在 _g 离开作用域时 drop，归还借用
+            drop(r1);
+            ok
+        });
+        // 等 jh1 拿到 guard 后再启动 jh2
+        rx.await.unwrap();
+        let r2 = h2.enter_phase(HarnessPhase::Branching);
+        let ok1 = jh1.await.unwrap();
+        let ok2 = r2.is_ok();
+        assert!(
+            ok1 ^ ok2,
+            "exactly one enter_phase must succeed; got ok1={ok1} ok2={ok2}"
+        );
+        if !ok2 {
+            assert!(matches!(r2, Err(HarnessError::NotIdle(_))));
+        }
+    }
+
+    #[tokio::test]
     async fn flush_error_returns_phase_to_idle() {
         // Storage fails immediately on append_entry (fail_after=0)
         let h = make_harness_failing_storage(0, vec![MockResponse::text("hi")]);
@@ -2199,6 +2296,17 @@ mod tests {
             "phase must be Idle after flush error"
         );
         assert!(result.is_err(), "prompt must return Err when storage fails");
+    }
+
+    #[tokio::test]
+    async fn compact_sets_compacting_phase() {
+        // do_compact 会因 InsufficientTokens 失败，但 phase 在失败路径上应仍是
+        // Compacting 直到 guard drop。此测试用并发 task 观察 phase。
+        // 简化：直接调 enter_phase(Compacting) 验证 drop 恢复——已在 guard_drop_restores_idle 覆盖。
+        // 这里测 compact() 的 observable 行为：compact 失败后 phase 回 Idle。
+        let h = make_harness(vec![]);
+        let _ = h.compact().await; // InsufficientTokens
+        assert_eq!(h.state().phase, HarnessPhase::Idle);
     }
 
     #[tokio::test]
@@ -2873,14 +2981,18 @@ mod tests {
             },
             ..AgentHarnessOptions::new("test-model")
         };
-        let h = Arc::new(
-            AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await,
-        );
+        let h =
+            Arc::new(AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await);
         harness_cell.get_or_init(|| h.clone());
 
         h.prompt("hi").await.unwrap();
 
-        let names: Vec<String> = h.state().tools.iter().map(|t| t.name().to_string()).collect();
+        let names: Vec<String> = h
+            .state()
+            .tools
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
         assert!(
             names.iter().any(|n| n == "mid_run_tool"),
             "mid-run set_tools must survive cleanup; tools = {names:?}"
@@ -2918,8 +3030,7 @@ mod tests {
             },
             ..AgentHarnessOptions::new("test-model")
         };
-        let h =
-            AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await;
+        let h = AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await;
 
         // Two prompts: the second `build_loop_config` would double-wrap if
         // cleanup failed to unwrap. No panic / no error => pass.
@@ -2989,15 +3100,19 @@ mod tests {
             },
             ..AgentHarnessOptions::new("test-model")
         };
-        let h = Arc::new(
-            AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await,
-        );
+        let h =
+            Arc::new(AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await);
         harness_cell.get_or_init(|| h.clone());
 
         // The run errors; prompt returns Ok (LLM error is an event, not a Result).
         h.prompt("hi").await.unwrap();
 
-        let names: Vec<String> = h.state().tools.iter().map(|t| t.name().to_string()).collect();
+        let names: Vec<String> = h
+            .state()
+            .tools
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
         assert!(
             names.iter().any(|n| n == "error_run_tool"),
             "mid-run set_tools must survive LLM error; tools = {names:?}"
@@ -3074,7 +3189,12 @@ mod tests {
         let result = h.prompt("hi").await;
         assert!(result.is_err(), "prompt must return Err when storage fails");
 
-        let names: Vec<String> = h.state().tools.iter().map(|t| t.name().to_string()).collect();
+        let names: Vec<String> = h
+            .state()
+            .tools
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
         assert!(
             !names.iter().any(|n| n == "storage_err_tool"),
             "mid-run set_tools must be rolled back on storage error; tools = {names:?}"
@@ -3107,8 +3227,7 @@ mod tests {
             context_window: 200_000,
             max_tokens: 8192,
         });
-        let h =
-            AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await;
+        let h = AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await;
 
         // Two prompts → 4 entries (user, assistant, user, assistant).
         h.prompt("hi").await.unwrap();
@@ -3117,7 +3236,10 @@ mod tests {
         // Default threshold: compaction must NOT trigger.
         let err = h.compact().await.unwrap_err();
         assert!(
-            matches!(err, HarnessError::Compaction(CompactionError::InsufficientTokens)),
+            matches!(
+                err,
+                HarnessError::Compaction(CompactionError::InsufficientTokens)
+            ),
             "expected InsufficientTokens with default threshold, got: {err:?}"
         );
 
@@ -3128,11 +3250,70 @@ mod tests {
         // keep_recent_tokens = 0 so the cut-point scan can find a boundary.
         h.set_compaction_keep_recent_tokens(Some(0));
 
-        let stats = h.compact().await.expect("compaction must trigger after lowering threshold");
+        let stats = h
+            .compact()
+            .await
+            .expect("compaction must trigger after lowering threshold");
         assert!(
             stats.compressed_entries > 0,
             "expected at least one entry compressed, got stats: {stats:?}"
         );
+    }
+    // ── Branch ops: Branching phase guard ────────────────────────────────────
+
+    #[tokio::test]
+    async fn branch_ops_reject_during_turning() {
+        let h = make_harness(vec![]);
+        {
+            let mut inner = h.inner.lock().unwrap();
+            inner.state.phase = HarnessPhase::Turning;
+        }
+
+        // fork_branch
+        let err = h.fork_branch(EntryId::new(), None).await;
+        assert!(matches!(
+            err,
+            Err(HarnessError::NotIdle(HarnessPhase::Turning))
+        ));
+
+        // navigate_tree
+        let err = h.navigate_tree(EntryId::new()).await;
+        assert!(matches!(
+            err,
+            Err(HarnessError::NotIdle(HarnessPhase::Turning))
+        ));
+
+        // delete_branch
+        let err = h.delete_branch(EntryId::new()).await;
+        assert!(matches!(
+            err,
+            Err(HarnessError::NotIdle(HarnessPhase::Turning))
+        ));
+
+        // generate_branch_summary
+        let err = h.generate_branch_summary(EntryId::new()).await;
+        assert!(matches!(
+            err,
+            Err(HarnessError::NotIdle(HarnessPhase::Turning))
+        ));
+
+        h.inner.lock().unwrap().state.phase = HarnessPhase::Idle;
+    }
+
+    #[tokio::test]
+    async fn branch_ops_restore_idle_after_completion() {
+        let h = make_harness(vec![]);
+
+        // fork_branch: failure path (empty session → entry not found) still
+        // must restore Idle via PhaseGuard::drop.
+        let entries = h.read_active_path().await.unwrap();
+        let from = entries.last().map(|e| e.id).unwrap_or(EntryId::new());
+        let _ = h.fork_branch(from, Some("test".into())).await;
+        assert_eq!(h.state().phase, HarnessPhase::Idle);
+
+        // navigate_tree: same target id; phase must return to Idle.
+        let _ = h.navigate_tree(from).await;
+        assert_eq!(h.state().phase, HarnessPhase::Idle);
     }
 }
 

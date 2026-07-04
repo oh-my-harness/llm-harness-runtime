@@ -846,7 +846,11 @@ mod tests {
             .iter()
             .filter(|d| d.message.contains("duplicate skill name 'shared-name'"))
             .collect();
-        assert_eq!(dup_diags.len(), 1, "expected one duplicate diagnostic, got: {diags:?}");
+        assert_eq!(
+            dup_diags.len(),
+            1,
+            "expected one duplicate diagnostic, got: {diags:?}"
+        );
     }
 
     #[tokio::test]
@@ -861,8 +865,7 @@ mod tests {
         std::fs::write(dir_b.join("shared.md"), "Template B body").unwrap();
 
         let env = OsEnv::new(tmp.path());
-        let (templates, diags) =
-            load_prompt_templates(&env, &[dir_a.clone(), dir_b.clone()]).await;
+        let (templates, diags) = load_prompt_templates(&env, &[dir_a.clone(), dir_b.clone()]).await;
         // Both kept (no dedup).
         assert_eq!(templates.len(), 2);
         assert!(templates.iter().all(|t| t.name == "shared"));
@@ -871,6 +874,10 @@ mod tests {
             .iter()
             .filter(|d| d.message.contains("duplicate template name 'shared'"))
             .collect();
-        assert_eq!(dup_diags.len(), 1, "expected one duplicate diagnostic, got: {diags:?}");
+        assert_eq!(
+            dup_diags.len(),
+            1,
+            "expected one duplicate diagnostic, got: {diags:?}"
+        );
     }
 }

@@ -37,6 +37,7 @@ pub enum DiagnosticLevel {
 /// 提升到 types crate 是因为 `HarnessError::NotIdle` 需要携带它，
 /// 而 `HarnessError` 在 types 中定义。
 #[derive(PartialEq, Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum HarnessPhase {
     /// 无正在进行的操作，接受新请求。
     Idle,
@@ -45,6 +46,9 @@ pub enum HarnessPhase {
     /// 正在执行 compaction。
     Compacting,
     /// 正在执行分支导航。
+    ///
+    /// 进入和退出此 phase 会发射 `PhaseChange` 事件（`Idle → Branching`
+    /// 和 `Branching → Idle`），监听 phase 转换的消费者会收到。
     Branching,
 }
 

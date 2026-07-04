@@ -846,7 +846,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(cfg.temperature, Some(0.7), "None directive must preserve current");
+        assert_eq!(
+            cfg.temperature,
+            Some(0.7),
+            "None directive must preserve current"
+        );
     }
 
     #[test]

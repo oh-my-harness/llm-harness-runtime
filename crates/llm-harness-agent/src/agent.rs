@@ -672,10 +672,7 @@ mod tests {
             agent.clear_follow_up_queue(),
             Err(AgentError::NotIdle)
         ));
-        assert!(matches!(
-            agent.clear_all_queues(),
-            Err(AgentError::NotIdle)
-        ));
+        assert!(matches!(agent.clear_all_queues(), Err(AgentError::NotIdle)));
         // 恢复 Idle 供后续清理
         agent.inner.lock().unwrap().state.phase = AgentPhase::Idle;
     }
