@@ -254,10 +254,8 @@ impl Provider for MockLlmClient {
         ProviderCapabilities::new(false, false, false)
     }
 
-    async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
-        Err(LlmError::InvalidRequest(
-            "MockLlmClient: use chat_stream instead".into(),
-        ))
+    async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.chat_stream(req).await?.collect().await
     }
 
     async fn chat_stream(&self, req: &ChatRequest) -> Result<StreamHandle, LlmError> {

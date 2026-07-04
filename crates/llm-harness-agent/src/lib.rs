@@ -19,7 +19,9 @@ pub mod skills;
 pub mod sub_agent;
 
 pub use agent::{Agent, AgentOptions, AgentPhase, AgentState, ModelInfo};
-pub use compaction::{CompactionPreparation, CompactionSettings, compact, prepare_compaction};
+pub use compaction::{
+    CompactionModelConfig, CompactionPreparation, CompactionSettings, compact, prepare_compaction,
+};
 pub use harness::{
     AbortCascadeHook, AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AsyncSpawnHookHandle,
     CompactionStats, FollowUpHandle, HarnessHooks, HarnessState, HarnessToolCallResult,

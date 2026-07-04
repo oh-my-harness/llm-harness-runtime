@@ -885,9 +885,7 @@ mod tests {
     /// 验证 final_answer 兜底为空字符串而非 panic。
     #[tokio::test]
     async fn final_answer_falls_back_to_empty_when_no_final_answer() {
-        let client = Arc::new(MockLlmClient::new(vec![
-            MockResponse::rate_limit_error(),
-        ]));
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::rate_limit_error()]));
         let (spawner, _factory, _) = make_spawner(client, "mock-model");
 
         let handle = spawner

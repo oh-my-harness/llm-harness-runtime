@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, path::PathBuf};
+use std::{fmt::Write as _, path::PathBuf, sync::Arc};
 
 use chrono::Utc;
 use llm_harness_loop::LlmMessage;
@@ -86,6 +86,23 @@ pub struct CompactionSettings {
     /// Metadata for the summary model (used for token budget checks).
     pub summary_model_info: ModelInfo,
 }
+/// Independent LLM provider/model for compaction summaries.
+///
+/// When set on [`crate::AgentHarnessOptions`], compaction uses this provider
+/// instead of the main conversation client — e.g. run the main conversation
+/// on an expensive model while compaction uses a cheap one.
+///
+/// All three fields are bound: they describe one provider link and must be
+/// set together. Encapsulating them in a struct makes half-configuration
+/// impossible at the type level.
+pub struct CompactionModelConfig {
+    /// LLM client (already bound to a provider/credential at construction).
+    pub client: Arc<dyn LlmClient>,
+    /// Model ID the client routes.
+    pub model: String,
+    /// Model metadata (context_window / max_tokens) for prompt budget checks.
+    pub model_info: ModelInfo,
+}
 
 impl Default for CompactionSettings {
     fn default() -> Self {
@@ -110,16 +127,14 @@ impl Default for CompactionSettings {
 pub struct CompactionPreparation {
     /// Full path entries from root to active leaf.
     pub path_entries: Vec<SessionEntry>,
-    /// First entry still valid from the previous compaction (or session root).
-    pub first_kept_entry: EntryId,
+    /// 本次压缩起点（上次 compaction 的保留区起点）。
+    pub compress_from_entry: EntryId,
     /// Entry at which the new compaction starts keeping content.
     pub cut_point: EntryId,
     /// Existing summary text (from last compaction) for iterative update mode.
     pub previous_summary: Option<String>,
     /// Estimated total token count before this compaction.
     pub estimated_tokens: usize,
-    /// Entries that were split across the cut point (v1: always None).
-    pub split_turn_prefix: Option<Vec<SessionEntry>>,
     /// File operations accumulated during the compacted period.
     pub file_operations: Vec<FileOperation>,
 }
@@ -226,11 +241,6 @@ pub fn prepare_compaction(
 
     let first_kept_entry = compactable[valid_cut].id;
     let cut_point = first_kept_entry;
-    let split_turn_prefix = (valid_cut < cut_relative)
-        .then(|| compactable[valid_cut..cut_relative].to_vec())
-        .filter(|entries| !entries.is_empty());
-
-    // Extract previous summary from last compaction for iterative update.
     let previous_summary = last_compaction.and_then(|lc| {
         if let AgentMessage::CompactionSummary(cs) = &lc.summary_message {
             Some(cs.summary.clone())
@@ -239,8 +249,6 @@ pub fn prepare_compaction(
         }
     });
 
-    // The `first_kept_entry` field in the returned Preparation tracks what's
-    // already been summarised (from the last compaction), not the new cut point.
     let prev_first_kept = last_compaction
         .map(|lc| lc.first_kept_entry)
         .unwrap_or(path[0].id);
@@ -248,11 +256,10 @@ pub fn prepare_compaction(
 
     Some(CompactionPreparation {
         path_entries: path.to_vec(),
-        first_kept_entry: prev_first_kept,
+        compress_from_entry: prev_first_kept,
         cut_point,
         previous_summary,
         estimated_tokens,
-        split_turn_prefix,
         file_operations,
     })
 }
@@ -308,15 +315,27 @@ pub async fn compact(
     let first_kept_idx = preparation
         .path_entries
         .iter()
-        .position(|e| e.id == preparation.first_kept_entry)
+        .position(|e| e.id == preparation.compress_from_entry)
         .ok_or_else(|| {
             CompactionError::SummaryFailed(format!(
-                "first kept entry {} not found in compaction path",
-                preparation.first_kept_entry
+                "compress-from entry {} not found in compaction path",
+                preparation.compress_from_entry
             ))
         })?;
 
-    let entries_to_compress = &preparation.path_entries[first_kept_idx..cut_idx];
+    let entries_to_compress = preparation
+        .path_entries
+        .get(first_kept_idx..cut_idx)
+        .ok_or_else(|| {
+            CompactionError::SummaryFailed(
+                "compress range invalid: compress_from_entry is not before cut_point".into(),
+            )
+        })?;
+    if entries_to_compress.is_empty() {
+        return Err(CompactionError::SummaryFailed(
+            "nothing to compact: compress range is empty".into(),
+        ));
+    }
 
     // Format conversation history as text.
     let conversation_text = format_entries_as_text(entries_to_compress);
@@ -373,14 +392,6 @@ pub async fn compact(
         ));
     }
 
-    let split_note = preparation.split_turn_prefix.is_some().then(|| {
-        "## Compaction Note\n\
-         The cut point was moved backward to the nearest turn boundary; \
-         extra entries before the requested token boundary were included in this \
-         summary to preserve message ordering."
-            .to_string()
-    });
-
     // Append file operations summary if any.
     let full_summary = if preparation.file_operations.is_empty() {
         summary_text
@@ -394,11 +405,6 @@ pub async fn compact(
             "{summary_text}\n\n## Files Touched\n{}",
             file_lines.join("\n")
         )
-    };
-    let full_summary = if let Some(note) = split_note {
-        format!("{full_summary}\n\n{note}")
-    } else {
-        full_summary
     };
 
     let summary_message = AgentMessage::CompactionSummary(CompactionSummaryMessage {
@@ -547,10 +553,16 @@ fn parse_file_operation(value: &serde_json::Value, entry_id: EntryId) -> Option<
 }
 
 fn parse_file_op_kind(kind: &str) -> Option<FileOpKind> {
-    match kind {
-        "read" | "Read" => Some(FileOpKind::Read),
-        "modify" | "modified" | "write" | "Write" | "Modify" => Some(FileOpKind::Modify),
-        _ => None,
+    if kind.eq_ignore_ascii_case("read") {
+        Some(FileOpKind::Read)
+    } else if kind.eq_ignore_ascii_case("modify")
+        || kind.eq_ignore_ascii_case("modified")
+        || kind.eq_ignore_ascii_case("write")
+        || kind.eq_ignore_ascii_case("created")
+    {
+        Some(FileOpKind::Modify)
+    } else {
+        None
     }
 }
 
@@ -747,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_compaction_marks_split_turn_boundary_downgrade() {
+    fn prepare_compaction_cut_point_adjusted_to_turn_boundary() {
         let u1 = EntryId::new();
         let a1 = EntryId::new();
         let u2 = EntryId::new();
@@ -761,14 +773,10 @@ mod tests {
         let prep = prepare_compaction(&path, None, &settings(), &model_info()).unwrap();
 
         assert_eq!(prep.cut_point, u2);
-        let split = prep
-            .split_turn_prefix
-            .expect("boundary adjustment should be visible");
-        assert_eq!(split[0].id, u2);
     }
 
     #[tokio::test]
-    async fn compact_errors_when_first_kept_entry_is_missing() {
+    async fn compact_errors_when_compress_from_entry_is_missing() {
         let path = vec![
             user_entry(EntryId::new(), "old"),
             assistant_entry(EntryId::new(), "large", Some(big_token_usage(1400))),
@@ -781,11 +789,10 @@ mod tests {
             &client,
             CompactionPreparation {
                 path_entries: path,
-                first_kept_entry: EntryId::new(),
+                compress_from_entry: EntryId::new(),
                 cut_point,
                 previous_summary: Some("previous".into()),
                 estimated_tokens: 1400,
-                split_turn_prefix: None,
                 file_operations: vec![],
             },
             &settings(),
@@ -795,7 +802,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(err, CompactionError::SummaryFailed(message) if message.contains("first kept entry"))
+            matches!(err, CompactionError::SummaryFailed(message) if message.contains("compress-from entry"))
         );
     }
 
@@ -823,13 +830,6 @@ mod tests {
             ),
             "cut point must be a user message"
         );
-    }
-
-    #[test]
-    fn parse_command_args_basic() {
-        use super::super::skills::parse_command_args;
-        let args = parse_command_args("staging \"update API\" --dry-run");
-        assert_eq!(args, vec!["staging", "update API", "--dry-run"]);
     }
 
     #[test]
@@ -862,5 +862,63 @@ mod tests {
         };
         assert!(op.path.ends_with("bar.rs"));
         assert!(matches!(op.kind, FileOpKind::Read));
+    }
+
+    #[tokio::test]
+    async fn compact_returns_error_when_nothing_to_compress() {
+        // Construct a Preparation where compress_from_entry == cut_point,
+        // making the compress range empty.
+        let entry = user_entry(EntryId::new(), "only entry");
+        let path = vec![entry.clone()];
+        let client = MockLlmClient::new(vec![]);
+
+        let err = compact(
+            &client,
+            CompactionPreparation {
+                path_entries: path,
+                compress_from_entry: entry.id,
+                cut_point: entry.id,
+                previous_summary: None,
+                estimated_tokens: 0,
+                file_operations: vec![],
+            },
+            &settings(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, CompactionError::SummaryFailed(ref msg) if msg.contains("nothing to compact")),
+            "expected nothing-to-compact error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_file_op_kind_case_insensitive_and_created() {
+        assert!(matches!(parse_file_op_kind("read"), Some(FileOpKind::Read)));
+        assert!(matches!(parse_file_op_kind("READ"), Some(FileOpKind::Read)));
+        assert!(matches!(parse_file_op_kind("Read"), Some(FileOpKind::Read)));
+        assert!(matches!(
+            parse_file_op_kind("modify"),
+            Some(FileOpKind::Modify)
+        ));
+        assert!(matches!(
+            parse_file_op_kind("Modified"),
+            Some(FileOpKind::Modify)
+        ));
+        assert!(matches!(
+            parse_file_op_kind("Write"),
+            Some(FileOpKind::Modify)
+        ));
+        assert!(matches!(
+            parse_file_op_kind("created"),
+            Some(FileOpKind::Modify)
+        ));
+        assert!(matches!(
+            parse_file_op_kind("CREATED"),
+            Some(FileOpKind::Modify)
+        ));
+        assert!(parse_file_op_kind("unknown").is_none());
     }
 }

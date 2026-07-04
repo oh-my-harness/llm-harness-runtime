@@ -21,7 +21,8 @@
 use std::sync::{Arc, Mutex};
 
 use llm_harness_agent::{
-    AgentHarness, AgentHarnessOptions, HarnessHooks, Plugin, PromptTemplate, Skill,
+    AgentHarness, AgentHarnessOptions, CompactionModelConfig, HarnessHooks, ModelInfo, Plugin,
+    PromptTemplate, Skill,
 };
 use llm_harness_loop::LlmClient;
 use llm_harness_types::{
@@ -126,6 +127,10 @@ pub struct HarnessBuilder {
     cost: Option<Arc<Mutex<CostAggregate>>>,
     /// Optional maximum output tokens per provider call.
     max_tokens: Option<u32>,
+    /// Optional independent compaction model config (model ID + metadata).
+    /// Client is resolved at build time. When set, compaction summaries use
+    /// this provider instead of the main conversation client.
+    compaction_model: Option<(String, ModelInfo)>,
 }
 
 impl HarnessBuilder {
@@ -147,6 +152,7 @@ impl HarnessBuilder {
             budget: None,
             cost: None,
             max_tokens: None,
+            compaction_model: None,
         }
     }
 
@@ -263,6 +269,19 @@ impl HarnessBuilder {
         self
     }
 
+    /// Configure an independent compaction model. When set, compaction
+    /// summaries use a separate provider/model instead of the main
+    /// conversation client — e.g. main conversation on Sonnet, compaction
+    /// on Haiku.
+    ///
+    /// `model_info` should reflect the compaction model's real
+    /// `context_window` and `max_tokens`, used for prompt budget checks
+    /// in `compact()`. The compaction client is resolved at build time
+    pub fn compaction_model(mut self, model: impl Into<String>, model_info: ModelInfo) -> Self {
+        self.compaction_model = Some((model.into(), model_info));
+        self
+    }
+
     /// Build an [`AgentHarness`] with an in-memory session.
     ///
     /// Resolves the registered LLM provider for the model ID and constructs
@@ -281,7 +300,8 @@ impl HarnessBuilder {
         env: Arc<dyn ExecutionEnv>,
     ) -> Result<AgentHarness, HarnessBuildError> {
         let client = self.resolve_provider(&self.model)?;
-        let opts = self.build_options();
+        let compaction = self.resolve_compaction()?;
+        let opts = self.build_options(compaction);
         Ok(AgentHarness::new_in_memory(client, env, opts).await)
     }
 
@@ -305,7 +325,8 @@ impl HarnessBuilder {
         session: llm_harness_agent::Session,
     ) -> Result<AgentHarness, HarnessBuildError> {
         let client = self.resolve_provider(&self.model)?;
-        let opts = self.build_options();
+        let compaction = self.resolve_compaction()?;
+        let opts = self.build_options(compaction);
         Ok(AgentHarness::with_session(client, env, session, opts))
     }
 
@@ -347,8 +368,26 @@ impl HarnessBuilder {
         })
     }
 
+    /// Resolve the compaction model config, if set. When compaction_model is
+    /// configured, resolves its LLM client via `resolve_provider` and returns
+    /// a fully populated `CompactionModelConfig`. Returns `None` when not set
+    /// (compaction falls back to the main conversation client).
+    fn resolve_compaction(&self) -> Result<Option<CompactionModelConfig>, HarnessBuildError> {
+        match &self.compaction_model {
+            Some((model, model_info)) => {
+                let client = self.resolve_provider(model)?;
+                Ok(Some(CompactionModelConfig {
+                    client,
+                    model: model.clone(),
+                    model_info: model_info.clone(),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Build [`AgentHarnessOptions`] from accumulated builder state.
-    fn build_options(&self) -> AgentHarnessOptions {
+    fn build_options(&self, compaction: Option<CompactionModelConfig>) -> AgentHarnessOptions {
         let mut opts = AgentHarnessOptions::new(self.model.clone());
         opts.tools = self.tools.clone();
         opts.hooks = self.hooks.clone();
@@ -357,6 +396,7 @@ impl HarnessBuilder {
         if let Some(max_tokens) = self.max_tokens {
             opts.max_tokens = max_tokens;
         }
+        opts.compaction_model = compaction;
 
         // 惰性创建共享 cost 状态。即使没有 pricing/budget，
         // 也注入 CostAccumulatorHook，使 token 计数始终能通过
@@ -824,7 +864,7 @@ mod tests {
             .pricing(Arc::new(StubPricing) as Arc<dyn crate::cost::PricingProvider>)
             .budget(5.0, None);
 
-        let opts = builder.build_options();
+        let opts = builder.build_options(None);
         // 成本累积器始终注入。
         assert!(
             !opts.hooks.after_provider_response.is_empty(),
@@ -843,7 +883,7 @@ mod tests {
     #[test]
     fn build_options_injects_accumulator_without_pricing() {
         let builder = HarnessBuilder::new("test-model");
-        let opts = builder.build_options();
+        let opts = builder.build_options(None);
         assert!(
             !opts.hooks.after_provider_response.is_empty(),
             "CostAccumulatorHook must be injected even without pricing"
@@ -858,7 +898,7 @@ mod tests {
     fn build_options_applies_max_tokens_override() {
         let opts = HarnessBuilder::new("test-model")
             .max_tokens(2048)
-            .build_options();
+            .build_options(None);
         assert_eq!(opts.max_tokens, 2048);
     }
 }

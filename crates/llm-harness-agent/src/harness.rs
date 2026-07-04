@@ -17,7 +17,9 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::ModelInfo;
-use crate::compaction::{CompactionSettings, FileOperation, compact, prepare_compaction};
+use crate::compaction::{
+    CompactionModelConfig, CompactionSettings, FileOperation, compact, prepare_compaction,
+};
 use crate::session::{Session, SessionRepo, repo::InMemorySessionRepo, types::*};
 use crate::skills::{
     PromptTemplate, Skill, SkillDiagnostic, format_skill_invocation, invoke_template,
@@ -421,6 +423,10 @@ pub struct AgentHarnessOptions {
     pub compaction_reserve_tokens: Option<u32>,
     /// Override how many recent context tokens to always preserve during compaction.
     pub compaction_keep_recent_tokens: Option<u32>,
+    /// Independent compaction provider/model. `None` → compaction uses the main
+    /// conversation client/model. When `Some`, all three fields inside are set
+    /// together — half-configuration is impossible at the type level.
+    pub compaction_model: Option<CompactionModelConfig>,
 }
 
 impl AgentHarnessOptions {
@@ -445,6 +451,7 @@ impl AgentHarnessOptions {
             retry: None,
             compaction_reserve_tokens: None,
             compaction_keep_recent_tokens: None,
+            compaction_model: None,
         }
     }
 }
@@ -517,6 +524,7 @@ impl PrepareNextTurnHook for DefaultPrepareNextTurn {
 /// `agent_loop` directly and manages session writes via `pending_session_writes`.
 pub struct AgentHarness {
     client: Arc<dyn LlmClient>,
+    compaction_model: Option<CompactionModelConfig>,
     session: Session,
     env: Arc<dyn ExecutionEnv>,
     inner: Arc<Mutex<HarnessInner>>,
@@ -602,6 +610,7 @@ impl AgentHarness {
 
         Self {
             client,
+            compaction_model: opts.compaction_model,
             session,
             env,
             inner: Arc::new(Mutex::new(inner)),
@@ -1792,12 +1801,20 @@ impl AgentHarness {
             max_tokens,
         });
 
+        // Compaction uses the independent compaction config if set, otherwise
+        // falls back to the main conversation client/model. The Option<struct>
+        // makes half-configuration impossible at the type level.
+        let (summary_client, summary_model, summary_model_info) = match &self.compaction_model {
+            Some(c) => (c.client.clone(), c.model.clone(), c.model_info.clone()),
+            None => (self.client.clone(), model.clone(), m_info.clone()),
+        };
+
         let settings = CompactionSettings {
             enabled: true,
             reserve_tokens: reserve_tokens.unwrap_or(16_384) as usize,
             keep_recent_tokens: keep_recent_tokens.unwrap_or(20_000) as usize,
-            summary_model: model.clone(),
-            summary_model_info: m_info.clone(),
+            summary_model,
+            summary_model_info,
         };
 
         // before_compact hook is called BEFORE prepare_compaction so that
@@ -1842,7 +1859,7 @@ impl AgentHarness {
         self.emit(AgentHarnessEvent::CompactionStart { estimated_tokens });
 
         let result = compact(
-            self.client.as_ref(),
+            summary_client.as_ref(),
             prep,
             &settings,
             self.auth
@@ -2579,6 +2596,77 @@ mod tests {
             .filter(|m| matches!(m, AgentMessage::Assistant(_)))
             .count();
         assert_eq!(assistant_count, 2);
+    }
+
+    /// Verifies that when `compaction_model` is configured, `do_compact`
+    /// routes the summary request through the independent compaction client
+    /// (not the main conversation client). The compaction client's response
+    /// ("compacted summary") should land in the session as a CompactionSummary.
+    #[tokio::test]
+    async fn do_compact_uses_independent_compaction_client() {
+        // Main client: two short text responses for two prompt() calls.
+        let main_client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+        ]));
+        // Compaction client: returns the summary text.
+        let compaction_client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
+            "compacted summary",
+        )]));
+
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        // Tiny context window + zero reserve so compaction triggers easily.
+        opts.model_info = Some(ModelInfo {
+            context_window: 1,
+            max_tokens: 50,
+        });
+        opts.compaction_reserve_tokens = Some(0);
+        opts.compaction_keep_recent_tokens = Some(0);
+        opts.compaction_model = Some(CompactionModelConfig {
+            client: compaction_client as Arc<dyn LlmClient>,
+            model: "compaction-model".into(),
+            model_info: ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            },
+        });
+        let h =
+            AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+        // Two prompts → 4 entries (user, assistant, user, assistant).
+        // Each ~1 token (char-based estimate), total ~4 > threshold 3.
+        h.prompt("hi").await.unwrap();
+        h.prompt("yo").await.unwrap();
+
+        // Trigger compaction. Should use compaction_client, not main_client.
+        h.compact().await.unwrap();
+        // Main client should only receive the two prompt() calls, NOT the
+        // compaction summary request — that must route through compaction_client.
+        assert_eq!(
+            main_client
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "main client must not receive compaction request"
+        );
+
+        // The compaction summary from compaction_client should be in the session.
+        let path = h.session.read_active_path().await.unwrap();
+        let has_summary = path.iter().any(|e| {
+            if let SessionEntryPayload::Compaction(c) = &e.payload {
+                matches!(
+                    &c.summary_message,
+                    AgentMessage::CompactionSummary(cs) if cs.summary.contains("compacted summary")
+                )
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_summary,
+            "compaction summary from independent client not found in session"
+        );
     }
 }
 
