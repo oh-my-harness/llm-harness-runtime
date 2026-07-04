@@ -29,7 +29,7 @@ pub use llm_harness_loop::{
     DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior, FinalAnswerMode,
     FinalAnswerToolConfig,
 };
-pub use plugin::{Plugin, StateProvider};
+pub use plugin::Plugin;
 pub use session::{
     BuiltContext, InMemorySessionRepo, JsonlSessionRepo, Session, SessionRepo, SessionStorage,
 };
@@ -55,7 +55,7 @@ pub mod prelude {
         ContextMode, DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior, FinalAnswerMode,
         FinalAnswerToolConfig, FollowUpHandle, InMemorySessionRepo, JsonlSessionRepo, ModelInfo,
         Plugin, PromptTemplate, ProviderSelection, Session, SessionRepo, SessionStorage, Skill,
-        SkillDiagnostic, SourcedSkill, SpawnOptions, StateProvider, SubAgentHandle, SubAgentResult,
+        SkillDiagnostic, SourcedSkill, SpawnOptions, SubAgentHandle, SubAgentResult,
         SubAgentSpawner,
     };
     pub use llm_harness_types::{

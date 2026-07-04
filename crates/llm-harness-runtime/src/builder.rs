@@ -1,7 +1,7 @@
 //! Builder for constructing [`AgentHarness`] with plugins, LLM providers, and tools.
 //!
 //! [`HarnessBuilder`] provides a fluent API for:
-//! - Installing plugins (tools, hooks, skills, templates, state providers)
+//! - Installing plugins (tools, hooks, skills, templates)
 //! - Registering LLM provider clients with exact and glob matching
 //! - Building an [`AgentHarness`] with an in-memory or existing session
 //!
@@ -21,7 +21,7 @@
 use std::sync::{Arc, Mutex};
 
 use llm_harness_agent::{
-    AgentHarness, AgentHarnessOptions, HarnessHooks, Plugin, PromptTemplate, Skill, StateProvider,
+    AgentHarness, AgentHarnessOptions, HarnessHooks, Plugin, PromptTemplate, Skill,
 };
 use llm_harness_loop::LlmClient;
 use llm_harness_types::{
@@ -100,7 +100,7 @@ pub enum HarnessBuildError {
 
 /// Fluent builder for constructing an [`AgentHarness`].
 ///
-/// Collects plugins, tools, hooks, skills, templates, and state providers,
+/// Collects plugins, tools, hooks, skills, templates,
 /// then constructs the harness with a resolved LLM provider client.
 pub struct HarnessBuilder {
     /// The initial model ID.
@@ -115,8 +115,6 @@ pub struct HarnessBuilder {
     templates: Vec<PromptTemplate>,
     /// Registered LLM providers.
     providers: Vec<ProviderMatcher>,
-    /// Active state provider (last registered wins).
-    state_provider: Option<Arc<dyn StateProvider>>,
     /// 可选的 pricing provider，用于成本计算。
     pricing: Option<Arc<dyn PricingProvider>>,
     /// 可选的预算上限 + 超限 hook。设置后，一个 `BudgetControlAdapter`
@@ -145,7 +143,6 @@ impl HarnessBuilder {
             skills: vec![],
             templates: vec![],
             providers: vec![],
-            state_provider: None,
             pricing: None,
             budget: None,
             cost: None,
@@ -155,14 +152,13 @@ impl HarnessBuilder {
 
     /// Install a plugin, accumulating its contributions.
     ///
-    /// Plugins contribute tools, hooks, skills, templates, and optionally
-    /// a state provider. Contributions are accumulated in registration order:
+    /// Plugins contribute tools, hooks, skills, and templates. Contributions
+    /// are accumulated in registration order:
     ///
     /// - **Tools**: appended to the tools list
     /// - **Hooks**: appended to respective hook vectors
     /// - **Skills**: appended to the skills list
     /// - **Templates**: appended to the templates list
-    /// - **StateProvider**: last registered provider wins (earlier providers discarded)
     ///
     /// If two plugins register tools or skills with the same name, both are added.
     /// Conflict resolution happens at tool dispatch time (framework-dependent).
@@ -186,11 +182,6 @@ impl HarnessBuilder {
 
         // Register templates.
         plugin.register_templates(&mut self.templates);
-
-        // Register state provider (last wins; silently overwrite earlier providers).
-        if let Some(provider) = plugin.state_provider() {
-            self.state_provider = Some(provider);
-        }
 
         self
     }
