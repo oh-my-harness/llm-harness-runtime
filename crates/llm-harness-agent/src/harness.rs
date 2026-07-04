@@ -63,6 +63,10 @@ pub struct HarnessState {
     pub queued_next_turn: Vec<AgentMessage>,
     /// Error text from the most recent failed LLM call.
     pub error_message: Option<String>,
+    /// Whether `set_tools` was called mid-run since the last `build_loop_config`.
+    /// Cleanup uses this to avoid rolling back the user's tool change together
+    /// with the HookedTool unwrap.
+    pub tools_overwritten_mid_run: bool,
 }
 
 // ── HarnessHooks ──────────────────────────────────────────────────────────────
@@ -590,6 +594,7 @@ impl AgentHarness {
             final_answer_mode: opts.final_answer_mode,
             system_prompt: opts.system_prompt,
             streaming_message: None,
+            tools_overwritten_mid_run: false,
             pending_tool_calls: HashSet::new(),
             pending_session_writes: vec![],
             queued_next_turn: vec![],
@@ -888,6 +893,7 @@ impl AgentHarness {
             if inner.state.phase == HarnessPhase::Idle {
                 (added, removed, Some(payload))
             } else {
+                inner.state.tools_overwritten_mid_run = true;
                 inner.state.pending_session_writes.push(payload);
                 (added, removed, None)
             }
@@ -1605,12 +1611,21 @@ impl AgentHarness {
             inner.state.pending_tool_calls.clear();
             inner.active_tool_names.clear();
             inner.current_abort = None;
-            // Restore original unwrapped tools so the next call to `build_loop_config`
-            // doesn't re-wrap already-HookedTool-wrapped tools (double-wrapping).
-            inner.state.tools = original_tools;
+            // On error, the run is discarded: reset the mid-run flag so the
+            // selective restore below rolls back to original_tools.
             if let Err(ref e) = result {
                 inner.state.error_message = Some(e.to_string());
                 inner.state.pending_session_writes.clear();
+                inner.state.tools_overwritten_mid_run = false;
+            }
+            // Restore original unwrapped tools so the next call to `build_loop_config`
+            // doesn't re-wrap already-HookedTool-wrapped tools (double-wrapping) —
+            // unless `set_tools` overwrote the tools mid-run, in which case keep the
+            // new (unwrapped) set; next `build_loop_config` will wrap them as needed.
+            if inner.state.tools_overwritten_mid_run {
+                inner.state.tools_overwritten_mid_run = false;
+            } else {
+                inner.state.tools = original_tools;
             }
         }
         self.set_phase(HarnessPhase::Idle);
@@ -2742,6 +2757,274 @@ mod tests {
         assert!(
             has_summary,
             "compaction summary from independent client not found in session"
+        );
+    }
+    /// `set_tools` called mid-run (via a `before_turn` hook) must survive the
+    /// cleanup that unwraps `HookedTool`. The new tool must still be present
+    /// after the run ends.
+    #[tokio::test]
+    async fn set_tools_mid_run_survives_cleanup() {
+        use std::sync::OnceLock;
+
+        // A before_tool_call hook is registered so `build_loop_config` wraps
+        // tools with HookedTool — this is the path whose cleanup previously
+        // rolled back mid-run set_tools.
+        struct NoOpBeforeToolCall;
+        impl BeforeToolCallHook for NoOpBeforeToolCall {
+            fn on_call<'a>(
+                &'a self,
+                _ctx: BeforeToolCallCtx<'a>,
+            ) -> futures::future::BoxFuture<'a, BeforeToolCallDecision> {
+                Box::pin(async { BeforeToolCallDecision::Allow })
+            }
+        }
+        struct SetToolsOnTurn {
+            harness: Arc<OnceLock<Arc<AgentHarness>>>,
+            done: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl BeforeTurnHook for SetToolsOnTurn {
+            fn before_turn<'a>(
+                &'a self,
+                _ctx: BeforeTurnCtx<'a>,
+            ) -> futures::future::BoxFuture<'a, ()> {
+                let harness_cell = self.harness.clone();
+                let done = self.done.clone();
+                Box::pin(async move {
+                    if done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    let h = harness_cell.get().unwrap().clone();
+                    let new_tool: Arc<dyn llm_harness_types::Tool> =
+                        Arc::new(DummyTool::new("mid_run_tool"));
+                    h.set_tools(vec![new_tool]).await.unwrap();
+                })
+            }
+        }
+
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
+        let env = Arc::new(NoOpEnv);
+        let harness_cell: Arc<OnceLock<Arc<AgentHarness>>> = Arc::new(OnceLock::new());
+        let opts = AgentHarnessOptions {
+            hooks: HarnessHooks {
+                before_turn: vec![Arc::new(SetToolsOnTurn {
+                    harness: harness_cell.clone(),
+                    done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                })],
+                // A no-op before_tool_call hook forces HookedTool wrapping.
+                before_tool_call: vec![Arc::new(NoOpBeforeToolCall)],
+                ..HarnessHooks::none()
+            },
+            ..AgentHarnessOptions::new("test-model")
+        };
+        let h = Arc::new(
+            AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await,
+        );
+        harness_cell.get_or_init(|| h.clone());
+
+        h.prompt("hi").await.unwrap();
+
+        let names: Vec<String> = h.state().tools.iter().map(|t| t.name().to_string()).collect();
+        assert!(
+            names.iter().any(|n| n == "mid_run_tool"),
+            "mid-run set_tools must survive cleanup; tools = {names:?}"
+        );
+        assert!(
+            !h.state().tools_overwritten_mid_run,
+            "flag must be reset after cleanup"
+        );
+    }
+
+    /// Without mid-run `set_tools`, cleanup must still unwrap HookedTool so the
+    /// next `build_loop_config` does not double-wrap. Two consecutive prompts
+    /// with a before_tool_call hook must succeed.
+    #[tokio::test]
+    async fn cleanup_unwraps_hooked_tool_without_mid_run_set() {
+        struct NoOpBeforeToolCall;
+        impl BeforeToolCallHook for NoOpBeforeToolCall {
+            fn on_call<'a>(
+                &'a self,
+                _ctx: BeforeToolCallCtx<'a>,
+            ) -> futures::future::BoxFuture<'a, BeforeToolCallDecision> {
+                Box::pin(async { BeforeToolCallDecision::Allow })
+            }
+        }
+
+        let client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("first"),
+            MockResponse::text("second"),
+        ]));
+        let env = Arc::new(NoOpEnv);
+        let opts = AgentHarnessOptions {
+            hooks: HarnessHooks {
+                before_tool_call: vec![Arc::new(NoOpBeforeToolCall)],
+                ..HarnessHooks::none()
+            },
+            ..AgentHarnessOptions::new("test-model")
+        };
+        let h =
+            AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await;
+
+        // Two prompts: the second `build_loop_config` would double-wrap if
+        // cleanup failed to unwrap. No panic / no error => pass.
+        h.prompt("one").await.unwrap();
+        h.prompt("two").await.unwrap();
+        assert!(
+            !h.state().tools_overwritten_mid_run,
+            "flag must remain false without mid-run set_tools"
+        );
+    }
+
+    /// `set_tools` in Idle phase must not set the mid-run flag (it takes the
+    /// direct `session.append` path, not the pending path).
+    #[tokio::test]
+    async fn set_tools_in_idle_does_not_set_flag() {
+        let h = make_harness(vec![]);
+        let tool: Arc<dyn llm_harness_types::Tool> = Arc::new(DummyTool::new("idle_tool"));
+        h.set_tools(vec![tool]).await.unwrap();
+        assert!(
+            !h.state().tools_overwritten_mid_run,
+            "Idle set_tools must not set the mid-run flag"
+        );
+    }
+
+    /// On an LLM error (`AgentEvent::Error`), the run ends but the mid-run
+    /// `set_tools` change is NOT rolled back — LLM errors are part of the run,
+    /// not a run-level failure. Only storage/session errors (which make
+    /// `drive_loop` return `Err`) trigger rollback.
+    #[tokio::test]
+    async fn set_tools_mid_run_preserved_on_llm_error() {
+        use std::sync::OnceLock;
+
+        struct SetToolsOnTurn {
+            harness: Arc<OnceLock<Arc<AgentHarness>>>,
+            done: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl BeforeTurnHook for SetToolsOnTurn {
+            fn before_turn<'a>(
+                &'a self,
+                _ctx: BeforeTurnCtx<'a>,
+            ) -> futures::future::BoxFuture<'a, ()> {
+                let harness_cell = self.harness.clone();
+                let done = self.done.clone();
+                Box::pin(async move {
+                    if done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    let h = harness_cell.get().unwrap().clone();
+                    let new_tool: Arc<dyn llm_harness_types::Tool> =
+                        Arc::new(DummyTool::new("error_run_tool"));
+                    h.set_tools(vec![new_tool]).await.unwrap();
+                })
+            }
+        }
+
+        // First response errors; before_turn fires first and calls set_tools.
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::rate_limit_error()]));
+        let env = Arc::new(NoOpEnv);
+        let harness_cell: Arc<OnceLock<Arc<AgentHarness>>> = Arc::new(OnceLock::new());
+        let opts = AgentHarnessOptions {
+            hooks: HarnessHooks {
+                before_turn: vec![Arc::new(SetToolsOnTurn {
+                    harness: harness_cell.clone(),
+                    done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                })],
+                ..HarnessHooks::none()
+            },
+            ..AgentHarnessOptions::new("test-model")
+        };
+        let h = Arc::new(
+            AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await,
+        );
+        harness_cell.get_or_init(|| h.clone());
+
+        // The run errors; prompt returns Ok (LLM error is an event, not a Result).
+        h.prompt("hi").await.unwrap();
+
+        let names: Vec<String> = h.state().tools.iter().map(|t| t.name().to_string()).collect();
+        assert!(
+            names.iter().any(|n| n == "error_run_tool"),
+            "mid-run set_tools must survive LLM error; tools = {names:?}"
+        );
+        assert!(
+            !h.state().tools_overwritten_mid_run,
+            "flag must be reset after cleanup"
+        );
+    }
+
+    /// On a storage/session error (`drive_loop` returns `Err`), the run is
+    /// discarded: mid-run `set_tools` must be rolled back to `original_tools`
+    /// and the flag reset. This is the counterpart to
+    /// `set_tools_mid_run_preserved_on_llm_error` — LLM errors are events
+    /// (preserve), storage errors are `Result::Err` (rollback).
+    #[tokio::test]
+    async fn set_tools_mid_run_rolled_back_on_storage_error() {
+        use std::sync::OnceLock;
+
+        struct SetToolsOnTurn {
+            harness: Arc<OnceLock<Arc<AgentHarness>>>,
+            done: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl BeforeTurnHook for SetToolsOnTurn {
+            fn before_turn<'a>(
+                &'a self,
+                _ctx: BeforeTurnCtx<'a>,
+            ) -> futures::future::BoxFuture<'a, ()> {
+                let harness_cell = self.harness.clone();
+                let done = self.done.clone();
+                Box::pin(async move {
+                    if done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    let h = harness_cell.get().unwrap().clone();
+                    let new_tool: Arc<dyn llm_harness_types::Tool> =
+                        Arc::new(DummyTool::new("storage_err_tool"));
+                    h.set_tools(vec![new_tool]).await.unwrap();
+                })
+            }
+        }
+
+        // fail_after=0: the first flush_pending_writes at TurnEnd fails,
+        // making drive_loop return Err — the storage-error path.
+        let repo = crate::session::repo::InMemorySessionRepo::new();
+        let storage = futures::executor::block_on(
+            repo.create(crate::session::types::CreateSessionOptions::default()),
+        )
+        .unwrap();
+        let failing = Arc::new(FailAfterNStorage::new(storage, 0));
+        let session = crate::session::session::Session::new(failing as Arc<dyn SessionStorage>);
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
+        let env = Arc::new(NoOpEnv);
+        let harness_cell: Arc<OnceLock<Arc<AgentHarness>>> = Arc::new(OnceLock::new());
+        let opts = AgentHarnessOptions {
+            hooks: HarnessHooks {
+                before_turn: vec![Arc::new(SetToolsOnTurn {
+                    harness: harness_cell.clone(),
+                    done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                })],
+                ..HarnessHooks::none()
+            },
+            ..AgentHarnessOptions::new("test-model")
+        };
+        let h = Arc::new(AgentHarness::with_session(
+            client as Arc<dyn LlmClient>,
+            env,
+            session,
+            opts,
+        ));
+        harness_cell.get_or_init(|| h.clone());
+
+        // Storage error makes prompt return Err.
+        let result = h.prompt("hi").await;
+        assert!(result.is_err(), "prompt must return Err when storage fails");
+
+        let names: Vec<String> = h.state().tools.iter().map(|t| t.name().to_string()).collect();
+        assert!(
+            !names.iter().any(|n| n == "storage_err_tool"),
+            "mid-run set_tools must be rolled back on storage error; tools = {names:?}"
+        );
+        assert!(
+            !h.state().tools_overwritten_mid_run,
+            "flag must be reset after storage-error rollback"
         );
     }
 }
