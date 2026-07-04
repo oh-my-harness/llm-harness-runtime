@@ -175,7 +175,11 @@ impl SessionStorage for JsonlSessionStorage {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
             Self::ensure_loaded(&mut inner).await?;
-            Ok(tree_ops::children(&inner.entry_map, &inner.children_map, parent))
+            Ok(tree_ops::children(
+                &inner.entry_map,
+                &inner.children_map,
+                parent,
+            ))
         })
     }
 
@@ -226,7 +230,11 @@ impl SessionStorage for JsonlSessionStorage {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
             Self::ensure_loaded(&mut inner).await?;
-            Ok(tree_ops::label_at(&inner.entry_map, &inner.children_map, id))
+            Ok(tree_ops::label_at(
+                &inner.entry_map,
+                &inner.children_map,
+                id,
+            ))
         })
     }
 
@@ -595,7 +603,9 @@ mod tests {
         })
         .to_string();
         lines.insert(1, &unknown);
-        tokio::fs::write(&entries_path, lines.join("\n")).await.unwrap();
+        tokio::fs::write(&entries_path, lines.join("\n"))
+            .await
+            .unwrap();
 
         let storage2 = repo.open(&id).await.unwrap();
         let session2 = Session::new(storage2);

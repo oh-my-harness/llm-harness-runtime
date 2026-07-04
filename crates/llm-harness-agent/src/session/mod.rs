@@ -3,7 +3,7 @@ pub mod jsonl;
 pub mod repo;
 pub mod session;
 pub mod storage;
-pub mod tree_ops;
+pub(crate) mod tree_ops;
 pub mod types;
 
 pub use jsonl::{JsonlSessionRepo, JsonlSessionStorage};

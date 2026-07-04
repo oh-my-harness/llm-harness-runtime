@@ -571,17 +571,11 @@ mod tests {
 
         // Branch A (will be deleted)
         session.navigate_to(root).await.unwrap();
-        let a_leaf = session
-            .append_message(assistant_msg("A"))
-            .await
-            .unwrap();
+        let a_leaf = session.append_message(assistant_msg("A")).await.unwrap();
 
         // Branch B (active)
         session.navigate_to(root).await.unwrap();
-        let _b_leaf = session
-            .append_message(assistant_msg("B"))
-            .await
-            .unwrap();
+        let _b_leaf = session.append_message(assistant_msg("B")).await.unwrap();
 
         // cursor is on b_leaf; deleting a_leaf should not move it.
         session.delete_branch(a_leaf).await.unwrap();
@@ -621,17 +615,11 @@ mod tests {
 
         // Branch A
         session.navigate_to(root).await.unwrap();
-        let a_leaf = session
-            .append_message(assistant_msg("A"))
-            .await
-            .unwrap();
+        let a_leaf = session.append_message(assistant_msg("A")).await.unwrap();
 
         // Navigate back to root and create branch B.
         session.navigate_to(root).await.unwrap();
-        let b_leaf = session
-            .append_message(assistant_msg("B"))
-            .await
-            .unwrap();
+        let b_leaf = session.append_message(assistant_msg("B")).await.unwrap();
 
         // Delete branch A — must not leave orphan BranchSwitch under A.
         session.delete_branch(a_leaf).await.unwrap();

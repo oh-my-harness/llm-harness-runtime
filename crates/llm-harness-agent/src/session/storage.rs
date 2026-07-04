@@ -64,6 +64,10 @@ pub trait SessionStorage: Send + Sync {
     ///
     /// Each inner `Vec` is ordered root-first (same convention as `path_to_root`).
     /// Replaces L calls to `path_to_root` in `Session::list_branches`.
+    ///
+    /// Returns `Err(EntryNotFound)` if any leaf's parent chain reaches an entry
+    /// not present in storage (data corruption / orphan) — implementors must not
+    /// return a partial path.
     fn paths_to_all_leaves(&self) -> BoxFuture<'_, Result<Vec<Vec<SessionEntry>>, SessionError>>;
 
     /// Find all entries of a given kind.

@@ -9,9 +9,14 @@ use super::types::{SessionEntry, SessionEntryKind, SessionEntryPayload};
 // Pure functions over `(entries, children_map)` — the shared in-memory index
 // shape used by both `InMemorySessionStorage` and `JsonlSessionStorage`.
 // Both backends delegate to these to guarantee identical tree semantics.
+//
+// Precondition: callers must keep `entries` and `children_map` mutually
+// consistent — every child ID in `children_map` must exist as a key in
+// `entries`, and both must be updated together on insert/delete. These
+// functions do not re-validate.
 
 /// Get all child entries of the given parent.
-pub fn children(
+pub(crate) fn children(
     entries: &HashMap<EntryId, SessionEntry>,
     children_map: &HashMap<Option<EntryId>, Vec<EntryId>>,
     parent: EntryId,
@@ -25,8 +30,8 @@ pub fn children(
         .collect()
 }
 
-/// Get all leaf entry IDs (entries with no children).
-pub fn all_leaves(
+/// Return the IDs of all leaf entries (entries with no children).
+fn leaves(
     entries: &HashMap<EntryId, SessionEntry>,
     children_map: &HashMap<Option<EntryId>, Vec<EntryId>>,
 ) -> Vec<EntryId> {
@@ -41,9 +46,16 @@ pub fn all_leaves(
         .copied()
         .collect()
 }
+/// Get all leaf entry IDs (entries with no children).
+pub(crate) fn all_leaves(
+    entries: &HashMap<EntryId, SessionEntry>,
+    children_map: &HashMap<Option<EntryId>, Vec<EntryId>>,
+) -> Vec<EntryId> {
+    leaves(entries, children_map)
+}
 
 /// Return all entries from `target` to the root, ordered root-first.
-pub fn path_to_root(
+pub(crate) fn path_to_root(
     entries: &HashMap<EntryId, SessionEntry>,
     target: EntryId,
 ) -> Result<Vec<SessionEntry>, SessionError> {
@@ -62,8 +74,7 @@ pub fn path_to_root(
     Ok(path)
 }
 
-/// Find the lowest common ancestor of two entries.
-pub fn common_ancestor(
+pub(crate) fn common_ancestor(
     entries: &HashMap<EntryId, SessionEntry>,
     a: EntryId,
     b: EntryId,
@@ -84,13 +95,12 @@ pub fn common_ancestor(
         Ok(v)
     }
     let a_anc = ancestors(entries, a)?;
-    let b_set: std::collections::HashSet<EntryId> =
-        ancestors(entries, b)?.into_iter().collect();
+    let b_set: std::collections::HashSet<EntryId> = ancestors(entries, b)?.into_iter().collect();
     Ok(a_anc.into_iter().find(|id| b_set.contains(id)))
 }
 
 /// Return the label name for the entry at `id`, if any.
-pub fn label_at(
+pub(crate) fn label_at(
     entries: &HashMap<EntryId, SessionEntry>,
     children_map: &HashMap<Option<EntryId>, Vec<EntryId>>,
     id: EntryId,
@@ -113,20 +123,11 @@ pub fn label_at(
 ///
 /// If any leaf's parent chain hits a missing entry (data corruption / orphan),
 /// returns `Err(EntryNotFound)` rather than silently returning a partial path.
-pub fn paths_to_all_leaves(
+pub(crate) fn paths_to_all_leaves(
     entries: &HashMap<EntryId, SessionEntry>,
     children_map: &HashMap<Option<EntryId>, Vec<EntryId>>,
 ) -> Result<Vec<Vec<SessionEntry>>, SessionError> {
-    let leaves: Vec<EntryId> = entries
-        .keys()
-        .filter(|id| {
-            children_map
-                .get(&Some(**id))
-                .map(|v| v.is_empty())
-                .unwrap_or(true)
-        })
-        .copied()
-        .collect();
+    let leaves = leaves(entries, children_map);
     let mut result = Vec::with_capacity(leaves.len());
     for leaf_id in leaves {
         let mut path = Vec::new();
@@ -145,9 +146,8 @@ pub fn paths_to_all_leaves(
     }
     Ok(result)
 }
-
 /// Find all entries of a given kind.
-pub fn find_entries_by_type(
+pub(crate) fn find_entries_by_type(
     entries: &HashMap<EntryId, SessionEntry>,
     kind: SessionEntryKind,
 ) -> Vec<EntryId> {
@@ -174,9 +174,7 @@ mod tests {
     }
 
     fn label(name: &str) -> SessionEntryPayload {
-        SessionEntryPayload::Label {
-            name: name.into(),
-        }
+        SessionEntryPayload::Label { name: name.into() }
     }
 
     /// Insert `entry` into `entries` and register it under `entry.parent_id` in `children`.
@@ -197,8 +195,10 @@ mod tests {
     ///   │   └── A_leaf
     ///   └── B
     ///       └── B_leaf
-    fn two_branch_tree(
-    ) -> (HashMap<EntryId, SessionEntry>, HashMap<Option<EntryId>, Vec<EntryId>>) {
+    fn two_branch_tree() -> (
+        HashMap<EntryId, SessionEntry>,
+        HashMap<Option<EntryId>, Vec<EntryId>>,
+    ) {
         let mut entries = HashMap::new();
         let mut children = HashMap::new();
 
@@ -220,36 +220,32 @@ mod tests {
 
     #[test]
     fn children_returns_direct_children() {
-        let (entries, children) = two_branch_tree();
-        let root_id = *children.get(&None).unwrap().first().unwrap();
-        let result = super::children(&entries, &children, root_id);
+        let (entries, child_map) = two_branch_tree();
+        let root_id = *child_map.get(&None).unwrap().first().unwrap();
+        let result = children(&entries, &child_map, root_id);
         assert_eq!(result.len(), 2);
     }
 
     #[test]
     fn children_empty_for_leaf() {
-        let (entries, children) = two_branch_tree();
-        let leaf_id = entries
-            .keys()
-            .find(|id| !children.get(&Some(**id)).is_some_and(|v| !v.is_empty()))
-            .copied()
-            .unwrap();
-        let result = super::children(&entries, &children, leaf_id);
+        let (entries, child_map) = two_branch_tree();
+        let leaf_id = all_leaves(&entries, &child_map)[0];
+        let result = children(&entries, &child_map, leaf_id);
         assert!(result.is_empty());
     }
 
     #[test]
     fn all_leaves_finds_two_leaves() {
         let (entries, children) = two_branch_tree();
-        let leaves = super::all_leaves(&entries, &children);
+        let leaves = all_leaves(&entries, &children);
         assert_eq!(leaves.len(), 2);
     }
 
     #[test]
     fn path_to_root_returns_root_first() {
         let (entries, children) = two_branch_tree();
-        let leaf_id = super::all_leaves(&entries, &children)[0];
-        let path = super::path_to_root(&entries, leaf_id).unwrap();
+        let leaf_id = all_leaves(&entries, &children)[0];
+        let path = path_to_root(&entries, leaf_id).unwrap();
         assert!(path.len() == 3); // leaf → mid → root
         assert_eq!(path[0].parent_id, None); // first element is root
         assert_eq!(path.last().unwrap().id, leaf_id); // last element is leaf
@@ -259,15 +255,15 @@ mod tests {
     fn path_to_root_missing_target_returns_err() {
         let (entries, _children) = two_branch_tree();
         let missing = EntryId::new();
-        let result = super::path_to_root(&entries, missing);
+        let result = path_to_root(&entries, missing);
         assert!(matches!(result, Err(SessionError::EntryNotFound(_))));
     }
 
     #[test]
     fn common_ancestor_of_two_leaves_is_root() {
         let (entries, children) = two_branch_tree();
-        let leaves = super::all_leaves(&entries, &children);
-        let ancestor = super::common_ancestor(&entries, leaves[0], leaves[1]).unwrap();
+        let leaves = all_leaves(&entries, &children);
+        let ancestor = common_ancestor(&entries, leaves[0], leaves[1]).unwrap();
         assert!(ancestor.is_some());
         let root_id = *children.get(&None).unwrap().first().unwrap();
         assert_eq!(ancestor.unwrap(), root_id);
@@ -278,23 +274,23 @@ mod tests {
         let (entries, children) = two_branch_tree();
         let root_id = *children.get(&None).unwrap().first().unwrap();
         // Root's first child is "A" (a Label entry).
-        let result = super::label_at(&entries, &children, root_id);
+        let result = label_at(&entries, &children, root_id);
         assert_eq!(result.as_deref(), Some("A"));
     }
 
     #[test]
     fn label_at_none_when_no_label_child() {
         let (entries, children) = two_branch_tree();
-        let leaves = super::all_leaves(&entries, &children);
+        let leaves = all_leaves(&entries, &children);
         // Leaves have no children → no label.
-        let result = super::label_at(&entries, &children, leaves[0]);
+        let result = label_at(&entries, &children, leaves[0]);
         assert_eq!(result, None);
     }
 
     #[test]
     fn paths_to_all_leaves_returns_two_paths() {
         let (entries, children) = two_branch_tree();
-        let paths = super::paths_to_all_leaves(&entries, &children).unwrap();
+        let paths = paths_to_all_leaves(&entries, &children).unwrap();
         assert_eq!(paths.len(), 2);
         for path in &paths {
             assert_eq!(path[0].parent_id, None); // each starts at root
@@ -316,7 +312,7 @@ mod tests {
         let orphan = make_entry(Some(phantom), label("orphan"));
         let _ = index(&mut entries, &mut children_map, orphan);
 
-        let result = super::paths_to_all_leaves(&entries, &children_map);
+        let result = paths_to_all_leaves(&entries, &children_map);
         assert!(
             matches!(result, Err(SessionError::EntryNotFound(_))),
             "orphan parent chain must surface as Err, not silent partial path"
@@ -326,14 +322,80 @@ mod tests {
     #[test]
     fn find_entries_by_type_label() {
         let (entries, _children) = two_branch_tree();
-        let ids = super::find_entries_by_type(&entries, SessionEntryKind::Label);
+        let ids = find_entries_by_type(&entries, SessionEntryKind::Label);
         assert_eq!(ids.len(), 5); // root, A, A_leaf, B, B_leaf — all Label
     }
 
     #[test]
     fn find_entries_by_type_none_for_absent_kind() {
         let (entries, _children) = two_branch_tree();
-        let ids = super::find_entries_by_type(&entries, SessionEntryKind::Message);
+        let ids = find_entries_by_type(&entries, SessionEntryKind::Message);
         assert!(ids.is_empty());
+    }
+    #[test]
+    fn common_ancestor_same_id_returns_self() {
+        let (entries, children) = two_branch_tree();
+        let leaves = all_leaves(&entries, &children);
+        let ancestor = common_ancestor(&entries, leaves[0], leaves[0]).unwrap();
+        assert_eq!(ancestor, Some(leaves[0]));
+    }
+
+    #[test]
+    fn common_ancestor_one_is_ancestor_of_other() {
+        let (entries, children) = two_branch_tree();
+        let root_id = *children.get(&None).unwrap().first().unwrap();
+        let leaves = all_leaves(&entries, &children);
+        // root is an ancestor of every leaf.
+        let ancestor = common_ancestor(&entries, root_id, leaves[0]).unwrap();
+        assert_eq!(ancestor, Some(root_id));
+    }
+
+    #[test]
+    fn common_ancestor_missing_id_returns_err() {
+        let (entries, _children) = two_branch_tree();
+        let missing = EntryId::new();
+        let result = common_ancestor(&entries, missing, missing);
+        assert!(matches!(result, Err(SessionError::EntryNotFound(_))));
+    }
+
+    #[test]
+    fn empty_tree_all_leaves_is_empty() {
+        let entries: HashMap<EntryId, SessionEntry> = HashMap::new();
+        let children: HashMap<Option<EntryId>, Vec<EntryId>> = HashMap::new();
+        assert!(all_leaves(&entries, &children).is_empty());
+    }
+
+    #[test]
+    fn empty_tree_paths_to_all_leaves_is_empty() {
+        let entries: HashMap<EntryId, SessionEntry> = HashMap::new();
+        let children: HashMap<Option<EntryId>, Vec<EntryId>> = HashMap::new();
+        let paths = paths_to_all_leaves(&entries, &children).unwrap();
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn empty_tree_find_entries_by_type_is_empty() {
+        let entries: HashMap<EntryId, SessionEntry> = HashMap::new();
+        assert!(find_entries_by_type(&entries, SessionEntryKind::Label).is_empty());
+    }
+
+    #[test]
+    fn single_node_tree_all_leaves_returns_root() {
+        let mut entries = HashMap::new();
+        let mut children = HashMap::new();
+        let root_id = index(&mut entries, &mut children, make_entry(None, label("root")));
+        let leaves = all_leaves(&entries, &children);
+        assert_eq!(leaves, vec![root_id]);
+    }
+
+    #[test]
+    fn single_node_tree_paths_to_all_leaves_one_path() {
+        let mut entries = HashMap::new();
+        let mut children = HashMap::new();
+        let root_id = index(&mut entries, &mut children, make_entry(None, label("root")));
+        let paths = paths_to_all_leaves(&entries, &children).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].len(), 1);
+        assert_eq!(paths[0][0].id, root_id);
     }
 }
