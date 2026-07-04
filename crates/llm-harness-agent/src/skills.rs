@@ -79,7 +79,13 @@ fn is_valid_skill_name(name: &str) -> bool {
 /// Returns `(fields, body)` where `fields` is a map of `kebab-case` keys to
 /// their string values. If there is no frontmatter the map is empty and `body`
 /// is the full input.
-pub fn parse_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
+pub fn parse_frontmatter(text: &str) -> (HashMap<String, String>, String) {
+    // Normalize CRLF to LF so the byte-based fence detection below works
+    // for files saved on Windows. Owned body is fine — all callers already
+    // `.to_string()` it.
+    let text = text.replace("\r\n", "\n");
+    let text = text.as_str();
+
     let mut fields = HashMap::new();
 
     // Frontmatter must start with "---" on the first line.
@@ -87,13 +93,13 @@ pub fn parse_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
         Some(rest) if rest.starts_with('\n') || rest.is_empty() => {
             &rest[rest.starts_with('\n') as usize..]
         }
-        _ => return (fields, text),
+        _ => return (fields, text.to_string()),
     };
 
     // Find the closing "---".
     let close = match after_fence.find("\n---") {
         Some(pos) => pos,
-        None => return (fields, text),
+        None => return (fields, text.to_string()),
     };
 
     let fm_text = &after_fence[..close];
@@ -128,7 +134,7 @@ pub fn parse_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
         }
     }
 
-    (fields, body)
+    (fields, body.to_string())
 }
 
 // ── load_skills ───────────────────────────────────────────────────────────────
@@ -718,5 +724,33 @@ mod tests {
         assert_eq!(desc.trim_end_matches("...").chars().count(), 60);
         // No partial char — all chars are valid Unicode scalars by construction.
         assert!(!desc.contains('\u{FFFD}'));
+    }
+
+    // ── parse_frontmatter CRLF ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_frontmatter_lf() {
+        let text = "---\nname: my-skill\ndescription: hello\n---\nbody line\n";
+        let (fields, body) = parse_frontmatter(text);
+        assert_eq!(fields.get("name").unwrap(), "my-skill");
+        assert_eq!(fields.get("description").unwrap(), "hello");
+        assert_eq!(body, "body line\n");
+    }
+
+    #[test]
+    fn parse_frontmatter_crlf() {
+        let text = "---\r\nname: my-skill\r\ndescription: hello\r\n---\r\nbody line\r\n";
+        let (fields, body) = parse_frontmatter(text);
+        assert_eq!(fields.get("name").unwrap(), "my-skill");
+        assert_eq!(fields.get("description").unwrap(), "hello");
+        assert_eq!(body, "body line\n");
+    }
+
+    #[test]
+    fn parse_frontmatter_no_frontmatter_crlf() {
+        let text = "just body\r\nsecond line\r\n";
+        let (fields, body) = parse_frontmatter(text);
+        assert!(fields.is_empty());
+        assert_eq!(body, "just body\nsecond line\n");
     }
 }
