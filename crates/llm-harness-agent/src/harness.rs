@@ -1232,29 +1232,41 @@ impl AgentHarness {
         self.inner.lock().unwrap().state.queued_next_turn.push(msg);
     }
 
-    /// Drain the steer queue (resets the sender channel).
-    pub fn clear_steering_queue(&self) {
+    /// Drain the steer queue. Only callable when Idle.
+    pub fn clear_steering_queue(&self) -> Result<(), HarnessError> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.state.phase != HarnessPhase::Idle {
+            return Err(HarnessError::NotIdle(inner.state.phase));
+        }
         let (tx, _) = mpsc::channel(inner.queue_capacity);
         inner.steer_tx = tx;
+        Ok(())
     }
 
-    /// Drain the follow-up queue.
-    pub fn clear_follow_up_queue(&self) {
+    /// Drain the follow-up queue. Only callable when Idle.
+    pub fn clear_follow_up_queue(&self) -> Result<(), HarnessError> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.state.phase != HarnessPhase::Idle {
+            return Err(HarnessError::NotIdle(inner.state.phase));
+        }
         let (tx, _) = mpsc::channel(inner.queue_capacity);
         inner.follow_up_tx = tx;
+        Ok(())
     }
 
-    /// Drain all queues (steer, follow-up, next_turn).
-    pub fn clear_all_queues(&self) {
+    /// Drain all queues (steer, follow-up, next_turn). Only callable when Idle.
+    pub fn clear_all_queues(&self) -> Result<(), HarnessError> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.state.phase != HarnessPhase::Idle {
+            return Err(HarnessError::NotIdle(inner.state.phase));
+        }
         let cap = inner.queue_capacity;
         let (steer_tx, _) = mpsc::channel(cap);
         let (follow_up_tx, _) = mpsc::channel(cap);
         inner.steer_tx = steer_tx;
         inner.follow_up_tx = follow_up_tx;
         inner.state.queued_next_turn.clear();
+        Ok(())
     }
 
     /// Returns `true` if any queue is non-empty.
@@ -2548,8 +2560,29 @@ mod tests {
     async fn clear_all_queues_empties_next_turn() {
         let h = make_harness(vec![]);
         h.next_turn("msg");
-        h.clear_all_queues();
+        h.clear_all_queues().unwrap();
         assert!(!h.has_queued_messages());
+    }
+
+    #[tokio::test]
+    async fn clear_queues_rejected_when_not_idle() {
+        let h = make_harness(vec![]);
+        // 强制进入非 Idle 阶段
+        h.inner.lock().unwrap().state.phase = HarnessPhase::Turning;
+        assert!(matches!(
+            h.clear_steering_queue(),
+            Err(HarnessError::NotIdle(HarnessPhase::Turning))
+        ));
+        assert!(matches!(
+            h.clear_follow_up_queue(),
+            Err(HarnessError::NotIdle(HarnessPhase::Turning))
+        ));
+        assert!(matches!(
+            h.clear_all_queues(),
+            Err(HarnessError::NotIdle(HarnessPhase::Turning))
+        ));
+        // 恢复 Idle 供后续清理
+        h.inner.lock().unwrap().state.phase = HarnessPhase::Idle;
     }
 
     struct DummyTool {

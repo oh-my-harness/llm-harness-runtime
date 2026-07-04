@@ -316,26 +316,34 @@ impl Agent {
         let _ = inner.follow_up_tx.try_send(msg);
     }
 
-    /// Drain the steer queue.
-    pub fn clear_steering_queue(&self) {
+    /// Drain the steer queue. Only callable when Idle.
+    pub fn clear_steering_queue(&self) -> Result<(), AgentError> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.state.phase != AgentPhase::Idle {
+            return Err(AgentError::NotIdle);
+        }
         let cap = inner.queue_capacity;
         let (new_tx, _) = mpsc::channel(cap);
         inner.steer_tx = new_tx;
+        Ok(())
     }
 
-    /// Drain the follow-up queue.
-    pub fn clear_follow_up_queue(&self) {
+    /// Drain the follow-up queue. Only callable when Idle.
+    pub fn clear_follow_up_queue(&self) -> Result<(), AgentError> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.state.phase != AgentPhase::Idle {
+            return Err(AgentError::NotIdle);
+        }
         let cap = inner.queue_capacity;
         let (new_tx, _) = mpsc::channel(cap);
         inner.follow_up_tx = new_tx;
+        Ok(())
     }
 
-    /// Drain both queues.
-    pub fn clear_all_queues(&self) {
-        self.clear_steering_queue();
-        self.clear_follow_up_queue();
+    /// Drain both queues. Only callable when Idle.
+    pub fn clear_all_queues(&self) -> Result<(), AgentError> {
+        self.clear_steering_queue()?;
+        self.clear_follow_up_queue()
     }
 
     /// Returns `true` if either the steer or follow-up channel has capacity used.
@@ -638,7 +646,7 @@ mod tests {
         }));
 
         // Clear before prompting
-        agent.clear_steering_queue();
+        agent.clear_steering_queue().unwrap();
 
         // Prompt with a fresh message
         agent.prompt("actual prompt").await.unwrap();
@@ -650,6 +658,26 @@ mod tests {
             2,
             "steer message should have been cleared"
         );
+    }
+    #[tokio::test]
+    async fn clear_queues_rejected_when_not_idle() {
+        let agent = make_agent(vec![]);
+        // 强制进入 Running 阶段
+        agent.inner.lock().unwrap().state.phase = AgentPhase::Running;
+        assert!(matches!(
+            agent.clear_steering_queue(),
+            Err(AgentError::NotIdle)
+        ));
+        assert!(matches!(
+            agent.clear_follow_up_queue(),
+            Err(AgentError::NotIdle)
+        ));
+        assert!(matches!(
+            agent.clear_all_queues(),
+            Err(AgentError::NotIdle)
+        ));
+        // 恢复 Idle 供后续清理
+        agent.inner.lock().unwrap().state.phase = AgentPhase::Idle;
     }
 
     #[tokio::test]
