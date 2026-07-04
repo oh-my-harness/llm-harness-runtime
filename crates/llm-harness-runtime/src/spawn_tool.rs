@@ -55,9 +55,9 @@ static SPAWN_AGENT_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(spawn_age
 fn format_completion(completion: &AsyncCompletion) -> String {
     match &completion.result {
         Ok(r) => format!(
-            "[Sub-agent '{id}' completed]\n{output}\n\nTool calls: {n}\nSession: {sid}",
+            "[Sub-agent '{id}' completed]\n{answer}\n\nTool calls: {n}\nSession: {sid}",
             id = completion.agent_id,
-            output = r.output,
+            answer = r.final_answer,
             n = r.tool_calls_count,
             sid = r.session_id,
         ),

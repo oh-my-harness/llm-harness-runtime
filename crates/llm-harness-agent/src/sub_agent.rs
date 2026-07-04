@@ -105,8 +105,11 @@ impl Drop for SubAgentHandle {
 /// sub-agent 完成后的结果。
 #[derive(Clone, Debug)]
 pub struct SubAgentResult {
-    /// 所有 turn 的 TextDelta 拼接的完整文本输出。
-    pub output: String,
+    /// Sub-agent 的最终答案。优先取最后一个 `kind=FinalAnswer` 的 assistant
+    /// message 的文本；若 sub-agent 全程未产生 FinalAnswer 消息（如 abort、
+    /// `FinalAnswerMode::required_tool()` strict 模式下模型未调用 final-answer
+    /// tool、或 broadcast Lagged 丢失尾部事件等退化路径），回退到 TextDelta 拼接。
+    pub final_answer: String,
     /// 本次执行共调用了几次工具。
     pub tool_calls_count: u32,
     /// Sub-agent 的 session ID（供调试和审计）。
@@ -122,12 +125,12 @@ mod tests {
     #[test]
     fn sub_agent_result_has_cost_field() {
         let r = SubAgentResult {
-            output: "hi".into(),
+            final_answer: "hi".into(),
             tool_calls_count: 1,
             session_id: "s1".into(),
             cost: CostAggregate::default(),
         };
-        assert_eq!(r.output, "hi");
+        assert_eq!(r.final_answer, "hi");
         // CostAggregate 未 impl PartialEq，用 Debug 字符串断言默认值。
         assert_eq!(
             format!("{:?}", r.cost),

@@ -199,16 +199,16 @@ impl Tool for SyncSpawnAgentTool {
 
 /// 格式化 sub-agent 成功结果。
 fn format_sub_agent_result(r: &SubAgentResult) -> String {
-    let output = &r.output;
-    let preview = if output.len() > 200 {
+    let answer = &r.final_answer;
+    let preview = if answer.len() > 200 {
         // char 边界安全截取，避免 panic。
         let mut end = 200;
-        while !output.is_char_boundary(end) {
+        while !answer.is_char_boundary(end) {
             end -= 1;
         }
-        format!("{}...", &output[..end])
+        format!("{}...", &answer[..end])
     } else {
-        output.clone()
+        answer.clone()
     };
     format!("[Sub-agent completed]\n{preview}")
 }

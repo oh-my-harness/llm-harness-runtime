@@ -276,9 +276,9 @@ impl AsyncSpawnHook {
 /// 格式化单条成功结果（设计 §8.1）。
 fn format_success(agent_id: &str, result: &SubAgentResult) -> String {
     format!(
-        "[Sub-agent '{id}' completed]\n{output}\n\nTool calls: {n}\nSession: {sid}",
+        "[Sub-agent '{id}' completed]\n{answer}\n\nTool calls: {n}\nSession: {sid}",
         id = agent_id,
-        output = result.output,
+        answer = result.final_answer,
         n = result.tool_calls_count,
         sid = result.session_id,
     )
@@ -519,10 +519,10 @@ mod tests {
     // helper：建一个会立即完成的 SubAgentHandle。
     fn quick_handle(output: &str) -> SubAgentHandle {
         let abort = tokio_util::sync::CancellationToken::new();
-        let output = output.to_string();
+        let final_answer = output.to_string();
         let join = tokio::spawn(async move {
             Ok(SubAgentResult {
-                output,
+                final_answer,
                 tool_calls_count: 0,
                 session_id: "test-session".into(),
                 cost: CostAggregate::default(),
@@ -542,7 +542,7 @@ mod tests {
         let completion = guard.recv().await.expect("completion received");
         assert_eq!(completion.agent_id, "agent-1");
         let result = completion.result.unwrap();
-        assert_eq!(result.output, "done");
+        assert_eq!(result.final_answer, "done");
     }
 
     #[tokio::test]
@@ -553,7 +553,7 @@ mod tests {
         let join = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             Ok(SubAgentResult {
-                output: "late".into(),
+                final_answer: "late".into(),
                 tool_calls_count: 0,
                 session_id: "s".into(),
                 cost: CostAggregate::default(),
@@ -588,7 +588,7 @@ mod tests {
             .send(AsyncCompletion {
                 agent_id: "x".into(),
                 result: Ok(SubAgentResult {
-                    output: "out".into(),
+                    final_answer: "out".into(),
                     tool_calls_count: 0,
                     session_id: "s".into(),
                     cost: CostAggregate::default(),
@@ -661,7 +661,7 @@ mod tests {
             .send(AsyncCompletion {
                 agent_id: "worker".into(),
                 result: Ok(SubAgentResult {
-                    output: "result text".into(),
+                    final_answer: "result text".into(),
                     tool_calls_count: 3,
                     session_id: "sess-1".into(),
                     cost: CostAggregate::default(),
@@ -739,7 +739,7 @@ mod tests {
                 .send(AsyncCompletion {
                     agent_id: format!("agent-{i}"),
                     result: Ok(SubAgentResult {
-                        output: format!("out-{i}"),
+                        final_answer: format!("out-{i}"),
                         tool_calls_count: i,
                         session_id: format!("s-{i}"),
                         cost: CostAggregate::default(),
@@ -781,7 +781,7 @@ mod tests {
             // on_idle() 提前返回，called 永不递增 → 测试 flaky。
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             Ok(SubAgentResult {
-                output: "done".into(),
+                final_answer: "done".into(),
                 tool_calls_count: 0,
                 session_id: "s".into(),
                 cost: CostAggregate::default(),

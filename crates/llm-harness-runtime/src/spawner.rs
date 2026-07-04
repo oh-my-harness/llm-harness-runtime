@@ -337,13 +337,25 @@ impl HarnessSubAgentSpawner {
 
                 // 事件收集 task（从 mpsc_rx 读取，不受 broadcast Lagged 影响）。
                 let event_task = tokio::spawn(async move {
-                    let mut output = String::new();
+                    // 与 workflow engine 的 run_llm_step 一致：
+                    //   - 优先取最后一个 FinalAnswer message 的文本（覆盖赋值）
+                    //   - 若全程无 FinalAnswer，回退到 TextDelta 拼接（退化路径下保留可见文本）
+                    //   - Progress 消息被忽略
+                    let mut final_answer: Option<String> = None;
+                    let mut text_delta_output = String::new();
                     let mut tool_count = 0u32;
                     while let Some(ev) = mpsc_rx.recv().await {
                         match ev.as_ref() {
-                            AgentHarnessEvent::Agent(AgentEvent::TextDelta { text, .. }) => {
-                                output.push_str(text);
-                            }
+                            AgentHarnessEvent::Agent(ev) => match ev {
+                                AgentEvent::TextDelta { text, .. } => {
+                                    text_delta_output.push_str(text);
+                                }
+                                _ => {
+                                    if let Some((_, _, text)) = ev.as_final_answer() {
+                                        final_answer = Some(text);
+                                    }
+                                }
+                            },
                             AgentHarnessEvent::ToolCallStart { .. } => {
                                 tool_count += 1;
                             }
@@ -354,7 +366,7 @@ impl HarnessSubAgentSpawner {
                             _ => {}
                         }
                     }
-                    (output, tool_count)
+                    (final_answer, text_delta_output, tool_count)
                 });
 
                 if let Err(e) = harness.prompt(&prompt).await {
@@ -371,13 +383,13 @@ impl HarnessSubAgentSpawner {
                 // 因 broadcast Lagged 丢失，这就是 event_task 的唯一退出路径。
                 drop(bridge);
 
-                let (output, tool_calls_count) = event_task
+                let (final_answer, text_delta_output, tool_calls_count) = event_task
                     .await
                     .map_err(|_| AgentError::Internal("event collection task panicked".into()))?;
 
                 let cost = harness.usage();
                 Ok(SubAgentResult {
-                    output,
+                    final_answer: final_answer.unwrap_or(text_delta_output),
                     tool_calls_count,
                     session_id: session_id_clone,
                     cost,
@@ -626,6 +638,55 @@ mod tests {
         }
     }
 
+    // ── EchoPlugin (for multi-turn final_answer test) ──────────────────────────
+
+    struct EchoPlugin;
+
+    impl llm_harness_agent::Plugin for EchoPlugin {
+        fn name(&self) -> &str {
+            "echo-test-plugin"
+        }
+
+        fn register_tools(&self, tools: &mut Vec<Arc<dyn llm_harness_types::Tool>>) {
+            tools.push(Arc::new(EchoTool));
+        }
+    }
+
+    struct EchoTool;
+
+    impl llm_harness_types::Tool for EchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn description(&self) -> &str {
+            "echoes back nothing"
+        }
+
+        fn parameters_schema(&self) -> &serde_json::Value {
+            static SCHEMA: std::sync::LazyLock<serde_json::Value> =
+                std::sync::LazyLock::new(|| serde_json::json!({}));
+            &SCHEMA
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _args: serde_json::Value,
+            _ctx: &'a llm_harness_types::ToolContext,
+        ) -> BoxFuture<
+            'a,
+            std::result::Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>,
+        > {
+            Box::pin(async {
+                Ok(llm_harness_types::ToolResult {
+                    content: vec![],
+                    details: serde_json::Value::Null,
+                    terminate: false,
+                })
+            })
+        }
+    }
+
     // ── NoopEnvFactory ──────────────────────────────────────────────────────────
 
     struct NoopEnvFactory;
@@ -657,6 +718,20 @@ mod tests {
         .env_factory(Arc::new(NoopEnvFactory))
         .session_factory(factory.clone());
         (spawner, factory, client)
+    }
+
+    /// Like `make_spawner` but uses `EchoPlugin` (registers an `echo` tool)
+    /// instead of `NoopPlugin`.
+    fn make_spawner_with_echo(client: Arc<dyn LlmClient>, model: &str) -> HarnessSubAgentSpawner {
+        let dir = tempfile::tempdir().unwrap();
+        HarnessSubAgentSpawner::new(
+            model.to_string(),
+            client,
+            dir.path().to_path_buf(),
+            |_, _, _| Box::new(EchoPlugin),
+        )
+        .env_factory(Arc::new(NoopEnvFactory))
+        .session_factory(Arc::new(CaptureModelSessionFactory::new()))
     }
 
     // ── Tests ──────────────────────────────────────────────────────────────────
@@ -744,9 +819,9 @@ mod tests {
         // join() runs the spawned task to completion.
         let result = handle.join().await.expect("sub-agent should complete");
         assert!(
-            result.output.contains("response from sub-agent"),
-            "output should contain mock response: {}",
-            result.output
+            result.final_answer.contains("response from sub-agent"),
+            "final_answer should contain mock response: {}",
+            result.final_answer
         );
         assert_eq!(result.tool_calls_count, 0);
 
@@ -775,6 +850,59 @@ mod tests {
             user_text.contains("Context:\nrelevant context\n\n---\n\n"),
             "user message should contain context prefix, got: {user_text:?}"
         );
+    }
+
+    /// 多轮场景：第一轮 tool_use（产生 Progress 消息 + 工具调用），
+    /// 第二轮 text（产生 FinalAnswer 消息）。
+    /// 验证 final_answer 只取 FinalAnswer 消息的文本，不混入 Progress 文本。
+    #[tokio::test]
+    async fn final_answer_extracts_last_final_answer_ignoring_progress() {
+        let responses = vec![
+            MockResponse::tool_use("call_1", "echo", "{}"),
+            MockResponse::text("the real answer"),
+        ];
+        let client = Arc::new(MockLlmClient::new(responses));
+        let spawner = make_spawner_with_echo(client, "mock-model");
+
+        let handle = spawner
+            .spawn(SpawnOptions {
+                prompt: "do the thing".into(),
+                provider: ProviderSelection::Inherit,
+                cwd: None,
+                context: ContextMode::None,
+            })
+            .await
+            .expect("spawn should succeed");
+
+        let result = handle.join().await.expect("sub-agent should complete");
+        assert_eq!(result.final_answer, "the real answer");
+        assert_eq!(result.tool_calls_count, 1);
+    }
+
+    /// 无 FinalAnswer 退化路径：stream 直接报错（RateLimit 不可 retry，
+    /// spawner 默认 retry=None → max_retries=0），loop emit Error 退出，
+    /// 全程无 FinalAnswer 消息也无 TextDelta。
+    /// 验证 final_answer 兜底为空字符串而非 panic。
+    #[tokio::test]
+    async fn final_answer_falls_back_to_empty_when_no_final_answer() {
+        let client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::rate_limit_error(),
+        ]));
+        let (spawner, _factory, _) = make_spawner(client, "mock-model");
+
+        let handle = spawner
+            .spawn(SpawnOptions {
+                prompt: "do the thing".into(),
+                provider: ProviderSelection::Inherit,
+                cwd: None,
+                context: ContextMode::None,
+            })
+            .await
+            .expect("spawn should succeed");
+
+        let result = handle.join().await.expect("sub-agent should complete");
+        // 无 FinalAnswer 且无 TextDelta → 兜底为空字符串。
+        assert_eq!(result.final_answer, "");
     }
     // ── Peer / Async spawn tests (Task 9) ───────────────────────────────────────
 

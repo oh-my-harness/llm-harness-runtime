@@ -196,9 +196,9 @@ async fn peer_handoff_a_to_b_and_back() {
     let a_completion = a_completion.expect("A did not complete in time");
     let result = a_completion.result.expect("A should complete successfully");
     assert!(
-        result.output.contains("final: task done by B"),
-        "A's output should contain final result, got: {}",
-        result.output
+        result.final_answer.contains("final: task done by B"),
+        "A's final_answer should contain final result, got: {}",
+        result.final_answer
     );
 
     let _ = b_completion.expect("B did not complete in time");
