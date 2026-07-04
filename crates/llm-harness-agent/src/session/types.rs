@@ -50,15 +50,6 @@ pub enum SessionEntryPayload {
         /// Optional label for this branch point.
         label: Option<String>,
     },
-    /// Records a cursor switch between two branches.
-    BranchSwitch {
-        /// The previous branch's leaf entry ID.
-        from: EntryId,
-        /// The new branch's leaf entry ID.
-        to: EntryId,
-        /// Optional human-provided summary of why this switch occurred.
-        summary: Option<String>,
-    },
     /// AI-generated summary of a branch.
     BranchSummary(BranchSummaryEntry),
 }
@@ -245,8 +236,6 @@ pub enum SessionEntryKind {
     Custom,
     /// A branch point annotation.
     BranchPoint,
-    /// A branch switch record.
-    BranchSwitch,
     /// An AI-generated branch summary.
     BranchSummary,
 }
@@ -266,7 +255,6 @@ impl SessionEntry {
             SessionEntryPayload::SessionInfo { .. } => SessionEntryKind::SessionInfo,
             SessionEntryPayload::Custom { .. } => SessionEntryKind::Custom,
             SessionEntryPayload::BranchPoint { .. } => SessionEntryKind::BranchPoint,
-            SessionEntryPayload::BranchSwitch { .. } => SessionEntryKind::BranchSwitch,
             SessionEntryPayload::BranchSummary(_) => SessionEntryKind::BranchSummary,
         }
     }

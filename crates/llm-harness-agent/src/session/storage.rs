@@ -19,7 +19,8 @@ pub trait SessionStorage: Send + Sync {
     /// Generate a new time-ordered entry ID (sync — no I/O needed).
     fn create_entry_id(&self) -> EntryId;
 
-    /// Append a pre-built entry; advances `active_cursor` to the new entry's ID.
+    /// Append a pre-built entry. Does NOT advance `active_cursor`; the caller
+    /// is responsible for calling `set_active_cursor` afterwards if needed.
     fn append_entry(&self, entry: SessionEntry) -> BoxFuture<'_, Result<(), SessionError>>;
 
     /// Get an entry by ID.

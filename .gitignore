@@ -7,3 +7,4 @@ Cargo.lock
 .DS_Store
 examples/coding-agent/
 docs/superpowers/
+docs/issues

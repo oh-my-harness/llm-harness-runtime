@@ -83,27 +83,13 @@ impl Session {
 
     // ── Branch operations ─────────────────────────────────────────────────
 
-    /// Switch the active cursor to `target` and write a `BranchSwitch` record.
+    /// Switch the active cursor to `target`.
     pub async fn navigate_to(&self, target: EntryId) -> Result<(), SessionError> {
         let current = self.storage.active_cursor().await?;
-        // Only write a BranchSwitch entry if we're actually moving to a different location.
-        if let Some(from) = current
-            && from != target
-        {
-            let switch_id = self.storage.create_entry_id();
-            let entry = SessionEntry {
-                id: switch_id,
-                parent_id: Some(from),
-                timestamp: Utc::now(),
-                payload: SessionEntryPayload::BranchSwitch {
-                    from,
-                    to: target,
-                    summary: None,
-                },
-            };
-            self.storage.append_entry(entry).await?;
+        if current != Some(target) {
+            self.storage.set_active_cursor(target).await?;
         }
-        self.storage.set_active_cursor(target).await
+        Ok(())
     }
 
     /// Fork at `from_entry`: set cursor to that entry and write a `BranchPoint` annotation.
@@ -382,6 +368,9 @@ mod tests {
         }
     }
 
+    /// After BranchSwitch entry removal: root has two real children (A and B),
+    /// both are true leaves — no BranchSwitch pollution inflating or deflating
+    /// the leaf count.
     #[tokio::test]
     async fn list_branches_returns_all_leaves() {
         let session = make_session().await;
@@ -445,5 +434,207 @@ mod tests {
             ctx.messages[0],
             AgentMessage::CompactionSummary(_)
         ));
+    }
+
+    /// Tree shape (via fork_branch, no BranchSwitch orphans):
+    ///   root
+    ///   ├── A_mid → A_leaf
+    ///   └── B_only
+    /// Deleting A_leaf removes A_leaf + A_mid (unique chain), keeps root + B_only.
+    #[tokio::test]
+    async fn delete_branch_removes_only_unique_chain() {
+        let session = make_session().await;
+        let root = session.append_message(user_msg("root")).await.unwrap();
+
+        // Branch A: root → A_mid → A_leaf
+        session.fork_branch(root, None).await.unwrap();
+        let _a_mid = session
+            .append_message(assistant_msg("A mid"))
+            .await
+            .unwrap();
+        let a_leaf = session
+            .append_message(assistant_msg("A leaf"))
+            .await
+            .unwrap();
+
+        // Branch B: root → B_only
+        session.fork_branch(root, None).await.unwrap();
+        let _b_leaf = session
+            .append_message(assistant_msg("B only"))
+            .await
+            .unwrap();
+
+        // Delete A_leaf — A_leaf's parent is A_mid; A_mid has only A_leaf, so continue.
+        // A_mid's parent is root; root has BranchPoint_A + BranchPoint_B (2 > 1), stop.
+        // Deletes: A_leaf + A_mid + BranchPoint_A. Keeps: root, BranchPoint_B, B_only.
+        session.delete_branch(a_leaf).await.unwrap();
+
+        // Active path (cursor on B branch) should be root → BranchPoint_B → B_only.
+        let ctx = session.build_context().await.unwrap();
+        // Active path is root → BranchPoint_B → B_only; BranchPoint is skipped by
+        // build_context, so 2 messages remain.
+        assert_eq!(
+            ctx.messages.len(),
+            2,
+            "root + B_only should remain on active path"
+        );
+    }
+
+    /// Tree shape:
+    ///   root
+    ///   └── A_mid → A_leaf
+    /// Deleting A_leaf walks up through A_mid (only child) to root (no parent),
+    /// deleting the entire chain including root.
+    #[tokio::test]
+    async fn delete_branch_to_root_removes_entire_chain() {
+        let session = make_session().await;
+        let _root = session.append_message(user_msg("root")).await.unwrap();
+        let _a_mid = session
+            .append_message(assistant_msg("A mid"))
+            .await
+            .unwrap();
+        let a_leaf = session
+            .append_message(assistant_msg("A leaf"))
+            .await
+            .unwrap();
+
+        // No siblings anywhere — entire chain root + A_mid + A_leaf is deleted.
+        session.delete_branch(a_leaf).await.unwrap();
+
+        let branches = session.list_branches().await.unwrap();
+        assert!(branches.is_empty(), "no branches should remain");
+
+        let ctx = session.build_context().await.unwrap();
+        assert!(
+            ctx.messages.is_empty(),
+            "context should be empty after deleting the only branch to root"
+        );
+    }
+
+    /// Tree shape (via fork_branch):
+    ///   root
+    ///   ├── BP_A → A_mid → A_leaf
+    ///   └── BP_B → B_only
+    /// Cursor on A_leaf; deleting A_leaf walks up to root (shared ancestor),
+    /// restoring cursor there.
+    #[tokio::test]
+    async fn delete_branch_restores_cursor_to_ancestor() {
+        let session = make_session().await;
+        let root = session.append_message(user_msg("root")).await.unwrap();
+
+        // Branch A: root → BP_A → A_mid → A_leaf
+        session.fork_branch(root, None).await.unwrap();
+        let _a_mid = session
+            .append_message(assistant_msg("A mid"))
+            .await
+            .unwrap();
+        let a_leaf = session
+            .append_message(assistant_msg("A leaf"))
+            .await
+            .unwrap();
+        // cursor is now on a_leaf.
+
+        // Branch B: root → BP_B → B_only (ensures root is a shared ancestor)
+        session.fork_branch(root, None).await.unwrap();
+        let _b_leaf = session
+            .append_message(assistant_msg("B only"))
+            .await
+            .unwrap();
+
+        // Move cursor back to a_leaf, then delete it.
+        session.navigate_to(a_leaf).await.unwrap();
+        session.delete_branch(a_leaf).await.unwrap();
+
+        // delete_branch walks: a_leaf → A_mid (only child) → BP_A (only child)
+        // → root (has BP_A + BP_B, 2 > 1, stop). Deletes a_leaf + A_mid + BP_A.
+        // cursor was on a_leaf (deleted) → restored to root.
+        let ctx = session.build_context().await.unwrap();
+        assert_eq!(
+            ctx.messages.len(),
+            1,
+            "cursor should be at root after deleting branch A"
+        );
+    }
+
+    /// Tree shape:
+    ///   root
+    ///   ├── A_only
+    ///   └── B_only
+    /// Cursor on B_only; deleting A_only should not move the cursor.
+    #[tokio::test]
+    async fn delete_branch_preserves_cursor_when_not_on_deleted() {
+        let session = make_session().await;
+        let root = session.append_message(user_msg("root")).await.unwrap();
+
+        // Branch A (will be deleted)
+        session.navigate_to(root).await.unwrap();
+        let a_leaf = session
+            .append_message(assistant_msg("A"))
+            .await
+            .unwrap();
+
+        // Branch B (active)
+        session.navigate_to(root).await.unwrap();
+        let _b_leaf = session
+            .append_message(assistant_msg("B"))
+            .await
+            .unwrap();
+
+        // cursor is on b_leaf; deleting a_leaf should not move it.
+        session.delete_branch(a_leaf).await.unwrap();
+
+        let ctx = session.build_context().await.unwrap();
+        assert_eq!(ctx.messages.len(), 2, "root + B should remain");
+        let last = ctx.messages.last().unwrap();
+        if let AgentMessage::Assistant(a) = last {
+            let text = a.content.iter().find_map(|c| {
+                if let ContentBlock::Text { text } = c {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            });
+            assert_eq!(text, Some("B"), "cursor should still be on branch B");
+        } else {
+            panic!("expected assistant message");
+        }
+    }
+
+    /// Regression: navigate_to followed by delete_branch must not leave orphan entries.
+    ///
+    /// Before fix: navigate_to wrote a BranchSwitch entry as child of the old leaf.
+    /// delete_branch deleted the old leaf but not the BranchSwitch child, leaving an
+    /// orphan whose parent_id pointed to a deleted entry. list_branches then failed
+    /// with EntryNotFound (jsonl backend) or returned a bogus branch (in-memory).
+    ///
+    /// Tree shape after fix:
+    ///   root
+    ///   ├── A   (deleted)
+    ///   └── B   (survives)
+    #[tokio::test]
+    async fn navigate_then_delete_branch_no_orphan() {
+        let session = make_session().await;
+        let root = session.append_message(user_msg("root")).await.unwrap();
+
+        // Branch A
+        session.navigate_to(root).await.unwrap();
+        let a_leaf = session
+            .append_message(assistant_msg("A"))
+            .await
+            .unwrap();
+
+        // Navigate back to root and create branch B.
+        session.navigate_to(root).await.unwrap();
+        let b_leaf = session
+            .append_message(assistant_msg("B"))
+            .await
+            .unwrap();
+
+        // Delete branch A — must not leave orphan BranchSwitch under A.
+        session.delete_branch(a_leaf).await.unwrap();
+
+        let branches = session.list_branches().await.unwrap();
+        assert_eq!(branches.len(), 1, "only branch B should remain");
+        assert_eq!(branches[0].leaf_id, b_leaf);
     }
 }
