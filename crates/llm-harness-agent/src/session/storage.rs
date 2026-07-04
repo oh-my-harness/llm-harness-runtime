@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use futures::future::BoxFuture;
 use llm_harness_types::{EntryId, SessionError};
 
+use super::tree_ops;
 use super::types::{SessionEntry, SessionEntryKind, SessionMetadata};
 
 // ── SessionStorage trait ───────────────────────────────────────────────────────
@@ -142,31 +143,14 @@ impl SessionStorage for InMemorySessionStorage {
     fn children(&self, parent: EntryId) -> BoxFuture<'_, Result<Vec<SessionEntry>, SessionError>> {
         Box::pin(async move {
             let st = self.inner.lock().unwrap();
-            let ids = st.children.get(&Some(parent)).cloned().unwrap_or_default();
-            let result = ids
-                .iter()
-                .filter_map(|id| st.entries.get(id).cloned())
-                .collect();
-            Ok(result)
+            Ok(tree_ops::children(&st.entries, &st.children, parent))
         })
     }
 
     fn all_leaves(&self) -> BoxFuture<'_, Result<Vec<EntryId>, SessionError>> {
         Box::pin(async move {
             let st = self.inner.lock().unwrap();
-            // A leaf is an entry that has no children.
-            let leaves = st
-                .entries
-                .keys()
-                .filter(|id| {
-                    st.children
-                        .get(&Some(**id))
-                        .map(|v| v.is_empty())
-                        .unwrap_or(true)
-                })
-                .copied()
-                .collect();
-            Ok(leaves)
+            Ok(tree_ops::all_leaves(&st.entries, &st.children))
         })
     }
 
@@ -189,19 +173,7 @@ impl SessionStorage for InMemorySessionStorage {
     ) -> BoxFuture<'_, Result<Vec<SessionEntry>, SessionError>> {
         Box::pin(async move {
             let st = self.inner.lock().unwrap();
-            let mut path = Vec::new();
-            let mut current = Some(target);
-            while let Some(id) = current {
-                match st.entries.get(&id) {
-                    Some(entry) => {
-                        current = entry.parent_id;
-                        path.push(entry.clone());
-                    }
-                    None => return Err(SessionError::EntryNotFound(id)),
-                }
-            }
-            path.reverse(); // root-first
-            Ok(path)
+            tree_ops::path_to_root(&st.entries, target)
         })
     }
 
@@ -212,81 +184,21 @@ impl SessionStorage for InMemorySessionStorage {
     ) -> BoxFuture<'_, Result<Option<EntryId>, SessionError>> {
         Box::pin(async move {
             let st = self.inner.lock().unwrap();
-            // Collect ancestor sets
-            fn ancestors(
-                entries: &HashMap<EntryId, SessionEntry>,
-                start: EntryId,
-            ) -> Result<Vec<EntryId>, SessionError> {
-                let mut v = Vec::new();
-                let mut cur = Some(start);
-                while let Some(id) = cur {
-                    v.push(id);
-                    cur = entries
-                        .get(&id)
-                        .ok_or(SessionError::EntryNotFound(id))?
-                        .parent_id;
-                }
-                Ok(v)
-            }
-            let a_anc = ancestors(&st.entries, a)?;
-            let b_set: std::collections::HashSet<_> = {
-                let b_anc = ancestors(&st.entries, b)?;
-                b_anc.into_iter().collect()
-            };
-            Ok(a_anc.into_iter().find(|id| b_set.contains(id)))
+            tree_ops::common_ancestor(&st.entries, a, b)
         })
     }
 
     fn label_at(&self, id: EntryId) -> BoxFuture<'_, Result<Option<String>, SessionError>> {
         Box::pin(async move {
-            use super::types::SessionEntryPayload;
             let st = self.inner.lock().unwrap();
-            let children = st
-                .children
-                .get(&Some(id))
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            for child_id in children {
-                if let Some(e) = st.entries.get(child_id)
-                    && let SessionEntryPayload::Label { name } = &e.payload
-                {
-                    return Ok(Some(name.clone()));
-                }
-            }
-            Ok(None)
+            Ok(tree_ops::label_at(&st.entries, &st.children, id))
         })
     }
 
     fn paths_to_all_leaves(&self) -> BoxFuture<'_, Result<Vec<Vec<SessionEntry>>, SessionError>> {
         Box::pin(async move {
             let st = self.inner.lock().unwrap();
-            let leaves: Vec<EntryId> = st
-                .entries
-                .keys()
-                .filter(|id| {
-                    st.children
-                        .get(&Some(**id))
-                        .map(|v| v.is_empty())
-                        .unwrap_or(true)
-                })
-                .copied()
-                .collect();
-            let mut result = Vec::with_capacity(leaves.len());
-            for leaf_id in leaves {
-                let mut path = Vec::new();
-                let mut cur = Some(leaf_id);
-                while let Some(id) = cur {
-                    if let Some(e) = st.entries.get(&id) {
-                        path.push(e.clone());
-                        cur = e.parent_id;
-                    } else {
-                        break;
-                    }
-                }
-                path.reverse();
-                result.push(path);
-            }
-            Ok(result)
+            tree_ops::paths_to_all_leaves(&st.entries, &st.children)
         })
     }
 
@@ -296,13 +208,7 @@ impl SessionStorage for InMemorySessionStorage {
     ) -> BoxFuture<'_, Result<Vec<EntryId>, SessionError>> {
         Box::pin(async move {
             let st = self.inner.lock().unwrap();
-            let ids = st
-                .entries
-                .values()
-                .filter(|e| e.kind() == kind)
-                .map(|e| e.id)
-                .collect();
-            Ok(ids)
+            Ok(tree_ops::find_entries_by_type(&st.entries, kind))
         })
     }
 

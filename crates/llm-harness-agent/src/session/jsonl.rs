@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 
 use super::repo::SessionRepo;
 use super::storage::SessionStorage;
+use super::tree_ops;
 use super::types::*;
 
 // ── JsonlSessionStorage ────────────────────────────────────────────────────────
@@ -149,16 +150,7 @@ impl SessionStorage for JsonlSessionStorage {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
             Self::ensure_loaded(&mut inner).await?;
-            let ids = inner
-                .children_map
-                .get(&Some(parent))
-                .cloned()
-                .unwrap_or_default();
-            let result = ids
-                .iter()
-                .filter_map(|id| inner.entry_map.get(id).cloned())
-                .collect();
-            Ok(result)
+            Ok(tree_ops::children(&inner.entry_map, &inner.children_map, parent))
         })
     }
 
@@ -166,19 +158,7 @@ impl SessionStorage for JsonlSessionStorage {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
             Self::ensure_loaded(&mut inner).await?;
-            let leaves = inner
-                .entry_map
-                .keys()
-                .filter(|id| {
-                    inner
-                        .children_map
-                        .get(&Some(**id))
-                        .map(|v| v.is_empty())
-                        .unwrap_or(true)
-                })
-                .copied()
-                .collect();
-            Ok(leaves)
+            Ok(tree_ops::all_leaves(&inner.entry_map, &inner.children_map))
         })
     }
 
@@ -201,19 +181,7 @@ impl SessionStorage for JsonlSessionStorage {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
             Self::ensure_loaded(&mut inner).await?;
-            let mut path = Vec::new();
-            let mut current = Some(target);
-            while let Some(id) = current {
-                match inner.entry_map.get(&id) {
-                    Some(entry) => {
-                        current = entry.parent_id;
-                        path.push(entry.clone());
-                    }
-                    None => return Err(SessionError::EntryNotFound(id)),
-                }
-            }
-            path.reverse();
-            Ok(path)
+            tree_ops::path_to_root(&inner.entry_map, target)
         })
     }
 
@@ -225,25 +193,7 @@ impl SessionStorage for JsonlSessionStorage {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
             Self::ensure_loaded(&mut inner).await?;
-            fn ancestors(
-                map: &HashMap<EntryId, SessionEntry>,
-                start: EntryId,
-            ) -> Result<Vec<EntryId>, SessionError> {
-                let mut v = Vec::new();
-                let mut cur = Some(start);
-                while let Some(id) = cur {
-                    v.push(id);
-                    cur = map
-                        .get(&id)
-                        .ok_or(SessionError::EntryNotFound(id))?
-                        .parent_id;
-                }
-                Ok(v)
-            }
-            let a_anc = ancestors(&inner.entry_map, a)?;
-            let b_set: std::collections::HashSet<_> =
-                ancestors(&inner.entry_map, b)?.into_iter().collect();
-            Ok(a_anc.into_iter().find(|id| b_set.contains(id)))
+            tree_ops::common_ancestor(&inner.entry_map, a, b)
         })
     }
 
@@ -251,19 +201,7 @@ impl SessionStorage for JsonlSessionStorage {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
             Self::ensure_loaded(&mut inner).await?;
-            let children = inner
-                .children_map
-                .get(&Some(id))
-                .map(|v| v.as_slice())
-                .unwrap_or(&[]);
-            for child_id in children {
-                if let Some(e) = inner.entry_map.get(child_id)
-                    && let SessionEntryPayload::Label { name } = &e.payload
-                {
-                    return Ok(Some(name.clone()));
-                }
-            }
-            Ok(None)
+            Ok(tree_ops::label_at(&inner.entry_map, &inner.children_map, id))
         })
     }
 
@@ -271,35 +209,7 @@ impl SessionStorage for JsonlSessionStorage {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
             Self::ensure_loaded(&mut inner).await?;
-            let leaves: Vec<EntryId> = inner
-                .entry_map
-                .keys()
-                .filter(|id| {
-                    inner
-                        .children_map
-                        .get(&Some(**id))
-                        .map(|v| v.is_empty())
-                        .unwrap_or(true)
-                })
-                .copied()
-                .collect();
-            let mut result = Vec::with_capacity(leaves.len());
-            for leaf_id in leaves {
-                let mut path = Vec::new();
-                let mut current = Some(leaf_id);
-                while let Some(id) = current {
-                    match inner.entry_map.get(&id) {
-                        Some(e) => {
-                            path.push(e.clone());
-                            current = e.parent_id;
-                        }
-                        None => return Err(SessionError::EntryNotFound(id)),
-                    }
-                }
-                path.reverse();
-                result.push(path);
-            }
-            Ok(result)
+            tree_ops::paths_to_all_leaves(&inner.entry_map, &inner.children_map)
         })
     }
 
@@ -310,12 +220,7 @@ impl SessionStorage for JsonlSessionStorage {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
             Self::ensure_loaded(&mut inner).await?;
-            Ok(inner
-                .entry_map
-                .values()
-                .filter(|e| e.kind() == kind)
-                .map(|e| e.id)
-                .collect())
+            Ok(tree_ops::find_entries_by_type(&inner.entry_map, kind))
         })
     }
 
