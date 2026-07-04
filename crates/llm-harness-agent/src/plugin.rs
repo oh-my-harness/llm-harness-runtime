@@ -63,8 +63,9 @@ use llm_harness_types::Tool;
 pub trait Plugin: Send + Sync {
     /// Unique identifier for this plugin (e.g., `"auth-google"`, `"tool-web-search"`).
     ///
-    /// Used for logging and diagnostics. Must be unique across all plugins
-    /// loaded in a single harness.
+    /// Used for logging and diagnostics. Should be unique across all plugins
+    /// loaded in a single harness; duplicates are accepted but may cause
+    /// confusion in diagnostics.
     fn name(&self) -> &str;
 
     /// Register tools to be available in this harness.
