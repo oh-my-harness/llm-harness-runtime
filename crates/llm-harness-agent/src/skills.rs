@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -161,6 +161,7 @@ pub async fn load_sourced_skills(
 ) -> (Vec<SourcedSkill>, Vec<SkillDiagnostic>) {
     let mut skills = Vec::new();
     let mut diags = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
     for (tag, dir) in dirs {
         let abort = CancellationToken::new();
@@ -195,10 +196,22 @@ pub async fn load_sourced_skills(
                 }
             };
             match parse_skill_file(&skill_file, &content, &entry.path) {
-                Ok(skill) => skills.push(SourcedSkill {
-                    skill,
-                    source_tag: tag.clone(),
-                }),
+                Ok(skill) => {
+                    if !seen.insert(skill.name.clone()) {
+                        diags.push(SkillDiagnostic {
+                            source: skill_file.clone(),
+                            level: DiagnosticLevel::Warn,
+                            message: format!(
+                                "duplicate skill name '{}' (already loaded); both kept, invocation matches first",
+                                skill.name
+                            ),
+                        });
+                    }
+                    skills.push(SourcedSkill {
+                        skill,
+                        source_tag: tag.clone(),
+                    })
+                }
                 Err(msg) => diags.push(SkillDiagnostic {
                     source: skill_file,
                     level: DiagnosticLevel::Warn,
@@ -268,6 +281,7 @@ pub async fn load_prompt_templates(
 ) -> (Vec<PromptTemplate>, Vec<SkillDiagnostic>) {
     let mut templates = Vec::new();
     let mut diags = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
 
     for dir in dirs {
         let abort = CancellationToken::new();
@@ -330,6 +344,16 @@ pub async fn load_prompt_templates(
                 description
             };
 
+            if !seen.insert(name.clone()) {
+                diags.push(SkillDiagnostic {
+                    source: path.clone(),
+                    level: DiagnosticLevel::Warn,
+                    message: format!(
+                        "duplicate template name '{}' (already loaded); both kept, invocation matches first",
+                        name
+                    ),
+                });
+            }
             templates.push(PromptTemplate {
                 name,
                 description,
@@ -796,5 +820,57 @@ mod tests {
         let (fields, body) = parse_frontmatter(text);
         assert!(fields.is_empty());
         assert_eq!(body, "just body\nsecond line\n");
+    }
+
+    #[tokio::test]
+    async fn load_skills_duplicate_name_produces_diagnostic() {
+        let tmp = TempDir::new().unwrap();
+        // Two skill dirs with the same frontmatter name.
+        for dir_name in ["dup-skill-a", "dup-skill-b"] {
+            let skill_dir = tmp.path().join(dir_name);
+            std::fs::create_dir(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: shared-name\ndescription: dup test\n---\nBody.",
+            )
+            .unwrap();
+        }
+
+        let env = OsEnv::new(tmp.path());
+        let (skills, diags) = load_skills(&env, &[tmp.path().to_path_buf()]).await;
+        // Both kept (no dedup).
+        assert_eq!(skills.len(), 2);
+        assert!(skills.iter().all(|s| s.name == "shared-name"));
+        // One warn diagnostic for the duplicate.
+        let dup_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("duplicate skill name 'shared-name'"))
+            .collect();
+        assert_eq!(dup_diags.len(), 1, "expected one duplicate diagnostic, got: {diags:?}");
+    }
+
+    #[tokio::test]
+    async fn load_prompt_templates_duplicate_name_produces_diagnostic() {
+        let tmp = TempDir::new().unwrap();
+        // Two .md files with the same stem (different dirs to avoid FS collision).
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        std::fs::create_dir(&dir_a).unwrap();
+        std::fs::create_dir(&dir_b).unwrap();
+        std::fs::write(dir_a.join("shared.md"), "Template A body").unwrap();
+        std::fs::write(dir_b.join("shared.md"), "Template B body").unwrap();
+
+        let env = OsEnv::new(tmp.path());
+        let (templates, diags) =
+            load_prompt_templates(&env, &[dir_a.clone(), dir_b.clone()]).await;
+        // Both kept (no dedup).
+        assert_eq!(templates.len(), 2);
+        assert!(templates.iter().all(|t| t.name == "shared"));
+        // One warn diagnostic for the duplicate.
+        let dup_diags: Vec<_> = diags
+            .iter()
+            .filter(|d| d.message.contains("duplicate template name 'shared'"))
+            .collect();
+        assert_eq!(dup_diags.len(), 1, "expected one duplicate diagnostic, got: {diags:?}");
     }
 }
