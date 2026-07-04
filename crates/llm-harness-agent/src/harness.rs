@@ -873,6 +873,30 @@ impl AgentHarness {
         inner.max_tokens = max_tokens;
     }
 
+    /// Override tokens to reserve for the LLM response during compaction.
+    /// Takes effect at the next `compact()` call. `None` clears the
+    /// override, falling back to the built-in default (16,384) at the next
+    /// `compact()` call — not the `AgentHarnessOptions` initial value.
+    ///
+    /// Note: this change is NOT persisted to the session log. On session
+    /// restore the value reverts to the initial option.
+    pub fn set_compaction_reserve_tokens(&self, tokens: Option<u32>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.compaction_reserve_tokens = tokens;
+    }
+
+    /// Override how many recent context tokens to always preserve during
+    /// compaction. Takes effect at the next `compact()` call. `None` clears
+    /// the override, falling back to the built-in default (20,000) at the
+    /// next `compact()` call — not the `AgentHarnessOptions` initial value.
+    ///
+    /// Note: this change is NOT persisted to the session log. On session
+    /// restore the value reverts to the initial option.
+    pub fn set_compaction_keep_recent_tokens(&self, tokens: Option<u32>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.compaction_keep_recent_tokens = tokens;
+    }
+
     /// Replace the registered tool list.
     pub async fn set_tools(&self, tools: Vec<Arc<dyn Tool>>) -> Result<(), HarnessError> {
         let (added, removed, pending) = {
@@ -3025,6 +3049,56 @@ mod tests {
         assert!(
             !h.state().tools_overwritten_mid_run,
             "flag must be reset after storage-error rollback"
+        );
+    }
+
+    /// `set_compaction_reserve_tokens` / `set_compaction_keep_recent_tokens`
+    /// must take effect at the next `compact()` call: with a large context
+    /// window and default reserve, compaction does not trigger; raising
+    /// reserve_tokens via the setter lowers the threshold so the same
+    /// session becomes compactable.
+    #[tokio::test]
+    async fn set_compaction_params_enables_early_compact() {
+        // Two prompt responses + one compaction summary.
+        let client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+            MockResponse::text("compacted summary"),
+        ]));
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        // Large context window + default reserve → threshold too high to trigger.
+        // estimated_tokens for "hi"+"response1"+"yo"+"response2" ≈ 2; default
+        // threshold = 200_000 - 16_384 = 183_616 ≫ 2.
+        opts.model_info = Some(ModelInfo {
+            context_window: 200_000,
+            max_tokens: 8192,
+        });
+        let h =
+            AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await;
+
+        // Two prompts → 4 entries (user, assistant, user, assistant).
+        h.prompt("hi").await.unwrap();
+        h.prompt("yo").await.unwrap();
+
+        // Default threshold: compaction must NOT trigger.
+        let err = h.compact().await.unwrap_err();
+        assert!(
+            matches!(err, HarnessError::Compaction(CompactionError::InsufficientTokens)),
+            "expected InsufficientTokens with default threshold, got: {err:?}"
+        );
+
+        // Raise reserve_tokens so threshold drops to 0. estimated_tokens = 1
+        // (user "hi" = 1 token; assistant usage.output_tokens = 0 via MockResponse::text).
+        // threshold = 200_000 - 200_000 = 0 < 1 → triggers.
+        h.set_compaction_reserve_tokens(Some(200_000));
+        // keep_recent_tokens = 0 so the cut-point scan can find a boundary.
+        h.set_compaction_keep_recent_tokens(Some(0));
+
+        let stats = h.compact().await.expect("compaction must trigger after lowering threshold");
+        assert!(
+            stats.compressed_entries > 0,
+            "expected at least one entry compressed, got stats: {stats:?}"
         );
     }
 }
