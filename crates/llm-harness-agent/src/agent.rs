@@ -42,6 +42,8 @@ pub struct AgentState {
     pub model_info: Option<ModelInfo>,
     /// Reasoning depth level.
     pub thinking_level: ThinkingLevel,
+    /// 采样温度；`None` 表示走 provider 默认。
+    pub temperature: Option<f32>,
     /// Active tool list.
     pub tools: Vec<Arc<dyn Tool>>,
     /// Final-answer classification mode.
@@ -99,6 +101,8 @@ pub struct AgentOptions {
     pub model_info: Option<ModelInfo>,
     /// Initial thinking level.
     pub thinking_level: ThinkingLevel,
+    /// Initial sampling temperature; `None` uses provider default.
+    pub temperature: Option<f32>,
     /// Initial tools.
     pub tools: Vec<Arc<dyn Tool>>,
     /// Final-answer classification mode.
@@ -117,6 +121,7 @@ impl AgentOptions {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             model_info: None,
             thinking_level: ThinkingLevel::Off,
+            temperature: None,
             tools: vec![],
             final_answer_mode: FinalAnswerMode::default(),
             system_prompt: None,
@@ -171,6 +176,7 @@ impl Agent {
             model: opts.model,
             model_info: opts.model_info,
             thinking_level: opts.thinking_level,
+            temperature: opts.temperature,
             tools: opts.tools,
             final_answer_mode: opts.final_answer_mode,
             messages: vec![],
@@ -251,6 +257,15 @@ impl Agent {
     pub fn set_thinking_level(&self, level: ThinkingLevel) {
         let mut inner = self.inner.lock().unwrap();
         inner.state.thinking_level = level;
+    }
+
+    /// Set the sampling temperature; takes effect at the start of the next turn.
+    ///
+    /// Note: this change is NOT persisted to the session log. On session restore
+    /// the temperature reverts to the `AgentOptions.temperature` initial value.
+    pub fn set_temperature(&self, temperature: Option<f32>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.state.temperature = temperature;
     }
 
     /// Replace the active tool list; takes effect at the start of the next turn.
@@ -402,6 +417,7 @@ impl Agent {
             let snapshot = TurnSnapshot {
                 model: inner.state.model.clone(),
                 thinking_level: inner.state.thinking_level,
+                temperature: inner.state.temperature,
                 tools: inner.state.tools.clone(),
                 system_prompt: inner.state.system_prompt.clone(),
             };
@@ -416,7 +432,7 @@ impl Agent {
             let config = LoopConfig {
                 model: snapshot.model,
                 max_tokens,
-                temperature: None,
+                temperature: snapshot.temperature,
                 thinking_level: snapshot.thinking_level,
                 tools: snapshot.tools,
                 active_tools: None,

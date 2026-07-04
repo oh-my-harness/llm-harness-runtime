@@ -22,6 +22,8 @@ pub struct TurnSnapshot {
     pub model: String,
     /// 推理深度级别。
     pub thinking_level: ThinkingLevel,
+    /// 采样温度；`None` 表示走 provider 默认。
+    pub temperature: Option<f32>,
     /// 本 turn 激活的工具列表。
     pub tools: Vec<Arc<dyn Tool>>,
     /// 系统提示。

@@ -39,6 +39,9 @@ pub struct NextTurnDirective {
     pub model: Option<String>,
     /// 替换下一轮的推理深度；`None` 表示沿用当前级别。
     pub thinking_level: Option<crate::ThinkingLevel>,
+    /// 替换下一轮的采样温度；`None` 表示沿用当前值。
+    /// `Some(None)` 表示清除温度（走 provider 默认），`Some(Some(t))` 表示设为 `t`。
+    pub temperature: Option<Option<f32>>,
     /// 替换全部工具列表；`None` 表示沿用当前工具列表。
     pub tools: Option<Vec<Arc<dyn Tool>>>,
     /// 仅控制激活工具子集（在当前或已替换的全集中过滤）；`None` 表示激活全部。

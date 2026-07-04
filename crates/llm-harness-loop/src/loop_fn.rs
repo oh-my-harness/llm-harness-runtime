@@ -129,6 +129,9 @@ fn apply_next_turn_directive(
     if let Some(level) = directive.thinking_level {
         config.thinking_level = level;
     }
+    if let Some(temp) = directive.temperature {
+        config.temperature = temp;
+    }
     if let Some(tools) = directive.tools {
         config.tools = tools;
     }
@@ -806,6 +809,7 @@ mod tests {
                 context: None,
                 model: None,
                 thinking_level: None,
+                temperature: None,
                 tools: None,
                 active_tools: None,
             },
@@ -815,6 +819,90 @@ mod tests {
         let subset = active_tool_subset(&cfg.tools, &active).unwrap();
         assert!(active.is_none());
         assert_eq!(subset.len(), 2);
+    }
+
+    #[test]
+    fn directive_temperature_none_preserves_current() {
+        let mut cfg = make_config(vec![]).1;
+        cfg.temperature = Some(0.7);
+        let mut ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        let mut active = None;
+
+        apply_next_turn_directive(
+            &mut ctx,
+            &mut cfg,
+            &mut active,
+            NextTurnDirective {
+                context: None,
+                model: None,
+                thinking_level: None,
+                temperature: None,
+                tools: None,
+                active_tools: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cfg.temperature, Some(0.7), "None directive must preserve current");
+    }
+
+    #[test]
+    fn directive_temperature_some_none_clears() {
+        let mut cfg = make_config(vec![]).1;
+        cfg.temperature = Some(0.7);
+        let mut ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        let mut active = None;
+
+        apply_next_turn_directive(
+            &mut ctx,
+            &mut cfg,
+            &mut active,
+            NextTurnDirective {
+                context: None,
+                model: None,
+                thinking_level: None,
+                temperature: Some(None),
+                tools: None,
+                active_tools: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cfg.temperature, None, "Some(None) must clear temperature");
+    }
+
+    #[test]
+    fn directive_temperature_some_some_sets_value() {
+        let mut cfg = make_config(vec![]).1;
+        cfg.temperature = None;
+        let mut ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        let mut active = None;
+
+        apply_next_turn_directive(
+            &mut ctx,
+            &mut cfg,
+            &mut active,
+            NextTurnDirective {
+                context: None,
+                model: None,
+                thinking_level: None,
+                temperature: Some(Some(0.3)),
+                tools: None,
+                active_tools: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cfg.temperature, Some(0.3), "Some(Some(0.3)) must set value");
     }
 
     #[tokio::test]

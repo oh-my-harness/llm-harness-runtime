@@ -61,6 +61,7 @@ impl PrepareNextTurnHook for WorkflowGateHook {
                 context: None,
                 model: None,
                 thinking_level: None,
+                temperature: None,
                 tools: None,
                 active_tools: Some(active),
             };

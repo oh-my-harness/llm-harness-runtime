@@ -297,6 +297,7 @@ impl PrepareNextTurnHook for CompositePrepareNextTurnHook {
                 context: None,
                 model: None,
                 thinking_level: None,
+                temperature: None,
                 tools: None,
                 active_tools: None,
             };
@@ -317,6 +318,9 @@ impl PrepareNextTurnHook for CompositePrepareNextTurnHook {
                 }
                 if result.thinking_level.is_some() {
                     directive.thinking_level = result.thinking_level;
+                }
+                if result.temperature.is_some() {
+                    directive.temperature = result.temperature;
                 }
                 if result.tools.is_some() {
                     directive.tools = result.tools;

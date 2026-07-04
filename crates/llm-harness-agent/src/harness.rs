@@ -43,6 +43,8 @@ pub struct HarnessState {
     pub model_info: Option<ModelInfo>,
     /// Reasoning depth level.
     pub thinking_level: ThinkingLevel,
+    /// 采样温度；`None` 表示走 provider 默认。
+    pub temperature: Option<f32>,
     /// Full registered tool list.
     pub tools: Vec<Arc<dyn Tool>>,
     /// Active tool subset; `None` means all tools are active.
@@ -391,6 +393,8 @@ pub struct AgentHarnessOptions {
     pub model_info: Option<ModelInfo>,
     /// Initial thinking level.
     pub thinking_level: ThinkingLevel,
+    /// Initial sampling temperature; `None` uses provider default.
+    pub temperature: Option<f32>,
     /// Initial tools.
     pub tools: Vec<Arc<dyn Tool>>,
     /// Final-answer classification mode.
@@ -436,6 +440,7 @@ impl AgentHarnessOptions {
             model: model.into(),
             model_info: None,
             thinking_level: ThinkingLevel::Off,
+            temperature: None,
             tools: vec![],
             final_answer_mode: FinalAnswerMode::default(),
             system_prompt: None,
@@ -472,12 +477,13 @@ impl PrepareNextTurnHook for DefaultPrepareNextTurn {
     ) -> futures::future::BoxFuture<'a, Result<NextTurnDirective, AgentError>> {
         Box::pin(async move {
             // Short lock: read current config, then release immediately.
-            let (model, thinking_level, tools, active_tools) = {
+            let (model, thinking_level, temperature, tools, active_tools) = {
                 let g = self.inner.lock().unwrap();
                 let st = &g.state;
                 (
                     st.model.clone(),
                     st.thinking_level,
+                    st.temperature,
                     st.tools.clone(),
                     st.active_tools.clone(),
                 )
@@ -487,6 +493,7 @@ impl PrepareNextTurnHook for DefaultPrepareNextTurn {
                 context: None,
                 model: Some(model),
                 thinking_level: Some(thinking_level),
+                temperature: Some(temperature),
                 tools: Some(tools),
                 active_tools,
             };
@@ -502,6 +509,9 @@ impl PrepareNextTurnHook for DefaultPrepareNextTurn {
                 }
                 if user.thinking_level.is_some() {
                     directive.thinking_level = user.thinking_level;
+                }
+                if user.temperature.is_some() {
+                    directive.temperature = user.temperature;
                 }
                 if user.tools.is_some() {
                     directive.tools = user.tools;
@@ -574,6 +584,7 @@ impl AgentHarness {
             model: opts.model,
             model_info: opts.model_info,
             thinking_level: opts.thinking_level,
+            temperature: opts.temperature,
             tools: opts.tools,
             active_tools: None,
             final_answer_mode: opts.final_answer_mode,
@@ -822,6 +833,18 @@ impl AgentHarness {
             from: old,
             to: level,
         });
+        Ok(())
+    }
+
+    /// Set the sampling temperature; takes effect at the start of the next turn.
+    ///
+    /// Note: unlike `set_thinking_level`, this change is NOT persisted to the
+    /// session log. On session restore the temperature reverts to the
+    /// `AgentHarnessOptions.temperature` initial value.
+    pub async fn set_temperature(&self, temperature: Option<f32>) -> Result<(), HarnessError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.state.temperature = temperature;
+        drop(inner);
         Ok(())
     }
 
@@ -1430,7 +1453,7 @@ impl AgentHarness {
         abort: CancellationToken,
     ) -> LoopConfig {
         // ── Snapshot state (lock is held via `inner` until `drop(inner)`) ──
-        let (tools, retry, model, thinking_level, active_tools, final_answer_mode, max_tokens) = {
+        let (tools, retry, model, thinking_level, temperature, active_tools, final_answer_mode, max_tokens) = {
             let inner = self.inner.lock().unwrap();
             let st = &inner.state;
             (
@@ -1438,6 +1461,7 @@ impl AgentHarness {
                 inner.retry.clone(),
                 st.model.clone(),
                 st.thinking_level,
+                st.temperature,
                 st.active_tools.clone(),
                 st.final_answer_mode.clone(),
                 inner.max_tokens,
@@ -1491,7 +1515,7 @@ impl AgentHarness {
         LoopConfig {
             model,
             max_tokens,
-            temperature: None,
+            temperature,
             thinking_level,
             tools,
             active_tools,
@@ -1627,6 +1651,7 @@ impl AgentHarness {
                             TurnSnapshot {
                                 model: inner.state.model.clone(),
                                 thinking_level: inner.state.thinking_level,
+                                temperature: inner.state.temperature,
                                 tools: inner.state.tools.clone(),
                                 system_prompt: inner.state.system_prompt.clone(),
                             }
