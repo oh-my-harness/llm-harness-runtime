@@ -782,6 +782,38 @@ impl AgentHarness {
         });
         Ok(())
     }
+    /// Append skills to the existing skill list without replacing it.
+    ///
+    /// Unlike `reload_resources`, this does not load from directories —
+    /// the caller provides already-loaded `Skill` values. Useful for
+    /// merging skills from multiple sources (directories, MCP, plugins)
+    /// at runtime.
+    pub fn add_skills(&self, skills: Vec<Skill>) {
+        let (skill_count, template_count) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.skills.extend(skills);
+            (inner.skills.len(), inner.templates.len())
+        };
+        self.emit(AgentHarnessEvent::ResourcesUpdate {
+            skills: skill_count,
+            templates: template_count,
+            diagnostics: vec![],
+        });
+    }
+
+    /// Append prompt templates to the existing list without replacing it.
+    pub fn add_templates(&self, templates: Vec<PromptTemplate>) {
+        let (skill_count, template_count) = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.templates.extend(templates);
+            (inner.skills.len(), inner.templates.len())
+        };
+        self.emit(AgentHarnessEvent::ResourcesUpdate {
+            skills: skill_count,
+            templates: template_count,
+            diagnostics: vec![],
+        });
+    }
 
     // ── Runtime configuration (any phase) ─────────────────────────────────
 
@@ -3313,12 +3345,62 @@ mod tests {
         opts.queue_capacity = 0;
         let _ = AgentHarness::with_session(client, env, session, opts);
     }
+
+    fn make_skill(name: &str, desc: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            label: None,
+            description: desc.to_string(),
+            content: format!("{name} body"),
+            source: std::path::PathBuf::from(format!("/skills/{name}/SKILL.md")),
+            disable_model_invocation: false,
+        }
+    }
+
+    #[test]
+    fn add_skills_appends_without_replacing() {
+        let h = make_harness(vec![]);
+        assert_eq!(h.skills().len(), 0);
+
+        h.add_skills(vec![make_skill("skill-a", "Does A")]);
+        assert_eq!(h.skills().len(), 1);
+        assert_eq!(h.skills()[0].name, "skill-a");
+
+        h.add_skills(vec![make_skill("skill-b", "Does B")]);
+        assert_eq!(h.skills().len(), 2);
+        assert_eq!(h.skills()[0].name, "skill-a");
+        assert_eq!(h.skills()[1].name, "skill-b");
+    }
+
+    #[test]
+    fn add_templates_appends_without_replacing() {
+        let h = make_harness(vec![]);
+        assert_eq!(h.templates().len(), 0);
+
+        h.add_templates(vec![PromptTemplate {
+            name: "tmpl-a".into(),
+            description: "Template A".into(),
+            content: "A $1".into(),
+            source: std::path::PathBuf::from("/templates/a.md"),
+        }]);
+        assert_eq!(h.templates().len(), 1);
+        assert_eq!(h.templates()[0].name, "tmpl-a");
+
+        h.add_templates(vec![PromptTemplate {
+            name: "tmpl-b".into(),
+            description: "Template B".into(),
+            content: "B $1".into(),
+            source: std::path::PathBuf::from("/templates/b.md"),
+        }]);
+        assert_eq!(h.templates().len(), 2);
+        assert_eq!(h.templates()[0].name, "tmpl-a");
+        assert_eq!(h.templates()[1].name, "tmpl-b");
+    }
 }
 
 #[cfg(test)]
 mod cost_state_tests {
     use super::*;
-
     #[test]
     fn usage_returns_default_when_no_accumulation() {
         // 用默认 cost 构造 options。
