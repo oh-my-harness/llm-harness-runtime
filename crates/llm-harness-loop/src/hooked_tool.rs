@@ -30,6 +30,9 @@ impl Tool for HookedTool {
     fn name(&self) -> &str {
         self.inner.name()
     }
+    fn level(&self) -> ToolLevel {
+        self.inner.level()
+    }
     fn description(&self) -> &str {
         self.inner.description()
     }

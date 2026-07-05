@@ -12,8 +12,8 @@ use llm_harness_agent::{
 };
 use llm_harness_loop::LlmClient;
 use llm_harness_types::{
-    AgentError, AgentEvent, ContentBlock, Tool, ToolContext, ToolError, ToolExecutionMode,
-    ToolResult,
+    AgentError, AgentEvent, ContentBlock, SUBMIT_STEP_RESULT_TOOL_NAME, SYNC_SPAWN_TOOL_NAME, Tool,
+    ToolContext, ToolError, ToolExecutionMode, ToolLevel, ToolResult,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -32,12 +32,6 @@ use crate::workflow::model::{
 };
 use crate::workflow::plan::validate_workflow;
 use anyhow::Result;
-
-/// 内置 tool 名：让 step agent 提交结构化结果。
-pub const SUBMIT_STEP_RESULT_TOOL_NAME: &str = "submit_step_result";
-
-/// 内置 tool 名：同步派发 sub-agent。
-pub const SYNC_SPAWN_TOOL_NAME: &str = "spawn_agent";
 
 /// broadcast channel 容量。步骤级事件频率低，overflow 时丢弃旧事件（比阻塞 run 好）。
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -111,6 +105,10 @@ impl Tool for SyncSpawnAgentTool {
         SYNC_SPAWN_TOOL_NAME
     }
 
+    fn level(&self) -> ToolLevel {
+        ToolLevel::BuiltIn
+    }
+
     fn description(&self) -> &str {
         "派发一个 sub-agent 处理子任务，同步等待结果。结果作为 tool 结果返回。"
     }
@@ -137,7 +135,7 @@ impl Tool for SyncSpawnAgentTool {
                 .to_string();
             if prompt.len() > SYNC_SPAWN_MAX_PROMPT_BYTES {
                 return Err(ToolError::Execution(format!(
-                    "spawn_agent: prompt exceeds {} bytes",
+                    "{SYNC_SPAWN_TOOL_NAME}: prompt exceeds {} bytes",
                     SYNC_SPAWN_MAX_PROMPT_BYTES
                 )));
             }
@@ -196,6 +194,8 @@ impl Tool for SyncSpawnAgentTool {
         })
     }
 }
+
+llm_harness_types::assert_builtin_registered!(SyncSpawnAgentTool => SYNC_SPAWN_TOOL_NAME);
 
 /// 格式化 sub-agent 成功结果。
 fn format_sub_agent_result(r: &SubAgentResult) -> String {
@@ -277,6 +277,10 @@ impl Tool for SubmitStepResultTool {
     fn name(&self) -> &str {
         SUBMIT_STEP_RESULT_TOOL_NAME
     }
+
+    fn level(&self) -> ToolLevel {
+        ToolLevel::BuiltIn
+    }
     fn description(&self) -> &str {
         "提交本步的结构化结果（JSON）。judge 会直接读此结果做跳转决策。"
     }
@@ -319,6 +323,8 @@ impl Tool for SubmitStepResultTool {
         })
     }
 }
+
+llm_harness_types::assert_builtin_registered!(SubmitStepResultTool => SUBMIT_STEP_RESULT_TOOL_NAME);
 
 /// 格式化 step_history 摘要，供步骤间上下文注入。
 const STEP_HISTORY_OUTPUT_PREVIEW_CHARS: usize = 1_000;

@@ -92,7 +92,9 @@ pub enum HarnessBuildError {
     /// No LLM provider was registered.
     #[error("No LLM provider registered")]
     NoProvider,
-
+    /// A business tool uses a framework-reserved name.
+    #[error("tool name conflict: {0}")]
+    ToolNameConflict(String),
     /// No registered provider matches the specified model.
     #[error("No provider matches model: {model}")]
     NoMatchingProvider { model: String },
@@ -430,6 +432,9 @@ impl HarnessBuilder {
         let client = self.resolve_provider(&self.model)?;
         let compaction = self.resolve_compaction()?;
         let opts = self.build_options(compaction);
+        // Check tool name conflicts before returning opts to the caller.
+        llm_harness_types::check_tool_name_conflicts(&opts.tools)
+            .map_err(HarnessBuildError::ToolNameConflict)?;
         Ok((client, opts))
     }
 

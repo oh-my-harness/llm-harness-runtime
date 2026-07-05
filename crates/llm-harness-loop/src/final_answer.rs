@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
+use llm_harness_types::{ContentBlock, Tool, ToolContext, ToolError, ToolLevel, ToolResult};
+
 use futures::future::BoxFuture;
-use llm_harness_types::{ContentBlock, Tool, ToolContext, ToolError, ToolResult};
 
 /// Default built-in tool name for opt-in final-answer delivery.
-pub const DEFAULT_FINAL_ANSWER_TOOL_NAME: &str = "final_answer";
+pub const DEFAULT_FINAL_ANSWER_TOOL_NAME: &str = llm_harness_types::FINAL_ANSWER_TOOL_NAME;
 
 /// Controls how the loop identifies durable final answers.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -31,7 +32,6 @@ impl FinalAnswerMode {
     pub fn tool_with_text_fallback() -> Self {
         Self::Tool(FinalAnswerToolConfig {
             missing_behavior: FinalAnswerMissingBehavior::FallbackToText,
-            ..FinalAnswerToolConfig::default()
         })
     }
 }
@@ -39,8 +39,6 @@ impl FinalAnswerMode {
 /// Built-in final-answer tool configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalAnswerToolConfig {
-    /// Tool name exposed to the provider.
-    pub name: String,
     /// Behavior when the model stops without calling the final-answer tool.
     pub missing_behavior: FinalAnswerMissingBehavior,
 }
@@ -48,18 +46,7 @@ pub struct FinalAnswerToolConfig {
 impl Default for FinalAnswerToolConfig {
     fn default() -> Self {
         Self {
-            name: DEFAULT_FINAL_ANSWER_TOOL_NAME.to_string(),
             missing_behavior: FinalAnswerMissingBehavior::Error,
-        }
-    }
-}
-
-impl FinalAnswerToolConfig {
-    /// Create a strict final-answer tool contract with a custom tool name.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            ..Self::default()
         }
     }
 }
@@ -74,7 +61,7 @@ pub enum FinalAnswerMissingBehavior {
     FallbackToText,
 }
 
-pub(crate) fn builtin_final_answer_tool(cfg: &FinalAnswerToolConfig) -> Arc<dyn Tool> {
+pub(crate) fn builtin_final_answer_tool() -> Arc<dyn Tool> {
     static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
     let schema = SCHEMA.get_or_init(|| {
         serde_json::json!({
@@ -89,20 +76,19 @@ pub(crate) fn builtin_final_answer_tool(cfg: &FinalAnswerToolConfig) -> Arc<dyn 
             "additionalProperties": false
         })
     });
-    Arc::new(BuiltinFinalAnswerTool {
-        name: cfg.name.clone(),
-        schema,
-    })
+    Arc::new(BuiltinFinalAnswerTool { schema })
 }
 
 struct BuiltinFinalAnswerTool {
-    name: String,
     schema: &'static serde_json::Value,
 }
-
 impl Tool for BuiltinFinalAnswerTool {
+    fn level(&self) -> ToolLevel {
+        ToolLevel::BuiltIn
+    }
+
     fn name(&self) -> &str {
-        &self.name
+        DEFAULT_FINAL_ANSWER_TOOL_NAME
     }
 
     fn label(&self) -> &str {
@@ -141,3 +127,5 @@ impl Tool for BuiltinFinalAnswerTool {
         })
     }
 }
+
+llm_harness_types::assert_builtin_registered!(BuiltinFinalAnswerTool => DEFAULT_FINAL_ANSWER_TOOL_NAME);

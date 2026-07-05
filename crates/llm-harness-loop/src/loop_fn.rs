@@ -53,24 +53,15 @@ fn tools_for_turn(
         return active_tool_subset(tools, active).map(|tools| (tools, None));
     };
 
-    if answer_cfg.name.trim().is_empty() {
-        return Err(AgentError::Internal(
-            "final-answer tool name must not be empty".into(),
-        ));
-    }
-    if tools.iter().any(|tool| tool.name() == answer_cfg.name) {
-        return Err(AgentError::Internal(format!(
-            "final-answer tool name '{}' conflicts with a registered tool",
-            answer_cfg.name
-        )));
-    }
-
-    let builtin = builtin_final_answer_tool(&answer_cfg);
+    let builtin = builtin_final_answer_tool();
     let mut registered = tools.to_vec();
     registered.push(builtin.clone());
 
     let mut selected = active_tool_subset(&registered, active)?;
-    if !selected.iter().any(|tool| tool.name() == answer_cfg.name) {
+    if !selected
+        .iter()
+        .any(|tool| tool.name() == FINAL_ANSWER_TOOL_NAME)
+    {
         selected.push(builtin);
     }
 
@@ -531,8 +522,8 @@ fn run_loop(
 
                 let final_answer_message = current_final_answer_tool
                     .as_ref()
-                    .and_then(|cfg| {
-                        final_answer_text_from_results(&cfg.name, &tool_calls, &results)
+                    .and_then(|_cfg| {
+                        final_answer_text_from_results(FINAL_ANSWER_TOOL_NAME, &tool_calls, &results)
                     })
                     .map(|text| {
                         let turn_id = assistant_msg.turn_id.clone();
@@ -626,7 +617,7 @@ fn run_loop(
             {
                 yield AgentEvent::Error(AgentError::Internal(format!(
                     "final-answer tool '{}' was required but the model stopped without calling it",
-                    cfg.name
+                    FINAL_ANSWER_TOOL_NAME
                 )));
                 break 'main;
             }
@@ -1163,35 +1154,6 @@ mod tests {
             )),
             "fallback mode should not error when the model answers with plain text"
         );
-    }
-
-    #[tokio::test]
-    async fn final_answer_tool_name_conflict_errors_before_provider_call() {
-        let (client, mut cfg) = make_config(vec![MockResponse::text("unused")]);
-        cfg.tools = vec![Arc::new(NamedTool("final_answer"))];
-        cfg.final_answer_mode = FinalAnswerMode::required_tool();
-
-        let events: Vec<AgentEvent> = agent_loop(
-            Arc::clone(&client) as Arc<dyn Provider>,
-            AgentContext {
-                system_prompt: None,
-                messages: vec![],
-            },
-            cfg,
-        )
-        .collect()
-        .await;
-
-        assert_eq!(
-            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
-        assert!(events.iter().any(|event| matches!(
-            event,
-            AgentEvent::Error(AgentError::Internal(message))
-                if message.contains("conflicts")
-                    && message.contains("final_answer")
-        )));
     }
 
     #[tokio::test]

@@ -6,7 +6,8 @@ use std::sync::{Arc, LazyLock};
 use futures::future::BoxFuture;
 use llm_harness_agent::{ContextMode, ProviderSelection, SpawnOptions};
 use llm_harness_types::{
-    ContentBlock, Tool, ToolContext, ToolError, ToolExecutionMode, ToolResult,
+    ContentBlock, SPAWN_AGENT_TOOL_NAME, Tool, ToolContext, ToolError, ToolExecutionMode,
+    ToolLevel, ToolResult,
 };
 
 use crate::spawn::async_spawn::AsyncCompletion;
@@ -74,7 +75,11 @@ fn format_completion(completion: &AsyncCompletion) -> String {
 
 impl Tool for SpawnAgentTool {
     fn name(&self) -> &str {
-        "spawn_agent"
+        SPAWN_AGENT_TOOL_NAME
+    }
+
+    fn level(&self) -> ToolLevel {
+        ToolLevel::BuiltIn
     }
 
     fn description(&self) -> &str {
@@ -189,6 +194,7 @@ impl Tool for SpawnAgentTool {
         })
     }
 }
+llm_harness_types::assert_builtin_registered!(SpawnAgentTool => SPAWN_AGENT_TOOL_NAME);
 
 #[cfg(test)]
 mod tests {
@@ -237,7 +243,7 @@ mod tests {
     #[test]
     fn spawn_agent_tool_name_and_schema() {
         let (tool, _) = make_tool();
-        assert_eq!(tool.name(), "spawn_agent");
+        assert_eq!(tool.name(), SPAWN_AGENT_TOOL_NAME);
         let schema = tool.parameters_schema();
         assert!(schema.get("properties").is_some());
         assert!(schema.get("required").is_some());

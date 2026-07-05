@@ -576,6 +576,10 @@ impl AgentHarness {
             opts.queue_capacity > 0,
             "queue_capacity must be > 0; a capacity of 0 creates a rendezvous channel where try_send almost always fails, silently breaking steer/follow-up"
         );
+        // Check tool name conflicts: business tools must not use framework-reserved names.
+        if let Err(msg) = llm_harness_types::check_tool_name_conflicts(&opts.tools) {
+            panic!("{msg}");
+        }
         // Deduplicate skills and templates (first-wins). This is the single
         // convergence point for all construction paths; regardless of how
         // opts was assembled, inner.skills / inner.templates will have no
@@ -968,6 +972,9 @@ impl AgentHarness {
 
     /// Replace the registered tool list.
     pub async fn set_tools(&self, tools: Vec<Arc<dyn Tool>>) -> Result<(), HarnessError> {
+        if let Err(msg) = llm_harness_types::check_tool_name_conflicts(&tools) {
+            return Err(HarnessError::Agent(AgentError::Internal(msg)));
+        }
         let (added, removed, pending) = {
             let mut inner = self.inner.lock().unwrap();
             let old_names: HashSet<String> = inner
@@ -1412,6 +1419,15 @@ impl AgentHarness {
     /// Return a copy of the current template list.
     pub fn templates(&self) -> Vec<PromptTemplate> {
         self.inner.lock().unwrap().templates.clone()
+    }
+
+    /// Return the list of framework built-in tool names.
+    ///
+    /// Business tools must not use these names; the harness rejects such
+    /// registrations at construction / `set_tools` time. Use this to
+    /// avoid collisions when naming user tools.
+    pub fn builtin_tool_names() -> &'static [&'static str] {
+        llm_harness_types::BUILTIN_TOOL_NAMES
     }
 
     /// Subscribe to the event broadcast stream.
@@ -3482,6 +3498,122 @@ mod tests {
         assert_eq!(h.skills()[0].description, "first");
         assert_eq!(h.templates().len(), 1);
         assert_eq!(h.templates()[0].description, "first");
+    }
+    struct BuiltInLevelTool {
+        name: String,
+    }
+    impl llm_harness_types::Tool for BuiltInLevelTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn level(&self) -> llm_harness_types::ToolLevel {
+            llm_harness_types::ToolLevel::BuiltIn
+        }
+        fn description(&self) -> &str {
+            "harness tool"
+        }
+        fn parameters_schema(&self) -> &serde_json::Value {
+            static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            S.get_or_init(|| serde_json::json!({}))
+        }
+        fn execute<'a>(
+            &'a self,
+            _: serde_json::Value,
+            _: &'a llm_harness_types::ToolContext,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>,
+        > {
+            Box::pin(async {
+                Ok(llm_harness_types::ToolResult {
+                    content: vec![],
+                    details: serde_json::Value::Null,
+                    terminate: false,
+                })
+            })
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "is reserved by the framework")]
+    fn with_session_panics_when_user_tool_conflicts_with_harness_tool() {
+        let client: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![]));
+        let env: Arc<dyn ExecutionEnv> = Arc::new(NoOpEnv);
+        let repo = InMemorySessionRepo::new();
+        let storage = futures::executor::block_on(repo.create(CreateSessionOptions::default()))
+            .expect("in-memory session creation cannot fail");
+        let session = Session::new(storage);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        opts.tools = vec![
+            Arc::new(BuiltInLevelTool {
+                name: "spawn_agent".into(),
+            }),
+            Arc::new(DummyTool::new("spawn_agent")), // User level, same name
+        ];
+        let _ = AgentHarness::with_session(client, env, session, opts);
+    }
+
+    #[tokio::test]
+    async fn set_tools_rejects_user_tool_conflicting_with_harness_tool() {
+        let h = make_harness(vec![]);
+        // First set a harness-level tool.
+        h.set_tools(vec![Arc::new(BuiltInLevelTool {
+            name: "my_harness_tool".into(),
+        })])
+        .await
+        .unwrap();
+        // Then try to set tools with a user-level tool of the same name.
+        let err = h
+            .set_tools(vec![
+                Arc::new(BuiltInLevelTool {
+                    name: "my_harness_tool".into(),
+                }),
+                Arc::new(DummyTool::new("my_harness_tool")),
+            ])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reserved by the framework"));
+    }
+
+    #[tokio::test]
+    async fn set_tools_rejects_duplicate_user_tool_names() {
+        let h = make_harness(vec![]);
+        // Two user-level tools with the same name: error (duplicate).
+        let err = h
+            .set_tools(vec![
+                Arc::new(DummyTool::new("dup")),
+                Arc::new(DummyTool::new("dup")),
+            ])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate tool name"));
+    }
+
+    #[test]
+    #[should_panic(expected = "is reserved by the framework")]
+    fn with_session_panics_when_user_tool_uses_reserved_name_alone() {
+        // 孤立 User tool 名为 spawn_agent（单元素批次，无同批次 BuiltIn）。
+        let client: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![]));
+        let env: Arc<dyn ExecutionEnv> = Arc::new(NoOpEnv);
+        let repo = InMemorySessionRepo::new();
+        let storage = futures::executor::block_on(repo.create(CreateSessionOptions::default()))
+            .expect("in-memory session creation cannot fail");
+        let session = Session::new(storage);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        opts.tools = vec![Arc::new(DummyTool::new("spawn_agent"))];
+        let _ = AgentHarness::with_session(client, env, session, opts);
+    }
+
+    #[tokio::test]
+    async fn set_tools_rejects_user_tool_using_reserved_name_alone() {
+        // 跨批次绕过尝试：set_tools replace 语义下，孤立 User tool
+        // 名为 final_answer 也应被拒绝。
+        let h = make_harness(vec![]);
+        let err = h
+            .set_tools(vec![Arc::new(DummyTool::new("final_answer"))])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reserved by the framework"));
     }
 }
 

@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use llm_harness_types::{Tool, ToolContext, ToolError, ToolResult};
+use llm_harness_types::{
+    SUBMIT_WORKFLOW_TOOL_NAME, Tool, ToolContext, ToolError, ToolLevel, ToolResult,
+};
 use serde::Deserialize;
 
 use crate::lifecycle::task::TaskId;
@@ -361,7 +363,11 @@ fn step_policy_schema() -> serde_json::Value {
 
 impl Tool for PlanWorkflowTool {
     fn name(&self) -> &str {
-        "submit_workflow"
+        SUBMIT_WORKFLOW_TOOL_NAME
+    }
+
+    fn level(&self) -> ToolLevel {
+        ToolLevel::BuiltIn
     }
 
     fn description(&self) -> &str {
@@ -407,6 +413,8 @@ impl Tool for PlanWorkflowTool {
         })
     }
 }
+
+llm_harness_types::assert_builtin_registered!(PlanWorkflowTool => SUBMIT_WORKFLOW_TOOL_NAME);
 
 #[cfg(test)]
 mod tests {

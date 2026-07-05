@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use llm_harness_agent::FollowUpHandle;
 use llm_harness_types::{
-    AgentMessage, ContentBlock, CustomMessage, ShouldStopCtx, ShouldStopHook, Tool, ToolContext,
-    ToolError, ToolExecutionMode, ToolResult, UserMessage,
+    AgentMessage, ContentBlock, CustomMessage, LIST_PEERS_TOOL_NAME, SEND_TO_PEER_TOOL_NAME,
+    ShouldStopCtx, ShouldStopHook, Tool, ToolContext, ToolError, ToolExecutionMode, ToolLevel,
+    ToolResult, UserMessage, WAIT_FOR_PEER_MESSAGE_TOOL_NAME,
 };
 use tokio::sync::mpsc;
 
@@ -279,7 +280,11 @@ fn wait_for_peer_schema() -> serde_json::Value {
 
 impl Tool for WaitForPeerMessageTool {
     fn name(&self) -> &str {
-        "wait_for_peer_message"
+        WAIT_FOR_PEER_MESSAGE_TOOL_NAME
+    }
+
+    fn level(&self) -> ToolLevel {
+        ToolLevel::BuiltIn
     }
 
     fn description(&self) -> &str {
@@ -330,6 +335,8 @@ impl Tool for WaitForPeerMessageTool {
         })
     }
 }
+
+llm_harness_types::assert_builtin_registered!(WaitForPeerMessageTool => WAIT_FOR_PEER_MESSAGE_TOOL_NAME);
 
 /// 把 `AgentMessage` 转成 LLM 可见的 `ContentBlock` 列表。
 ///
@@ -426,7 +433,11 @@ fn send_to_peer_schema() -> serde_json::Value {
 
 impl Tool for SendToPeerTool {
     fn name(&self) -> &str {
-        "send_to_peer"
+        SEND_TO_PEER_TOOL_NAME
+    }
+
+    fn level(&self) -> ToolLevel {
+        ToolLevel::BuiltIn
     }
 
     fn description(&self) -> &str {
@@ -489,6 +500,8 @@ impl Tool for SendToPeerTool {
     }
 }
 
+llm_harness_types::assert_builtin_registered!(SendToPeerTool => SEND_TO_PEER_TOOL_NAME);
+
 /// LLM tool：列出当前在线的 peer 列表。
 pub struct ListPeersTool {
     directory: Arc<PeerDirectory>,
@@ -509,7 +522,11 @@ fn list_peers_schema() -> serde_json::Value {
 
 impl Tool for ListPeersTool {
     fn name(&self) -> &str {
-        "list_peers"
+        LIST_PEERS_TOOL_NAME
+    }
+
+    fn level(&self) -> ToolLevel {
+        ToolLevel::BuiltIn
     }
 
     fn description(&self) -> &str {
@@ -554,6 +571,9 @@ impl Tool for ListPeersTool {
         })
     }
 }
+
+llm_harness_types::assert_builtin_registered!(ListPeersTool => LIST_PEERS_TOOL_NAME);
+
 #[cfg(test)]
 mod tests {
     use super::*;

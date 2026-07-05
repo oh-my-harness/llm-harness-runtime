@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use llm_harness_types::{
-    ContentBlock, Tool, ToolContext, ToolError, ToolExecutionMode, ToolResult,
+    ContentBlock, Tool, ToolContext, ToolError, ToolExecutionMode, ToolLevel, ToolResult,
+    WAIT_FOR_EXTERNAL_EVENT_TOOL_NAME,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -101,7 +102,11 @@ fn wait_for_event_schema() -> serde_json::Value {
 
 impl Tool for WaitForExternalEventTool {
     fn name(&self) -> &str {
-        "wait_for_external_event"
+        WAIT_FOR_EXTERNAL_EVENT_TOOL_NAME
+    }
+
+    fn level(&self) -> ToolLevel {
+        ToolLevel::BuiltIn
     }
 
     fn description(&self) -> &str {
@@ -175,6 +180,7 @@ impl Tool for WaitForExternalEventTool {
         })
     }
 }
+llm_harness_types::assert_builtin_registered!(WaitForExternalEventTool => WAIT_FOR_EXTERNAL_EVENT_TOOL_NAME);
 
 #[cfg(test)]
 mod tests {
