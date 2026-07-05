@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::error::Result;
-use crate::task::{Checkpoint, TaskId};
+use crate::lifecycle::task::{Checkpoint, TaskId};
 use crate::workflow::model::{Workflow, WorkflowState};
 
 /// 事件等待记录（descriptor + runtime 写入的时间戳）。

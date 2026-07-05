@@ -6,7 +6,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use llm_harness_runtime::audit::{AuditEntry, AuditSink};
+use llm_harness_runtime::observability::audit::{AuditEntry, AuditSink};
 use llm_harness_runtime::error::Result;
 
 /// JSONL file-backed audit sink with SHA-256 hash-chain integrity.
@@ -136,7 +136,7 @@ impl AuditSink for JsonlAuditSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_runtime::audit::{AuditDecision, AuditEventType};
+    use llm_harness_runtime::observability::audit::{AuditDecision, AuditEventType};
     use llm_harness_types::EntryId;
 
     fn make_entry(trace_id: &str) -> AuditEntry {

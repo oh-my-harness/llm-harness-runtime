@@ -2,7 +2,7 @@ use futures::future::BoxFuture;
 use llm_harness_types::{ContentBlock, Tool, ToolContext, ToolError, ToolResult};
 use serde_json::Value;
 
-use crate::tool_registry::{ToolDefinition, ToolExecutionMode as RuntimeExecMode};
+use crate::platform::tool_registry::{ToolDefinition, ToolExecutionMode as RuntimeExecMode};
 
 /// Adapts a `ToolDefinition` (from a `ToolSource`) into a core `Tool` trait object.
 ///
@@ -72,7 +72,7 @@ impl Tool for ToolSourceAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool_registry::ToolExecutionMode as RuntimeExecMode;
+    use crate::platform::tool_registry::ToolExecutionMode as RuntimeExecMode;
     use std::sync::Arc;
 
     #[test]

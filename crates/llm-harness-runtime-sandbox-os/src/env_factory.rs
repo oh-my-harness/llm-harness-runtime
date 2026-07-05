@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use llm_harness_runtime::spawner::EnvFactory;
+use llm_harness_runtime::spawn::spawner::EnvFactory;
 use llm_harness_types::{AgentError, ExecutionEnv};
 
 use crate::OsEnv;

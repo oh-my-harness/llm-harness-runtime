@@ -18,8 +18,8 @@ use llm_harness_types::{
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::task::TaskId;
-use crate::task_store::TaskStore;
+use crate::lifecycle::task::TaskId;
+use crate::lifecycle::task_store::TaskStore;
 
 /// 通用事件流抽象。业务层实现。
 /// timer / IO 完成 / 上游 task 完成 / 外部信号等来源均可。
@@ -179,8 +179,8 @@ impl Tool for WaitForExternalEventTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task::TaskId;
-    use crate::task_store::JsonlTaskStore;
+    use crate::lifecycle::task::TaskId;
+    use crate::lifecycle::task_store::JsonlTaskStore;
     use llm_harness_types::ContentBlock;
     use llm_harness_types::{Tool, ToolContext, ToolError};
     use tempfile::TempDir;

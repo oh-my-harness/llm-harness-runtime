@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use llm_harness_agent::Plugin;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
-use llm_harness_runtime::async_spawn::async_spawn_pair;
+use llm_harness_runtime::spawn::async_spawn::async_spawn_pair;
 use llm_harness_runtime::builder::HarnessBuilder;
-use llm_harness_runtime::spawn_tool::SpawnAgentTool;
-use llm_harness_runtime::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
+use llm_harness_runtime::spawn::spawn_tool::SpawnAgentTool;
+use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_runtime_sandbox_os::{OsEnv, OsEnvFactory};
 use llm_harness_types::ExecutionEnv;
 /// 一个长跑 tool：sleep 直到完成或被 abort。
@@ -125,7 +125,7 @@ async fn abort_cancels_inflight_subagent() {
         .unwrap();
     let harness = Arc::new(harness);
 
-    let watcher = llm_harness_runtime::async_spawn::IdleWatcher::new(registry.clone(), {
+    let watcher = llm_harness_runtime::spawn::async_spawn::IdleWatcher::new(registry.clone(), {
         let h = Arc::downgrade(&harness);
         Arc::new(move || {
             let h = h.clone();
@@ -239,7 +239,7 @@ async fn abort_does_not_affect_future_spawns() {
         .unwrap();
     let harness = Arc::new(harness);
 
-    let watcher = llm_harness_runtime::async_spawn::IdleWatcher::new(registry.clone(), {
+    let watcher = llm_harness_runtime::spawn::async_spawn::IdleWatcher::new(registry.clone(), {
         let h = Arc::downgrade(&harness);
         Arc::new(move || {
             let h = h.clone();
@@ -381,7 +381,7 @@ async fn idle_watcher_abort() {
         .unwrap();
     let harness = Arc::new(harness);
 
-    let watcher = llm_harness_runtime::async_spawn::IdleWatcher::new(registry.clone(), {
+    let watcher = llm_harness_runtime::spawn::async_spawn::IdleWatcher::new(registry.clone(), {
         let h = Arc::downgrade(&harness);
         Arc::new(move || {
             let h = h.clone();

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_runtime::error::Result;
-use llm_harness_runtime::sandbox::{Sandbox, SandboxConfig};
+use llm_harness_runtime::platform::sandbox::{Sandbox, SandboxConfig};
 use llm_harness_runtime_sandbox_os::OsEnv;
 use llm_harness_types::ExecutionEnv;
 
@@ -93,7 +93,7 @@ impl Sandbox for SeatbeltSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_runtime::sandbox::{ResourceLimits, SandboxConfig};
+    use llm_harness_runtime::platform::sandbox::{ResourceLimits, SandboxConfig};
 
     #[tokio::test]
     async fn seatbelt_sandbox_starts() {

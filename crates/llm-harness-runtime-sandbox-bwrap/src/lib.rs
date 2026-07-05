@@ -11,7 +11,7 @@ pub struct BwrapSandbox;
 #[cfg(not(target_os = "linux"))]
 impl BwrapSandbox {
     /// Panics on non-Linux platforms.
-    pub fn new(_config: llm_harness_runtime::sandbox::SandboxConfig) -> Self {
+    pub fn new(_config: llm_harness_runtime::platform::sandbox::SandboxConfig) -> Self {
         panic!("BwrapSandbox is only available on Linux")
     }
 }

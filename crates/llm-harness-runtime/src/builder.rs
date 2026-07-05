@@ -29,7 +29,7 @@ use llm_harness_types::{
     AfterProviderResponseHook, CostAggregate, ExecutionEnv, PricingProvider, ShouldStopHook, Tool,
 };
 
-use crate::{
+use crate::control::{
     budget::BudgetControlAdapter, budget::BudgetExceededHook, cost_hook::CostAccumulatorHook,
 };
 use thiserror::Error;
@@ -851,17 +851,17 @@ mod tests {
 
     #[test]
     fn build_options_injects_accumulator_and_budget_hooks() {
-        use crate::cost::TokenPrice;
+        use crate::control::cost::TokenPrice;
 
         struct StubPricing;
-        impl crate::cost::PricingProvider for StubPricing {
+        impl crate::control::cost::PricingProvider for StubPricing {
             fn price_for(&self, _model: &str, _provider: &str) -> Option<TokenPrice> {
                 None
             }
         }
 
         let builder = HarnessBuilder::new("test-model")
-            .pricing(Arc::new(StubPricing) as Arc<dyn crate::cost::PricingProvider>)
+            .pricing(Arc::new(StubPricing) as Arc<dyn crate::control::cost::PricingProvider>)
             .budget(5.0, None);
 
         let opts = builder.build_options(None);

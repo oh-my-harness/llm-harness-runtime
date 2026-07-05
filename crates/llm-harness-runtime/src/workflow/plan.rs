@@ -11,8 +11,8 @@ use llm_harness_types::{Tool, ToolContext, ToolError, ToolResult};
 use serde::Deserialize;
 
 use crate::error::Result;
-use crate::task::TaskId;
-use crate::task_store::TaskStore;
+use crate::lifecycle::task::TaskId;
+use crate::lifecycle::task_store::TaskStore;
 use crate::workflow::model::{
     ConditionExpr, Edge, EdgeCondition, Step, StepExecutionPolicy, StepId, Workflow,
 };
@@ -541,7 +541,7 @@ mod tests {
 
     // ── PlanWorkflowTool 测试 ──────────────────────────────────────────────
 
-    use crate::task_store::JsonlTaskStore;
+    use crate::lifecycle::task_store::JsonlTaskStore;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 

@@ -188,7 +188,7 @@ fn compare_number(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cost::CostAggregate;
+    use crate::control::cost::CostAggregate;
 
     fn make_step() -> Step {
         Step::llm("s1", "Step 1", "do step 1", vec![])

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_runtime::error::Result;
-use llm_harness_runtime::sandbox::{Sandbox, SandboxConfig};
+use llm_harness_runtime::platform::sandbox::{Sandbox, SandboxConfig};
 use llm_harness_types::ExecutionEnv;
 
 use crate::env::OsEnv;
@@ -70,7 +70,7 @@ impl Sandbox for OsEnvSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_runtime::sandbox::ResourceLimits;
+    use llm_harness_runtime::platform::sandbox::ResourceLimits;
 
     #[tokio::test]
     async fn os_env_sandbox_starts() {

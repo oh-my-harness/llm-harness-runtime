@@ -14,26 +14,12 @@
 //! - Budget control (`BudgetExceededHook`, `BudgetControlAdapter`)
 //! - Harness construction (`HarnessBuilder`)
 
-pub mod async_spawn;
-pub mod audit;
-pub mod budget;
 pub mod builder;
-pub mod cost;
-pub mod cost_hook;
 pub mod error;
-pub mod event;
-pub mod human_approval;
-pub mod mcp;
-pub mod peer;
-pub mod prompt;
-pub mod resource;
-pub mod sandbox;
-pub mod spawn_tool;
-pub mod spawner;
-pub mod task;
-pub mod task_store;
-pub mod tool_adapter;
-pub mod tool_registry;
-pub mod tracer;
-pub mod tracing_adapter;
 pub mod workflow;
+
+pub mod control;
+pub mod lifecycle;
+pub mod observability;
+pub mod platform;
+pub mod spawn;

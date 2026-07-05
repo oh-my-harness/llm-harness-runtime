@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::async_spawn::{AsyncCompletion, AsyncSpawnHandle, AsyncSpawnRegistry};
+use crate::spawn::async_spawn::{AsyncCompletion, AsyncSpawnHandle, AsyncSpawnRegistry};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_agent::{
@@ -18,7 +18,7 @@ use llm_harness_types::{AgentError, AgentEvent, ExecutionEnv, HarnessError, Harn
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::{HarnessBuildError, HarnessBuilder};
-use crate::peer::{PeerCleanupGuard, PeerDirectory, PeerMessageHook, PeerMetadata, SharedPeerRx};
+use crate::spawn::peer::{PeerCleanupGuard, PeerDirectory, PeerMessageHook, PeerMetadata, SharedPeerRx};
 
 // ── EnvFactory ────────────────────────────────────────────────────────────
 
@@ -566,8 +566,8 @@ impl SessionFactory for JsonlSessionFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::async_spawn::async_spawn_pair;
-    use crate::peer::{PeerDirectory, PeerMetadata};
+    use crate::spawn::async_spawn::async_spawn_pair;
+    use crate::spawn::peer::{PeerDirectory, PeerMetadata};
     use std::sync::Mutex;
 
     use llm_harness_agent::session::repo::InMemorySessionRepo;

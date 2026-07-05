@@ -11,7 +11,7 @@ pub struct SeatbeltSandbox;
 #[cfg(not(target_os = "macos"))]
 impl SeatbeltSandbox {
     /// Panics on non-macOS platforms.
-    pub fn new(_config: llm_harness_runtime::sandbox::SandboxConfig) -> Self {
+    pub fn new(_config: llm_harness_runtime::platform::sandbox::SandboxConfig) -> Self {
         panic!("SeatbeltSandbox is only available on macOS")
     }
 }

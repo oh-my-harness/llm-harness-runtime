@@ -9,20 +9,20 @@ use llm_harness_types::{
     ContentBlock, Tool, ToolContext, ToolError, ToolExecutionMode, ToolResult,
 };
 
-use crate::async_spawn::AsyncCompletion;
-use crate::peer::PeerMetadata;
-use crate::spawner::HarnessSubAgentSpawner;
+use crate::spawn::async_spawn::AsyncCompletion;
+use crate::spawn::peer::PeerMetadata;
+use crate::spawn::spawner::HarnessSubAgentSpawner;
 
 pub struct SpawnAgentTool {
     spawner: Arc<HarnessSubAgentSpawner>,
-    directory: Option<Arc<crate::peer::PeerDirectory>>,
+    directory: Option<Arc<crate::spawn::peer::PeerDirectory>>,
 }
 
 impl SpawnAgentTool {
     /// `registry` 参数保留向后兼容（sync path 现用 oneshot；async path 经 completion channel，由 `track(deliver_to_channel=true)` 控制）。
     pub fn new(
         spawner: Arc<HarnessSubAgentSpawner>,
-        _registry: Arc<crate::async_spawn::AsyncSpawnRegistry>,
+        _registry: Arc<crate::spawn::async_spawn::AsyncSpawnRegistry>,
     ) -> Self {
         Self {
             spawner,
@@ -30,7 +30,7 @@ impl SpawnAgentTool {
         }
     }
 
-    pub fn with_peer_directory(mut self, directory: Arc<crate::peer::PeerDirectory>) -> Self {
+    pub fn with_peer_directory(mut self, directory: Arc<crate::spawn::peer::PeerDirectory>) -> Self {
         self.directory = Some(directory);
         self
     }
@@ -190,12 +190,12 @@ impl Tool for SpawnAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::async_spawn::async_spawn_pair;
-    use crate::spawner::JsonlSessionFactory;
+    use crate::spawn::async_spawn::async_spawn_pair;
+    use crate::spawn::spawner::JsonlSessionFactory;
     use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
     use llm_harness_types::ExecutionEnv;
 
-    fn make_tool() -> (SpawnAgentTool, Arc<crate::async_spawn::AsyncSpawnRegistry>) {
+    fn make_tool() -> (SpawnAgentTool, Arc<crate::spawn::async_spawn::AsyncSpawnRegistry>) {
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
         let spawner = HarnessSubAgentSpawner::new(
             "test-model",
@@ -219,7 +219,7 @@ mod tests {
     }
 
     struct NoopEnvFactory;
-    impl crate::spawner::EnvFactory for NoopEnvFactory {
+    impl crate::spawn::spawner::EnvFactory for NoopEnvFactory {
         fn create(
             &self,
             _cwd: &std::path::Path,
@@ -283,7 +283,7 @@ mod tests {
     /// format_completion 的 Err 分支：失败结果格式化含 agent_id 和错误信息。
     #[test]
     fn format_completion_failure_includes_agent_id_and_error() {
-        use crate::async_spawn::AsyncCompletion;
+        use crate::spawn::async_spawn::AsyncCompletion;
         use llm_harness_types::AgentError;
         let completion = AsyncCompletion {
             agent_id: "failed-agent".into(),
@@ -299,8 +299,8 @@ mod tests {
 
     fn make_peer_tool() -> (
         SpawnAgentTool,
-        Arc<crate::async_spawn::AsyncSpawnRegistry>,
-        Arc<crate::peer::PeerDirectory>,
+        Arc<crate::spawn::async_spawn::AsyncSpawnRegistry>,
+        Arc<crate::spawn::peer::PeerDirectory>,
     ) {
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
         let spawner = HarnessSubAgentSpawner::new(
@@ -312,7 +312,7 @@ mod tests {
         .session_factory(Arc::new(JsonlSessionFactory))
         .env_factory(Arc::new(NoopEnvFactory));
         let (registry, _hook) = async_spawn_pair();
-        let directory = Arc::new(crate::peer::PeerDirectory::new());
+        let directory = Arc::new(crate::spawn::peer::PeerDirectory::new());
         let spawner = Arc::new(
             spawner
                 .enable_async_delivery(registry.clone())

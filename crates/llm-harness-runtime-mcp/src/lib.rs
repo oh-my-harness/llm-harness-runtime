@@ -3,9 +3,9 @@ use std::sync::Arc;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_runtime::error::Result;
-use llm_harness_runtime::mcp::{McpClientHandle, McpError, McpToolDef};
-use llm_harness_runtime::prompt::{PromptSource, PromptSourceTemplate};
-use llm_harness_runtime::tool_registry::{ToolDefinition, ToolExecutionMode, ToolSource};
+use llm_harness_runtime::platform::mcp::{McpClientHandle, McpError, McpToolDef};
+use llm_harness_runtime::platform::prompt::{PromptSource, PromptSourceTemplate};
+use llm_harness_runtime::platform::tool_registry::{ToolDefinition, ToolExecutionMode, ToolSource};
 use llm_harness_types::{ContentBlock, Tool, ToolContext, ToolError, ToolResult};
 use serde_json::Value;
 
@@ -146,7 +146,7 @@ fn mcp_tool_to_definition(tool: McpToolDef) -> ToolDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_runtime::mcp::{McpContent, McpResult};
+    use llm_harness_runtime::platform::mcp::{McpContent, McpResult};
     use std::sync::Mutex;
 
     struct StubMcpClient {

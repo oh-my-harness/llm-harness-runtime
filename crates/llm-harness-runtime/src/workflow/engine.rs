@@ -20,11 +20,11 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::{HarnessBuildError, HarnessBuilder};
-use crate::cost::CostAggregate;
+use crate::control::cost::CostAggregate;
 use crate::error::Result;
-use crate::spawner::{EnvFactory, HarnessSubAgentSpawner, SessionFactory};
-use crate::task::{Checkpoint, TaskError, TaskId, TaskResult};
-use crate::task_store::TaskStore;
+use crate::spawn::spawner::{EnvFactory, HarnessSubAgentSpawner, SessionFactory};
+use crate::lifecycle::task::{Checkpoint, TaskError, TaskId, TaskResult};
+use crate::lifecycle::task_store::TaskStore;
 use crate::workflow::executor::{ExecutorCtx, StepExecutor, builtin_executors};
 use crate::workflow::judge::{EdgeConditionJudge, NoopJudge, StepCtx, StepTransitionJudge};
 use crate::workflow::model::{
@@ -1594,7 +1594,7 @@ impl Plugin for HookPlugin {
 #[cfg(test)]
 mod sync_tool_tests {
     use super::*;
-    use crate::spawner::JsonlSessionFactory;
+    use crate::spawn::spawner::JsonlSessionFactory;
     use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
     use llm_harness_types::ExecutionEnv;
 
@@ -1606,7 +1606,7 @@ mod sync_tool_tests {
     }
 
     struct NoopEnvFactory;
-    impl crate::spawner::EnvFactory for NoopEnvFactory {
+    impl crate::spawn::spawner::EnvFactory for NoopEnvFactory {
         fn create(
             &self,
             _cwd: &std::path::Path,
@@ -1724,7 +1724,7 @@ mod sync_tool_tests {
 #[cfg(test)]
 mod engine_tests {
     use super::*;
-    use crate::spawner::JsonlSessionFactory;
+    use crate::spawn::spawner::JsonlSessionFactory;
     use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
     use llm_harness_types::ExecutionEnv;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1759,7 +1759,7 @@ mod engine_tests {
         assert!(result.final_message.as_deref().unwrap_or("").contains("42"));
     }
 
-    use crate::task_store::JsonlTaskStore;
+    use crate::lifecycle::task_store::JsonlTaskStore;
     use crate::workflow::judge::NoopJudge;
     use crate::workflow::model::{ConditionExpr, Edge, EdgeCondition};
 

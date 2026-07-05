@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_runtime::error::Result;
-use llm_harness_runtime::sandbox::{Sandbox, SandboxConfig};
+use llm_harness_runtime::platform::sandbox::{Sandbox, SandboxConfig};
 use llm_harness_runtime_sandbox_os::OsEnv;
 use llm_harness_types::ExecutionEnv;
 
@@ -111,7 +111,7 @@ pub(crate) fn bwrap_args(s: &BwrapSandbox) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_runtime::sandbox::{ResourceLimits, SandboxConfig};
+    use llm_harness_runtime::platform::sandbox::{ResourceLimits, SandboxConfig};
 
     #[test]
     fn bwrap_args_include_unshare_all() {
