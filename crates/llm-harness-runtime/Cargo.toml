@@ -26,7 +26,6 @@ uuid.workspace              = true
 [dev-dependencies]
 llm-harness-loop = { workspace = true, features = ["test-utils"] }
 llm-harness-runtime-sandbox-os  = { path = "../llm-harness-runtime-sandbox-os" }
-llm-harness-runtime-auth        = { path = "../llm-harness-runtime-auth" }
 llm-harness-runtime-audit-jsonl = { path = "../llm-harness-runtime-audit-jsonl" }
 llm-harness-runtime-trace-otel  = { path = "../llm-harness-runtime-trace-otel" }
 chrono.workspace  = true

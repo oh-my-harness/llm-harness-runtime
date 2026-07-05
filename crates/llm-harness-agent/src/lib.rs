@@ -61,7 +61,7 @@ pub mod prelude {
         SubAgentSpawner,
     };
     pub use llm_harness_types::{
-        AgentError, AgentEvent, AgentMessage, AssistantMessage, AuthHook, BranchSummaryMessage,
+        AgentError, AgentEvent, AgentMessage, AssistantMessage, BranchSummaryMessage,
         CompactionError, CompactionSummaryMessage, ContentBlock, DiagnosticLevel, EntryId,
         EnvError, ExecutionEnv, FileInfo, HarnessError, HarnessPhase, ImageSource, ShellOptions,
         ShellOutput, StopReason, StreamOptions, ThinkingLevel, TokenUsage, Tool, ToolContext,

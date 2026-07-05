@@ -10,7 +10,6 @@
 //! - Tracing (`TraceExporter`)
 //! - Cost aggregation (`PricingProvider`, `CostAggregate`)
 //! - Audit logging (`AuditSink`)
-//! - Authentication (see `llm-harness-types` and `llm-harness-runtime-auth`)
 //! - Human approval (`HumanApprover`, `HumanApprovalWrapper`)
 //! - Budget control (`BudgetExceededHook`, `BudgetControlAdapter`)
 //! - Harness construction (`HarnessBuilder`)

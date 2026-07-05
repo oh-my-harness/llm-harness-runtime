@@ -74,7 +74,7 @@ Strong success criteria let the LLM loop independently. Weak criteria ("make it 
 代码注释、文档字符串、提交信息统一用英文或中文：
 
 - 新增代码优先用中文注释（与现有项目文档保持一致）
-- 技术术语保持英文（如 `LLM`、`Hook`、`AuthInfo`、`Budget`）
+- 技术术语保持英文（如 `LLM`、`Hook`、`Budget`）
 - 禁止用日文、韩文、其他非英中语言
 
 **审查点：** 在代码审查和提交前，检查是否有日文/韩文残留。
@@ -112,7 +112,6 @@ llm-harness-runtime/          ← 本仓库根
 │   ├── llm-harness-runtime-sandbox-os/
 │   ├── llm-harness-runtime-sandbox-bwrap/
 │   ├── llm-harness-runtime-sandbox-seatbelt/
-│   ├── llm-harness-runtime-auth/
 │   ├── llm-harness-runtime-mcp/
 │   ├── llm-harness-runtime-audit-jsonl/
 │   └── llm-harness-runtime-trace-otel/
@@ -153,8 +152,7 @@ llm-harness-types     → llm_adapter (外部 git 依赖，非内部 crate)
 ### Trait 与实现的分离
 
 - **trait 声明**（`llm-harness-types` crate）：只定义签名、语义、错误类型，不含逻辑。
-- **实现**（如 `EnvAuthHook`、`BudgetControlAdapter` 等）：提供示例实现，用户可覆盖。
-- 不在 trait 中硬编码具体行为，所有行为可替换。
+- **实现**（如 `BudgetControlAdapter` 等）：提供示例实现，用户可覆盖。
 
 ### CompositeHook 合成语义
 
@@ -224,12 +222,12 @@ pub struct HarnessHooks {
 
 1. **先写测试**：用 mock 实现 trait，编写单元测试验证合成逻辑
 2. **停下来**：提交测试，等用户审查——审查的是"trait 行为预期"，不是"实现细节"
-3. **实现**：用户批准后，实现具体 hook（如 `EnvAuthHook`）
+3. **实现**：用户批准后，实现具体 hook
 4. **重构**：在测试保护下整理代码
 
 **基础设施：**
 - Trait 的 mock 实现放在测试模块中（`#[cfg(test)]`）
-- 示例实现（如 `EnvAuthHook`、`FileAuthHook`）在各自的 crate 中，带单独测试
+- 示例实现在各自的 crate 中，带单独测试
 - 集成测试用真实 `AgentHarness` + mock core types，不依赖外部 LLM
 
 ## 实现后自查
@@ -262,6 +260,6 @@ pub struct HarnessHooks {
   无需等用户明确要求。不要累积多个阶段后一次性提交推送。
 - Commit message 格式：`<type>(<scope>): <description>`
   - type：`feat` / `fix` / `docs` / `test` / `refactor` / `chore`
-  - scope：crate 名，如 `traits`、`auth`、`budget`、`orchestration`
-  - 示例：`feat(auth): implement EnvAuthHook`、`test(orchestration): add CompositeHook tests`
+  - scope：crate 名，如 `traits`、`budget`、`orchestration`
+  - 示例：`feat(budget): implement BudgetControlAdapter`、`test(orchestration): add CompositeHook tests`
 - description 说明 *为什么* 而非 *做了什么*。

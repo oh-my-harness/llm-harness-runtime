@@ -186,22 +186,6 @@ pub trait AfterProviderResponseHook: Send + Sync {
     fn after_response<'a>(&'a self, info: &'a ProviderResponseInfo) -> BoxFuture<'a, ()>;
 }
 
-// ── AuthHook ──────────────────────────────────────────────────────────────────
-
-/// 动态认证信息。
-pub struct AuthInfo {
-    /// API key；`None` 表示使用 provider 默认配置。
-    pub api_key: Option<String>,
-    /// 附加的认证 HTTP 头（如 OAuth token）。
-    pub headers: Vec<(String, String)>,
-}
-
-/// 动态认证 hook；每次 LLM 调用前解析最新凭据（适用于 OAuth token 过期等场景）。
-pub trait AuthHook: Send + Sync {
-    /// 返回当前有效的认证信息。
-    fn resolve<'a>(&'a self) -> BoxFuture<'a, Result<AuthInfo, AgentError>>;
-}
-
 // ── Turn 边界 Hooks ───────────────────────────────────────────────────────────
 
 /// 传递给 `BeforeRunHook::before_run` 的上下文。
@@ -330,16 +314,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_info_fields() {
-        let a = AuthInfo {
-            api_key: Some("sk-test".into()),
-            headers: vec![("X-Custom".into(), "val".into())],
-        };
-        assert!(a.api_key.is_some());
-        assert_eq!(a.headers.len(), 1);
-    }
-
-    #[test]
     fn all_hook_traits_are_object_safe() {
         fn _a(_: &dyn TransformContextHook) {}
         fn _b(_: &dyn PrepareNextTurnHook) {}
@@ -348,7 +322,6 @@ mod tests {
         fn _e(_: &dyn ShouldStopHook) {}
         fn _f(_: &dyn BeforeProviderRequestHook) {}
         fn _g(_: &dyn AfterProviderResponseHook) {}
-        fn _h(_: &dyn AuthHook) {}
         fn _i(_: &dyn BeforeRunHook) {}
         fn _j(_: &dyn BeforeTurnHook) {}
         fn _k(_: &dyn AfterTurnHook) {}

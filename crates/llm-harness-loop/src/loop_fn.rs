@@ -758,7 +758,6 @@ mod tests {
             should_stop: None,
             before_provider_request: None,
             after_provider_response: None,
-            auth: None,
             steer_rx: None,
             follow_up_rx: None,
             retry: None,

@@ -455,7 +455,6 @@ impl Agent {
                 should_stop: None,
                 before_provider_request: None,
                 after_provider_response: None,
-                auth: None,
                 steer_rx: Some(steer_rx),
                 follow_up_rx: Some(follow_up_rx),
                 retry: None,

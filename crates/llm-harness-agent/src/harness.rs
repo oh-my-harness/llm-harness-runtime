@@ -413,8 +413,6 @@ pub struct AgentHarnessOptions {
     pub stream_options: StreamOptions,
     /// Hook collection (all optional).
     pub hooks: HarnessHooks,
-    /// Authentication hook.
-    pub auth: Option<Arc<dyn AuthHook>>,
     /// Custom context converter; uses `DefaultConvertToLlm` when `None`.
     pub convert_to_llm: Option<Arc<dyn ConvertToLlmHook>>,
     /// Pre-loaded skills.
@@ -452,7 +450,6 @@ impl AgentHarnessOptions {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
             stream_options: StreamOptions::default(),
             hooks: HarnessHooks::none(),
-            auth: None,
             convert_to_llm: None,
             skills: vec![],
             cost: Arc::new(Mutex::new(CostAggregate::default())),
@@ -549,7 +546,6 @@ pub struct AgentHarness {
     convert_to_llm: Arc<dyn ConvertToLlmHook>,
     hooks: HarnessHooks,
     stream_options: StreamOptions,
-    auth: Option<Arc<dyn AuthHook>>,
 }
 
 impl AgentHarness {
@@ -636,7 +632,6 @@ impl AgentHarness {
             convert_to_llm,
             hooks: opts.hooks,
             stream_options: opts.stream_options,
-            auth: opts.auth,
         }
     }
 
@@ -1620,7 +1615,6 @@ impl AgentHarness {
                     self.hooks.after_provider_response.clone(),
                 )) as Arc<dyn AfterProviderResponseHook>
             }),
-            auth: self.auth.clone(),
             steer_rx: Some(steer_rx),
             follow_up_rx: Some(follow_up_rx),
             retry,
@@ -1968,15 +1962,7 @@ impl AgentHarness {
         let file_operations = prep.file_operations.clone(); // clone so compact() still has access for summary
         self.emit(AgentHarnessEvent::CompactionStart { estimated_tokens });
 
-        let result = compact(
-            summary_client.as_ref(),
-            prep,
-            &settings,
-            self.auth
-                .as_ref()
-                .map(|a| a.as_ref() as &(dyn AuthHook + Send + Sync)),
-        )
-        .await?;
+        let result = compact(summary_client.as_ref(), prep, &settings).await?;
         self.apply_compaction_result(result, file_operations, &path)
             .await
     }

@@ -290,13 +290,10 @@ fn is_valid_cut_start(entry: &SessionEntry) -> bool {
 /// Call the summary LLM to generate a compaction summary.
 ///
 /// Does **not** write to the session; the caller (Harness) appends the result.
-/// If the auth hook is provided it is accepted but v1 ignores it — auth must be
-/// configured at `client` construction time.
 pub async fn compact(
     client: &(dyn LlmClient + Send + Sync),
     preparation: CompactionPreparation,
     settings: &CompactionSettings,
-    _auth: Option<&(dyn AuthHook + Send + Sync)>,
 ) -> Result<CompactionResult, CompactionError> {
     // Find the cut point index in path_entries.
     let cut_idx = preparation
@@ -796,7 +793,6 @@ mod tests {
                 file_operations: vec![],
             },
             &settings(),
-            None,
         )
         .await
         .unwrap_err();
@@ -883,7 +879,6 @@ mod tests {
                 file_operations: vec![],
             },
             &settings(),
-            None,
         )
         .await
         .unwrap_err();

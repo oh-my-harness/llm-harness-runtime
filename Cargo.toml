@@ -10,7 +10,6 @@ members = [
     "crates/llm-harness-runtime-sandbox-os",
     "crates/llm-harness-runtime-sandbox-bwrap",
     "crates/llm-harness-runtime-sandbox-seatbelt",
-    "crates/llm-harness-runtime-auth",
     "crates/llm-harness-runtime-mcp",
     "crates/llm-harness-runtime-audit-jsonl",
     "crates/llm-harness-runtime-trace-otel",

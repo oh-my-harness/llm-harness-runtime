@@ -3,11 +3,11 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use llm_harness_types::{
     AfterProviderResponseHook, AfterToolCallCtx, AfterToolCallDecision, AfterToolCallHook,
-    AfterTurnCtx, AfterTurnHook, AgentContext, AgentError, AuthHook, AuthInfo, BeforeCompactCtx,
-    BeforeCompactDecision, BeforeCompactHook, BeforeProviderRequestHook, BeforeRunCtx,
-    BeforeRunHook, BeforeRunResult, BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook,
-    BeforeTurnCtx, BeforeTurnHook, PrepareNextTurnCtx, PrepareNextTurnHook, ProviderResponseInfo,
-    ShouldStopCtx, ShouldStopHook, StreamOptions, TransformContextHook,
+    AfterTurnCtx, AfterTurnHook, AgentContext, AgentError, BeforeCompactCtx, BeforeCompactDecision,
+    BeforeCompactHook, BeforeProviderRequestHook, BeforeRunCtx, BeforeRunHook, BeforeRunResult,
+    BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook, BeforeTurnCtx, BeforeTurnHook,
+    PrepareNextTurnCtx, PrepareNextTurnHook, ProviderResponseInfo, ShouldStopCtx, ShouldStopHook,
+    StreamOptions, TransformContextHook,
 };
 
 /// Chains multiple `AfterProviderResponseHook` implementations (all-execute semantics).
@@ -412,43 +412,6 @@ impl BeforeCompactHook for CompositeBeforeCompactHook {
     }
 }
 
-/// Chains multiple `AuthHook` implementations (last-wins semantics).
-///
-/// Hooks execute in order; the last non-error result wins.
-pub struct CompositeAuthHook {
-    hooks: Vec<Arc<dyn AuthHook>>,
-}
-
-impl CompositeAuthHook {
-    /// Create a composite from a list of hooks.
-    pub fn new(hooks: Vec<Arc<dyn AuthHook>>) -> Self {
-        Self { hooks }
-    }
-}
-
-impl AuthHook for CompositeAuthHook {
-    fn resolve<'a>(&'a self) -> BoxFuture<'a, Result<AuthInfo, AgentError>> {
-        Box::pin(async move {
-            let mut last_result: Option<Result<AuthInfo, AgentError>> = None;
-            for hook in &self.hooks {
-                match hook.resolve().await {
-                    Ok(info) => last_result = Some(Ok(info)),
-                    // Don't clobber an earlier success with a later error:
-                    // "last non-error result wins" semantics means we keep
-                    // trying remaining hooks but never overwrite a valid
-                    // credential with a failure from a lower-priority source.
-                    Err(_) if last_result.is_some() => {}
-                    Err(e) => last_result = Some(Err(e)),
-                }
-            }
-            last_result.unwrap_or(Ok(AuthInfo {
-                api_key: None,
-                headers: vec![],
-            }))
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,65 +551,5 @@ mod tests {
         fn _accept(_: &dyn BeforeCompactHook) {}
         let composite = CompositeBeforeCompactHook::new(vec![]);
         _accept(&composite);
-    }
-
-    #[test]
-    fn composite_auth_hook_is_object_safe() {
-        fn _accept(_: &dyn AuthHook) {}
-        let composite = CompositeAuthHook::new(vec![]);
-        _accept(&composite);
-    }
-
-    #[tokio::test]
-    async fn composite_auth_hook_keeps_first_success_on_later_error() {
-        // Regression: "last non-error result wins" — a later hook erroring
-        // must not clobber an earlier success.
-        use llm_harness_types::{AgentError, AuthInfo};
-
-        struct StaticKey(&'static str);
-        impl AuthHook for StaticKey {
-            fn resolve<'a>(&'a self) -> BoxFuture<'a, Result<AuthInfo, AgentError>> {
-                Box::pin(async move {
-                    Ok(AuthInfo {
-                        api_key: Some(self.0.into()),
-                        headers: vec![],
-                    })
-                })
-            }
-        }
-
-        struct Failing;
-        impl AuthHook for Failing {
-            fn resolve<'a>(&'a self) -> BoxFuture<'a, Result<AuthInfo, AgentError>> {
-                Box::pin(async move { Err(AgentError::Internal("oauth refresh failed".into())) })
-            }
-        }
-
-        // [Ok, Err] → Ok preserved
-        let composite =
-            CompositeAuthHook::new(vec![Arc::new(StaticKey("sk-first")), Arc::new(Failing)]);
-        let result = composite.resolve().await;
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap().api_key.as_deref(),
-            Some("sk-first"),
-            "earlier success must survive later error"
-        );
-
-        // [Err, Ok] → Ok from second hook wins
-        let composite =
-            CompositeAuthHook::new(vec![Arc::new(Failing), Arc::new(StaticKey("sk-second"))]);
-        let result = composite.resolve().await;
-        assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap().api_key.as_deref(),
-            Some("sk-second"),
-            "later success must override earlier error"
-        );
-
-        // [Err, Err] → first error preserved (root cause)
-        let composite = CompositeAuthHook::new(vec![Arc::new(Failing), Arc::new(Failing)]);
-        let result = composite.resolve().await;
-        assert!(result.is_err());
     }
 }

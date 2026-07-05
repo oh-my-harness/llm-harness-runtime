@@ -113,8 +113,6 @@ pub struct LoopConfig {
     pub before_provider_request: Option<Arc<dyn BeforeProviderRequestHook>>,
     /// provider 响应后的观测钩子。
     pub after_provider_response: Option<Arc<dyn AfterProviderResponseHook>>,
-    /// 动态身份验证（目前不直接传递给 adapter，但为将来保留）。
-    pub auth: Option<Arc<dyn AuthHook>>,
 
     // === Reactive injection ===
     /// 在 turn 间注入的消息（转向）。
@@ -156,7 +154,6 @@ mod tests {
             should_stop: None,
             before_provider_request: None,
             after_provider_response: None,
-            auth: None,
             steer_rx: None,
             follow_up_rx: None,
             retry: None,
