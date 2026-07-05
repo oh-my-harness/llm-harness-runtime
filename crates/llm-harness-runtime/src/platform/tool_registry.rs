@@ -4,7 +4,7 @@ use futures::future::BoxFuture;
 use llm_harness_types::Tool;
 use serde_json::Value;
 
-use crate::error::Result;
+use anyhow::Result;
 
 /// Argument converter function type used in `ToolDefinition`.
 pub type ConverterFn = Arc<dyn Fn(Value) -> std::result::Result<Value, String> + Send + Sync>;

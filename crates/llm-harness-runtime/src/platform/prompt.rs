@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use futures::future::BoxFuture;
 use llm_harness_agent::PromptTemplate;
 
-use crate::error::Result;
+use anyhow::Result;
 
 /// Argument definition for a prompt template parameter.
 #[derive(Debug, Clone)]

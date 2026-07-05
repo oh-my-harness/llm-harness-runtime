@@ -5,7 +5,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use llm_harness_types::ExecutionEnv;
 
-use crate::error::Result;
+use anyhow::Result;
 
 /// Network access rule for sandbox configuration.
 #[derive(Debug, Clone)]

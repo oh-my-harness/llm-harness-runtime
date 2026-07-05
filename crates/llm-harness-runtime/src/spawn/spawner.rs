@@ -18,7 +18,9 @@ use llm_harness_types::{AgentError, AgentEvent, ExecutionEnv, HarnessError, Harn
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::{HarnessBuildError, HarnessBuilder};
-use crate::spawn::peer::{PeerCleanupGuard, PeerDirectory, PeerMessageHook, PeerMetadata, SharedPeerRx};
+use crate::spawn::peer::{
+    PeerCleanupGuard, PeerDirectory, PeerMessageHook, PeerMetadata, SharedPeerRx,
+};
 
 // ── EnvFactory ────────────────────────────────────────────────────────────
 

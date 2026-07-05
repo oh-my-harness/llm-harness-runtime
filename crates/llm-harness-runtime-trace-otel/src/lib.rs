@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
+use anyhow::Result;
 use futures::future::BoxFuture;
-use llm_harness_runtime::error::Result;
 use llm_harness_runtime::observability::tracer::{SpanEvent, TraceExporter};
 
 /// In-memory `TraceExporter` for unit and integration testing.

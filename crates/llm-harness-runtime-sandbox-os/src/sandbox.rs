@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use anyhow::Result;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use llm_harness_runtime::error::Result;
 use llm_harness_runtime::platform::sandbox::{Sandbox, SandboxConfig};
 use llm_harness_types::ExecutionEnv;
 

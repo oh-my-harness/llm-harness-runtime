@@ -15,8 +15,8 @@
 use llm_harness_agent::Plugin;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_loop::{LlmMessage, RequestContent};
-use llm_harness_runtime::spawn::async_spawn::{AsyncSpawnRegistry, IdleWatcher, async_spawn_pair};
 use llm_harness_runtime::builder::HarnessBuilder;
+use llm_harness_runtime::spawn::async_spawn::{AsyncSpawnRegistry, IdleWatcher, async_spawn_pair};
 use llm_harness_runtime::spawn::spawn_tool::SpawnAgentTool;
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_runtime_sandbox_os::{OsEnv, OsEnvFactory};

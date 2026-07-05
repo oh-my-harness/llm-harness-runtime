@@ -18,8 +18,8 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::control::cost::CostAggregate;
-use crate::error::Result;
 use crate::workflow::model::{Step, StepRecord, StepResult, WorkflowContext};
+use anyhow::Result;
 
 pub const JSON_TRANSFORM_EXECUTOR_NAME: &str = "json_transform";
 pub const SHELL_EXECUTOR_NAME: &str = "shell";

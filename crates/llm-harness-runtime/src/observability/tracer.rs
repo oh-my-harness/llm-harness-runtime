@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use uuid::Uuid;
 
-use crate::error::Result;
+use anyhow::Result;
 
 /// Span identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

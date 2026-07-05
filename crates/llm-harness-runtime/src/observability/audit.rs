@@ -4,7 +4,7 @@ use llm_harness_types::EntryId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::Result;
+use anyhow::Result;
 
 /// Type of audit event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

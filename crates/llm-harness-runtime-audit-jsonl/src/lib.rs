@@ -6,8 +6,8 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+use anyhow::Result;
 use llm_harness_runtime::observability::audit::{AuditEntry, AuditSink};
-use llm_harness_runtime::error::Result;
 
 /// JSONL file-backed audit sink with SHA-256 hash-chain integrity.
 ///

@@ -30,7 +30,10 @@ impl SpawnAgentTool {
         }
     }
 
-    pub fn with_peer_directory(mut self, directory: Arc<crate::spawn::peer::PeerDirectory>) -> Self {
+    pub fn with_peer_directory(
+        mut self,
+        directory: Arc<crate::spawn::peer::PeerDirectory>,
+    ) -> Self {
         self.directory = Some(directory);
         self
     }
@@ -195,7 +198,10 @@ mod tests {
     use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
     use llm_harness_types::ExecutionEnv;
 
-    fn make_tool() -> (SpawnAgentTool, Arc<crate::spawn::async_spawn::AsyncSpawnRegistry>) {
+    fn make_tool() -> (
+        SpawnAgentTool,
+        Arc<crate::spawn::async_spawn::AsyncSpawnRegistry>,
+    ) {
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
         let spawner = HarnessSubAgentSpawner::new(
             "test-model",

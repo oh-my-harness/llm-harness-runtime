@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use llm_harness_runtime::observability::audit::{AuditDecision, AuditEntry, AuditEventType, AuditSink};
+use llm_harness_runtime::observability::audit::{
+    AuditDecision, AuditEntry, AuditEventType, AuditSink,
+};
 use llm_harness_runtime_audit_jsonl::JsonlAuditSink;
 use llm_harness_types::EntryId;
 

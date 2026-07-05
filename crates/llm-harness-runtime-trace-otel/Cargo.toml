@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 llm-harness-runtime.workspace = true
+anyhow.workspace = true
 futures.workspace             = true
 
 [dev-dependencies]

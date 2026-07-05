@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::error::Result;
 use crate::lifecycle::task::{Checkpoint, TaskId};
 use crate::workflow::model::{Workflow, WorkflowState};
+use anyhow::Result;
 
 /// 事件等待记录（descriptor + runtime 写入的时间戳）。
 /// 业务层用 saved_at 判断 descriptor 是否过期（如崩溃后很久才恢复）。

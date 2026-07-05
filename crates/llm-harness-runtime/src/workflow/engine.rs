@@ -21,10 +21,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::builder::{HarnessBuildError, HarnessBuilder};
 use crate::control::cost::CostAggregate;
-use crate::error::Result;
-use crate::spawn::spawner::{EnvFactory, HarnessSubAgentSpawner, SessionFactory};
 use crate::lifecycle::task::{Checkpoint, TaskError, TaskId, TaskResult};
 use crate::lifecycle::task_store::TaskStore;
+use crate::spawn::spawner::{EnvFactory, HarnessSubAgentSpawner, SessionFactory};
 use crate::workflow::executor::{ExecutorCtx, StepExecutor, builtin_executors};
 use crate::workflow::judge::{EdgeConditionJudge, NoopJudge, StepCtx, StepTransitionJudge};
 use crate::workflow::model::{
@@ -32,6 +31,7 @@ use crate::workflow::model::{
     WorkflowState, WorkflowStatus,
 };
 use crate::workflow::plan::validate_workflow;
+use anyhow::Result;
 
 /// 内置 tool 名：让 step agent 提交结构化结果。
 pub const SUBMIT_STEP_RESULT_TOOL_NAME: &str = "submit_step_result";

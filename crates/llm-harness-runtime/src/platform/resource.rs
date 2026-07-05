@@ -3,7 +3,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use llm_harness_types::AgentContext;
 
-use crate::error::Result;
+use anyhow::Result;
 
 /// Description of a context resource.
 #[derive(Debug, Clone)]

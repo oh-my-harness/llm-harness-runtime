@@ -10,12 +10,12 @@ use futures::future::BoxFuture;
 use llm_harness_types::{Tool, ToolContext, ToolError, ToolResult};
 use serde::Deserialize;
 
-use crate::error::Result;
 use crate::lifecycle::task::TaskId;
 use crate::lifecycle::task_store::TaskStore;
 use crate::workflow::model::{
     ConditionExpr, Edge, EdgeCondition, Step, StepExecutionPolicy, StepId, Workflow,
 };
+use anyhow::Result;
 
 const MAX_STEP_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_STEP_ATTEMPTS: u32 = 10;

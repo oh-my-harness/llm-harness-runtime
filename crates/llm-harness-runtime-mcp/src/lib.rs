@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use anyhow::Result;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use llm_harness_runtime::error::Result;
 use llm_harness_runtime::platform::mcp::{McpClientHandle, McpError, McpToolDef};
 use llm_harness_runtime::platform::prompt::{PromptSource, PromptSourceTemplate};
 use llm_harness_runtime::platform::tool_registry::{ToolDefinition, ToolExecutionMode, ToolSource};

@@ -26,7 +26,6 @@ agent  ──┘                ──→  runtime-audit-jsonl
 ```
 src/
 ├── lib.rs
-├── error.rs            # 1 行 type alias，几乎所有模块引用，留顶层
 ├── builder.rs          # HarnessBuilder——所有路径汇聚点，留顶层
 ├── platform/           # 横切 trait + adapter（后端 crate 实现的接口）
 │   ├── sandbox.rs      # Sandbox trait + SandboxConfig/NetRule/ResourceLimits
@@ -120,9 +119,7 @@ src/
 ### 2.8 杂项
 | 模块 | 职责 |
 |---|---|
-| `error.rs` | `pub type Result<T> = std::result::Result<T, anyhow::Error>;` |
-| `lib.rs` | `pub mod` 声明：顶层 `builder`/`error`/`workflow` + 5 个分组 `control`/`lifecycle`/`observability`/`platform`/`spawn`。无 re-export，路径即物理路径。 |
-
+| `lib.rs` | `pub mod` 声明：顶层 `builder`/`workflow` + 5 个分组 `control`/`lifecycle`/`observability`/`platform`/`spawn`。无 re-export，路径即物理路径。错误处理直接用 `anyhow::Result`，无独立 error 模块。 |
 ## 3. 核心抽象 trait 清单
 
 runtime 定义的对外 trait（业务层/后端 crate 实现）：
@@ -228,7 +225,7 @@ run()
 
 ## 6. 阅读顺序建议
 
-1. `lib.rs`（模块清单）→ `error.rs` / `control/cost.rs` / `lifecycle/task.rs`（基础类型）
+1. `lib.rs`（模块清单）→ `control/cost.rs` / `lifecycle/task.rs`（基础类型）
 2. `builder.rs`（HarnessBuilder 是所有路径的汇聚点）
 3. `spawn/spawner.rs` + `spawn/async_spawn.rs` + `spawn/peer.rs`（sub-agent 派发 + 通信）
 4. `workflow/model.rs`（纯数据模型）→ `workflow/judge.rs` → `workflow/gate.rs` → `workflow/plan.rs`（编排外围）

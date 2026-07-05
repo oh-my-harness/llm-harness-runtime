@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::error::Error;
 
-use crate::error::Result;
+use anyhow::Result;
 
 /// MCP client handle — trait that the business layer implements.
 /// Runtime does NOT bind to any specific MCP SDK.
