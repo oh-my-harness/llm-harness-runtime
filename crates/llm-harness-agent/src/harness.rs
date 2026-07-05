@@ -572,6 +572,10 @@ impl AgentHarness {
         session: Session,
         opts: AgentHarnessOptions,
     ) -> Self {
+        assert!(
+            opts.queue_capacity > 0,
+            "queue_capacity must be > 0; a capacity of 0 creates a rendezvous channel where try_send almost always fails, silently breaking steer/follow-up"
+        );
         let cap = opts.queue_capacity;
         let (steer_tx, _steer_rx) = mpsc::channel(cap);
         let (follow_up_tx, _follow_up_rx) = mpsc::channel(cap);
@@ -3300,6 +3304,19 @@ mod tests {
         // navigate_tree: same target id; phase must return to Idle.
         let _ = h.navigate_tree(from).await;
         assert_eq!(h.state().phase, HarnessPhase::Idle);
+    }
+    #[test]
+    #[should_panic(expected = "queue_capacity must be > 0")]
+    fn with_session_rejects_zero_queue_capacity() {
+        let client: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![]));
+        let env: Arc<dyn ExecutionEnv> = Arc::new(NoOpEnv);
+        let repo = InMemorySessionRepo::new();
+        let storage = futures::executor::block_on(repo.create(CreateSessionOptions::default()))
+            .expect("in-memory session creation cannot fail");
+        let session = Session::new(storage);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        opts.queue_capacity = 0;
+        let _ = AgentHarness::with_session(client, env, session, opts);
     }
 }
 

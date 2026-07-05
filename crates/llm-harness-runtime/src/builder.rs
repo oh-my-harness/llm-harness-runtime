@@ -24,9 +24,10 @@ use llm_harness_agent::{
     AgentHarness, AgentHarnessOptions, CompactionModelConfig, HarnessHooks, ModelInfo, Plugin,
     PromptTemplate, Skill,
 };
-use llm_harness_loop::LlmClient;
+use llm_harness_loop::{ConvertToLlmHook, FinalAnswerMode, LlmClient, RetryConfig};
 use llm_harness_types::{
-    AfterProviderResponseHook, CostAggregate, ExecutionEnv, PricingProvider, ShouldStopHook, Tool,
+    AfterProviderResponseHook, CostAggregate, ExecutionEnv, PricingProvider, ShouldStopHook,
+    StreamOptions, ThinkingLevel, Tool,
 };
 
 use crate::control::{
@@ -131,6 +132,28 @@ pub struct HarnessBuilder {
     /// Client is resolved at build time. When set, compaction summaries use
     /// this provider instead of the main conversation client.
     compaction_model: Option<(String, ModelInfo)>,
+    /// Initial system prompt.
+    system_prompt: Option<String>,
+    /// Initial thinking level.
+    thinking_level: Option<ThinkingLevel>,
+    /// Initial sampling temperature.
+    temperature: Option<f32>,
+    /// Optional model metadata (context_window, etc.).
+    model_info: Option<ModelInfo>,
+    /// Retry config for transient provider errors.
+    retry: Option<RetryConfig>,
+    /// Final-answer classification mode.
+    final_answer_mode: Option<FinalAnswerMode>,
+    /// Custom context converter.
+    convert_to_llm: Option<Arc<dyn ConvertToLlmHook>>,
+    /// Stream options for LLM requests.
+    stream_options: Option<StreamOptions>,
+    /// Compaction reserved response tokens override.
+    compaction_reserve_tokens: Option<u32>,
+    /// Compaction keep-recent tokens override.
+    compaction_keep_recent_tokens: Option<u32>,
+    /// Steer/follow-up queue capacity.
+    queue_capacity: Option<usize>,
 }
 
 impl HarnessBuilder {
@@ -153,6 +176,17 @@ impl HarnessBuilder {
             cost: None,
             max_tokens: None,
             compaction_model: None,
+            system_prompt: None,
+            thinking_level: None,
+            temperature: None,
+            model_info: None,
+            retry: None,
+            final_answer_mode: None,
+            convert_to_llm: None,
+            stream_options: None,
+            compaction_reserve_tokens: None,
+            compaction_keep_recent_tokens: None,
+            queue_capacity: None,
         }
     }
 
@@ -279,6 +313,72 @@ impl HarnessBuilder {
     /// in `compact()`. The compaction client is resolved at build time
     pub fn compaction_model(mut self, model: impl Into<String>, model_info: ModelInfo) -> Self {
         self.compaction_model = Some((model.into(), model_info));
+        self
+    }
+
+    /// Set the initial system prompt. `None` resets to default (no system prompt).
+    pub fn system_prompt(mut self, prompt: Option<String>) -> Self {
+        self.system_prompt = prompt;
+        self
+    }
+
+    /// Set the initial thinking level.
+    pub fn thinking_level(mut self, level: ThinkingLevel) -> Self {
+        self.thinking_level = Some(level);
+        self
+    }
+
+    /// Set the initial sampling temperature. `None` resets to provider default.
+    pub fn temperature(mut self, temp: Option<f32>) -> Self {
+        self.temperature = temp;
+        self
+    }
+
+    /// Set model metadata (context_window, max_tokens). `None` resets to default.
+    pub fn model_info(mut self, info: Option<ModelInfo>) -> Self {
+        self.model_info = info;
+        self
+    }
+
+    /// Set retry config for transient provider errors. `None` disables retry.
+    pub fn retry(mut self, config: Option<RetryConfig>) -> Self {
+        self.retry = config;
+        self
+    }
+
+    /// Set the final-answer classification mode.
+    pub fn final_answer_mode(mut self, mode: FinalAnswerMode) -> Self {
+        self.final_answer_mode = Some(mode);
+        self
+    }
+
+    /// Set a custom context converter. `None` uses `DefaultConvertToLlm`.
+    pub fn convert_to_llm(mut self, converter: Option<Arc<dyn ConvertToLlmHook>>) -> Self {
+        self.convert_to_llm = converter;
+        self
+    }
+
+    /// Set stream options for LLM requests. `None` resets to default.
+    pub fn stream_options(mut self, opts: Option<StreamOptions>) -> Self {
+        self.stream_options = opts;
+        self
+    }
+
+    /// Override compaction reserved response tokens. `None` uses compaction default.
+    pub fn compaction_reserve_tokens(mut self, tokens: Option<u32>) -> Self {
+        self.compaction_reserve_tokens = tokens;
+        self
+    }
+
+    /// Override compaction keep-recent tokens. `None` uses compaction default.
+    pub fn compaction_keep_recent_tokens(mut self, tokens: Option<u32>) -> Self {
+        self.compaction_keep_recent_tokens = tokens;
+        self
+    }
+
+    /// Set steer/follow-up queue capacity. `None` resets to default (32).
+    pub fn queue_capacity(mut self, capacity: Option<usize>) -> Self {
+        self.queue_capacity = capacity;
         self
     }
 
@@ -420,6 +520,41 @@ impl HarnessBuilder {
                 exceeded_hook.clone(),
             ));
             opts.hooks.should_stop.push(budget_adapter);
+        }
+
+        // ── 由 setter 配置的可选字段 ──
+        if let Some(ref prompt) = self.system_prompt {
+            opts.system_prompt = Some(prompt.clone());
+        }
+        if let Some(level) = self.thinking_level {
+            opts.thinking_level = level;
+        }
+        if let Some(temp) = self.temperature {
+            opts.temperature = Some(temp);
+        }
+        if let Some(ref info) = self.model_info {
+            opts.model_info = Some(info.clone());
+        }
+        if let Some(ref config) = self.retry {
+            opts.retry = Some(config.clone());
+        }
+        if let Some(mode) = &self.final_answer_mode {
+            opts.final_answer_mode = mode.clone();
+        }
+        if let Some(ref converter) = self.convert_to_llm {
+            opts.convert_to_llm = Some(converter.clone());
+        }
+        if let Some(ref opts_so) = self.stream_options {
+            opts.stream_options = opts_so.clone();
+        }
+        if let Some(tokens) = self.compaction_reserve_tokens {
+            opts.compaction_reserve_tokens = Some(tokens);
+        }
+        if let Some(tokens) = self.compaction_keep_recent_tokens {
+            opts.compaction_keep_recent_tokens = Some(tokens);
+        }
+        if let Some(cap) = self.queue_capacity {
+            opts.queue_capacity = cap;
         }
 
         opts
@@ -900,5 +1035,153 @@ mod tests {
             .max_tokens(2048)
             .build_options(None);
         assert_eq!(opts.max_tokens, 2048);
+    }
+    #[test]
+    fn builder_setters_exist() {
+        // 只验证 setter 存在且返回 Self（链式）；具体值断言见后续测试。
+        let _ = HarnessBuilder::new("m")
+            .system_prompt(Some("hi".to_string()))
+            .thinking_level(ThinkingLevel::High)
+            .temperature(Some(0.7))
+            .model_info(Some(ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            }))
+            .retry(Some(RetryConfig {
+                max_retries: 3,
+                base_delay_ms: 500,
+            }))
+            .final_answer_mode(FinalAnswerMode::default())
+            .convert_to_llm(None)
+            .stream_options(Some(StreamOptions::default()))
+            .compaction_reserve_tokens(Some(1024))
+            .compaction_keep_recent_tokens(Some(2048))
+            .queue_capacity(Some(64));
+    }
+    // ── build_options field propagation tests (Task 4) ────────────────────────
+
+    #[test]
+    fn build_options_applies_system_prompt() {
+        let opts = HarnessBuilder::new("m")
+            .system_prompt(Some("be brief".to_string()))
+            .build_options(None);
+        assert_eq!(opts.system_prompt.as_deref(), Some("be brief"));
+    }
+
+    #[test]
+    fn build_options_applies_thinking_level() {
+        let opts = HarnessBuilder::new("m")
+            .thinking_level(ThinkingLevel::High)
+            .build_options(None);
+        assert_eq!(opts.thinking_level, ThinkingLevel::High);
+    }
+
+    #[test]
+    fn build_options_applies_temperature() {
+        let opts = HarnessBuilder::new("m")
+            .temperature(Some(0.7))
+            .build_options(None);
+        assert_eq!(opts.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn build_options_temperature_none_resets() {
+        let opts = HarnessBuilder::new("m")
+            .temperature(Some(0.7))
+            .temperature(None)
+            .build_options(None);
+        assert_eq!(opts.temperature, None);
+    }
+
+    #[test]
+    fn build_options_applies_model_info() {
+        let info = ModelInfo {
+            context_window: 200_000,
+            max_tokens: 8192,
+        };
+        let opts = HarnessBuilder::new("m")
+            .model_info(Some(info.clone()))
+            .build_options(None);
+        let got = opts.model_info.expect("model_info should be set");
+        assert_eq!(got.context_window, info.context_window);
+        assert_eq!(got.max_tokens, info.max_tokens);
+    }
+
+    #[test]
+    fn build_options_applies_retry() {
+        let cfg = RetryConfig {
+            max_retries: 3,
+            base_delay_ms: 500,
+        };
+        let opts = HarnessBuilder::new("m")
+            .retry(Some(cfg.clone()))
+            .build_options(None);
+        let got = opts.retry.expect("retry should be set");
+        assert_eq!(got.max_retries, cfg.max_retries);
+        assert_eq!(got.base_delay_ms, cfg.base_delay_ms);
+    }
+
+    #[test]
+    fn build_options_applies_final_answer_mode() {
+        let mode = FinalAnswerMode::default();
+        let opts = HarnessBuilder::new("m")
+            .final_answer_mode(mode.clone())
+            .build_options(None);
+        assert_eq!(opts.final_answer_mode, mode);
+    }
+
+    #[test]
+    fn build_options_applies_stream_options() {
+        let so = StreamOptions {
+            timeout_ms: Some(30_000),
+            ..StreamOptions::default()
+        };
+        let opts = HarnessBuilder::new("m")
+            .stream_options(Some(so.clone()))
+            .build_options(None);
+        assert_eq!(opts.stream_options.timeout_ms, so.timeout_ms);
+    }
+
+    #[test]
+    fn build_options_applies_compaction_reserve_tokens() {
+        let opts = HarnessBuilder::new("m")
+            .compaction_reserve_tokens(Some(1024))
+            .build_options(None);
+        assert_eq!(opts.compaction_reserve_tokens, Some(1024));
+    }
+
+    #[test]
+    fn build_options_applies_compaction_keep_recent_tokens() {
+        let opts = HarnessBuilder::new("m")
+            .compaction_keep_recent_tokens(Some(2048))
+            .build_options(None);
+        assert_eq!(opts.compaction_keep_recent_tokens, Some(2048));
+    }
+
+    #[test]
+    fn build_options_applies_queue_capacity() {
+        let opts = HarnessBuilder::new("m")
+            .queue_capacity(Some(64))
+            .build_options(None);
+        assert_eq!(opts.queue_capacity, 64);
+    }
+
+    #[test]
+    fn build_options_defaults_when_no_setter_called() {
+        let opts = HarnessBuilder::new("m").build_options(None);
+        assert_eq!(opts.system_prompt, None);
+        assert_eq!(opts.thinking_level, ThinkingLevel::Off);
+        assert_eq!(opts.temperature, None);
+        assert!(opts.model_info.is_none());
+        assert!(opts.retry.is_none());
+        assert_eq!(opts.final_answer_mode, FinalAnswerMode::default());
+        assert!(opts.convert_to_llm.is_none());
+        assert_eq!(
+            opts.stream_options.timeout_ms,
+            StreamOptions::default().timeout_ms
+        );
+        assert_eq!(opts.compaction_reserve_tokens, None);
+        assert_eq!(opts.compaction_keep_recent_tokens, None);
+        assert_eq!(opts.queue_capacity, 32); // DEFAULT_QUEUE_CAPACITY
     }
 }
