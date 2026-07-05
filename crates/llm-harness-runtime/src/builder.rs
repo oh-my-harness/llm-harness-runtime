@@ -122,10 +122,6 @@ pub struct HarnessBuilder {
     /// 可选的预算上限 + 超限 hook。设置后，一个 `BudgetControlAdapter`
     /// 会被注入 `should_stop`，与 `CostAccumulatorHook` 共享同一 cost Arc。
     budget: Option<(f64, Option<Arc<dyn BudgetExceededHook>>)>,
-    /// 共享成本状态。在 `build_options` 中惰性创建；由
-    /// `CostAccumulatorHook`、`BudgetControlAdapter` 和
-    /// `AgentHarnessOptions.cost` 共享。
-    cost: Option<Arc<Mutex<CostAggregate>>>,
     /// Optional maximum output tokens per provider call.
     max_tokens: Option<u32>,
     /// Optional independent compaction model config (model ID + metadata).
@@ -173,7 +169,6 @@ impl HarnessBuilder {
             providers: vec![],
             pricing: None,
             budget: None,
-            cost: None,
             max_tokens: None,
             compaction_model: None,
             system_prompt: None,
@@ -200,8 +195,10 @@ impl HarnessBuilder {
     /// - **Skills**: appended to the skills list
     /// - **Templates**: appended to the templates list
     ///
-    /// If two plugins register tools or skills with the same name, both are added.
-    /// Conflict resolution happens at tool dispatch time (framework-dependent).
+    /// If two plugins register tools or skills with the same name, both are
+    /// added — `install` neither deduplicates nor diagnoses. Tool dispatch
+    /// resolves duplicates by last-registration-wins; skill/template lookup
+    /// resolves by first-registration-wins. See `Plugin` trait docs for details.
     ///
     /// # Arguments
     ///
@@ -399,9 +396,7 @@ impl HarnessBuilder {
         self,
         env: Arc<dyn ExecutionEnv>,
     ) -> Result<AgentHarness, HarnessBuildError> {
-        let client = self.resolve_provider(&self.model)?;
-        let compaction = self.resolve_compaction()?;
-        let opts = self.build_options(compaction);
+        let (client, opts) = self.resolve_and_build()?;
         Ok(AgentHarness::new_in_memory(client, env, opts).await)
     }
 
@@ -424,10 +419,18 @@ impl HarnessBuilder {
         env: Arc<dyn ExecutionEnv>,
         session: llm_harness_agent::Session,
     ) -> Result<AgentHarness, HarnessBuildError> {
+        let (client, opts) = self.resolve_and_build()?;
+        Ok(AgentHarness::with_session(client, env, session, opts))
+    }
+
+    /// Resolve provider, compaction config, and build options from builder state.
+    fn resolve_and_build(
+        self,
+    ) -> Result<(Arc<dyn LlmClient>, AgentHarnessOptions), HarnessBuildError> {
         let client = self.resolve_provider(&self.model)?;
         let compaction = self.resolve_compaction()?;
         let opts = self.build_options(compaction);
-        Ok(AgentHarness::with_session(client, env, session, opts))
+        Ok((client, opts))
     }
 
     /// Resolve an LLM provider for the given model ID.
@@ -498,13 +501,10 @@ impl HarnessBuilder {
         }
         opts.compaction_model = compaction;
 
-        // 惰性创建共享 cost 状态。即使没有 pricing/budget，
+        // 创建共享 cost 状态。即使没有 pricing/budget，
         // 也注入 CostAccumulatorHook，使 token 计数始终能通过
         // AgentHarness::usage() 读取。
-        let cost = self
-            .cost
-            .clone()
-            .unwrap_or_else(|| Arc::new(Mutex::new(CostAggregate::default())));
+        let cost = Arc::new(Mutex::new(CostAggregate::default()));
         opts.cost = cost.clone();
 
         // 注入内置成本累积器（始终注入，使 usage() 可用）。

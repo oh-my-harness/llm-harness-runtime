@@ -28,18 +28,25 @@ use llm_harness_types::Tool;
 ///
 /// ## Conflict Resolution
 ///
-/// Two plugin types can conflict:
+/// `install` does not deduplicate or diagnose name conflicts at registration
+/// time; the four contribution vectors are appended as-is. Behavior when two
+/// plugins contribute the same name differs by resource type:
 ///
-/// 1. **Tool name conflicts**: If two plugins register tools with the same `name()`,
-///    both are added to the registry. The harness tool dispatcher will see both;
-///    the behavior depends on the dispatcher implementation (typically: first match,
-///    or error on duplicate).
+/// 1. **Tool name conflicts**: both tools are kept in the `Vec<Arc<dyn Tool>>`.
+///    At dispatch time the loop builds a `HashMap<&str, Arc<dyn Tool>>` keyed by
+///    `name()`, so the **last-registered** tool with a given name wins (the
+///    earlier entry is silently shadowed). No diagnostic is emitted.
 ///
-/// 2. **Skill/template name conflicts**: If two plugins provide the same skill or
-///    template name, both are added. Skills/templates are looked up by name; which
-///    one is used depends on the lookup order and de-duplication logic.
+/// 2. **Skill / template name conflicts**: both entries are kept. Lookup uses
+///    `iter().find(|s| s.name == name)`, so the **first-registered** entry wins.
+///    No diagnostic is emitted on the `install` path. (By contrast, the
+///    directory-loading path — `load_skills` / `load_prompt_templates` — emits
+///    a `duplicate ... name` warning diagnostic; that path is not taken for
+///    plugin-contributed skills/templates.)
 ///
-/// Applications should document plugin loading order and test for conflicts.
+/// Applications that care about conflict visibility should validate plugin
+/// contributions before calling `install`, or rely on directory loading (which
+/// does diagnose duplicates).
 ///
 /// ## Minimal Example
 ///
