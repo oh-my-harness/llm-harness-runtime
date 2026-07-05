@@ -1467,14 +1467,9 @@ impl AgentHarness {
         let composite = Arc::new(CompositeBeforeRunHook::new(self.hooks.before_run.clone()));
         let (skills, templates) = {
             let inner = self.inner.lock().unwrap();
-            let snames: Vec<String> = inner.skills.iter().map(|s| s.name.clone()).collect();
-            let tnames: Vec<String> = inner.templates.iter().map(|t| t.name.clone()).collect();
-            (snames, tnames)
+            (inner.skills.clone(), inner.templates.clone())
         };
-        let resources = AgentHarnessResources {
-            skill_names: skills,
-            template_names: templates,
-        };
+        let resources = AgentHarnessResources { skills, templates };
         let prompt_text = initial
             .iter()
             .find_map(|m| {

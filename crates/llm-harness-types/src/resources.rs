@@ -1,7 +1,9 @@
+use crate::{PromptTemplate, Skill};
+
 /// Harness runtime resources, provided via `BeforeRunHook` context.
 pub struct AgentHarnessResources {
-    /// Names of the loaded skills.
-    pub skill_names: Vec<String>,
-    /// Names of the loaded prompt templates.
-    pub template_names: Vec<String>,
+    /// Loaded skills (full content available to hooks).
+    pub skills: Vec<Skill>,
+    /// Loaded prompt templates.
+    pub templates: Vec<PromptTemplate>,
 }
