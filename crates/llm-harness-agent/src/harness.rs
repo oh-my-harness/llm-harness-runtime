@@ -576,6 +576,12 @@ impl AgentHarness {
             opts.queue_capacity > 0,
             "queue_capacity must be > 0; a capacity of 0 creates a rendezvous channel where try_send almost always fails, silently breaking steer/follow-up"
         );
+        // Deduplicate skills and templates (first-wins). This is the single
+        // convergence point for all construction paths; regardless of how
+        // opts was assembled, inner.skills / inner.templates will have no
+        // duplicate names after this.
+        let skills = dedup_skills(opts.skills);
+        let templates = dedup_templates(opts.templates);
         let cap = opts.queue_capacity;
         let (steer_tx, _steer_rx) = mpsc::channel(cap);
         let (follow_up_tx, _follow_up_rx) = mpsc::channel(cap);
@@ -603,8 +609,8 @@ impl AgentHarness {
 
         let inner = HarnessInner {
             state,
-            skills: opts.skills,
-            templates: opts.templates,
+            skills,
+            templates,
             steer_tx,
             follow_up_tx,
             cost: opts.cost,
@@ -638,7 +644,27 @@ impl AgentHarness {
             stream_options: opts.stream_options,
         }
     }
+}
 
+/// Deduplicate skills by name, keeping the first occurrence (first-wins).
+fn dedup_skills(skills: Vec<Skill>) -> Vec<Skill> {
+    let mut seen = HashSet::new();
+    skills
+        .into_iter()
+        .filter(|s| seen.insert(s.name.clone()))
+        .collect()
+}
+
+/// Deduplicate templates by name, keeping the first occurrence (first-wins).
+fn dedup_templates(templates: Vec<PromptTemplate>) -> Vec<PromptTemplate> {
+    let mut seen = HashSet::new();
+    templates
+        .into_iter()
+        .filter(|t| seen.insert(t.name.clone()))
+        .collect()
+}
+
+impl AgentHarness {
     // ── Structural operations (Idle only) ─────────────────────────────────
 
     /// Start a new run from a text prompt.
@@ -768,7 +794,8 @@ impl AgentHarness {
         let (templates, tmpl_diags) =
             load_prompt_templates(self.env.as_ref(), &template_dirs).await;
         diags.extend(tmpl_diags);
-
+        let skills = dedup_skills(skills);
+        let templates = dedup_templates(templates);
         let (skill_count, tmpl_count) = (skills.len(), templates.len());
         {
             let mut inner = self.inner.lock().unwrap();
@@ -785,13 +812,13 @@ impl AgentHarness {
     /// Append skills to the existing skill list without replacing it.
     ///
     /// Unlike `reload_resources`, this does not load from directories —
-    /// the caller provides already-loaded `Skill` values. Useful for
-    /// merging skills from multiple sources (directories, MCP, plugins)
-    /// at runtime.
     pub fn add_skills(&self, skills: Vec<Skill>) {
         let (skill_count, template_count) = {
             let mut inner = self.inner.lock().unwrap();
-            inner.skills.extend(skills);
+            let existing: HashSet<String> = inner.skills.iter().map(|s| s.name.clone()).collect();
+            inner
+                .skills
+                .extend(skills.into_iter().filter(|s| !existing.contains(&s.name)));
             (inner.skills.len(), inner.templates.len())
         };
         self.emit(AgentHarnessEvent::ResourcesUpdate {
@@ -805,7 +832,13 @@ impl AgentHarness {
     pub fn add_templates(&self, templates: Vec<PromptTemplate>) {
         let (skill_count, template_count) = {
             let mut inner = self.inner.lock().unwrap();
-            inner.templates.extend(templates);
+            let existing: HashSet<String> =
+                inner.templates.iter().map(|t| t.name.clone()).collect();
+            inner.templates.extend(
+                templates
+                    .into_iter()
+                    .filter(|t| !existing.contains(&t.name)),
+            );
             (inner.skills.len(), inner.templates.len())
         };
         self.emit(AgentHarnessEvent::ResourcesUpdate {
@@ -3395,6 +3428,60 @@ mod tests {
         assert_eq!(h.templates().len(), 2);
         assert_eq!(h.templates()[0].name, "tmpl-a");
         assert_eq!(h.templates()[1].name, "tmpl-b");
+    }
+    #[test]
+    fn add_skills_deduplicates_first_wins() {
+        let h = make_harness(vec![]);
+        h.add_skills(vec![make_skill("shared", "original")]);
+        h.add_skills(vec![make_skill("shared", "should be dropped")]);
+        assert_eq!(h.skills().len(), 1);
+        assert_eq!(h.skills()[0].description, "original");
+    }
+
+    #[test]
+    fn add_templates_deduplicates_first_wins() {
+        let h = make_harness(vec![]);
+        let tmpl = |name: &str, desc: &str| PromptTemplate {
+            name: name.into(),
+            description: desc.into(),
+            content: format!("{name} $1"),
+            source: std::path::PathBuf::from(format!("/templates/{name}.md")),
+        };
+        h.add_templates(vec![tmpl("shared", "original")]);
+        h.add_templates(vec![tmpl("shared", "should be dropped")]);
+        assert_eq!(h.templates().len(), 1);
+        assert_eq!(h.templates()[0].description, "original");
+    }
+
+    #[test]
+    fn with_session_deduplicates_skills_in_opts() {
+        let client: Arc<dyn LlmClient> = Arc::new(MockLlmClient::new(vec![]));
+        let env: Arc<dyn ExecutionEnv> = Arc::new(NoOpEnv);
+        let repo = InMemorySessionRepo::new();
+        let storage = futures::executor::block_on(repo.create(CreateSessionOptions::default()))
+            .expect("in-memory session creation cannot fail");
+        let session = Session::new(storage);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        opts.skills = vec![make_skill("dup", "first"), make_skill("dup", "second")];
+        opts.templates = vec![
+            PromptTemplate {
+                name: "t".into(),
+                description: "first".into(),
+                content: "x".into(),
+                source: std::path::PathBuf::from("/t.md"),
+            },
+            PromptTemplate {
+                name: "t".into(),
+                description: "second".into(),
+                content: "x".into(),
+                source: std::path::PathBuf::from("/t2.md"),
+            },
+        ];
+        let h = AgentHarness::with_session(client, env, session, opts);
+        assert_eq!(h.skills().len(), 1);
+        assert_eq!(h.skills()[0].description, "first");
+        assert_eq!(h.templates().len(), 1);
+        assert_eq!(h.templates()[0].description, "first");
     }
 }
 
