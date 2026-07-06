@@ -84,6 +84,9 @@ pub struct StepExecutionPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     /// Maximum execution attempts for step execution failures. Includes the first attempt.
+    ///
+    /// Independent from judge-produced `Transition::Retry` (limited by `max_retries`).
+    /// Worst case total executions per step = `max_attempts × max_retries`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_attempts: Option<u32>,
     /// Fixed delay before retrying a failed attempt, in milliseconds.

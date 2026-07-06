@@ -41,6 +41,10 @@ const DEFAULT_MAX_STEPS: usize = 100;
 
 /// 默认 Retry 上限。连续 Retry 超限 → Failed。
 /// 语义：允许的连续 Retry 次数（不含原始执行）。max_retries=5 时第 6 次触发 Failed。
+///
+/// 注意：与 StepExecutionPolicy.max_attempts 独立。最坏情况下单步总执行次数
+/// = max_retries × max_attempts（judge Retry 触发完整 policy retry 循环）。
+/// max_steps 是最终兜底。如需更严格的联合上限，在业务层自行限制。
 const DEFAULT_MAX_RETRIES: usize = 5;
 
 /// SubmitStepResultTool 提交的 JSON payload 大小上限（bytes）。
@@ -221,6 +225,7 @@ fn format_sub_agent_failure(e: &AgentError) -> String {
 // ── WorkflowEngineConfig ───────────────────────────────────────────────────
 
 /// 打包 WorkflowEngine 构造器的共用参数，避免 new/new_free_task/restore 传 5 个散参。
+#[derive(Clone)]
 pub struct WorkflowEngineConfig {
     pub client: Arc<dyn LlmClient>,
     pub model: String,
@@ -622,6 +627,9 @@ impl WorkflowEngine {
     }
 
     /// 设置 Retry 上限。默认 `DEFAULT_MAX_RETRIES`，连续 Retry 超限 → Failed。
+    ///
+    /// 此上限与 `StepExecutionPolicy.max_attempts` 独立：judge Retry 触发后，
+    /// 每次重跑仍会执行完整的 policy retry 循环。最坏情况单步执行次数 = max_retries × max_attempts。
     #[must_use]
     pub fn with_max_retries(mut self, max: usize) -> Self {
         self.max_retries = max;
@@ -1410,15 +1418,35 @@ impl WorkflowEngine {
         Ok(())
     }
 
-    /// Prepare a paused task for continuation.
+    /// Prepare a paused or failed task for continuation.
     ///
-    /// `run()` owns the `Paused -> Running` transition and drives execution.
-    /// Keeping that single state-machine entry point prevents an explicit
-    /// resume from being mistaken for crash recovery of an already-running task.
+    /// Accepts `Paused` (operator-initiated pause) and `Failed` (transient error
+    /// such as LLM 403 / network blip). Resets to `Paused` so that `run()` —
+    /// which owns the `Paused -> Running` transition — can drive execution
+    /// from `current_step`.
+    ///
+    /// `Succeeded` and `Cancelled` are terminal and cannot be resumed.
+    ///
+    /// **Side-effect policy**: Runtime only resets the state machine; it does
+    /// NOT manage step-level side effects (e.g. cached PanGen results). The
+    /// step executor is responsible for deciding whether to recompute — a
+    /// resumed `Failed` step will be re-driven by `run_loop`, and the executor
+    /// decides to skip/recompute based on its own domain markers.
     pub async fn resume(&self) -> Result<()> {
         let mut state = self.workflow_state.lock().await;
-        if state.status != WorkflowStatus::Paused {
-            anyhow::bail!("resume: task is not Paused (status={:?})", state.status);
+        match state.status {
+            WorkflowStatus::Paused => {}
+            WorkflowStatus::Failed => {
+                // Reset Failed → Paused so run() can pick it up.
+                state.status = WorkflowStatus::Paused;
+                state.reason = None;
+                state.error = None;
+                state.result = None;
+                state.ended_at = None;
+            }
+            ref s => {
+                anyhow::bail!("resume: task is not Paused/Failed (status={:?})", s);
+            }
         }
         self.pause_requested
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -2478,6 +2506,117 @@ mod engine_tests {
             vec!["s1", "s2"]
         );
         assert_eq!(result.final_message.as_deref(), Some("step2 done"));
+    }
+
+    /// #36: a task that enters `Failed` due to a transient error (e.g. LLM 403)
+    /// can be resumed via `resume()` (Failed → Paused) and then `run()` picks it
+    /// up from `current_step`, retrying the failed step.
+    #[tokio::test]
+    async fn failed_task_can_be_resumed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+            edges: vec![],
+        };
+        // Simulate a task that already entered Failed (e.g. transient LLM error).
+        let mut state = WorkflowState::new("s1".into());
+        state.status = WorkflowStatus::Failed;
+        state.error = Some(TaskError::Internal("step 's1' failed: LLM 403".into()));
+        state.started_at = Some(chrono::Utc::now());
+        state.ended_at = Some(chrono::Utc::now());
+        let task_id = TaskId("failed-resume".into());
+        store.save_workflow(&task_id, &workflow).await.unwrap();
+        store.save_workflow_state(&task_id, &state).await.unwrap();
+
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step1 done")]));
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::restore(store, task_id, config, Arc::new(NoopJudge))
+            .await
+            .unwrap();
+        assert_eq!(engine.state().await, WorkflowStatus::Failed);
+
+        // resume() resets Failed → Paused.
+        engine.resume().await.unwrap();
+        assert_eq!(engine.state().await, WorkflowStatus::Paused);
+
+        // run() retries from current_step (s1), succeeds.
+        engine.run().await.unwrap();
+        assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// #36: `Succeeded` is terminal — resume() must reject it.
+    #[tokio::test]
+    async fn succeeded_task_cannot_be_resumed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+            edges: vec![],
+        };
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+        engine.run().await.unwrap();
+        assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+
+        let err = engine.resume().await.unwrap_err();
+        assert!(err.to_string().contains("not Paused/Failed"));
+    }
+
+    /// #36: restore() a persisted Failed task, then resume() + run() recovers.
+    #[tokio::test]
+    async fn restore_failed_then_resume_recovers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        let task_id = TaskId("restore-failed".into());
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+            edges: vec![],
+        };
+        // Persist a Failed state.
+        let mut state = WorkflowState::new("s1".into());
+        state.status = WorkflowStatus::Failed;
+        state.error = Some(TaskError::Internal("LLM 403".into()));
+        state.started_at = Some(chrono::Utc::now());
+        state.ended_at = Some(chrono::Utc::now());
+        store.save_workflow(&task_id, &workflow).await.unwrap();
+        store.save_workflow_state(&task_id, &state).await.unwrap();
+
+        // restore() loads the Failed task.
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step1 done")]));
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let restored = WorkflowEngine::restore(store, task_id, config, Arc::new(NoopJudge))
+            .await
+            .unwrap();
+        assert_eq!(restored.state().await, WorkflowStatus::Failed);
+
+        // resume() + run() recovers.
+        restored.resume().await.unwrap();
+        restored.run().await.unwrap();
+        assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

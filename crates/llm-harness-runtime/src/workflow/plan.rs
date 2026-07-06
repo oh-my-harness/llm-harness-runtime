@@ -128,6 +128,31 @@ pub fn validate_workflow(wf: &Workflow) -> Result<()> {
             MAX_EDGES
         );
     }
+
+    // Warn: 同一步的出边不应混用 Expr 和 Label 条件。
+    // Expr 边由 EdgeConditionJudge 声明式求值，Label 边需要自定义 judge 处理。
+    // 混用容易误用：Label 边在 EdgeConditionJudge 中不参与匹配，仅作报错信息。
+    use std::collections::HashMap;
+    let mut edges_by_from: HashMap<&str, Vec<&EdgeCondition>> = HashMap::new();
+    for edge in &wf.edges {
+        if let Some(cond) = &edge.condition {
+            edges_by_from
+                .entry(edge.from.as_str())
+                .or_default()
+                .push(cond);
+        }
+    }
+    for (from, conds) in &edges_by_from {
+        let has_expr = conds.iter().any(|c| matches!(c, EdgeCondition::Expr(_)));
+        let has_label = conds.iter().any(|c| matches!(c, EdgeCondition::Label(_)));
+        if has_expr && has_label {
+            eprintln!(
+                "validate_workflow: warning: step '{}' has mixed Expr + Label edge conditions                  (Expr edges are evaluated by EdgeConditionJudge; Label edges require a custom judge)",
+                from
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -606,4 +631,33 @@ mod tests {
         assert!(tool.execute(args, &make_tool_ctx()).await.is_err());
         assert!(store.load_workflow(&task_id).await.unwrap().is_none());
     }
+}
+
+#[test]
+fn mixed_expr_label_edges_passes_with_warning() {
+    // Mixed Expr + Label edges should not fail validation (only warns).
+    let wf = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "A", "do A", vec![]),
+            Step::llm("s2", "B", "do B", vec![]),
+            Step::llm("s3", "C", "do C", vec![]),
+        ],
+        edges: vec![
+            Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: Some(EdgeCondition::Label("success".into())),
+            },
+            Edge {
+                from: "s1".into(),
+                to: "s3".into(),
+                condition: Some(EdgeCondition::Expr(ConditionExpr::Exists {
+                    pointer: "/x".into(),
+                })),
+            },
+        ],
+    };
+    // Should pass (warning only, not error).
+    assert!(validate_workflow(&wf).is_ok());
 }
