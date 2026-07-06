@@ -92,10 +92,7 @@ async fn async_delivery_running_period_sub_completes_during_loop() {
     // 主 agent harness
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
-        .tool(Arc::new(SpawnAgentTool::new(
-            spawner.clone(),
-            registry.clone(),
-        )))
+        .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
         .should_stop_hook(async_hook.clone())
         .build(env.clone())
         .await
@@ -197,10 +194,7 @@ async fn async_delivery_idle_period_watcher_wakes_main() {
 
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
-        .tool(Arc::new(SpawnAgentTool::new(
-            spawner.clone(),
-            registry.clone(),
-        )))
+        .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
         .should_stop_hook(async_hook.clone())
         .build(env.clone())
         .await

@@ -20,11 +20,7 @@ pub struct SpawnAgentTool {
 }
 
 impl SpawnAgentTool {
-    /// `registry` 参数保留向后兼容（sync path 现用 oneshot；async path 经 completion channel，由 `track(deliver_to_channel=true)` 控制）。
-    pub fn new(
-        spawner: Arc<HarnessSubAgentSpawner>,
-        _registry: Arc<crate::spawn::async_spawn::AsyncSpawnRegistry>,
-    ) -> Self {
+    pub fn new(spawner: Arc<HarnessSubAgentSpawner>) -> Self {
         Self {
             spawner,
             directory: None,
@@ -219,7 +215,7 @@ mod tests {
         .env_factory(Arc::new(NoopEnvFactory));
         let (registry, _hook) = async_spawn_pair();
         let spawner = Arc::new(spawner.enable_async_delivery(registry.clone()));
-        let tool = SpawnAgentTool::new(spawner, registry.clone());
+        let tool = SpawnAgentTool::new(spawner);
         (tool, registry)
     }
 
@@ -330,8 +326,7 @@ mod tests {
                 .enable_async_delivery(registry.clone())
                 .enable_peer_communication(directory.clone()),
         );
-        let tool =
-            SpawnAgentTool::new(spawner, registry.clone()).with_peer_directory(directory.clone());
+        let tool = SpawnAgentTool::new(spawner).with_peer_directory(directory.clone());
         (tool, registry, directory)
     }
 

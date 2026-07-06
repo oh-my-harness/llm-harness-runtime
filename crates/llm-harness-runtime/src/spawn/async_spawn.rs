@@ -458,8 +458,8 @@ impl IdleWatcherHook for IdleWatcher {
         if let Some(token) = self.cancel_token.lock().unwrap().take() {
             token.cancel();
         }
-        // 不 abort：保留 watcher_task 引用以便 drop 时自动回收。
-        // task 会在 cancel 分支 break 后自然退出。
+        // 不 abort：take() 取出 JoinHandle 后立即 drop（detach），task 不被
+        // 硬杀，会在 cancel 分支 break 后自然退出。清空 slot 以便下次 on_idle 重新 spawn。
         self.watcher_task.lock().unwrap().take();
     }
 }
@@ -643,14 +643,12 @@ mod tests {
 
     #[tokio::test]
     async fn async_spawn_hook_drains_and_injects_follow_up() {
-        // 这个测试需要验证 follow_up 被注入。
-        // FollowUpHandle 持真实 harness 的 inner —— 太重。
-        // 方案：用一个最小 AgentHarness（in-memory）提供 FollowUpHandle，
-        //       验证 harness 的 follow_up channel 收到消息。
-        // 但 harness.follow_up_rx 是私有的。
-        //
-        // 替代方案：直接验证 hook 行为契约——should_stop 返回 true、不 panic、
-        // 排空 channel（track task 发的 completion 被 try_recv 消费掉）。
+        // 这个测试验证 should_stop 的降级行为：不 set follow_up_handle 时，
+        // hook 返回 true 且不 panic。handle_ready=false 分支不排空 channel
+        // （消息留 channel，下次 should_stop 再取）——这是"不丢消息"设计，
+        // 与 PeerMessageHook 同构。注意：此路径仅测试可达，生产中
+        // set_async_spawn_hook 原子地 set handle + 存 hook 引用，run_loop
+        // 看到 hook 时 handle 必已 set，handle_ready=false 不可达。
         // follow_up 投递的端到端验证留给 Task 11 集成测试。
         let (registry, hook) = async_spawn_pair();
         hook.borrow_completion_rx();
@@ -670,13 +668,13 @@ mod tests {
             .await
             .unwrap();
 
-        // 不 set follow_up_handle —— hook 应不 panic，仍排空 channel
+        // 不 set follow_up_handle —— handle_ready=false，hook 不排空（消息留 channel）
         let assistant = empty_assistant();
         let ctx = make_stop_ctx(&assistant);
         let stop = hook.should_stop(ctx).await;
         assert!(stop);
 
-        // channel 应已排空（但 hook 没 borrow guard 时无法验证）。
+        // channel 未排空（handle_ready=false 时不 try_recv）。
         // 验证：再次 should_stop，不 panic。
         let ctx2 = make_stop_ctx(&assistant);
         let stop2 = hook.should_stop(ctx2).await;
