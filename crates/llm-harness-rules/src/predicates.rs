@@ -9,7 +9,7 @@ use crate::predicate::Predicate;
 /// 集合包含：tool_name ∈ allowed_tools。
 /// P0-A 流程引擎越界兜底就用这个（tool_name 是否在当前步 allowed_tools 里）。
 pub struct Contains {
-    pub allowed: Vec<String>,
+    pub(crate) allowed: Vec<String>,
 }
 
 impl Contains {
@@ -82,8 +82,8 @@ impl Predicate for RegexField {
 /// 勿配 on_match: Deny——test() 在返回 true 时记录时间戳，配 Deny 会导致
 /// 「前 max 次被拒、之后放行」的语义反转。
 pub struct RateLimit {
-    pub max: u32,
-    pub window: std::time::Duration,
+    pub(crate) max: u32,
+    pub(crate) window: std::time::Duration,
     calls: Mutex<std::collections::HashMap<String, Vec<std::time::Instant>>>,
 }
 

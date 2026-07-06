@@ -72,7 +72,7 @@ fn default_declarative_judge(
 /// `step_abort.cancelled()` → `handle.abort()` → 返回 `Err(ToolError::Aborted)`。
 ///
 /// schema 不含 `wait`；传 `wait` 任意值被忽略。
-pub struct SyncSpawnAgentTool {
+pub(crate) struct SyncSpawnAgentTool {
     spawner: Arc<HarnessSubAgentSpawner>,
     /// step 级 abort token。引擎构造 tool 时注入，与注入到 step harness 的 abort token 同一个 clone。
     step_abort: CancellationToken,
@@ -251,7 +251,7 @@ pub enum WorkflowEvent {
 /// 内置 tool：让 step agent 提交结构化结果（JSON）。
 /// 引擎在 step 收尾时把提交的 JSON 填入 StepResult.structured，
 /// judge 直接读 ctx.last_result.structured，不用自己经 TaskStore 反查 checkpoint。
-pub struct SubmitStepResultTool {
+pub(crate) struct SubmitStepResultTool {
     /// 提交的结果经 channel 传给引擎（run_step 在收集事件时读取）。
     tx: Arc<tokio::sync::Mutex<Option<serde_json::Value>>>,
 }

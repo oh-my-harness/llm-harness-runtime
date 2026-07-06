@@ -25,7 +25,7 @@ pub trait CustomMessageConverter: Send + Sync {
 /// 框架提供的默认转换器。
 pub struct DefaultConvertToLlm {
     /// Optional handler for `AgentMessage::Custom` variants.
-    pub custom_handler: Option<Arc<dyn CustomMessageConverter>>,
+    pub(crate) custom_handler: Option<Arc<dyn CustomMessageConverter>>,
 }
 
 impl DefaultConvertToLlm {

@@ -43,7 +43,7 @@ pub trait StepTransitionJudge: Send + Sync {
 
 /// 空 judge：永不跳转。自由 task（单步 workflow）用。
 /// `run()` 检测"无后继 step"自动结束，无需 judge 参与。
-pub struct NoopJudge;
+pub(crate) struct NoopJudge;
 
 impl StepTransitionJudge for NoopJudge {
     fn decide<'a>(&'a self, _ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
@@ -66,7 +66,7 @@ impl StepTransitionJudge for NoopJudge {
 /// It evaluates structured edge conditions against `StepResult.structured`.
 /// String labels are intentionally treated as custom-judge labels and are not
 /// guessed by this judge.
-pub struct EdgeConditionJudge {
+pub(crate) struct EdgeConditionJudge {
     edges: Vec<Edge>,
 }
 

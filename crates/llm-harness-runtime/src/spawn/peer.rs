@@ -190,7 +190,7 @@ impl Default for PeerDirectory {
 /// `WaitForPeerMessageTool` 共享同一 receiver。should_stop 用 `try_lock` 非阻塞
 /// 取一条；若 `try_lock` 失败（tool 正在 `recv().await`，理论上 should_stop 和
 /// tool execute 不会并发），跳过、返回 true。
-pub struct PeerMessageHook {
+pub(crate) struct PeerMessageHook {
     peer_rx: SharedPeerRx,
     /// 延迟注入：hook 构建时为 None，harness 构建后 `set_follow_up_handle` 回填。
     /// 极短窗口内若 None，跳过 try_recv（消息留 channel，下次 should_stop 再取）、返回 true。
@@ -370,7 +370,7 @@ fn message_to_content(msg: &AgentMessage) -> Vec<ContentBlock> {
 /// 必须由 sub-agent 的执行 task（`tokio::spawn` 闭包）持有，
 /// 不能留在 `spawn_inner` 栈上——否则 `spawn_inner` 返回时 guard 就 drop，
 /// sub-agent 还没跑完就被 unregister。`unregister` 幂等，覆盖 success/error/panic。
-pub struct PeerCleanupGuard {
+pub(crate) struct PeerCleanupGuard {
     directory: Arc<PeerDirectory>,
     agent_id: String,
 }

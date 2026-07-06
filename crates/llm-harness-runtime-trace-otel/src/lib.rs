@@ -9,6 +9,7 @@ use llm_harness_runtime::observability::tracer::{SpanEvent, TraceExporter};
 /// Accumulates `SpanEvent` values in memory for assertions. Does NOT connect
 /// to any external OTel collector. For production use, implement a real
 /// `TraceExporter` using the opentelemetry-otlp crate.
+#[doc(hidden)]
 pub struct InMemoryTraceExporter {
     exported_spans: Mutex<Vec<SpanEvent>>,
 }

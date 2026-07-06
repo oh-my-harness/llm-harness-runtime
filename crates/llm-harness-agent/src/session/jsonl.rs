@@ -17,7 +17,7 @@ use super::types::*;
 ///
 /// Entries are appended as newline-delimited JSON. The in-memory tree cache
 /// is built on first access and kept in sync via incremental updates.
-pub struct JsonlSessionStorage {
+pub(crate) struct JsonlSessionStorage {
     inner: Mutex<JsonlInner>,
 }
 
@@ -37,7 +37,7 @@ impl JsonlSessionStorage {
     ///
     /// `dir` is the session directory (must already exist).
     /// Metadata is loaded from `dir/meta.json` if present; otherwise `metadata` is used.
-    pub async fn open(dir: &Path, metadata: SessionMetadata) -> Result<Self, SessionError> {
+    pub(crate) async fn open(dir: &Path, metadata: SessionMetadata) -> Result<Self, SessionError> {
         let entries_path = dir.join("entries.jsonl");
         let meta_path = dir.join("meta.json");
 

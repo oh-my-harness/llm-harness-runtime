@@ -25,19 +25,23 @@ use llm_harness_types::{
 ///   `total_cache_write_tokens`) accumulate. `total_cost` stays `0.0` and
 ///   `by_model` stays empty — per-model token breakdown is only meaningful
 ///   when pricing is configured, since `ModelCost` carries a USD `cost` field.
-pub struct CostAccumulatorHook {
+pub(crate) struct CostAccumulatorHook {
     cost: Arc<Mutex<CostAggregate>>,
     pricing: Option<Arc<dyn PricingProvider>>,
 }
 
 impl CostAccumulatorHook {
     /// Create a new accumulator writing into the shared cost state.
-    pub fn new(cost: Arc<Mutex<CostAggregate>>, pricing: Option<Arc<dyn PricingProvider>>) -> Self {
+    pub(crate) fn new(
+        cost: Arc<Mutex<CostAggregate>>,
+        pricing: Option<Arc<dyn PricingProvider>>,
+    ) -> Self {
         Self { cost, pricing }
     }
 
     /// Snapshot of the current accumulated cost.
-    pub fn current_cost(&self) -> CostAggregate {
+    #[allow(dead_code)]
+    pub(crate) fn current_cost(&self) -> CostAggregate {
         self.cost.lock().unwrap().clone()
     }
 }

@@ -134,7 +134,7 @@ impl AsyncSpawnRegistry {
     /// 返回 `(AsyncSpawnHandle, oneshot::Receiver)`：oneshot 供 `wait=true`
     /// 同步路径直接 await（按 agent_id 一对一路由，修复 F-3/F-4）。
     /// 异步路径（wait=false）丢弃 oneshot，track task 的 send 变 no-op。
-    pub fn track(
+    pub(crate) fn track(
         self: &Arc<Self>,
         handle: SubAgentHandle,
         agent_id: String,
@@ -245,7 +245,7 @@ pub struct AsyncSpawnHook {
 }
 
 impl AsyncSpawnHook {
-    pub fn new(registry: Arc<AsyncSpawnRegistry>) -> Self {
+    pub(crate) fn new(registry: Arc<AsyncSpawnRegistry>) -> Self {
         Self {
             registry,
             completion_rx: Mutex::new(None),
@@ -256,7 +256,7 @@ impl AsyncSpawnHook {
     /// loop 启动前调用：从 registry take completion_rx guard 存入 Mutex slot。
     /// loop 结束后 guard 随 hook（或下一次 borrow）drop 归还。
     /// 若已借入则跳过（理论上 Running 期间不会重复调）。
-    pub fn borrow_completion_rx(&self) {
+    pub(crate) fn borrow_completion_rx(&self) {
         let mut slot = self.completion_rx.lock().unwrap();
         if slot.is_none()
             && let Some(guard) = self.registry.take_completion_rx()

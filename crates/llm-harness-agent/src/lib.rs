@@ -38,7 +38,7 @@ pub use session::{
 pub use skills::{
     PromptTemplate, Skill, SkillDiagnostic, SourcedSkill, format_skill_invocation,
     format_skills_for_system_prompt, invoke_template, load_prompt_templates, load_skills,
-    load_sourced_skills, parse_command_args, parse_frontmatter, parse_skill_file,
+    parse_command_args, parse_frontmatter, parse_skill_file,
 };
 pub use sub_agent::{
     ContextMode, ProviderSelection, SpawnOptions, SubAgentHandle, SubAgentResult, SubAgentSpawner,

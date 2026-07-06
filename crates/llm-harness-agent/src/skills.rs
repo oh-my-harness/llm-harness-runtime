@@ -102,7 +102,7 @@ pub async fn load_skills(
 }
 
 /// Like `load_skills` but attaches a caller-supplied source tag to each skill.
-pub async fn load_sourced_skills(
+pub(crate) async fn load_sourced_skills(
     env: &dyn ExecutionEnv,
     dirs: &[(String, PathBuf)],
 ) -> (Vec<SourcedSkill>, Vec<SkillDiagnostic>) {

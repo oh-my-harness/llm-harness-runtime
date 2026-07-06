@@ -74,7 +74,7 @@ impl PrepareNextTurnHook for WorkflowGateHook {
 /// 规则：`tool_name ∈ (allowed_tools ∪ injected_tool_names) → Allow, fallback Deny`。
 /// `injected_tool_names` 是引擎每步注入的内置 tool（如 submit_step_result），
 /// 不受 step.allowed_tools 限制但必须放行，否则 step agent 无法提交结果。
-pub fn build_gate_approval_hook(
+pub(crate) fn build_gate_approval_hook(
     allowed_tools: &[String],
     injected_tool_names: &[String],
 ) -> Arc<RuleBasedApprovalHook> {

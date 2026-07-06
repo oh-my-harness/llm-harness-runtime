@@ -12,13 +12,15 @@ use crate::platform::tool_registry::{ToolDefinition, ToolExecutionMode as Runtim
 /// `ToolSourceAdapter` is for non-MCP tools where the definition carries a
 /// `custom_converter` that pre-processes arguments, or as a metadata-only
 /// placeholder that returns the converted args as output.
-pub struct ToolSourceAdapter {
+#[allow(dead_code)]
+pub(crate) struct ToolSourceAdapter {
     definition: ToolDefinition,
 }
 
 impl ToolSourceAdapter {
     /// Create an adapter from a `ToolDefinition`.
-    pub fn from_definition(definition: ToolDefinition) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn from_definition(definition: ToolDefinition) -> Self {
         Self { definition }
     }
 }

@@ -6,7 +6,7 @@ pub mod storage;
 pub(crate) mod tree_ops;
 pub mod types;
 
-pub use jsonl::{JsonlSessionRepo, JsonlSessionStorage};
+pub use jsonl::JsonlSessionRepo;
 pub use repo::{InMemorySessionRepo, SessionRepo};
 pub use session::Session;
 pub use storage::SessionStorage;

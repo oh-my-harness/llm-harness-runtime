@@ -106,13 +106,13 @@ struct InMemoryState {
 }
 
 /// In-memory session storage; useful for tests and ephemeral sessions.
-pub struct InMemorySessionStorage {
+pub(crate) struct InMemorySessionStorage {
     inner: Mutex<InMemoryState>,
 }
 
 impl InMemorySessionStorage {
     /// Create a new in-memory session storage with the given initial metadata.
-    pub fn new(metadata: SessionMetadata) -> Self {
+    pub(crate) fn new(metadata: SessionMetadata) -> Self {
         Self {
             inner: Mutex::new(InMemoryState {
                 metadata,
