@@ -314,11 +314,16 @@ impl TaskStore for JsonlTaskStore {
             let key = task_id.0.clone();
             let lock = self.task_lock(key).await;
             let _g = lock.lock().await;
-            match tokio::fs::remove_dir_all(&dir).await {
+            let result = match tokio::fs::remove_dir_all(&dir).await {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e.into()),
-            }
+            };
+            // 清理 HashMap 中的 lock entry，避免长期运行后无用的 Arc<Mutex> 累积。
+            // 安全：in-flight 操作持有自己的 Arc clone，remove 只从 HashMap 移除 entry，
+            // 不影响已存在的锁。新操作会通过 or_insert_with 重建 entry。
+            self.locks.lock().await.remove(&task_id.0);
+            result
         })
     }
 }
