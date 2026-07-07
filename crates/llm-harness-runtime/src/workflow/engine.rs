@@ -12,8 +12,8 @@ use llm_harness_agent::{
 };
 use llm_harness_loop::LlmClient;
 use llm_harness_types::{
-    AgentError, AgentEvent, ContentBlock, SUBMIT_STEP_RESULT_TOOL_NAME, SYNC_SPAWN_TOOL_NAME, Tool,
-    ToolContext, ToolError, ToolExecutionMode, ToolLevel, ToolResult,
+    AgentError, AgentEvent, AssistantMessageKind, ContentBlock, SUBMIT_STEP_RESULT_TOOL_NAME,
+    SYNC_SPAWN_TOOL_NAME, Tool, ToolContext, ToolError, ToolExecutionMode, ToolLevel, ToolResult,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -235,6 +235,36 @@ pub struct WorkflowEngineConfig {
 }
 
 // ── WorkflowEvent ──────────────────────────────────────────────────────────
+/// LLM step 内部的粗粒度进度事件。由 `step_progress_from` 从 `AgentEvent` 裁剪而来。
+/// 只携带前端展示必需的字段，丢弃 `AssistantMessage` / 完整 `ToolResult` 等大对象。
+#[derive(Debug, Clone)]
+pub enum StepProgress {
+    /// LLM 开始请求调用某个工具。
+    ToolCallStart { tool_use_id: String, name: String },
+    /// LLM 工具调用参数完整到达。
+    ToolCallEnd {
+        tool_use_id: String,
+        args: serde_json::Value,
+    },
+    /// Tool 开始执行（Rust 层面）。
+    ToolExecutionStart {
+        tool_use_id: String,
+        tool_name: String,
+    },
+    /// Tool 执行完毕。
+    ToolExecutionEnd {
+        tool_use_id: String,
+        ok: bool,
+        error: Option<String>,
+    },
+    /// 一次 turn 结束。
+    TurnEnd { index: u32 },
+    /// Assistant message 完整生成完毕。
+    MessageEnd {
+        message_id: String,
+        kind: AssistantMessageKind,
+    },
+}
 
 /// 引擎级事件。subscribe() 返回的 Receiver 推送此类型。
 /// 步骤级事件必须对外可见——长周期任务才能做监控/UI。
@@ -243,14 +273,73 @@ pub struct WorkflowEngineConfig {
 /// overflow 时丢弃旧事件（比阻塞 run 好）。订阅者应容忍丢事件。
 #[derive(Debug, Clone)]
 pub enum WorkflowEvent {
-    StepStarted { step_id: StepId, step_name: String },
-    StepFinished { step_id: StepId, result: StepResult },
-    Paused { reason: String },
+    StepStarted {
+        step_id: StepId,
+        step_name: String,
+    },
+    StepFinished {
+        step_id: StepId,
+        result: StepResult,
+    },
+    Paused {
+        reason: String,
+    },
     Resumed,
-    Cancelled { reason: String },
-    Failed { error: String },
+    Cancelled {
+        reason: String,
+    },
+    Failed {
+        error: String,
+    },
+    /// LLM step 内部进度（工具调用边界、turn 边界）。
+    /// 高频事件，overflow 时丢弃旧事件——订阅者应容忍丢事件。
+    StepProgress {
+        step_id: StepId,
+        progress: StepProgress,
+    },
 }
 
+/// 从 `AgentEvent` 裁剪出粗粒度进度事件。
+/// 返回 `None` 的事件（TextDelta、ThinkingDelta 等）不透传到 `WorkflowEvent`。
+fn step_progress_from(ev: &AgentEvent) -> Option<StepProgress> {
+    Some(match ev {
+        AgentEvent::ToolCallStart {
+            tool_use_id, name, ..
+        } => StepProgress::ToolCallStart {
+            tool_use_id: tool_use_id.clone(),
+            name: name.clone(),
+        },
+        AgentEvent::ToolCallEnd { tool_use_id, args } => StepProgress::ToolCallEnd {
+            tool_use_id: tool_use_id.clone(),
+            args: args.clone(),
+        },
+        AgentEvent::ToolExecutionStart {
+            tool_use_id,
+            tool_name,
+            ..
+        } => StepProgress::ToolExecutionStart {
+            tool_use_id: tool_use_id.clone(),
+            tool_name: tool_name.clone(),
+        },
+        AgentEvent::ToolExecutionEnd {
+            tool_use_id,
+            result,
+        } => StepProgress::ToolExecutionEnd {
+            tool_use_id: tool_use_id.clone(),
+            ok: result.is_ok(),
+            error: result.as_ref().err().map(|e| e.to_string()),
+        },
+        AgentEvent::TurnEnd { index, .. } => StepProgress::TurnEnd { index: *index },
+        AgentEvent::MessageEnd {
+            message_id,
+            message,
+        } => StepProgress::MessageEnd {
+            message_id: message_id.clone(),
+            kind: message.kind,
+        },
+        _ => return None,
+    })
+}
 // ── SubmitStepResultTool ───────────────────────────────────────────────────
 
 /// 内置 tool：让 step agent 提交结构化结果（JSON）。
@@ -1225,6 +1314,13 @@ impl WorkflowEngine {
                             AgentHarnessEvent::Agent(ev) => {
                                 if let Some((_, _, text)) = ev.as_final_answer() {
                                     final_answer_output = Some(text);
+                                }
+                                // Forward coarse-grained progress to workflow subscribers.
+                                if let Some(progress) = step_progress_from(ev) {
+                                    let _ = self.event_tx.send(WorkflowEvent::StepProgress {
+                                        step_id: step.id().clone(),
+                                        progress,
+                                    });
                                 }
                             }
                             AgentHarnessEvent::ToolCallStart { .. } => tool_calls_count += 1,
@@ -2502,6 +2598,330 @@ mod engine_tests {
             vec!["s1", "s2"]
         );
         assert_eq!(result.final_message.as_deref(), Some("step2 done"));
+    }
+
+    fn test_msg(content: Vec<ContentBlock>) -> llm_harness_types::AssistantMessage {
+        use llm_harness_types::{AssistantMessage, AssistantMessageKind};
+        AssistantMessage {
+            kind: AssistantMessageKind::FinalAnswer,
+            message_id: "msg_1".into(),
+            turn_id: "turn_1".into(),
+            content,
+            stop_reason: None,
+            timestamp: chrono::Utc::now(),
+            provider: None,
+            api: None,
+            model: None,
+            usage: None,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn step_progress_from_maps_coarse_events() {
+        use llm_harness_types::{AssistantMessageKind, ToolError, ToolResult};
+
+        // ToolCallStart
+        let ev = AgentEvent::ToolCallStart {
+            message_id: "m1".into(),
+            tool_use_id: "tu-1".into(),
+            name: "search".into(),
+        };
+        match step_progress_from(&ev) {
+            Some(StepProgress::ToolCallStart { tool_use_id, name }) => {
+                assert_eq!(tool_use_id, "tu-1");
+                assert_eq!(name, "search");
+            }
+            other => panic!("expected ToolCallStart, got {other:?}"),
+        }
+
+        // ToolCallEnd
+        let ev = AgentEvent::ToolCallEnd {
+            tool_use_id: "tu-1".into(),
+            args: serde_json::json!({"q": "rust"}),
+        };
+        match step_progress_from(&ev) {
+            Some(StepProgress::ToolCallEnd { tool_use_id, args }) => {
+                assert_eq!(tool_use_id, "tu-1");
+                assert_eq!(args["q"], "rust");
+            }
+            other => panic!("expected ToolCallEnd, got {other:?}"),
+        }
+
+        // ToolExecutionStart
+        let ev = AgentEvent::ToolExecutionStart {
+            tool_use_id: "tu-1".into(),
+            tool_name: "search".into(),
+            args: serde_json::json!({}),
+        };
+        match step_progress_from(&ev) {
+            Some(StepProgress::ToolExecutionStart {
+                tool_use_id,
+                tool_name,
+            }) => {
+                assert_eq!(tool_use_id, "tu-1");
+                assert_eq!(tool_name, "search");
+            }
+            other => panic!("expected ToolExecutionStart, got {other:?}"),
+        }
+
+        // ToolExecutionEnd — Ok
+        let ev = AgentEvent::ToolExecutionEnd {
+            tool_use_id: "tu-1".into(),
+            result: Ok(ToolResult {
+                content: vec![],
+                details: serde_json::Value::Null,
+                terminate: false,
+            }),
+        };
+        match step_progress_from(&ev) {
+            Some(StepProgress::ToolExecutionEnd {
+                tool_use_id,
+                ok,
+                error,
+            }) => {
+                assert_eq!(tool_use_id, "tu-1");
+                assert!(ok);
+                assert!(error.is_none());
+            }
+            other => panic!("expected ToolExecutionEnd Ok, got {other:?}"),
+        }
+
+        // ToolExecutionEnd — Err
+        let ev = AgentEvent::ToolExecutionEnd {
+            tool_use_id: "tu-1".into(),
+            result: Err(ToolError::Aborted),
+        };
+        match step_progress_from(&ev) {
+            Some(StepProgress::ToolExecutionEnd { ok, error, .. }) => {
+                assert!(!ok);
+                assert!(error.is_some());
+            }
+            other => panic!("expected ToolExecutionEnd Err, got {other:?}"),
+        }
+
+        // TurnEnd
+        let ev = AgentEvent::TurnEnd {
+            index: 3,
+            message: test_msg(vec![]),
+            tool_results: vec![],
+        };
+        match step_progress_from(&ev) {
+            Some(StepProgress::TurnEnd { index }) => assert_eq!(index, 3),
+            other => panic!("expected TurnEnd, got {other:?}"),
+        }
+
+        // MessageEnd
+        let ev = AgentEvent::MessageEnd {
+            message_id: "m1".into(),
+            message: test_msg(vec![ContentBlock::Text { text: "hi".into() }]),
+        };
+        match step_progress_from(&ev) {
+            Some(StepProgress::MessageEnd { message_id, kind }) => {
+                assert_eq!(message_id, "m1");
+                assert_eq!(kind, AssistantMessageKind::FinalAnswer);
+            }
+            other => panic!("expected MessageEnd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_progress_from_returns_none_for_filtered_events() {
+        // TextDelta — filtered (high frequency)
+        let ev = AgentEvent::TextDelta {
+            message_id: "m1".into(),
+            text: "hel".into(),
+        };
+        assert!(step_progress_from(&ev).is_none());
+
+        // ThinkingDelta — filtered
+        let ev = AgentEvent::ThinkingDelta {
+            message_id: "m1".into(),
+            thinking: "th".into(),
+            signature: None,
+        };
+        assert!(step_progress_from(&ev).is_none());
+
+        // ToolCallArgsDelta — filtered
+        let ev = AgentEvent::ToolCallArgsDelta {
+            tool_use_id: "tu-1".into(),
+            partial_input: "{".into(),
+        };
+        assert!(step_progress_from(&ev).is_none());
+
+        // AgentStart — filtered
+        assert!(step_progress_from(&AgentEvent::AgentStart).is_none());
+
+        // TurnStart — filtered
+        let ev = AgentEvent::TurnStart { index: 0 };
+        assert!(step_progress_from(&ev).is_none());
+
+        // MessageStart — filtered
+        let ev = AgentEvent::MessageStart {
+            message_id: "m1".into(),
+        };
+        assert!(step_progress_from(&ev).is_none());
+    }
+
+    /// Integration: a free-task LLM step that calls submit_step_result should
+    /// emit StepStarted → StepProgress(ToolCallStart) → StepProgress(ToolCallEnd)
+    /// → StepProgress(ToolExecutionStart) → StepProgress(ToolExecutionEnd)
+    /// → StepFinished, in order.
+    #[tokio::test]
+    async fn step_progress_events_emitted_in_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
+            "tu-1",
+            SUBMIT_STEP_RESULT_TOOL_NAME,
+            r#"{"result":{"passed":true}}"#,
+        )]));
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+            edges: vec![],
+        };
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = Arc::new(WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap());
+        let mut rx = engine.subscribe();
+        let engine_clone = engine.clone();
+        let mut run_handle = tokio::spawn(async move { engine_clone.run().await });
+
+        // Collect events until the task finishes.
+        let mut events = Vec::new();
+        loop {
+            tokio::select! {
+                biased;
+                ev = rx.recv() => {
+                    match ev {
+                        Ok(e) => events.push(e),
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+                _ = &mut run_handle => break,
+            }
+        }
+
+        // Assert the sequence contains the expected progress variants in order.
+        let mut saw_step_started = false;
+        let mut saw_tool_call_start = false;
+        let mut saw_tool_call_end = false;
+        let mut saw_tool_execution_start = false;
+        let mut saw_tool_execution_end = false;
+        let mut saw_step_finished = false;
+        for ev in &events {
+            match ev {
+                WorkflowEvent::StepStarted { .. } => saw_step_started = true,
+                WorkflowEvent::StepProgress {
+                    progress: StepProgress::ToolCallStart { .. },
+                    ..
+                } => {
+                    assert!(saw_step_started);
+                    saw_tool_call_start = true;
+                }
+                WorkflowEvent::StepProgress {
+                    progress: StepProgress::ToolCallEnd { .. },
+                    ..
+                } => {
+                    assert!(saw_tool_call_start);
+                    saw_tool_call_end = true;
+                }
+                WorkflowEvent::StepProgress {
+                    progress: StepProgress::ToolExecutionStart { .. },
+                    ..
+                } => {
+                    assert!(saw_tool_call_end);
+                    saw_tool_execution_start = true;
+                }
+                WorkflowEvent::StepProgress {
+                    progress: StepProgress::ToolExecutionEnd { .. },
+                    ..
+                } => {
+                    assert!(saw_tool_execution_start);
+                    saw_tool_execution_end = true;
+                }
+                WorkflowEvent::StepFinished { .. } => {
+                    assert!(saw_tool_execution_end);
+                    saw_step_finished = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_step_started, "missing StepStarted");
+        assert!(saw_tool_call_start, "missing ToolCallStart");
+        assert!(saw_tool_call_end, "missing ToolCallEnd");
+        assert!(saw_tool_execution_start, "missing ToolExecutionStart");
+        assert!(saw_tool_execution_end, "missing ToolExecutionEnd");
+        assert!(saw_step_finished, "missing StepFinished");
+    }
+    /// Abort: when a step is cancelled mid-flight, no StepProgress events
+    /// should arrive after the Cancelled event. Residual events are discarded.
+    #[tokio::test]
+    async fn step_progress_events_stop_after_cancel() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let workflow = Workflow {
+            entry_step: "exec".into(),
+            steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+            edges: vec![],
+        };
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = Arc::new(
+            WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+                .unwrap()
+                .with_executor("blocking", Arc::new(BlockingExecutor)),
+        );
+        let mut rx = engine.subscribe();
+        let engine_clone = engine.clone();
+        let mut run_handle = tokio::spawn(async move { engine_clone.run().await });
+
+        // Give the step time to start, then cancel.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        engine.cancel("test abort").await.unwrap();
+
+        // Collect events until run finishes.
+        let mut events = Vec::new();
+        loop {
+            tokio::select! {
+                biased;
+                ev = rx.recv() => {
+                    match ev {
+                        Ok(e) => events.push(e),
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+                _ = &mut run_handle => break,
+            }
+        }
+
+        // StepStarted should arrive, then Cancelled. No StepProgress for an
+        // executor step (it has no AgentEvent stream), and none after cancel.
+        let mut saw_cancelled = false;
+        for ev in &events {
+            match ev {
+                WorkflowEvent::Cancelled { .. } => saw_cancelled = true,
+                WorkflowEvent::StepProgress { .. } => {
+                    // Executor steps don't emit progress; if any arrived it
+                    // must be before Cancelled.
+                    assert!(!saw_cancelled, "StepProgress after Cancelled");
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_cancelled, "missing Cancelled event");
     }
 
     #[tokio::test]
