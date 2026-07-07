@@ -287,7 +287,7 @@ impl Tool for SubmitStepResultTool {
         ToolLevel::BuiltIn
     }
     fn description(&self) -> &str {
-        "提交本步的结构化结果（JSON）。judge 会直接读此结果做跳转决策。"
+        "提交本步的结构化结果（JSON）并结束本步。judge 会直接读此结果做跳转决策。调用此 tool 后无需再输出文本总结。"
     }
     fn parameters_schema(&self) -> &'static serde_json::Value {
         static S: LazyLock<serde_json::Value> = LazyLock::new(submit_step_result_schema);
@@ -323,7 +323,7 @@ impl Tool for SubmitStepResultTool {
                     text: "Step result submitted.".into(),
                 }],
                 details: serde_json::json!({ "submitted": true }),
-                terminate: false,
+                terminate: true,
             })
         })
     }
@@ -2336,6 +2336,127 @@ mod engine_tests {
         let result = engine.run().await.unwrap();
         assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
         assert_eq!(result.turns, 2); // 2 步历史
+    }
+
+    /// Regression: when the model calls `submit_step_result`, the loop must
+    /// terminate immediately and NOT issue a follow-up LLM call. Before the
+    /// `terminate: true` fix, the model would emit a plain-text EndTurn after
+    /// submitting, which downstream `NonEmptyResponseHook` agents mis-flagged
+    /// as an empty response and retried until giving up.
+    #[tokio::test]
+    async fn submit_step_result_terminates_without_extra_llm_call() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Single preset: the model calls submit_step_result with a result.
+        // If the loop wrongly continues, the mock falls back to a text
+        // EndTurn — we detect that via call_count > 1.
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
+            "tu-1",
+            SUBMIT_STEP_RESULT_TOOL_NAME,
+            r#"{"result":{"passed":true}}"#,
+        )]));
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+            edges: vec![],
+        };
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+        let result = engine.run().await.unwrap();
+
+        assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+        // Exactly one LLM call: the submit_step_result tool call. No follow-up.
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+        // Structured result captured from the submit tool.
+        let history = engine.step_history().await;
+        let structured = history[0]
+            .result
+            .as_ref()
+            .and_then(|r| r.structured.clone())
+            .expect("structured result should be captured");
+        assert_eq!(structured["passed"], serde_json::json!(true));
+        // Turns counts executed turns in history; the submit call is one turn.
+        assert_eq!(result.turns, 1);
+    }
+    /// Regression (judge-driven multi-step path): `submit_step_result` must
+    /// terminate the step's agent loop immediately even in a judged workflow
+    /// with outgoing edges. Before the `terminate: true` fix, the model would
+    /// emit a follow-up plain-text EndTurn after submitting, inflating the
+    /// LLM call count and risking downstream `NonEmptyResponseHook` retries.
+    /// Unlike the free-task test above, this exercises the `decide_transition`
+    /// → judge → `Transition::To` path rather than the free-task Abort shortcut.
+    #[tokio::test]
+    async fn submit_step_result_terminates_in_judged_multi_step_workflow() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // s1: submit_step_result (tool call). s2: plain text.
+        // If the loop wrongly continues after s1's submit, the mock falls
+        // back to "(no more mock responses)" text → EndTurn, consuming an
+        // extra LLM call before the judge runs. That would make call_count 3.
+        let client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::tool_use(
+                "tu-1",
+                SUBMIT_STEP_RESULT_TOOL_NAME,
+                r#"{"result":{"passed":true}}"#,
+            ),
+            MockResponse::text("step2 done"),
+        ]));
+        let workflow = Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::llm("s1", "Step 1", "do step 1", vec![]),
+                Step::llm("s2", "Step 2", "do step 2", vec![]),
+            ],
+            edges: vec![Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            }],
+        };
+        // judge: s1 → s2 → Abort.
+        struct LinearJudge;
+        impl StepTransitionJudge for LinearJudge {
+            fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+                let cur = ctx.current_step.id().clone();
+                Box::pin(async move {
+                    if cur == "s1" {
+                        Transition::To("s2".into())
+                    } else {
+                        Transition::Abort {
+                            reason: "done".into(),
+                        }
+                    }
+                })
+            }
+        }
+        let config = WorkflowEngineConfig {
+            client: client.clone(),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+        };
+        let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge)).unwrap();
+        let result = engine.run().await.unwrap();
+
+        assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+        // Exactly two LLM calls: s1's submit_step_result + s2's text. No
+        // follow-up call after s1 submits (would be 3 if terminate were false).
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
+        // s1's structured result captured via the submit tool.
+        let history = engine.step_history().await;
+        let s1_structured = history[0]
+            .result
+            .as_ref()
+            .and_then(|r| r.structured.clone())
+            .expect("s1 structured result should be captured");
+        assert_eq!(s1_structured["passed"], serde_json::json!(true));
+        // Both steps executed.
+        assert_eq!(result.turns, 2);
     }
 
     #[tokio::test]
