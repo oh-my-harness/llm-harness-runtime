@@ -1933,13 +1933,25 @@ impl AgentHarness {
                     break;
                 }
                 AgentEvent::Error(e) => {
+                    // Clear pending writes so the failed turn's user message is not
+                    // flushed to the session on a future successful turn, which would
+                    // produce two consecutive user messages and cause Anthropic to reject.
+                    {
+                        let mut inner = self.inner.lock().unwrap();
+                        inner.state.pending_session_writes.clear();
+                    }
+                    if matches!(e, AgentError::Aborted) {
+                        // Abort is a terminal sentinel, not a failure: emit Aborted
+                        // (mirroring Settled) so consumers can distinguish cancel from
+                        // a channel-closed crash. drive_loop returns Ok — the abort is
+                        // a signal, not a propagated error — so error_message must NOT
+                        // be set (it is a pub field exposed via state()).
+                        self.emit(AgentHarnessEvent::Aborted);
+                        break;
+                    }
                     {
                         let mut inner = self.inner.lock().unwrap();
                         inner.state.error_message = Some(e.to_string());
-                        // Clear pending writes so the failed turn's user message is not
-                        // flushed to the session on a future successful turn, which would
-                        // produce two consecutive user messages and cause Anthropic to reject.
-                        inner.state.pending_session_writes.clear();
                     }
                     self.emit(AgentHarnessEvent::Agent(event));
                 }
@@ -2705,6 +2717,81 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "abort should cancel idle watcher"
+        );
+    }
+    #[tokio::test]
+    async fn abort_emits_aborted_event() {
+        // When abort() cancels the run token mid-flight, the agent loop yields
+        // Error(Aborted) and drive_loop must emit AgentHarnessEvent::Aborted
+        // (terminal sentinel) so consumers can distinguish abort from a crash.
+        use tokio::sync::Notify;
+        let ready = Arc::new(Notify::new());
+        struct BlockingTool {
+            schema: serde_json::Value,
+            ready: Arc<Notify>,
+        }
+        impl llm_harness_types::Tool for BlockingTool {
+            fn name(&self) -> &str {
+                "blocking"
+            }
+            fn description(&self) -> &str {
+                "blocks until aborted"
+            }
+            fn parameters_schema(&self) -> &serde_json::Value {
+                &self.schema
+            }
+            fn execute<'a>(
+                &'a self,
+                _args: serde_json::Value,
+                ctx: &'a llm_harness_types::ToolContext,
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>,
+            > {
+                let ready = self.ready.clone();
+                Box::pin(async move {
+                    // Signal that the tool is now blocking on the abort token,
+                    // then wait for cancellation.
+                    ready.notify_one();
+                    ctx.abort.cancelled().await;
+                    Err(llm_harness_types::ToolError::Aborted)
+                })
+            }
+        }
+        let h = make_harness(vec![MockResponse::tool_use("call_1", "blocking", "{}")]);
+        let tool: Arc<dyn llm_harness_types::Tool> = Arc::new(BlockingTool {
+            schema: serde_json::json!({"type":"object","properties":{}}),
+            ready: ready.clone(),
+        });
+        h.set_tools(vec![tool]).await.unwrap();
+        let mut rx = h.subscribe();
+        let h_arc = Arc::new(h);
+        let prompt_task = tokio::spawn({
+            let h = h_arc.clone();
+            async move { h.prompt("call the tool").await }
+        });
+        // Wait until the tool is blocking on the abort token (deterministic),
+        // then abort.
+        ready.notified().await;
+        h_arc.abort();
+        // Collect events until a terminal sentinel arrives.
+        let mut saw_aborted = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while let Ok(Ok(ev)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if matches!(ev.as_ref(), AgentHarnessEvent::Aborted) {
+                saw_aborted = true;
+                break;
+            }
+        }
+        let _ = prompt_task.await;
+        assert!(
+            saw_aborted,
+            "abort() should emit AgentHarnessEvent::Aborted sentinel"
+        );
+        // Abort is a signal, not a failure: error_message must not be set.
+        assert!(
+            h_arc.state().error_message.is_none(),
+            "abort must not leave error_message set (it is a signal, not an error)"
         );
     }
 

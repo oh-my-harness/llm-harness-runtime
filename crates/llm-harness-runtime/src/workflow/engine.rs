@@ -1159,9 +1159,11 @@ impl WorkflowEngine {
         builder = builder.install(&HookPlugin { hooks: hook_state });
 
         // f. build + set_abort_token + prompt。
-        let harness = builder
-            .build_with_session(env, Session::new(storage))
-            .map_err(|e: HarnessBuildError| anyhow::anyhow!("build harness: {e}"))?;
+        let harness = Arc::new(
+            builder
+                .build_with_session(env, Session::new(storage))
+                .map_err(|e: HarnessBuildError| anyhow::anyhow!("build harness: {e}"))?,
+        );
         harness.set_abort_token(step_abort.clone());
 
         // g. step 指令。步骤间上下文注入：在 step.prompt 前拼接 step_history 摘要。
@@ -1190,7 +1192,13 @@ impl WorkflowEngine {
         };
 
         let mut rx = harness.subscribe();
-        harness.prompt(&prompt_text).await?;
+        // Spawn prompt() on a separate task so events can be consumed
+        // concurrently. Without this, prompt().await blocks until the entire
+        // agent loop finishes, overflowing the broadcast channel (capacity 256)
+        // before the consumer below starts — causing Lagged errors and missing
+        // the Settled sentinel.
+        let harness_clone = Arc::clone(&harness);
+        let prompt_task = tokio::spawn(async move { harness_clone.prompt(&prompt_text).await });
 
         // h. 收集事件 → StepResult。
         //    哨兵：Settled（所有排队活动结束）或 Aborted（被 cancel）。
@@ -1199,11 +1207,13 @@ impl WorkflowEngine {
         let mut final_answer_output: Option<String> = None;
         let mut tool_calls_count = 0u32;
         let mut settled = false;
+        let mut aborted = false;
         loop {
             tokio::select! {
                 biased;
                 _ = step_abort.cancelled() => {
                     // abort：收到的部分 output 保留，但不标记 settled。
+                    aborted = true;
                     break;
                 }
                 event = rx.recv() => {
@@ -1224,13 +1234,35 @@ impl WorkflowEngine {
                             }
                             _ => {}
                         },
-                        Err(_) => break, // channel 关闭
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // Channel is still open; we dropped events.
+                            // Continue recv — the prompt task join below is
+                            // the authoritative error source if Settled was lost.
+                            continue;
+                        }
                     }
                 }
             }
         }
+        // Join the prompt task to surface any errors from the agent loop.
+        // If the channel closed without Settled, the prompt task may hold
+        // the actual error (e.g. LLM failure, storage error).
+        let prompt_result = prompt_task
+            .await
+            .map_err(|e| anyhow::anyhow!("prompt task panicked: {e}"))?;
+        if aborted {
+            // step_abort 被 cancel：正常中止，不是 harness 异常退出。
+            // prompt() 返回 Ok（drive_loop 将 abort 视为信号而非错误）；
+            // 丢弃部分 output，向上报错让调用方决定重试或终止。
+            prompt_result?;
+            anyhow::bail!("run_llm_step: step '{}' aborted", step.id());
+        }
         if !settled {
-            // channel 关闭但未收到 Settled：harness 异常退出。
+            // channel 关闭但未收到 Settled 或 Aborted：harness 异常退出。
+            // If prompt() returned an error, propagate that (more specific).
+            // Otherwise, report the generic sentinel-missing error.
+            prompt_result?;
             anyhow::bail!(
                 "run_llm_step: event stream closed before Settled (step '{}')",
                 step.id()
