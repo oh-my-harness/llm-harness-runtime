@@ -116,10 +116,10 @@ Wheels are uploaded to the public [llm-harness-py-wheels](https://github.com/oh-
 |----------|-----------|--------|
 | macOS Apple Silicon | `cp39-abi3-macosx_11_0_arm64` | ✅ |
 | macOS Intel | `cp39-abi3-macosx_10_12_x86_64` | ✅ |
-| Linux x64 | `cp39-abi3-manylinux_*_x86_64` | ⏳ needs Linux machine |
+| Linux x64 | `cp39-abi3-manylinux_2_17_x86_64` | ✅ |
 | Windows x64 | `cp39-abi3-win_amd64` | ⏳ needs Windows machine |
 
-Wheels are built with the abi3 (stable ABI) feature — one wheel covers CPython 3.9–3.13+. macOS wheels are cross-compiled on an Apple Silicon machine. Linux and Windows wheels must be built on their respective platforms — run `maturin build --release` in `crates/llm-harness-py/` and upload with `gh release upload`.
+Wheels are built with the abi3 (stable ABI) feature — one wheel covers CPython 3.9–3.13+. macOS wheels are cross-compiled on an Apple Silicon machine. Linux x64 wheels are built via Docker manylinux container. Windows wheels must be built on a Windows machine — run `maturin build --release` in `crates/llm-harness-py/` and upload with `gh release upload`.
 
 ### Manual build
 

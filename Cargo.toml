@@ -35,7 +35,7 @@ llm-harness-agent  = { path = "crates/llm-harness-agent" }
 llm-harness-runtime = { path = "crates/llm-harness-runtime" }
 
 # API adapter — separate repo
-llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "69a868f5c8aa33059900f132e9c93366d1e479c3" }
+llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "93d34d5" }
 
 # Infrastructure
 anyhow             = "1"
@@ -54,6 +54,6 @@ tokio-stream       = "0.1"
 tokio-util         = { version = "0.7" }
 uuid               = { version = "1", features = ["v4", "v7"] }
 tempfile           = "3"
-reqwest            = { version = "0.12", features = ["json"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 base64             = "0.22"
 zeroize            = "1"

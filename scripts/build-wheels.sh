@@ -10,11 +10,12 @@
 #   - maturin (pip install maturin)
 #   - Python 3.12 on PATH
 #   - rustup targets: x86_64-apple-darwin (for Intel macOS cross-compile)
+#   - Docker (for Linux x64 cross-compile via manylinux container)
 #   - gh (GitHub CLI) authenticated, with access to the runtime repo
 #
-# Linux x64 and Windows x64 wheels cannot be built on macOS.
-# Build those on their respective platforms and upload separately:
-#   gh release upload v<version> -R oh-my-harness/llm-harness-runtime <wheel-files>
+# Windows x64 wheels cannot be built on macOS.
+# Build those on a Windows machine and upload separately:
+#   gh release upload v<version> -R oh-my-harness/llm-harness-py-wheels <wheel-files>
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -39,21 +40,43 @@ fi
 
 mkdir -p "$WHEEL_DIR"
 
-# ── Build wheels ──────────────────────────────────────────────
+# ── Build macOS wheels ───────────────────────────────────────
 # abi3 (stable ABI) wheels: one wheel covers CPython 3.9–3.13+.
 # We still need a build interpreter for maturin to find Python headers;
 # python3.12 is fine — the abi3 feature makes the output version-agnostic.
-TARGETS=(
+MACOS_TARGETS=(
     "aarch64-apple-darwin"
     "x86_64-apple-darwin"
 )
 
-for target in "${TARGETS[@]}"; do
+for target in "${MACOS_TARGETS[@]}"; do
     echo ""
-    echo "▶ Building abi3 wheel for $target ..."
+    echo "▶ Building macOS abi3 wheel for $target ..."
     "$MATURIN" build --release --target "$target" --interpreter "$PY" \
         --manifest-path "$CRATE_DIR/Cargo.toml"
 done
+
+# ── Build Linux x64 wheel (via Docker manylinux container) ───
+# The container has no GitHub credentials, so we mount the host's cargo
+# git cache (not bin/) to avoid re-fetching private dependencies.
+# Python 3.12 is not in the maturin image, so install it via python3.12.
+echo ""
+echo "▶ Building Linux x64 abi3 wheel (Docker manylinux) ..."
+if ! docker info &>/dev/null; then
+    echo "  ⚠ Docker daemon not running — skipping Linux wheel."
+    echo "    Start Docker and re-run to build Linux x64 wheels."
+else
+    # The maturin image sets ENTRYPOINT to maturin, so we override it.
+    # abi3 feature is read from pyproject.toml; we just need any Python 3.x
+    # for maturin to find headers — the image ships Python 3.9 (abi3 baseline).
+    docker run --rm --platform linux/amd64 \
+        --entrypoint /bin/bash \
+        -v "$(pwd):/io" \
+        -v "${CARGO_HOME:-$HOME/.cargo}/git:/root/.cargo/git" \
+        -v "${CARGO_HOME:-$HOME/.cargo}/registry:/root/.cargo/registry" \
+        ghcr.io/pyo3/maturin:latest \
+        -c "maturin build --release --manifest-path /io/$CRATE_DIR/Cargo.toml --interpreter python3 --out /io/$WHEEL_DIR"
+fi
 
 echo ""
 echo "✓ Built wheels:"
