@@ -19,11 +19,10 @@ Prebuilt wheels (CPython 3.12) are published on the [Releases](../../releases) p
 | Linux x64 | `cp312-cp312-manylinux_*_x86_64` |
 | Windows x64 | `cp312-cp312-win_amd64` |
 
-This is a **private** repo — `pip --find-links <github-url>` cannot fetch release assets without authentication. Download wheels with `gh` instead:
+Prebuilt wheels are published to the public [llm-harness-py-wheels](https://github.com/oh-my-harness/llm-harness-py-wheels) repo (compiled binaries only, no source). `pip` resolves them directly:
 
 ```bash
-gh release download v0.2.0 -R oh-my-harness/llm-harness-runtime --dir wheels --pattern '*.whl'
-pip install llm_harness_py --find-links wheels
+pip install llm_harness_py --find-links https://github.com/oh-my-harness/llm-harness-py-wheels/releases/expanded_assets/v0.2.0
 ```
 
 ### Rust crates

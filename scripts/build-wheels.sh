@@ -63,19 +63,20 @@ if [ "$BUILD_ONLY" = "--build-only" ]; then
     exit 0
 fi
 
-# ── Upload to GitHub Release ──────────────────────────────────
+# ── Upload to GitHub Release (public wheels repo) ────────────
 TAG="v$VERSION"
+WHEELS_REPO="oh-my-harness/llm-harness-py-wheels"
 echo ""
-echo "▶ Uploading wheels to release $TAG ..."
+echo "▶ Uploading wheels to release $TAG in $WHEELS_REPO ..."
 
-if gh release view "$TAG" -R oh-my-harness/llm-harness-runtime &>/dev/null; then
-    gh release upload "$TAG" -R oh-my-harness/llm-harness-runtime "$WHEEL_DIR"/*.whl --clobber
+if gh release view "$TAG" -R "$WHEELS_REPO" &>/dev/null; then
+    gh release upload "$TAG" -R "$WHEELS_REPO" "$WHEEL_DIR"/*.whl --clobber
 else
-    gh release create "$TAG" -R oh-my-harness/llm-harness-runtime \
+    gh release create "$TAG" -R "$WHEELS_REPO" \
         --title "$TAG" \
-        --notes "PyO3 Python SDK wheels (CPython 3.12). See README for install instructions." \
+        --notes "Prebuilt PyO3 wheels for llm-harness-py (CPython 3.12). Source code is in the private llm-harness-runtime repo; this repo distributes compiled binaries only." \
         "$WHEEL_DIR"/*.whl
 fi
 
 echo ""
-echo "✓ Done. Release: https://github.com/oh-my-harness/llm-harness-runtime/releases/tag/$TAG"
+echo "✓ Done. Release: https://github.com/$WHEELS_REPO/releases/tag/$TAG"
