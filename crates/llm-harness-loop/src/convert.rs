@@ -96,45 +96,11 @@ impl ConvertToLlmHook for DefaultConvertToLlm {
                     },
                 }
             }
-            // Post-process: ensure user/assistant alternation for providers
-            // (notably Anthropic) that require it.  A Tool message is encoded
-            // as a user-role message in Anthropic's wire format, so Tool
-            // followed by User would violate alternation.
-            ensure_alternation(&mut out);
+            // Keep this conversion provider-neutral. Provider adapters own
+            // wire-format constraints such as Anthropic user/assistant
+            // alternation and OpenAI tool-call adjacency.
             Ok(out)
         })
-    }
-}
-
-/// Check whether the message will be sent with a user-like role to providers
-/// that enforce user/assistant alternation (e.g. Anthropic).
-///
-/// Returns `true` if `msg` is a [`Message::User`] or [`Message::Tool`], since
-/// both are encoded as `role: "user"` in Anthropic's wire format.
-fn is_user_role(msg: &AdapterMessage) -> bool {
-    matches!(msg, AdapterMessage::User(_) | AdapterMessage::Tool { .. })
-}
-
-/// Ensure message alternation by inserting empty `Assistant` messages between
-/// consecutive user-role messages.
-///
-/// Some providers (notably Anthropic) require messages to strictly alternate
-/// between `user` and `assistant` roles.  A `Tool` message is encoded as a
-/// `user`-role message (containing a `tool_result` block), so a `Tool` followed
-/// by a `User` (or two `Tool` messages, or a `User` followed by a `User`)
-/// would violate the alternation requirement and cause a 400 error.
-///
-/// This function inserts an empty `Assistant` message as a separator wherever
-/// alternation would otherwise be violated.  Empty assistant messages are
-/// silently consumed by Anthropic without observable effect.
-fn ensure_alternation(messages: &mut Vec<AdapterMessage>) {
-    let mut i = 1;
-    while i < messages.len() {
-        if is_user_role(&messages[i - 1]) && is_user_role(&messages[i]) {
-            messages.insert(i, AdapterMessage::Assistant(vec![]));
-            i += 1; // Skip the inserted assistant message
-        }
-        i += 1;
     }
 }
 
@@ -283,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_result_followed_by_user_inserts_empty_assistant() {
+    async fn tool_result_followed_by_user_preserves_messages() {
         let conv = DefaultConvertToLlm::new();
         let msgs = vec![
             AgentMessage::ToolResult(ToolResultMessage {
@@ -298,16 +264,15 @@ mod tests {
             }),
         ];
         let result = conv.convert(&msgs).await.unwrap();
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 2);
         assert!(matches!(&result[0], AdapterMessage::Tool { .. }));
-        assert!(matches!(&result[1], AdapterMessage::Assistant(c) if c.is_empty()));
-        assert!(matches!(&result[2], AdapterMessage::User(c) if {
+        assert!(matches!(&result[1], AdapterMessage::User(c) if {
             matches!(&c[0], RequestContent::Text(t) if t == "continue")
         }));
     }
 
     #[tokio::test]
-    async fn two_tools_in_a_row_separated_by_assistant() {
+    async fn two_tools_in_a_row_remain_adjacent() {
         let conv = DefaultConvertToLlm::new();
         let msgs = vec![
             AgentMessage::ToolResult(ToolResultMessage {
@@ -324,14 +289,59 @@ mod tests {
             }),
         ];
         let result = conv.convert(&msgs).await.unwrap();
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 2);
         assert!(matches!(&result[0], AdapterMessage::Tool { .. }));
-        assert!(matches!(&result[1], AdapterMessage::Assistant(c) if c.is_empty()));
-        assert!(matches!(&result[2], AdapterMessage::Tool { .. }));
+        assert!(matches!(&result[1], AdapterMessage::Tool { .. }));
     }
 
     #[tokio::test]
-    async fn user_followed_by_user_inserts_empty_assistant() {
+    async fn assistant_tool_calls_and_results_preserve_openai_adjacency() {
+        let conv = DefaultConvertToLlm::new();
+        let msgs = vec![
+            AgentMessage::Assistant({
+                let mut m = crate::test_utils::test_assistant_message(vec![
+                    ContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "first".into(),
+                        input: serde_json::json!({}),
+                    },
+                    ContentBlock::ToolUse {
+                        id: "c2".into(),
+                        name: "second".into(),
+                        input: serde_json::json!({}),
+                    },
+                ]);
+                m.stop_reason = Some(StopReason::ToolUse);
+                m
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_use_id: "c1".into(),
+                content: vec![text_block("first done")],
+                is_error: false,
+                timestamp: Utc::now(),
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_use_id: "c2".into(),
+                content: vec![text_block("second done")],
+                is_error: false,
+                timestamp: Utc::now(),
+            }),
+        ];
+        let result = conv.convert(&msgs).await.unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(matches!(&result[0], AdapterMessage::Assistant(_)));
+        assert!(matches!(
+            &result[1],
+            AdapterMessage::Tool { invocation_id, .. } if invocation_id == "c1"
+        ));
+        assert!(matches!(
+            &result[2],
+            AdapterMessage::Tool { invocation_id, .. } if invocation_id == "c2"
+        ));
+    }
+
+    #[tokio::test]
+    async fn user_followed_by_user_preserves_messages() {
         let conv = DefaultConvertToLlm::new();
         let msgs = vec![
             AgentMessage::User(UserMessage {
@@ -344,10 +354,9 @@ mod tests {
             }),
         ];
         let result = conv.convert(&msgs).await.unwrap();
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 2);
         assert!(matches!(&result[0], AdapterMessage::User(_)));
-        assert!(matches!(&result[1], AdapterMessage::Assistant(c) if c.is_empty()));
-        assert!(matches!(&result[2], AdapterMessage::User(_)));
+        assert!(matches!(&result[1], AdapterMessage::User(_)));
     }
 
     #[tokio::test]
@@ -375,7 +384,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch_summary_followed_by_user_inserts_assistant() {
+    async fn branch_summary_followed_by_user_preserves_messages() {
         let conv = DefaultConvertToLlm::new();
         let msgs = vec![
             AgentMessage::BranchSummary(BranchSummaryMessage {
@@ -388,53 +397,8 @@ mod tests {
             }),
         ];
         let result = conv.convert(&msgs).await.unwrap();
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 2);
         assert!(matches!(&result[0], AdapterMessage::User(_)));
-        assert!(matches!(&result[1], AdapterMessage::Assistant(c) if c.is_empty()));
-        assert!(matches!(&result[2], AdapterMessage::User(_)));
-    }
-
-    #[test]
-    fn ensure_alternation_noop_on_alternating_messages() {
-        let mut msgs = vec![
-            AdapterMessage::User(vec![]),
-            AdapterMessage::Assistant(vec![]),
-            AdapterMessage::User(vec![]),
-        ];
-        let before = msgs.clone();
-        ensure_alternation(&mut msgs);
-        assert_eq!(msgs, before);
-    }
-
-    #[test]
-    fn ensure_alternation_single_message_unchanged() {
-        let mut msgs = vec![AdapterMessage::User(vec![])];
-        let before = msgs.clone();
-        ensure_alternation(&mut msgs);
-        assert_eq!(msgs, before);
-    }
-
-    #[test]
-    fn ensure_alternation_empty_list_unchanged() {
-        let mut msgs: Vec<AdapterMessage> = vec![];
-        ensure_alternation(&mut msgs);
-        assert!(msgs.is_empty());
-    }
-
-    #[test]
-    fn ensure_alternation_three_users_adds_two_assistants() {
-        let mut msgs = vec![
-            AdapterMessage::User(vec![]),
-            AdapterMessage::User(vec![]),
-            AdapterMessage::User(vec![]),
-        ];
-        ensure_alternation(&mut msgs);
-        assert_eq!(msgs.len(), 5);
-        // Positions: 0:User, 1:Assistant, 2:User, 3:Assistant, 4:User
-        assert!(matches!(&msgs[0], AdapterMessage::User(_)));
-        assert!(matches!(&msgs[1], AdapterMessage::Assistant(c) if c.is_empty()));
-        assert!(matches!(&msgs[2], AdapterMessage::User(_)));
-        assert!(matches!(&msgs[3], AdapterMessage::Assistant(c) if c.is_empty()));
-        assert!(matches!(&msgs[4], AdapterMessage::User(_)));
+        assert!(matches!(&result[1], AdapterMessage::User(_)));
     }
 }
