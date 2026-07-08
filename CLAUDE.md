@@ -104,6 +104,7 @@ Strong success criteria let the LLM loop independently. Weak criteria ("make it 
 ```
 llm-harness-runtime/          ← 本仓库根
 ├── Cargo.toml                (workspace)
+├── CLAUDE.md
 ├── crates/
 │   ├── llm-harness-types/    (Hook/Tool trait + 所有共享类型)
 │   ├── llm-harness-loop/     (agent loop 引擎)
@@ -114,9 +115,9 @@ llm-harness-runtime/          ← 本仓库根
 │   ├── llm-harness-runtime-sandbox-seatbelt/
 │   ├── llm-harness-runtime-mcp/
 │   ├── llm-harness-runtime-audit-jsonl/
-│   └── llm-harness-runtime-trace-otel/
+│   ├── llm-harness-runtime-trace-otel/
+│   └── llm-harness-py/       (PyO3 Python FFI 绑定, cdylib)
 ├── docs/
-└── CLAUDE.md
 
 外部依赖（独立 git repo）：
   llm_adapter  ← git: github.com/oh-my-harness/llm-api-adapter
@@ -125,17 +126,20 @@ llm-harness-runtime/          ← 本仓库根
 依赖方向（A → B 表示 A 依赖 B）：
 
 ```
-llm-harness-runtime-* → llm-harness-runtime
-llm-harness-runtime   → llm-harness-agent
-llm-harness-agent     → llm-harness-loop
-llm-harness-loop      → llm-harness-types, llm_adapter
-llm-harness-types     → llm_adapter (外部 git 依赖，非内部 crate)
+llm-harness-py          → llm-harness-runtime, llm-harness-agent, llm-harness-loop, llm-harness-types
+llm-harness-runtime-*  → llm-harness-runtime
+llm-harness-runtime    → llm-harness-agent
+llm-harness-agent      → llm-harness-loop
+llm-harness-loop       → llm-harness-types, llm_adapter
+llm-harness-types      → llm_adapter (外部 git 依赖，非内部 crate)
 ```
 
 **硬性规则：**
 - `llm-harness-types` 不依赖其他内部 crate，保持纯类型/trait 声明。可依赖外部 git crate（如 `llm_adapter`）用于 re-export 共享类型。
 - `llm-harness-runtime-*` 各 crate 不相互依赖（可单独使用）。
+- `llm-harness-py` 是最上层绑定层，依赖所有核心 crate，但不被任何内部 crate 依赖。
 - 依赖方向不允许反转（下层不依赖上层）。
+
 
 ## 设计文档
 
@@ -216,6 +220,21 @@ pub struct HarnessHooks {
 - 框架在第一个 hook 失败时停止链式调用（first-non-allow 语义）并向用户返回错误。
 - 不强制成功，允许用户决定是否重试、回退或中止。
 
+### Python FFI 绑定（`llm-harness-py`）
+
+`crates/llm-harness-py/` 是 PyO3 绑定层，把 Rust 核心 crate 的能力暴露为 Python 扩展模块。它是最上层依赖，不被任何内部 crate 依赖。
+
+**设计约束：**
+- 核心层（types/loop/agent/runtime）的 `pub` API 变更 → 必须同步检查 FFI 绑定。
+- 绑定层只做"翻译"：`#[pyclass]` 包装 Rust struct，`#[pyfunction]` 工厂函数包装 Python callable 为 trait 实现。不在绑定层写业务逻辑。
+- `serde_json::Value` ↔ Python dict 的转换统一走 `value_conv.rs`，不要在别处重复实现。
+
+**GIL 与线程模型（修改 `pytool.rs` / `pyhooks.rs` / `pyagent.rs` 前必读）：**
+- 全局 tokio runtime 用 `PyOnceLock` 初始化（不用 `LazyLock`，避免 pytest 下死锁）。
+- Rust async → Python 调用路径：`py.detach()` 释放 GIL → `rt.block_on()` → `spawn_blocking` → `Python::attach()` 重新获取 GIL → 调用 Python callback。
+- Python callable（sync 或 async）一律在 `spawn_blocking` 线程执行。async 回调用 `asyncio.run()` 驱动。
+- 构造时用 `inspect.iscoroutinefunction` 检测是否 async，存储 `is_async` 标志。
+
 ## 测试原则
 
 **TDD 流程（实现 trait 时）：**
@@ -229,6 +248,26 @@ pub struct HarnessHooks {
 - Trait 的 mock 实现放在测试模块中（`#[cfg(test)]`）
 - 示例实现在各自的 crate 中，带单独测试
 - 集成测试用真实 `AgentHarness` + mock core types，不依赖外部 LLM
+
+**运行测试：**
+- 一键跑全部测试（Rust workspace + PyO3 Python 测试）：
+  ```
+  ./scripts/test.sh
+  ```
+  该脚本按顺序执行四个阶段：Rust workspace 测试（排除 py crate）→ `maturin develop` 编译安装 cdylib → pytest Python 测试 → `cargo test -p llm-harness-py --ignored` Rust 集成测试（含 `--no-default-features --features test-utils`）。
+- 仅跑 Rust 核心 crate：
+  ```
+  cargo test --workspace --exclude llm-harness-py
+  ```
+- 仅跑 Python FFI 绑定（需先 `maturin develop`）：
+  ```
+  .venv/bin/pytest crates/llm-harness-py/tests/ -v
+  ```
+- 仅跑 PyO3 Rust 集成测试（不走 maturin，直接编译 rlib + auto-initialize）：
+  ```
+  PYO3_PYTHON=$(pwd)/.venv/bin/python3 cargo test -p llm-harness-py --no-default-features --features test-utils -- --ignored
+  ```
+- Python venv 路径：`crates/llm-harness-py/.venv/`（maturin 和 pytest 均在此）。
 
 ## 实现后自查
 
@@ -250,6 +289,16 @@ pub struct HarnessHooks {
 
 **文档同步**
 - ⚠️ 新增或修改了 trait 签名、HarnessHooks 插槽、CompositeHook 语义？更新本文件（CLAUDE.md）对应段落。
+
+**Python FFI 同步**
+- ❌ 修改了 `llm-harness-types` / `llm-harness-loop` / `llm-harness-agent` / `llm-harness-runtime` 中以下任一类别的 `pub` API？必须同步检查 `crates/llm-harness-py/` 对应的绑定是否需要更新：
+  - Tool / Hook / Judge / Executor trait 签名或返回类型
+  - `ToolContext`、`ToolResult`、`ToolError` 等共享类型字段
+  - `Agent`、`AgentHarness`、`HarnessBuilder` 的 pub 方法
+  - `AgentEvent` / `AgentHarnessEvent` 变体或字段
+  - 新增 pub trait 或 struct（需要在 `lib.rs` 注册 `#[pyclass]` / `#[pyfunction]`）
+- ❌ 新增/修改了 Hook 类型或 HarnessHooks 插槽？需要同步 `pyhooks.rs` 工厂函数 + `lib.rs` 注册 + `pybuilder.rs` 暴露。
+- ⚠️ 仅内部实现变化（不改 pub API）？FFI 通常无需改动，但仍需 `cargo test -p llm-harness-py` 确认绑定编译通过。
 
 ## Git 规则
 
