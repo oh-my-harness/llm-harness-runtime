@@ -34,7 +34,7 @@ llm-harness-agent  = { path = "crates/llm-harness-agent" }
 llm-harness-runtime = { path = "crates/llm-harness-runtime" }
 
 # API adapter — separate repo
-llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "d6ec86a382369f06dc4d767a4a8556493916ef38" }
+llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "69a868f5c8aa33059900f132e9c93366d1e479c3" }
 
 # Infrastructure
 anyhow             = "1"
