@@ -535,6 +535,8 @@ pub struct WorkflowEngine {
     max_steps: usize,
     /// Retry 上限，默认 `DEFAULT_MAX_RETRIES`。连续 Retry 超限 → Failed。
     max_retries: usize,
+    /// 每步 LLM 调用的最大输出 token 数。`None` 用 harness 默认值 (8192)。
+    max_tokens: Option<u32>,
     /// run() 重入守卫。防止并发 run() 覆盖写。
     running: AtomicBool,
     /// 规划此 workflow 的 task ID。由 with_planned_by 设置，
@@ -660,6 +662,7 @@ impl WorkflowEngine {
             event_tx,
             max_steps: DEFAULT_MAX_STEPS,
             max_retries: DEFAULT_MAX_RETRIES,
+            max_tokens: None,
             running: AtomicBool::new(false),
             planned_by: None,
         }
@@ -722,6 +725,15 @@ impl WorkflowEngine {
     #[must_use]
     pub fn with_max_retries(mut self, max: usize) -> Self {
         self.max_retries = max;
+        self
+    }
+
+    /// 设置每步 LLM 调用的最大输出 token 数。
+    /// `None` 用 harness 默认值。reasoning 模型 (glm-5.2) 的 thinking 可能很长，
+    /// 默认 8192 不够时需要调大。
+    #[must_use]
+    pub fn with_max_tokens(mut self, max: Option<u32>) -> Self {
+        self.max_tokens = max;
         self
     }
 
@@ -1199,6 +1211,9 @@ impl WorkflowEngine {
         // b. 构造 builder。
         let mut builder = HarnessBuilder::new(&self.config.model)
             .provider(&self.config.model, self.config.client.clone());
+        if let Some(max_tokens) = self.max_tokens {
+            builder = builder.max_tokens(max_tokens);
+        }
 
         // c. 注册 step plugin（若有）。
         if let Some(factory) = self.step_plugin_factories.get(step.id()) {

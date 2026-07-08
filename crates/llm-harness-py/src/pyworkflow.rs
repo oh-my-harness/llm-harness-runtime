@@ -634,6 +634,18 @@ impl PyWorkflowEngine {
         slf
     }
 
+    /// 设置每步 LLM 调用的最大输出 token 数。
+    /// None 用默认值 (8192)。reasoning 模型的 thinking 可能很长，需要调大。
+    fn with_max_tokens<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        max_tokens: Option<u32>,
+    ) -> PyRefMut<'a, Self> {
+        if let Some(engine) = slf.engine.take() {
+            slf.engine = Some(engine.with_max_tokens(max_tokens));
+        }
+        slf
+    }
+
     /// 设置 workflow context 变量。必须在 `run()` 之前调用。
     ///
     /// 将 `key` → `value` 写入引擎共享 context 的 `variables` 表。

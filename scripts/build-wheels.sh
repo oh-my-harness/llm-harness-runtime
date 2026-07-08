@@ -40,6 +40,9 @@ fi
 mkdir -p "$WHEEL_DIR"
 
 # ── Build wheels ──────────────────────────────────────────────
+# abi3 (stable ABI) wheels: one wheel covers CPython 3.9–3.13+.
+# We still need a build interpreter for maturin to find Python headers;
+# python3.12 is fine — the abi3 feature makes the output version-agnostic.
 TARGETS=(
     "aarch64-apple-darwin"
     "x86_64-apple-darwin"
@@ -47,7 +50,7 @@ TARGETS=(
 
 for target in "${TARGETS[@]}"; do
     echo ""
-    echo "▶ Building wheel for $target ..."
+    echo "▶ Building abi3 wheel for $target ..."
     "$MATURIN" build --release --target "$target" --interpreter "$PY" \
         --manifest-path "$CRATE_DIR/Cargo.toml"
 done
@@ -55,6 +58,31 @@ done
 echo ""
 echo "✓ Built wheels:"
 ls -lh "$WHEEL_DIR"/*.whl
+
+# ── Smoke test: verify each wheel installs and imports ───────
+# Cross-compiled wheels (e.g. x86_64 on an arm64 host) can't be installed
+# locally, so attempt pip install and skip on failure.
+echo ""
+echo "── Smoke testing wheels ─────────────────────────────────"
+SMOKE_VENV=$(mktemp -d)
+"$PY" -m venv "$SMOKE_VENV"
+for wheel in "$WHEEL_DIR"/*.whl; do
+    wheel_name=$(basename "$wheel")
+    if ! "$SMOKE_VENV/bin/pip" install --quiet "$wheel" 2>/dev/null; then
+        echo "  ⊘ $wheel_name (skipped: not installable on this host)"
+        continue
+    fi
+    echo "  ▶ $wheel_name"
+    "$SMOKE_VENV/bin/python" -c "import llm_harness_py; print('    ✓ import ok')"
+    "$SMOKE_VENV/bin/pip" uninstall -y llm_harness_py --quiet
+done
+rm -rf "$SMOKE_VENV"
+
+# ── Generate checksums ───────────────────────────────────────
+echo ""
+echo "── Generating checksums ─────────────────────────────────"
+( cd "$WHEEL_DIR" && shasum -a 256 *.whl > checksums.txt )
+echo "✓ $(cat "$WHEEL_DIR/checksums.txt" | wc -l | tr -d ' ') checksums written"
 
 if [ "$BUILD_ONLY" = "--build-only" ]; then
     echo ""
@@ -70,12 +98,13 @@ echo ""
 echo "▶ Uploading wheels to release $TAG in $WHEELS_REPO ..."
 
 if gh release view "$TAG" -R "$WHEELS_REPO" &>/dev/null; then
-    gh release upload "$TAG" -R "$WHEELS_REPO" "$WHEEL_DIR"/*.whl --clobber
+    gh release upload "$TAG" -R "$WHEELS_REPO" \
+        "$WHEEL_DIR"/*.whl "$WHEEL_DIR/checksums.txt" --clobber
 else
     gh release create "$TAG" -R "$WHEELS_REPO" \
         --title "$TAG" \
-        --notes "Prebuilt PyO3 wheels for llm-harness-py (CPython 3.12). Source code is in the private llm-harness-runtime repo; this repo distributes compiled binaries only." \
-        "$WHEEL_DIR"/*.whl
+        --notes "Prebuilt PyO3 abi3 wheels for llm-harness-py (CPython 3.9+). Source code is in the private llm-harness-runtime repo; this repo distributes compiled binaries only." \
+        "$WHEEL_DIR"/*.whl "$WHEEL_DIR/checksums.txt"
 fi
 
 echo ""

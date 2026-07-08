@@ -13,12 +13,12 @@ The runtime exposes a PyO3 module `llm_harness_py` with everything you need to b
 ### Install
 
 ```bash
-python3.12 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install llm_harness_py \
   --find-links https://github.com/oh-my-harness/llm-harness-py-wheels/releases/expanded_assets/v0.2.0
 ```
 
-> Wheels are hosted in the public [llm-harness-py-wheels](https://github.com/oh-my-harness/llm-harness-py-wheels) repo (compiled binaries only, no source code). CPython 3.12 required.
+> Wheels are hosted in the public [llm-harness-py-wheels](https://github.com/oh-my-harness/llm-harness-py-wheels) repo (compiled binaries only, no source code). CPython 3.9+.
 
 ### Quickstart: a single-turn agent with a custom tool
 
@@ -80,7 +80,7 @@ If you need to modify the Rust runtime itself:
 
 ```bash
 cd crates/llm-harness-py
-python3.12 -m venv .venv && source .venv/bin/activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install maturin
 maturin develop --release    # builds and installs into the active venv
 ```
@@ -114,18 +114,18 @@ Wheels are uploaded to the public [llm-harness-py-wheels](https://github.com/oh-
 
 | Platform | Wheel tag | Status |
 |----------|-----------|--------|
-| macOS Apple Silicon | `cp312-cp312-macosx_11_0_arm64` | ✅ |
-| macOS Intel | `cp312-cp312-macosx_10_12_x86_64` | ✅ |
-| Linux x64 | `cp312-cp312-manylinux_*_x86_64` | ⏳ needs Linux machine |
-| Windows x64 | `cp312-cp312-win_amd64` | ⏳ needs Windows machine |
+| macOS Apple Silicon | `cp39-abi3-macosx_11_0_arm64` | ✅ |
+| macOS Intel | `cp39-abi3-macosx_10_12_x86_64` | ✅ |
+| Linux x64 | `cp39-abi3-manylinux_*_x86_64` | ⏳ needs Linux machine |
+| Windows x64 | `cp39-abi3-win_amd64` | ⏳ needs Windows machine |
 
-macOS wheels are cross-compiled on an Apple Silicon machine. Linux and Windows wheels must be built on their respective platforms — run `maturin build --release` in `crates/llm-harness-py/` and upload with `gh release upload`.
+Wheels are built with the abi3 (stable ABI) feature — one wheel covers CPython 3.9–3.13+. macOS wheels are cross-compiled on an Apple Silicon machine. Linux and Windows wheels must be built on their respective platforms — run `maturin build --release` in `crates/llm-harness-py/` and upload with `gh release upload`.
 
 ### Manual build
 
 ```bash
 cd crates/llm-harness-py
-maturin build --release --target aarch64-apple-darwin --interpreter python3.12
+maturin build --release --target aarch64-apple-darwin --interpreter python3
 ```
 
 ---
