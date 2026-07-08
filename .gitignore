@@ -8,3 +8,5 @@ Cargo.lock
 examples/coding-agent/
 docs/superpowers/
 docs/issues
+.venv
+__pycache__

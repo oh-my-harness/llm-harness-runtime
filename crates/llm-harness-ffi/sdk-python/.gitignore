@@ -1,9 +1,0 @@
-build/
-dist/
-*.egg-info/
-.pytest_cache/
-**/__pycache__/
-**/*.py[cod]
-llm_harness_sdk/native/*.dll
-llm_harness_sdk/native/*.dylib
-llm_harness_sdk/native/*.so
