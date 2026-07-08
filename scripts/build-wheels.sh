@@ -11,11 +11,11 @@
 #   - Python 3.12 on PATH
 #   - rustup targets: x86_64-apple-darwin (for Intel macOS cross-compile)
 #   - Docker (for Linux x64 cross-compile via manylinux container)
-#   - gh (GitHub CLI) authenticated, with access to the runtime repo
+#   - gh (GitHub CLI) authenticated, with write access to the wheels repo
 #
 # Windows x64 wheels cannot be built on macOS.
-# Build those on a Windows machine and upload separately:
-#   gh release upload v<version> -R oh-my-harness/llm-harness-py-wheels <wheel-files>
+# Build and upload those on a Windows machine:
+#   powershell -ExecutionPolicy Bypass -File ./scripts/build-windows-wheel.ps1 -Version <version>
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -121,13 +121,19 @@ echo ""
 echo "▶ Uploading wheels to release $TAG in $WHEELS_REPO ..."
 
 if gh release view "$TAG" -R "$WHEELS_REPO" &>/dev/null; then
-    gh release upload "$TAG" -R "$WHEELS_REPO" \
-        "$WHEEL_DIR"/*.whl "$WHEEL_DIR/checksums.txt" --clobber
+    if ! gh release upload "$TAG" -R "$WHEELS_REPO" \
+        "$WHEEL_DIR"/*.whl "$WHEEL_DIR/checksums.txt" --clobber; then
+        echo "✗ gh release upload failed. Check write access to $WHEELS_REPO."
+        exit 1
+    fi
 else
-    gh release create "$TAG" -R "$WHEELS_REPO" \
+    if ! gh release create "$TAG" -R "$WHEELS_REPO" \
         --title "$TAG" \
         --notes "Prebuilt PyO3 abi3 wheels for llm-harness-py (CPython 3.9+). Source code is in the private llm-harness-runtime repo; this repo distributes compiled binaries only." \
-        "$WHEEL_DIR"/*.whl "$WHEEL_DIR/checksums.txt"
+        "$WHEEL_DIR"/*.whl "$WHEEL_DIR/checksums.txt"; then
+        echo "✗ gh release create failed. Check write access to $WHEELS_REPO."
+        exit 1
+    fi
 fi
 
 echo ""

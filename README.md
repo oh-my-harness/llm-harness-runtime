@@ -101,11 +101,12 @@ llm-harness-runtime = { git = "https://github.com/oh-my-harness/llm-harness-runt
 
 ## Building wheels (maintainers)
 
-Use the build script (requires Rust, maturin, Python 3.12, and `gh` authenticated):
+Use the build scripts (requires Rust, maturin, Python 3.12, and `gh` authenticated with write access to the public wheels repo):
 
 ```bash
 ./scripts/build-wheels.sh 0.2.0               # build macOS wheels + upload to wheels repo
 ./scripts/build-wheels.sh 0.2.0 --build-only  # build only, skip upload
+powershell -ExecutionPolicy Bypass -File ./scripts/build-windows-wheel.ps1 -Version 0.2.0
 ```
 
 Wheels are uploaded to the public [llm-harness-py-wheels](https://github.com/oh-my-harness/llm-harness-py-wheels) repo's GitHub Release.
@@ -117,9 +118,9 @@ Wheels are uploaded to the public [llm-harness-py-wheels](https://github.com/oh-
 | macOS Apple Silicon | `cp39-abi3-macosx_11_0_arm64` | ✅ |
 | macOS Intel | `cp39-abi3-macosx_10_12_x86_64` | ✅ |
 | Linux x64 | `cp39-abi3-manylinux_2_17_x86_64` | ✅ |
-| Windows x64 | `cp39-abi3-win_amd64` | ⏳ needs Windows machine |
+| Windows x64 | `cp39-abi3-win_amd64` | ✅ |
 
-Wheels are built with the abi3 (stable ABI) feature — one wheel covers CPython 3.9–3.13+. macOS wheels are cross-compiled on an Apple Silicon machine. Linux x64 wheels are built via Docker manylinux container. Windows wheels must be built on a Windows machine — run `maturin build --release` in `crates/llm-harness-py/` and upload with `gh release upload`.
+Wheels are built with the abi3 (stable ABI) feature — one wheel covers CPython 3.9–3.13+. macOS wheels are cross-compiled on an Apple Silicon machine. Linux x64 wheels are built via Docker manylinux container. Windows x64 wheels are built natively on Windows with `scripts/build-windows-wheel.ps1`.
 
 ### Manual build
 
@@ -148,4 +149,4 @@ crates/
 
 ## Versioning
 
-Workspace version is in the root `Cargo.toml` (`[workspace.package]`). To release a new version: bump the version, run `./scripts/build-wheels.sh <version>` to build and upload wheels.
+Workspace version is in the root `Cargo.toml` (`[workspace.package]`). To release a new version: bump the version, run `./scripts/build-wheels.sh <version>` on macOS/Linux for macOS + Linux wheels, then run `scripts/build-windows-wheel.ps1 -Version <version>` on Windows for the Windows wheel.
