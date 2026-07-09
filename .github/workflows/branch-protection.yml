@@ -1,0 +1,18 @@
+name: Branch Protection
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  enforce-pr:
+    runs-on: ubuntu-latest
+    # 组织 owner 仍可绕过——这是 Free 计划的硬限制
+    if: github.event.pusher.name != 'dependabot[bot]'
+    steps:
+      - name: Block direct push to main
+        run: |
+          echo "❌ Direct push to main is not allowed."
+          echo "Please use a pull request instead."
+          echo "Pusher: ${{ github.event.pusher.name }}"
+          exit 1
