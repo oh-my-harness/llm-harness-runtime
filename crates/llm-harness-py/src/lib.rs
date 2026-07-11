@@ -314,7 +314,9 @@ fn create_should_stop_hook<'py>(
 /// 从 Python callable 创建一个 `BeforeCompactHook`。
 ///
 /// callback 签名：`callback(ctx: dict) -> str | dict`
-/// 返回 `"proceed"` / `"skip"` 或 `{"action": "override", "summary": ...}`。
+/// 返回 `"proceed"` / `"skip"` / `"compact"` 或 `{"action": "override", "summary": <msg_dict>, "first_kept_entry": <str>}`。
+/// `first_kept_entry` 必须是 `ctx["entry_ids"]` 中的一个值。
+/// 可选字段 `tokens_before` (默认 `ctx["estimated_tokens"]`) 和 `tokens_after` (默认 0)。
 /// 若 callback 为 `async def`，其 coroutine 将在 `spawn_blocking` 线程上
 /// 通过 `asyncio.run()` 执行。
 #[pyfunction]

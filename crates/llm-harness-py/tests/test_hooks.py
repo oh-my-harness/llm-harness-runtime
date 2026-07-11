@@ -310,6 +310,35 @@ def test_create_before_compact_hook_accepts_async_callback():
     assert hook is not None
 
 
+def test_create_before_compact_hook_accepts_compact_decision():
+    """create_before_compact_hook accepts a callback returning 'compact'."""
+
+    def my_hook(ctx):
+        return "compact"
+
+    hook = llm_harness_py.create_before_compact_hook(my_hook)
+    assert isinstance(hook, llm_harness_py.Hook)
+
+
+def test_create_before_compact_hook_accepts_override_decision():
+    """create_before_compact_hook accepts a callback returning an override dict with first_kept_entry."""
+
+    def my_hook(ctx):
+        entry_ids = ctx["entry_ids"]
+        return {
+            "action": "override",
+            "summary": {
+                "role": "compaction_summary",
+                "summary": "custom summary",
+                "timestamp": "2025-01-01T00:00:00Z",
+            },
+            "first_kept_entry": entry_ids[-1] if entry_ids else "",
+        }
+
+    hook = llm_harness_py.create_before_compact_hook(my_hook)
+    assert isinstance(hook, llm_harness_py.Hook)
+
+
 # ── create_transform_context_hook tests ──────────────────────────────────────
 
 

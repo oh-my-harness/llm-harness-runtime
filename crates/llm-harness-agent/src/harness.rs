@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::ModelInfo;
 use crate::compaction::{
-    CompactionModelConfig, CompactionSettings, FileOperation, compact, prepare_compaction,
+    CompactionModelConfig, CompactionSettings, DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS, FileOperation, compact, compute_cut_point,
+    estimate_summary_tokens, estimate_tokens,
 };
 use crate::session::{Session, SessionRepo, repo::InMemorySessionRepo, types::*};
 use crate::skills::{
@@ -54,13 +56,13 @@ pub struct HarnessState {
     /// System prompt.
     pub system_prompt: Option<String>,
     /// Streaming assistant message snapshot; `None` when not streaming.
-    pub streaming_message: Option<AssistantMessage>,
+    pub(crate) streaming_message: Option<AssistantMessage>,
     /// IDs of tools currently executing.
-    pub pending_tool_calls: HashSet<String>,
+    pub(crate) pending_tool_calls: HashSet<String>,
     /// Session entries buffered during a running turn; flushed at turn end.
-    pub pending_session_writes: Vec<SessionEntryPayload>,
+    pub(crate) pending_session_writes: Vec<SessionEntryPayload>,
     /// Messages queued for injection at the start of the next `prompt()`.
-    pub queued_next_turn: Vec<AgentMessage>,
+    pub(crate) queued_next_turn: Vec<AgentMessage>,
     /// Error text from the most recent failed LLM call.
     pub error_message: Option<String>,
     /// Whether `set_tools` was called mid-run since the last `build_loop_config`.
@@ -325,6 +327,7 @@ struct HarnessInner {
     retry: Option<RetryConfig>,
     compaction_reserve_tokens: Option<u32>,
     compaction_keep_recent_tokens: Option<u32>,
+    auto_compact: bool,
     /// Maps tool_use_id → tool_name for in-flight tool calls.
     active_tool_names: std::collections::HashMap<String, String>,
     /// Idle watcher（opt-in）。harness 持 watcher 的 `Arc`，watcher 的
@@ -433,6 +436,8 @@ pub struct AgentHarnessOptions {
     /// conversation client/model. When `Some`, all three fields inside are set
     /// together — half-configuration is impossible at the type level.
     pub compaction_model: Option<CompactionModelConfig>,
+    /// Enable automatic compaction at each turn start. Default: `false`.
+    pub auto_compact: bool,
 }
 
 impl AgentHarnessOptions {
@@ -458,6 +463,7 @@ impl AgentHarnessOptions {
             compaction_reserve_tokens: None,
             compaction_keep_recent_tokens: None,
             compaction_model: None,
+            auto_compact: false,
         }
     }
 }
@@ -624,6 +630,7 @@ impl AgentHarness {
             retry: opts.retry,
             compaction_reserve_tokens: opts.compaction_reserve_tokens,
             compaction_keep_recent_tokens: opts.compaction_keep_recent_tokens,
+            auto_compact: opts.auto_compact,
             active_tool_names: std::collections::HashMap::new(),
             idle_watcher: None,
             async_spawn_hook: None,
@@ -711,7 +718,10 @@ impl AgentHarness {
             w.cancel();
         }
 
-        // 2. Merge queued + initial.
+        // 2. Auto-compaction (Idle phase, before run starts).
+        // Non-InsufficientTokens errors propagate to abort the run — the
+        // context is too large and continuing would fail downstream.
+        self.try_auto_compact().await?;
         let initial: Vec<AgentMessage> = queued.into_iter().chain(messages).collect();
 
         // 3. before_run hook.
@@ -755,37 +765,6 @@ impl AgentHarness {
             invoke_template(&tmpl, &args)
         };
         self.prompt(text).await
-    }
-
-    /// Run compaction on the active session path (Idle only).
-    ///
-    /// Event contract: `CompactionEnd` is emitted while the harness is still
-    /// in the `Compacting` phase (before the guard drops and restores Idle).
-    /// Consumers observing `PhaseChange { Compacting → Idle }` can rely on the
-    /// `CompactionEnd` event having already been emitted.
-    pub async fn compact(&self) -> Result<CompactionStats, HarnessError> {
-        let _guard = self.enter_phase(HarnessPhase::Compacting)?;
-
-        let result = self.do_compact().await;
-
-        match result {
-            Ok(stats) => {
-                self.emit(AgentHarnessEvent::CompactionEnd {
-                    stats: Some(stats.clone()),
-                    error: None,
-                });
-                Ok(stats)
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                self.emit(AgentHarnessEvent::CompactionEnd {
-                    stats: None,
-                    error: Some(msg.clone()),
-                });
-                Err(e)
-            }
-        }
-        // _guard 在此 drop，恢复 Idle
     }
 
     /// Reload skills and templates from the given directories.
@@ -944,30 +923,6 @@ impl AgentHarness {
     pub fn set_max_tokens(&self, max_tokens: u32) {
         let mut inner = self.inner.lock().unwrap();
         inner.max_tokens = max_tokens;
-    }
-
-    /// Override tokens to reserve for the LLM response during compaction.
-    /// Takes effect at the next `compact()` call. `None` clears the
-    /// override, falling back to the built-in default (16,384) at the next
-    /// `compact()` call — not the `AgentHarnessOptions` initial value.
-    ///
-    /// Note: this change is NOT persisted to the session log. On session
-    /// restore the value reverts to the initial option.
-    pub fn set_compaction_reserve_tokens(&self, tokens: Option<u32>) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.compaction_reserve_tokens = tokens;
-    }
-
-    /// Override how many recent context tokens to always preserve during
-    /// compaction. Takes effect at the next `compact()` call. `None` clears
-    /// the override, falling back to the built-in default (20,000) at the
-    /// next `compact()` call — not the `AgentHarnessOptions` initial value.
-    ///
-    /// Note: this change is NOT persisted to the session log. On session
-    /// restore the value reverts to the initial option.
-    pub fn set_compaction_keep_recent_tokens(&self, tokens: Option<u32>) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.compaction_keep_recent_tokens = tokens;
     }
 
     /// Replace the registered tool list.
@@ -1177,10 +1132,7 @@ impl AgentHarness {
         let summary = response.text();
 
         let from_entry = path.first().map(|e| e.id).unwrap_or(leaf);
-        let token_count: usize = path
-            .iter()
-            .map(crate::compaction::estimate_tokens_for_entry)
-            .sum();
+        let token_count: usize = crate::compaction::estimate_tokens(&path);
 
         let entry = BranchSummaryEntry {
             leaf_id: leaf,
@@ -1277,6 +1229,11 @@ impl AgentHarness {
                 return Err(HarnessError::NotIdle(inner.state.phase));
             }
         }
+        // No auto-compaction here: continue_run is called by IdleWatcher after
+        // a sub-agent completion, but the completion result is not yet in the
+        // session (injected via should_stop hook during run_loop). Compacting
+        // now would operate on stale context. Auto-compaction runs at
+        // prompt_with_messages entry instead.
         self.run_loop(vec![]).await
     }
 
@@ -1964,53 +1921,179 @@ impl AgentHarness {
         Ok(())
     }
 
-    async fn do_compact(&self) -> Result<CompactionStats, HarnessError> {
+    /// Run compaction on the active session path (Idle only).
+    ///
+    /// Enters `Compacting` phase, runs `do_compact`, emits `CompactionEnd`,
+    /// and returns to `Idle` when the phase guard drops.
+    ///
+    /// Event contract: `CompactionEnd` is emitted while the harness is still
+    /// in the `Compacting` phase (before the guard drops and restores Idle).
+    /// Consumers observing `PhaseChange { Compacting → Idle }` can rely on the
+    /// `CompactionEnd` event having already been emitted.
+    ///
+    /// If `auto_compact` is enabled, this is called automatically at
+    /// `prompt_with_messages` entry.
+    pub async fn compact(&self) -> Result<CompactionStats, HarnessError> {
+        self.compact_with_path(None).await
+    }
+
+    /// Internal compaction entry point that accepts an optional pre-loaded
+    /// session path to avoid redundant `read_active_path` I/O when the caller
+    /// already has the data (e.g. `try_auto_compact`).
+    async fn compact_with_path(
+        &self,
+        preloaded_path: Option<Vec<SessionEntry>>,
+    ) -> Result<CompactionStats, HarnessError> {
+        let _guard = self.enter_phase(HarnessPhase::Compacting)?;
+        let result = self.do_compact(preloaded_path, None).await;
+        match result {
+            Ok(stats) => {
+                self.emit(AgentHarnessEvent::CompactionEnd {
+                    stats: Some(stats.clone()),
+                    error: None,
+                });
+                Ok(stats)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.emit(AgentHarnessEvent::CompactionEnd {
+                    stats: None,
+                    error: Some(msg.clone()),
+                });
+                Err(e)
+            }
+        }
+    }
+
+    /// Auto-compaction check called at `prompt_with_messages` entry (Idle phase).
+    ///
+    /// If `auto_compact` is disabled, returns `Ok(())` immediately.
+    /// Performs a lightweight threshold check *before* entering the Compacting
+    /// phase to avoid spurious `PhaseChange`/`CompactionEnd` events on every
+    /// turn where compaction is not needed.
+    ///
+    /// When a `before_compact` hook is registered, the threshold pre-check is
+    /// skipped — the hook may return `BeforeCompactDecision::Compact` to force
+    /// compaction even when tokens are under threshold.
+    ///
+    /// Returns `Ok(())` when compaction is not needed (`InsufficientTokens` or
+    /// `NoValidBoundary`). All other errors propagate to the caller.
+    ///
+    /// Unlike `compact_with_path` (used by the public `compact()` method),
+    /// benign skips (`InsufficientTokens` / `NoValidBoundary`) do NOT emit
+    /// `CompactionEnd` events — they are silently treated as "nothing to do".
+    /// This avoids spurious error events when a hook forces `Compact` but no
+    /// valid cut boundary exists.
+    async fn try_auto_compact(&self) -> Result<(), HarnessError> {
+        let (auto_compact, has_before_compact_hook) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.auto_compact, !self.hooks.before_compact.is_empty())
+        };
+        if !auto_compact {
+            return Ok(());
+        }
+
+        // Lightweight pre-check: if tokens are under threshold, skip without
+        // entering Compacting phase (avoids spurious events).
         let path = self.session.read_active_path().await?;
+        if path.is_empty() {
+            return Ok(());
+        }
+
+        let pre = self.compaction_prereqs(&path);
+
+        if !has_before_compact_hook {
+            // No hook: apply threshold pre-check and cut-point validation to
+            // avoid spurious PhaseChange/CompactionEnd events.
+            if pre.estimated_tokens <= pre.threshold {
+                return Ok(());
+            }
+            // Validate that a valid cut boundary exists before entering the
+            // Compacting phase — otherwise do_compact would return
+            // NoValidBoundary after emitting spurious events.
+            if compute_cut_point(
+                &path,
+                pre.last_compaction.as_ref(),
+                &pre.settings,
+                Some(pre.start_idx),
+                Some(pre.estimated_tokens),
+            )
+            .is_none()
+            {
+                return Ok(());
+            }
+        }
+
+        // Create a temporary abort token so `abort()` can cancel the
+        // compaction LLM call during auto-compaction (run_loop hasn't set
+        // current_abort yet). The RAII guard restores the previous value on
+        // drop, making it panic-safe.
+        let _abort_guard = AbortTokenGuard::new(self, CancellationToken::new());
+
+        // Enter Compacting phase and run do_compact directly (not via
+        // compact_with_path) so benign skips don't emit CompactionEnd events.
+        let _guard = self.enter_phase(HarnessPhase::Compacting)?;
+        let result = self.do_compact(Some(path), Some(pre)).await;
+        match result {
+            Ok(stats) => {
+                self.emit(AgentHarnessEvent::CompactionEnd {
+                    stats: Some(stats),
+                    error: None,
+                });
+                Ok(())
+            }
+            // Benign skips: no CompactionEnd event, no error propagation.
+            Err(HarnessError::Compaction(CompactionError::InsufficientTokens)) => Ok(()),
+            Err(HarnessError::Compaction(CompactionError::NoValidBoundary)) => Ok(()),
+            Err(HarnessError::Compaction(CompactionError::Skipped)) => Ok(()),
+            Err(e) => {
+                self.emit(AgentHarnessEvent::CompactionEnd {
+                    stats: None,
+                    error: Some(e.to_string()),
+                });
+                Err(e)
+            }
+        }
+    }
+
+    async fn do_compact(
+        &self,
+        preloaded_path: Option<Vec<SessionEntry>>,
+        preloaded_pre: Option<CompactionPrereqs>,
+    ) -> Result<CompactionStats, HarnessError> {
+        let path = match preloaded_path {
+            Some(p) => p,
+            None => self.session.read_active_path().await?,
+        };
         if path.is_empty() {
             return Err(CompactionError::InsufficientTokens.into());
         }
 
-        // Find last compaction entry on path.
-        let last_compaction = path.iter().rev().find_map(|e| {
-            if let SessionEntryPayload::Compaction(c) = &e.payload {
-                Some(c.clone())
-            } else {
-                None
-            }
-        });
+        let pre = preloaded_pre.unwrap_or_else(|| self.compaction_prereqs(&path));
 
-        // Read config and assemble CompactionSettings BEFORE the hook so the
-        // hook receives context_window / reserve_tokens / keep_recent_tokens.
-        let (model_info, model, max_tokens, reserve_tokens, keep_recent_tokens) = {
+        // Read config that is NOT in CompactionPrereqs: model, abort, summary client.
+        let (model, abort) = {
             let inner = self.inner.lock().unwrap();
             (
-                inner.state.model_info.clone(),
                 inner.state.model.clone(),
-                inner.max_tokens,
-                inner.compaction_reserve_tokens,
-                inner.compaction_keep_recent_tokens,
+                inner.current_abort.clone().unwrap_or_default(),
             )
         };
-
-        let m_info = model_info.unwrap_or(ModelInfo {
-            context_window: 200_000,
-            max_tokens,
-        });
 
         // Compaction uses the independent compaction config if set, otherwise
         // falls back to the main conversation client/model. The Option<struct>
         // makes half-configuration impossible at the type level.
         let (summary_client, summary_model, summary_model_info) = match &self.compaction_model {
             Some(c) => (c.client.clone(), c.model.clone(), c.model_info.clone()),
-            None => (self.client.clone(), model.clone(), m_info.clone()),
+            None => (self.client.clone(), model.clone(), pre.m_info.clone()),
         };
 
+        // Patch summary_model / summary_model_info into settings (prereqs used
+        // placeholders since the summary client is only resolved here).
         let settings = CompactionSettings {
-            enabled: true,
-            reserve_tokens: reserve_tokens.unwrap_or(16_384) as usize,
-            keep_recent_tokens: keep_recent_tokens.unwrap_or(20_000) as usize,
             summary_model,
             summary_model_info,
+            ..pre.settings
         };
 
         // before_compact hook is called BEFORE prepare_compaction so that
@@ -2019,44 +2102,135 @@ impl AgentHarness {
             let composite = Arc::new(CompositeBeforeCompactHook::new(
                 self.hooks.before_compact.clone(),
             ));
-            let built = self.session.build_context().await?;
-            let estimated_tokens: usize = path
-                .iter()
-                .map(crate::compaction::estimate_tokens_for_entry)
-                .sum();
+            let built = crate::session::session::build_context_from_entries(&path);
+            let entry_ids: Vec<EntryId> = path.iter().map(|e| e.id).collect();
             let decision = composite
                 .before_compact(BeforeCompactCtx {
-                    estimated_tokens,
+                    estimated_tokens: pre.estimated_tokens,
                     messages: &built.messages,
-                    context_window: m_info.context_window,
+                    entry_ids: &entry_ids,
+                    context_window: pre.m_info.context_window,
                     reserve_tokens: settings.reserve_tokens,
                     keep_recent_tokens: settings.keep_recent_tokens,
                 })
                 .await;
             match decision {
                 BeforeCompactDecision::Skip => {
-                    return Err(CompactionError::InsufficientTokens.into());
+                    return Err(CompactionError::Skipped.into());
                 }
                 BeforeCompactDecision::Override(result) => {
-                    return self.apply_compaction_result(result, vec![], &path).await;
+                    return self
+                        .apply_compaction_result(result, vec![], &path, true)
+                        .await;
+                }
+                BeforeCompactDecision::Compact => {
+                    let prep = compute_cut_point(
+                        &path,
+                        pre.last_compaction.as_ref(),
+                        &settings,
+                        Some(pre.start_idx),
+                        Some(pre.estimated_tokens),
+                    );
+                    let prep = match prep {
+                        Some(p) => p,
+                        None => return Err(CompactionError::NoValidBoundary.into()),
+                    };
+                    let file_operations = prep.file_operations.clone();
+                    self.emit(AgentHarnessEvent::CompactionStart {
+                        estimated_tokens: prep.estimated_tokens,
+                    });
+                    let result = compact(summary_client.as_ref(), prep, &settings, &abort).await?;
+                    return self
+                        .apply_compaction_result(result, file_operations, &path, false)
+                        .await;
                 }
                 BeforeCompactDecision::Proceed => {}
             }
         }
 
-        let prep = prepare_compaction(&path, last_compaction.as_ref(), &settings, &m_info);
+        if pre.estimated_tokens <= pre.threshold {
+            return Err(CompactionError::InsufficientTokens.into());
+        }
+
+        let prep = compute_cut_point(
+            &path,
+            pre.last_compaction.as_ref(),
+            &settings,
+            Some(pre.start_idx),
+            Some(pre.estimated_tokens),
+        );
         let prep = match prep {
             Some(p) => p,
-            None => return Err(CompactionError::InsufficientTokens.into()),
+            None => return Err(CompactionError::NoValidBoundary.into()),
         };
 
         let estimated_tokens = prep.estimated_tokens;
-        let file_operations = prep.file_operations.clone(); // clone so compact() still has access for summary
+        let file_operations = prep.file_operations.clone();
         self.emit(AgentHarnessEvent::CompactionStart { estimated_tokens });
 
-        let result = compact(summary_client.as_ref(), prep, &settings).await?;
-        self.apply_compaction_result(result, file_operations, &path)
+        let result = compact(summary_client.as_ref(), prep, &settings, &abort).await?;
+        self.apply_compaction_result(result, file_operations, &path, false)
             .await
+    }
+
+    /// Compute shared compaction prerequisites from the session path and
+    /// harness config. Used by both `try_auto_compact` (pre-check) and
+    /// `do_compact` (execution) to avoid redundant computation.
+    ///
+    /// `settings.summary_model` / `settings.summary_model_info` are
+    /// placeholders — `do_compact` patches them after resolving the summary
+    /// client.
+    fn compaction_prereqs(&self, path: &[SessionEntry]) -> CompactionPrereqs {
+        let last_compaction = path.iter().rev().find_map(|e| {
+            if let SessionEntryPayload::Compaction(c) = &e.payload {
+                Some(c.clone())
+            } else {
+                None
+            }
+        });
+
+        let (model_info, max_tokens, reserve_tokens, keep_recent_tokens) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                inner.state.model_info.clone(),
+                inner.max_tokens,
+                inner.compaction_reserve_tokens,
+                inner.compaction_keep_recent_tokens,
+            )
+        };
+
+        let m_info = model_info.unwrap_or(ModelInfo {
+            context_window: DEFAULT_CONTEXT_WINDOW,
+            max_tokens,
+        });
+
+        let settings = CompactionSettings {
+            reserve_tokens: reserve_tokens.unwrap_or(DEFAULT_RESERVE_TOKENS as u32) as usize,
+            keep_recent_tokens: keep_recent_tokens.unwrap_or(DEFAULT_KEEP_RECENT_TOKENS as u32)
+                as usize,
+            summary_model: String::new(),
+            summary_model_info: m_info.clone(),
+        };
+
+        let start_idx = live_region_start(path);
+        // `estimate_tokens` returns 0 for Compaction entries, but
+        // `build_context_from_entries` injects the last compaction's summary
+        // into the LLM context. Add it explicitly for accurate threshold check.
+        let summary_tokens = last_compaction
+            .as_ref()
+            .map(estimate_summary_tokens)
+            .unwrap_or(0);
+        let estimated_tokens = estimate_tokens(&path[start_idx..]) + summary_tokens;
+        let threshold = (m_info.context_window as usize).saturating_sub(settings.reserve_tokens);
+
+        CompactionPrereqs {
+            last_compaction,
+            m_info,
+            settings,
+            start_idx,
+            estimated_tokens,
+            threshold,
+        }
     }
 
     async fn apply_compaction_result(
@@ -2064,6 +2238,7 @@ impl AgentHarness {
         result: CompactionResult,
         file_operations: Vec<FileOperation>,
         path: &[SessionEntry],
+        from_hook: bool,
     ) -> Result<CompactionStats, HarnessError> {
         if !path.iter().any(|e| e.id == result.first_kept_entry) {
             return Err(CompactionError::InvalidFirstKeptEntry(result.first_kept_entry).into());
@@ -2071,10 +2246,14 @@ impl AgentHarness {
 
         let tokens_before = result.tokens_before;
         let tokens_after = result.tokens_after;
-        let compressed_entries = path
+        let cut_idx = path
             .iter()
             .position(|e| e.id == result.first_kept_entry)
             .expect("first_kept_entry validated before apply_compaction_result");
+        // Only entries from the live region start onward are compressed
+        // in this round; earlier entries were already compacted.
+        let start_idx = live_region_start(path);
+        let compressed_entries = cut_idx.saturating_sub(start_idx);
 
         let details = if file_operations.is_empty() {
             None
@@ -2086,7 +2265,7 @@ impl AgentHarness {
             summary_message: result.summary_message,
             first_kept_entry: result.first_kept_entry,
             tokens_before,
-            from_hook: false,
+            from_hook,
             details,
         };
         self.session
@@ -2101,6 +2280,42 @@ impl AgentHarness {
     }
 }
 
+/// Find the index in `path` of the `first_kept_entry` belonging to the most
+/// recent `Compaction` entry. Returns 0 when there is no prior compaction.
+fn live_region_start(path: &[SessionEntry]) -> usize {
+    path.iter()
+        .rev()
+        .find_map(|e| {
+            if let SessionEntryPayload::Compaction(c) = &e.payload {
+                Some(c.first_kept_entry)
+            } else {
+                None
+            }
+        })
+        .and_then(|id| path.iter().position(|e| e.id == id))
+        .unwrap_or(0)
+}
+// ── CompactionPrereqs ─────────────────────────────────────────────────────────
+
+/// Shared compaction prerequisites computed once from the session path and
+/// harness config. Used by `try_auto_compact` (pre-check) and `do_compact`
+/// (execution) to avoid redundant computation.
+///
+/// `settings.summary_model` / `settings.summary_model_info` are placeholders
+/// filled with the main conversation model's info — not the compaction model.
+/// They are NOT safe to use for summary LLM calls. `do_compact` patches them
+/// after resolving the summary client from `self.compaction_model`. This
+/// indirection avoids cloning the summary client (`Arc<dyn LlmClient>`) during
+/// the pre-check path where it is not needed. Only `settings.reserve_tokens`
+/// and `settings.keep_recent_tokens` are valid in the pre-check path.
+struct CompactionPrereqs {
+    last_compaction: Option<CompactionEntry>,
+    m_info: ModelInfo,
+    settings: CompactionSettings,
+    start_idx: usize,
+    estimated_tokens: usize,
+    threshold: usize,
+}
 // ── PhaseGuard ────────────────────────────────────────────────────────────────
 
 /// RAII guard：进入非 Idle phase，离开作用域时自动恢复 Idle。
@@ -2121,6 +2336,34 @@ impl std::fmt::Debug for PhaseGuard<'_> {
 impl Drop for PhaseGuard<'_> {
     fn drop(&mut self) {
         self.harness.set_phase(HarnessPhase::Idle);
+    }
+}
+
+// ── AbortTokenGuard ──────────────────────────────────────────────────────────
+
+/// RAII guard: temporarily replaces `current_abort` with a new token,
+/// restoring the previous value on drop (even on panic).
+struct AbortTokenGuard<'a> {
+    harness: &'a AgentHarness,
+    prev: Option<CancellationToken>,
+}
+
+impl AbortTokenGuard<'_> {
+    fn new(harness: &AgentHarness, token: CancellationToken) -> AbortTokenGuard<'_> {
+        let prev = {
+        let mut inner = harness.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = inner.current_abort.take();
+            inner.current_abort = Some(token);
+            prev
+        };
+        AbortTokenGuard { harness, prev }
+    }
+}
+
+impl Drop for AbortTokenGuard<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.harness.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.current_abort = self.prev.take();
     }
 }
 
@@ -2972,6 +3215,230 @@ mod tests {
             "compact() must return InvalidFirstKeptEntry for a nonexistent entry: {err:?}"
         );
     }
+    /// Supplies a fixed `CompactionResult` so tests don't need a real LLM for compaction.
+    struct OverrideCompactHook {
+        first_kept_entry: std::sync::Mutex<Option<EntryId>>,
+    }
+
+    impl OverrideCompactHook {
+        fn new() -> Self {
+            Self {
+                first_kept_entry: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn set_first_kept(&self, id: EntryId) {
+            *self.first_kept_entry.lock().unwrap() = Some(id);
+        }
+    }
+
+    impl BeforeCompactHook for OverrideCompactHook {
+        fn before_compact<'a>(
+            &'a self,
+            ctx: BeforeCompactCtx<'a>,
+        ) -> BoxFuture<'a, BeforeCompactDecision> {
+            let first_kept = self.first_kept_entry.lock().unwrap().unwrap();
+            let summary = AgentMessage::CompactionSummary(CompactionSummaryMessage {
+                summary: format!("summary of {} messages", ctx.messages.len()),
+                timestamp: chrono::Utc::now(),
+            });
+            let result = CompactionResult {
+                summary_message: summary,
+                first_kept_entry: first_kept,
+                tokens_before: 1000,
+                tokens_after: 100,
+            };
+            Box::pin(async move { BeforeCompactDecision::Override(result) })
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_via_hook_override_inserts_summary() {
+        let hook = Arc::new(OverrideCompactHook::new());
+
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("reply")]));
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        opts.hooks = HarnessHooks {
+            before_compact: vec![hook.clone()],
+            ..HarnessHooks::none()
+        };
+        let h = AgentHarness::new_in_memory(client, env, opts).await;
+
+        h.prompt("question").await.unwrap();
+
+        // Use the last written entry as first_kept_entry so compaction keeps nothing.
+        let ctx_before = h.build_context().await.unwrap();
+        assert!(!ctx_before.messages.is_empty());
+
+        // Append a marker entry and tell the hook to keep from there.
+        let kept_id = h
+            .append_custom_entry("marker".into(), serde_json::json!({}))
+            .await
+            .unwrap();
+        hook.set_first_kept(kept_id);
+
+        let stats = h.compact().await.unwrap();
+        assert_eq!(
+            stats.tokens_before, 1000,
+            "wrong tokens_before from override"
+        );
+
+        // After compaction, the first message must be the summary.
+        let ctx_after = h.build_context().await.unwrap();
+        assert!(
+            matches!(
+                ctx_after.messages.first(),
+                Some(AgentMessage::CompactionSummary(_))
+            ),
+            "expected summary as first message; got {:?}",
+            ctx_after.messages.first().map(std::mem::discriminant)
+        );
+    }
+    /// A hook returning `BeforeCompactDecision::Compact` forces the framework
+    /// to run compaction via `compute_cut_point` (bypassing the threshold check),
+    /// using the independent compaction client for the LLM summary.
+    #[tokio::test]
+    async fn compact_decision_forces_framework_compaction() {
+        use futures::future::BoxFuture;
+        use llm_harness_types::{BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook};
+
+        struct CompactDecisionHook;
+        impl BeforeCompactHook for CompactDecisionHook {
+            fn before_compact<'a>(
+                &'a self,
+                _ctx: BeforeCompactCtx<'a>,
+            ) -> BoxFuture<'a, BeforeCompactDecision> {
+                Box::pin(async { BeforeCompactDecision::Compact })
+            }
+        }
+
+        let main_client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+        ]));
+        let compaction_client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
+            "forced compact summary",
+        )]));
+
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        opts.model_info = Some(ModelInfo {
+            context_window: 1,
+            max_tokens: 50,
+        });
+        opts.compaction_reserve_tokens = Some(0);
+        opts.compaction_keep_recent_tokens = Some(0);
+        opts.compaction_model = Some(CompactionModelConfig {
+            client: compaction_client.clone() as Arc<dyn LlmClient>,
+            model: "compaction-model".into(),
+            model_info: ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            },
+        });
+        opts.hooks = HarnessHooks {
+            before_compact: vec![Arc::new(CompactDecisionHook)],
+            ..HarnessHooks::none()
+        };
+        let h =
+            AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+        // Two prompts → 4 entries (user, assistant, user, assistant).
+        h.prompt("hi").await.unwrap();
+        h.prompt("yo").await.unwrap();
+
+        // compact() triggers do_compact, which calls the hook → Compact decision
+        // → compute_cut_point → compact() fn → apply_compaction_result.
+        let stats = h.compact().await.unwrap();
+        assert!(
+            stats.tokens_before > 0,
+            "tokens_before should be positive; got {}",
+            stats.tokens_before
+        );
+
+        // Compaction client should have been used for the summary.
+        assert_eq!(
+            compaction_client
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "compaction client must receive exactly one summary request"
+        );
+
+        // Main client should only have the two prompt() calls.
+        assert_eq!(
+            main_client
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "main client must not receive compaction request"
+        );
+
+        // The summary must be in the session, and from_hook must be false.
+        let path = h.session.read_active_path().await.unwrap();
+        let has_summary = path.iter().any(|e| {
+            if let SessionEntryPayload::Compaction(c) = &e.payload {
+                matches!(
+                    &c.summary_message,
+                    AgentMessage::CompactionSummary(cs)
+                        if cs.summary.contains("forced compact summary")
+                ) && !c.from_hook
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_summary,
+            "compaction summary with from_hook=false not found in session"
+        );
+    }
+    /// A hook returning `BeforeCompactDecision::Skip` must map to
+    /// `CompactionError::Skipped` (not `InsufficientTokens`), giving the
+    /// caller an accurate error message on manual `compact()`.
+    #[tokio::test]
+    async fn compact_skip_returns_skipped_error() {
+        use futures::future::BoxFuture;
+        use llm_harness_types::{BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook};
+
+        struct SkipHook;
+        impl BeforeCompactHook for SkipHook {
+            fn before_compact<'a>(
+                &'a self,
+                _ctx: BeforeCompactCtx<'a>,
+            ) -> BoxFuture<'a, BeforeCompactDecision> {
+                Box::pin(async { BeforeCompactDecision::Skip })
+            }
+        }
+
+        let main_client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+        ]));
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        opts.model_info = Some(ModelInfo {
+            context_window: 1,
+            max_tokens: 50,
+        });
+        opts.compaction_reserve_tokens = Some(0);
+        opts.compaction_keep_recent_tokens = Some(0);
+        opts.hooks = HarnessHooks {
+            before_compact: vec![Arc::new(SkipHook)],
+            ..HarnessHooks::none()
+        };
+        let h =
+            AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+        h.prompt("hi").await.unwrap();
+        h.prompt("yo").await.unwrap();
+
+        let err = h.compact().await.unwrap_err();
+        assert!(
+            matches!(err, HarnessError::Compaction(CompactionError::Skipped)),
+            "expected CompactionError::Skipped, got: {err:?}"
+        );
+    }
     #[tokio::test]
     async fn continue_run_returns_not_idle_when_turning() {
         let h = make_harness(vec![]);
@@ -3075,6 +3542,186 @@ mod tests {
         assert!(
             has_summary,
             "compaction summary from independent client not found in session"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_public_method_works() {
+        let main_client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+            MockResponse::text("compacted summary"),
+        ]));
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        // Tiny context window + zero reserve so compaction triggers easily.
+        opts.model_info = Some(ModelInfo {
+            context_window: 1,
+            max_tokens: 50,
+        });
+        opts.compaction_reserve_tokens = Some(0);
+        opts.compaction_keep_recent_tokens = Some(0);
+        // Use main client for compaction but with a large enough context window
+        // for the summary request to fit.
+        opts.compaction_model = Some(CompactionModelConfig {
+            client: main_client.clone() as Arc<dyn LlmClient>,
+            model: "test-model".into(),
+            model_info: ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            },
+        });
+        let h =
+            AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+        h.prompt("hi").await.unwrap();
+        h.prompt("yo").await.unwrap();
+
+        // compact() is now a production method.
+        let stats = h.compact().await.unwrap();
+        assert!(stats.tokens_before > 0);
+
+        let path = h.session.read_active_path().await.unwrap();
+        let has_summary = path
+            .iter()
+            .any(|e| matches!(&e.payload, SessionEntryPayload::Compaction(_)));
+        assert!(has_summary, "compaction summary not found in session");
+    }
+
+    #[tokio::test]
+    async fn auto_compact_triggers_on_prompt() {
+        // Main client: 2 prompt responses + 1 compaction summary + 1 response for third prompt.
+        let main_client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+            MockResponse::text("auto compact summary"),
+            MockResponse::text("response3"),
+        ]));
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        opts.model_info = Some(ModelInfo {
+            context_window: 1,
+            max_tokens: 50,
+        });
+        opts.compaction_reserve_tokens = Some(0);
+        opts.compaction_keep_recent_tokens = Some(0);
+        opts.auto_compact = true;
+        opts.compaction_model = Some(CompactionModelConfig {
+            client: main_client.clone() as Arc<dyn LlmClient>,
+            model: "test-model".into(),
+            model_info: ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            },
+        });
+        let h =
+            AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+        // Two prompts build up context. Third prompt triggers auto-compaction
+        // at run entry (Idle phase), then the run proceeds.
+        h.prompt("first message").await.unwrap();
+        h.prompt("second message").await.unwrap();
+        h.prompt("third message").await.unwrap();
+
+        // Verify compaction happened: session should have a CompactionEntry.
+        let path = h.session.read_active_path().await.unwrap();
+        let has_compaction = path
+            .iter()
+            .any(|e| matches!(&e.payload, SessionEntryPayload::Compaction(_)));
+        assert!(
+            has_compaction,
+            "auto-compaction should have triggered on the third prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_compact_failure_propagates_error() {
+        // Main client: 2 normal responses for first 2 prompts.
+        let main_client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+        ]));
+        // Compaction client that returns a RateLimit error.
+        let compaction_client =
+            Arc::new(MockLlmClient::new(vec![MockResponse::rate_limit_error()]));
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        opts.model_info = Some(ModelInfo {
+            context_window: 1,
+            max_tokens: 50,
+        });
+        opts.compaction_reserve_tokens = Some(0);
+        opts.compaction_keep_recent_tokens = Some(0);
+        opts.auto_compact = true;
+        opts.compaction_model = Some(CompactionModelConfig {
+            client: compaction_client as Arc<dyn LlmClient>,
+            model: "compaction-model".into(),
+            model_info: ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            },
+        });
+        let h =
+            AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+        h.prompt("first").await.unwrap();
+        h.prompt("second").await.unwrap();
+
+        // Third prompt triggers auto-compaction at run entry (Idle phase).
+        // The compaction client returns RateLimit error → SummaryFailed.
+        // The error must propagate and abort the run (context is too large
+        // to continue without compaction).
+        let err = h.prompt("third").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarnessError::Compaction(CompactionError::SummaryFailed(_))
+            ),
+            "expected SummaryFailed from compaction rate limit, got: {err:?}"
+        );
+
+        // Main client should NOT have received a third request (run aborted).
+        assert_eq!(
+            main_client
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "main client must not receive a third request after compaction failure"
+        );
+    }
+
+    /// When `auto_compact` is disabled, repeated prompts must NOT trigger
+    /// any compaction, even if tokens exceed the threshold.
+    #[tokio::test]
+    async fn auto_compact_disabled_does_not_compact() {
+        let main_client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+            MockResponse::text("response3"),
+        ]));
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        opts.model_info = Some(ModelInfo {
+            context_window: 1,
+            max_tokens: 50,
+        });
+        opts.compaction_reserve_tokens = Some(0);
+        opts.compaction_keep_recent_tokens = Some(0);
+        opts.auto_compact = false; // explicitly disabled
+        let h =
+            AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+        h.prompt("first").await.unwrap();
+        h.prompt("second").await.unwrap();
+        h.prompt("third").await.unwrap();
+
+        let path = h.session.read_active_path().await.unwrap();
+        let has_compaction = path
+            .iter()
+            .any(|e| matches!(&e.payload, SessionEntryPayload::Compaction(_)));
+        assert!(
+            !has_compaction,
+            "auto_compact=false must not trigger compaction"
         );
     }
     /// `set_tools` called mid-run (via a `before_turn` hook) must survive the
@@ -3358,60 +4005,6 @@ mod tests {
         );
     }
 
-    /// `set_compaction_reserve_tokens` / `set_compaction_keep_recent_tokens`
-    /// must take effect at the next `compact()` call: with a large context
-    /// window and default reserve, compaction does not trigger; raising
-    /// reserve_tokens via the setter lowers the threshold so the same
-    /// session becomes compactable.
-    #[tokio::test]
-    async fn set_compaction_params_enables_early_compact() {
-        // Two prompt responses + one compaction summary.
-        let client = Arc::new(MockLlmClient::new(vec![
-            MockResponse::text("response1"),
-            MockResponse::text("response2"),
-            MockResponse::text("compacted summary"),
-        ]));
-        let env = Arc::new(NoOpEnv);
-        let mut opts = AgentHarnessOptions::new("test-model");
-        // Large context window + default reserve → threshold too high to trigger.
-        // estimated_tokens for "hi"+"response1"+"yo"+"response2" ≈ 2; default
-        // threshold = 200_000 - 16_384 = 183_616 ≫ 2.
-        opts.model_info = Some(ModelInfo {
-            context_window: 200_000,
-            max_tokens: 8192,
-        });
-        let h = AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await;
-
-        // Two prompts → 4 entries (user, assistant, user, assistant).
-        h.prompt("hi").await.unwrap();
-        h.prompt("yo").await.unwrap();
-
-        // Default threshold: compaction must NOT trigger.
-        let err = h.compact().await.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                HarnessError::Compaction(CompactionError::InsufficientTokens)
-            ),
-            "expected InsufficientTokens with default threshold, got: {err:?}"
-        );
-
-        // Raise reserve_tokens so threshold drops to 0. estimated_tokens = 1
-        // (user "hi" = 1 token; assistant usage.output_tokens = 0 via MockResponse::text).
-        // threshold = 200_000 - 200_000 = 0 < 1 → triggers.
-        h.set_compaction_reserve_tokens(Some(200_000));
-        // keep_recent_tokens = 0 so the cut-point scan can find a boundary.
-        h.set_compaction_keep_recent_tokens(Some(0));
-
-        let stats = h
-            .compact()
-            .await
-            .expect("compaction must trigger after lowering threshold");
-        assert!(
-            stats.compressed_entries > 0,
-            "expected at least one entry compressed, got stats: {stats:?}"
-        );
-    }
     // ── Branch ops: Branching phase guard ────────────────────────────────────
 
     #[tokio::test]
@@ -3701,6 +4294,345 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("reserved by the framework"));
+    }
+    /// LLM client that never returns from `chat` — for testing abort paths.
+    struct BlockingClient;
+
+    #[async_trait::async_trait]
+    impl LlmClient for BlockingClient {
+        fn capabilities(&self) -> llm_harness_loop::ProviderCapabilities {
+            llm_harness_loop::ProviderCapabilities::new(false, false, false)
+        }
+        async fn chat(
+            &self,
+            _: &llm_harness_loop::ChatRequest,
+        ) -> std::result::Result<llm_harness_loop::ChatResponse, llm_harness_loop::LlmError>
+        {
+            std::future::pending().await
+        }
+        async fn chat_stream(
+            &self,
+            _: &llm_harness_loop::ChatRequest,
+        ) -> std::result::Result<llm_harness_loop::StreamHandle, llm_harness_loop::LlmError>
+        {
+            std::future::pending().await
+        }
+    }
+
+    /// When `auto_compact` is enabled and the compaction LLM call blocks,
+    /// calling `abort()` must cancel it (the temporary abort token is set
+    /// in `current_abort` before compaction starts).
+    #[tokio::test]
+    async fn auto_compact_abort_cancels_compaction() {
+        let main_client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+        ]));
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        opts.model_info = Some(ModelInfo {
+            context_window: 1,
+            max_tokens: 50,
+        });
+        opts.compaction_reserve_tokens = Some(0);
+        opts.compaction_keep_recent_tokens = Some(0);
+        opts.auto_compact = true;
+        // BlockingClient never returns — compaction will hang unless aborted.
+        opts.compaction_model = Some(CompactionModelConfig {
+            client: Arc::new(BlockingClient) as Arc<dyn LlmClient>,
+            model: "blocking-model".into(),
+            model_info: ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            },
+        });
+        let h = Arc::new(
+            AgentHarness::new_in_memory(main_client as Arc<dyn LlmClient>, env, opts).await,
+        );
+
+        h.prompt("first").await.unwrap();
+        h.prompt("second").await.unwrap();
+
+        // Third prompt triggers auto-compaction. The compaction LLM call
+        // blocks forever. We abort from another task.
+        let h_clone = h.clone();
+        let prompt_task = tokio::spawn(async move { h_clone.prompt("third").await });
+
+        // Give compaction time to start (enter Compacting phase + LLM call).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        h.abort();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), prompt_task).await;
+        assert!(
+            result.is_ok(),
+            "prompt task should finish after abort, not hang"
+        );
+        let prompt_result = result.unwrap().unwrap();
+        assert!(
+            prompt_result.is_err(),
+            "aborted auto-compaction should produce an error, got: {prompt_result:?}"
+        );
+    }
+
+    /// When a `before_compact` hook returns `Compact`, auto-compaction must
+    /// trigger even if tokens are under the threshold (the pre-check is
+    /// skipped when a hook is registered).
+    #[tokio::test]
+    async fn auto_compact_with_compact_hook_under_threshold() {
+        use futures::future::BoxFuture;
+        use llm_harness_types::{BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook};
+
+        struct CompactDecisionHook;
+        impl BeforeCompactHook for CompactDecisionHook {
+            fn before_compact<'a>(
+                &'a self,
+                _ctx: BeforeCompactCtx<'a>,
+            ) -> BoxFuture<'a, BeforeCompactDecision> {
+                Box::pin(async { BeforeCompactDecision::Compact })
+            }
+        }
+
+        let main_client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+            MockResponse::text("forced compact summary"),
+            MockResponse::text("response3"),
+        ]));
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        // Large context window → tokens will be well under threshold.
+        opts.model_info = Some(ModelInfo {
+            context_window: 1_000_000,
+            max_tokens: 50,
+        });
+        opts.compaction_reserve_tokens = Some(100_000);
+        opts.compaction_keep_recent_tokens = Some(0);
+        opts.auto_compact = true;
+        opts.compaction_model = Some(CompactionModelConfig {
+            client: main_client.clone() as Arc<dyn LlmClient>,
+            model: "test-model".into(),
+            model_info: ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            },
+        });
+        opts.hooks = HarnessHooks {
+            before_compact: vec![Arc::new(CompactDecisionHook)],
+            ..HarnessHooks::none()
+        };
+        let h =
+            AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+        h.prompt("first").await.unwrap();
+        h.prompt("second").await.unwrap();
+        // Third prompt: tokens are under threshold, but the hook returns
+        // Compact → compaction should trigger anyway.
+        h.prompt("third").await.unwrap();
+
+        let path = h.session.read_active_path().await.unwrap();
+        let has_compaction = path
+            .iter()
+            .any(|e| matches!(&e.payload, SessionEntryPayload::Compaction(_)));
+        assert!(
+            has_compaction,
+            "hook returning Compact should trigger compaction even under threshold"
+        );
+    }
+
+    /// When tokens exceed the threshold but `compute_cut_point` returns
+    /// `None` (all entries fit within `keep_recent_tokens`), auto-compaction
+    /// must NOT emit `CompactionEnd` events.
+    ///
+    /// This test deliberately builds context across 2 prompts so the session
+    /// path is non-empty when `try_auto_compact` runs on the 3rd prompt.
+    /// `keep_recent_tokens` is set high enough to retain all entries, so
+    /// the backward scan in `compute_cut_point` reaches `i == 0` and returns
+    /// `None` — the actual NoValidBoundary path.
+    #[tokio::test]
+    async fn auto_compact_no_spurious_events_when_no_valid_boundary() {
+        let main_client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+            MockResponse::text("response3"),
+        ]));
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        // Tiny context window + zero reserve → threshold = 1.
+        // Two prompts produce ~4 tokens of entries → estimated_tokens > threshold.
+        opts.model_info = Some(ModelInfo {
+            context_window: 1,
+            max_tokens: 50,
+        });
+        opts.compaction_reserve_tokens = Some(0);
+        // keep_recent_tokens large enough to retain all entries → backward
+        // scan reaches i == 0 → compute_cut_point returns None.
+        opts.compaction_keep_recent_tokens = Some(100_000);
+        opts.auto_compact = true;
+        opts.compaction_model = Some(CompactionModelConfig {
+            client: main_client.clone() as Arc<dyn LlmClient>,
+            model: "test-model".into(),
+            model_info: ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            },
+        });
+        let h =
+            AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+        // Build up context so the session path is non-empty.
+        h.prompt("first").await.unwrap();
+        h.prompt("second").await.unwrap();
+
+        // Collect events for the 3rd prompt — try_auto_compact sees a
+        // non-empty path, tokens exceed threshold, but compute_cut_point
+        // returns None (all entries within keep_recent window).
+        let mut event_rx = h.subscribe();
+        h.prompt("third").await.unwrap();
+
+        // Drain events — should see no CompactionEnd (benign skip, silent).
+        let mut had_compaction_end = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(event.as_ref(), AgentHarnessEvent::CompactionEnd { .. }) {
+                had_compaction_end = true;
+            }
+        }
+        assert!(
+            !had_compaction_end,
+            "should not emit CompactionEnd when compute_cut_point returns None"
+        );
+    }
+
+    /// When a `before_compact` hook returns `Compact` but no valid cut
+    /// boundary exists, auto-compaction must NOT emit `CompactionEnd` events.
+    /// This is the hook-path equivalent of `auto_compact_no_spurious_events_when_no_valid_boundary`.
+    #[tokio::test]
+    async fn auto_compact_hook_compact_no_boundary_no_spurious_events() {
+        use futures::future::BoxFuture;
+        use llm_harness_types::{BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook};
+
+        struct CompactDecisionHook;
+        impl BeforeCompactHook for CompactDecisionHook {
+            fn before_compact<'a>(
+                &'a self,
+                _ctx: BeforeCompactCtx<'a>,
+            ) -> BoxFuture<'a, BeforeCompactDecision> {
+                Box::pin(async { BeforeCompactDecision::Compact })
+            }
+        }
+
+        let main_client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+            MockResponse::text("response3"),
+        ]));
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        opts.model_info = Some(ModelInfo {
+            context_window: 1,
+            max_tokens: 50,
+        });
+        opts.compaction_reserve_tokens = Some(0);
+        // keep_recent_tokens large enough to retain all entries → backward
+        // scan reaches i == 0 → compute_cut_point returns None.
+        opts.compaction_keep_recent_tokens = Some(100_000);
+        opts.auto_compact = true;
+        opts.compaction_model = Some(CompactionModelConfig {
+            client: main_client.clone() as Arc<dyn LlmClient>,
+            model: "test-model".into(),
+            model_info: ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            },
+        });
+        opts.hooks = HarnessHooks {
+            before_compact: vec![Arc::new(CompactDecisionHook)],
+            ..HarnessHooks::none()
+        };
+        let h =
+            AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+        // Build up context so the session path is non-empty.
+        h.prompt("first").await.unwrap();
+        h.prompt("second").await.unwrap();
+
+        // 3rd prompt: try_auto_compact sees non-empty path, hook returns
+        // Compact, but compute_cut_point returns None (all entries within
+        // keep_recent window) → NoValidBoundary → benign skip, no CompactionEnd.
+        let mut event_rx = h.subscribe();
+        h.prompt("third").await.unwrap();
+
+        // Drain events — should see no CompactionEnd (benign skip, silent).
+        let mut had_compaction_end = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(event.as_ref(), AgentHarnessEvent::CompactionEnd { .. }) {
+                had_compaction_end = true;
+            }
+        }
+        assert!(
+            !had_compaction_end,
+            "hook Compact path with NoValidBoundary must not emit CompactionEnd"
+        );
+    }
+
+    /// When a `before_compact` hook returns `Proceed` and tokens are under
+    /// the threshold, auto-compaction must NOT emit `CompactionEnd` events.
+    /// The `PhaseChange { Idle → Compacting → Idle }` churn is the
+    /// inherent cost of registering a hook (the framework must enter the
+    /// Compacting phase to call the hook), but the `CompactionEnd` event
+    /// is suppressed for this benign skip.
+    #[tokio::test]
+    async fn auto_compact_hook_proceed_under_threshold_no_compaction_end() {
+        use futures::future::BoxFuture;
+        use llm_harness_types::{BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook};
+
+        struct ProceedHook;
+        impl BeforeCompactHook for ProceedHook {
+            fn before_compact<'a>(
+                &'a self,
+                _ctx: BeforeCompactCtx<'a>,
+            ) -> BoxFuture<'a, BeforeCompactDecision> {
+                Box::pin(async { BeforeCompactDecision::Proceed })
+            }
+        }
+
+        let main_client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("response1"),
+            MockResponse::text("response2"),
+            MockResponse::text("response3"),
+        ]));
+        let env = Arc::new(NoOpEnv);
+        let mut opts = AgentHarnessOptions::new("test-model");
+        // Large context window → tokens always under threshold.
+        opts.model_info = Some(ModelInfo {
+            context_window: 1_000_000,
+            max_tokens: 50,
+        });
+        opts.auto_compact = true;
+        opts.hooks = HarnessHooks {
+            before_compact: vec![Arc::new(ProceedHook)],
+            ..HarnessHooks::none()
+        };
+        let h =
+            AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+        h.prompt("first").await.unwrap();
+
+        let mut event_rx = h.subscribe();
+        h.prompt("second").await.unwrap();
+
+        // Drain events — should see no CompactionEnd (Proceed + under
+        // threshold → InsufficientTokens → benign skip, silent).
+        let mut had_compaction_end = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if matches!(event.as_ref(), AgentHarnessEvent::CompactionEnd { .. }) {
+                had_compaction_end = true;
+            }
+        }
+        assert!(
+            !had_compaction_end,
+            "hook Proceed + under-threshold must not emit CompactionEnd"
+        );
     }
 }
 

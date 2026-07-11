@@ -150,6 +150,8 @@ pub struct HarnessBuilder {
     compaction_reserve_tokens: Option<u32>,
     /// Compaction keep-recent tokens override.
     compaction_keep_recent_tokens: Option<u32>,
+    /// Enable automatic compaction at each turn start.
+    auto_compact: bool,
     /// Steer/follow-up queue capacity.
     queue_capacity: Option<usize>,
 }
@@ -183,6 +185,7 @@ impl HarnessBuilder {
             stream_options: None,
             compaction_reserve_tokens: None,
             compaction_keep_recent_tokens: None,
+            auto_compact: false,
             queue_capacity: None,
         }
     }
@@ -375,6 +378,12 @@ impl HarnessBuilder {
         self
     }
 
+    /// Enable automatic compaction at each turn start.
+    pub fn auto_compact(mut self, enabled: bool) -> Self {
+        self.auto_compact = enabled;
+        self
+    }
+
     /// Set steer/follow-up queue capacity. `None` resets to default (32).
     pub fn queue_capacity(mut self, capacity: Option<usize>) -> Self {
         self.queue_capacity = capacity;
@@ -558,6 +567,7 @@ impl HarnessBuilder {
         if let Some(tokens) = self.compaction_keep_recent_tokens {
             opts.compaction_keep_recent_tokens = Some(tokens);
         }
+        opts.auto_compact = self.auto_compact;
         if let Some(cap) = self.queue_capacity {
             opts.queue_capacity = cap;
         }

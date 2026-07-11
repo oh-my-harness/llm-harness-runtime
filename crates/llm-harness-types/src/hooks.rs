@@ -4,13 +4,13 @@ use futures::future::BoxFuture;
 
 use crate::{
     AgentContext, AgentError, AgentHarnessResources, AgentMessage, AssistantMessage,
-    CompactionResult, ContentBlock, StopReason, StreamOptions, Tool, ToolError, ToolResult,
-    TurnSnapshot,
+    CompactionResult, ContentBlock, EntryId, StopReason, StreamOptions, Tool, ToolError,
+    ToolResult, TurnSnapshot,
 };
 
 // ── TransformContextHook ──────────────────────────────────────────────────────
 
-/// 每次 LLM 调用前对上下文做转换；compaction 通过此 hook 接入。
+/// 每次 LLM 调用前对上下文做转换。
 pub trait TransformContextHook: Send + Sync {
     /// 对 `ctx` 做变换后返回新的上下文。
     fn transform<'a>(
@@ -253,6 +253,9 @@ pub struct BeforeCompactCtx<'a> {
     pub estimated_tokens: usize,
     /// 当前消息列表。
     pub messages: &'a [AgentMessage],
+    /// 当前 active path 中所有 entry 的 ID（与 messages 一一对应之前的完整 path）。
+    /// Override 决策需要从中选取 `first_kept_entry`。
+    pub entry_ids: &'a [EntryId],
     /// 模型上下文窗口大小（token 数）。
     pub context_window: u32,
     /// 压缩时预留给 LLM 回复的 token 数。
@@ -268,6 +271,9 @@ pub enum BeforeCompactDecision {
     Proceed,
     /// 跳过本次 compaction（由 hook 决定暂不压缩）。
     Skip,
+    /// 强制走框架默认压缩流程，跳过阈值检查。
+    /// 框架算 cut point + LLM 摘要，hook 不需要提供任何东西。
+    Compact,
     /// 使用 hook 提供的 `CompactionResult` 替代框架生成的摘要。
     Override(CompactionResult),
 }
@@ -311,6 +317,13 @@ mod tests {
     fn before_compact_decision_skip() {
         let d = BeforeCompactDecision::Skip;
         assert!(matches!(d, BeforeCompactDecision::Skip));
+    }
+
+    #[test]
+    fn compact_decision_is_constructible() {
+        let d = BeforeCompactDecision::Compact;
+        assert!(!matches!(d, BeforeCompactDecision::Proceed));
+        assert!(!matches!(d, BeforeCompactDecision::Skip));
     }
 
     #[test]
