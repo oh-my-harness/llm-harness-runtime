@@ -398,6 +398,7 @@ impl BeforeCompactHook for CompositeBeforeCompactHook {
                 let hook_ctx = BeforeCompactCtx {
                     estimated_tokens: ctx.estimated_tokens,
                     messages: ctx.messages,
+                    entry_ids: ctx.entry_ids,
                     context_window: ctx.context_window,
                     reserve_tokens: ctx.reserve_tokens,
                     keep_recent_tokens: ctx.keep_recent_tokens,

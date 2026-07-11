@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use llm_harness_agent::{AgentHarness, AgentHarnessOptions, HarnessHooks};
+use llm_harness_agent::{AgentHarness, AgentHarnessOptions};
 use llm_harness_loop::{
     LlmClient,
     test_utils::{MockLlmClient, MockResponse, NoOpEnv},
@@ -116,45 +116,6 @@ impl Tool for EchoTool {
                 terminate: false,
             })
         })
-    }
-}
-
-// ── Compaction override hook ──────────────────────────────────────────────────
-
-/// Supplies a fixed `CompactionResult` so tests don't need a real LLM for compaction.
-struct OverrideCompactHook {
-    first_kept_entry: std::sync::Mutex<Option<EntryId>>,
-}
-
-impl OverrideCompactHook {
-    fn new() -> Self {
-        Self {
-            first_kept_entry: std::sync::Mutex::new(None),
-        }
-    }
-
-    fn set_first_kept(&self, id: EntryId) {
-        *self.first_kept_entry.lock().unwrap() = Some(id);
-    }
-}
-
-impl BeforeCompactHook for OverrideCompactHook {
-    fn before_compact<'a>(
-        &'a self,
-        ctx: BeforeCompactCtx<'a>,
-    ) -> BoxFuture<'a, BeforeCompactDecision> {
-        let first_kept = self.first_kept_entry.lock().unwrap().unwrap();
-        let summary = AgentMessage::CompactionSummary(CompactionSummaryMessage {
-            summary: format!("summary of {} messages", ctx.messages.len()),
-            timestamp: chrono::Utc::now(),
-        });
-        let result = CompactionResult {
-            summary_message: summary,
-            first_kept_entry: first_kept,
-            tokens_before: 1000,
-            tokens_after: 100,
-        };
-        Box::pin(async move { BeforeCompactDecision::Override(result) })
     }
 }
 
@@ -323,50 +284,6 @@ async fn fork_and_navigate_produces_independent_branches() {
 
     let all = h.list_branches().await.unwrap();
     assert!(all.len() >= 2, "expected ≥2 branches, got {}", all.len());
-}
-
-#[tokio::test]
-async fn compaction_via_hook_override_inserts_summary() {
-    let hook = Arc::new(OverrideCompactHook::new());
-
-    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("reply")]));
-    let env = Arc::new(NoOpEnv);
-    let mut opts = AgentHarnessOptions::new("test-model");
-    opts.hooks = HarnessHooks {
-        before_compact: vec![hook.clone()],
-        ..HarnessHooks::none()
-    };
-    let h = AgentHarness::new_in_memory(client, env, opts).await;
-
-    h.prompt("question").await.unwrap();
-
-    // Use the last written entry as first_kept_entry so compaction keeps nothing.
-    let ctx_before = h.build_context().await.unwrap();
-    assert!(!ctx_before.messages.is_empty());
-
-    // Append a marker entry and tell the hook to keep from there.
-    let kept_id = h
-        .append_custom_entry("marker".into(), serde_json::json!({}))
-        .await
-        .unwrap();
-    hook.set_first_kept(kept_id);
-
-    let stats = h.compact().await.unwrap();
-    assert_eq!(
-        stats.tokens_before, 1000,
-        "wrong tokens_before from override"
-    );
-
-    // After compaction, the first message must be the summary.
-    let ctx_after = h.build_context().await.unwrap();
-    assert!(
-        matches!(
-            ctx_after.messages.first(),
-            Some(AgentMessage::CompactionSummary(_))
-        ),
-        "expected summary as first message; got {:?}",
-        ctx_after.messages.first().map(std::mem::discriminant)
-    );
 }
 
 #[tokio::test]

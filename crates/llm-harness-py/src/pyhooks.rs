@@ -13,6 +13,7 @@
 //! `asyncio.Event`），否则会死锁。如需共享主 loop 的原语，应使用
 //! `asyncio.run_coroutine_threadsafe()` 将 coroutine 调度回主 loop。
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
@@ -765,11 +766,13 @@ impl ShouldStopHook for PyShouldStopHook {
 // ── BeforeCompactHook ───────────────────────────────────────────────────────
 
 /// Python callable 包装为 `BeforeCompactHook`。
-///
 /// callback 签名：`callback(ctx: dict) -> str | dict`
 /// - 返回 `"proceed"` → `BeforeCompactDecision::Proceed`
 /// - 返回 `"skip"` → `BeforeCompactDecision::Skip`
-/// - 返回 `{"action": "override", "summary": <msg_dict>, ...}` → `Override`
+/// - 返回 `"compact"` → `BeforeCompactDecision::Compact`
+/// - 返回 `{"action": "override", "summary": <msg_dict>, "first_kept_entry": <str>}` → `Override`
+///   `first_kept_entry` 必须是 `ctx["entry_ids"]` 中的一个值。
+///   可选字段 `tokens_before` (默认 `ctx["estimated_tokens"]`) 和 `tokens_after` (默认 0)。
 ///
 /// 若 callback 为 `async def`，其 coroutine 将在 `spawn_blocking` 线程上
 /// 通过 `asyncio.run()` 执行。
@@ -797,6 +800,7 @@ impl BeforeCompactHook for PyBeforeCompactHook {
         let is_async = self.is_async;
         let estimated_tokens = ctx.estimated_tokens;
         let messages = ctx.messages.to_vec();
+        let entry_ids: Vec<String> = ctx.entry_ids.iter().map(|id| id.to_string()).collect();
         let context_window = ctx.context_window;
         let reserve_tokens = ctx.reserve_tokens;
         let keep_recent_tokens = ctx.keep_recent_tokens;
@@ -807,11 +811,12 @@ impl BeforeCompactHook for PyBeforeCompactHook {
                     let dict = PyDict::new(py);
                     dict.set_item("estimated_tokens", estimated_tokens)?;
                     dict.set_item("messages", agent_messages_to_list(py, &messages)?)?;
+                    dict.set_item("entry_ids", entry_ids)?;
                     dict.set_item("context_window", context_window)?;
                     dict.set_item("reserve_tokens", reserve_tokens)?;
                     dict.set_item("keep_recent_tokens", keep_recent_tokens)?;
                     let raw = call_callback_with_mode(py, &cb, (dict,), is_async)?;
-                    parse_before_compact_decision(&raw)
+                    parse_before_compact_decision(&raw, estimated_tokens)
                 })
             })
             .await;
@@ -832,11 +837,18 @@ impl BeforeCompactHook for PyBeforeCompactHook {
 }
 
 /// 解析 Python 返回值为 `BeforeCompactDecision`。
-fn parse_before_compact_decision(raw: &Bound<'_, PyAny>) -> PyResult<BeforeCompactDecision> {
+///
+/// `estimated_tokens` is used to fill `tokens_before` for Override decisions
+/// when the callback does not provide it explicitly.
+fn parse_before_compact_decision(
+    raw: &Bound<'_, PyAny>,
+    estimated_tokens: usize,
+) -> PyResult<BeforeCompactDecision> {
     if let Ok(s) = raw.extract::<String>() {
         return match s.as_str() {
             "proceed" => Ok(BeforeCompactDecision::Proceed),
             "skip" => Ok(BeforeCompactDecision::Skip),
+            "compact" => Ok(BeforeCompactDecision::Compact),
             "override" => Err(pyo3::exceptions::PyValueError::new_err(
                 "action 'override' requires a dict with 'summary'",
             )),
@@ -853,6 +865,7 @@ fn parse_before_compact_decision(raw: &Bound<'_, PyAny>) -> PyResult<BeforeCompa
     match action.as_str() {
         "proceed" => Ok(BeforeCompactDecision::Proceed),
         "skip" => Ok(BeforeCompactDecision::Skip),
+        "compact" => Ok(BeforeCompactDecision::Compact),
         "override" => {
             let summary_val = d
                 .get_item("summary")?
@@ -862,11 +875,33 @@ fn parse_before_compact_decision(raw: &Bound<'_, PyAny>) -> PyResult<BeforeCompa
                 serde_json::from_value(summary_json).map_err(|e| {
                     pyo3::exceptions::PyValueError::new_err(format!("invalid summary: {e}"))
                 })?;
+            let first_kept_str: String = d
+                .get_item("first_kept_entry")?
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "missing 'first_kept_entry' — must be one of ctx['entry_ids']",
+                    )
+                })?
+                .extract()?;
+            let first_kept_entry =
+                llm_harness_types::EntryId::from_str(&first_kept_str).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "invalid first_kept_entry: {e}"
+                    ))
+                })?;
             Ok(BeforeCompactDecision::Override(CompactionResult {
                 summary_message,
-                first_kept_entry: llm_harness_types::EntryId::new(),
-                tokens_before: 0,
-                tokens_after: 0,
+                first_kept_entry,
+                tokens_before: d
+                    .get_item("tokens_before")?
+                    .map(|v| v.extract::<usize>())
+                    .transpose()?
+                    .unwrap_or(estimated_tokens),
+                tokens_after: d
+                    .get_item("tokens_after")?
+                    .map(|v| v.extract::<usize>())
+                    .transpose()?
+                    .unwrap_or(0),
             }))
         }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(

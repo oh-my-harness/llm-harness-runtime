@@ -212,7 +212,7 @@ impl Session {
 /// Finds the last `Compaction` entry, skips all entries before its
 /// `first_kept_entry`, inserts the compaction summary, then walks the
 /// remaining entries collecting messages and configuration changes.
-pub fn build_context_from_entries(entries: &[SessionEntry]) -> BuiltContext {
+pub(crate) fn build_context_from_entries(entries: &[SessionEntry]) -> BuiltContext {
     let mut last_model: Option<String> = None;
     let mut last_thinking_level: Option<ThinkingLevel> = None;
     let mut last_active_tools: Option<Vec<String>> = None;

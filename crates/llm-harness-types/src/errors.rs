@@ -145,6 +145,10 @@ pub enum SessionError {
 pub enum CompactionError {
     #[error("not enough tokens to compact")]
     InsufficientTokens,
+    #[error("no valid cut boundary found in compaction path")]
+    NoValidBoundary,
+    #[error("compaction skipped by before_compact hook")]
+    Skipped,
     #[error("summary model call failed: {0}")]
     SummaryFailed(String),
     #[error("first_kept_entry {0} not found in compaction path")]
