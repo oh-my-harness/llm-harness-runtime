@@ -174,7 +174,7 @@ fn estimate_tokens_for_message(msg: &AgentMessage) -> usize {
             // Use actual output token count when available; `input_tokens` reflects the
             // full request cost (all prior context), not the size of this message alone.
             if let Some(usage) = &a.usage {
-                return usage.output_tokens as usize;
+                return (usage.output_tokens + usage.reasoning_tokens) as usize;
             }
             estimate_tokens_for_content_blocks(&a.content)
         }
@@ -338,6 +338,12 @@ pub async fn compact(
 
     // Format conversation history as text.
     let conversation_text = format_entries_as_text(&preparation.entries_to_compress);
+
+    if conversation_text.trim().is_empty() {
+        return Err(CompactionError::SummaryFailed(
+            "nothing to compact: conversation text is empty after filtering".into(),
+        ));
+    }
 
     // Build user message.
     let user_content = if let Some(prev) = &preparation.previous_summary {
