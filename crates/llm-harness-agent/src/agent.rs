@@ -65,8 +65,6 @@ struct AgentInner {
     state: AgentState,
     steer_tx: mpsc::Sender<AgentMessage>,
     follow_up_tx: mpsc::Sender<AgentMessage>,
-    steer_rx: Option<mpsc::Receiver<AgentMessage>>,
-    follow_up_rx: Option<mpsc::Receiver<AgentMessage>>,
     max_tokens: u32,
     queue_capacity: usize,
     /// CancellationToken for the currently running loop; `None` when idle.
@@ -81,8 +79,6 @@ impl AgentInner {
         let (follow_up_tx, follow_up_rx) = mpsc::channel(cap);
         self.steer_tx = steer_tx;
         self.follow_up_tx = follow_up_tx;
-        self.steer_rx = None;
-        self.follow_up_rx = None;
         (steer_rx, follow_up_rx)
     }
 }
@@ -166,8 +162,8 @@ impl Agent {
     /// Create a new Agent.
     pub fn new(client: Arc<dyn LlmClient>, opts: AgentOptions) -> Self {
         let cap = opts.queue_capacity;
-        let (steer_tx, steer_rx) = mpsc::channel(cap);
-        let (follow_up_tx, follow_up_rx) = mpsc::channel(cap);
+        let (steer_tx, _steer_rx) = mpsc::channel(cap);
+        let (follow_up_tx, _follow_up_rx) = mpsc::channel(cap);
         let (event_tx, _) = broadcast::channel::<Arc<AgentEvent>>(BROADCAST_CAPACITY);
         let (phase_tx, phase_rx) = watch::channel(AgentPhase::Idle);
 
@@ -190,8 +186,6 @@ impl Agent {
             state,
             steer_tx,
             follow_up_tx,
-            steer_rx: Some(steer_rx),
-            follow_up_rx: Some(follow_up_rx),
             max_tokens: opts.max_tokens,
             queue_capacity: cap,
             current_abort: None,
@@ -466,6 +460,7 @@ impl Agent {
 
         // 2. Drive event stream.
         let mut new_messages: Vec<AgentMessage> = vec![];
+        let mut loop_error: Option<AgentError> = None;
         let mut stream: std::pin::Pin<Box<dyn futures::Stream<Item = AgentEvent> + Send>> =
             if is_continue {
                 Box::pin(agent_loop_continue(self.client.clone(), ctx, config))
@@ -474,6 +469,9 @@ impl Agent {
             };
 
         while let Some(event) = stream.next().await {
+            if let AgentEvent::Error(ref e) = event {
+                loop_error = Some(e.clone());
+            }
             self.apply_event(&event, &mut new_messages);
             let _ = self.event_tx.send(Arc::new(event));
         }
@@ -489,7 +487,11 @@ impl Agent {
         }
         let _ = self.phase_tx.send(AgentPhase::Idle);
 
-        Ok(())
+        if let Some(e) = loop_error {
+            Err(e)
+        } else {
+            Ok(())
+        }
     }
 
     /// Update observable state fields from an event (called while driving the stream).
@@ -636,18 +638,25 @@ mod tests {
     async fn clear_steering_queue_drains_pending_messages() {
         let agent = make_agent(vec![MockResponse::text("response")]);
 
-        // Enqueue a steer message while Idle
+        // Enqueue a steer message while Idle, then drain it.
         agent.steer_message(AgentMessage::User(UserMessage {
             content: vec![ContentBlock::Text {
                 text: "ignored message".into(),
             }],
             timestamp: chrono::Utc::now(),
         }));
-
-        // Clear before prompting
+        assert!(
+            agent.has_queued_messages(),
+            "steer message must be enqueued"
+        );
         agent.clear_steering_queue().unwrap();
+        assert!(
+            !agent.has_queued_messages(),
+            "steer queue must be empty after clear"
+        );
 
-        // Prompt with a fresh message
+        // Prompt with a fresh message; the cleared steer queue must not inject
+        // any stale messages into the transcript.
         agent.prompt("actual prompt").await.unwrap();
 
         let state = agent.state();
@@ -704,5 +713,20 @@ mod tests {
             2,
             "single-user prompt_with_messages must replace transcript (was {before_len} before)"
         );
+    }
+
+    #[tokio::test]
+    async fn prompt_returns_err_when_loop_emits_error_event() {
+        // A rate-limit error with no retry config causes the loop to emit
+        // AgentEvent::Error(Provider(...)) and terminate. prompt() must
+        // propagate that as Err rather than swallowing it as Ok(()).
+        let agent = make_agent(vec![MockResponse::rate_limit_error()]);
+        let result = agent.prompt("hi").await;
+        assert!(
+            matches!(result, Err(AgentError::Provider(_))),
+            "prompt must return Err when the loop emits an error event, got {result:?}"
+        );
+        // Phase must still reset to Idle even on error.
+        assert_eq!(agent.state().phase, AgentPhase::Idle);
     }
 }
