@@ -2,16 +2,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::spawn::async_spawn::{AsyncCompletion, AsyncSpawnHandle, AsyncSpawnRegistry};
+use crate::spawn::sub_agent::{
+    ContextMode, ProviderSelection, SpawnOptions, SubAgentHandle, SubAgentResult, SubAgentSpawner,
+};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_agent::{
     AgentHarnessEvent, Plugin, Session,
     session::SessionStorage,
     session::{JsonlSessionRepo, SessionRepo, types::CreateSessionOptions},
-    sub_agent::{
-        ContextMode, ProviderSelection, SpawnOptions, SubAgentHandle, SubAgentResult,
-        SubAgentSpawner,
-    },
 };
 use llm_harness_loop::LlmClient;
 use llm_harness_types::{AgentError, AgentEvent, ExecutionEnv, HarnessError, HarnessPhase};

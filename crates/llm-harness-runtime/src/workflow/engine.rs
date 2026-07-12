@@ -5,11 +5,11 @@ use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use futures::future::BoxFuture;
-use llm_harness_agent::{
-    AgentHarnessEvent, ContextMode, HarnessHooks, Plugin, ProviderSelection, Session, SpawnOptions,
-    SubAgentResult, sub_agent::SubAgentSpawner,
+use crate::spawn::sub_agent::{
+    ContextMode, ProviderSelection, SpawnOptions, SubAgentResult, SubAgentSpawner,
 };
+use futures::future::BoxFuture;
+use llm_harness_agent::{AgentHarnessEvent, HarnessHooks, Plugin, Session};
 use llm_harness_loop::LlmClient;
 use llm_harness_types::{
     AgentError, AgentEvent, AssistantMessageKind, ContentBlock, SUBMIT_STEP_RESULT_TOOL_NAME,

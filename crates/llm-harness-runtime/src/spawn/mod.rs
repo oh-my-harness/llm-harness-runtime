@@ -8,3 +8,4 @@ pub mod async_spawn;
 pub mod peer;
 pub mod spawn_tool;
 pub mod spawner;
+pub mod sub_agent;

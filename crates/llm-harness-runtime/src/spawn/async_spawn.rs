@@ -8,10 +8,9 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::spawn::sub_agent::{SubAgentHandle, SubAgentResult};
 use futures::future::BoxFuture;
-use llm_harness_agent::{
-    AsyncSpawnHookHandle, FollowUpHandle, IdleWatcherHook, SubAgentHandle, SubAgentResult,
-};
+use llm_harness_agent::{AsyncSpawnHookHandle, FollowUpHandle, IdleWatcherHook};
 use llm_harness_types::{
     AgentError, AgentMessage, ContentBlock, ShouldStopCtx, ShouldStopHook, UserMessage,
 };

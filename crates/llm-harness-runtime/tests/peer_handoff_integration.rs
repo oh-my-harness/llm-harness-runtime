@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use llm_harness_agent::{ContextMode, Plugin, ProviderSelection, SpawnOptions};
+use llm_harness_agent::Plugin;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_runtime::spawn::async_spawn::async_spawn_pair;
 use llm_harness_runtime::spawn::peer::{
@@ -20,6 +20,7 @@ use llm_harness_runtime::spawn::peer::{
     WaitForPeerMessageTool,
 };
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
+use llm_harness_runtime::spawn::sub_agent::{ContextMode, ProviderSelection, SpawnOptions};
 use llm_harness_types::Tool;
 
 /// sub-agent plugin：注册 peer 通信工具。

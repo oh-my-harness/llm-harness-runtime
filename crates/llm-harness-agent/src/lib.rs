@@ -16,7 +16,6 @@ pub mod harness;
 pub mod plugin;
 pub mod session;
 pub mod skills;
-pub mod sub_agent;
 
 pub use agent::{Agent, AgentOptions, AgentPhase, AgentState, ModelInfo};
 pub use compaction::{CompactionModelConfig, CompactionPreparation, CompactionSettings, compact};
@@ -38,9 +37,6 @@ pub use skills::{
     format_skills_for_system_prompt, invoke_template, load_prompt_templates, load_skills,
     parse_command_args, parse_frontmatter, parse_skill_file,
 };
-pub use sub_agent::{
-    ContextMode, ProviderSelection, SpawnOptions, SubAgentHandle, SubAgentResult, SubAgentSpawner,
-};
 
 /// Recommended imports for most `llm-harness` SDK users.
 ///
@@ -52,11 +48,10 @@ pub mod prelude {
     pub use crate::{
         Agent, AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AgentOptions, AgentPhase,
         AgentState, BuiltContext, CompactionPreparation, CompactionSettings, CompactionStats,
-        ContextMode, DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior, FinalAnswerMode,
+        DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior, FinalAnswerMode,
         FinalAnswerToolConfig, FollowUpHandle, InMemorySessionRepo, JsonlSessionRepo, ModelInfo,
-        Plugin, PromptTemplate, ProviderSelection, Session, SessionRepo, SessionStorage, Skill,
-        SkillDiagnostic, SourcedSkill, SpawnOptions, SubAgentHandle, SubAgentResult,
-        SubAgentSpawner,
+        Plugin, PromptTemplate, Session, SessionRepo, SessionStorage, Skill, SkillDiagnostic,
+        SourcedSkill,
     };
     pub use llm_harness_types::{
         AgentError, AgentEvent, AgentMessage, AssistantMessage, BranchSummaryMessage,

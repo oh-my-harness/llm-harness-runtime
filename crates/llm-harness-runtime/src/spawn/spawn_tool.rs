@@ -3,8 +3,8 @@
 
 use std::sync::{Arc, LazyLock};
 
+use crate::spawn::sub_agent::{ContextMode, ProviderSelection, SpawnOptions};
 use futures::future::BoxFuture;
-use llm_harness_agent::{ContextMode, ProviderSelection, SpawnOptions};
 use llm_harness_types::{
     ContentBlock, SPAWN_AGENT_TOOL_NAME, Tool, ToolContext, ToolError, ToolExecutionMode,
     ToolLevel, ToolResult,
