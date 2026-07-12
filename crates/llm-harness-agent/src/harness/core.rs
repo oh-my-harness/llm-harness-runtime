@@ -11,7 +11,10 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::ModelInfo;
-use crate::compaction::CompactionModelConfig;
+use crate::compaction::{
+    CompactionSummaryConfig, CompactionThresholdConfig, DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS,
+};
 use crate::session::{Session, SessionRepo, repo::InMemorySessionRepo, types::*};
 use crate::skills::{
     PromptTemplate, Skill, format_skill_invocation, invoke_template, load_prompt_templates,
@@ -22,10 +25,10 @@ use super::event::AgentHarnessEvent;
 use super::follow_up::FollowUpHandle;
 use super::hooks::{AbortCascadeHook, AsyncSpawnHookHandle, IdleWatcherHook};
 use super::options::AgentHarnessOptions;
-use super::state::{
-    BROADCAST_CAPACITY, HarnessHooks, HarnessInner, HarnessState, dedup_skills, dedup_templates,
-    filter_readable,
-};
+use super::state::{HarnessHooks, HarnessInner, HarnessState};
+use crate::skills::{dedup_skills, dedup_templates, filter_readable};
+
+const BROADCAST_CAPACITY: usize = 256;
 
 // ── AgentHarness ──────────────────────────────────────────────────────────────
 
@@ -35,7 +38,6 @@ use super::state::{
 /// `agent_loop` directly and manages session writes via `pending_session_writes`.
 pub struct AgentHarness {
     pub(super) client: Arc<dyn LlmClient>,
-    pub(super) compaction_model: Option<CompactionModelConfig>,
     pub(super) session: Session,
     pub(super) env: Arc<dyn ExecutionEnv>,
     pub(super) inner: Arc<Mutex<HarnessInner>>,
@@ -87,6 +89,12 @@ impl AgentHarness {
         let skills = dedup_skills(opts.skills);
         let templates = dedup_templates(opts.templates);
         let cap = opts.queue_capacity;
+
+        let compaction_context_window = opts
+            .model_info
+            .as_ref()
+            .map(|mi| mi.context_window)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW);
         let (steer_tx, _steer_rx) = mpsc::channel(cap);
         let (follow_up_tx, _follow_up_rx) = mpsc::channel(cap);
 
@@ -123,8 +131,26 @@ impl AgentHarness {
             queue_capacity: cap,
             max_tokens: opts.max_tokens,
             retry: opts.retry,
-            compaction_reserve_tokens: opts.compaction_reserve_tokens,
-            compaction_keep_recent_tokens: opts.compaction_keep_recent_tokens,
+            compaction_threshold: CompactionThresholdConfig {
+                reserve_tokens: opts
+                    .compaction_reserve_tokens
+                    .map(|t| t as usize)
+                    .unwrap_or(DEFAULT_RESERVE_TOKENS),
+                keep_recent_tokens: opts
+                    .compaction_keep_recent_tokens
+                    .map(|t| t as usize)
+                    .unwrap_or(DEFAULT_KEEP_RECENT_TOKENS),
+                context_window: compaction_context_window,
+            },
+            compaction_summary: opts.compaction_model.map(|c| {
+                (
+                    c.client,
+                    CompactionSummaryConfig {
+                        summary_model: c.model,
+                        summary_model_info: c.model_info,
+                    },
+                )
+            }),
             auto_compact: opts.auto_compact,
             active_tool_names: std::collections::HashMap::new(),
             idle_watcher: None,
@@ -138,7 +164,6 @@ impl AgentHarness {
 
         Self {
             client,
-            compaction_model: opts.compaction_model,
             session,
             env,
             inner: Arc::new(Mutex::new(inner)),

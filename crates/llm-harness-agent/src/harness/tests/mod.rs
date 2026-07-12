@@ -18,14 +18,14 @@ mod tools;
 // ── Shared helpers used by multiple test files ───────────────────────────────
 
 /// Test helper: wraps any SessionStorage and fails `append_entry` after `fail_after` successes.
-pub(super) struct FailAfterNStorage {
+struct FailAfterNStorage {
     inner: Arc<dyn SessionStorage>,
     fail_after: usize,
     call_count: std::sync::Mutex<usize>,
 }
 
 impl FailAfterNStorage {
-    pub(super) fn new(inner: Arc<dyn SessionStorage>, fail_after: usize) -> Self {
+    fn new(inner: Arc<dyn SessionStorage>, fail_after: usize) -> Self {
         Self {
             inner,
             fail_after,
@@ -143,10 +143,7 @@ impl SessionStorage for FailAfterNStorage {
     }
 }
 
-pub(super) fn make_harness_failing_storage(
-    fail_after: usize,
-    responses: Vec<MockResponse>,
-) -> AgentHarness {
+fn make_harness_failing_storage(fail_after: usize, responses: Vec<MockResponse>) -> AgentHarness {
     let repo = crate::session::repo::InMemorySessionRepo::new();
     let storage = futures::executor::block_on(
         repo.create(crate::session::types::CreateSessionOptions::default()),
@@ -164,7 +161,7 @@ pub(super) fn make_harness_failing_storage(
     )
 }
 
-pub(super) fn make_harness(responses: Vec<MockResponse>) -> AgentHarness {
+fn make_harness(responses: Vec<MockResponse>) -> AgentHarness {
     let client = Arc::new(MockLlmClient::new(responses));
     let env = Arc::new(NoOpEnv);
     let opts = AgentHarnessOptions::new("test-model");
@@ -175,12 +172,12 @@ pub(super) fn make_harness(responses: Vec<MockResponse>) -> AgentHarness {
     ))
 }
 
-pub(super) struct DummyTool {
+struct DummyTool {
     name: String,
     schema: serde_json::Value,
 }
 impl DummyTool {
-    pub(super) fn new(name: &str) -> Self {
+    fn new(name: &str) -> Self {
         Self {
             name: name.to_owned(),
             schema: serde_json::json!({"type":"object","properties":{}}),
@@ -217,7 +214,7 @@ impl llm_harness_types::Tool for DummyTool {
     }
 }
 
-pub(super) struct BuiltInLevelTool {
+struct BuiltInLevelTool {
     name: String,
 }
 impl llm_harness_types::Tool for BuiltInLevelTool {
@@ -253,7 +250,7 @@ impl llm_harness_types::Tool for BuiltInLevelTool {
 }
 
 /// LLM client that never returns from `chat` — for testing abort paths.
-pub(super) struct BlockingClient;
+struct BlockingClient;
 
 #[async_trait::async_trait]
 impl LlmClient for BlockingClient {

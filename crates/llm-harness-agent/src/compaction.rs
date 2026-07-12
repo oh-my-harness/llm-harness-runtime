@@ -53,7 +53,7 @@ Create a structured context checkpoint summary using this format:\n\
 ## Critical Context\n\
 - [File paths, function names, error messages to preserve]\n";
 
-// ── CompactionSettings ────────────────────────────────────────────────────────
+// ── Compaction config ─────────────────────────────────────────────────────────
 
 /// Whether a file was read or modified during the compacted period.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,18 +75,36 @@ pub struct FileOperation {
     pub at_entry: EntryId,
 }
 
-/// Configuration for the compaction subsystem.
+/// 阈值与切点配置。用于 pre-check 和切点计算。
 #[derive(Debug, Clone)]
-pub struct CompactionSettings {
-    /// Tokens reserved for LLM response headroom; compaction triggers when
-    /// `total_tokens > context_window - reserve_tokens`.
+pub struct CompactionThresholdConfig {
+    /// 为 LLM 响应预留的 token 数。
     pub reserve_tokens: usize,
-    /// Tokens of recent history to preserve uncompressed.
+    /// 保留不压缩的近期历史 token 数。
     pub keep_recent_tokens: usize,
-    /// Model ID used to generate the summary.
+    /// 主对话模型的上下文窗口大小（决定何时触发压缩）。
+    /// 注意：不是 summary model 的 context_window。
+    pub context_window: u32,
+}
+
+/// Summary LLM 调用配置。
+#[derive(Debug, Clone)]
+pub struct CompactionSummaryConfig {
+    /// 生成摘要的模型 ID。
     pub summary_model: String,
-    /// Metadata for the summary model (used for token budget checks).
+    /// Summary 模型的元数据（上下文窗口、最大输出 token 数）。
     pub summary_model_info: ModelInfo,
+}
+
+impl CompactionThresholdConfig {
+    /// 使用默认值构造。
+    pub fn with_defaults(context_window: u32) -> Self {
+        Self {
+            reserve_tokens: DEFAULT_RESERVE_TOKENS,
+            keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
+            context_window,
+        }
+    }
 }
 
 /// Default `reserve_tokens` used when `compaction_reserve_tokens` is `None`.
@@ -95,8 +113,7 @@ pub(crate) const DEFAULT_RESERVE_TOKENS: usize = 16_384;
 pub(crate) const DEFAULT_KEEP_RECENT_TOKENS: usize = 20_000;
 /// Default `context_window` used when `model_info` is `None`.
 pub(crate) const DEFAULT_CONTEXT_WINDOW: u32 = 200_000;
-/// Default `max_tokens` used when `model_info` is `None`.
-const DEFAULT_MAX_TOKENS: u32 = 8_192;
+
 /// Independent LLM provider/model for compaction summaries.
 ///
 /// When set on [`crate::AgentHarnessOptions`], compaction uses this provider
@@ -113,20 +130,6 @@ pub struct CompactionModelConfig {
     pub model: String,
     /// Model metadata (context_window / max_tokens) for prompt budget checks.
     pub model_info: ModelInfo,
-}
-
-impl Default for CompactionSettings {
-    fn default() -> Self {
-        Self {
-            reserve_tokens: DEFAULT_RESERVE_TOKENS,
-            keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
-            summary_model: String::new(),
-            summary_model_info: ModelInfo {
-                context_window: DEFAULT_CONTEXT_WINDOW,
-                max_tokens: DEFAULT_MAX_TOKENS,
-            },
-        }
-    }
 }
 
 /// Intermediate result of `compute_cut_point`: decision + cut-point data.
@@ -224,7 +227,7 @@ pub(crate) fn estimate_tokens(path: &[SessionEntry]) -> usize {
 pub(crate) fn compute_cut_point(
     path: &[SessionEntry],
     last_compaction: Option<&CompactionEntry>,
-    settings: &CompactionSettings,
+    threshold: &CompactionThresholdConfig,
     start_idx: Option<usize>,
     estimated_tokens: Option<usize>,
 ) -> Option<CompactionPreparation> {
@@ -249,7 +252,7 @@ pub(crate) fn compute_cut_point(
 
     for (i, entry) in compactable.iter().enumerate().rev() {
         let t = estimate_tokens_for_entry(entry);
-        if kept_tokens + t > settings.keep_recent_tokens && i + 1 < compactable.len() {
+        if kept_tokens + t > threshold.keep_recent_tokens && i + 1 < compactable.len() {
             cut_relative = i + 1;
             break;
         }
@@ -327,7 +330,7 @@ fn is_valid_cut_start(entry: &SessionEntry) -> bool {
 pub async fn compact(
     client: &(dyn LlmClient + Send + Sync),
     preparation: CompactionPreparation,
-    settings: &CompactionSettings,
+    summary: &CompactionSummaryConfig,
     abort: &CancellationToken,
 ) -> Result<CompactionResult, CompactionError> {
     if preparation.entries_to_compress.is_empty() {
@@ -366,8 +369,8 @@ pub async fn compact(
     // Validate that the prompt fits within the summary model's context window.
     let prompt_tokens = estimate_tokens_for_text(SUMMARIZATION_SYSTEM_PROMPT)
         + estimate_tokens_for_text(&user_content);
-    let max_input_tokens = (settings.summary_model_info.context_window as usize)
-        .saturating_sub(settings.summary_model_info.max_tokens as usize);
+    let max_input_tokens = (summary.summary_model_info.context_window as usize)
+        .saturating_sub(summary.summary_model_info.max_tokens as usize);
     if prompt_tokens > max_input_tokens {
         return Err(CompactionError::SummaryFailed(format!(
             "conversation too long to summarize: ~{prompt_tokens} tokens exceeds \
@@ -376,8 +379,8 @@ pub async fn compact(
     }
 
     let req = ChatRequest::builder(
-        settings.summary_model.clone(),
-        settings.summary_model_info.max_tokens,
+        summary.summary_model.clone(),
+        summary.summary_model_info.max_tokens,
     )
     .messages(vec![
         LlmMessage::System(SUMMARIZATION_SYSTEM_PROMPT.to_string()),
@@ -668,10 +671,16 @@ mod tests {
         }
     }
 
-    fn settings() -> CompactionSettings {
-        CompactionSettings {
+    fn settings() -> CompactionThresholdConfig {
+        CompactionThresholdConfig {
             reserve_tokens: 1000,
             keep_recent_tokens: 100,
+            context_window: 2000,
+        }
+    }
+
+    fn summary_config() -> CompactionSummaryConfig {
+        CompactionSummaryConfig {
             summary_model: "test-model".into(),
             summary_model_info: ModelInfo {
                 context_window: 2000,
@@ -686,15 +695,10 @@ mod tests {
             max_tokens: 512,
         }
     }
-
-    /// Decide whether compaction is needed and determine the cut point.
-    ///
-    /// Returns `None` when the current token count is within budget.
-    /// Pure function — does not call the LLM.
     fn prepare_compaction(
         path: &[SessionEntry],
         last_compaction: Option<&CompactionEntry>,
-        settings: &CompactionSettings,
+        threshold: &CompactionThresholdConfig,
         model_info: &ModelInfo,
     ) -> Option<CompactionPreparation> {
         if path.is_empty() {
@@ -709,16 +713,16 @@ mod tests {
         let summary_tokens = last_compaction.map(estimate_summary_tokens).unwrap_or(0);
         let estimated_tokens: usize = estimate_tokens(compactable) + summary_tokens;
 
-        let threshold =
-            (model_info.context_window as usize).saturating_sub(settings.reserve_tokens);
-        if estimated_tokens <= threshold {
+        let cut_threshold =
+            (model_info.context_window as usize).saturating_sub(threshold.reserve_tokens);
+        if estimated_tokens <= cut_threshold {
             return None;
         }
 
         compute_cut_point(
             path,
             last_compaction,
-            settings,
+            threshold,
             Some(start_idx),
             Some(estimated_tokens),
         )
@@ -885,7 +889,7 @@ mod tests {
                 estimated_tokens: 0,
                 file_operations: vec![],
             },
-            &settings(),
+            &summary_config(),
             &CancellationToken::new(),
         )
         .await
@@ -985,10 +989,10 @@ mod tests {
         };
 
         // Use a tiny context window so the threshold is exceeded.
-        let settings = CompactionSettings {
+        let settings = CompactionThresholdConfig {
             reserve_tokens: 0,
             keep_recent_tokens: 0,
-            ..settings()
+            context_window: 1,
         };
         let model_info = ModelInfo {
             context_window: 1,
@@ -1013,7 +1017,7 @@ mod tests {
     #[test]
     fn compute_cut_point_returns_none_when_too_short() {
         let path = vec![user_entry(EntryId::new(), "hi")];
-        let settings = CompactionSettings::default();
+        let settings = CompactionThresholdConfig::with_defaults(DEFAULT_CONTEXT_WINDOW);
         assert!(compute_cut_point(&path, None, &settings, None, None).is_none());
     }
 
@@ -1024,10 +1028,10 @@ mod tests {
             assistant_entry(EntryId::new(), "large reply", Some(big_token_usage(1400))),
             user_entry(EntryId::new(), "new question"),
         ];
-        let settings = CompactionSettings {
+        let settings = CompactionThresholdConfig {
             reserve_tokens: 16_384,
             keep_recent_tokens: 0,
-            ..CompactionSettings::default()
+            context_window: DEFAULT_CONTEXT_WINDOW,
         };
         let result = compute_cut_point(&path, None, &settings, None, None);
         assert!(result.is_some());

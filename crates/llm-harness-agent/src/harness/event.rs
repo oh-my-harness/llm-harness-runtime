@@ -19,8 +19,6 @@ pub struct CompactionStats {
 /// Tool call result carried by `AgentHarnessEvent::ToolCallEnd`.
 #[derive(Debug, Clone)]
 pub struct HarnessToolCallResult {
-    /// Result content blocks.
-    pub content: Vec<ContentBlock>,
     /// Extension data.
     pub details: serde_json::Value,
     /// Whether the tool returned an error.

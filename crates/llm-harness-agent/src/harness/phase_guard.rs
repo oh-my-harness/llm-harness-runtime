@@ -58,12 +58,12 @@ impl Drop for AbortTokenGuard<'_> {
 // ── Phase management methods ─────────────────────────────────────────────────
 
 impl AgentHarness {
-    pub(super) fn notify_phase_change(&self, old: HarnessPhase, new: HarnessPhase) {
+    fn notify_phase_change(&self, old: HarnessPhase, new: HarnessPhase) {
         let _ = self.phase_tx.send(new);
         self.emit(AgentHarnessEvent::PhaseChange { from: old, to: new });
     }
 
-    pub(super) fn set_phase(&self, phase: HarnessPhase) {
+    fn set_phase(&self, phase: HarnessPhase) {
         let old = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let old = inner.state.phase;

@@ -18,7 +18,10 @@ pub mod session;
 pub mod skills;
 
 pub use agent::{Agent, AgentOptions, AgentPhase, AgentState, ModelInfo};
-pub use compaction::{CompactionModelConfig, CompactionPreparation, CompactionSettings, compact};
+pub use compaction::{
+    CompactionModelConfig, CompactionPreparation, CompactionSummaryConfig,
+    CompactionThresholdConfig, compact,
+};
 pub use harness::{
     AbortCascadeHook, AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AsyncSpawnHookHandle,
     CompactionStats, FollowUpHandle, HarnessHooks, HarnessState, HarnessToolCallResult,
@@ -47,11 +50,11 @@ pub use skills::{
 pub mod prelude {
     pub use crate::{
         Agent, AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AgentOptions, AgentPhase,
-        AgentState, BuiltContext, CompactionPreparation, CompactionSettings, CompactionStats,
-        DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior, FinalAnswerMode,
-        FinalAnswerToolConfig, FollowUpHandle, InMemorySessionRepo, JsonlSessionRepo, ModelInfo,
-        Plugin, PromptTemplate, Session, SessionRepo, SessionStorage, Skill, SkillDiagnostic,
-        SourcedSkill,
+        AgentState, BuiltContext, CompactionPreparation, CompactionStats, CompactionSummaryConfig,
+        CompactionThresholdConfig, DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior,
+        FinalAnswerMode, FinalAnswerToolConfig, FollowUpHandle, InMemorySessionRepo,
+        JsonlSessionRepo, ModelInfo, Plugin, PromptTemplate, Session, SessionRepo, SessionStorage,
+        Skill, SkillDiagnostic, SourcedSkill,
     };
     pub use llm_harness_types::{
         AgentError, AgentEvent, AgentMessage, AssistantMessage, BranchSummaryMessage,

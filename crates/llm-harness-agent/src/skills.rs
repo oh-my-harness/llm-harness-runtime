@@ -9,6 +9,34 @@ use tokio_util::sync::CancellationToken;
 // ── Skill / PromptTemplate types are defined in `llm_harness_types::skills` ──
 pub use llm_harness_types::{PromptTemplate, Skill, SkillDiagnostic, SourcedSkill};
 
+// ── Dedup / filter helpers ────────────────────────────────────────────────────
+
+/// Deduplicate skills by name, keeping the first occurrence (first-wins).
+pub(crate) fn dedup_skills(skills: Vec<Skill>) -> Vec<Skill> {
+    let mut seen = HashSet::new();
+    skills
+        .into_iter()
+        .filter(|s| seen.insert(s.name.clone()))
+        .collect()
+}
+
+/// Filter skills to those visible to the model (`!disable_model_invocation`).
+pub(crate) fn filter_readable(skills: &[Skill]) -> Vec<Skill> {
+    skills
+        .iter()
+        .filter(|s| !s.disable_model_invocation)
+        .cloned()
+        .collect()
+}
+
+/// Deduplicate templates by name, keeping the first occurrence (first-wins).
+pub(crate) fn dedup_templates(templates: Vec<PromptTemplate>) -> Vec<PromptTemplate> {
+    let mut seen = HashSet::new();
+    templates
+        .into_iter()
+        .filter(|t| seen.insert(t.name.clone()))
+        .collect()
+}
 // ── Skill validation ──────────────────────────────────────────────────────────
 
 fn is_valid_skill_name(name: &str) -> bool {

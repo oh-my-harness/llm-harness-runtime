@@ -20,7 +20,7 @@ use super::event::{AgentHarnessEvent, HarnessToolCallResult};
 use super::prepare_next_turn::DefaultPrepareNextTurn;
 
 impl AgentHarness {
-    pub(super) fn push_pending_write(&self, payload: SessionEntryPayload) {
+    fn push_pending_write(&self, payload: SessionEntryPayload) {
         self.inner
             .lock()
             .unwrap()
@@ -29,7 +29,7 @@ impl AgentHarness {
             .push(payload);
     }
 
-    pub(super) async fn flush_pending_writes(&self) -> Result<usize, HarnessError> {
+    async fn flush_pending_writes(&self) -> Result<usize, HarnessError> {
         let mut count = 0;
         loop {
             let payload = {
@@ -279,7 +279,7 @@ impl AgentHarness {
         result
     }
 
-    pub(super) async fn drive_loop(
+    async fn drive_loop(
         &self,
         initial: Vec<AgentMessage>,
         steer_rx: mpsc::Receiver<AgentMessage>,
@@ -413,11 +413,7 @@ impl AgentHarness {
                     self.emit(AgentHarnessEvent::ToolCallEnd {
                         tool_use_id: tool_use_id.clone(),
                         tool_name: resolved_name,
-                        result: HarnessToolCallResult {
-                            content,
-                            details,
-                            is_error,
-                        },
+                        result: HarnessToolCallResult { details, is_error },
                     });
                     self.emit(AgentHarnessEvent::Agent(event));
                 }

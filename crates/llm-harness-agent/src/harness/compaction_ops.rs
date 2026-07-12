@@ -1,7 +1,7 @@
 // compaction_ops.rs — compaction methods extracted from harness/mod.rs
 use std::sync::Arc;
 
-use llm_harness_loop::composite::CompositeBeforeCompactHook;
+use llm_harness_loop::{LlmClient, composite::CompositeBeforeCompactHook};
 use llm_harness_types::{
     BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook, CompactionError, CompactionResult,
     EntryId, HarnessError, HarnessPhase,
@@ -10,8 +10,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::ModelInfo;
 use crate::compaction::{
-    CompactionSettings, DEFAULT_CONTEXT_WINDOW, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS,
-    FileOperation, compact, compute_cut_point, estimate_summary_tokens, estimate_tokens,
+    CompactionSummaryConfig, CompactionThresholdConfig, DEFAULT_CONTEXT_WINDOW, FileOperation,
+    compact, compute_cut_point, estimate_summary_tokens, estimate_tokens,
 };
 use crate::session::types::{CompactionEntry, SessionEntry, SessionEntryPayload};
 
@@ -21,7 +21,7 @@ use super::phase_guard::AbortTokenGuard;
 
 /// Find the index in `path` of the `first_kept_entry` belonging to the most
 /// recent `Compaction` entry. Returns 0 when there is no prior compaction.
-pub(super) fn live_region_start(path: &[SessionEntry]) -> usize {
+fn live_region_start(path: &[SessionEntry]) -> usize {
     path.iter()
         .rev()
         .find_map(|e| {
@@ -40,21 +40,14 @@ pub(super) fn live_region_start(path: &[SessionEntry]) -> usize {
 /// Shared compaction prerequisites computed once from the session path and
 /// harness config. Used by `try_auto_compact` (pre-check) and `do_compact`
 /// (execution) to avoid redundant computation.
-///
-/// `settings.summary_model` / `settings.summary_model_info` are placeholders
-/// filled with the main conversation model's info — not the compaction model.
-/// They are NOT safe to use for summary LLM calls. `do_compact` patches them
-/// after resolving the summary client from `self.compaction_model`. This
-/// indirection avoids cloning the summary client (`Arc<dyn LlmClient>`) during
-/// the pre-check path where it is not needed. Only `settings.reserve_tokens`
-/// and `settings.keep_recent_tokens` are valid in the pre-check path.
-pub(super) struct CompactionPrereqs {
-    pub(super) last_compaction: Option<CompactionEntry>,
-    pub(super) m_info: ModelInfo,
-    pub(super) settings: CompactionSettings,
-    pub(super) start_idx: usize,
-    pub(super) estimated_tokens: usize,
-    pub(super) threshold: usize,
+struct CompactionPrereqs {
+    last_compaction: Option<CompactionEntry>,
+    threshold_config: CompactionThresholdConfig,
+    summary_config: CompactionSummaryConfig,
+    summary_client: Arc<dyn LlmClient>,
+    start_idx: usize,
+    estimated_tokens: usize,
+    threshold: usize,
 }
 
 impl AgentHarness {
@@ -77,7 +70,7 @@ impl AgentHarness {
     /// Internal compaction entry point that accepts an optional pre-loaded
     /// session path to avoid redundant `read_active_path` I/O when the caller
     /// already has the data (e.g. `try_auto_compact`).
-    pub(super) async fn compact_with_path(
+    async fn compact_with_path(
         &self,
         preloaded_path: Option<Vec<SessionEntry>>,
     ) -> Result<CompactionStats, HarnessError> {
@@ -155,7 +148,7 @@ impl AgentHarness {
             if compute_cut_point(
                 &path,
                 pre.last_compaction.as_ref(),
-                &pre.settings,
+                &pre.threshold_config,
                 Some(pre.start_idx),
                 Some(pre.estimated_tokens),
             )
@@ -163,7 +156,7 @@ impl AgentHarness {
             {
                 return self.handle_no_valid_boundary(
                     pre.estimated_tokens,
-                    pre.m_info.context_window as usize,
+                    pre.threshold_config.context_window as usize,
                 );
             }
         }
@@ -171,7 +164,7 @@ impl AgentHarness {
         // Save values needed for NoValidBoundary handling before `pre` is
         // moved into do_compact.
         let saved_estimated_tokens = pre.estimated_tokens;
-        let saved_context_window = pre.m_info.context_window as usize;
+        let saved_context_window = pre.threshold_config.context_window as usize;
 
         // Create a temporary abort token so `abort()` can cancel the
         // compaction LLM call during auto-compaction (run_loop hasn't set
@@ -197,10 +190,7 @@ impl AgentHarness {
                 // do_compact returned NoValidBoundary after entering Compacting
                 // phase. Apply the same over-limit logic: if tokens exceed the
                 // context window, propagate the error; otherwise silently proceed.
-                self.handle_no_valid_boundary(
-                    saved_estimated_tokens,
-                    saved_context_window,
-                )
+                self.handle_no_valid_boundary(saved_estimated_tokens, saved_context_window)
             }
             Err(HarnessError::Compaction(CompactionError::Skipped)) => Ok(()),
             Err(e) => {
@@ -233,7 +223,7 @@ impl AgentHarness {
         }
     }
 
-    pub(super) async fn do_compact(
+    async fn do_compact(
         &self,
         preloaded_path: Option<Vec<SessionEntry>>,
         preloaded_pre: Option<CompactionPrereqs>,
@@ -248,29 +238,9 @@ impl AgentHarness {
 
         let pre = preloaded_pre.unwrap_or_else(|| self.compaction_prereqs(&path));
 
-        // Read config that is NOT in CompactionPrereqs: model, abort, summary client.
-        let (model, abort) = {
+        let abort = {
             let inner = self.inner.lock().unwrap();
-            (
-                inner.state.model.clone(),
-                inner.current_abort.clone().unwrap_or_default(),
-            )
-        };
-
-        // Compaction uses the independent compaction config if set, otherwise
-        // falls back to the main conversation client/model. The Option<struct>
-        // makes half-configuration impossible at the type level.
-        let (summary_client, summary_model, summary_model_info) = match &self.compaction_model {
-            Some(c) => (c.client.clone(), c.model.clone(), c.model_info.clone()),
-            None => (self.client.clone(), model.clone(), pre.m_info.clone()),
-        };
-
-        // Patch summary_model / summary_model_info into settings (prereqs used
-        // placeholders since the summary client is only resolved here).
-        let settings = CompactionSettings {
-            summary_model,
-            summary_model_info,
-            ..pre.settings
+            inner.current_abort.clone().unwrap_or_default()
         };
 
         // before_compact hook is called BEFORE prepare_compaction so that
@@ -286,9 +256,9 @@ impl AgentHarness {
                     estimated_tokens: pre.estimated_tokens,
                     messages: &built.messages,
                     entry_ids: &entry_ids,
-                    context_window: pre.m_info.context_window,
-                    reserve_tokens: settings.reserve_tokens,
-                    keep_recent_tokens: settings.keep_recent_tokens,
+                    context_window: pre.threshold_config.context_window,
+                    reserve_tokens: pre.threshold_config.reserve_tokens,
+                    keep_recent_tokens: pre.threshold_config.keep_recent_tokens,
                 })
                 .await;
             match decision {
@@ -301,25 +271,7 @@ impl AgentHarness {
                         .await;
                 }
                 BeforeCompactDecision::Compact => {
-                    let prep = compute_cut_point(
-                        &path,
-                        pre.last_compaction.as_ref(),
-                        &settings,
-                        Some(pre.start_idx),
-                        Some(pre.estimated_tokens),
-                    );
-                    let prep = match prep {
-                        Some(p) => p,
-                        None => return Err(CompactionError::NoValidBoundary.into()),
-                    };
-                    let file_operations = prep.file_operations.clone();
-                    self.emit(AgentHarnessEvent::CompactionStart {
-                        estimated_tokens: prep.estimated_tokens,
-                    });
-                    let result = compact(summary_client.as_ref(), prep, &settings, &abort).await?;
-                    return self
-                        .apply_compaction_result(result, file_operations, &path, false)
-                        .await;
+                    return self.execute_compaction(&path, &pre, &abort).await;
                 }
                 BeforeCompactDecision::Proceed => {}
             }
@@ -329,35 +281,42 @@ impl AgentHarness {
             return Err(CompactionError::InsufficientTokens.into());
         }
 
+        self.execute_compaction(&path, &pre, &abort).await
+    }
+
+    async fn execute_compaction(
+        &self,
+        path: &[SessionEntry],
+        pre: &CompactionPrereqs,
+        abort: &CancellationToken,
+    ) -> Result<CompactionStats, HarnessError> {
         let prep = compute_cut_point(
-            &path,
+            path,
             pre.last_compaction.as_ref(),
-            &settings,
+            &pre.threshold_config,
             Some(pre.start_idx),
             Some(pre.estimated_tokens),
-        );
-        let prep = match prep {
-            Some(p) => p,
-            None => return Err(CompactionError::NoValidBoundary.into()),
-        };
-
-        let estimated_tokens = prep.estimated_tokens;
+        )
+        .ok_or(CompactionError::NoValidBoundary)?;
         let file_operations = prep.file_operations.clone();
-        self.emit(AgentHarnessEvent::CompactionStart { estimated_tokens });
-
-        let result = compact(summary_client.as_ref(), prep, &settings, &abort).await?;
-        self.apply_compaction_result(result, file_operations, &path, false)
+        self.emit(AgentHarnessEvent::CompactionStart {
+            estimated_tokens: prep.estimated_tokens,
+        });
+        let result = compact(
+            pre.summary_client.as_ref(),
+            prep,
+            &pre.summary_config,
+            abort,
+        )
+        .await?;
+        self.apply_compaction_result(result, file_operations, path, false)
             .await
     }
 
     /// Compute shared compaction prerequisites from the session path and
     /// harness config. Used by both `try_auto_compact` (pre-check) and
     /// `do_compact` (execution) to avoid redundant computation.
-    ///
-    /// `settings.summary_model` / `settings.summary_model_info` are
-    /// placeholders — `do_compact` patches them after resolving the summary
-    /// client.
-    pub(super) fn compaction_prereqs(&self, path: &[SessionEntry]) -> CompactionPrereqs {
+    fn compaction_prereqs(&self, path: &[SessionEntry]) -> CompactionPrereqs {
         let last_compaction = path.iter().rev().find_map(|e| {
             if let SessionEntryPayload::Compaction(c) = &e.payload {
                 Some(c.clone())
@@ -366,27 +325,36 @@ impl AgentHarness {
             }
         });
 
-        let (model_info, max_tokens, reserve_tokens, keep_recent_tokens) = {
+        let (threshold_config, summary_client, summary_config) = {
             let inner = self.inner.lock().unwrap();
-            (
-                inner.state.model_info.clone(),
-                inner.max_tokens,
-                inner.compaction_reserve_tokens,
-                inner.compaction_keep_recent_tokens,
-            )
-        };
+            let context_window = inner
+                .state
+                .model_info
+                .as_ref()
+                .map(|mi| mi.context_window)
+                .unwrap_or(DEFAULT_CONTEXT_WINDOW);
 
-        let m_info = model_info.unwrap_or(ModelInfo {
-            context_window: DEFAULT_CONTEXT_WINDOW,
-            max_tokens,
-        });
+            let tc = CompactionThresholdConfig {
+                reserve_tokens: inner.compaction_threshold.reserve_tokens,
+                keep_recent_tokens: inner.compaction_threshold.keep_recent_tokens,
+                context_window,
+            };
 
-        let settings = CompactionSettings {
-            reserve_tokens: reserve_tokens.unwrap_or(DEFAULT_RESERVE_TOKENS as u32) as usize,
-            keep_recent_tokens: keep_recent_tokens.unwrap_or(DEFAULT_KEEP_RECENT_TOKENS as u32)
-                as usize,
-            summary_model: String::new(),
-            summary_model_info: m_info.clone(),
+            match &inner.compaction_summary {
+                Some((client, cfg)) => (tc, client.clone(), cfg.clone()),
+                None => {
+                    let model = inner.state.model.clone();
+                    let m_info = inner.state.model_info.clone().unwrap_or(ModelInfo {
+                        context_window: DEFAULT_CONTEXT_WINDOW,
+                        max_tokens: inner.max_tokens,
+                    });
+                    let sc = CompactionSummaryConfig {
+                        summary_model: model,
+                        summary_model_info: m_info,
+                    };
+                    (tc, self.client.clone(), sc)
+                }
+            }
         };
 
         let start_idx = live_region_start(path);
@@ -398,35 +366,35 @@ impl AgentHarness {
             .map(estimate_summary_tokens)
             .unwrap_or(0);
         let estimated_tokens = estimate_tokens(&path[start_idx..]) + summary_tokens;
-        let threshold = (m_info.context_window as usize).saturating_sub(settings.reserve_tokens);
+        let threshold = (threshold_config.context_window as usize)
+            .saturating_sub(threshold_config.reserve_tokens);
 
         CompactionPrereqs {
             last_compaction,
-            m_info,
-            settings,
+            threshold_config,
+            summary_config,
+            summary_client,
             start_idx,
             estimated_tokens,
             threshold,
         }
     }
 
-    pub(super) async fn apply_compaction_result(
+    async fn apply_compaction_result(
         &self,
         result: CompactionResult,
         file_operations: Vec<FileOperation>,
         path: &[SessionEntry],
         from_hook: bool,
     ) -> Result<CompactionStats, HarnessError> {
-        if !path.iter().any(|e| e.id == result.first_kept_entry) {
-            return Err(CompactionError::InvalidFirstKeptEntry(result.first_kept_entry).into());
-        }
-
-        let tokens_before = result.tokens_before;
-        let tokens_after = result.tokens_after;
         let cut_idx = path
             .iter()
             .position(|e| e.id == result.first_kept_entry)
-            .expect("first_kept_entry validated before apply_compaction_result");
+            .ok_or(CompactionError::InvalidFirstKeptEntry(
+                result.first_kept_entry,
+            ))?;
+        let tokens_before = result.tokens_before;
+        let tokens_after = result.tokens_after;
         // Only entries from the live region start onward are compressed
         // in this round; earlier entries were already compacted.
         let start_idx = live_region_start(path);

@@ -1,20 +1,17 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, RwLock};
 
-use llm_harness_loop::{FinalAnswerMode, RetryConfig};
+use llm_harness_loop::{FinalAnswerMode, LlmClient, RetryConfig};
 use llm_harness_types::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::ModelInfo;
+use crate::compaction::{CompactionSummaryConfig, CompactionThresholdConfig};
 use crate::session::types::*;
 use crate::skills::{PromptTemplate, Skill};
 
 use super::{AbortCascadeHook, AsyncSpawnHookHandle, IdleWatcherHook};
-
-pub(super) const BROADCAST_CAPACITY: usize = 256;
-pub(super) const DEFAULT_QUEUE_CAPACITY: usize = 32;
-pub(super) const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 // ── HarnessState ──────────────────────────────────────────────────────────────
 
@@ -123,8 +120,9 @@ pub(super) struct HarnessInner {
     pub(super) queue_capacity: usize,
     pub(super) max_tokens: u32,
     pub(super) retry: Option<RetryConfig>,
-    pub(super) compaction_reserve_tokens: Option<u32>,
-    pub(super) compaction_keep_recent_tokens: Option<u32>,
+    pub(super) compaction_threshold: CompactionThresholdConfig,
+    /// 已解析的 summary client + config。`None` → compaction 使用主对话 client/model。
+    pub(super) compaction_summary: Option<(Arc<dyn LlmClient>, CompactionSummaryConfig)>,
     pub(super) auto_compact: bool,
     /// Maps tool_use_id → tool_name for in-flight tool calls.
     pub(super) active_tool_names: std::collections::HashMap<String, String>,
@@ -154,33 +152,4 @@ impl HarnessInner {
         self.follow_up_tx = follow_up_tx;
         (steer_rx, follow_up_rx)
     }
-}
-
-// ── Dedup helpers ─────────────────────────────────────────────────────────────
-
-/// Deduplicate skills by name, keeping the first occurrence (first-wins).
-pub(super) fn dedup_skills(skills: Vec<Skill>) -> Vec<Skill> {
-    let mut seen = HashSet::new();
-    skills
-        .into_iter()
-        .filter(|s| seen.insert(s.name.clone()))
-        .collect()
-}
-
-/// Filter skills to those visible to the model (`!disable_model_invocation`).
-pub(super) fn filter_readable(skills: &[Skill]) -> Vec<Skill> {
-    skills
-        .iter()
-        .filter(|s| !s.disable_model_invocation)
-        .cloned()
-        .collect()
-}
-
-/// Deduplicate templates by name, keeping the first occurrence (first-wins).
-pub(super) fn dedup_templates(templates: Vec<PromptTemplate>) -> Vec<PromptTemplate> {
-    let mut seen = HashSet::new();
-    templates
-        .into_iter()
-        .filter(|t| seen.insert(t.name.clone()))
-        .collect()
 }

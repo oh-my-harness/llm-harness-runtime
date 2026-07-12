@@ -7,8 +7,10 @@ use crate::agent::ModelInfo;
 use crate::compaction::CompactionModelConfig;
 use crate::skills::{PromptTemplate, Skill};
 
-use super::state::{DEFAULT_MAX_TOKENS, DEFAULT_QUEUE_CAPACITY, HarnessHooks};
+use super::state::HarnessHooks;
 
+const DEFAULT_MAX_TOKENS: u32 = 8192;
+const DEFAULT_QUEUE_CAPACITY: usize = 32;
 // ── Construction options ──────────────────────────────────────────────────────
 
 /// Construction options for [`AgentHarness`].
