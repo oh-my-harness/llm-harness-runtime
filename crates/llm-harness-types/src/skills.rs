@@ -13,10 +13,11 @@ pub struct Skill {
     pub label: Option<String>,
     /// Short description shown to the LLM (≤ 1024 chars).
     pub description: String,
-    /// Full Markdown body of the skill (everything after the frontmatter).
-    pub content: String,
     /// Absolute path of the source SKILL.md file.
     pub source: PathBuf,
+    /// Skill root directory (parent of `source`). Used for resolving
+    /// relative sub-file paths in `skill_read` and `resolve_skill_resource`.
+    pub base_dir: PathBuf,
     /// When `true`, the skill is excluded from the system prompt and must be
     /// invoked explicitly via `AgentHarness::invoke_skill()`.
     pub disable_model_invocation: bool,

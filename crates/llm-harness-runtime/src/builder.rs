@@ -18,7 +18,8 @@
 //!     .await?;
 //! ```
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, RwLock};
 
 use llm_harness_agent::{
     AgentHarness, AgentHarnessOptions, CompactionModelConfig, HarnessHooks, ModelInfo, Plugin,
@@ -154,6 +155,12 @@ pub struct HarnessBuilder {
     auto_compact: bool,
     /// Steer/follow-up queue capacity.
     queue_capacity: Option<usize>,
+    /// Whether to auto-register `SkillReadTool` when skills are present.
+    /// Defaults to `true`. Set to `false` via [`disable_skill_read_tool`](Self::disable_skill_read_tool).
+    skill_read_tool_enabled: bool,
+    /// Shared readable-skills store, passed to both `SkillReadTool` and
+    /// `AgentHarnessOptions` so runtime skill updates are visible to the tool.
+    readable_skills: Option<Arc<RwLock<Vec<Skill>>>>,
 }
 
 impl HarnessBuilder {
@@ -185,6 +192,8 @@ impl HarnessBuilder {
             stream_options: None,
             compaction_reserve_tokens: None,
             compaction_keep_recent_tokens: None,
+            skill_read_tool_enabled: true,
+            readable_skills: None,
             auto_compact: false,
             queue_capacity: None,
         }
@@ -390,6 +399,15 @@ impl HarnessBuilder {
         self
     }
 
+    /// Disable auto-registration of `SkillReadTool`.
+    ///
+    /// By default, `build()` / `build_with_session()` register `SkillReadTool`
+    /// when skills are present. Call this to opt out.
+    pub fn disable_skill_read_tool(mut self) -> Self {
+        self.skill_read_tool_enabled = false;
+        self
+    }
+
     /// Build an [`AgentHarness`] with an in-memory session.
     ///
     /// Resolves the registered LLM provider for the model ID and constructs
@@ -407,7 +425,8 @@ impl HarnessBuilder {
         self,
         env: Arc<dyn ExecutionEnv>,
     ) -> Result<AgentHarness, HarnessBuildError> {
-        let (client, opts) = self.resolve_and_build()?;
+        let builder = self.inject_skill_read_tool(&env);
+        let (client, opts) = builder.resolve_and_build()?;
         Ok(AgentHarness::new_in_memory(client, env, opts).await)
     }
 
@@ -430,8 +449,31 @@ impl HarnessBuilder {
         env: Arc<dyn ExecutionEnv>,
         session: llm_harness_agent::Session,
     ) -> Result<AgentHarness, HarnessBuildError> {
-        let (client, opts) = self.resolve_and_build()?;
+        let builder = self.inject_skill_read_tool(&env);
+        let (client, opts) = builder.resolve_and_build()?;
         Ok(AgentHarness::with_session(client, env, session, opts))
+    }
+    pub(crate) fn inject_skill_read_tool(mut self, env: &Arc<dyn ExecutionEnv>) -> Self {
+        if self.skill_read_tool_enabled {
+            let readable: Vec<Skill> = {
+                let mut seen = HashSet::new();
+                self.skills
+                    .iter()
+                    .filter(|s| !s.disable_model_invocation && seen.insert(s.name.clone()))
+                    .cloned()
+                    .collect()
+            };
+            if !readable.is_empty() {
+                let store = Arc::new(RwLock::new(readable));
+                self.tools
+                    .push(Arc::new(llm_harness_agent::SkillReadTool::new(
+                        store.clone(),
+                        env.clone(),
+                    )));
+                self.readable_skills = Some(store);
+            }
+        }
+        self
     }
 
     /// Resolve provider, compaction config, and build options from builder state.
@@ -509,6 +551,7 @@ impl HarnessBuilder {
         opts.tools = self.tools.clone();
         opts.hooks = self.hooks.clone();
         opts.skills = self.skills.clone();
+        opts.readable_skills = self.readable_skills.clone();
         opts.templates = self.templates.clone();
         if let Some(max_tokens) = self.max_tokens {
             opts.max_tokens = max_tokens;
@@ -728,8 +771,8 @@ mod tests {
                 name: name.to_string(),
                 label: None,
                 description: "test skill".to_string(),
-                content: "# Test Skill\n".to_string(),
-                source: std::path::PathBuf::from("/test"),
+                source: std::path::PathBuf::from("/test/SKILL.md"),
+                base_dir: std::path::PathBuf::from("/test"),
                 disable_model_invocation: false,
             });
             self
@@ -1198,5 +1241,62 @@ mod tests {
         assert_eq!(opts.compaction_reserve_tokens, None);
         assert_eq!(opts.compaction_keep_recent_tokens, None);
         assert_eq!(opts.queue_capacity, 32); // DEFAULT_QUEUE_CAPACITY
+    }
+
+    #[test]
+    fn build_registers_skill_read_tool_when_skills_present() {
+        use llm_harness_loop::test_utils::MockLlmClient;
+        use llm_harness_runtime_sandbox_os::OsEnv;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env: Arc<dyn llm_harness_types::ExecutionEnv> = Arc::new(OsEnv::new(tmp.path()));
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let plugin = MockPlugin::new("p1").with_skill("my-skill");
+        let builder = HarnessBuilder::new("m")
+            .provider("m", client)
+            .install(&plugin)
+            .inject_skill_read_tool(&env);
+        let (_client, opts) = builder.resolve_and_build().unwrap();
+        let has_skill_read = opts.tools.iter().any(|t| t.name() == "skill_read");
+        assert!(
+            has_skill_read,
+            "skill_read tool should be registered when skills are present"
+        );
+    }
+
+    #[test]
+    fn build_no_skill_read_tool_when_no_skills() {
+        use llm_harness_loop::test_utils::MockLlmClient;
+
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let builder = HarnessBuilder::new("m").provider("m", client);
+        let (_client, opts) = builder.resolve_and_build().unwrap();
+        let has_skill_read = opts.tools.iter().any(|t| t.name() == "skill_read");
+        assert!(
+            !has_skill_read,
+            "skill_read tool should NOT be registered when no skills"
+        );
+    }
+
+    #[test]
+    fn disable_skill_read_tool_opt_out() {
+        use llm_harness_loop::test_utils::MockLlmClient;
+        use llm_harness_runtime_sandbox_os::OsEnv;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env: Arc<dyn llm_harness_types::ExecutionEnv> = Arc::new(OsEnv::new(tmp.path()));
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let plugin = MockPlugin::new("p1").with_skill("my-skill");
+        let builder = HarnessBuilder::new("m")
+            .provider("m", client)
+            .install(&plugin)
+            .disable_skill_read_tool()
+            .inject_skill_read_tool(&env);
+        let (_client, opts) = builder.resolve_and_build().unwrap();
+        let has_skill_read = opts.tools.iter().any(|t| t.name() == "skill_read");
+        assert!(
+            !has_skill_read,
+            "skill_read should NOT be registered when opted out"
+        );
     }
 }

@@ -74,8 +74,8 @@ fn make_skill(name: &str, desc: &str) -> Skill {
         name: name.to_string(),
         label: None,
         description: desc.to_string(),
-        content: format!("{name} body"),
         source: std::path::PathBuf::from(format!("/skills/{name}/SKILL.md")),
+        base_dir: std::path::PathBuf::from(format!("/skills/{name}")),
         disable_model_invocation: false,
     }
 }

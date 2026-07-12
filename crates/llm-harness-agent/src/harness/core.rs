@@ -24,6 +24,7 @@ use super::hooks::{AbortCascadeHook, AsyncSpawnHookHandle, IdleWatcherHook};
 use super::options::AgentHarnessOptions;
 use super::state::{
     BROADCAST_CAPACITY, HarnessHooks, HarnessInner, HarnessState, dedup_skills, dedup_templates,
+    filter_readable,
 };
 
 // ── AgentHarness ──────────────────────────────────────────────────────────────
@@ -113,6 +114,7 @@ impl AgentHarness {
         let inner = HarnessInner {
             state,
             skills,
+            readable_skills: opts.readable_skills,
             templates,
             steer_tx,
             follow_up_tx,
@@ -208,7 +210,7 @@ impl AgentHarness {
 
     /// Expand `name` as a skill invocation and start a run.
     pub async fn skill(&self, name: &str, additional: Option<&str>) -> Result<(), HarnessError> {
-        let text = {
+        let (skill, abort) = {
             let inner = self.inner.lock().unwrap();
             let skill = inner
                 .skills
@@ -216,9 +218,10 @@ impl AgentHarness {
                 .find(|s| s.name == name)
                 .ok_or_else(|| HarnessError::SkillNotFound(name.to_string()))?
                 .clone();
-            drop(inner);
-            format_skill_invocation(&skill, additional)
+            let abort = inner.current_abort.clone().unwrap_or_default();
+            (skill, abort)
         };
+        let text = format_skill_invocation(self.env.as_ref(), &skill, additional, abort).await?;
         self.prompt(text).await
     }
 
@@ -257,6 +260,9 @@ impl AgentHarness {
         let (skill_count, tmpl_count) = (skills.len(), templates.len());
         {
             let mut inner = self.inner.lock().unwrap();
+            if let Some(ref store) = inner.readable_skills {
+                *store.write().unwrap_or_else(|e| e.into_inner()) = filter_readable(&skills);
+            }
             inner.skills = skills;
             inner.templates = templates;
         }
@@ -267,16 +273,26 @@ impl AgentHarness {
         });
         Ok(())
     }
-    /// Append skills to the existing skill list without replacing it.
-    ///
-    /// Unlike `reload_resources`, this does not load from directories —
     pub fn add_skills(&self, skills: Vec<Skill>) {
         let (skill_count, template_count) = {
             let mut inner = self.inner.lock().unwrap();
             let existing: HashSet<String> = inner.skills.iter().map(|s| s.name.clone()).collect();
-            inner
-                .skills
-                .extend(skills.into_iter().filter(|s| !existing.contains(&s.name)));
+            let new_skills: Vec<Skill> = skills
+                .into_iter()
+                .filter(|s| !existing.contains(&s.name))
+                .collect();
+            let new_readable: Vec<Skill> = new_skills
+                .iter()
+                .filter(|s| !s.disable_model_invocation)
+                .cloned()
+                .collect();
+            inner.skills.extend(new_skills);
+            if let Some(ref store) = inner.readable_skills {
+                store
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(new_readable);
+            }
             (inner.skills.len(), inner.templates.len())
         };
         self.emit(AgentHarnessEvent::ResourcesUpdate {

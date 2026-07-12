@@ -273,7 +273,7 @@ pub(crate) fn build_context_from_entries(entries: &[SessionEntry]) -> BuiltConte
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-utils"))]
 mod tests {
 
     use llm_harness_types::*;

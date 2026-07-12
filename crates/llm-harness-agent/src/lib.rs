@@ -33,9 +33,9 @@ pub use session::{
     BuiltContext, InMemorySessionRepo, JsonlSessionRepo, Session, SessionRepo, SessionStorage,
 };
 pub use skills::{
-    PromptTemplate, Skill, SkillDiagnostic, SourcedSkill, format_skill_invocation,
+    PromptTemplate, Skill, SkillDiagnostic, SkillReadTool, SourcedSkill, format_skill_invocation,
     format_skills_for_system_prompt, invoke_template, load_prompt_templates, load_skills,
-    parse_command_args, parse_frontmatter, parse_skill_file,
+    parse_command_args, parse_frontmatter, parse_skill_file, resolve_skill_resource,
 };
 
 /// Recommended imports for most `llm-harness` SDK users.

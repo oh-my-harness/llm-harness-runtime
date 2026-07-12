@@ -50,6 +50,7 @@ pub const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
 pub const SYNC_SPAWN_TOOL_NAME: &str = "sync_spawn_agent";
 pub const SUBMIT_STEP_RESULT_TOOL_NAME: &str = "submit_step_result";
 pub const SUBMIT_WORKFLOW_TOOL_NAME: &str = "submit_workflow";
+pub const SKILL_READ_TOOL_NAME: &str = "skill_read";
 
 /// 所有框架内置 tool 的名字列表。
 ///
@@ -66,6 +67,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     SYNC_SPAWN_TOOL_NAME,
     SUBMIT_STEP_RESULT_TOOL_NAME,
     SUBMIT_WORKFLOW_TOOL_NAME,
+    SKILL_READ_TOOL_NAME,
 ];
 
 /// 编译期断言：`BUILTIN_TOOL_NAMES` 内无重复项。重复则编译失败。

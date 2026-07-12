@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use llm_harness_loop::{ConvertToLlmHook, FinalAnswerMode, RetryConfig};
 use llm_harness_types::*;
@@ -39,6 +39,10 @@ pub struct AgentHarnessOptions {
     pub convert_to_llm: Option<Arc<dyn ConvertToLlmHook>>,
     /// Pre-loaded skills.
     pub skills: Vec<Skill>,
+    /// Shared readable-skills store for `SkillReadTool`. When `Some`,
+    /// `reload_resources`/`add_skills` keep this in sync so the tool sees
+    /// runtime skill updates. Created by `HarnessBuilder::inject_skill_read_tool`.
+    pub readable_skills: Option<Arc<RwLock<Vec<Skill>>>>,
     /// Pre-loaded prompt templates.
     pub templates: Vec<PromptTemplate>,
     /// Retry config for transient provider errors; `None` disables retry.
@@ -71,11 +75,12 @@ impl AgentHarnessOptions {
             final_answer_mode: FinalAnswerMode::default(),
             system_prompt: None,
             max_tokens: DEFAULT_MAX_TOKENS,
-            queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            skills: vec![],
+            readable_skills: None,
             stream_options: StreamOptions::default(),
             hooks: HarnessHooks::none(),
             convert_to_llm: None,
-            skills: vec![],
+            queue_capacity: DEFAULT_QUEUE_CAPACITY,
             cost: Arc::new(Mutex::new(CostAggregate::default())),
             templates: vec![],
             retry: None,

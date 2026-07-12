@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use llm_harness_loop::{FinalAnswerMode, RetryConfig};
 use llm_harness_types::*;
@@ -111,6 +111,11 @@ impl HarnessHooks {
 pub(super) struct HarnessInner {
     pub(super) state: HarnessState,
     pub(super) skills: Vec<Skill>,
+    /// Shared readable-skills store, kept in sync with `skills` (filtered to
+    /// `!disable_model_invocation`). `SkillReadTool` holds a clone of this Arc
+    /// so it sees updates from `reload_resources`/`add_skills` without needing
+    /// access to `inner`.
+    pub(super) readable_skills: Option<Arc<RwLock<Vec<Skill>>>>,
     pub(super) templates: Vec<PromptTemplate>,
     pub(super) steer_tx: mpsc::Sender<AgentMessage>,
     pub(super) follow_up_tx: mpsc::Sender<AgentMessage>,
@@ -159,6 +164,15 @@ pub(super) fn dedup_skills(skills: Vec<Skill>) -> Vec<Skill> {
     skills
         .into_iter()
         .filter(|s| seen.insert(s.name.clone()))
+        .collect()
+}
+
+/// Filter skills to those visible to the model (`!disable_model_invocation`).
+pub(super) fn filter_readable(skills: &[Skill]) -> Vec<Skill> {
+    skills
+        .iter()
+        .filter(|s| !s.disable_model_invocation)
+        .cloned()
         .collect()
 }
 
