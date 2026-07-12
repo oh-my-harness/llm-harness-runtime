@@ -392,10 +392,13 @@ async fn auto_compact_triggers_on_prompt() {
     let env = Arc::new(NoOpEnv);
     let mut opts = AgentHarnessOptions::new("test-model");
     opts.model_info = Some(ModelInfo {
-        context_window: 1,
+        // context_window large enough for the conversation to fit, but
+        // threshold = context_window - reserve is low enough to trigger
+        // compaction after two prompts.
+        context_window: 100,
         max_tokens: 50,
     });
-    opts.compaction_reserve_tokens = Some(0);
+    opts.compaction_reserve_tokens = Some(95);
     opts.compaction_keep_recent_tokens = Some(0);
     opts.auto_compact = true;
     opts.compaction_model = Some(CompactionModelConfig {
@@ -437,10 +440,12 @@ async fn auto_compact_failure_propagates_error() {
     let env = Arc::new(NoOpEnv);
     let mut opts = AgentHarnessOptions::new("test-model");
     opts.model_info = Some(ModelInfo {
-        context_window: 1,
+        // context_window large enough for the conversation to fit, but
+        // threshold = 10 - 9 = 1, so 2 user tokens trigger compaction.
+        context_window: 10,
         max_tokens: 50,
     });
-    opts.compaction_reserve_tokens = Some(0);
+    opts.compaction_reserve_tokens = Some(9);
     opts.compaction_keep_recent_tokens = Some(0);
     opts.auto_compact = true;
     opts.compaction_model = Some(CompactionModelConfig {
@@ -525,10 +530,11 @@ async fn auto_compact_abort_cancels_compaction() {
     let env = Arc::new(NoOpEnv);
     let mut opts = AgentHarnessOptions::new("test-model");
     opts.model_info = Some(ModelInfo {
-        context_window: 1,
+        // threshold = 2 - 1 = 1, so 2 user tokens from 2 prompts trigger.
+        context_window: 2,
         max_tokens: 50,
     });
-    opts.compaction_reserve_tokens = Some(0);
+    opts.compaction_reserve_tokens = Some(1);
     opts.compaction_keep_recent_tokens = Some(0);
     opts.auto_compact = true;
     // BlockingClient never returns — compaction will hang unless aborted.
@@ -633,16 +639,19 @@ async fn auto_compact_with_compact_hook_under_threshold() {
 }
 
 /// When tokens exceed the threshold but `compute_cut_point` returns
-/// `None` (all entries fit within `keep_recent_tokens`), auto-compaction
-/// must NOT emit `CompactionEnd` events.
+/// `None` (all entries fit within `keep_recent_tokens`), and tokens are
+/// still within the context window, auto-compaction silently lets the
+/// run proceed — no `CompactionEnd` event is emitted.
 ///
 /// This test deliberately builds context across 2 prompts so the session
 /// path is non-empty when `try_auto_compact` runs on the 3rd prompt.
 /// `keep_recent_tokens` is set high enough to retain all entries, so
 /// the backward scan in `compute_cut_point` reaches `i == 0` and returns
-/// `None` — the actual NoValidBoundary path.
+/// `None` — the actual NoValidBoundary path. The context window is set
+/// large enough that `estimated_tokens <= context_window`, so this is
+/// a soft threshold exceedance, not a hard limit.
 #[tokio::test]
-async fn auto_compact_no_spurious_events_when_no_valid_boundary() {
+async fn auto_compact_silent_when_no_valid_boundary_under_context_window() {
     let main_client = Arc::new(MockLlmClient::new(vec![
         MockResponse::text("response1"),
         MockResponse::text("response2"),
@@ -650,13 +659,13 @@ async fn auto_compact_no_spurious_events_when_no_valid_boundary() {
     ]));
     let env = Arc::new(NoOpEnv);
     let mut opts = AgentHarnessOptions::new("test-model");
-    // Tiny context window + zero reserve → threshold = 1.
-    // Two prompts produce ~4 tokens of entries → estimated_tokens > threshold.
+    // context_window large enough that estimated_tokens (~4) < context_window.
+    // reserve_tokens set so threshold < estimated_tokens.
     opts.model_info = Some(ModelInfo {
-        context_window: 1,
+        context_window: 1_000_000,
         max_tokens: 50,
     });
-    opts.compaction_reserve_tokens = Some(0);
+    opts.compaction_reserve_tokens = Some(1_000_000);
     // keep_recent_tokens large enough to retain all entries → backward
     // scan reaches i == 0 → compute_cut_point returns None.
     opts.compaction_keep_recent_tokens = Some(100_000);
@@ -681,7 +690,8 @@ async fn auto_compact_no_spurious_events_when_no_valid_boundary() {
     let mut event_rx = h.subscribe();
     h.prompt("third").await.unwrap();
 
-    // Drain events — should see no CompactionEnd (benign skip, silent).
+    // Should NOT emit CompactionEnd — soft threshold exceedance with
+    // no valid boundary is a silent skip (consistent with InsufficientTokens).
     let mut had_compaction_end = false;
     while let Ok(event) = event_rx.try_recv() {
         if matches!(event.as_ref(), AgentHarnessEvent::CompactionEnd { .. }) {
@@ -690,15 +700,75 @@ async fn auto_compact_no_spurious_events_when_no_valid_boundary() {
     }
     assert!(
         !had_compaction_end,
-        "should not emit CompactionEnd when compute_cut_point returns None"
+        "should not emit CompactionEnd for soft threshold exceedance with no valid boundary"
+    );
+}
+
+/// When tokens exceed the context window (hard limit) and
+/// `compute_cut_point` returns `None`, auto-compaction must return
+/// `Err(NoValidBoundary)` so the caller knows continuing is futile.
+#[tokio::test]
+async fn auto_compact_errors_when_no_valid_boundary_over_context_window() {
+    let main_client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("response1"),
+        MockResponse::text("response2"),
+        // response3 won't be consumed — prompt("third") should error.
+    ]));
+    let env = Arc::new(NoOpEnv);
+    let mut opts = AgentHarnessOptions::new("test-model");
+    // Tiny context window + zero reserve → threshold = 1.
+    // MockLlmClient produces AssistantMessage with usage.output_tokens=0,
+    // so only user messages contribute tokens. After 2 prompts:
+    // path = [u1(1), a1(0), u2(1), a2(0)] → estimated_tokens = 2 > context_window(1).
+    opts.model_info = Some(ModelInfo {
+        context_window: 1,
+        max_tokens: 50,
+    });
+    opts.compaction_reserve_tokens = Some(0);
+    // keep_recent_tokens large enough to retain all entries → backward
+    // scan reaches i == 0 → compute_cut_point returns None.
+    opts.compaction_keep_recent_tokens = Some(100_000);
+    opts.auto_compact = true;
+    opts.compaction_model = Some(CompactionModelConfig {
+        client: main_client.clone() as Arc<dyn LlmClient>,
+        model: "test-model".into(),
+        model_info: ModelInfo {
+            context_window: 200_000,
+            max_tokens: 8192,
+        },
+    });
+    let h = AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+    // Build up context. MockLlmClient sets usage.output_tokens=0, so
+    // assistant entries contribute 0 tokens. Only user entries count.
+    // prompt("first"): path was empty → skips. After: [u1(1), a1(0)].
+    // prompt("second"): estimated_tokens=1 <= threshold=1 → skips. After: [u1, a1, u2, a2].
+    h.prompt("first").await.unwrap();
+    h.prompt("second").await.unwrap();
+
+    // 3rd prompt: try_auto_compact sees estimated_tokens=2 > context_window(1),
+    // but compute_cut_point returns None → Err(NoValidBoundary) propagates.
+    let result = h.prompt("third").await;
+    assert!(
+        result.is_err(),
+        "prompt should fail when context exceeds window and no valid cut boundary exists"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            HarnessError::Compaction(CompactionError::NoValidBoundary)
+        ),
+        "expected NoValidBoundary error, got: {err:?}"
     );
 }
 
 /// When a `before_compact` hook returns `Compact` but no valid cut
-/// boundary exists, auto-compaction must NOT emit `CompactionEnd` events.
-/// This is the hook-path equivalent of `auto_compact_no_spurious_events_when_no_valid_boundary`.
+/// boundary exists, and tokens are within the context window,
+/// auto-compaction silently lets the run proceed — no `CompactionEnd`
+/// event is emitted.
 #[tokio::test]
-async fn auto_compact_hook_compact_no_boundary_no_spurious_events() {
+async fn auto_compact_hook_compact_no_boundary_silent_under_context_window() {
     use futures::future::BoxFuture;
     use llm_harness_types::{BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook};
 
@@ -716,6 +786,79 @@ async fn auto_compact_hook_compact_no_boundary_no_spurious_events() {
         MockResponse::text("response1"),
         MockResponse::text("response2"),
         MockResponse::text("response3"),
+    ]));
+    let env = Arc::new(NoOpEnv);
+    let mut opts = AgentHarnessOptions::new("test-model");
+    // context_window large enough that estimated_tokens < context_window.
+    opts.model_info = Some(ModelInfo {
+        context_window: 1_000_000,
+        max_tokens: 50,
+    });
+    opts.compaction_reserve_tokens = Some(1_000_000);
+    // keep_recent_tokens large enough to retain all entries → backward
+    // scan reaches i == 0 → compute_cut_point returns None.
+    opts.compaction_keep_recent_tokens = Some(100_000);
+    opts.auto_compact = true;
+    opts.compaction_model = Some(CompactionModelConfig {
+        client: main_client.clone() as Arc<dyn LlmClient>,
+        model: "test-model".into(),
+        model_info: ModelInfo {
+            context_window: 200_000,
+            max_tokens: 8192,
+        },
+    });
+    opts.hooks = HarnessHooks {
+        before_compact: vec![Arc::new(CompactDecisionHook)],
+        ..HarnessHooks::none()
+    };
+    let h = AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+    // Build up context so the session path is non-empty.
+    h.prompt("first").await.unwrap();
+    h.prompt("second").await.unwrap();
+
+    // 3rd prompt: try_auto_compact sees non-empty path, hook returns
+    // Compact, but compute_cut_point returns None (all entries within
+    // keep_recent window) → NoValidBoundary → silent skip, run proceeds.
+    let mut event_rx = h.subscribe();
+    h.prompt("third").await.unwrap();
+
+    // Should NOT emit CompactionEnd — soft threshold exceedance with
+    // no valid boundary is a silent skip, even in the hook path.
+    let mut had_compaction_end = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if matches!(event.as_ref(), AgentHarnessEvent::CompactionEnd { .. }) {
+            had_compaction_end = true;
+        }
+    }
+    assert!(
+        !had_compaction_end,
+        "hook Compact path with NoValidBoundary under context window must not emit CompactionEnd"
+    );
+}
+
+/// When a `before_compact` hook returns `Compact` but no valid cut
+/// boundary exists, and tokens exceed the context window, auto-compaction
+/// must return `Err(NoValidBoundary)`.
+#[tokio::test]
+async fn auto_compact_hook_compact_no_boundary_errors_over_context_window() {
+    use futures::future::BoxFuture;
+    use llm_harness_types::{BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook};
+
+    struct CompactDecisionHook;
+    impl BeforeCompactHook for CompactDecisionHook {
+        fn before_compact<'a>(
+            &'a self,
+            _ctx: BeforeCompactCtx<'a>,
+        ) -> BoxFuture<'a, BeforeCompactDecision> {
+            Box::pin(async { BeforeCompactDecision::Compact })
+        }
+    }
+
+    let main_client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("response1"),
+        MockResponse::text("response2"),
+        // response3 won't be consumed — prompt("third") should error.
     ]));
     let env = Arc::new(NoOpEnv);
     let mut opts = AgentHarnessOptions::new("test-model");
@@ -742,26 +885,28 @@ async fn auto_compact_hook_compact_no_boundary_no_spurious_events() {
     };
     let h = AgentHarness::new_in_memory(main_client.clone() as Arc<dyn LlmClient>, env, opts).await;
 
-    // Build up context so the session path is non-empty.
+    // Build up context. Assistant entries have usage.output_tokens=0,
+    // so only user entries contribute tokens.
+    // prompt("first"): path empty → skips. After: [u1(1), a1(0)].
+    // prompt("second"): hook Compact, compute_cut_point None,
+    //   estimated_tokens=1 <= context_window=1 → silent skip, proceeds. After: [u1, a1, u2, a2].
     h.prompt("first").await.unwrap();
     h.prompt("second").await.unwrap();
 
-    // 3rd prompt: try_auto_compact sees non-empty path, hook returns
-    // Compact, but compute_cut_point returns None (all entries within
-    // keep_recent window) → NoValidBoundary → benign skip, no CompactionEnd.
-    let mut event_rx = h.subscribe();
-    h.prompt("third").await.unwrap();
-
-    // Drain events — should see no CompactionEnd (benign skip, silent).
-    let mut had_compaction_end = false;
-    while let Ok(event) = event_rx.try_recv() {
-        if matches!(event.as_ref(), AgentHarnessEvent::CompactionEnd { .. }) {
-            had_compaction_end = true;
-        }
-    }
+    // 3rd prompt: hook returns Compact, compute_cut_point returns None,
+    // estimated_tokens=2 > context_window=1 → Err(NoValidBoundary) propagates.
+    let result = h.prompt("third").await;
     assert!(
-        !had_compaction_end,
-        "hook Compact path with NoValidBoundary must not emit CompactionEnd"
+        result.is_err(),
+        "prompt should fail when context exceeds window and hook Compact has no valid boundary"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            HarnessError::Compaction(CompactionError::NoValidBoundary)
+        ),
+        "expected NoValidBoundary error, got: {err:?}"
     );
 }
 

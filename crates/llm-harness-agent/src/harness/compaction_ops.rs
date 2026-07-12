@@ -113,14 +113,18 @@ impl AgentHarness {
     /// skipped — the hook may return `BeforeCompactDecision::Compact` to force
     /// compaction even when tokens are under threshold.
     ///
-    /// Returns `Ok(())` when compaction is not needed (`InsufficientTokens` or
-    /// `NoValidBoundary`). All other errors propagate to the caller.
+    /// Returns `Ok(())` when compaction is not needed (`InsufficientTokens`)
+    /// or when no valid cut boundary exists but tokens are within the context
+    /// window (soft threshold exceedance — the request fits, so the run
+    /// proceeds silently). When tokens exceed the context window and no valid
+    /// cut boundary exists, returns `Err(NoValidBoundary)` — continuing would
+    /// send an over-limit request to the API.
     ///
     /// Unlike `compact_with_path` (used by the public `compact()` method),
-    /// benign skips (`InsufficientTokens` / `NoValidBoundary`) do NOT emit
-    /// `CompactionEnd` events — they are silently treated as "nothing to do".
-    /// This avoids spurious error events when a hook forces `Compact` but no
-    /// valid cut boundary exists.
+    /// benign skips (`InsufficientTokens` / `NoValidBoundary` under the
+    /// context window) do NOT emit `CompactionEnd` events — they are silently
+    /// treated as "nothing to do". This avoids spurious error events when a
+    /// hook forces `Compact` but no valid cut boundary exists.
     pub(super) async fn try_auto_compact(&self) -> Result<(), HarnessError> {
         let (auto_compact, has_before_compact_hook) = {
             let inner = self.inner.lock().unwrap();
@@ -157,9 +161,17 @@ impl AgentHarness {
             )
             .is_none()
             {
-                return Ok(());
+                return self.handle_no_valid_boundary(
+                    pre.estimated_tokens,
+                    pre.m_info.context_window as usize,
+                );
             }
         }
+
+        // Save values needed for NoValidBoundary handling before `pre` is
+        // moved into do_compact.
+        let saved_estimated_tokens = pre.estimated_tokens;
+        let saved_context_window = pre.m_info.context_window as usize;
 
         // Create a temporary abort token so `abort()` can cancel the
         // compaction LLM call during auto-compaction (run_loop hasn't set
@@ -181,7 +193,15 @@ impl AgentHarness {
             }
             // Benign skips: no CompactionEnd event, no error propagation.
             Err(HarnessError::Compaction(CompactionError::InsufficientTokens)) => Ok(()),
-            Err(HarnessError::Compaction(CompactionError::NoValidBoundary)) => Ok(()),
+            Err(HarnessError::Compaction(CompactionError::NoValidBoundary)) => {
+                // do_compact returned NoValidBoundary after entering Compacting
+                // phase. Apply the same over-limit logic: if tokens exceed the
+                // context window, propagate the error; otherwise silently proceed.
+                self.handle_no_valid_boundary(
+                    saved_estimated_tokens,
+                    saved_context_window,
+                )
+            }
             Err(HarnessError::Compaction(CompactionError::Skipped)) => Ok(()),
             Err(e) => {
                 self.emit(AgentHarnessEvent::CompactionEnd {
@@ -190,6 +210,26 @@ impl AgentHarness {
                 });
                 Err(e)
             }
+        }
+    }
+
+    /// Handle the case where compaction is needed but no valid cut boundary
+    /// exists.
+    ///
+    /// - If `estimated_tokens > context_window`: returns `Err(NoValidBoundary)`
+    ///   because continuing would send an over-limit request to the API.
+    /// - If `estimated_tokens <= context_window`: returns `Ok(())` silently —
+    ///   the request fits within the model's capacity even though it exceeds
+    ///   the reserve. No event emitted, consistent with InsufficientTokens/Skipped.
+    fn handle_no_valid_boundary(
+        &self,
+        estimated_tokens: usize,
+        context_window: usize,
+    ) -> Result<(), HarnessError> {
+        if estimated_tokens > context_window {
+            Err(CompactionError::NoValidBoundary.into())
+        } else {
+            Ok(())
         }
     }
 

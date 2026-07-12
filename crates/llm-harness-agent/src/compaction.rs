@@ -15,6 +15,8 @@ use crate::session::types::{CompactionEntry, SessionEntry, SessionEntryPayload};
 /// Bytes per token for the rough character-count heuristic (≈4 bytes/token for
 /// ASCII; CJK text is over-estimated since UTF-8 uses 3 bytes/char).
 const CHARS_PER_TOKEN: usize = 4;
+/// Fixed token estimate for an image content block (images aren't tokenized by char count).
+const IMAGE_TOKEN_ESTIMATE: usize = 250;
 
 /// System prompt used by the summary model during compaction.
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
@@ -93,6 +95,8 @@ pub(crate) const DEFAULT_RESERVE_TOKENS: usize = 16_384;
 pub(crate) const DEFAULT_KEEP_RECENT_TOKENS: usize = 20_000;
 /// Default `context_window` used when `model_info` is `None`.
 pub(crate) const DEFAULT_CONTEXT_WINDOW: u32 = 200_000;
+/// Default `max_tokens` used when `model_info` is `None`.
+const DEFAULT_MAX_TOKENS: u32 = 8_192;
 /// Independent LLM provider/model for compaction summaries.
 ///
 /// When set on [`crate::AgentHarnessOptions`], compaction uses this provider
@@ -119,7 +123,7 @@ impl Default for CompactionSettings {
             summary_model: String::new(),
             summary_model_info: ModelInfo {
                 context_window: DEFAULT_CONTEXT_WINDOW,
-                max_tokens: 8192,
+                max_tokens: DEFAULT_MAX_TOKENS,
             },
         }
     }
@@ -156,7 +160,7 @@ fn estimate_tokens_for_content_blocks(blocks: &[ContentBlock]) -> usize {
         .iter()
         .map(|b| match b {
             ContentBlock::Text { text } => estimate_tokens_for_text(text),
-            ContentBlock::Image { .. } => 250,
+            ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
             ContentBlock::Thinking { thinking, .. } => estimate_tokens_for_text(thinking),
             ContentBlock::ToolUse { input, .. } => estimate_tokens_for_text(&input.to_string()),
         })
@@ -292,44 +296,6 @@ pub(crate) fn compute_cut_point(
         }),
         file_operations,
     })
-}
-
-/// Decide whether compaction is needed and determine the cut point.
-///
-/// Returns `None` when the current token count is within budget.
-/// Pure function — does not call the LLM.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn prepare_compaction(
-    path: &[SessionEntry],
-    last_compaction: Option<&CompactionEntry>,
-    settings: &CompactionSettings,
-    model_info: &ModelInfo,
-) -> Option<CompactionPreparation> {
-    if path.is_empty() {
-        return None;
-    }
-
-    let start_idx = last_compaction
-        .and_then(|lc| path.iter().position(|e| e.id == lc.first_kept_entry))
-        .unwrap_or(0);
-
-    let compactable = &path[start_idx..];
-    let summary_tokens = last_compaction.map(estimate_summary_tokens).unwrap_or(0);
-    let estimated_tokens: usize = estimate_tokens(compactable) + summary_tokens;
-
-    let threshold = (model_info.context_window as usize).saturating_sub(settings.reserve_tokens);
-    if estimated_tokens <= threshold {
-        return None;
-    }
-
-    compute_cut_point(
-        path,
-        last_compaction,
-        settings,
-        Some(start_idx),
-        Some(estimated_tokens),
-    )
 }
 
 /// Find the nearest index at or before `cut_relative` in `entries` that is a
@@ -713,6 +679,43 @@ mod tests {
             context_window: 2000,
             max_tokens: 512,
         }
+    }
+
+    /// Decide whether compaction is needed and determine the cut point.
+    ///
+    /// Returns `None` when the current token count is within budget.
+    /// Pure function — does not call the LLM.
+    fn prepare_compaction(
+        path: &[SessionEntry],
+        last_compaction: Option<&CompactionEntry>,
+        settings: &CompactionSettings,
+        model_info: &ModelInfo,
+    ) -> Option<CompactionPreparation> {
+        if path.is_empty() {
+            return None;
+        }
+
+        let start_idx = last_compaction
+            .and_then(|lc| path.iter().position(|e| e.id == lc.first_kept_entry))
+            .unwrap_or(0);
+
+        let compactable = &path[start_idx..];
+        let summary_tokens = last_compaction.map(estimate_summary_tokens).unwrap_or(0);
+        let estimated_tokens: usize = estimate_tokens(compactable) + summary_tokens;
+
+        let threshold =
+            (model_info.context_window as usize).saturating_sub(settings.reserve_tokens);
+        if estimated_tokens <= threshold {
+            return None;
+        }
+
+        compute_cut_point(
+            path,
+            last_compaction,
+            settings,
+            Some(start_idx),
+            Some(estimated_tokens),
+        )
     }
 
     #[test]
