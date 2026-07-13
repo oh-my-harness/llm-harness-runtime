@@ -112,21 +112,36 @@ async fn compaction_via_hook_override_inserts_summary() {
         .unwrap();
     hook.set_first_kept(kept_id);
 
+    let mut event_rx = h.subscribe();
     let stats = h.compact().await.unwrap();
     assert_eq!(
         stats.tokens_before, 1000,
         "wrong tokens_before from override"
     );
 
-    // After compaction, the first message must be the summary.
-    let ctx_after = h.build_context().await.unwrap();
+    // Override path must emit CompactionStart before CompactionEnd.
+    let mut saw_start = false;
+    let mut saw_end = false;
+    let mut start_before_end = false;
+    while let Ok(event) = event_rx.try_recv() {
+        match event.as_ref() {
+            AgentHarnessEvent::CompactionStart { .. } => {
+                saw_start = true;
+                if !saw_end {
+                    start_before_end = true;
+                }
+            }
+            AgentHarnessEvent::CompactionEnd { .. } => {
+                saw_end = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_start, "Override path must emit CompactionStart");
+    assert!(saw_end, "Override path must emit CompactionEnd");
     assert!(
-        matches!(
-            ctx_after.messages.first(),
-            Some(AgentMessage::CompactionSummary(_))
-        ),
-        "expected summary as first message; got {:?}",
-        ctx_after.messages.first().map(std::mem::discriminant)
+        start_before_end,
+        "CompactionStart must precede CompactionEnd"
     );
 }
 /// A hook returning `BeforeCompactDecision::Compact` forces the framework

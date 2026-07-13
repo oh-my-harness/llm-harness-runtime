@@ -266,6 +266,9 @@ impl AgentHarness {
                     return Err(CompactionError::Skipped.into());
                 }
                 BeforeCompactDecision::Override(result) => {
+                    self.emit(AgentHarnessEvent::CompactionStart {
+                        estimated_tokens: pre.estimated_tokens,
+                    });
                     return self
                         .apply_compaction_result(result, vec![], &path, true)
                         .await;
