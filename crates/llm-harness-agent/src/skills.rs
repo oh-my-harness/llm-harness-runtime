@@ -1114,7 +1114,7 @@ mod tests {
         let (fields, body) = parse_frontmatter(text);
         assert_eq!(fields.get("name").unwrap(), "foo");
         // "description" was not parsed as a field key.
-        assert!(fields.get("description").is_none());
+        assert!(!fields.contains_key("description"));
         // Body starts after the real closing fence — no frontmatter leakage.
         assert_eq!(body, "body line\n");
     }

@@ -1,31 +1,29 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::spawn::async_spawn::{AsyncCompletion, AsyncSpawnHandle, AsyncSpawnRegistry};
-use crate::spawn::sub_agent::{
-    ContextMode, ProviderSelection, SpawnOptions, SubAgentHandle, SubAgentResult, SubAgentSpawner,
+use crate::spawn::message_bus::{AgentEntry, AgentStatus, MessageBus};
+use crate::spawn::spawn_types::{
+    ContextMode, ProviderSelection, SpawnOptions, SubAgentHandle, SubAgentResult,
 };
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use llm_harness_agent::ModelInfo;
 use llm_harness_agent::{
     AgentHarnessEvent, Plugin, Session,
     session::SessionStorage,
     session::{JsonlSessionRepo, SessionRepo, types::CreateSessionOptions},
 };
-use llm_harness_loop::LlmClient;
-use llm_harness_types::{AgentError, AgentEvent, ExecutionEnv, HarnessError, HarnessPhase};
+use llm_harness_loop::{FinalAnswerMode, LlmClient, RetryConfig};
+use llm_harness_types::{
+    AgentError, AgentEvent, ExecutionEnv, HarnessError, HarnessPhase, StreamOptions, ThinkingLevel,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::{HarnessBuildError, HarnessBuilder};
-use crate::spawn::peer::{
-    PeerCleanupGuard, PeerDirectory, PeerMessageHook, PeerMetadata, SharedPeerRx,
-};
 
 // ── EnvFactory ────────────────────────────────────────────────────────────
 
-/// `ExecutionEnv` 的抽象工厂。
-///
-/// 位于 `llm-harness-runtime` 中，使 `HarnessSubAgentSpawner` 无需
+/// `ExecutionEnv` 的抽象工厂，使 `HarnessSubAgentSpawner` 无需
 /// 直接依赖 `llm-harness-runtime-sandbox-os`。
 pub trait EnvFactory: Send + Sync {
     fn create(&self, cwd: &Path) -> Result<Arc<dyn ExecutionEnv>, AgentError>;
@@ -36,9 +34,7 @@ pub trait EnvFactory: Send + Sync {
 /// `SessionFactory::create` 的返回类型。
 pub type SessionCreateResult = (Arc<dyn SessionStorage>, String);
 
-/// Session 存储的抽象工厂。
-///
-/// 位于 `llm-harness-runtime` 中，使调用方可以选择 session 存储后端
+/// Session 存储的抽象工厂，使调用方可以选择 session 存储后端
 ///（`JsonlSessionRepo`、`InMemorySessionRepo` 等），`HarnessSubAgentSpawner`
 /// 不写死后端。
 pub trait SessionFactory: Send + Sync {
@@ -55,12 +51,9 @@ pub trait SessionFactory: Send + Sync {
 /// Sub-agent plugin 的工厂函数类型。
 ///
 /// - `cwd`：sub-agent 工作目录。
-/// - `peer_rx`：peer 模式下为 `Some(rx)`（与 `PeerMessageHook` 共享同一
-///   `SharedPeerRx`），plugin 可据此注册 `WaitForPeerMessageTool`；非 peer 模式为 `None`。
-/// - `agent_id`：peer 模式下为 `Some(id)`（取自 `PeerMetadata.agent_id`），
-///   plugin 可据此在 `SendToPeerTool` 中标注发送者身份；非 peer 模式为 `None`。
-pub type PluginFactory =
-    Arc<dyn Fn(&Path, Option<SharedPeerRx>, Option<&str>) -> Box<dyn Plugin> + Send + Sync>;
+/// - `bus`：共享的 `MessageBus`，plugin 可据此注册通信工具。
+/// - `agent_id`：sub-agent 的标识（取自 session_id）。
+pub type PluginFactory = Arc<dyn Fn(&Path, Arc<MessageBus>, &str) -> Box<dyn Plugin> + Send + Sync>;
 
 // ── ProviderAlias ─────────────────────────────────────────────────────────
 
@@ -72,8 +65,8 @@ struct ProviderAlias {
 
 // ── HarnessSubAgentSpawner ────────────────────────────────────────────────
 
-/// `SubAgentSpawner` 的具体实现：为每个 sub-agent 创建独立的
-/// `AgentHarness` 实例，支持可选的 provider 别名。
+/// 为每个 sub-agent 创建独立的 `AgentHarness` 实例，支持可选的 provider 别名。
+/// 提供 `spawn_async()`（异步）派发方式。
 pub struct HarnessSubAgentSpawner {
     default_model: String,
     default_client: Arc<dyn LlmClient>,
@@ -82,27 +75,40 @@ pub struct HarnessSubAgentSpawner {
     env_factory: Arc<dyn EnvFactory>,
     session_factory: Arc<dyn SessionFactory>,
     session_base_dir: PathBuf,
-    /// 可选：peer 通讯录。None 则无 peer 通信。
-    peer_directory: Option<Arc<PeerDirectory>>,
-    /// 可选：异步投递 registry。None 则无异步投递（spawn_async 会返回错误）。
-    async_registry: Option<Arc<AsyncSpawnRegistry>>,
+    /// 共享 MessageBus。`spawn_async` 把 sub-agent 注册到 bus 并 track，
+    /// 完成后结果经 event channel 投递回主 agent。
+    message_bus: Arc<MessageBus>,
+    /// 以下字段继承主 agent 的 LLM 行为配置，构建 sub-agent harness 时注入。
+    /// 全部 `None` 表示用 harness 默认值。
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    thinking_level: Option<ThinkingLevel>,
+    retry: Option<RetryConfig>,
+    stream_options: Option<StreamOptions>,
+    final_answer_mode: Option<FinalAnswerMode>,
+    model_info: Option<ModelInfo>,
+    /// Maximum concurrent in-flight sub-agents. `None` = unlimited.
+    max_concurrent: Option<usize>,
 }
 
 impl HarnessSubAgentSpawner {
     /// 创建新的 spawner。
     ///
-    /// `sub_plugin_factory` 在每次 spawn 时使用 sub-agent 的 cwd 调用。
-    /// 必须返回不含 `SpawnAgentTool` 的 Plugin，以防止递归派发（v0.3+）。
-    /// 参数：
-    /// - `peer_rx`：peer 模式下 `Some(rx)`（与 `PeerMessageHook` 共享），
-    ///   非 peer 模式 `None`。plugin 可据此决定是否注册 `WaitForPeerMessageTool`。
-    /// - `agent_id`：peer 模式下 `Some(id)`（取自 `PeerMetadata.agent_id`），
-    ///   非 peer 模式 `None`。plugin 可据此在 `SendToPeerTool` 中标注发送者。
+    /// - `default_model`：默认模型名。
+    /// - `default_client`：默认 LLM client。
+    /// - `session_base_dir`：sub-agent session 文件的根目录。
+    /// - `bus`：共享 `MessageBus`，`spawn_async` 据此注册 sub-agent 并 track。
+    /// - `sub_plugin_factory`：每次 spawn 时用 sub-agent 的 cwd 调用，返回
+    ///   不含 `SpawnAgentTool` 的 Plugin（防止递归派发）。闭包参数：
+    ///   - `&Path`：sub-agent 工作目录。
+    ///   - `Arc<MessageBus>`：共享消息总线，plugin 可据此注册通信工具。
+    ///   - `&str`：sub-agent 的标识（取自 session_id）。
     pub fn new(
         default_model: impl Into<String>,
         default_client: Arc<dyn LlmClient>,
         session_base_dir: PathBuf,
-        sub_plugin_factory: impl Fn(&Path, Option<SharedPeerRx>, Option<&str>) -> Box<dyn Plugin>
+        bus: Arc<MessageBus>,
+        sub_plugin_factory: impl Fn(&Path, Arc<MessageBus>, &str) -> Box<dyn Plugin>
         + Send
         + Sync
         + 'static,
@@ -115,11 +121,17 @@ impl HarnessSubAgentSpawner {
             env_factory: Arc::new(NoOpEnvFactory),
             session_factory: Arc::new(NoOpSessionFactory),
             session_base_dir,
-            peer_directory: None,
-            async_registry: None,
+            message_bus: bus,
+            max_tokens: None,
+            temperature: None,
+            thinking_level: None,
+            retry: None,
+            stream_options: None,
+            final_answer_mode: None,
+            model_info: None,
+            max_concurrent: None,
         }
     }
-
     /// 注册 provider 别名（如 "fast" → 更便宜的模型）。
     pub fn alias(mut self, name: &str, client: Arc<dyn LlmClient>, model: &str) -> Self {
         self.aliases.push(ProviderAlias {
@@ -128,6 +140,10 @@ impl HarnessSubAgentSpawner {
             client,
         });
         self
+    }
+    /// 返回已注册的 provider 别名列表。
+    pub fn alias_names(&self) -> Vec<String> {
+        self.aliases.iter().map(|a| a.name.clone()).collect()
     }
 
     /// 设置环境工厂（默认：NoOpEnvFactory —— 未设置真实 factory 时
@@ -143,22 +159,53 @@ impl HarnessSubAgentSpawner {
         self.session_factory = factory;
         self
     }
-
-    /// 启用 sub↔sub peer 通信。传入共享的 `PeerDirectory`。
-    ///
-    /// 启用后，`spawn_with_peer` / `spawn_async_with_peer` 会把 sub-agent
-    /// 注册进通讯录，使其能收发 peer 消息。
-    pub fn enable_peer_communication(mut self, directory: Arc<PeerDirectory>) -> Self {
-        self.peer_directory = Some(directory);
+    /// 设置最大输出 token 数。`None` 用 harness 默认值 (8192)。
+    pub fn max_tokens(mut self, max: Option<u32>) -> Self {
+        self.max_tokens = max;
         self
     }
 
-    /// 启用 sub→主 异步投递。传入通过 `async_spawn_pair()` 创建的 registry。
-    ///
-    /// 启用后，`spawn_async` / `spawn_async_with_peer` 会把 sub-agent 的
-    /// completion 投递回主 agent 的 `AsyncSpawnHook`。
-    pub fn enable_async_delivery(mut self, registry: Arc<AsyncSpawnRegistry>) -> Self {
-        self.async_registry = Some(registry);
+    /// 设置采样温度。`None` 用 provider 默认值。
+    pub fn temperature(mut self, temp: Option<f32>) -> Self {
+        self.temperature = temp;
+        self
+    }
+
+    /// 设置推理深度级别。`None` 用 harness 默认值。
+    pub fn thinking_level(mut self, level: Option<ThinkingLevel>) -> Self {
+        self.thinking_level = level;
+        self
+    }
+
+    /// 设置临时错误重试配置。`None` 禁用重试。
+    pub fn retry(mut self, config: Option<RetryConfig>) -> Self {
+        self.retry = config;
+        self
+    }
+
+    /// 设置流式请求选项（超时等）。`None` 用 harness 默认值。
+    pub fn stream_options(mut self, opts: Option<StreamOptions>) -> Self {
+        self.stream_options = opts;
+        self
+    }
+
+    /// 设置 final-answer 分类模式。`None` 用 harness 默认值。
+    pub fn final_answer_mode(mut self, mode: Option<FinalAnswerMode>) -> Self {
+        self.final_answer_mode = mode;
+        self
+    }
+
+    /// 设置模型元数据（context_window 等）。`None` 用 harness 默认值。
+    pub fn model_info(mut self, info: Option<ModelInfo>) -> Self {
+        self.model_info = info;
+        self
+    }
+
+    /// Set the maximum number of concurrent in-flight sub-agents.
+    /// `None` means unlimited (use with caution). When the limit is
+    /// reached, `spawn_async` returns `AgentError::ResourceLimitExceeded`.
+    pub fn max_concurrent(mut self, max: Option<usize>) -> Self {
+        self.max_concurrent = max;
         self
     }
 }
@@ -166,22 +213,12 @@ impl HarnessSubAgentSpawner {
 impl HarnessSubAgentSpawner {
     /// 私有：构建 sub-agent harness + tokio task，返回 `SubAgentHandle` 和 session_id。
     ///
-    /// `peer_meta` 决定是否往 `PeerDirectory` 注册：
-    /// - `Some(meta)` 且 spawner 已 `enable_peer_communication`：建 peer channel +
-    ///   `PeerMessageHook`（延迟注入 `FollowUpHandle`）+ `PeerCleanupGuard`（move 进 task）。
-    /// - `None` 或未启用 peer：普通 spawn。
-    ///
-    /// 返回 `(handle, session_id)`：`spawn_async*` 用 session_id 作 agent_id
-    /// （非 peer 模式，设计 §7.4）；peer 模式由调用方提供 agent_id。
-    /// `preregister_abort`：true 时将 abort token 预注册到 `async_registry`
-    /// （仅 `spawn_async*` 路径，它们会调 `track()`，track task 完成时移除 entry）。
-    /// 同步路径（`spawn`/`spawn_with_peer`）传 false——不调 track，预注册的 entry
-    /// 永不会被移除，会泄漏。
+    /// harness 被包裹在 `Arc` 中：一个 clone 注册到 `MessageBus` 的 `AgentEntry`，
+    /// 另一个 clone move 进 tokio::spawn task。所有 harness 方法取 `&self`，
+    /// 因此 `Arc<AgentHarness>` 直接可用于 `subscribe()` / `steer()` / `prompt()`。
     fn spawn_inner(
         &self,
         opts: SpawnOptions,
-        peer_meta: Option<PeerMetadata>,
-        preregister_abort: bool,
     ) -> BoxFuture<'_, Result<(SubAgentHandle, String), AgentError>> {
         let default_model = self.default_model.clone();
         let default_client = self.default_client.clone();
@@ -194,7 +231,14 @@ impl HarnessSubAgentSpawner {
         let env_factory = self.env_factory.clone();
         let session_factory = self.session_factory.clone();
         let session_base_dir = self.session_base_dir.clone();
-        let peer_directory = self.peer_directory.clone();
+        let bus = self.message_bus.clone();
+        let max_tokens = self.max_tokens;
+        let temperature = self.temperature;
+        let thinking_level = self.thinking_level;
+        let retry = self.retry.clone();
+        let stream_options = self.stream_options.clone();
+        let final_answer_mode = self.final_answer_mode.clone();
+        let model_info = self.model_info.clone();
 
         async move {
             // 1. 解析 provider。
@@ -216,51 +260,39 @@ impl HarnessSubAgentSpawner {
             let cwd = opts.cwd.unwrap_or(default_cwd);
             let env = env_factory.create(&cwd)?;
 
-            // 3. peer 注册（若 peer_meta + peer_directory 都有）。
-            //    先于 plugin 创建：register 建 channel + 返回 rx，rx 的克隆传给
-            //    plugin factory（供 WaitForPeerMessageTool 注册）和 PeerMessageHook。
-            //    register 早于 set_follow_up_handle——此时别的 peer 已能 send，
-            //    但 hook 的 follow_up_handle=None 时不取消息（Task 4 降级），
-            //    消息留 channel，set_follow_up_handle 后下次 should_stop 再取。
-            let peer_rx: Option<SharedPeerRx> = if let Some(meta) = peer_meta.as_ref() {
-                if let Some(dir) = peer_directory.as_ref() {
-                    let rx = dir
-                        .register(meta.clone())
-                        .map_err(|e| AgentError::Internal(format!("peer register failed: {e}")))?;
-                    Some(rx)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            // 4. 创建 sub-agent plugin（不含 SpawnAgentTool）。
-            //    传 peer_rx 克隆：plugin 可据此注册 WaitForPeerMessageTool。
-            //    传 agent_id：plugin 可据此在 SendToPeerTool 中标注发送者。
-            //    agent_id 借自 peer_meta，在下方 build_with_session 前即用毕。
-            let sub_plugin = (sub_plugin_factory)(
-                &cwd,
-                peer_rx.clone(),
-                peer_meta.as_ref().map(|m| m.agent_id.as_str()),
-            );
-
-            // 5. 创建 session（通过 SessionFactory，不写死后端）。
-            // 注意：session 在磁盘上创建后，如果下一步构建 harness 失败，
-            // 该 session 会成为孤儿（存在于磁盘但无引用）。
-            // 未来可通过内存 storage 先构建 harness、确认成功后再持久化来避免。
+            // 3. 创建 session（通过 SessionFactory，不写死后端）。
+            //    先创建 session 以获得 session_id，再传给 plugin factory。
             let (storage, session_id) = session_factory.create(&session_base_dir, &model).await?;
 
-            // 6. 建 PeerMessageHook（持同一 peer_rx）。
-            let peer_hook: Option<Arc<PeerMessageHook>> =
-                peer_rx.map(|rx| Arc::new(PeerMessageHook::new(rx)));
+            // 4. 创建 sub-agent plugin（不含 SpawnAgentTool）。
+            //    传 bus 克隆：plugin 可据此注册通信工具。
+            //    传 &session_id：plugin 可据此标识 agent。
+            let sub_plugin = (sub_plugin_factory)(&cwd, bus.clone(), &session_id);
 
-            // 构建 harness（装 peer_hook 若有）。
+            // 5. 构建 harness，继承主 agent 的 LLM 行为配置。
             let mut builder = HarnessBuilder::new(&model)
                 .install(sub_plugin.as_ref())
                 .provider(&model, client);
-            if let Some(ref hook) = peer_hook {
-                builder = builder.should_stop_hook(hook.clone());
+            if let Some(v) = max_tokens {
+                builder = builder.max_tokens(v);
+            }
+            if let Some(v) = temperature {
+                builder = builder.temperature(Some(v));
+            }
+            if let Some(v) = thinking_level {
+                builder = builder.thinking_level(v);
+            }
+            if let Some(v) = &retry {
+                builder = builder.retry(Some(v.clone()));
+            }
+            if let Some(v) = &stream_options {
+                builder = builder.stream_options(Some(v.clone()));
+            }
+            if let Some(v) = &final_answer_mode {
+                builder = builder.final_answer_mode(v.clone());
+            }
+            if let Some(v) = &model_info {
+                builder = builder.model_info(Some(v.clone()));
             }
             let harness = builder
                 .build_with_session(env, Session::new(storage))
@@ -268,40 +300,32 @@ impl HarnessSubAgentSpawner {
                     AgentError::Internal(format!("failed to build sub-agent harness: {e}"))
                 })?;
 
-            // 7. peer: set_follow_up_handle + guard。
-            //    guard 必须在 set_follow_up_handle 之后建，且 move 进执行 task。
-            let peer_guard: Option<PeerCleanupGuard> =
-                if let (Some(hook), Some(meta), Some(dir)) =
-                    (peer_hook.as_ref(), peer_meta.as_ref(), peer_directory.as_ref())
-                {
-                    hook.set_follow_up_handle(harness.follow_up_handle());
-                    Some(PeerCleanupGuard::new(dir.clone(), meta.agent_id.clone()))
-                } else {
-                    None
-                };
+            // 6. 包裹在 Arc 中：一个 clone 给 AgentEntry，一个 move 进 task。
+            let harness = Arc::new(harness);
 
-            // 8. 构建 prompt（可选的 context 注入）。
+            // 7. 构建 prompt（可选的 context 注入）。
             let prompt = match &opts.context {
                 ContextMode::None => opts.prompt,
                 ContextMode::Inject(ctx) => {
                     format!("Context:\n{ctx}\n\n---\n\n{}", opts.prompt)
                 }
             };
-            // 9. 创建 abort token。仅在调用方会 track() 时预注册到 registry
-            // （spawn_async* 路径）。同步路径（spawn/spawn_with_peer）不调 track，
-            // 预注册的 entry 永不会被 track task 移除，导致泄漏。
-            // 预注册消除竞态：cancel_all 可能在 spawn 后、track insert 前触发，
-            // 漏掉该 sub-agent。提前注册后 track() 的 insert 为幂等覆盖（同 token clone）。
-            // key：peer 模式用 meta.agent_id，非 peer 用 session_id。
+
+            // 8. 创建 abort token。预注册到 bus 的 subagent_aborts，
+            //    使 cancel_all 可在 spawn 后、track insert 前触发时覆盖。
             let abort_token = CancellationToken::new();
-            if preregister_abort && let Some(ref registry) = self.async_registry {
-                let key = peer_meta
-                    .as_ref()
-                    .map(|m| m.agent_id.as_str())
-                    .unwrap_or(&session_id);
-                registry.register_subagent_abort(key, abort_token.clone());
-            }
-            // 10. 启动 tokio task。abort_token 注入 harness，使 handle.abort()
+            bus.register_subagent_abort(&session_id, abort_token.clone());
+            // 注册到 agent registry，使 bus 可 steer / subscribe。
+            bus.register(
+                &session_id,
+                AgentEntry {
+                    status: AgentStatus::Running,
+                    harness: Some(harness.clone()),
+                    is_main: false,
+                },
+            );
+
+            // 9. 启动 tokio task。abort_token 注入 harness，使 handle.abort()
             // 能到达 agent loop。
             let abort_clone = abort_token.clone();
             let session_id_clone = session_id.clone();
@@ -309,8 +333,6 @@ impl HarnessSubAgentSpawner {
                 // 将 abort token 注入 harness，使 handle.abort()
                 // 能到达 agent loop。
                 harness.set_abort_token(abort_clone);
-                // peer_guard move 进 task：task 结束（success/error/panic）才 drop→unregister。
-                let _guard = peer_guard;
 
                 // Bridge: broadcast → unbounded mpsc。
                 // event_task 从 mpsc 读，不会因 broadcast buffer 满而 Lagged。
@@ -402,93 +424,37 @@ impl HarnessSubAgentSpawner {
         .boxed()
     }
 
-    /// 同步、有 peer：`spawn_inner(opts, Some(meta), false)`，返回 `SubAgentHandle`。
-    /// 调用方自己 `join()`。不预注册 abort token（不调 track，无需 cancel_all 覆盖）。
-    pub fn spawn_with_peer(
-        &self,
-        opts: SpawnOptions,
-        meta: PeerMetadata,
-    ) -> BoxFuture<'_, Result<SubAgentHandle, AgentError>> {
-        Box::pin(async move {
-            let (handle, _session_id) = self.spawn_inner(opts, Some(meta), false).await?;
-            Ok(handle)
-        })
-    }
-
-    /// Spawn sub-agent 后台执行（task 异步跑），经 `registry.track` 返回
-    /// `(AsyncSpawnHandle, oneshot::Receiver)`。方法名 "async" 指 sub-agent
-    /// 不阻塞当前 tool execute，**不**指结果投递方式——`SpawnAgentTool` 的
-    /// wait=true / wait=false 都走此方法，由 `deliver_to_channel` 区分：
+    /// Spawn sub-agent 后台执行（task 异步跑），经 `bus.track_with_oneshot`
+    /// 返回 agent_id。结果经 event channel 投递给主 agent 的 hook/watcher。
     ///
-    /// - `deliver_to_channel=false`（wait=true / sync）：结果经 oneshot 直接
-    ///   回 tool，**不**投递 completion channel（避免双投递）。in_flight 计数
-    ///   此场景无实际作用（主 agent 在 tool execute 阻塞，不进 Idle），但保留
-    ///   以统一 task 生命周期管理。
-    /// - `deliver_to_channel=true`（wait=false / async）：tool 丢弃 oneshot，
-    ///   结果必须经 completion channel 投递给 hook/watcher。
-    ///
-    /// 需先 `enable_async_delivery`，否则返回错误。
-    /// agent_id 取 session_id（非 peer 模式，设计 §7.4）。
-    pub fn spawn_async(
-        &self,
-        opts: SpawnOptions,
-        deliver_to_channel: bool,
-    ) -> BoxFuture<
-        '_,
-        Result<
-            (
-                AsyncSpawnHandle,
-                tokio::sync::oneshot::Receiver<AsyncCompletion>,
-            ),
-            AgentError,
-        >,
-    > {
-        let registry = self.async_registry.clone();
+    /// agent_id 取 session_id。
+    pub fn spawn_async(&self, opts: SpawnOptions) -> BoxFuture<'_, Result<String, AgentError>> {
+        let bus = self.message_bus.clone();
+        let max_concurrent = self.max_concurrent;
         Box::pin(async move {
-            let registry = registry.ok_or_else(|| {
-                AgentError::Internal("async delivery not enabled on spawner".into())
-            })?;
-            let (handle, session_id) = self.spawn_inner(opts, None, true).await?;
-            Ok(registry.track(handle, session_id, deliver_to_channel))
-        })
-    }
-    /// Spawn sub-agent 后台执行（task 异步跑）+ peer 注册，经 `registry.track`
-    /// 返回 `(AsyncSpawnHandle, oneshot::Receiver)`。与 `spawn_async` 同构，
-    /// `deliver_to_channel` 语义见该方法文档。agent_id 取自 `PeerMetadata.agent_id`。
-    ///
-    /// 需先 `enable_async_delivery`，否则返回错误。
-    pub fn spawn_async_with_peer(
-        &self,
-        opts: SpawnOptions,
-        meta: PeerMetadata,
-        deliver_to_channel: bool,
-    ) -> BoxFuture<
-        '_,
-        Result<
-            (
-                AsyncSpawnHandle,
-                tokio::sync::oneshot::Receiver<AsyncCompletion>,
-            ),
-            AgentError,
-        >,
-    > {
-        let registry = self.async_registry.clone();
-        Box::pin(async move {
-            let registry = registry.ok_or_else(|| {
-                AgentError::Internal("async delivery not enabled on spawner".into())
-            })?;
-            let agent_id = meta.agent_id.clone();
-            let (handle, _session_id) = self.spawn_inner(opts, Some(meta), true).await?;
-            Ok(registry.track(handle, agent_id, deliver_to_channel))
-        })
-    }
-}
-
-impl SubAgentSpawner for HarnessSubAgentSpawner {
-    fn spawn(&self, opts: SpawnOptions) -> BoxFuture<'_, Result<SubAgentHandle, AgentError>> {
-        Box::pin(async move {
-            let (handle, _session_id) = self.spawn_inner(opts, None, false).await?;
-            Ok(handle)
+            // Atomically acquire an in-flight slot before spawning to close
+            // the TOCTOU window: concurrent spawn_async calls (parallel tool
+            // execution) would each pass the old check-then-act test.
+            // Always acquire so that track_with_oneshot's fetch_sub is balanced.
+            match max_concurrent {
+                Some(max) => {
+                    if !bus.try_acquire_slot(max) {
+                        return Err(AgentError::ResourceLimitExceeded(format!(
+                            "concurrent sub-agent limit reached ({max} in-flight)"
+                        )));
+                    }
+                }
+                None => bus.acquire_slot(),
+            }
+            let (handle, session_id) = match self.spawn_inner(opts).await {
+                Ok(v) => v,
+                Err(e) => {
+                    bus.release_slot();
+                    return Err(e);
+                }
+            };
+            let async_handle = bus.track_with_oneshot(handle, session_id);
+            Ok(async_handle.agent_id().to_string())
         })
     }
 }
@@ -538,7 +504,8 @@ impl SessionFactory for JsonlSessionFactory {
         let session_dir = base_dir.join("sub-agents");
         let model = model.to_string();
         Box::pin(async move {
-            std::fs::create_dir_all(&session_dir)
+            tokio::fs::create_dir_all(&session_dir)
+                .await
                 .map_err(|e| AgentError::Internal(format!("failed to create session dir: {e}")))?;
             let repo = JsonlSessionRepo::new(&session_dir);
             let storage = repo
@@ -567,9 +534,8 @@ impl SessionFactory for JsonlSessionFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spawn::async_spawn::async_spawn_pair;
-    use crate::spawn::peer::{PeerDirectory, PeerMetadata};
-    use std::sync::Mutex;
+    use crate::spawn::message_bus::message_bus_pair;
+    use parking_lot::Mutex;
 
     use llm_harness_agent::session::repo::InMemorySessionRepo;
     use llm_harness_agent::session::types::CreateSessionOptions;
@@ -592,7 +558,7 @@ mod tests {
         }
 
         fn model(&self) -> Option<String> {
-            self.captured_model.lock().unwrap().clone()
+            self.captured_model.lock().clone()
         }
     }
 
@@ -602,7 +568,7 @@ mod tests {
             _base_dir: &Path,
             model: &str,
         ) -> BoxFuture<'_, Result<SessionCreateResult, AgentError>> {
-            *self.captured_model.lock().unwrap() = Some(model.to_string());
+            *self.captured_model.lock() = Some(model.to_string());
             let model = model.to_string();
             Box::pin(async move {
                 let repo = InMemorySessionRepo::new();
@@ -703,6 +669,7 @@ mod tests {
     fn make_spawner(
         client: Arc<dyn LlmClient>,
         model: &str,
+        bus: Arc<MessageBus>,
     ) -> (
         HarnessSubAgentSpawner,
         Arc<CaptureModelSessionFactory>,
@@ -714,6 +681,7 @@ mod tests {
             model.to_string(),
             client.clone(),
             dir.path().to_path_buf(),
+            bus,
             |_, _, _| Box::new(NoopPlugin),
         )
         .env_factory(Arc::new(NoopEnvFactory))
@@ -721,14 +689,17 @@ mod tests {
         (spawner, factory, client)
     }
 
-    /// Like `make_spawner` but uses `EchoPlugin` (registers an `echo` tool)
-    /// instead of `NoopPlugin`.
-    fn make_spawner_with_echo(client: Arc<dyn LlmClient>, model: &str) -> HarnessSubAgentSpawner {
+    fn make_spawner_with_echo(
+        client: Arc<dyn LlmClient>,
+        model: &str,
+        bus: Arc<MessageBus>,
+    ) -> HarnessSubAgentSpawner {
         let dir = tempfile::tempdir().unwrap();
         HarnessSubAgentSpawner::new(
             model.to_string(),
             client,
             dir.path().to_path_buf(),
+            bus,
             |_, _, _| Box::new(EchoPlugin),
         )
         .env_factory(Arc::new(NoopEnvFactory))
@@ -742,11 +713,12 @@ mod tests {
     async fn known_alias_uses_correct_client_and_model() {
         let default_client = Arc::new(MockLlmClient::new(vec![]));
         let fast_client = Arc::new(MockLlmClient::new(vec![]));
-        let (spawner, factory, _client) = make_spawner(default_client, "default-model");
+        let bus = message_bus_pair();
+        let (spawner, factory, _client) = make_spawner(default_client, "default-model", bus);
         let spawner = spawner.alias("fast", fast_client, "fast-model");
 
-        let _handle = spawner
-            .spawn(SpawnOptions {
+        let (_handle, _session_id) = spawner
+            .spawn_inner(SpawnOptions {
                 prompt: "hello".into(),
                 provider: ProviderSelection::Alias("fast".into()),
                 cwd: None,
@@ -757,15 +729,15 @@ mod tests {
 
         assert_eq!(factory.model(), Some("fast-model".into()));
     }
-
     /// 未知 alias → AgentError。
     #[tokio::test]
     async fn unknown_alias_returns_error() {
         let client = Arc::new(MockLlmClient::new(vec![]));
-        let (spawner, _factory, _client) = make_spawner(client, "default-model");
+        let bus = message_bus_pair();
+        let (spawner, _factory, _client) = make_spawner(client, "default-model", bus);
 
         let err = spawner
-            .spawn(SpawnOptions {
+            .spawn_inner(SpawnOptions {
                 prompt: "hello".into(),
                 provider: ProviderSelection::Alias("does-not-exist".into()),
                 cwd: None,
@@ -779,15 +751,15 @@ mod tests {
             "error should mention unknown alias: {err}"
         );
     }
-
     /// ProviderSelection::Inherit → 使用 default。
     #[tokio::test]
     async fn inherit_uses_default_model() {
         let client = Arc::new(MockLlmClient::new(vec![]));
-        let (spawner, factory, _client) = make_spawner(client, "default-model");
+        let bus = message_bus_pair();
+        let (spawner, factory, _client) = make_spawner(client, "default-model", bus);
 
-        let _handle = spawner
-            .spawn(SpawnOptions {
+        let (_handle, _session_id) = spawner
+            .spawn_inner(SpawnOptions {
                 prompt: "hello".into(),
                 provider: ProviderSelection::Inherit,
                 cwd: None,
@@ -798,17 +770,17 @@ mod tests {
 
         assert_eq!(factory.model(), Some("default-model".into()));
     }
-
     /// ContextMode::Inject(text) → prompt 前缀正确。
     #[tokio::test]
     async fn context_injection_prefixes_prompt() {
         let mock = MockResponse::text("response from sub-agent");
         let client = Arc::new(MockLlmClient::new(vec![mock]));
         let client_clone = client.clone();
-        let (spawner, _factory, _) = make_spawner(client, "default-model");
+        let bus = message_bus_pair();
+        let (spawner, _factory, _) = make_spawner(client, "default-model", bus);
 
-        let handle = spawner
-            .spawn(SpawnOptions {
+        let (handle, _session_id) = spawner
+            .spawn_inner(SpawnOptions {
                 prompt: "my task".into(),
                 provider: ProviderSelection::Inherit,
                 cwd: None,
@@ -852,7 +824,6 @@ mod tests {
             "user message should contain context prefix, got: {user_text:?}"
         );
     }
-
     /// 多轮场景：第一轮 tool_use（产生 Progress 消息 + 工具调用），
     /// 第二轮 text（产生 FinalAnswer 消息）。
     /// 验证 final_answer 只取 FinalAnswer 消息的文本，不混入 Progress 文本。
@@ -863,10 +834,11 @@ mod tests {
             MockResponse::text("the real answer"),
         ];
         let client = Arc::new(MockLlmClient::new(responses));
-        let spawner = make_spawner_with_echo(client, "mock-model");
+        let bus = message_bus_pair();
+        let spawner = make_spawner_with_echo(client, "mock-model", bus);
 
-        let handle = spawner
-            .spawn(SpawnOptions {
+        let (handle, _session_id) = spawner
+            .spawn_inner(SpawnOptions {
                 prompt: "do the thing".into(),
                 provider: ProviderSelection::Inherit,
                 cwd: None,
@@ -879,7 +851,6 @@ mod tests {
         assert_eq!(result.final_answer, "the real answer");
         assert_eq!(result.tool_calls_count, 1);
     }
-
     /// 无 FinalAnswer 退化路径：stream 直接报错（RateLimit 不可 retry，
     /// spawner 默认 retry=None → max_retries=0），loop emit Error 退出，
     /// 全程无 FinalAnswer 消息也无 TextDelta。
@@ -887,10 +858,11 @@ mod tests {
     #[tokio::test]
     async fn final_answer_falls_back_to_empty_when_no_final_answer() {
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::rate_limit_error()]));
-        let (spawner, _factory, _) = make_spawner(client, "mock-model");
+        let bus = message_bus_pair();
+        let (spawner, _factory, _) = make_spawner(client, "mock-model", bus);
 
-        let handle = spawner
-            .spawn(SpawnOptions {
+        let (handle, _session_id) = spawner
+            .spawn_inner(SpawnOptions {
                 prompt: "do the thing".into(),
                 provider: ProviderSelection::Inherit,
                 cwd: None,
@@ -903,25 +875,29 @@ mod tests {
         // 无 FinalAnswer 且无 TextDelta → 兜底为空字符串。
         assert_eq!(result.final_answer, "");
     }
-    // ── Peer / Async spawn tests (Task 9) ───────────────────────────────────────
+
+    // ── Async spawn tests ───────────────────────────────────────────────────
 
     /// 建一个可工作的 spawner：真实 SessionFactory + EnvFactory + NoopPlugin。
     /// MockLlmClient 给一条 "ok" 文本响应，sub-agent 一轮即停。
-    fn make_peer_test_spawner() -> HarnessSubAgentSpawner {
+    fn make_async_test_spawner(bus: Arc<MessageBus>) -> HarnessSubAgentSpawner {
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
         let dir = tempfile::tempdir().unwrap();
-        HarnessSubAgentSpawner::new("test-model", client, dir.path().to_path_buf(), |_, _, _| {
-            Box::new(NoopPlugin)
-        })
+        HarnessSubAgentSpawner::new(
+            "test-model",
+            client,
+            dir.path().to_path_buf(),
+            bus,
+            |_, _, _| Box::new(NoopPlugin),
+        )
         .env_factory(Arc::new(NoopEnvFactory))
         .session_factory(Arc::new(CaptureModelSessionFactory::new()))
     }
 
     #[tokio::test]
-    async fn spawn_async_returns_handle_and_tracks_in_flight() {
-        let spawner = make_peer_test_spawner();
-        let (registry, _hook) = async_spawn_pair();
-        let spawner = spawner.enable_async_delivery(registry.clone());
+    async fn spawn_async_returns_agent_id_and_tracks_in_flight() {
+        let bus = message_bus_pair();
+        let spawner = make_async_test_spawner(bus.clone());
 
         let opts = SpawnOptions {
             prompt: "say hi".into(),
@@ -929,143 +905,134 @@ mod tests {
             cwd: None,
             context: ContextMode::None,
         };
-        let (handle, _sync_rx) = spawner
-            .spawn_async(opts, true)
+        let agent_id = spawner
+            .spawn_async(opts)
             .await
             .expect("spawn_async should succeed");
-        assert!(!handle.agent_id().is_empty());
+        assert!(!agent_id.is_empty());
         // 等 track task 完成（sub-agent 跑完 "say hi"）
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(registry.in_flight_count(), 0);
+        assert_eq!(bus.in_flight_count(), 0);
     }
 
+    /// max_concurrent enforces a hard limit: when the limit is 0, spawn_async
+    /// returns ResourceLimitExceeded immediately.
     #[tokio::test]
-    async fn spawn_with_peer_registers_in_directory() {
-        let spawner = make_peer_test_spawner();
-        let dir = Arc::new(PeerDirectory::new());
-        let spawner = spawner.enable_peer_communication(dir.clone());
-
+    async fn max_concurrent_zero_rejects_spawn() {
+        let bus = message_bus_pair();
+        let spawner = make_async_test_spawner(bus.clone()).max_concurrent(Some(0));
         let opts = SpawnOptions {
-            prompt: "hi".into(),
+            prompt: "say hi".into(),
             provider: ProviderSelection::Inherit,
             cwd: None,
             context: ContextMode::None,
         };
-        let meta = PeerMetadata {
-            agent_id: "test-peer".into(),
-            capabilities: vec!["test".into()],
-            description: "test".into(),
-        };
-        let handle = spawner
-            .spawn_with_peer(opts, meta)
+        let err = spawner
+            .spawn_async(opts)
             .await
-            .expect("spawn_with_peer should succeed");
-        // peer 注册期间在通讯录里
-        assert!(
-            dir.list_peers().iter().any(|p| p.agent_id == "test-peer"),
-            "peer should be registered while sub-agent is running"
-        );
-        // join 等 sub-agent 完成
-        let _result = handle.join().await.expect("sub-agent should complete");
-        // 完成后 unregister
-        assert!(
-            !dir.list_peers().iter().any(|p| p.agent_id == "test-peer"),
-            "peer should be unregistered after sub-agent completes"
-        );
+            .expect_err("should reject with limit 0");
+        assert!(matches!(err, AgentError::ResourceLimitExceeded(_)));
+        assert_eq!(bus.in_flight_count(), 0);
     }
 
+    /// max_concurrent with a failing spawn_inner: in_flight must be released
+    /// on the error path so the counter doesn't drift.
     #[tokio::test]
-    async fn spawn_async_with_peer_tracks_and_registers() {
-        let spawner = make_peer_test_spawner();
-        let dir = Arc::new(PeerDirectory::new());
-        let (registry, _hook) = async_spawn_pair();
-        let spawner = spawner
-            .enable_peer_communication(dir.clone())
-            .enable_async_delivery(registry.clone());
-
-        let opts = SpawnOptions {
-            prompt: "hi".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
-        };
-        let meta = PeerMetadata {
-            agent_id: "async-peer".into(),
-            capabilities: vec![],
-            description: "".into(),
-        };
-        let (handle, _sync_rx) = spawner
-            .spawn_async_with_peer(opts, meta, true)
-            .await
-            .expect("spawn_async_with_peer should succeed");
-        assert_eq!(handle.agent_id(), "async-peer");
-        assert!(
-            dir.list_peers().iter().any(|p| p.agent_id == "async-peer"),
-            "peer should be registered while sub-agent is running"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(
-            !dir.list_peers().iter().any(|p| p.agent_id == "async-peer"),
-            "peer should be unregistered after sub-agent completes"
-        );
-        assert_eq!(registry.in_flight_count(), 0);
-    }
-    /// peer 模式下 plugin factory 收到 `Some(rx)`，非 peer 模式收到 `None`。
-    /// 验证 `SharedPeerRx` 被正确传递给 plugin，使其能注册 `WaitForPeerMessageTool`。
-    #[tokio::test]
-    async fn plugin_factory_receives_peer_rx_in_peer_mode() {
-        use std::sync::Mutex as StdMutex;
-
+    async fn max_concurrent_releases_slot_on_spawn_failure() {
+        let bus = message_bus_pair();
+        // NoOpSessionFactory → spawn_inner fails at session creation.
+        let client = Arc::new(MockLlmClient::new(vec![]));
         let dir = tempfile::tempdir().unwrap();
-        // 捕获 plugin factory 收到的 `peer_rx` 是 `Some` 还是 `None`。
-        let captured: Arc<StdMutex<Vec<bool>>> = Arc::new(StdMutex::new(vec![]));
-        let captured_clone = captured.clone();
-        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
         let spawner = HarnessSubAgentSpawner::new(
             "test-model",
             client,
             dir.path().to_path_buf(),
-            move |_cwd, peer_rx, _agent_id| {
-                captured_clone.lock().unwrap().push(peer_rx.is_some());
-                Box::new(NoopPlugin)
-            },
+            bus.clone(),
+            |_, _, _| Box::new(NoopPlugin),
         )
         .env_factory(Arc::new(NoopEnvFactory))
-        .session_factory(Arc::new(CaptureModelSessionFactory::new()));
+        .max_concurrent(Some(3));
 
-        // 非 peer 模式：factory 收到 None
         let opts = SpawnOptions {
-            prompt: "hi".into(),
+            prompt: "say hi".into(),
             provider: ProviderSelection::Inherit,
             cwd: None,
             context: ContextMode::None,
         };
-        let _ = spawner.spawn(opts).await.unwrap();
-        assert_eq!(
-            captured.lock().unwrap().as_slice(),
-            &[false],
-            "non-peer spawn should pass None to plugin factory"
-        );
+        let _err = spawner
+            .spawn_async(opts)
+            .await
+            .expect_err("should fail (NoOpSessionFactory)");
+        // Slot must have been released.
+        assert_eq!(bus.in_flight_count(), 0);
 
-        // peer 模式：factory 收到 Some(rx)
-        let peer_dir = Arc::new(PeerDirectory::new());
-        let spawner = spawner.enable_peer_communication(peer_dir.clone());
-        let opts = SpawnOptions {
-            prompt: "hi".into(),
+        // After a failure, a subsequent spawn should still be allowed (slot was released).
+        let spawner2 = make_async_test_spawner(bus.clone()).max_concurrent(Some(3));
+        let opts2 = SpawnOptions {
+            prompt: "say hi".into(),
             provider: ProviderSelection::Inherit,
             cwd: None,
             context: ContextMode::None,
         };
-        let meta = PeerMetadata {
-            agent_id: "rx-peer".into(),
-            capabilities: vec![],
-            description: "".into(),
+        let _id = spawner2
+            .spawn_async(opts2)
+            .await
+            .expect("should succeed after failure released the slot");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(bus.in_flight_count(), 0);
+    }
+
+    /// max_concurrent with successful spawn: in_flight must return to 0
+    /// after the sub-agent completes (verifies no double-increment).
+    #[tokio::test]
+    async fn max_concurrent_balanced_after_successful_spawn() {
+        let bus = message_bus_pair();
+        let spawner = make_async_test_spawner(bus.clone()).max_concurrent(Some(5));
+        let opts = SpawnOptions {
+            prompt: "say hi".into(),
+            provider: ProviderSelection::Inherit,
+            cwd: None,
+            context: ContextMode::None,
         };
-        let _ = spawner.spawn_with_peer(opts, meta).await.unwrap();
+        let _id = spawner.spawn_async(opts).await.expect("should succeed");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(
-            captured.lock().unwrap().as_slice(),
-            &[false, true],
-            "peer-mode spawn should pass Some(rx) to plugin factory"
+            bus.in_flight_count(),
+            0,
+            "in_flight must be 0 after completion"
         );
+    }
+
+    // ── Arc<AgentHarness> shared across tokio tasks ────────────────────────────
+
+    /// `AgentHarness` is `Send + Sync`: wrapping it in `Arc` and sharing one
+    /// clone across a `tokio::spawn` boundary while another clone is held
+    /// externally (the shape `MessageBus::AgentEntry` will need) compiles and
+    /// runs. All harness methods take `&self`, so `Arc<AgentHarness>` works
+    /// directly for `subscribe()` / `steer()` without `Arc::try_unwrap`.
+    #[tokio::test]
+    async fn arc_harness_can_be_shared_across_tasks() {
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
+        let env: Arc<dyn ExecutionEnv> = Arc::new(llm_harness_loop::test_utils::NoOpEnv);
+        let harness = Arc::new(
+            HarnessBuilder::new("test-model")
+                .provider("test-model", client)
+                .build(env)
+                .await
+                .expect("build harness"),
+        );
+
+        // Clone for task — Arc<AgentHarness> moves into tokio::spawn.
+        let harness_for_task = harness.clone();
+        let handle = tokio::spawn(async move {
+            let _rx = harness_for_task.subscribe();
+            harness_for_task.steer("from-task");
+        });
+
+        // Original Arc still usable — AgentEntry would hold this clone.
+        let _rx = harness.subscribe();
+        harness.steer("from-main");
+
+        handle.await.expect("spawned task should complete");
     }
 }

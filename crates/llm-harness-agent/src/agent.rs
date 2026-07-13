@@ -284,7 +284,7 @@ impl Agent {
 
     /// Enqueue a text message as a steer (injected between turns of a running loop).
     pub fn steer(&self, text: impl Into<String>) {
-        self.steer_message(AgentMessage::User(UserMessage {
+        let _ = self.steer_message(AgentMessage::User(UserMessage {
             content: vec![ContentBlock::Text { text: text.into() }],
             timestamp: chrono::Utc::now(),
         }));
@@ -299,9 +299,14 @@ impl Agent {
     }
 
     /// Enqueue a full message as a steer.
-    pub fn steer_message(&self, msg: AgentMessage) {
+    ///
+    /// Returns `Err` if the steer channel is full or closed.
+    pub fn steer_message(&self, msg: AgentMessage) -> Result<(), ChannelError> {
         let inner = self.inner.lock().unwrap();
-        let _ = inner.steer_tx.try_send(msg);
+        inner.steer_tx.try_send(msg).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => ChannelError::Full,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => ChannelError::Closed,
+        })
     }
 
     /// Enqueue a full message as a follow-up.
@@ -639,12 +644,14 @@ mod tests {
         let agent = make_agent(vec![MockResponse::text("response")]);
 
         // Enqueue a steer message while Idle, then drain it.
-        agent.steer_message(AgentMessage::User(UserMessage {
-            content: vec![ContentBlock::Text {
-                text: "ignored message".into(),
-            }],
-            timestamp: chrono::Utc::now(),
-        }));
+        agent
+            .steer_message(AgentMessage::User(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "ignored message".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            }))
+            .unwrap();
         assert!(
             agent.has_queued_messages(),
             "steer message must be enqueued"

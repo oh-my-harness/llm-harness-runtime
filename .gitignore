@@ -10,3 +10,4 @@ docs/superpowers/
 docs/issues
 .venv
 __pycache__
+.superpowers/

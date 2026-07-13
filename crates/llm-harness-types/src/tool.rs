@@ -43,31 +43,32 @@ pub enum ToolLevel {
 /// 必须引用这些常量，避免多处硬编码字符串不一致。
 pub const FINAL_ANSWER_TOOL_NAME: &str = "final_answer";
 pub const WAIT_FOR_EXTERNAL_EVENT_TOOL_NAME: &str = "wait_for_external_event";
-pub const WAIT_FOR_PEER_MESSAGE_TOOL_NAME: &str = "wait_for_peer_message";
-pub const SEND_TO_PEER_TOOL_NAME: &str = "send_to_peer";
-pub const LIST_PEERS_TOOL_NAME: &str = "list_peers";
 pub const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
-pub const SYNC_SPAWN_TOOL_NAME: &str = "sync_spawn_agent";
 pub const SUBMIT_STEP_RESULT_TOOL_NAME: &str = "submit_step_result";
 pub const SUBMIT_WORKFLOW_TOOL_NAME: &str = "submit_workflow";
 pub const SKILL_READ_TOOL_NAME: &str = "skill_read";
 
-/// 所有框架内置 tool 的名字列表。
-///
-/// 新增内置 tool 时**必须**在此登记（用上面的常量），并在该 tool 的
-/// `impl Tool` 旁调用 [`assert_builtin_registered!`] 宏做编译期校验。
-/// 列表内的重复名字会在编译期触发 panic（const 断言），从而编译失败。
+// Main↔subagent communication tools
+pub const MESSAGE_SUBAGENT_TOOL_NAME: &str = "message_subagent";
+pub const AWAIT_SUBAGENT_REPLY_TOOL_NAME: &str = "await_subagent_reply";
+pub const QUERY_SUBAGENT_TOOL_NAME: &str = "query_subagent";
+pub const ABORT_SUBAGENT_TOOL_NAME: &str = "abort_subagent";
+pub const MESSAGE_MAIN_TOOL_NAME: &str = "message_main";
+pub const AWAIT_MAIN_MESSAGE_TOOL_NAME: &str = "await_main_message";
+
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     FINAL_ANSWER_TOOL_NAME,
     WAIT_FOR_EXTERNAL_EVENT_TOOL_NAME,
-    WAIT_FOR_PEER_MESSAGE_TOOL_NAME,
-    SEND_TO_PEER_TOOL_NAME,
-    LIST_PEERS_TOOL_NAME,
     SPAWN_AGENT_TOOL_NAME,
-    SYNC_SPAWN_TOOL_NAME,
     SUBMIT_STEP_RESULT_TOOL_NAME,
     SUBMIT_WORKFLOW_TOOL_NAME,
     SKILL_READ_TOOL_NAME,
+    MESSAGE_SUBAGENT_TOOL_NAME,
+    AWAIT_SUBAGENT_REPLY_TOOL_NAME,
+    QUERY_SUBAGENT_TOOL_NAME,
+    ABORT_SUBAGENT_TOOL_NAME,
+    MESSAGE_MAIN_TOOL_NAME,
+    AWAIT_MAIN_MESSAGE_TOOL_NAME,
 ];
 
 /// 编译期断言：`BUILTIN_TOOL_NAMES` 内无重复项。重复则编译失败。

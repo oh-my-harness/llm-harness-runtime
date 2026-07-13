@@ -82,6 +82,8 @@ pub enum AgentError {
     NotIdle,
     #[error("internal: {0}")]
     Internal(String),
+    #[error("resource limit exceeded: {0}")]
+    ResourceLimitExceeded(String),
 }
 
 // ── EnvError ──────────────────────────────────────────────────────────────────
@@ -191,6 +193,14 @@ pub enum HarnessError {
     Env(#[from] EnvError),
     #[error(transparent)]
     Template(#[from] TemplateError),
+}
+/// 消息通道错误（steer / event channel 满 or 关闭）。
+#[derive(thiserror::Error, Debug, Clone, Copy)]
+pub enum ChannelError {
+    #[error("channel full")]
+    Full,
+    #[error("channel closed")]
+    Closed,
 }
 
 #[cfg(test)]

@@ -5,15 +5,12 @@ use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use crate::spawn::sub_agent::{
-    ContextMode, ProviderSelection, SpawnOptions, SubAgentResult, SubAgentSpawner,
-};
 use futures::future::BoxFuture;
 use llm_harness_agent::{AgentHarnessEvent, HarnessHooks, Plugin, Session};
 use llm_harness_loop::LlmClient;
 use llm_harness_types::{
-    AgentError, AgentEvent, AssistantMessageKind, ContentBlock, SUBMIT_STEP_RESULT_TOOL_NAME,
-    SYNC_SPAWN_TOOL_NAME, Tool, ToolContext, ToolError, ToolExecutionMode, ToolLevel, ToolResult,
+    AgentEvent, AssistantMessageKind, ContentBlock, SPAWN_AGENT_TOOL_NAME,
+    SUBMIT_STEP_RESULT_TOOL_NAME, Tool, ToolContext, ToolError, ToolLevel, ToolResult,
 };
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -50,9 +47,6 @@ const DEFAULT_MAX_RETRIES: usize = 5;
 /// SubmitStepResultTool 提交的 JSON payload 大小上限（bytes）。
 const SUBMIT_RESULT_MAX_BYTES: usize = 256 * 1024;
 
-/// SyncSpawnAgentTool prompt 长度上限（bytes）。
-const SYNC_SPAWN_MAX_PROMPT_BYTES: usize = 1024 * 1024;
-
 fn default_declarative_judge(
     workflow: &Workflow,
     judge: Arc<dyn StepTransitionJudge>,
@@ -66,160 +60,6 @@ fn default_declarative_judge(
     } else {
         judge
     }
-}
-
-// ── SyncSpawnAgentTool ─────────────────────────────────────────────────────
-
-/// 流程场景专用的同步 spawn tool。走 `spawner.spawn()`（非 `spawn_async`）。
-///
-/// cancel 传播（方案 A：tool 内 `select!`）：
-/// `step_abort.cancelled()` → `handle.abort()` → 返回 `Err(ToolError::Aborted)`。
-///
-/// schema 不含 `wait`；传 `wait` 任意值被忽略。
-pub(crate) struct SyncSpawnAgentTool {
-    spawner: Arc<HarnessSubAgentSpawner>,
-    /// step 级 abort token。引擎构造 tool 时注入，与注入到 step harness 的 abort token 同一个 clone。
-    step_abort: CancellationToken,
-}
-
-impl SyncSpawnAgentTool {
-    pub fn new(spawner: Arc<HarnessSubAgentSpawner>, step_abort: CancellationToken) -> Self {
-        Self {
-            spawner,
-            step_abort,
-        }
-    }
-}
-
-fn sync_spawn_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "prompt": { "type": "string", "description": "给 sub-agent 的任务指令" },
-            "agent_id": { "type": "string", "description": "sub-agent 标识 ID" },
-            "context": { "type": "string", "description": "附加上下文" },
-            "provider": { "type": "string", "description": "provider 别名" }
-        },
-        "required": ["prompt"]
-    })
-}
-
-impl Tool for SyncSpawnAgentTool {
-    fn name(&self) -> &str {
-        SYNC_SPAWN_TOOL_NAME
-    }
-
-    fn level(&self) -> ToolLevel {
-        ToolLevel::BuiltIn
-    }
-
-    fn description(&self) -> &str {
-        "派发一个 sub-agent 处理子任务，同步等待结果。结果作为 tool 结果返回。"
-    }
-
-    fn parameters_schema(&self) -> &'static serde_json::Value {
-        static SYNC_SPAWN_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(sync_spawn_schema);
-        &SYNC_SPAWN_SCHEMA
-    }
-
-    fn execution_mode(&self) -> ToolExecutionMode {
-        ToolExecutionMode::Parallel
-    }
-
-    fn execute<'a>(
-        &'a self,
-        args: Value,
-        _ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolError>> {
-        Box::pin(async move {
-            let prompt = args
-                .get("prompt")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ToolError::Execution("missing prompt".into()))?
-                .to_string();
-            if prompt.len() > SYNC_SPAWN_MAX_PROMPT_BYTES {
-                return Err(ToolError::Execution(format!(
-                    "{SYNC_SPAWN_TOOL_NAME}: prompt exceeds {} bytes",
-                    SYNC_SPAWN_MAX_PROMPT_BYTES
-                )));
-            }
-            let context = args
-                .get("context")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| ContextMode::Inject(s.to_string()))
-                .unwrap_or(ContextMode::None);
-            let provider = args
-                .get("provider")
-                .and_then(|v| v.as_str())
-                .map(|s| ProviderSelection::Alias(s.to_string()))
-                .unwrap_or(ProviderSelection::Inherit);
-            // wait 参数被忽略（schema 不含，但 LLM 可能传）
-            let opts = SpawnOptions {
-                prompt,
-                provider,
-                cwd: None,
-                context,
-            };
-            // spawn 前检查 abort：若已 cancelled 则不浪费 spawn。
-            if self.step_abort.is_cancelled() {
-                return Err(ToolError::Aborted);
-            }
-            let handle = self
-                .spawner
-                .spawn(opts)
-                .await
-                .map_err(|e| ToolError::Execution(e.to_string()))?;
-            // 取出 abort token：select! 的 cancel arm 不持 handle 所有权。
-            let abort_token = handle.abort_token();
-
-            // select!：正常 join / step abort
-            tokio::select! {
-                biased;
-                _ = self.step_abort.cancelled() => {
-                    abort_token.cancel();
-                    Err(ToolError::Aborted)
-                }
-                result = handle.join() => {
-                    match result {
-                        Ok(r) => Ok(ToolResult {
-                            content: vec![ContentBlock::Text { text: format_sub_agent_result(&r) }],
-                            details: serde_json::json!({ "agent_id": r.session_id, "is_error": false }),
-                            terminate: false,
-                        }),
-                        Err(e) => Ok(ToolResult {
-                            content: vec![ContentBlock::Text { text: format_sub_agent_failure(&e) }],
-                            details: serde_json::json!({ "agent_id": "unknown", "is_error": true }),
-                            terminate: false,
-                        }),
-                    }
-                }
-            }
-        })
-    }
-}
-
-llm_harness_types::assert_builtin_registered!(SyncSpawnAgentTool => SYNC_SPAWN_TOOL_NAME);
-
-/// 格式化 sub-agent 成功结果。
-fn format_sub_agent_result(r: &SubAgentResult) -> String {
-    let answer = &r.final_answer;
-    let preview = if answer.len() > 200 {
-        // char 边界安全截取，避免 panic。
-        let mut end = 200;
-        while !answer.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &answer[..end])
-    } else {
-        answer.clone()
-    };
-    format!("[Sub-agent completed]\n{preview}")
-}
-
-/// 格式化 sub-agent 失败。
-fn format_sub_agent_failure(e: &AgentError) -> String {
-    format!("[Sub-agent failed]\n{e}")
 }
 
 // ── WorkflowEngineConfig ───────────────────────────────────────────────────
@@ -1221,7 +1061,7 @@ impl WorkflowEngine {
             builder = builder.install(plugin.as_ref());
         }
 
-        // d. 注册 extra tools + SyncSpawnAgentTool（若该步允许）+ SubmitStepResultTool。
+        // d. 注册 extra tools + 异步 spawn tool 组（若该步允许）+ SubmitStepResultTool。
         //    收集所有注入的 tool 名（extra_tools + submit_step_result），
         //    传给 gate 让其不被过滤。
         let mut injected_tool_names: HashSet<String> = HashSet::new();
@@ -1229,14 +1069,55 @@ impl WorkflowEngine {
             injected_tool_names.insert(tool.name().to_string());
             builder = builder.tool(tool.clone());
         }
-        if allowed_tools.iter().any(|t| t == SYNC_SPAWN_TOOL_NAME) {
-            let spawner = self.build_step_spawner();
-            let sync_tool = Arc::new(SyncSpawnAgentTool::new(
-                Arc::new(spawner),
-                step_abort.clone(),
-            ));
-            builder = builder.tool(sync_tool);
-        }
+        let post_build_spawn_setup: Option<(
+            Arc<crate::spawn::delivery::AsyncSpawnHook>,
+            Arc<crate::spawn::message_bus::MessageBus>,
+        )> = if allowed_tools.iter().any(|t| t == SPAWN_AGENT_TOOL_NAME) {
+            let bus = crate::spawn::message_bus::message_bus_pair();
+            let async_hook = crate::spawn::delivery::async_spawn_pair(bus.clone());
+            let spawner = Arc::new(self.build_step_spawner(bus.clone()));
+            // Register the main agent on the bus. The main_id must match
+            // what MessageMainTool / AwaitSubagentReplyTool use.
+            bus.register(
+                crate::spawn::message_bus::MAIN_AGENT_ID,
+                crate::spawn::message_bus::AgentEntry {
+                    status: crate::spawn::message_bus::AgentStatus::Running,
+                    harness: None,
+                    is_main: true,
+                },
+            );
+            injected_tool_names.insert(SPAWN_AGENT_TOOL_NAME.to_string());
+            injected_tool_names.insert(llm_harness_types::MESSAGE_SUBAGENT_TOOL_NAME.to_string());
+            injected_tool_names
+                .insert(llm_harness_types::AWAIT_SUBAGENT_REPLY_TOOL_NAME.to_string());
+            injected_tool_names.insert(llm_harness_types::ABORT_SUBAGENT_TOOL_NAME.to_string());
+            builder = builder.tool(Arc::new(crate::spawn::tools::SpawnAgentTool::new(spawner)));
+            builder = builder.tool(Arc::new(crate::spawn::tools::MessageSubagentTool::new(
+                bus.clone(),
+                crate::spawn::message_bus::MAIN_AGENT_ID,
+            )));
+            builder = builder.tool(Arc::new(crate::spawn::tools::AwaitSubagentReplyTool::new(
+                bus.clone(),
+                crate::spawn::message_bus::MAIN_AGENT_ID,
+            )));
+            builder = builder.tool(Arc::new(crate::spawn::tools::QuerySubagentTool::new(
+                bus.clone(),
+            )));
+            builder = builder.tool(Arc::new(crate::spawn::tools::AbortSubagentTool::new(
+                bus.clone(),
+            )));
+            builder = builder.should_stop_hook(async_hook.clone());
+            // AsyncSpawnHook 注入 CustomMessage{type:"sub_agent_message"}，
+            // 需注册 converter 否则 agent loop 报错。
+            builder = builder.convert_to_llm(Some(Arc::new(
+                llm_harness_loop::convert::DefaultConvertToLlm::new().with_custom_converter(
+                    Arc::new(crate::spawn::delivery::SubAgentMessageConverter),
+                ),
+            )));
+            Some((async_hook, bus))
+        } else {
+            None
+        };
         // 每步注入 SubmitStepResultTool，让 step agent 能提交结构化结果。
         let (submit_tool, structured_rx) = SubmitStepResultTool::new();
         injected_tool_names.insert(SUBMIT_STEP_RESULT_TOOL_NAME.to_string());
@@ -1269,6 +1150,22 @@ impl WorkflowEngine {
                 .map_err(|e: HarnessBuildError| anyhow::anyhow!("build harness: {e}"))?,
         );
         harness.set_abort_token(step_abort.clone());
+        if let Some((async_hook, bus)) = post_build_spawn_setup {
+            let watcher = crate::spawn::delivery::IdleWatcher::new(bus.clone(), {
+                let h = Arc::downgrade(&harness);
+                Arc::new(move || {
+                    let h = h.clone();
+                    Box::pin(async move {
+                        if let Some(h) = h.upgrade() {
+                            let _ = h.continue_run().await;
+                        }
+                    })
+                })
+            });
+            harness.set_idle_watcher(Arc::new(watcher));
+            harness.set_async_spawn_hook(async_hook);
+            harness.set_abort_cascade_hook(bus);
+        }
 
         // g. step 指令。步骤间上下文注入：在 step.prompt 前拼接 step_history 摘要。
         //    若共享 context 非空，也注入 KV 摘要，让 LLM step 能读到上游 executor 写入的变量。
@@ -1397,15 +1294,20 @@ impl WorkflowEngine {
     }
 
     /// 构造 step 内部 fan-out 用的 spawner（局部对象，step 结束丢弃）。
-    fn build_step_spawner(&self) -> HarnessSubAgentSpawner {
+    fn build_step_spawner(
+        &self,
+        bus: Arc<crate::spawn::message_bus::MessageBus>,
+    ) -> HarnessSubAgentSpawner {
         HarnessSubAgentSpawner::new(
             self.config.model.clone(),
             self.config.client.clone(),
             self.config.session_base_dir.clone(),
-            |_cwd, _peer_rx, _agent_id| Box::new(NoopPlugin),
+            bus,
+            |_cwd, _bus, _agent_id| Box::new(NoopPlugin),
         )
         .env_factory(self.config.env_factory.clone())
         .session_factory(self.config.session_factory.clone())
+        .max_tokens(self.max_tokens)
     }
 
     /// 持久化 WorkflowState（若有 task_store）。
@@ -1769,140 +1671,11 @@ impl Plugin for HookPlugin {
 }
 
 #[cfg(test)]
-mod sync_tool_tests {
-    use super::*;
-    use crate::spawn::spawner::JsonlSessionFactory;
-    use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
-    use llm_harness_types::ExecutionEnv;
-
-    struct NoopPlugin;
-    impl llm_harness_agent::Plugin for NoopPlugin {
-        fn name(&self) -> &str {
-            "noop"
-        }
-    }
-
-    struct NoopEnvFactory;
-    impl crate::spawn::spawner::EnvFactory for NoopEnvFactory {
-        fn create(
-            &self,
-            _cwd: &std::path::Path,
-        ) -> std::result::Result<Arc<dyn ExecutionEnv>, AgentError> {
-            Ok(Arc::new(llm_harness_loop::test_utils::NoOpEnv))
-        }
-    }
-
-    /// LLM client that never returns from `chat_stream` —— 用于测试 abort 路径。
-    /// sub-agent 会阻塞在 LLM 调用上，直到 step abort 触发 select! 的 cancel arm。
-    struct BlockingClient;
-
-    #[async_trait::async_trait]
-    impl llm_harness_loop::LlmClient for BlockingClient {
-        fn capabilities(&self) -> llm_harness_loop::ProviderCapabilities {
-            llm_harness_loop::ProviderCapabilities::new(false, false, false)
-        }
-        async fn chat(
-            &self,
-            _: &llm_harness_loop::ChatRequest,
-        ) -> std::result::Result<llm_harness_loop::ChatResponse, llm_harness_loop::LlmError>
-        {
-            std::future::pending().await
-        }
-        async fn chat_stream(
-            &self,
-            _: &llm_harness_loop::ChatRequest,
-        ) -> std::result::Result<llm_harness_loop::StreamHandle, llm_harness_loop::LlmError>
-        {
-            std::future::pending().await
-        }
-    }
-
-    fn make_spawner(client: Arc<dyn llm_harness_loop::LlmClient>) -> Arc<HarnessSubAgentSpawner> {
-        Arc::new(
-            HarnessSubAgentSpawner::new(
-                "test-model",
-                client,
-                std::env::temp_dir().join("sync-tool-test"),
-                |_cwd, _rx, _id| Box::new(NoopPlugin),
-            )
-            .session_factory(Arc::new(JsonlSessionFactory))
-            .env_factory(Arc::new(NoopEnvFactory)),
-        )
-    }
-
-    fn make_ctx(abort: CancellationToken) -> ToolContext {
-        ToolContext {
-            env: Arc::new(llm_harness_loop::test_utils::NoOpEnv),
-            abort,
-            tool_use_id: "tu_1".into(),
-            turn_index: 0,
-            assistant_message: Arc::new(empty_msg()),
-            update_tx: tokio::sync::mpsc::channel(1).0,
-        }
-    }
-
-    fn empty_msg() -> llm_harness_types::AssistantMessage {
-        llm_harness_loop::test_utils::test_assistant_message(vec![])
-    }
-
-    #[tokio::test]
-    async fn sync_tool_returns_result_on_normal_join() {
-        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
-            "sub-agent done",
-        )]));
-        let spawner = make_spawner(client);
-        let step_abort = CancellationToken::new();
-        let tool = SyncSpawnAgentTool::new(spawner, step_abort);
-        let ctx = make_ctx(CancellationToken::new());
-        let result = tool
-            .execute(serde_json::json!({"prompt": "do work"}), &ctx)
-            .await
-            .unwrap();
-        assert!(!result.terminate);
-        match &result.content[0] {
-            ContentBlock::Text { text } => assert!(text.contains("Sub-agent completed")),
-            _ => panic!("expected text"),
-        }
-    }
-
-    #[tokio::test]
-    async fn sync_tool_aborts_subagent_on_step_abort() {
-        let client = Arc::new(BlockingClient);
-        let spawner = make_spawner(client);
-        let step_abort = CancellationToken::new();
-        let tool = SyncSpawnAgentTool::new(spawner, step_abort.clone());
-        let ctx = make_ctx(CancellationToken::new());
-        let abort_clone = step_abort.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            abort_clone.cancel();
-        });
-        let result = tool
-            .execute(serde_json::json!({"prompt": "long work"}), &ctx)
-            .await;
-        assert!(matches!(result, Err(ToolError::Aborted)));
-    }
-
-    #[tokio::test]
-    async fn sync_tool_ignores_wait_param() {
-        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
-        let spawner = make_spawner(client);
-        let step_abort = CancellationToken::new();
-        let tool = SyncSpawnAgentTool::new(spawner, step_abort);
-        let ctx = make_ctx(CancellationToken::new());
-        let result = tool
-            .execute(serde_json::json!({"prompt": "work", "wait": true}), &ctx)
-            .await
-            .unwrap();
-        assert!(!result.terminate);
-    }
-}
-
-#[cfg(test)]
 mod engine_tests {
     use super::*;
     use crate::spawn::spawner::JsonlSessionFactory;
     use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
+    use llm_harness_types::AgentError;
     use llm_harness_types::ExecutionEnv;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

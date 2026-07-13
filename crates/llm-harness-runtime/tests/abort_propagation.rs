@@ -1,7 +1,7 @@
 //! 验证：主 agent abort 后，已派发的异步 sub-agent 被级联取消。
 //!
 //! 行为预期（abort 级联实现后）：
-//! - `AsyncSpawnRegistry` 在 `track()` 时存入 sub-agent 的 abort token。
+//! - `MessageBus` 在 `track_with_oneshot()` 时存入 sub-agent 的 abort token。
 //! - 主 agent `abort()` 经 `AbortCascadeHook::cancel_all_subagents()` 取消所有
 //!   in-flight sub-agent 的 abort token。
 //! - 因此：主 agent abort 后，sub-agent 的 LLM 不会被调用（或调用被中断），
@@ -12,9 +12,10 @@ use std::sync::Arc;
 use llm_harness_agent::Plugin;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_runtime::builder::HarnessBuilder;
-use llm_harness_runtime::spawn::async_spawn::async_spawn_pair;
-use llm_harness_runtime::spawn::spawn_tool::SpawnAgentTool;
+use llm_harness_runtime::spawn::delivery::async_spawn_pair;
+use llm_harness_runtime::spawn::message_bus::message_bus_pair;
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
+use llm_harness_runtime::spawn::tools::SpawnAgentTool;
 use llm_harness_runtime_sandbox_os::{OsEnv, OsEnvFactory};
 use llm_harness_types::ExecutionEnv;
 /// 一个长跑 tool：sleep 直到完成或被 abort。
@@ -100,17 +101,18 @@ async fn abort_cancels_inflight_subagent() {
     let _ = std::fs::remove_dir_all(&session_dir);
     std::fs::create_dir_all(&session_dir).unwrap();
 
-    let (registry, async_hook) = async_spawn_pair();
+    let registry = message_bus_pair();
+    let async_hook = async_spawn_pair(registry.clone());
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
             sub_client.clone(),
             session_dir.join("sub-sessions"),
-            |_cwd, _peer_rx, _agent_id| Box::new(BlockingToolPlugin),
+            registry.clone(),
+            |_cwd, _bus, _agent_id| Box::new(BlockingToolPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
-        .env_factory(Arc::new(OsEnvFactory))
-        .enable_async_delivery(registry.clone()),
+        .env_factory(Arc::new(OsEnvFactory)),
     );
 
     let harness = HarnessBuilder::new("main-model")
@@ -122,7 +124,7 @@ async fn abort_cancels_inflight_subagent() {
         .unwrap();
     let harness = Arc::new(harness);
 
-    let watcher = llm_harness_runtime::spawn::async_spawn::IdleWatcher::new(registry.clone(), {
+    let watcher = llm_harness_runtime::spawn::delivery::IdleWatcher::new(registry.clone(), {
         let h = Arc::downgrade(&harness);
         Arc::new(move || {
             let h = h.clone();
@@ -211,17 +213,18 @@ async fn abort_does_not_affect_future_spawns() {
     let _ = std::fs::remove_dir_all(&session_dir);
     std::fs::create_dir_all(&session_dir).unwrap();
 
-    let (registry, async_hook) = async_spawn_pair();
+    let registry = message_bus_pair();
+    let async_hook = async_spawn_pair(registry.clone());
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
             sub_client.clone(),
             session_dir.join("sub-sessions"),
-            |_cwd, _peer_rx, _agent_id| Box::new(BlockingToolPlugin),
+            registry.clone(),
+            |_cwd, _bus, _agent_id| Box::new(BlockingToolPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
-        .env_factory(Arc::new(OsEnvFactory))
-        .enable_async_delivery(registry.clone()),
+        .env_factory(Arc::new(OsEnvFactory)),
     );
 
     let harness = HarnessBuilder::new("main-model")
@@ -233,7 +236,7 @@ async fn abort_does_not_affect_future_spawns() {
         .unwrap();
     let harness = Arc::new(harness);
 
-    let watcher = llm_harness_runtime::spawn::async_spawn::IdleWatcher::new(registry.clone(), {
+    let watcher = llm_harness_runtime::spawn::delivery::IdleWatcher::new(registry.clone(), {
         let h = Arc::downgrade(&harness);
         Arc::new(move || {
             let h = h.clone();
@@ -350,17 +353,18 @@ async fn idle_watcher_abort() {
     let _ = std::fs::remove_dir_all(&session_dir);
     std::fs::create_dir_all(&session_dir).unwrap();
 
-    let (registry, async_hook) = async_spawn_pair();
+    let registry = message_bus_pair();
+    let async_hook = async_spawn_pair(registry.clone());
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
             sub_client.clone(),
             session_dir.join("sub-sessions"),
-            |_cwd, _peer_rx, _agent_id| Box::new(BlockingToolPlugin),
+            registry.clone(),
+            |_cwd, _bus, _agent_id| Box::new(BlockingToolPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
-        .env_factory(Arc::new(OsEnvFactory))
-        .enable_async_delivery(registry.clone()),
+        .env_factory(Arc::new(OsEnvFactory)),
     );
 
     let harness = HarnessBuilder::new("main-model")
@@ -372,7 +376,7 @@ async fn idle_watcher_abort() {
         .unwrap();
     let harness = Arc::new(harness);
 
-    let watcher = llm_harness_runtime::spawn::async_spawn::IdleWatcher::new(registry.clone(), {
+    let watcher = llm_harness_runtime::spawn::delivery::IdleWatcher::new(registry.clone(), {
         let h = Arc::downgrade(&harness);
         Arc::new(move || {
             let h = h.clone();

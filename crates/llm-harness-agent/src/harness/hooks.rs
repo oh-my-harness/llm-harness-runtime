@@ -31,7 +31,7 @@ pub trait AsyncSpawnHookHandle: Send + Sync {
     fn drain_completions(&self) -> Option<AgentMessage>;
 }
 
-/// Abort 级联 hook（由 runtime 层的 `AsyncSpawnRegistry` 实现）。
+/// Abort 级联 hook（由 `MessageBus` 实现）。
 /// harness `abort()` 时调用，取消所有通过本 harness 派发的 in-flight sub-agent。
 pub trait AbortCascadeHook: Send + Sync {
     /// 取消所有通过本 harness 派发的 in-flight sub-agent。

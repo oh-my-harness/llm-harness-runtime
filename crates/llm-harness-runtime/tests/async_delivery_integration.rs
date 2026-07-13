@@ -19,9 +19,10 @@ use llm_harness_loop::{
     RequestContent, StreamHandle,
 };
 use llm_harness_runtime::builder::HarnessBuilder;
-use llm_harness_runtime::spawn::async_spawn::{AsyncSpawnRegistry, IdleWatcher, async_spawn_pair};
-use llm_harness_runtime::spawn::spawn_tool::SpawnAgentTool;
+use llm_harness_runtime::spawn::delivery::{IdleWatcher, async_spawn_pair};
+use llm_harness_runtime::spawn::message_bus::{MessageBus, message_bus_pair};
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
+use llm_harness_runtime::spawn::tools::SpawnAgentTool;
 use llm_harness_runtime_sandbox_os::{OsEnv, OsEnvFactory};
 use llm_harness_types::ExecutionEnv;
 use std::sync::Arc;
@@ -29,6 +30,28 @@ struct NoopPlugin;
 impl Plugin for NoopPlugin {
     fn name(&self) -> &str {
         "noop"
+    }
+}
+use llm_harness_loop::convert::{CustomMessageConverter, DefaultConvertToLlm};
+
+/// Converts `CustomMessage{type:"sub_agent_message"}` to a user message
+/// so the LLM can see sub-agent results in context.
+struct SubAgentMessageConverter;
+impl CustomMessageConverter for SubAgentMessageConverter {
+    fn convert<'a>(
+        &'a self,
+        msg: &'a llm_harness_types::CustomMessage,
+    ) -> futures::future::BoxFuture<'a, Result<LlmMessage, llm_harness_types::AgentError>> {
+        Box::pin(async move {
+            let text = msg
+                .data
+                .get("messages")
+                .and_then(|v| v.as_str())
+                .unwrap_or("sub-agent event");
+            Ok(LlmMessage::User(vec![RequestContent::Text(
+                text.to_string(),
+            )]))
+        })
     }
 }
 
@@ -79,17 +102,18 @@ async fn async_delivery_running_period_sub_completes_during_loop() {
     std::fs::create_dir_all(&session_dir).unwrap();
 
     // sub-agent spawner：必须 enable_async_delivery，否则 spawn_async 返回错误。
-    let (registry, async_hook) = async_spawn_pair();
+    let registry = message_bus_pair();
+    let async_hook = async_spawn_pair(registry.clone());
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
             sub_client,
             session_dir.join("sub-sessions"),
-            |_cwd, _peer_rx, _agent_id| Box::new(NoopPlugin),
+            registry.clone(),
+            |_cwd, _bus, _agent_id| Box::new(NoopPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
-        .env_factory(Arc::new(OsEnvFactory))
-        .enable_async_delivery(registry.clone()),
+        .env_factory(Arc::new(OsEnvFactory)),
     );
 
     // 主 agent harness
@@ -97,6 +121,9 @@ async fn async_delivery_running_period_sub_completes_during_loop() {
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
         .should_stop_hook(async_hook.clone())
+        .convert_to_llm(Some(Arc::new(
+            DefaultConvertToLlm::new().with_custom_converter(Arc::new(SubAgentMessageConverter)),
+        )))
         .build(env.clone())
         .await
         .unwrap();
@@ -182,23 +209,27 @@ async fn async_delivery_idle_period_watcher_wakes_main() {
     let _ = std::fs::remove_dir_all(&session_dir);
     std::fs::create_dir_all(&session_dir).unwrap();
 
-    let (registry, async_hook) = async_spawn_pair();
+    let registry = message_bus_pair();
+    let async_hook = async_spawn_pair(registry.clone());
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
             sub_client,
             session_dir.join("sub-sessions"),
-            |_cwd, _peer_rx, _agent_id| Box::new(NoopPlugin),
+            registry.clone(),
+            |_cwd, _bus, _agent_id| Box::new(NoopPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
-        .env_factory(Arc::new(OsEnvFactory))
-        .enable_async_delivery(registry.clone()),
+        .env_factory(Arc::new(OsEnvFactory)),
     );
 
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
         .should_stop_hook(async_hook.clone())
+        .convert_to_llm(Some(Arc::new(
+            DefaultConvertToLlm::new().with_custom_converter(Arc::new(SubAgentMessageConverter)),
+        )))
         .build(env.clone())
         .await
         .unwrap();
@@ -252,9 +283,8 @@ async fn async_delivery_idle_period_watcher_wakes_main() {
         "expected >=3 LLM calls after idle wake, got {calls}"
     );
 }
-
 /// 轮询等待 registry 的 in_flight 归零（sub-agent 全部完成）。
-async fn wait_for_in_flight_zero(registry: &AsyncSpawnRegistry) {
+async fn wait_for_in_flight_zero(registry: &MessageBus) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if registry.in_flight_count() == 0 {
@@ -321,23 +351,27 @@ async fn continue_run_idle_path_no_wasted_llm_call() {
     let _ = std::fs::remove_dir_all(&session_dir);
     std::fs::create_dir_all(&session_dir).unwrap();
 
-    let (registry, async_hook) = async_spawn_pair();
+    let registry = message_bus_pair();
+    let async_hook = async_spawn_pair(registry.clone());
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
             sub_client,
             session_dir.join("sub-sessions"),
-            |_cwd, _peer_rx, _agent_id| Box::new(NoopPlugin),
+            registry.clone(),
+            |_cwd, _bus, _agent_id| Box::new(NoopPlugin),
         )
         .session_factory(Arc::new(JsonlSessionFactory))
-        .env_factory(Arc::new(OsEnvFactory))
-        .enable_async_delivery(registry.clone()),
+        .env_factory(Arc::new(OsEnvFactory)),
     );
 
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
         .should_stop_hook(async_hook.clone())
+        .convert_to_llm(Some(Arc::new(
+            DefaultConvertToLlm::new().with_custom_converter(Arc::new(SubAgentMessageConverter)),
+        )))
         .build(env.clone())
         .await
         .unwrap();

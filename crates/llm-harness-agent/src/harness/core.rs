@@ -678,16 +678,23 @@ impl AgentHarness {
 
     /// Enqueue a text message as a steer.
     pub fn steer(&self, text: impl Into<String>) {
-        self.steer_message(AgentMessage::User(UserMessage {
+        let _ = self.steer_message(AgentMessage::User(UserMessage {
             content: vec![ContentBlock::Text { text: text.into() }],
             timestamp: chrono::Utc::now(),
         }));
     }
 
     /// Enqueue a full message as a steer.
-    pub fn steer_message(&self, msg: AgentMessage) {
+    ///
+    /// Returns `Err` if the steer channel is full (capacity exceeded) or
+    /// closed (agent not running). The caller can use this to report
+    /// delivery failure instead of silently dropping the message.
+    pub fn steer_message(&self, msg: AgentMessage) -> Result<(), ChannelError> {
         let inner = self.inner.lock().unwrap();
-        let _ = inner.steer_tx.try_send(msg);
+        inner.steer_tx.try_send(msg).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => ChannelError::Full,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => ChannelError::Closed,
+        })
     }
 
     /// Enqueue a text message as a follow-up.
