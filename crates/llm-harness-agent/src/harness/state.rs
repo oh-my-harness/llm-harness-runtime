@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
 use llm_harness_loop::{FinalAnswerMode, LlmClient, RetryConfig};
@@ -41,7 +41,7 @@ pub struct HarnessState {
     /// IDs of tools currently executing.
     pub(crate) pending_tool_calls: HashSet<String>,
     /// Session entries buffered during a running turn; flushed at turn end.
-    pub(crate) pending_session_writes: Vec<SessionEntryPayload>,
+    pub(crate) pending_session_writes: VecDeque<SessionEntryPayload>,
     /// Messages queued for injection at the start of the next `prompt()`.
     pub(crate) queued_next_turn: Vec<AgentMessage>,
     /// Error text from the most recent failed LLM call.

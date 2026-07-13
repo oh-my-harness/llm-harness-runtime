@@ -26,7 +26,7 @@ impl AgentHarness {
             .unwrap()
             .state
             .pending_session_writes
-            .push(payload);
+            .push_back(payload);
     }
 
     async fn flush_pending_writes(&self) -> Result<usize, HarnessError> {
@@ -34,7 +34,7 @@ impl AgentHarness {
         loop {
             let payload = {
                 let inner = self.inner.lock().unwrap();
-                inner.state.pending_session_writes.first().cloned()
+                inner.state.pending_session_writes.front().cloned()
             };
             let Some(payload) = payload else { break };
             // Write before removing. If this fails, payload remains in pending.
@@ -45,7 +45,7 @@ impl AgentHarness {
                 .unwrap()
                 .state
                 .pending_session_writes
-                .remove(0);
+                .pop_front();
             count += 1;
         }
         Ok(count)
@@ -391,7 +391,7 @@ impl AgentHarness {
                     };
                     let msg = AgentMessage::ToolResult(ToolResultMessage {
                         tool_use_id: tool_use_id.clone(),
-                        content: content.clone(),
+                        content,
                         is_error,
                         timestamp: chrono::Utc::now(),
                     });

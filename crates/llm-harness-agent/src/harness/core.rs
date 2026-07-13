@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -114,7 +114,7 @@ impl AgentHarness {
             streaming_message: None,
             tools_overwritten_mid_run: false,
             pending_tool_calls: HashSet::new(),
-            pending_session_writes: vec![],
+            pending_session_writes: VecDeque::new(),
             queued_next_turn: vec![],
             error_message: None,
         };
@@ -371,7 +371,7 @@ impl AgentHarness {
             if inner.state.phase == HarnessPhase::Idle {
                 (old, Some(payload))
             } else {
-                inner.state.pending_session_writes.push(payload);
+                inner.state.pending_session_writes.push_back(payload);
                 (old, None)
             }
         };
@@ -395,7 +395,7 @@ impl AgentHarness {
             if inner.state.phase == HarnessPhase::Idle {
                 (old, Some(payload))
             } else {
-                inner.state.pending_session_writes.push(payload);
+                inner.state.pending_session_writes.push_back(payload);
                 (old, None)
             }
         };
@@ -465,7 +465,7 @@ impl AgentHarness {
                 (added, removed, Some(payload))
             } else {
                 inner.state.tools_overwritten_mid_run = true;
-                inner.state.pending_session_writes.push(payload);
+                inner.state.pending_session_writes.push_back(payload);
                 (added, removed, None)
             }
         };
