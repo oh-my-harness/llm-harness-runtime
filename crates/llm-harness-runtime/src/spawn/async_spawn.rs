@@ -292,39 +292,46 @@ fn format_failure(agent_id: &str, error: &AgentError) -> String {
     )
 }
 
-impl ShouldStopHook for AsyncSpawnHook {
-    fn should_stop<'a>(&'a self, _ctx: ShouldStopCtx<'a>) -> BoxFuture<'a, bool> {
-        Box::pin(async move {
-            // 先检查 handle 是否就绪。handle=None 时不排空（消息留 channel），
-            // 与 PeerMessageHook（Task 4）同构——避免消息取出后因 handle=None 丢失。
-            let handle_ready = self.follow_up_handle.lock().unwrap().is_some();
-            if !handle_ready {
-                return true;
-            }
-            // handle 就绪，排空所有就绪结果
-            let mut results: Vec<String> = Vec::new();
-            {
-                let mut slot = self.completion_rx.lock().unwrap();
-                if let Some(guard) = slot.as_mut() {
-                    while let Some(completion) = guard.try_recv() {
-                        match completion.result {
-                            Ok(ref r) => results.push(format_success(&completion.agent_id, r)),
-                            Err(AgentError::Aborted) => {}
-                            Err(ref e) => results.push(format_failure(&completion.agent_id, e)),
-                        }
+impl AsyncSpawnHook {
+    /// 排空 completion channel，返回格式化后的 AgentMessage。
+    /// 无结果或 follow_up_handle 未就绪时返回 None。
+    /// 调用前提：completion_rx 已 borrow（slot 为 Some）。
+    fn drain_and_format(&self) -> Option<AgentMessage> {
+        let handle_ready = self.follow_up_handle.lock().unwrap().is_some();
+        if !handle_ready {
+            return None;
+        }
+        let mut results: Vec<String> = Vec::new();
+        {
+            let mut slot = self.completion_rx.lock().unwrap();
+            if let Some(guard) = slot.as_mut() {
+                while let Some(completion) = guard.try_recv() {
+                    match completion.result {
+                        Ok(ref r) => results.push(format_success(&completion.agent_id, r)),
+                        Err(AgentError::Aborted) => {}
+                        Err(ref e) => results.push(format_failure(&completion.agent_id, e)),
                     }
                 }
             }
-            // borrow 在同一线程立即释放（try_recv 同步，不跨 await）
-            if !results.is_empty() {
-                let packed = results.join("\n\n---\n\n");
-                let msg = AgentMessage::User(UserMessage {
-                    content: vec![ContentBlock::Text { text: packed }],
-                    timestamp: chrono::Utc::now(),
-                });
-                if let Some(h) = self.follow_up_handle.lock().unwrap().as_ref() {
-                    h.follow_up_message(msg);
-                }
+        }
+        if results.is_empty() {
+            return None;
+        }
+        let packed = results.join("\n\n---\n\n");
+        Some(AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::Text { text: packed }],
+            timestamp: chrono::Utc::now(),
+        }))
+    }
+}
+
+impl ShouldStopHook for AsyncSpawnHook {
+    fn should_stop<'a>(&'a self, _ctx: ShouldStopCtx<'a>) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            if let Some(msg) = self.drain_and_format()
+                && let Some(h) = self.follow_up_handle.lock().unwrap().as_ref()
+            {
+                h.follow_up_message(msg);
             }
             // 无论有无结果都返回 true：有结果 → loop 取 follow_up 续命；无结果 → 真停
             true
@@ -478,6 +485,10 @@ impl AsyncSpawnHookHandle for AsyncSpawnHook {
 
     fn set_follow_up_handle(&self, handle: FollowUpHandle) {
         AsyncSpawnHook::set_follow_up_handle(self, handle);
+    }
+
+    fn drain_completions(&self) -> Option<AgentMessage> {
+        self.drain_and_format()
     }
 }
 

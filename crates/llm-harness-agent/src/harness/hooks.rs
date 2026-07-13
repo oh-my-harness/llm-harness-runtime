@@ -1,3 +1,5 @@
+use llm_harness_types::AgentMessage;
+
 use super::FollowUpHandle;
 
 // ── Idle watcher / async spawn hook decoupling traits ────────────────────────
@@ -23,6 +25,10 @@ pub trait AsyncSpawnHookHandle: Send + Sync {
     /// 保证 should_stop 能注入 follow_up（修复 F-6：生产中 follow_up_handle
     /// 从未 set 导致 should_stop 永远走 handle_ready=false 死循环）。
     fn set_follow_up_handle(&self, handle: FollowUpHandle);
+    /// 排空 completion channel，返回格式化后的消息。
+    /// 必须在 `borrow_completion_rx` 之后调用。
+    /// 用于 `continue_run` 在启动 `run_loop` 前预排空，避免浪费一轮 LLM 调用。
+    fn drain_completions(&self) -> Option<AgentMessage>;
 }
 
 /// Abort 级联 hook（由 runtime 层的 `AsyncSpawnRegistry` 实现）。

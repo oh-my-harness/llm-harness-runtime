@@ -745,12 +745,25 @@ impl AgentHarness {
                 return Err(HarnessError::NotIdle(inner.state.phase));
             }
         }
+        // 预排空 completion channel：把 sub-agent 结果格式化为 AgentMessage，
+        // 作为 initial 传入 run_loop，让 LLM 第一轮就能看到结果。
+        // borrow → drain → release → run_loop 内部再 borrow。
+        let initial: Vec<AgentMessage> = {
+            let async_hook = self.inner.lock().unwrap().async_spawn_hook.clone();
+            if let Some(h) = &async_hook {
+                h.borrow_completion_rx();
+                let drained = h.drain_completions();
+                h.release_completion_rx();
+                drained.into_iter().collect()
+            } else {
+                vec![]
+            }
+        };
         // No auto-compaction here: continue_run is called by IdleWatcher after
-        // a sub-agent completion, but the completion result is not yet in the
-        // session (injected via should_stop hook during run_loop). Compacting
-        // now would operate on stale context. Auto-compaction runs at
+        // a sub-agent completion. The completion result (if any) is now in
+        // `initial` and will be persisted by run_loop. Auto-compaction runs at
         // prompt_with_messages entry instead.
-        self.run_loop(vec![]).await
+        self.run_loop(initial).await
     }
 
     /// Buffer a text message to be injected at the start of the next `prompt()`.

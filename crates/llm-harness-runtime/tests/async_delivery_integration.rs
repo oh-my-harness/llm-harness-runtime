@@ -14,7 +14,10 @@
 
 use llm_harness_agent::Plugin;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
-use llm_harness_loop::{LlmMessage, RequestContent};
+use llm_harness_loop::{
+    ChatRequest, ChatResponse, LlmClient, LlmError, LlmMessage, ProviderCapabilities,
+    RequestContent, StreamHandle,
+};
 use llm_harness_runtime::builder::HarnessBuilder;
 use llm_harness_runtime::spawn::async_spawn::{AsyncSpawnRegistry, IdleWatcher, async_spawn_pair};
 use llm_harness_runtime::spawn::spawn_tool::SpawnAgentTool;
@@ -264,5 +267,160 @@ async fn wait_for_in_flight_zero(registry: &AsyncSpawnRegistry) {
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// 从 captured_requests 提取第 N 次 LLM 调用中所有 user 消息的文本内容。
+fn user_text_in_call(client: &MockLlmClient, call_index: usize) -> String {
+    let reqs = client.captured_requests.lock().unwrap();
+    let Some(req) = reqs.get(call_index) else {
+        return String::new();
+    };
+    let mut buf = String::new();
+    for msg in req.messages() {
+        if let LlmMessage::User(blocks) = msg {
+            for block in blocks {
+                if let RequestContent::Text(t) = block {
+                    buf.push_str(t);
+                    buf.push('\n');
+                }
+            }
+        }
+    }
+    buf
+}
+
+/// 验证 `continue_run` 预排空优化：Idle 路径下，`continue_run` 在启动 `run_loop`
+/// 前排空 completion channel，把 sub-agent 结果作为 initial messages 注入，
+/// LLM 第一轮就能看到结果——不再浪费一轮 LLM 调用。
+///
+/// Call 0: prompt → tool_use(spawn_agent)
+/// Call 1: tool result → LLM 停止 → 进 Idle
+/// Call 2: continue_run 预排空 + 启动，LLM **直接看到** sub-agent 结果
+#[tokio::test]
+async fn continue_run_idle_path_no_wasted_llm_call() {
+    let main_client = Arc::new(MockLlmClient::new(vec![
+        // Call 0: 调 spawn_agent tool（wait=false）
+        MockResponse::tool_use("call_1", "spawn_agent", r#"{"prompt":"work","wait":false}"#),
+        // Call 1: tool result turn，LLM 停止 → 进 Idle
+        MockResponse::text("ok spawned"),
+        // Call 2: continue_run 预排空后启动，LLM 看到 sub-agent 结果
+        MockResponse::text("processed async result"),
+    ]));
+
+    // sub-agent：用 DelayedClient 包装，延迟 50ms 后才响应，确保 sub-agent
+    // 在主 agent 进入 Idle 之后才完成，强制走 continue_run 预排空路径
+    //（而非 should_stop 中途注入路径）。
+    let sub_client = Arc::new(DelayedClient::new(
+        MockLlmClient::new(vec![MockResponse::text("async work done")]),
+        std::time::Duration::from_millis(50),
+    ));
+
+    let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new(std::env::current_dir().unwrap()));
+    let session_dir = std::env::temp_dir().join("continue-run-no-wasted-call-test");
+    let _ = std::fs::remove_dir_all(&session_dir);
+    std::fs::create_dir_all(&session_dir).unwrap();
+
+    let (registry, async_hook) = async_spawn_pair();
+    let spawner = Arc::new(
+        HarnessSubAgentSpawner::new(
+            "sub-model",
+            sub_client,
+            session_dir.join("sub-sessions"),
+            |_cwd, _peer_rx, _agent_id| Box::new(NoopPlugin),
+        )
+        .session_factory(Arc::new(JsonlSessionFactory))
+        .env_factory(Arc::new(OsEnvFactory))
+        .enable_async_delivery(registry.clone()),
+    );
+
+    let harness = HarnessBuilder::new("main-model")
+        .provider("main-model", main_client.clone())
+        .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
+        .should_stop_hook(async_hook.clone())
+        .build(env.clone())
+        .await
+        .unwrap();
+    let harness = Arc::new(harness);
+    let watcher = IdleWatcher::new(registry.clone(), {
+        let h = Arc::downgrade(&harness);
+        Arc::new(move || {
+            let h = h.clone();
+            Box::pin(async move {
+                if let Some(h) = h.upgrade() {
+                    let _ = h.continue_run().await;
+                }
+            })
+        })
+    });
+    harness.set_idle_watcher(Arc::new(watcher));
+    harness.set_async_spawn_hook(async_hook.clone());
+    harness.set_abort_cascade_hook(registry.clone());
+
+    harness.prompt("spawn a sub-agent").await.unwrap();
+
+    // 等待 sub-agent 完成 + watcher 唤醒 + 全部 LLM 调用完成
+    wait_for_in_flight_zero(&registry).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let calls = main_client
+            .call_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if calls >= 3 {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let calls = main_client
+        .call_count
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        calls, 3,
+        "expected exactly 3 LLM calls (no wasted call), got {calls}"
+    );
+
+    // 核心断言：Call 2（continue_run 预排空后启动的那轮）直接包含 sub-agent 结果
+    let call2_text = user_text_in_call(&main_client, 2);
+    assert!(
+        call2_text.contains("async work done") || call2_text.contains("completed"),
+        "Call 2 (continue_run with pre-drain) should contain sub-agent result, \
+         but got: {call2_text}"
+    );
+}
+
+/// 包装 `MockLlmClient`，在 `chat_stream` 前插入固定延迟。
+/// 用于测试中确保 sub-agent 在主 agent 进入 Idle 后才完成。
+struct DelayedClient {
+    inner: Arc<MockLlmClient>,
+    delay: std::time::Duration,
+}
+
+impl DelayedClient {
+    fn new(inner: MockLlmClient, delay: std::time::Duration) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            delay,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for DelayedClient {
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.chat(req).await
+    }
+
+    async fn chat_stream(&self, req: &ChatRequest) -> Result<StreamHandle, LlmError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.chat_stream(req).await
     }
 }
