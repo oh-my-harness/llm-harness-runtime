@@ -10,7 +10,6 @@
 //! - Tracing (`TraceExporter`)
 //! - Cost aggregation (`PricingProvider`, `CostAggregate`)
 //! - Audit logging (`AuditSink`)
-//! - Human approval (`HumanApprover`, `HumanApprovalWrapper`)
 //! - Budget control (`BudgetExceededHook`, `BudgetControlAdapter`)
 //! - Harness construction (`HarnessBuilder`)
 

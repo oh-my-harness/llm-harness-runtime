@@ -52,7 +52,7 @@ instruction prompts → structured context → workflow → harness code → opt
 |---|---|---|
 | workflow design / loop engineering | `WorkflowEngine` — staged workflow + back-edge + retry | ✅ |
 | evaluation | `StepTransitionJudge` trait + `StepResult.structured` | ✅ |
-| permission controls | `HumanApprover` + `WorkflowGateHook` + `RuleBasedApprovalHook` | ✅ |
+| permission controls | `BeforeToolCallHook`（业务层直接实现人工审批）+ `WorkflowGateHook` + `RuleBasedApprovalHook` | ✅ |
 | persistent state management | `TaskStore` + `Checkpoint` + `WorkflowState` | ✅ |
 | memory / context management | `WorkflowContext` (blackboard) + `Session` + compaction | ✅ |
 | tools | `ToolRegistry` + `ToolSource` + MCP | ✅ |
@@ -465,7 +465,7 @@ Transition::To(generator)  ← back-edge
 - 标准化评估报告格式（step_history + cost + audit 的统一导出）。
 
 **安全边界**：
-- Permission control（`HumanApprover`）在 evolution loop 之外。
+- Permission control（`BeforeToolCallHook` 业务层直接实现）在 evolution loop 之外。
 - Editable surface 标记（待 Gap-5 修复后）界定可修改范围。
 - 新 harness 必须通过 regression test（held-in + held-out）才 accept。
 
@@ -484,7 +484,7 @@ Transition::To(generator)  ← back-edge
 **原则**：人类在正确的时间、正确的抽象层级介入。
 
 **runtime 用法**：
-- `HumanApprover`（`BeforeToolCallHook`）在关键 tool call 前要求人工审批。
+- `BeforeToolCallHook`（业务层直接实现）在关键 tool call 前要求人工审批。
 - `EventStream` + `WaitForExternalEventTool` 在关键决策点 pause workflow，等人工输入后 resume。
 - `WorkflowEvent` 广播让人类实时监听进度。
 - `BudgetControlAdapter` 在预算耗尽时停止，交人类决策。
@@ -497,7 +497,7 @@ Transition::To(generator)  ← back-edge
 
 ### 5.1 机制与策略分离（最高优先级）
 
-runtime 提供机制（workflow 遍历、hook 组合、spawn、persist、sandbox、audit），不提供策略（怎么路由、什么时候分支、怎么评估、怎么搜索）。策略通过 trait 回调注入（`StepTransitionJudge`、`StepExecutor`、`BudgetExceededHook`、`HumanApprover`）。
+runtime 提供机制（workflow 遍历、hook 组合、spawn、persist、sandbox、audit），不提供策略（怎么路由、什么时候分支、怎么评估、怎么搜索）。策略通过 trait 回调注入（`StepTransitionJudge`、`StepExecutor`、`BudgetExceededHook`）。人工审批由业务层直接实现 `BeforeToolCallHook`，无需独立 trait。
 
 **检验标准**：runtime 一行不改即可服务不同 agent（EDA / coding / research / data synthesis）。
 
@@ -587,7 +587,7 @@ harness 像 OS——封装复杂逻辑，保持接口简单。trait 是系统调
 | ADAS (Hu et al. 2025) | meta-agent search，archive-based | Workflow 序列化 + PlanWorkflowTool | meta-agent + archive 管理 + novelty 检查 |
 | AFlow (Zhang et al. 2025) | MCTS 搜索 workflow 图 | Workflow 图模型 + engine.run() + TaskStore | MCTS 选择/展开/回传策略 |
 | DGM (Zhang et al. 2025) | 进化 harness-code repo | Sandbox(bash+editor) + HarnessConfig(待) | 进化循环 + parent 选择 + 评估 |
-| Self-Harness (Zhang et al. 2026) | weakness mining + bounded proposal + validation | step_history + AuditSink + HumanApprover | failure 聚类 + proposal + regression test |
+| Self-Harness (Zhang et al. 2026) | weakness mining + bounded proposal + validation | step_history + AuditSink + `BeforeToolCallHook`（业务层实现审批） | failure 聚类 + proposal + regression test |
 | STOP (Zelikman et al. 2023) | 递归改进 improver 函数 | runtime 是被改进的 $I$ | 递归循环 + meta-utility 评估 |
 | AlphaEvolve (Novikov et al. 2025) | evolutionary search + EVOLVE-BLOCK | Sandbox + file system | 进化循环 + parent sampling + novelty rejection |
 | Autodata (Kulikov et al. 2026) | challenger + weak/strong solver + verifier | spawn_async + peer communication + multi-provider | 角色协调 + reward 逻辑 + training data 输出 |

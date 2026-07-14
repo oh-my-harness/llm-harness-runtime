@@ -1,19 +1,11 @@
-//! Hook composition matrix tests (§8.1.4).
-//!
-//! Verifies that individual hooks and cross-hook combinations behave correctly
-//! without a full AgentHarness run loop.
-
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
 use llm_harness_agent::HarnessHooks;
-use llm_harness_runtime::control::human_approval::{
-    ApprovalDecision, ApprovalRequest, HumanApprovalWrapper, HumanApprover, TimeoutPolicy,
-};
 use llm_harness_runtime::observability::tracer::{CaptureLevel, SpanCaptureConfig, SpanStatus};
 use llm_harness_runtime::observability::tracing_adapter::TracingHookAdapter;
 use llm_harness_runtime_trace_otel::InMemoryTraceExporter;
-use llm_harness_types::BeforeToolCallHook;
+use llm_harness_types::{BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook};
+use serde_json::Value;
 
 // ── Test 1: TracingHookAdapter lifecycle produces no panics ─────────────────
 
@@ -68,36 +60,44 @@ fn tracing_is_independent_of_budget_state() {
     assert!(exporter.exported_spans().is_empty());
 }
 
-// ── Test 3: HumanApprovalWrapper implements BeforeToolCallHook ───────────────
+// ── Test 3: Custom BeforeToolCallHook can be wired into HarnessHooks ─────────
 
-/// Compile-time verification: HumanApprovalWrapper is coercible to
-/// Arc<dyn BeforeToolCallHook>, confirming it satisfies the HarnessHooks slot type.
+/// Compile-time verification: a business-layer hook that directly implements
+/// `BeforeToolCallHook` is coercible to `Arc<dyn BeforeToolCallHook>`,
+/// confirming it satisfies the HarnessHooks slot type.
+///
+/// Human approval is now expressed by directly implementing `BeforeToolCallHook`
+/// — the core `Allow`/`Modify`/`Deny` decision vocabulary plus `ToolResult.terminate`
+/// (true = hard reject, false = advise-and-retry) covers all approval semantics
+/// without a dedicated trait.
 #[test]
-fn human_approval_wrapper_satisfies_before_tool_call_hook() {
-    struct AlwaysDenyApprover;
+fn custom_before_tool_call_hook_satisfies_harness_hooks() {
+    use futures::future::BoxFuture;
+    use llm_harness_types::{ContentBlock, ToolResult};
 
-    impl HumanApprover for AlwaysDenyApprover {
-        fn ask<'a>(
+    struct AlwaysDenyHook;
+
+    impl BeforeToolCallHook for AlwaysDenyHook {
+        fn on_call<'a>(
             &'a self,
-            request: &'a ApprovalRequest,
-        ) -> BoxFuture<'a, Option<ApprovalDecision>> {
+            ctx: BeforeToolCallCtx<'a>,
+        ) -> BoxFuture<'a, BeforeToolCallDecision> {
             Box::pin(async move {
-                Some(ApprovalDecision::Deny {
-                    reason: format!("blocked: {}", request.tool_name),
+                BeforeToolCallDecision::Deny(ToolResult {
+                    content: vec![ContentBlock::Text {
+                        text: format!("blocked: {}", ctx.tool_name),
+                    }],
+                    details: Value::Null,
+                    terminate: true,
                 })
             })
         }
     }
 
-    let wrapper = Arc::new(HumanApprovalWrapper::new(
-        Arc::new(AlwaysDenyApprover),
-        TimeoutPolicy::Deny {
-            reason: "timeout".into(),
-        },
-    ));
+    let hook = Arc::new(AlwaysDenyHook);
 
-    // Verify the wrapper can be held as Arc<dyn BeforeToolCallHook>.
-    let _: Arc<dyn BeforeToolCallHook> = wrapper;
+    // Verify the hook can be held as Arc<dyn BeforeToolCallHook>.
+    let _: Arc<dyn BeforeToolCallHook> = hook;
 }
 
 // ── Test 4: HarnessHooks::none() constructs with all slots absent ────────────

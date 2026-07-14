@@ -38,11 +38,10 @@ src/
 │   ├── audit.rs        # AuditSink trait + AuditEntry（SHA-256 hash chain）
 │   ├── tracer.rs       # TraceExporter trait + Span* 类型
 │   └── tracing_adapter.rs # core hooks → span 事件桥接
-├── control/            # 运行时控制流：成本/预算/审批
+├── control/            # 运行时控制流：成本/预算
 │   ├── cost.rs         # 从 types re-export CostAggregate/ModelCost/PricingProvider/TokenPrice
 │   ├── cost_hook.rs    # CostAccumulatorHook（AfterProviderResponseHook）
-│   ├── budget.rs       # BudgetExceededHook trait + BudgetControlAdapter（ShouldStopHook）
-│   └── human_approval.rs # HumanApprover trait + HumanApprovalWrapper（BeforeToolCallHook）
+│   └── budget.rs       # BudgetExceededHook trait + BudgetControlAdapter（ShouldStopHook）
 ├── spawn/              # sub-agent 派发 + peer 通信
 │   ├── spawner.rs      # HarnessSubAgentSpawner（impl SubAgentSpawner）+ EnvFactory/SessionFactory/JsonlSessionFactory
 │   ├── async_spawn.rs  # AsyncSpawnRegistry/AsyncSpawnHandle/async_spawn_pair
@@ -114,7 +113,8 @@ src/
 | `cost.rs` | 从 types re-export `CostAggregate`/`ModelCost`/`PricingProvider`/`TokenPrice`。 |
 | `cost_hook.rs` | `CostAccumulatorHook`（`AfterProviderResponseHook`），写共享 `Arc<Mutex<CostAggregate>>`。 |
 | `budget.rs` | `BudgetExceededHook` trait（业务层）+ `BudgetControlAdapter`（`ShouldStopHook`，读 cost → 超限问 hook）。surveillance 模式只统计不停。 |
-| `human_approval.rs` | `HumanApprover` trait + `HumanApprovalWrapper`（`BeforeToolCallHook`，默认 timeout=Deny fail-secure）。 |
+
+人工审批不设独立 trait——业务层直接实现 `BeforeToolCallHook`，用核心 `Allow`/`Modify`/`Deny` 决策词汇 + `ToolResult.terminate`（true=硬拒绝, false=建议重试）覆盖全部审批语义。规则审批走 `llm-harness-rules` 的 `RuleBasedApprovalHook`。
 
 ### 2.8 杂项
 | 模块 | 职责 |
@@ -127,7 +127,7 @@ runtime 定义的对外 trait（业务层/后端 crate 实现）：
 ```
 EnvFactory          SessionFactory         PluginFactory
 TaskStore           EventStream
-PricingProvider*    BudgetExceededHook     HumanApprover
+PricingProvider*    BudgetExceededHook
 AuditSink           TraceExporter
 Sandbox             ResourceProvider       PromptSource
 ToolRegistry        ToolSource             McpClientHandle
@@ -139,7 +139,6 @@ runtime 自己实现的（impl core trait）：
 - `HarnessSubAgentSpawner` impl `SubAgentSpawner`
 - `CostAccumulatorHook` impl `AfterProviderResponseHook`
 - `BudgetControlAdapter` impl `ShouldStopHook`
-- `HumanApprovalWrapper` impl `BeforeToolCallHook`
 - `WorkflowGateHook` impl `PrepareNextTurnHook`
 - `SpanContextMap`（tracing_adapter）impl 一组 core hooks
 - `JsonTransformExecutor` impl `StepExecutor`
@@ -230,4 +229,4 @@ run()
 3. `spawn/spawner.rs` + `spawn/async_spawn.rs` + `spawn/peer.rs`（sub-agent 派发 + 通信）
 4. `workflow/model.rs`（纯数据模型）→ `workflow/judge.rs` → `workflow/gate.rs` → `workflow/plan.rs`（编排外围）
 5. `workflow/engine.rs`（核心，~3000 行，最后精读）
-6. 横切 trait 模块按需读：`control/`（cost_hook/budget/human_approval）、`observability/`（audit/tracer/tracing_adapter）、`platform/`（sandbox/resource/prompt/mcp/tool_registry/tool_adapter）
+6. 横切 trait 模块按需读：`control/`（cost_hook/budget）、`observability/`（audit/tracer/tracing_adapter）、`platform/`（sandbox/resource/prompt/mcp/tool_registry/tool_adapter）
