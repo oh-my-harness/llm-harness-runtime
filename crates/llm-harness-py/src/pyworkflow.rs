@@ -227,10 +227,13 @@ pub struct PyJudgeWrapper {
     pub judge: Arc<PyJudge>,
 }
 
-/// 持有 `PyExecutor` 的不透明 Python 包装，供 Python 侧引用已注册的 executor。
+/// 持有 `StepExecutor` 的不透明 Python 包装，供 Python 侧引用已注册的 executor。
+///
+/// 内部以 `Arc<dyn StepExecutor>` 存储，因此可以包装 `PyExecutor`（Python callback）、
+/// `ShellExecutor`、`HttpCallExecutor` 等任何实现了 `StepExecutor` 的类型。
 #[pyclass(name = "Executor")]
 pub struct PyExecutorWrapper {
-    pub executor: Arc<PyExecutor>,
+    pub executor: Arc<dyn StepExecutor>,
 }
 
 // ── dict_to_workflow ────────────────────────────────────────────────────────

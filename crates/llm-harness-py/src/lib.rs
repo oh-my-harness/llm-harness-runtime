@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use llm_harness_runtime::workflow::executor::{HttpCallExecutor, HttpCallPolicy, ShellExecutor};
 use pyo3::prelude::*;
 
 pub mod event_stream;
@@ -31,6 +32,8 @@ fn llm_harness_py(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_tool, m)?)?;
     m.add_function(wrap_pyfunction!(create_judge, m)?)?;
     m.add_function(wrap_pyfunction!(create_executor, m)?)?;
+    m.add_function(wrap_pyfunction!(create_shell_executor, m)?)?;
+    m.add_function(wrap_pyfunction!(create_http_executor, m)?)?;
     m.add_function(wrap_pyfunction!(create_before_turn_hook, m)?)?;
     m.add_class::<pyeventstream::PyEventStreamHandle>()?;
     m.add_class::<pyeventstream::PyWaitForExternalEventTool>()?;
@@ -144,6 +147,59 @@ fn create_executor<'py>(
     let executor = pyworkflow::PyExecutor::new(callback);
     let wrapper = pyworkflow::PyExecutorWrapper {
         executor: Arc::new(executor),
+    };
+    Py::new(py, wrapper).map(|p| p.into_bound(py))
+}
+
+/// Create a ShellExecutor with a command allowlist.
+///
+/// `commands` is a list of allowed command names (e.g. ["echo", "python"]).
+/// `default_timeout_ms` overrides the default timeout per shell call (default 30000).
+/// `max_output_bytes` caps stdout/stderr capture (default 1 MiB).
+///
+/// The executor is NOT registered by default — register with
+/// `engine.with_executor("shell", shell_executor)`.
+#[pyfunction]
+#[pyo3(signature = (commands, default_timeout_ms=30000, max_output_bytes=1048576))]
+fn create_shell_executor<'py>(
+    py: Python<'py>,
+    commands: Vec<String>,
+    default_timeout_ms: u64,
+    max_output_bytes: usize,
+) -> PyResult<Bound<'py, pyworkflow::PyExecutorWrapper>> {
+    let exec = ShellExecutor::new(commands)
+        .with_default_timeout(std::time::Duration::from_millis(default_timeout_ms))
+        .with_max_output_bytes(max_output_bytes);
+    let wrapper = pyworkflow::PyExecutorWrapper {
+        executor: Arc::new(exec),
+    };
+    Py::new(py, wrapper).map(|p| p.into_bound(py))
+}
+
+/// Create an HttpCallExecutor with a host allowlist policy.
+///
+/// `allowed_hosts` is a list of allowed hostnames (e.g. ["api.example.com"]).
+/// `allowed_schemes` defaults to ["https"]; pass ["http", "https"] to allow HTTP.
+/// `max_timeout_ms` caps request duration (default 30000).
+/// `allow_private_ip_targets` defaults to False (blocks localhost/10.x/172.16.x/192.168.x).
+#[pyfunction]
+#[pyo3(signature = (allowed_hosts, allowed_schemes=None, max_timeout_ms=30000, allow_private_ip_targets=false))]
+fn create_http_executor<'py>(
+    py: Python<'py>,
+    allowed_hosts: Vec<String>,
+    allowed_schemes: Option<Vec<String>>,
+    max_timeout_ms: u64,
+    allow_private_ip_targets: bool,
+) -> PyResult<Bound<'py, pyworkflow::PyExecutorWrapper>> {
+    let mut policy = HttpCallPolicy::new(allowed_hosts)
+        .with_max_timeout(std::time::Duration::from_millis(max_timeout_ms));
+    if let Some(schemes) = allowed_schemes {
+        policy = policy.with_allowed_schemes(schemes);
+    }
+    policy = policy.allow_private_ip_targets(allow_private_ip_targets);
+    let exec = HttpCallExecutor::new(policy);
+    let wrapper = pyworkflow::PyExecutorWrapper {
+        executor: Arc::new(exec),
     };
     Py::new(py, wrapper).map(|p| p.into_bound(py))
 }
