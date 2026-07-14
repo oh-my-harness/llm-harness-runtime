@@ -3,16 +3,16 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use llm_harness_runtime::platform::mcp::{McpClientHandle, McpError, McpToolDef};
+use llm_harness_runtime::platform::mcp::{McpClientHandle, McpError};
 use llm_harness_runtime::platform::prompt::{PromptSource, PromptSourceTemplate};
-use llm_harness_runtime::platform::tool_registry::{ToolDefinition, ToolExecutionMode, ToolSource};
+
 use llm_harness_types::{ContentBlock, Tool, ToolContext, ToolError, ToolResult};
 use serde_json::Value;
 
-/// Adapts an `McpClientHandle` as a `ToolSource`.
+/// Discovers tools from an MCP server and adapts them as core `Tool` objects.
 ///
-/// Discovers tools from an MCP server via `tools/list` and produces
-/// `ToolDefinition` values that the registry can register.
+/// Call `into_adapters()` to get `McpToolAdapter` instances that hold the
+/// `McpClientHandle` and dispatch `execute()` to `call_tool()`.
 pub struct McpToolSource {
     client: Arc<dyn McpClientHandle>,
 }
@@ -24,9 +24,6 @@ impl McpToolSource {
     }
 
     /// Discover tools and return them as `McpToolAdapter` instances.
-    ///
-    /// Prefer this over `discover()` when you need adapters that can actually
-    /// call back to the MCP server — `McpToolAdapter` holds the client ref.
     pub async fn into_adapters(&self) -> Result<Vec<McpToolAdapter>> {
         let tools = self.client.list_tools().await?;
         Ok(tools
@@ -41,20 +38,9 @@ impl McpToolSource {
     }
 }
 
-impl ToolSource for McpToolSource {
-    fn discover(&self) -> BoxFuture<'_, Result<Vec<ToolDefinition>>> {
-        async move {
-            let tools = self.client.list_tools().await?;
-            Ok(tools.into_iter().map(mcp_tool_to_definition).collect())
-        }
-        .boxed()
-    }
-}
-
 /// Adapts a single MCP tool + client as a core `Tool` trait object.
 ///
-/// Unlike `ToolDefinition` (metadata only), this holds the `McpClientHandle`
-/// and dispatches `execute()` to `call_tool()`.
+/// Holds the `McpClientHandle` and dispatches `execute()` to `call_tool()`.
 pub struct McpToolAdapter {
     tool_name: String,
     description: String,
@@ -133,20 +119,10 @@ impl PromptSource for McpPromptSource {
     }
 }
 
-fn mcp_tool_to_definition(tool: McpToolDef) -> ToolDefinition {
-    ToolDefinition {
-        name: tool.name,
-        description: tool.description,
-        parameters_schema: tool.input_schema,
-        execution_mode: ToolExecutionMode::Parallel,
-        custom_converter: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_runtime::platform::mcp::{McpContent, McpResult};
+    use llm_harness_runtime::platform::mcp::{McpContent, McpResult, McpToolDef};
     use std::sync::Mutex;
 
     struct StubMcpClient {
@@ -181,7 +157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_tool_source_discovers_tools() {
+    async fn mcp_tool_source_into_adapters() {
         let client = Arc::new(StubMcpClient {
             tools: Mutex::new(vec![McpToolDef {
                 name: "read".into(),
@@ -191,9 +167,9 @@ mod tests {
         });
 
         let source = McpToolSource::new(client);
-        let defs = source.discover().await.unwrap();
-        assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].name, "read");
+        let adapters = source.into_adapters().await.unwrap();
+        assert_eq!(adapters.len(), 1);
+        assert_eq!(adapters[0].name(), "read");
     }
 
     #[tokio::test]

@@ -32,8 +32,6 @@ src/
 │   ├── resource.rs     # ResourceProvider trait + ResourceInjector
 │   ├── prompt.rs       # PromptSource trait + PromptTemplateCompiler
 │   ├── mcp.rs          # McpClientHandle trait + Mcp* 类型
-│   ├── tool_registry.rs# ToolRegistry/ToolSource trait + ToolDefinition
-│   └── tool_adapter.rs # ToolSourceAdapter：ToolDefinition → core Tool
 ├── observability/      # 可观测 + 安全审计
 │   ├── audit.rs        # AuditSink trait + AuditEntry（SHA-256 hash chain）
 │   ├── tracer.rs       # TraceExporter trait + Span* 类型
@@ -98,8 +96,7 @@ src/
 | `resource.rs` | `ResourceProvider` trait + `ResourceInjector`（把 resource 内容拼到 system prompt 尾部）。 |
 | `prompt.rs` | `PromptSource` trait + `PromptTemplateCompiler`（`{{name}}` → `$1` 位置参数）。 |
 | `mcp.rs` | `McpClientHandle` trait + `McpToolDef`/`McpResult`/`McpContent`/`McpError`。 |
-| `tool_registry.rs` | `ToolRegistry` trait + `ToolSource` trait + `ToolDefinition`。 |
-| `tool_adapter.rs` | `ToolSourceAdapter`：把 `ToolDefinition` 适配成 core `Tool`（MCP 工具用 mcp crate 的 `McpToolAdapter`）。 |
+
 
 ### 2.6 可观测 + 审计（`observability/`）
 | 模块 | 职责 |
@@ -131,7 +128,7 @@ TaskStore           EventStream
 PricingProvider*    BudgetExceededHook
 AuditSink           TraceExporter
 Sandbox             ResourceProvider       PromptSource
-ToolRegistry        ToolSource             McpClientHandle
+McpClientHandle
 StepExecutor        StepTransitionJudge
 ```
 > `PricingProvider` 实际定义在 types，runtime re-export。
@@ -225,4 +222,4 @@ run()
 3. `spawn/spawner.rs` + `spawn/message_bus.rs` + `spawn/delivery.rs`（sub-agent 派发 + 通信）
 4. `workflow/model.rs`（纯数据模型）→ `workflow/judge.rs` → `workflow/gate.rs` → `workflow/plan.rs`（编排外围）
 5. `workflow/engine.rs`（核心，~3000 行，最后精读）
-6. 横切 trait 模块按需读：`control/`（cost_hook/budget）、`observability/`（audit/tracer/tracing_adapter）、`platform/`（sandbox/resource/prompt/mcp/tool_registry/tool_adapter）
+6. 横切 trait 模块按需读：`control/`（cost_hook/budget）、`observability/`（audit/tracer/tracing_adapter）、`platform/`（sandbox/resource/prompt/mcp）

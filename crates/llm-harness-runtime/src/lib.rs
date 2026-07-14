@@ -2,7 +2,6 @@
 //!
 //! This crate defines traits and core orchestration logic for:
 //! - Sandbox abstraction (`Sandbox` trait)
-//! - Tool registry and discovery (`ToolRegistry`, `ToolSource`)
 //! - MCP adapter (`McpClientHandle`)
 //! - Resource injection (`ResourceProvider`, `ResourceInjector`)
 //! - Prompt template integration (`PromptSource`, `PromptTemplateCompiler`)

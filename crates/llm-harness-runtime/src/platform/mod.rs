@@ -8,5 +8,3 @@ pub mod mcp;
 pub mod prompt;
 pub mod resource;
 pub mod sandbox;
-pub mod tool_adapter;
-pub mod tool_registry;

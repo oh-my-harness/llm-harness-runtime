@@ -55,7 +55,7 @@ instruction prompts → structured context → workflow → harness code → opt
 | permission controls | `BeforeToolCallHook`（业务层直接实现人工审批）+ `WorkflowGateHook` + `RuleBasedApprovalHook` | ✅ |
 | persistent state management | `TaskStore` + `Checkpoint` + `WorkflowState` | ✅ |
 | memory / context management | `WorkflowContext` (blackboard) + `Session` + compaction | ✅ |
-| tools | `ToolRegistry` + `ToolSource` + MCP | ✅ |
+| tools | `Tool` trait + `Plugin` 注册 + `McpToolAdapter` | ✅ |
 | planning | `PlanWorkflowTool` + LLM step | ✅ |
 | action | `StepExecutor` + `Sandbox` | ✅ |
 | file system as persistent memory | `Sandbox` cwd + `shell` executor | ✅ |
