@@ -642,6 +642,7 @@ impl PyWorkflowEngine {
     /// `with_task_store(dir)` 指定的路径）。
     /// `task_id` 是要恢复的 task ID（`task-<uuid>` 格式）。
     /// `provider`/`model`/`judge` 与 `new()` 相同。
+    #[allow(clippy::too_many_arguments)]
     #[classmethod]
     #[pyo3(signature = (task_store_dir, task_id, provider, model, judge, session_base_dir="sessions"))]
     fn restore(
@@ -668,12 +669,13 @@ impl PyWorkflowEngine {
         };
 
         let rt = runtime(py);
-        let engine = py.detach(move || {
-            rt.block_on(async move {
-                WorkflowEngine::restore(store, task_id, config, judge_arc).await
+        let engine = py
+            .detach(move || {
+                rt.block_on(async move {
+                    WorkflowEngine::restore(store, task_id, config, judge_arc).await
+                })
             })
-        })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         Ok(Self {
             engine: Some(Arc::new(engine)),
@@ -749,9 +751,7 @@ impl PyWorkflowEngine {
                 HookKind::ShouldStop(h) => harness_hooks.should_stop.push(h.clone()),
                 HookKind::BeforeCompact(h) => harness_hooks.before_compact.push(h.clone()),
                 HookKind::TransformContext(h) => harness_hooks.transform_context.push(h.clone()),
-                HookKind::PrepareNextTurn(h) => {
-                    harness_hooks.prepare_next_turn.push(h.clone())
-                }
+                HookKind::PrepareNextTurn(h) => harness_hooks.prepare_next_turn.push(h.clone()),
             }
         }
 
@@ -769,10 +769,10 @@ impl PyWorkflowEngine {
             match Arc::try_unwrap(arc) {
                 Ok(engine) => {
                     let p = plugin.borrow().plugin.clone();
-                    slf.engine = Some(Arc::new(engine.with_step_plugin(
-                        step_id,
-                        move || Box::new(PyPluginAdapter(p.clone())),
-                    )));
+                    slf.engine =
+                        Some(Arc::new(engine.with_step_plugin(step_id, move || {
+                            Box::new(PyPluginAdapter(p.clone()))
+                        })));
                 }
                 Err(arc) => slf.engine = Some(arc),
             }
@@ -799,10 +799,7 @@ impl PyWorkflowEngine {
     }
 
     /// 设置每步 LLM 调用的最大输出 token 数。
-    fn with_max_tokens<'a>(
-        mut slf: PyRefMut<'a, Self>,
-        max_tokens: u32,
-    ) -> PyRefMut<'a, Self> {
+    fn with_max_tokens<'a>(mut slf: PyRefMut<'a, Self>, max_tokens: u32) -> PyRefMut<'a, Self> {
         if let Some(arc) = slf.engine.take() {
             match Arc::try_unwrap(arc) {
                 Ok(engine) => {
@@ -816,10 +813,7 @@ impl PyWorkflowEngine {
 
     /// 设置自定义 TaskStore（JSONL 文件存储）。
     /// `dir` 是所有 task 数据的根目录。
-    fn with_task_store<'a>(
-        mut slf: PyRefMut<'a, Self>,
-        dir: &str,
-    ) -> PyRefMut<'a, Self> {
+    fn with_task_store<'a>(mut slf: PyRefMut<'a, Self>, dir: &str) -> PyRefMut<'a, Self> {
         if let Some(arc) = slf.engine.take() {
             match Arc::try_unwrap(arc) {
                 Ok(engine) => {
@@ -833,10 +827,7 @@ impl PyWorkflowEngine {
     }
 
     /// 设置步骤数上限。超过 → Failed。
-    fn with_max_steps<'a>(
-        mut slf: PyRefMut<'a, Self>,
-        max: usize,
-    ) -> PyRefMut<'a, Self> {
+    fn with_max_steps<'a>(mut slf: PyRefMut<'a, Self>, max: usize) -> PyRefMut<'a, Self> {
         if let Some(arc) = slf.engine.take() {
             match Arc::try_unwrap(arc) {
                 Ok(engine) => {
@@ -849,10 +840,7 @@ impl PyWorkflowEngine {
     }
 
     /// 设置连续 Retry 上限。超过 → Failed。
-    fn with_max_retries<'a>(
-        mut slf: PyRefMut<'a, Self>,
-        max: usize,
-    ) -> PyRefMut<'a, Self> {
+    fn with_max_retries<'a>(mut slf: PyRefMut<'a, Self>, max: usize) -> PyRefMut<'a, Self> {
         if let Some(arc) = slf.engine.take() {
             match Arc::try_unwrap(arc) {
                 Ok(engine) => {
@@ -983,7 +971,12 @@ impl PyWorkflowEngine {
     }
 
     /// 创建检查点（append-only）。`description` 人类可读，`payload` 任意 JSON 可序列化对象。
-    fn checkpoint(&self, py: Python<'_>, description: &str, payload: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn checkpoint(
+        &self,
+        py: Python<'_>,
+        description: &str,
+        payload: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
         let engine = self
             .engine
             .as_ref()

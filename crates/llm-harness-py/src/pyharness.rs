@@ -281,11 +281,9 @@ fn parse_thinking_level(s: &str) -> PyResult<ThinkingLevel> {
         "high" => Ok(ThinkingLevel::High),
         "xhigh" => Ok(ThinkingLevel::XHigh),
         s if s.starts_with("budget:") => {
-            let n: u32 = s[7..]
-                .parse()
-                .map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!("invalid budget value: {e}"))
-                })?;
+            let n: u32 = s[7..].parse().map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid budget value: {e}"))
+            })?;
             Ok(ThinkingLevel::Budget(n))
         }
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -419,12 +417,10 @@ impl PyAgentHarness {
     ) -> PyResult<()> {
         let harness = self.harness.clone();
         let model = model.to_string();
-        let info = match (context_window, max_tokens) {
-            (cw, mt) => Some(llm_harness_agent::ModelInfo {
-                context_window: cw.unwrap_or(0),
-                max_tokens: mt.unwrap_or(0),
-            }),
-        };
+        let info = Some(llm_harness_agent::ModelInfo {
+            context_window: context_window.unwrap_or(0),
+            max_tokens: max_tokens.unwrap_or(0),
+        });
         let rt = runtime(py);
         let result =
             py.detach(move || rt.block_on(async move { harness.set_model(model, info).await }));
@@ -443,8 +439,8 @@ impl PyAgentHarness {
     fn set_temperature(&self, py: Python<'_>, temperature: Option<f32>) -> PyResult<()> {
         let harness = self.harness.clone();
         let rt = runtime(py);
-        let result =
-            py.detach(move || rt.block_on(async move { harness.set_temperature(temperature).await }));
+        let result = py
+            .detach(move || rt.block_on(async move { harness.set_temperature(temperature).await }));
         result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -496,8 +492,7 @@ impl PyAgentHarness {
     fn continue_run(&self, py: Python<'_>) -> PyResult<()> {
         let harness = self.harness.clone();
         let rt = runtime(py);
-        let result =
-            py.detach(move || rt.block_on(async move { harness.continue_run().await }));
+        let result = py.detach(move || rt.block_on(async move { harness.continue_run().await }));
         result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
