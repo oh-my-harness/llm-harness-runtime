@@ -5,18 +5,21 @@
 //! `StepCtx`/`ExecutorCtx` 的借用字段在进入 `spawn_blocking` 前序列化为
 //! owned 数据，避免跨线程借用和 GIL 下 `.await` 死锁。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use llm_harness_agent::{HarnessHooks, Plugin};
+use llm_harness_runtime::lifecycle::task::TaskId;
+use llm_harness_runtime::lifecycle::task_store::JsonlTaskStore;
 use llm_harness_runtime::spawn::spawner::{EnvFactory, JsonlSessionFactory};
 use llm_harness_runtime::workflow::engine::{WorkflowEngine, WorkflowEngineConfig, WorkflowEvent};
 use llm_harness_runtime::workflow::executor::{ExecutorCtx, StepExecutor};
 use llm_harness_runtime::workflow::judge::{StepCtx, StepTransitionJudge};
 use llm_harness_runtime::workflow::model::{
-    Edge, EdgeCondition, Step, StepResult, Transition, Workflow,
+    Edge, EdgeCondition, Step, StepRecord, StepResult, Transition, Workflow, WorkflowStatus,
 };
-use llm_harness_types::{AgentError, ExecutionEnv, Tool, UnsupportedEnv};
+use llm_harness_types::{AgentError, CostAggregate, ExecutionEnv, Tool, UnsupportedEnv};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -486,6 +489,97 @@ impl Plugin for PyPluginAdapter {
     }
 }
 
+// ── Type conversion helpers ─────────────────────────────────────────────────
+
+/// 将 `WorkflowStatus` 转为小写字符串。
+fn workflow_status_to_str(status: &WorkflowStatus) -> &'static str {
+    match status {
+        WorkflowStatus::Idle => "idle",
+        WorkflowStatus::Running => "running",
+        WorkflowStatus::Paused => "paused",
+        WorkflowStatus::Succeeded => "succeeded",
+        WorkflowStatus::Failed => "failed",
+        WorkflowStatus::Cancelled => "cancelled",
+    }
+}
+
+/// 将 `CostAggregate` 转换为 Python dict。
+pub(crate) fn cost_aggregate_to_dict(py: Python<'_>, cost: &CostAggregate) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("total_input_tokens", cost.total_input_tokens)?;
+    dict.set_item("total_output_tokens", cost.total_output_tokens)?;
+    dict.set_item("total_cache_read_tokens", cost.total_cache_read_tokens)?;
+    dict.set_item("total_cache_write_tokens", cost.total_cache_write_tokens)?;
+    dict.set_item("total_reasoning_tokens", cost.total_reasoning_tokens)?;
+    dict.set_item("total_cost", cost.total_cost)?;
+
+    let by_model = PyDict::new(py);
+    for (model, mc) in &cost.by_model {
+        let mc_dict = PyDict::new(py);
+        mc_dict.set_item("input_tokens", mc.input_tokens)?;
+        mc_dict.set_item("output_tokens", mc.output_tokens)?;
+        mc_dict.set_item("cache_read_tokens", mc.cache_read_tokens)?;
+        mc_dict.set_item("cache_write_tokens", mc.cache_write_tokens)?;
+        mc_dict.set_item("reasoning_tokens", mc.reasoning_tokens)?;
+        mc_dict.set_item("cost", mc.cost)?;
+        mc_dict.set_item("call_count", mc.call_count)?;
+        by_model.set_item(model, mc_dict)?;
+    }
+    dict.set_item("by_model", by_model)?;
+    Ok(dict.into_any().unbind())
+}
+
+/// 将 `Transition` 转换为 Python dict。
+fn transition_to_dict(py: Python<'_>, t: &Transition) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    match t {
+        Transition::To(step_id) => {
+            dict.set_item("type", "to")?;
+            dict.set_item("step_id", step_id.clone())?;
+        }
+        Transition::Retry => {
+            dict.set_item("type", "retry")?;
+        }
+        Transition::Fail { reason } => {
+            dict.set_item("type", "fail")?;
+            dict.set_item("reason", reason.clone())?;
+        }
+        Transition::Abort { reason } => {
+            dict.set_item("type", "abort")?;
+            dict.set_item("reason", reason.clone())?;
+        }
+    }
+    Ok(dict.into_any().unbind())
+}
+
+/// 将 `StepResult` 转换为 Python dict。
+fn step_result_to_dict(py: Python<'_>, r: &StepResult) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("output", r.output.clone())?;
+    match &r.structured {
+        Some(v) => dict.set_item("structured", value_to_pyobject(py, v)?)?,
+        None => dict.set_item("structured", py.None())?,
+    }
+    dict.set_item("tool_calls_count", r.tool_calls_count)?;
+    dict.set_item("session_id", r.session_id.clone())?;
+    dict.set_item("cost", cost_aggregate_to_dict(py, &r.cost)?)?;
+    Ok(dict.into_any().unbind())
+}
+
+/// 将 `StepRecord` 转换为 Python dict。
+fn step_record_to_dict(py: Python<'_>, record: &StepRecord) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    dict.set_item("step_id", record.step_id.clone())?;
+    dict.set_item("started_at", record.started_at.to_rfc3339())?;
+    dict.set_item("ended_at", record.ended_at.to_rfc3339())?;
+    match &record.result {
+        Some(r) => dict.set_item("result", step_result_to_dict(py, r)?)?,
+        None => dict.set_item("result", py.None())?,
+    }
+    dict.set_item("transition", transition_to_dict(py, &record.transition)?)?;
+    Ok(dict.into_any().unbind())
+}
+
 // ── PyWorkflowEngine ────────────────────────────────────────────────────────
 
 /// Python 侧的 `WorkflowEngine` 包装类。
@@ -493,11 +587,14 @@ impl Plugin for PyPluginAdapter {
 /// 暴露 fluent API：`with_tool()` / `with_hooks()` / `with_step_plugin()` /
 /// `with_executor()` / `run()` / `subscribe()` / `task_id()`。
 ///
-/// 内部持有 `Option<WorkflowEngine>`（非 `Arc`），因为 `with_*` 方法
-/// 消费 `self`。`run()` / `subscribe()` 在执行时按需创建 `Arc`。
+/// 内部持有 `Option<Arc<WorkflowEngine>>`。`with_*` 方法通过 `Arc::try_unwrap`
+/// 取得所有权（builder 阶段只有一个引用，必定成功）。`run()` 克隆 `Arc` 后
+/// 在 tokio runtime 上执行，原始 `Arc` 保留在 `Option` 中，使得 `pause()` /
+/// `resume()` / `cancel()` / `state()` 等 `&self` 方法可在 `run()` 期间从
+/// 另一个 Python 线程调用。
 #[pyclass(name = "WorkflowEngine")]
 pub struct PyWorkflowEngine {
-    pub(crate) engine: Option<WorkflowEngine>,
+    pub(crate) engine: Option<Arc<WorkflowEngine>>,
 }
 
 #[pymethods]
@@ -535,7 +632,51 @@ impl PyWorkflowEngine {
         })?;
 
         Ok(Self {
-            engine: Some(engine),
+            engine: Some(Arc::new(engine)),
+        })
+    }
+
+    /// 从 TaskStore 恢复引擎。classmethod。
+    ///
+    /// `task_store_dir` 是 `JsonlTaskStore` 的根目录（之前 run() 使用的
+    /// `with_task_store(dir)` 指定的路径）。
+    /// `task_id` 是要恢复的 task ID（`task-<uuid>` 格式）。
+    /// `provider`/`model`/`judge` 与 `new()` 相同。
+    #[classmethod]
+    #[pyo3(signature = (task_store_dir, task_id, provider, model, judge, session_base_dir="sessions"))]
+    fn restore(
+        _cls: &Bound<'_, pyo3::types::PyType>,
+        py: Python<'_>,
+        task_store_dir: &str,
+        task_id: &str,
+        provider: &Bound<'_, PyProvider>,
+        model: &str,
+        judge: &Bound<'_, PyJudgeWrapper>,
+        session_base_dir: &str,
+    ) -> PyResult<Self> {
+        let store = Arc::new(JsonlTaskStore::new(PathBuf::from(task_store_dir)));
+        let task_id = TaskId(task_id.to_string());
+        let client = provider.borrow().client.clone();
+        let judge_arc: Arc<dyn StepTransitionJudge> = judge.borrow().judge.clone();
+
+        let config = WorkflowEngineConfig {
+            client,
+            model: model.to_string(),
+            env_factory: Arc::new(UnsupportedEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: std::path::PathBuf::from(session_base_dir),
+        };
+
+        let rt = runtime(py);
+        let engine = py.detach(move || {
+            rt.block_on(async move {
+                WorkflowEngine::restore(store, task_id, config, judge_arc).await
+            })
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        Ok(Self {
+            engine: Some(Arc::new(engine)),
         })
     }
 
@@ -544,40 +685,50 @@ impl PyWorkflowEngine {
         mut slf: PyRefMut<'a, Self>,
         tool: &Bound<'_, PyToolWrapper>,
     ) -> PyRefMut<'a, Self> {
-        if let Some(engine) = slf.engine.take() {
-            let t: Arc<dyn Tool> = tool.borrow().tool.clone();
-            slf.engine = Some(engine.with_tool(t));
+        if let Some(arc) = slf.engine.take() {
+            match Arc::try_unwrap(arc) {
+                Ok(engine) => {
+                    let t: Arc<dyn Tool> = tool.borrow().tool.clone();
+                    slf.engine = Some(Arc::new(engine.with_tool(t)));
+                }
+                Err(arc) => slf.engine = Some(arc),
+            }
         }
         slf
     }
 
     /// 注册一个外部事件 tool（`PyWaitForExternalEventTool`）。返回 self 以支持链式调用。
-    ///
-    /// 与 `with_tool` 不同，此方法接受 `create_event_channel()` 返回的
-    /// `WaitForExternalEventTool`，提取其内部 `Arc<dyn Tool>` 注册到引擎。
     fn with_external_tool<'a>(
         mut slf: PyRefMut<'a, Self>,
         tool: &Bound<'_, PyWaitForExternalEventTool>,
     ) -> PyRefMut<'a, Self> {
-        if let Some(engine) = slf.engine.take() {
-            let t: Arc<dyn Tool> = tool.borrow().tool.clone();
-            slf.engine = Some(engine.with_tool(t));
+        if let Some(arc) = slf.engine.take() {
+            match Arc::try_unwrap(arc) {
+                Ok(engine) => {
+                    let t: Arc<dyn Tool> = tool.borrow().tool.clone();
+                    slf.engine = Some(Arc::new(engine.with_tool(t)));
+                }
+                Err(arc) => slf.engine = Some(arc),
+            }
         }
         slf
     }
 
     /// 注入额外 hooks。返回 self 以支持链式调用。
-    ///
-    /// `hooks_list` 为 `create_*_hook` 创建的 Hook 列表。
-    /// 按 `HookKind` 变体分发到 `HarnessHooks` 对应字段。
     fn with_hooks<'a>(
         mut slf: PyRefMut<'a, Self>,
         hooks_list: &Bound<'_, PyList>,
     ) -> PyResult<PyRefMut<'a, Self>> {
-        let engine = slf
+        let arc = slf
             .engine
             .take()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine already consumed"))?;
+
+        let engine = Arc::try_unwrap(arc).map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "engine is shared (running?); cannot add hooks",
+            )
+        })?;
 
         let mut harness_hooks = HarnessHooks::none();
         for item in hooks_list.iter() {
@@ -598,25 +749,33 @@ impl PyWorkflowEngine {
                 HookKind::ShouldStop(h) => harness_hooks.should_stop.push(h.clone()),
                 HookKind::BeforeCompact(h) => harness_hooks.before_compact.push(h.clone()),
                 HookKind::TransformContext(h) => harness_hooks.transform_context.push(h.clone()),
-                HookKind::PrepareNextTurn(h) => harness_hooks.prepare_next_turn.push(h.clone()),
+                HookKind::PrepareNextTurn(h) => {
+                    harness_hooks.prepare_next_turn.push(h.clone())
+                }
             }
         }
 
-        slf.engine = Some(engine.with_hooks(harness_hooks));
+        slf.engine = Some(Arc::new(engine.with_hooks(harness_hooks)));
         Ok(slf)
     }
 
-    /// 为指定 step 注册一个 plugin 工厂。返回 self 以支持链式调用。
+    /// 为指定 step 安装 plugin。返回 self 以支持链式调用。
     fn with_step_plugin<'a>(
         mut slf: PyRefMut<'a, Self>,
         step_id: &str,
         plugin: &Bound<'_, PyPluginWrapper>,
     ) -> PyRefMut<'a, Self> {
-        if let Some(engine) = slf.engine.take() {
-            let plugin_arc = plugin.borrow().plugin.clone();
-            slf.engine = Some(engine.with_step_plugin(step_id, move || {
-                Box::new(PyPluginAdapter(plugin_arc.clone())) as Box<dyn Plugin>
-            }));
+        if let Some(arc) = slf.engine.take() {
+            match Arc::try_unwrap(arc) {
+                Ok(engine) => {
+                    let p = plugin.borrow().plugin.clone();
+                    slf.engine = Some(Arc::new(engine.with_step_plugin(
+                        step_id,
+                        move || Box::new(PyPluginAdapter(p.clone())),
+                    )));
+                }
+                Err(arc) => slf.engine = Some(arc),
+            }
         }
         slf
     }
@@ -627,30 +786,85 @@ impl PyWorkflowEngine {
         name: &str,
         executor: &Bound<'_, PyExecutorWrapper>,
     ) -> PyRefMut<'a, Self> {
-        if let Some(engine) = slf.engine.take() {
-            let exec: Arc<dyn StepExecutor> = executor.borrow().executor.clone();
-            slf.engine = Some(engine.with_executor(name, exec));
+        if let Some(arc) = slf.engine.take() {
+            match Arc::try_unwrap(arc) {
+                Ok(engine) => {
+                    let e = executor.borrow().executor.clone();
+                    slf.engine = Some(Arc::new(engine.with_executor(name, e)));
+                }
+                Err(arc) => slf.engine = Some(arc),
+            }
         }
         slf
     }
 
     /// 设置每步 LLM 调用的最大输出 token 数。
-    /// None 用默认值 (8192)。reasoning 模型的 thinking 可能很长，需要调大。
     fn with_max_tokens<'a>(
         mut slf: PyRefMut<'a, Self>,
-        max_tokens: Option<u32>,
+        max_tokens: u32,
     ) -> PyRefMut<'a, Self> {
-        if let Some(engine) = slf.engine.take() {
-            slf.engine = Some(engine.with_max_tokens(max_tokens));
+        if let Some(arc) = slf.engine.take() {
+            match Arc::try_unwrap(arc) {
+                Ok(engine) => {
+                    slf.engine = Some(Arc::new(engine.with_max_tokens(Some(max_tokens))));
+                }
+                Err(arc) => slf.engine = Some(arc),
+            }
         }
         slf
     }
 
-    /// 设置 workflow context 变量。必须在 `run()` 之前调用。
-    ///
-    /// 将 `key` → `value` 写入引擎共享 context 的 `variables` 表。
-    /// `value` 通过 `pyobject_to_value` 转换为 `serde_json::Value`。
-    /// 使用 `try_lock()` 避免在 GIL 下阻塞（run() 启动前锁无竞争）。
+    /// 设置自定义 TaskStore（JSONL 文件存储）。
+    /// `dir` 是所有 task 数据的根目录。
+    fn with_task_store<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        dir: &str,
+    ) -> PyRefMut<'a, Self> {
+        if let Some(arc) = slf.engine.take() {
+            match Arc::try_unwrap(arc) {
+                Ok(engine) => {
+                    let store = Arc::new(JsonlTaskStore::new(PathBuf::from(dir)));
+                    slf.engine = Some(Arc::new(engine.with_task_store(store)));
+                }
+                Err(arc) => slf.engine = Some(arc),
+            }
+        }
+        slf
+    }
+
+    /// 设置步骤数上限。超过 → Failed。
+    fn with_max_steps<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        max: usize,
+    ) -> PyRefMut<'a, Self> {
+        if let Some(arc) = slf.engine.take() {
+            match Arc::try_unwrap(arc) {
+                Ok(engine) => {
+                    slf.engine = Some(Arc::new(engine.with_max_steps(max)));
+                }
+                Err(arc) => slf.engine = Some(arc),
+            }
+        }
+        slf
+    }
+
+    /// 设置连续 Retry 上限。超过 → Failed。
+    fn with_max_retries<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        max: usize,
+    ) -> PyRefMut<'a, Self> {
+        if let Some(arc) = slf.engine.take() {
+            match Arc::try_unwrap(arc) {
+                Ok(engine) => {
+                    slf.engine = Some(Arc::new(engine.with_max_retries(max)));
+                }
+                Err(arc) => slf.engine = Some(arc),
+            }
+        }
+        slf
+    }
+
+    /// 设置共享 context 变量（KV 黑板）。executor 可通过 `ExecutorCtx` 读取。
     fn set_context_variable(&self, key: &str, value: &Bound<'_, PyAny>) -> PyResult<()> {
         let engine = self
             .engine
@@ -670,30 +884,18 @@ impl PyWorkflowEngine {
     /// 启动/恢复执行。阻塞直到 workflow 完成。
     ///
     /// 释放 GIL 后在 tokio runtime 上运行 `engine.run()`。
-    fn run(&mut self, py: Python<'_>) -> PyResult<()> {
+    /// `run()` 期间可从另一个 Python 线程调用 `pause()` / `cancel()` 等。
+    fn run(&self, py: Python<'_>) -> PyResult<()> {
         let engine = self
             .engine
-            .take()
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
-        let engine = Arc::new(engine);
-        let rt = runtime(py);
         let engine_clone = engine.clone();
+        let rt = runtime(py);
         let result = py.detach(move || {
             rt.block_on(async move { engine_clone.run().await })
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         });
-        // After run(), engine_clone (the second Arc) is dropped when the
-        // block_on closure exits. Arc::try_unwrap should succeed.
-        // If it fails, the engine is left unusable — surface a clear error.
-        match Arc::try_unwrap(engine) {
-            Ok(e) => self.engine = Some(e),
-            Err(_) => {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "workflow engine has outstanding references after run(); \
-                     the engine is no longer usable",
-                ));
-            }
-        }
         result?;
         Ok(())
     }
@@ -707,10 +909,106 @@ impl PyWorkflowEngine {
         Ok(engine.task_id().0.clone())
     }
 
+    /// 查询当前 workflow 状态。
+    /// 返回字符串："idle" / "running" / "paused" / "succeeded" / "failed" / "cancelled"。
+    fn state(&self, py: Python<'_>) -> PyResult<String> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
+        let rt = runtime(py);
+        let status = py.detach(move || rt.block_on(async move { engine.state().await }));
+        Ok(workflow_status_to_str(&status).to_string())
+    }
+
+    /// 返回当前执行步骤 ID。
+    fn current_step(&self, py: Python<'_>) -> PyResult<String> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
+        let rt = runtime(py);
+        let step = py.detach(move || rt.block_on(async move { engine.current_step().await }));
+        Ok(step)
+    }
+
+    /// 返回步骤历史（审计链），list[dict]。
+    fn step_history(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
+        let rt = runtime(py);
+        let history = py.detach(move || rt.block_on(async move { engine.step_history().await }));
+        let mut result = Vec::with_capacity(history.len());
+        for record in &history {
+            result.push(step_record_to_dict(py, record)?);
+        }
+        Ok(result)
+    }
+
+    /// 非阻塞：请求暂停。`run()` 在步边界检查并消费。
+    /// `reason` 是暂停原因（人类可读）。
+    fn pause(&self, reason: &str) -> PyResult<()> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
+        engine
+            .pause(reason)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// 恢复已暂停或失败的 task。将状态重置为 Paused，随后 `run()` 可继续。
+    fn resume(&self, py: Python<'_>) -> PyResult<()> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
+        let rt = runtime(py);
+        let result = py.detach(move || rt.block_on(async move { engine.resume().await }));
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// 取消正在运行的 workflow。当前步记为 Abort，状态置为 Cancelled。
+    fn cancel(&self, py: Python<'_>, reason: &str) -> PyResult<()> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
+        let reason = reason.to_string();
+        let rt = runtime(py);
+        let result = py.detach(move || rt.block_on(async move { engine.cancel(&reason).await }));
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// 创建检查点（append-only）。`description` 人类可读，`payload` 任意 JSON 可序列化对象。
+    fn checkpoint(&self, py: Python<'_>, description: &str, payload: &Bound<'_, PyAny>) -> PyResult<()> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
+        let payload_val = pyobject_to_value(payload)?;
+        let description = description.to_string();
+        let rt = runtime(py);
+        let result = py.detach(move || {
+            rt.block_on(async move { engine.checkpoint(&description, payload_val).await })
+        });
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// 返回累计 token/成本统计，dict。
+    fn total_cost(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
+        let rt = runtime(py);
+        let cost = py.detach(move || rt.block_on(async move { engine.total_cost().await }));
+        cost_aggregate_to_dict(py, &cost)
+    }
+
     /// 订阅引擎事件流，返回 `WorkflowEventIterator`。
-    ///
-    /// 每次调用返回一个独立的 receiver；多个订阅者各自接收事件。
-    /// `timeout_ms` 为单次 `__next__` 等待超时（毫秒），默认 5000。
     #[pyo3(signature = (timeout_ms=5000))]
     fn subscribe(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<Py<PyWorkflowEventIterator>> {
         let engine = self

@@ -14,13 +14,14 @@
 use std::sync::Arc;
 
 use llm_harness_agent::{AgentHarness, AgentHarnessEvent};
-use llm_harness_types::HarnessPhase;
+use llm_harness_types::{HarnessPhase, ThinkingLevel, Tool};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 use tokio::sync::broadcast;
 
 use crate::event_stream::agent_event_to_dict;
 use crate::pyagent::runtime;
+use crate::pyworkflow::cost_aggregate_to_dict;
 
 /// 将 `HarnessPhase` 转为字符串标识。
 fn phase_str(phase: HarnessPhase) -> &'static str {
@@ -268,6 +269,31 @@ impl PyHarnessEventIterator {
     }
 }
 
+/// 将字符串解析为 `ThinkingLevel`。
+///
+/// 接受: "off", "minimal", "low", "medium", "high", "xhigh", 或 "budget:<tokens>"。
+fn parse_thinking_level(s: &str) -> PyResult<ThinkingLevel> {
+    match s.to_lowercase().as_str() {
+        "off" => Ok(ThinkingLevel::Off),
+        "minimal" => Ok(ThinkingLevel::Minimal),
+        "low" => Ok(ThinkingLevel::Low),
+        "medium" => Ok(ThinkingLevel::Medium),
+        "high" => Ok(ThinkingLevel::High),
+        "xhigh" => Ok(ThinkingLevel::XHigh),
+        s if s.starts_with("budget:") => {
+            let n: u32 = s[7..]
+                .parse()
+                .map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("invalid budget value: {e}"))
+                })?;
+            Ok(ThinkingLevel::Budget(n))
+        }
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid thinking level: '{s}'. Use: off, minimal, low, medium, high, xhigh, or budget:<tokens>"
+        ))),
+    }
+}
+
 /// Python 侧的 `AgentHarness` 包装类。
 #[pyclass(name = "AgentHarness")]
 pub struct PyAgentHarness {
@@ -378,5 +404,136 @@ impl PyAgentHarness {
         });
 
         Ok(events)
+    }
+
+    // ── Dynamic configuration ──────────────────────────────────────────────
+
+    /// 动态切换模型。可选提供 `context_window` 和 `max_tokens`。
+    #[pyo3(signature = (model, context_window=None, max_tokens=None))]
+    fn set_model(
+        &self,
+        py: Python<'_>,
+        model: &str,
+        context_window: Option<u32>,
+        max_tokens: Option<u32>,
+    ) -> PyResult<()> {
+        let harness = self.harness.clone();
+        let model = model.to_string();
+        let info = match (context_window, max_tokens) {
+            (cw, mt) => Some(llm_harness_agent::ModelInfo {
+                context_window: cw.unwrap_or(0),
+                max_tokens: mt.unwrap_or(0),
+            }),
+        };
+        let rt = runtime(py);
+        let result =
+            py.detach(move || rt.block_on(async move { harness.set_model(model, info).await }));
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// 设置或清除系统提示。下一轮生效。
+    #[pyo3(signature = (prompt=None))]
+    fn set_system_prompt(&self, prompt: Option<&str>) {
+        self.harness
+            .set_system_prompt(prompt.map(|s| s.to_string()));
+    }
+
+    /// 设置采样温度。`None` 重置为 provider 默认值。下一轮生效。
+    #[pyo3(signature = (temperature=None))]
+    fn set_temperature(&self, py: Python<'_>, temperature: Option<f32>) -> PyResult<()> {
+        let harness = self.harness.clone();
+        let rt = runtime(py);
+        let result =
+            py.detach(move || rt.block_on(async move { harness.set_temperature(temperature).await }));
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// 设置 thinking level。接受: "off", "minimal", "low", "medium", "high", "xhigh", "budget:<tokens>"。
+    fn set_thinking_level(&self, py: Python<'_>, level: &str) -> PyResult<()> {
+        let level = parse_thinking_level(level)?;
+        let harness = self.harness.clone();
+        let rt = runtime(py);
+        let result =
+            py.detach(move || rt.block_on(async move { harness.set_thinking_level(level).await }));
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// 设置每次 provider 调用的最大输出 token 数。下一轮生效。
+    fn set_max_tokens(&self, max_tokens: u32) {
+        self.harness.set_max_tokens(max_tokens);
+    }
+
+    /// 替换已注册的工具列表。
+    fn set_tools(&self, py: Python<'_>, tools: &Bound<'_, PyList>) -> PyResult<()> {
+        let mut tool_vec: Vec<Arc<dyn Tool>> = Vec::with_capacity(tools.len());
+        for item in tools.iter() {
+            let wrapper = item.cast::<crate::pytool::PyToolWrapper>()?;
+            let t: Arc<dyn Tool> = wrapper.borrow().tool.clone();
+            tool_vec.push(t);
+        }
+        let harness = self.harness.clone();
+        let rt = runtime(py);
+        let result =
+            py.detach(move || rt.block_on(async move { harness.set_tools(tool_vec).await }));
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    // ── Steering / Follow-up ────────────────────────────────────────────────
+
+    /// 向正在运行的 harness 插入一条 steering 消息。
+    /// 当前 turn 完成后，steering 消息会被加入下一轮的 context。
+    fn steer(&self, text: &str) {
+        self.harness.steer(text);
+    }
+
+    /// 向正在运行的 harness 插入一条 follow-up 消息。
+    /// Follow-up 消息在当前 turn 结束后立即触发新一轮。
+    fn follow_up(&self, text: &str) {
+        self.harness.follow_up(text);
+    }
+
+    /// 继续上一次运行（不附加新消息）。
+    fn continue_run(&self, py: Python<'_>) -> PyResult<()> {
+        let harness = self.harness.clone();
+        let rt = runtime(py);
+        let result =
+            py.detach(move || rt.block_on(async move { harness.continue_run().await }));
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// 发送下一条 user 消息并继续运行。
+    fn next_turn(&self, text: &str) {
+        self.harness.next_turn(text);
+    }
+
+    // ── Cost / Usage ────────────────────────────────────────────────────────
+
+    /// 返回累计 token/成本统计，dict。
+    fn usage(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let cost = self.harness.usage();
+        cost_aggregate_to_dict(py, &cost)
+    }
+
+    /// 重置累计成本统计。
+    fn reset_usage(&self) {
+        self.harness.reset_usage();
+    }
+
+    // ── Waiting ─────────────────────────────────────────────────────────────
+
+    /// 阻塞直到 harness 进入 idle 状态。
+    fn wait_for_idle(&self, py: Python<'_>) -> PyResult<()> {
+        let harness = self.harness.clone();
+        let rt = runtime(py);
+        py.detach(move || rt.block_on(async move { harness.wait_for_idle().await }));
+        Ok(())
+    }
+
+    /// 阻塞直到 harness 进入 settled 状态（idle 且无待处理事件）。
+    fn wait_for_settled(&self, py: Python<'_>) -> PyResult<()> {
+        let harness = self.harness.clone();
+        let rt = runtime(py);
+        py.detach(move || rt.block_on(async move { harness.wait_for_settled().await }));
+        Ok(())
     }
 }
