@@ -9,7 +9,7 @@ use super::state::HarnessInner;
 /// 对 `AgentHarness` follow_up channel 的可克隆句柄。
 ///
 /// 持有与 `AgentHarness` 同一个 `Arc<Mutex<HarnessInner>>`，使外部组件
-/// （`AsyncSpawnHook`、`PeerMessageHook`、`IdleWatcher`）能在不持有整个
+/// （`AsyncSpawnHook`、`IdleWatcher`）能在不持有整个
 /// harness 引用的前提下注入 follow_up 消息。
 ///
 /// **不缓存** `follow_up_tx`——每次 `follow_up_message` 都重新 `lock()` 取

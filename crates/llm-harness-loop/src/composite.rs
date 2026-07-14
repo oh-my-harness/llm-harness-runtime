@@ -341,7 +341,7 @@ impl PrepareNextTurnHook for CompositePrepareNextTurnHook {
 /// `true`. Unlike short-circuit composites, every hook always runs — this is
 /// deliberate: `ShouldStopHook` is a query (not a decision gate), and hooks
 /// may carry side effects such as draining a follow-up channel
-/// (`AsyncSpawnHook`, `PeerMessageHook`) that must not be skipped just because
+/// (`AsyncSpawnHook`) that must not be skipped just because
 /// an earlier hook (e.g. `BudgetControlAdapter`) already returned `true`.
 /// Short-circuiting would silently defer or drop pending follow-up messages.
 pub struct CompositeShouldStopHook {

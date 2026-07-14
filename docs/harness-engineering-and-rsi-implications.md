@@ -59,8 +59,8 @@ instruction prompts → structured context → workflow → harness code → opt
 | planning | `PlanWorkflowTool` + LLM step | ✅ |
 | action | `StepExecutor` + `Sandbox` | ✅ |
 | file system as persistent memory | `Sandbox` cwd + `shell` executor | ✅ |
-| sub-agent spawn + parallel | `spawn_async` + `AsyncSpawnRegistry` + peer communication | ✅ |
-| agent delegation tools | `SpawnAgentTool` + `ListPeersTool` + `SendToPeerTool` | ⚠️ 缺 resume_agent |
+| sub-agent spawn + parallel | `spawn_async` + `MessageBus` + `delivery` | ✅ |
+| agent delegation tools | `SpawnAgentTool` + `MessageSubagentTool`/`MessageMainTool` + `AwaitSubagentReplyTool`/`AwaitMainMessageTool` + `QuerySubagentTool` + `AbortSubagentTool` | ⚠️ 缺 resume_agent |
 | audit trail | `AuditSink` + SHA-256 hash chain | ✅ |
 | cost / budget control | `CostAggregate` + `BudgetControlAdapter` | ✅ |
 | crash recovery | `WorkflowEngine.restore()` + `TaskStore` | ✅ |
@@ -116,7 +116,7 @@ instruction prompts → structured context → workflow → harness code → opt
 
 **不够好**：
 - **无结构化回传**：sub-agent 不能向主 agent 返回 JSON 结构化结果。`SubmitStepResultTool` 只在 workflow step 内可用，sub-agent 没有等价物。如果 sub-agent 是 Stage Agent 跑完一轮 EDA，它只能把 QoR 指标写进文本回答，主 agent 要自己解析。
-- **无中间进度**：主 agent 只能拿到最终结果，看不到 sub-agent 的中间步骤。除非 sub-agent 主动通过 `SendToPeerTool` 发消息。
+- **无中间进度**：主 agent 只能拿到最终结果，看不到 sub-agent 的中间步骤。除非 sub-agent 主动通过 `MessageMainTool` 发消息。
 - **session 可恢复但需手动**：`session_id` 被保留，但要恢复 sub-agent 的 session 需应用层手动构建。
 
 **文章对照**：文章的 "sub-agent and backend jobs" 模式强调输出要 "stored as files, logs, and status records"——inspectable。runtime 的 session 落盘（`JsonlSessionFactory`）提供了可检视性，但结构化结果回传缺失。
@@ -216,7 +216,7 @@ instruction prompts → structured context → workflow → harness code → opt
 
 **事实**：`WorkflowEngine` 是单线遍历（`run_loop` 串行执行 step）。Issue #37（并行 fan-out / fan-in）未实现。`spawn_async` 可派发 sub-agent，但不在 workflow engine 的图模型内。
 
-**影响**：AFlow 的 MCTS 同时展开多个候选、Autodata 的强弱 solver 同时跑、AgenticPD 的多分支并行探索——这些需要并行 fan-out。当前只能用 `spawn_async` + peer communication 在 workflow 外变通，Judge 的协调逻辑要应用层手写。
+**影响**：AFlow 的 MCTS 同时展开多个候选、Autodata 的强弱 solver 同时跑、AgenticPD 的多分支并行探索——这些需要并行 fan-out。当前只能用 `spawn_async` + `MessageBus` 在 workflow 外变通，Judge 的协调逻辑要应用层手写。
 
 **文章依据**：AFlow MCTS 的 Expand 可同时展开多节点；Autodata 的 Strong/Weak Solver 并行执行。
 
@@ -438,8 +438,8 @@ Transition::To(generator)  ← back-edge
 **runtime 用法**：
 - `spawn_async` 派发多个 sub-agent 并行探索不同参数。
 - 每个 sub-agent 的 sandbox cwd 独立，结果写文件。
-- 主 agent 通过 `SendToPeerTool` 收集结果，或读 sub-agent 的输出文件。
-- `AsyncSpawnRegistry.cancel_all()` 取消失败分支。
+- 主 agent 通过 `MessageSubagentTool` 收集结果，或读 sub-agent 的输出文件。
+- `MessageBus` 取消失败分支（`AbortSubagentTool`）。
 - sub-agent 的 session 通过 `JsonlSessionFactory` 落盘，可事后 inspect。
 
 ### 4.4 Harness 自我改进（Meta-Harness / DGM 式）
@@ -590,6 +590,6 @@ harness 像 OS——封装复杂逻辑，保持接口简单。trait 是系统调
 | Self-Harness (Zhang et al. 2026) | weakness mining + bounded proposal + validation | step_history + AuditSink + `BeforeToolCallHook`（业务层实现审批） | failure 聚类 + proposal + regression test |
 | STOP (Zelikman et al. 2023) | 递归改进 improver 函数 | runtime 是被改进的 $I$ | 递归循环 + meta-utility 评估 |
 | AlphaEvolve (Novikov et al. 2025) | evolutionary search + EVOLVE-BLOCK | Sandbox + file system | 进化循环 + parent sampling + novelty rejection |
-| Autodata (Kulikov et al. 2026) | challenger + weak/strong solver + verifier | spawn_async + peer communication + multi-provider | 角色协调 + reward 逻辑 + training data 输出 |
+| Autodata (Kulikov et al. 2026) | challenger + weak/strong solver + verifier | spawn_async + MessageBus + multi-provider | 角色协调 + reward 逻辑 + training data 输出 |
 | AI Scientist (Lu et al. 2026) | ideation → experimentation → write-up pipeline | Workflow(staged) + back-edge + shell executor | 领域 prompt + 阶段间逻辑 |
 | AgenticPD | stage-aware optimization tree + checkpoint reuse | Workflow + Sandbox + spawn + context | 优化树管理 + Judge 导航 + QoR 评估 |

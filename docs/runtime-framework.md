@@ -42,11 +42,12 @@ src/
 │   ├── cost.rs         # 从 types re-export CostAggregate/ModelCost/PricingProvider/TokenPrice
 │   ├── cost_hook.rs    # CostAccumulatorHook（AfterProviderResponseHook）
 │   └── budget.rs       # BudgetExceededHook trait + BudgetControlAdapter（ShouldStopHook）
-├── spawn/              # sub-agent 派发 + peer 通信
+├── spawn/              # sub-agent 派发 + 通信
 │   ├── spawner.rs      # HarnessSubAgentSpawner（impl SubAgentSpawner）+ EnvFactory/SessionFactory/JsonlSessionFactory
-│   ├── async_spawn.rs  # AsyncSpawnRegistry/AsyncSpawnHandle/async_spawn_pair
-│   ├── spawn_tool.rs   # SpawnAgentTool（LLM 可见的 spawn_agent tool）
-│   └── peer.rs         # PeerDirectory/SharedPeerRx/PeerMessageHook/WaitForPeerMessageTool/SendToPeerTool
+│   ├── message_bus.rs  # MessageBus：统一事件通道 + agent 注册表 + 消息路由
+│   ├── delivery.rs     # AsyncSpawnHandle/AsyncSpawnHook/IdleWatcher/SubAgentMessageConverter
+│   ├── tools.rs        # LLM 可见 tools：SpawnAgentTool/MessageSubagentTool/AwaitSubagentReplyTool/QuerySubagentTool/AbortSubagentTool/MessageMainTool/AwaitMainMessageTool
+│   └── spawn_types.rs  # SpawnOptions/ProviderSelection/ContextMode/SubAgentHandle/SubAgentResult
 ├── lifecycle/          # task 持久化 + 事件
 │   ├── task.rs         # TaskId/TaskError/TaskResult/Checkpoint 纯数据
 │   ├── task_store.rs   # TaskStore trait + JsonlTaskStore 参考实现
@@ -64,14 +65,14 @@ src/
 | 模块 | 职责 |
 |---|---|
 | `builder.rs` | `HarnessBuilder`：fluent API 收集 tools/hooks/skills/templates/providers/pricing/budget/compaction_model，解析 provider（精确 + 最长前缀 glob），惰性创建共享 `CostAggregate`，注入 `CostAccumulatorHook` + 可选 `BudgetControlAdapter`，产出 `AgentHarness`。 |
-
 ### 2.2 Sub-agent 派发（`spawn/`）
 | 模块 | 职责 |
 |---|---|
-| `spawner.rs` | `HarnessSubAgentSpawner`（impl `SubAgentSpawner`）。`spawn_inner` 统一构建：env → peer 注册 → sub plugin → session → PeerMessageHook → harness → abort token → tokio task + 事件收集。4 个公开入口：`spawn` / `spawn_with_peer` / `spawn_async` / `spawn_async_with_peer`。还含 `EnvFactory` / `SessionFactory` / `PluginFactory` / `JsonlSessionFactory`。 |
-| `async_spawn.rs` | 异步投递：`AsyncSpawnRegistry`（completion channel + in-flight 计数 + abort map + `cancel_all`）、`AsyncSpawnHandle`、`CompletionRxGuard`、`async_spawn_pair()`。 |
-| `spawn_tool.rs` | `SpawnAgentTool`：LLM 可见的 `spawn_agent` tool，带 `wait` 参数区分 sync/async 语义。 |
-| `peer.rs` | Sub↔sub 通信：`PeerDirectory`（agent_id → tx）、`SharedPeerRx`、`PeerMessageHook`（should_stop 时 `try_recv`）、`WaitForPeerMessageTool`、`SendToPeerTool`、`PeerCleanupGuard`。 |
+| `spawner.rs` | `HarnessSubAgentSpawner`（impl `SubAgentSpawner`）。`spawn_inner` 统一构建：env → message bus 注册 → sub plugin → session → harness → abort token → tokio task + 事件收集。公开入口：`spawn` / `spawn_async`。还含 `EnvFactory` / `SessionFactory` / `JsonlSessionFactory`。 |
+| `message_bus.rs` | `MessageBus`：统一事件通道（`SubAgentEvent` 广播）+ agent 注册表（`AgentEntry`/`AgentStatus`）+ 消息路由（`SendReceipt`）。`EventRxGuard` RAII 借还 event rx。`message_bus_pair()` 工厂。 |
+| `delivery.rs` | 异步投递 + 通信桥接：`AsyncSpawnHandle`（abort 句柄）、`AsyncSpawnHook`（should_stop 时排空 event channel）、`IdleWatcher`（sub idle 时唤醒 main）、`SubAgentMessageConverter`（sub 消息格式转换）、`async_spawn_pair()`。 |
+| `tools.rs` | LLM 可见 tools：`SpawnAgentTool`（`spawn_agent`，带 `wait` 参数区分 sync/async）、`MessageSubagentTool` / `MessageMainTool`（方向消息发送）、`AwaitSubagentReplyTool` / `AwaitMainMessageTool`（阻塞等待回复）、`QuerySubagentTool`（查 agent 列表）、`AbortSubagentTool`（中止 sub-agent）。 |
+| `spawn_types.rs` | `SpawnOptions`（启动配置）、`ProviderSelection`（provider 选择策略）、`ContextMode`（上下文传递方式）、`SubAgentHandle`（join + abort）、`SubAgentResult`（最终答案 + cost）。 |
 
 ### 2.3 Workflow 编排（`workflow/`）
 | 模块 | 职责 |
@@ -162,17 +163,16 @@ build(env)
 
 ### 4.2 Sub-agent spawn（`spawn_inner`）
 ```
-opts + peer_meta? + preregister_abort?
+opts + bus + preregister_abort?
   ├─ 1. 解析 provider（Inherit / Alias）
   ├─ 2. env_factory.create(cwd)
-  ├─ 3. 若 peer_meta + directory: directory.register(meta) → peer_rx
-  ├─ 4. sub_plugin_factory(cwd, peer_rx, agent_id)
-  ├─ 5. session_factory.create() → (storage, session_id)
-  ├─ 6. PeerMessageHook::new(peer_rx)（若有）
-  ├─ 7. HarnessBuilder.build_with_session(env, Session::new(storage))
-  ├─ 8. peer: hook.set_follow_up_handle + PeerCleanupGuard
-  ├─ 9. abort_token；若 preregister → registry.register_subagent_abort
-  ├─ 10. tokio::spawn:
+  ├─ 3. session_factory.create() → (storage, session_id)
+  ├─ 4. sub_plugin_factory(cwd, bus.clone(), session_id)
+  ├─ 5. HarnessBuilder.build_with_session(env, Session::new(storage))
+  ├─ 6. harness = Arc::new(harness)
+  ├─ 7. 构建 prompt（可选 context 注入）
+  ├─ 8. abort_token；bus.register_subagent_abort + bus.register(AgentEntry)
+  ├─ 9. tokio::spawn:
   │      harness.set_abort_token
   │      broadcast→mpsc bridge（防 Lagged 死等）
   │      event_task 收集 final_answer/text_delta/tool_count
@@ -216,17 +216,13 @@ run()
 3. **状态单一表达**：`WorkflowState`（status + current_step + step_history + context）覆盖写；`Checkpoint` 是业务层数据快照，append-only，不复制进度。两者不重叠。
 4. **门禁双闸**：`WorkflowGateHook`（`PrepareNextTurnHook`，主动收窄工具集）+ `RuleBasedApprovalHook`（`BeforeToolCallHook`，Deny 兜底）。LLM 物理上提不出越界 tool call。
 5. **abort 传播**：`CancellationToken` 从 engine `step_abort` → 注入 step harness → sub-agent 的 `handle.abort()` → agent loop。`cancel_all` 先 take 出 map 释放锁再遍历 cancel，避免持锁唤醒 waker。
-6. **peer 通信**：`SharedPeerRx = Arc<tokio::sync::Mutex<Receiver>>`，hook（`try_lock`）和 tool（`lock().await`）不会并发（agent loop 单线程）。`PeerCleanupGuard` drop 触发幂等 unregister。
-7. **事件收集防死等**：sub-agent task 内 broadcast→mpsc bridge，`recv()` Err（Closed/Lagged）直接退出，让 mpsc_tx drop，event_task 经 `recv()==None` 收尾。
-8. **cost 共享**：`CostAggregate` 用 `Arc<Mutex<...>>` 在 `CostAccumulatorHook` / `BudgetControlAdapter` / `AgentHarnessOptions.cost` 间共享，`usage()` 读 live 状态。
-9. **崩溃恢复**：单进程独占，`TaskStore` 无跨进程锁；恢复语义=旧进程确认死后新进程 load + `validate_workflow` 重校验。
-10. **后端解耦**：runtime 只定义 trait（Sandbox/AuditSink/TraceExporter/McpClientHandle/...），具体后端在独立 crate 实现，dev-deps 拉来测试。
-
-## 6. 阅读顺序建议
-
+6. **sub-agent 通信**：`MessageBus` 统一管理 agent 注册表（`AgentEntry`）+ 事件通道（`SubAgentEvent` 广播）+ 消息路由（`send_message` → `SendReceipt`）。`AsyncSpawnHook` 在 should_stop 时排空 event channel。`IdleWatcher` 在 sub idle 时唤醒 main。
+7. **cost 共享**：`CostAggregate` 用 `Arc<Mutex<...>>` 在 `CostAccumulatorHook` / `BudgetControlAdapter` / `AgentHarnessOptions.cost` 间共享，`usage()` 读 live 状态。
+8. **崩溃恢复**：单进程独占，`TaskStore` 无跨进程锁；恢复语义=旧进程确认死后新进程 load + `validate_workflow` 重校验。
+9. **后端解耦**：runtime 只定义 trait（Sandbox/AuditSink/TraceExporter/McpClientHandle/...），具体后端在独立 crate 实现，dev-deps 拉来测试。
 1. `lib.rs`（模块清单）→ `control/cost.rs` / `lifecycle/task.rs`（基础类型）
 2. `builder.rs`（HarnessBuilder 是所有路径的汇聚点）
-3. `spawn/spawner.rs` + `spawn/async_spawn.rs` + `spawn/peer.rs`（sub-agent 派发 + 通信）
+3. `spawn/spawner.rs` + `spawn/message_bus.rs` + `spawn/delivery.rs`（sub-agent 派发 + 通信）
 4. `workflow/model.rs`（纯数据模型）→ `workflow/judge.rs` → `workflow/gate.rs` → `workflow/plan.rs`（编排外围）
 5. `workflow/engine.rs`（核心，~3000 行，最后精读）
 6. 横切 trait 模块按需读：`control/`（cost_hook/budget）、`observability/`（audit/tracer/tracing_adapter）、`platform/`（sandbox/resource/prompt/mcp/tool_registry/tool_adapter）

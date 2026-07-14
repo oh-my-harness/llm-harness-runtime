@@ -43,7 +43,7 @@ pub struct Event {
     pub details: Value,
 }
 
-/// 通用事件等待 tool。泛化 `WaitForPeerMessageTool` 的通用入口。
+/// 通用事件等待 tool。业务层注入 `EventStream`，tool 在 `execute` 里阻塞等待。
 ///
 /// task 调用此 tool 后，tool 在 `execute` 里 `stream.next().await` 阻塞。
 /// event 到达 → tool 返回 `ToolResult` → agent loop 自然进入下一个 turn 续跑。
