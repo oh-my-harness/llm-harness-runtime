@@ -1,6 +1,6 @@
 //! Rule 与 Decision。
 
-use crate::predicate::Predicate;
+use crate::rules::predicate::Predicate;
 
 /// 规则命中后的决策。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

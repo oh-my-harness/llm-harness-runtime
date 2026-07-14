@@ -13,6 +13,7 @@
 //! - Harness construction (`HarnessBuilder`)
 
 pub mod builder;
+pub mod rules;
 pub mod workflow;
 
 pub mod control;

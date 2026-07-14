@@ -1,7 +1,6 @@
-//! llm-harness-rules — 纯规则匹配层。
+//! 纯规则匹配层。
 //!
 //! 提供 `Predicate` trait、内置 predicate、`RuleChain`、`RuleBasedApprovalHook`。
-//! 只依赖 `llm-harness-types`，不依赖 runtime/agent。
 //! 可被任何实现 `BeforeToolCallHook` 的场景复用。
 
 pub mod chain;

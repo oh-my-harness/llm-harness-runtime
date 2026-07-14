@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::rule::{Decision, Rule};
+use crate::rules::rule::{Decision, Rule};
 
 /// 规则链。按顺序匹配，首个命中的 rule 的 Decision 生效。
 /// 全部不命中 → 返回 fallback（默认 Deny，fail-secure）。
@@ -64,7 +64,7 @@ impl RuleChainBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::predicates::Contains;
+    use crate::rules::predicates::Contains;
 
     #[test]
     fn first_match_wins_over_later() {

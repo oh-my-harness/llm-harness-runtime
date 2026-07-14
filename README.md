@@ -137,7 +137,6 @@ maturin build --release --target aarch64-apple-darwin --interpreter python3
 crates/
 ├── llm-harness-types/      # core type definitions
 ├── llm-harness-loop/       # agent loop
-├── llm-harness-rules/      # rules engine
 ├── llm-harness-agent/      # agent harness
 ├── llm-harness-runtime/    # runtime: workflow engine, executors, event stream, builder
 ├── llm-harness-runtime-sandbox-*/  # sandbox backends (bwrap, seatbelt, os)

@@ -5,8 +5,8 @@ use llm_harness_types::{
     BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook, ContentBlock, ToolResult,
 };
 
-use crate::chain::RuleChain;
-use crate::rule::Decision;
+use crate::rules::chain::RuleChain;
+use crate::rules::rule::Decision;
 
 /// 基于 `RuleChain` 的工具调用审批 hook。
 ///
@@ -42,8 +42,8 @@ impl BeforeToolCallHook for RuleBasedApprovalHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::predicates::Contains;
-    use crate::rule::Rule;
+    use crate::rules::predicates::Contains;
+    use crate::rules::rule::Rule;
     use llm_harness_types::AssistantMessage;
 
     /// 构造一个最小的 ctx。`msg` 必须比 ctx 活得久——调用方持有 msg。

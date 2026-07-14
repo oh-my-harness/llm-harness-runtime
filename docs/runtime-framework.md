@@ -27,6 +27,12 @@ agent  ──┘                ──→  runtime-audit-jsonl
 src/
 ├── lib.rs
 ├── builder.rs          # HarnessBuilder——所有路径汇聚点，留顶层
+├── rules/              # 规则匹配层（Predicate/Rule/RuleChain/RuleBasedApprovalHook）
+│   ├── predicate.rs    # Predicate trait
+│   ├── rule.rs         # Rule + Decision
+│   ├── chain.rs        # RuleChain + RuleChainBuilder
+│   ├── predicates.rs   # 内置 predicate：Contains/NumberRangeField/RegexField/RateLimit
+│   └── hook.rs         # RuleBasedApprovalHook（impl BeforeToolCallHook）
 ├── platform/           # 横切 trait + adapter（后端 crate 实现的接口）
 │   ├── sandbox.rs      # Sandbox trait + SandboxConfig/NetRule/ResourceLimits
 │   ├── resource.rs     # ResourceProvider trait + ResourceInjector
@@ -112,12 +118,12 @@ src/
 | `cost_hook.rs` | `CostAccumulatorHook`（`AfterProviderResponseHook`），写共享 `Arc<Mutex<CostAggregate>>`。 |
 | `budget.rs` | `BudgetExceededHook` trait（业务层）+ `BudgetControlAdapter`（`ShouldStopHook`，读 cost → 超限问 hook）。surveillance 模式只统计不停。 |
 
-人工审批不设独立 trait——业务层直接实现 `BeforeToolCallHook`，用核心 `Allow`/`Modify`/`Deny` 决策词汇 + `ToolResult.terminate`（true=硬拒绝, false=建议重试）覆盖全部审批语义。规则审批走 `llm-harness-rules` 的 `RuleBasedApprovalHook`。
+人工审批不设独立 trait——业务层直接实现 `BeforeToolCallHook`，用核心 `Allow`/`Modify`/`Deny` 决策词汇 + `ToolResult.terminate`（true=硬拒绝, false=建议重试）覆盖全部审批语义。规则审批走 `rules` 模块的 `RuleBasedApprovalHook`。
 
 ### 2.8 杂项
 | 模块 | 职责 |
 |---|---|
-| `lib.rs` | `pub mod` 声明：顶层 `builder`/`workflow` + 5 个分组 `control`/`lifecycle`/`observability`/`platform`/`spawn`。无 re-export，路径即物理路径。错误处理直接用 `anyhow::Result`，无独立 error 模块。 |
+| `lib.rs` | `pub mod` 声明：顶层 `builder`/`rules`/`workflow` + 5 个分组 `control`/`lifecycle`/`observability`/`platform`/`spawn`。无 re-export，路径即物理路径。错误处理直接用 `anyhow::Result`，无独立 error 模块。 |
 ## 3. 核心抽象 trait 清单
 
 runtime 定义的对外 trait（业务层/后端 crate 实现）：

@@ -2,14 +2,14 @@
 //! 流程门禁 hook。路径 1 下 LLM 物理上提不出越界，但保留 hook 作为兜底。
 //!
 //! 第一道闸：WorkflowGateHook（impl PrepareNextTurnHook）——主动收窄工具集。
-//! 第二道闸：RuleBasedApprovalHook（来自 llm-harness-rules）——兜底拦截。
+//! 第二道闸：RuleBasedApprovalHook（来自 rules 模块）——兜底拦截。
 //! 两道闸问同一个 step_tools 映射。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::rules::{Contains, Decision, Rule, RuleBasedApprovalHook, RuleChain};
 use futures::future::BoxFuture;
-use llm_harness_rules::{Contains, Decision, Rule, RuleBasedApprovalHook, RuleChain};
 use llm_harness_types::{AgentError, NextTurnDirective, PrepareNextTurnCtx, PrepareNextTurnHook};
 use tokio::sync::Mutex;
 

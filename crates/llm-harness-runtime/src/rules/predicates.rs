@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
-use crate::predicate::Predicate;
+use crate::rules::predicate::Predicate;
 
 /// 集合包含：tool_name ∈ allowed_tools。
 /// P0-A 流程引擎越界兜底就用这个（tool_name 是否在当前步 allowed_tools 里）。
