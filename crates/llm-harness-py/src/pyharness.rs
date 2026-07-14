@@ -531,4 +531,30 @@ impl PyAgentHarness {
         py.detach(move || rt.block_on(async move { harness.wait_for_settled().await }));
         Ok(())
     }
+
+    // ── Context manager ─────────────────────────────────────────────────────
+
+    /// Context manager entry: returns self for use in `with` statements.
+    ///
+    /// ```python
+    /// with HarnessBuilder("gpt-4o").provider("gpt-*", provider).build() as h:
+    ///     h.prompt("Hello!")
+    ///     for event in h.collect_until_settled():
+    ///         ...
+    /// ```
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    /// Context manager exit: aborts any in-progress prompt and returns.
+    /// Ensures clean shutdown when used with `with`.
+    fn __exit__(
+        &mut self,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        self.harness.abort();
+        Ok(false) // don't suppress exceptions
+    }
 }

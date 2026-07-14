@@ -58,6 +58,7 @@ fn llm_harness_py(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// Return the SDK version string.
 #[pyfunction]
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

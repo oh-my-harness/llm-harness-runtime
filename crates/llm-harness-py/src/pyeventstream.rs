@@ -62,6 +62,11 @@ impl PyWaitForExternalEventTool {
     }
 }
 
+/// Create a human-in-the-loop event channel.
+///
+/// Returns `(handle, wait_tool)`. Register `wait_tool` on the engine
+/// or harness; when the LLM calls it, execution pauses until
+/// `handle.submit(event_type, payload)` is called from another thread.
 #[pyfunction]
 pub fn create_event_channel(
     py: Python<'_>,

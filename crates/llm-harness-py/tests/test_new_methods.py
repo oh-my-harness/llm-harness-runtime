@@ -193,3 +193,48 @@ def test_harness_set_model():
     harness = _make_harness()
     harness.set_model("gpt-4o-mini")
     harness.set_model("claude-3-opus", context_window=200000, max_tokens=4096)
+
+
+# ── Context manager + docstrings ────────────────────────────────────────────
+
+def test_harness_context_manager():
+    """AgentHarness supports `with` statement."""
+    provider = lh.create_openai_provider(api_key="test-key")
+    harness = (
+        lh.HarnessBuilder("gpt-4o")
+        .provider("gpt-*", provider)
+        .system_prompt("You are helpful.")
+        .build()
+    )
+    with harness as h:
+        assert h is harness
+        assert h.phase() == "idle"
+    # After exit, harness is still usable
+    assert harness.phase() == "idle"
+
+
+def test_harness_context_manager_no_suppress():
+    """Context manager does not suppress exceptions."""
+    provider = lh.create_openai_provider(api_key="test-key")
+    harness = (
+        lh.HarnessBuilder("gpt-4o")
+        .provider("gpt-*", provider)
+        .build()
+    )
+    with pytest.raises(ValueError, match="test error"):
+        with harness:
+            raise ValueError("test error")
+
+
+def test_docstrings_present():
+    """Key functions and classes have docstrings."""
+    assert lh.version.__doc__ is not None
+    assert lh.create_tool.__doc__ is not None
+    assert lh.create_event_channel.__doc__ is not None
+    assert lh.create_openai_provider.__doc__ is not None
+    assert lh.WorkflowEngine.__doc__ is not None
+    assert lh.WorkflowEngine.run.__doc__ is not None
+    assert lh.WorkflowEngine.restore.__doc__ is not None
+    assert lh.AgentHarness.__doc__ is not None
+    assert lh.AgentHarness.prompt.__doc__ is not None
+    assert lh.HarnessBuilder.__doc__ is not None
