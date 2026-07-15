@@ -34,6 +34,7 @@ fn senza(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pyagent::PyAgent>()?;
     m.add_class::<event_stream::PyEventIterator>()?;
     m.add_class::<pyworkflow::PyJudgeWrapper>()?;
+    m.add_class::<pyworkflow::PyCompositeJudge>()?;
     m.add_class::<pyworkflow::PyExecutorWrapper>()?;
     m.add_class::<pyhooks::PyHookWrapper>()?;
     m.add_class::<pytool::PyToolWrapper>()?;
@@ -41,6 +42,7 @@ fn senza(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(create_sync_tool, m)?)?;
     m.add_function(wrap_pyfunction!(create_tool, m)?)?;
     m.add_function(wrap_pyfunction!(create_judge, m)?)?;
+    m.add_function(wrap_pyfunction!(create_composite_judge, m)?)?;
     m.add_function(wrap_pyfunction!(create_executor, m)?)?;
     m.add_function(wrap_pyfunction!(create_shell_executor, m)?)?;
     m.add_function(wrap_pyfunction!(create_http_executor, m)?)?;
@@ -140,9 +142,29 @@ fn create_judge<'py>(
 ) -> PyResult<Bound<'py, pyworkflow::PyJudgeWrapper>> {
     let judge = pyworkflow::PyJudge::new(callback);
     let wrapper = pyworkflow::PyJudgeWrapper {
-        judge: Arc::new(judge),
+        judge: Arc::new(judge) as Arc<dyn llm_harness_runtime::workflow::judge::StepTransitionJudge>,
     };
     Py::new(py, wrapper).map(|p| p.into_bound(py))
+}
+
+/// 创建一个 CompositeJudge，支持按节点注册独立路由函数。
+///
+/// 用法：
+/// ```python
+/// judge = senza.create_composite_judge()
+/// judge.on("step1", lambda ctx: "to:step2")
+/// judge.on("step2", lambda ctx: "abort:done" if ctx["output"] else "retry")
+/// judge.fallback(lambda ctx: "abort:done")  # 可选
+/// engine = senza.WorkflowEngine(workflow, provider, model, judge)
+/// ```
+///
+/// 未注册 `.on()` 的 step 会依次尝试：用户 fallback → 声明式 Expr 边 → Abort。
+/// 如果 workflow 有 Expr 条件边，引擎会自动注入 EdgeConditionJudge 作为 fallback。
+#[pyfunction]
+fn create_composite_judge<'py>(
+    py: Python<'py>,
+) -> PyResult<Bound<'py, pyworkflow::PyCompositeJudge>> {
+    Py::new(py, pyworkflow::PyCompositeJudge::new()).map(|p| p.into_bound(py))
 }
 
 /// 从 Python callable 创建一个 `StepExecutor`。

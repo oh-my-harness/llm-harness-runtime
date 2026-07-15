@@ -5,6 +5,7 @@
 //! `StepCtx`/`ExecutorCtx` 的借用字段在进入 `spawn_blocking` 前序列化为
 //! owned 数据，避免跨线程借用和 GIL 下 `.await` 死锁。
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,13 +17,14 @@ use llm_harness_runtime::spawn::spawner::{EnvFactory, JsonlSessionFactory};
 use llm_harness_runtime::workflow::engine::{WorkflowEngine, WorkflowEngineConfig, WorkflowEvent};
 use llm_harness_runtime::workflow::error::WorkflowError;
 use llm_harness_runtime::workflow::executor::{ExecutorCtx, StepExecutor};
-use llm_harness_runtime::workflow::judge::{StepCtx, StepTransitionJudge};
+use llm_harness_runtime::workflow::judge::{EdgeConditionJudge, StepCtx, StepTransitionJudge};
 use llm_harness_runtime::workflow::model::{
     Edge, EdgeCondition, Step, StepRecord, StepResult, Transition, Workflow, WorkflowStatus,
 };
 use llm_harness_types::{AgentError, CostAggregate, ExecutionEnv, Tool, UnsupportedEnv};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use serde_json::Value;
 
 use crate::pyagent::runtime;
 use crate::pyeventstream::PyWaitForExternalEventTool;
@@ -222,11 +224,166 @@ impl StepExecutor for PyExecutor {
 
 // ── Python 包装类 ───────────────────────────────────────────────────────────
 
-/// 持有 `PyJudge` 的不透明 Python 包装，供 Python 侧引用已注册的 judge。
+/// 持有 `StepTransitionJudge` 的不透明 Python 包装，供 Python 侧引用已注册的 judge。
+///
+/// 内部以 `Arc<dyn StepTransitionJudge>` 存储，因此可以包装 `PyJudge`（单 callback）、
+/// `PyCompositeJudgeInner`（多 handler 分发）等任何实现了 `StepTransitionJudge` 的类型。
 #[pyclass(name = "Judge")]
 pub struct PyJudgeWrapper {
-    pub judge: Arc<PyJudge>,
+    pub judge: Arc<dyn StepTransitionJudge>,
 }
+
+// ── PyCompositeJudge ────────────────────────────────────────────────────────
+
+/// Python 多 handler 分发 judge。
+///
+/// 内部维护 `HashMap<step_id, callback>` + 可选 fallback callback。
+/// 未注册的 step 如果 workflow 有声明式 Expr 边，引擎会自动注入 `EdgeConditionJudge`
+/// 作为 edge_fallback。
+pub struct PyCompositeJudgeInner {
+    handlers: std::sync::Mutex<HashMap<String, Py<PyAny>>>,
+    fallback: std::sync::Mutex<Option<Py<PyAny>>>,
+    edge_fallback: std::sync::Mutex<Option<EdgeConditionJudge>>,
+}
+
+impl PyCompositeJudgeInner {
+    pub fn new() -> Self {
+        Self {
+            handlers: std::sync::Mutex::new(HashMap::new()),
+            fallback: std::sync::Mutex::new(None),
+            edge_fallback: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn set_edge_fallback(&self, judge: EdgeConditionJudge) {
+        *self.edge_fallback.lock().unwrap() = Some(judge);
+    }
+}
+
+impl StepTransitionJudge for PyCompositeJudgeInner {
+    fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+        let step_id = ctx.current_step.id().to_string();
+
+        // 1. Try registered handler (async — calls Python)
+        if let Some(cb) = self.handlers.lock().unwrap().get(&step_id).cloned() {
+            let structured = ctx.last_result.structured.clone();
+            let output = ctx.last_result.output.clone();
+            let step_count = ctx.step_history.len();
+            return Box::pin(async move {
+                call_python_judge(&cb, &step_id, &output, &structured, step_count).await
+            });
+        }
+
+        // 2. Try user fallback callback (async — calls Python)
+        if let Some(cb) = self.fallback.lock().unwrap().clone() {
+            let structured = ctx.last_result.structured.clone();
+            let output = ctx.last_result.output.clone();
+            let step_count = ctx.step_history.len();
+            return Box::pin(async move {
+                call_python_judge(&cb, &step_id, &output, &structured, step_count).await
+            });
+        }
+
+        // 3. Try edge condition fallback (sync)
+        if let Some(edge_judge) = self.edge_fallback.lock().unwrap().clone() {
+            let transition = edge_judge.decide_sync(ctx);
+            return Box::pin(async move { transition });
+        }
+
+        // 4. No handler
+        let reason = format!("no handler registered for step '{}'", step_id);
+        Box::pin(async move { Transition::Abort { reason } })
+    }
+
+    fn is_noop(&self) -> bool {
+        false
+    }
+}
+
+/// Python wrapper for composite judge. Exposes `.on()` and `.fallback()`.
+#[pyclass(name = "CompositeJudge")]
+pub struct PyCompositeJudge {
+    inner: Arc<PyCompositeJudgeInner>,
+}
+
+#[pymethods]
+impl PyCompositeJudge {
+    /// Register a per-step routing handler.
+    ///
+    /// callback signature: `callback(ctx: dict) -> str`
+    /// Return value encoding: "to:<step_id>", "retry", "fail:<reason>", "abort:<reason>"
+    fn on(&self, step: &str, callback: Py<PyAny>) -> PyResult<()> {
+        self.inner.handlers.lock().unwrap().insert(step.to_string(), callback);
+        Ok(())
+    }
+
+    /// Set a fallback handler for steps without a registered `.on()` handler.
+    fn fallback(&self, callback: Py<PyAny>) -> PyResult<()> {
+        *self.inner.fallback.lock().unwrap() = Some(callback);
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        let count = self.inner.handlers.lock().unwrap().len();
+        format!("CompositeJudge(handlers={})", count)
+    }
+}
+
+impl PyCompositeJudge {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(PyCompositeJudgeInner::new()),
+        }
+    }
+
+    pub fn inner(&self) -> Arc<PyCompositeJudgeInner> {
+        self.inner.clone()
+    }
+}
+
+/// Shared helper: call a Python judge callback and parse the transition.
+async fn call_python_judge(
+    callback: &Py<PyAny>,
+    step_id: &str,
+    output: &str,
+    structured: &Option<Value>,
+    step_count: usize,
+) -> Transition {
+    let cb = callback.clone();
+    let structured = structured.clone();
+    let output = output.to_string();
+    let step_id = step_id.to_string();
+
+    let result = tokio::task::spawn_blocking(move || {
+        Python::attach(|py| {
+            let cb = cb.bind(py);
+            let dict = PyDict::new(py);
+            dict.set_item("step_id", &step_id)?;
+            dict.set_item("output", &output)?;
+            dict.set_item("step_count", step_count)?;
+            if let Some(s) = &structured {
+                dict.set_item("structured", value_to_pyobject(py, s)?)?;
+            } else {
+                dict.set_item("structured", py.None())?;
+            }
+            let raw = cb.call1((dict,))?;
+            let transition_str: String = raw.extract()?;
+            Ok::<_, PyErr>(transition_str)
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(s)) => parse_transition(&s),
+        Ok(Err(e)) => Transition::Abort {
+            reason: format!("judge callback error: {e}"),
+        },
+        Err(e) => Transition::Abort {
+            reason: format!("judge join failed: {e}"),
+        },
+    }
+}
+
 
 /// 持有 `StepExecutor` 的不透明 Python 包装，供 Python 侧引用已注册的 executor。
 ///
@@ -493,6 +650,38 @@ impl Plugin for PyPluginAdapter {
     }
 }
 
+
+/// Extract `Arc<dyn StepTransitionJudge>` from a Python judge object.
+///
+/// Accepts both `Judge` (from `create_judge()`) and `CompositeJudge`
+/// (from `create_composite_judge()`). For CompositeJudge, if the workflow
+/// has declarative Expr edges and no user fallback is set, auto-injects
+/// `EdgeConditionJudge` as the edge fallback.
+fn extract_judge(
+    _py: Python<'_>,
+    judge: &Bound<'_, PyAny>,
+    workflow: &Workflow,
+) -> PyResult<Arc<dyn StepTransitionJudge>> {
+    if let Ok(wrapper) = judge.extract::<PyRef<PyJudgeWrapper>>() {
+        return Ok(wrapper.judge.clone());
+    }
+    if let Ok(composite) = judge.extract::<PyRef<PyCompositeJudge>>() {
+        let inner = composite.inner();
+        // Auto-inject EdgeConditionJudge as fallback for unregistered steps
+        // if the workflow has Expr edges.
+        let has_expr_edges = workflow.edges.iter().any(|e| {
+            matches!(e.condition, Some(EdgeCondition::Expr(_)))
+        });
+        if has_expr_edges {
+            inner.set_edge_fallback(EdgeConditionJudge::from_workflow(workflow));
+        }
+        return Ok(inner as Arc<dyn StepTransitionJudge>);
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "judge must be created by create_judge() or create_composite_judge()",
+    ))
+}
+
 // ── Type conversion helpers ─────────────────────────────────────────────────
 
 /// 将 `WorkflowStatus` 转为小写字符串。
@@ -632,12 +821,12 @@ impl PyWorkflowEngine {
         workflow_dict: &Bound<'_, PyDict>,
         provider: &Bound<'_, PyProvider>,
         model: &str,
-        judge: &Bound<'_, PyJudgeWrapper>,
+        judge: &Bound<'_, PyAny>,
         session_base_dir: &str,
     ) -> PyResult<Self> {
         let workflow = dict_to_workflow(workflow_dict)?;
         let client = provider.borrow().client.clone();
-        let judge_arc: Arc<dyn StepTransitionJudge> = judge.borrow().judge.clone();
+        let judge_arc: Arc<dyn StepTransitionJudge> = extract_judge(py, judge, &workflow)?;
 
         let config = WorkflowEngineConfig {
             client,
@@ -673,13 +862,16 @@ impl PyWorkflowEngine {
         task_id: &str,
         provider: &Bound<'_, PyProvider>,
         model: &str,
-        judge: &Bound<'_, PyJudgeWrapper>,
+        judge: &Bound<'_, PyAny>,
         session_base_dir: &str,
     ) -> PyResult<Self> {
         let store = Arc::new(JsonlTaskStore::new(PathBuf::from(task_store_dir)));
         let task_id = TaskId(task_id.to_string());
         let client = provider.borrow().client.clone();
-        let judge_arc: Arc<dyn StepTransitionJudge> = judge.borrow().judge.clone();
+        // For restore, we don't have the workflow dict to auto-inject edge fallback.
+        // The user should re-register handlers on a new CompositeJudge if needed.
+        let empty_workflow = Workflow { entry_step: String::new(), steps: vec![], edges: vec![] };
+        let judge_arc: Arc<dyn StepTransitionJudge> = extract_judge(py, judge, &empty_workflow)?;
 
         let config = WorkflowEngineConfig {
             client,

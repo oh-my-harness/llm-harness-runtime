@@ -4,9 +4,12 @@
 use futures::future::BoxFuture;
 use serde_json::Value;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::workflow::model::{
-    ConditionExpr, Edge, EdgeCondition, Step, StepRecord, StepResult, Transition, Workflow,
-    WorkflowContext,
+    ConditionExpr, Edge, EdgeCondition, Step, StepId, StepRecord, StepResult, Transition,
+    Workflow, WorkflowContext,
 };
 
 /// 传递给 `StepTransitionJudge::decide` 的上下文。
@@ -66,7 +69,8 @@ impl StepTransitionJudge for NoopJudge {
 /// It evaluates structured edge conditions against `StepResult.structured`.
 /// String labels are intentionally treated as custom-judge labels and are not
 /// guessed by this judge.
-pub(crate) struct EdgeConditionJudge {
+#[derive(Clone)]
+pub struct EdgeConditionJudge {
     edges: Vec<Edge>,
 }
 
@@ -79,7 +83,12 @@ impl EdgeConditionJudge {
         Self::new(workflow.edges.clone())
     }
 
-    fn decide_sync(&self, ctx: &StepCtx<'_>) -> Transition {
+    /// Return a clone of the internal edges vec.
+    pub fn clone_edges(&self) -> Vec<Edge> {
+        self.edges.clone()
+    }
+
+    pub fn decide_sync(&self, ctx: &StepCtx<'_>) -> Transition {
         let outgoing: Vec<&Edge> = self
             .edges
             .iter()
@@ -143,6 +152,74 @@ impl StepTransitionJudge for EdgeConditionJudge {
     }
 }
 
+/// Composite judge: dispatches to per-step handlers instead of one big decide.
+///
+/// Register a handler for each step that needs custom routing logic.
+/// Steps without a registered handler fall through to the fallback
+/// (user-set handler, EdgeConditionJudge, or Abort).
+pub struct CompositeJudge {
+    handlers: HashMap<StepId, Arc<dyn Fn(&StepCtx) -> Transition + Send + Sync>>,
+    fallback: Option<Arc<dyn Fn(&StepCtx) -> Transition + Send + Sync>>,
+    edge_fallback: Option<EdgeConditionJudge>,
+}
+
+impl Default for CompositeJudge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CompositeJudge {
+    pub fn new() -> Self {
+        Self {
+            handlers: HashMap::new(),
+            fallback: None,
+            edge_fallback: None,
+        }
+    }
+
+    /// Register a routing handler for a specific step.
+    pub fn on<F>(&mut self, step: &str, f: F) -> &mut Self
+    where
+        F: Fn(&StepCtx) -> Transition + Send + Sync + 'static,
+    {
+        self.handlers.insert(step.to_string(), Arc::new(f));
+        self
+    }
+
+    /// Set a fallback handler for steps without a registered handler.
+    pub fn fallback_fn<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&StepCtx) -> Transition + Send + Sync + 'static,
+    {
+        self.fallback = Some(Arc::new(f));
+        self
+    }
+
+    /// Set `EdgeConditionJudge` as the fallback for unregistered steps.
+    pub fn set_edge_fallback(&mut self, judge: EdgeConditionJudge) {
+        self.edge_fallback = Some(judge);
+    }
+}
+
+impl StepTransitionJudge for CompositeJudge {
+    fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+        let step_id = ctx.current_step.id().as_str();
+        let transition = if let Some(handler) = self.handlers.get(step_id) {
+            handler(ctx)
+        } else if let Some(fb) = &self.fallback {
+            fb(ctx)
+        } else if let Some(edge) = &self.edge_fallback {
+            edge.decide_sync(ctx)
+        } else {
+            Transition::Abort {
+                reason: format!("no handler registered for step '{}'", step_id),
+            }
+        };
+        Box::pin(async move { transition })
+    }
+}
+
 fn evaluate_condition(expr: &ConditionExpr, structured: Option<&Value>) -> bool {
     match expr {
         ConditionExpr::Exists { pointer } => read_structured_pointer(structured, pointer).is_some(),
@@ -189,6 +266,93 @@ fn compare_number(
 mod tests {
     use super::*;
     use crate::control::cost::CostAggregate;
+
+    fn make_step_with_id(id: &str) -> Step {
+        Step::llm(id, id, "do", vec![])
+    }
+
+    #[tokio::test]
+    async fn composite_judge_dispatches_to_registered_handler() {
+        let mut judge = CompositeJudge::new();
+        judge.on("s1", |_| Transition::To("next".into()));
+        judge.on("s2", |_| Transition::Retry);
+
+        let step = make_step_with_id("s1");
+        let result = make_result();
+        let ctx = StepCtx {
+            current_step: &step,
+            last_result: &result,
+            step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
+        };
+        let t = judge.decide(&ctx).await;
+        assert!(matches!(t, Transition::To(id) if id == "next"));
+
+        let step2 = make_step_with_id("s2");
+        let ctx2 = StepCtx {
+            current_step: &step2,
+            last_result: &result,
+            step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
+        };
+        let t2 = judge.decide(&ctx2).await;
+        assert!(matches!(t2, Transition::Retry));
+    }
+
+    #[tokio::test]
+    async fn composite_judge_aborts_for_unregistered_step_without_fallback() {
+        let mut judge = CompositeJudge::new();
+        judge.on("s1", |_| Transition::To("next".into()));
+
+        let step = make_step_with_id("unknown");
+        let result = make_result();
+        let ctx = StepCtx {
+            current_step: &step,
+            last_result: &result,
+            step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
+        };
+        let t = judge.decide(&ctx).await;
+        assert!(matches!(t, Transition::Abort { reason } if reason.contains("no handler")));
+    }
+
+    #[tokio::test]
+    async fn composite_judge_uses_fallback_fn_for_unregistered_step() {
+        let mut judge = CompositeJudge::new();
+        judge.on("s1", |_| Transition::To("next".into()));
+        let judge = judge.fallback_fn(|_| Transition::Fail { reason: "fb".into() });
+
+        let step = make_step_with_id("unknown");
+        let result = make_result();
+        let ctx = StepCtx {
+            current_step: &step,
+            last_result: &result,
+            step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
+        };
+        let t = judge.decide(&ctx).await;
+        assert!(matches!(t, Transition::Fail { reason } if reason == "fb"));
+    }
+
+    #[tokio::test]
+    async fn composite_judge_uses_edge_fallback() {
+        let mut judge = CompositeJudge::new();
+        judge.on("custom", |_| Transition::To("handled".into()));
+        judge.set_edge_fallback(EdgeConditionJudge::new(vec![edge("next", None)]));
+
+        // Unregistered step "s1" → edge fallback → unconditional edge to "next"
+        let step = make_step_with_id("s1");
+        let result = make_result();
+        let ctx = StepCtx {
+            current_step: &step,
+            last_result: &result,
+            step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
+        };
+        let t = judge.decide(&ctx).await;
+        assert!(matches!(t, Transition::To(id) if id == "next"));
+    }
+
 
     fn make_step() -> Step {
         Step::llm("s1", "Step 1", "do step 1", vec![])
