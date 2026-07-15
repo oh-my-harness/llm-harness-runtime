@@ -21,6 +21,7 @@ use crate::control::cost::CostAggregate;
 use crate::lifecycle::task::{Checkpoint, TaskError, TaskId, TaskResult};
 use crate::lifecycle::task_store::TaskStore;
 use crate::spawn::spawner::{EnvFactory, HarnessSubAgentSpawner, SessionFactory};
+use crate::workflow::error::WorkflowError;
 use crate::workflow::executor::{ExecutorCtx, StepExecutor, builtin_executors};
 use crate::workflow::judge::{EdgeConditionJudge, NoopJudge, StepCtx, StepTransitionJudge};
 use crate::workflow::model::{
@@ -28,7 +29,6 @@ use crate::workflow::model::{
     WorkflowState, WorkflowStatus,
 };
 use crate::workflow::plan::validate_workflow;
-use anyhow::Result;
 
 /// broadcast channel 容量。步骤级事件频率低，overflow 时丢弃旧事件（比阻塞 run 好）。
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -392,7 +392,7 @@ impl WorkflowEngine {
         workflow: Workflow,
         config: WorkflowEngineConfig,
         judge: Arc<dyn StepTransitionJudge>,
-    ) -> Result<Self> {
+    ) -> Result<Self, WorkflowError> {
         validate_workflow(&workflow)?;
         let judge = default_declarative_judge(&workflow, judge);
         Ok(Self::from_parts(workflow, config, judge, None))
@@ -408,7 +408,7 @@ impl WorkflowEngine {
         prompt: String,
         allowed_tools: Vec<String>,
         config: WorkflowEngineConfig,
-    ) -> Result<Self> {
+    ) -> Result<Self, WorkflowError> {
         let workflow = Workflow {
             entry_step: "run".into(),
             steps: vec![Step::llm("run", "run", prompt, allowed_tools)],
@@ -424,17 +424,19 @@ impl WorkflowEngine {
         task_id: TaskId,
         config: WorkflowEngineConfig,
         judge: Arc<dyn StepTransitionJudge>,
-    ) -> Result<Self> {
-        let workflow = store.load_workflow(&task_id).await?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "restore: workflow not found in store for task {}",
-                task_id.0
-            )
-        })?;
+    ) -> Result<Self, WorkflowError> {
+        let workflow = store
+            .load_workflow(&task_id)
+            .await?
+            .ok_or_else(|| WorkflowError::WorkflowNotFound {
+                task_id: task_id.0.clone(),
+            })?;
         // 信任边界外数据：恢复后同样校验。
         validate_workflow(&workflow)?;
         let judge = default_declarative_judge(&workflow, judge);
-        let saved_state = store.load_workflow_state(&task_id).await?;
+        let saved_state = store
+            .load_workflow_state(&task_id)
+            .await?;
         let state = saved_state.unwrap_or_else(|| WorkflowState::new(workflow.entry_step.clone()));
         let engine = Self::from_parts_with_state(
             workflow,
@@ -586,7 +588,7 @@ impl WorkflowEngine {
     }
 
     /// 启动/恢复执行。
-    pub async fn run(&self) -> Result<TaskResult> {
+    pub async fn run(&self) -> Result<TaskResult, WorkflowError> {
         enum StartupAction {
             Continue,
             Return(TaskResult),
@@ -595,7 +597,7 @@ impl WorkflowEngine {
 
         // 重入守卫：防止并发 run() 覆盖写。
         if self.running.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            anyhow::bail!("run: task is already running (concurrent run() detected)");
+            return Err(WorkflowError::AlreadyRunning);
         }
 
         // 1. 翻转 status → Running，落盘。
@@ -655,10 +657,9 @@ impl WorkflowEngine {
                 _ => {
                     self.running
                         .store(false, std::sync::atomic::Ordering::SeqCst);
-                    anyhow::bail!(
-                        "run: task is not Idle/Paused/Running (status={:?})",
-                        state.status
-                    );
+                    return Err(WorkflowError::InvalidStatus {
+                        status: state.status.clone(),
+                    });
                 }
             }
             // 持锁期间只构造快照，drop 锁后再做文件 I/O。
@@ -669,7 +670,9 @@ impl WorkflowEngine {
         };
         // 若有 task_store，保存 workflow 定义（供 restore 重建）。
         if let Some(store) = &self.task_store {
-            store.save_workflow(&self.task_id, &self.workflow).await?;
+            store
+                .save_workflow(&self.task_id, &self.workflow)
+                .await?;
         }
 
         // RAII 守卫：无论 run_loop 正常返回、Err 还是 panic，都清除重入标志。
@@ -688,13 +691,13 @@ impl WorkflowEngine {
                 let _ = self.event_tx.send(WorkflowEvent::Failed {
                     error: error.clone(),
                 });
-                anyhow::bail!(error)
+                Err(WorkflowError::TaskFailed(error))
             }
         }
     }
 
     /// run() 的主循环。拆出以降低 run() 圈复杂度。
-    async fn run_loop(&self) -> Result<TaskResult> {
+    async fn run_loop(&self) -> Result<TaskResult, WorkflowError> {
         loop {
             // 2. 取 current_step + 检查 max_steps（合并为一次锁获取）。
             let (current_step_id, history_len) = {
@@ -706,8 +709,8 @@ impl WorkflowEngine {
                 .steps
                 .iter()
                 .find(|s| s.id() == &current_step_id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("run: current_step '{}' not in workflow", current_step_id)
+                .ok_or_else(|| WorkflowError::CurrentStepNotFound {
+                    step_id: current_step_id.clone(),
                 })?
                 .clone();
 
@@ -818,7 +821,7 @@ impl WorkflowEngine {
         }
     }
 
-    async fn pause_if_requested(&self) -> Result<()> {
+    async fn pause_if_requested(&self) -> Result<(), WorkflowError> {
         if !self
             .pause_requested
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -845,7 +848,7 @@ impl WorkflowEngine {
         let _ = self.event_tx.send(WorkflowEvent::Paused {
             reason: reason.clone(),
         });
-        Err(TaskError::Paused(reason).into())
+        Err(WorkflowError::Paused(reason))
     }
 
     /// 判断 transition：自由 task 直接 Abort，否则调 judge.decide。
@@ -869,7 +872,7 @@ impl WorkflowEngine {
 
     /// 统一的 task 失败处理：置 Failed + error + ended_at + persist + 事件 + bail。
     /// 消除 run()/apply_transition 中重复的错误处理模式。
-    async fn fail_task(&self, error_msg: String) -> Result<TaskResult> {
+    async fn fail_task(&self, error_msg: String) -> Result<TaskResult, WorkflowError> {
         let mut state = self.workflow_state.lock().await;
         state.status = WorkflowStatus::Failed;
         state.error = Some(TaskError::Internal(error_msg.clone()));
@@ -880,11 +883,15 @@ impl WorkflowEngine {
         let _ = self.event_tx.send(WorkflowEvent::Failed {
             error: error_msg.clone(),
         });
-        anyhow::bail!(error_msg)
+        Err(WorkflowError::TaskFailed(error_msg))
     }
 
     /// Dispatch one workflow step by kind.
-    async fn run_step(&self, step: &Step, step_abort: CancellationToken) -> Result<StepResult> {
+    async fn run_step(
+        &self,
+        step: &Step,
+        step_abort: CancellationToken,
+    ) -> Result<StepResult, WorkflowError> {
         match step {
             Step::Llm { .. } => self.run_llm_step(step, step_abort).await,
             Step::Executor { .. } => self.run_executor_step(step, step_abort).await,
@@ -900,7 +907,7 @@ impl WorkflowEngine {
         &self,
         step: &Step,
         step_abort: CancellationToken,
-    ) -> Result<StepResult> {
+    ) -> Result<StepResult, WorkflowError> {
         let policy = step.policy().cloned().unwrap_or_default();
         let max_attempts = policy.max_attempts.unwrap_or(1).max(1);
         let timeout = policy.timeout_ms.map(Duration::from_millis);
@@ -908,7 +915,9 @@ impl WorkflowEngine {
 
         for attempt in 1..=max_attempts {
             if step_abort.is_cancelled() {
-                anyhow::bail!("step '{}' aborted", step.id());
+                return Err(WorkflowError::StepAborted {
+                    id: step.id().to_string(),
+                });
             }
             let attempt_abort = step_abort.child_token();
             let result = self
@@ -925,17 +934,16 @@ impl WorkflowEngine {
                         if max_attempts == 1 {
                             return Err(err);
                         }
-                        anyhow::bail!(
-                            "step '{}' failed after {} attempts: {}",
-                            step.id(),
+                        return Err(WorkflowError::StepExhausted {
+                            id: step.id().to_string(),
                             max_attempts,
-                            err
-                        );
+                            source: err.into(),
+                        });
                     }
                     if !retry_backoff.is_zero() {
                         tokio::select! {
                             biased;
-                            _ = step_abort.cancelled() => anyhow::bail!("step '{}' aborted", step.id()),
+                            _ = step_abort.cancelled() => return Err(WorkflowError::StepAborted { id: step.id().to_string() }),
                             _ = tokio::time::sleep(retry_backoff) => {}
                         }
                     }
@@ -951,21 +959,20 @@ impl WorkflowEngine {
         step: &Step,
         attempt_abort: CancellationToken,
         timeout: Option<Duration>,
-    ) -> Result<StepResult> {
+    ) -> Result<StepResult, WorkflowError> {
         let Some(timeout) = timeout else {
             return self.run_step(step, attempt_abort).await;
         };
         tokio::select! {
             biased;
-            _ = attempt_abort.cancelled() => anyhow::bail!("step '{}' aborted", step.id()),
+            _ = attempt_abort.cancelled() => Err(WorkflowError::StepAborted { id: step.id().to_string() }),
             result = self.run_step(step, attempt_abort.clone()) => result,
             _ = tokio::time::sleep(timeout) => {
                 attempt_abort.cancel();
-                anyhow::bail!(
-                    "step '{}' timed out after {} ms",
-                    step.id(),
-                    timeout.as_millis()
-                )
+                Err(WorkflowError::StepTimeout {
+                    id: step.id().to_string(),
+                    timeout_ms: timeout.as_millis() as u64,
+                })
             }
         }
     }
@@ -975,22 +982,25 @@ impl WorkflowEngine {
         &self,
         step: &Step,
         step_abort: CancellationToken,
-    ) -> Result<StepResult> {
+    ) -> Result<StepResult, WorkflowError> {
         let Step::Executor { executor_name, .. } = step else {
-            anyhow::bail!("run_executor_step called with non-executor step");
+            return Err(WorkflowError::Internal(
+                "run_executor_step called with non-executor step".into(),
+            ));
         };
         let executor = self
             .step_executors
             .get(executor_name)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("executor '{}' not registered", executor_name))?;
+            .ok_or_else(|| WorkflowError::ExecutorNotFound {
+                name: executor_name.clone(),
+            })?;
         let started_at = chrono::Utc::now();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let env = self
             .config
             .env_factory
-            .create(&cwd)
-            .map_err(|e| anyhow::anyhow!("env_factory: {e}"))?;
+            .create(&cwd)?;
         let history = self.workflow_state.lock().await.step_history.clone();
         let prev_result = history.last().and_then(|record| record.result.as_ref());
         let ctx = ExecutorCtx {
@@ -1004,9 +1014,9 @@ impl WorkflowEngine {
         let mut result = tokio::select! {
             biased;
             _ = step_abort.cancelled() => {
-                anyhow::bail!("executor step aborted");
+                return Err(WorkflowError::StepAborted { id: step.id().to_string() });
             }
-            r = executor.execute(&ctx) => r?,
+            r = executor.execute(&ctx) => r.map_err(|e| WorkflowError::StepFailed { id: step.id().to_string(), source: e })?,
         };
         let ended_at = chrono::Utc::now();
         if result.started_at.is_none() {
@@ -1022,14 +1032,20 @@ impl WorkflowEngine {
     }
 
     /// 跑 LLM step：构造 harness + prompt + 收集结果。
-    async fn run_llm_step(&self, step: &Step, step_abort: CancellationToken) -> Result<StepResult> {
+    async fn run_llm_step(
+        &self,
+        step: &Step,
+        step_abort: CancellationToken,
+    ) -> Result<StepResult, WorkflowError> {
         let Step::Llm {
             prompt,
             allowed_tools,
             ..
         } = step
         else {
-            anyhow::bail!("run_llm_step called with non-LLM step");
+            return Err(WorkflowError::Internal(
+                "run_llm_step called with non-LLM step".into(),
+            ));
         };
         // 记录真实开始时间（用于 StepRecord）。
         let started_at = chrono::Utc::now();
@@ -1039,14 +1055,12 @@ impl WorkflowEngine {
         let env = self
             .config
             .env_factory
-            .create(&cwd)
-            .map_err(|e| anyhow::anyhow!("env_factory: {e}"))?;
+            .create(&cwd)?;
         let (storage, session_id) = self
             .config
             .session_factory
             .create(&self.config.session_base_dir, &self.config.model)
-            .await
-            .map_err(|e| anyhow::anyhow!("session_factory: {e}"))?;
+            .await?;
 
         // b. 构造 builder。
         let mut builder = HarnessBuilder::new(&self.config.model)
@@ -1147,7 +1161,10 @@ impl WorkflowEngine {
         let harness = Arc::new(
             builder
                 .build_with_session(env, Session::new(storage))
-                .map_err(|e: HarnessBuildError| anyhow::anyhow!("build harness: {e}"))?,
+                .map_err(|e: HarnessBuildError| WorkflowError::StepFailed {
+                    id: step.id().to_string(),
+                    source: e.into(),
+                })?,
         );
         harness.set_abort_token(step_abort.clone());
         if let Some((async_hook, bus)) = post_build_spawn_setup {
@@ -1258,23 +1275,25 @@ impl WorkflowEngine {
         // the actual error (e.g. LLM failure, storage error).
         let prompt_result = prompt_task
             .await
-            .map_err(|e| anyhow::anyhow!("prompt task panicked: {e}"))?;
+            .map_err(|e| WorkflowError::Internal(format!("prompt task panicked: {e}")))?;
         if aborted {
             // step_abort 被 cancel：正常中止，不是 harness 异常退出。
             // prompt() 返回 Ok（drive_loop 将 abort 视为信号而非错误）；
             // 丢弃部分 output，向上报错让调用方决定重试或终止。
             prompt_result?;
-            anyhow::bail!("run_llm_step: step '{}' aborted", step.id());
+            return Err(WorkflowError::StepAborted {
+                id: step.id().to_string(),
+            });
         }
         if !settled {
             // channel 关闭但未收到 Settled 或 Aborted：harness 异常退出。
             // If prompt() returned an error, propagate that (more specific).
             // Otherwise, report the generic sentinel-missing error.
             prompt_result?;
-            anyhow::bail!(
+            return Err(WorkflowError::Internal(format!(
                 "run_llm_step: event stream closed before Settled (step '{}')",
                 step.id()
-            );
+            )));
         }
         let cost = harness.usage();
         let ended_at = chrono::Utc::now();
@@ -1312,12 +1331,14 @@ impl WorkflowEngine {
 
     /// 持久化 WorkflowState（若有 task_store）。
     /// 调用方应在 drop 锁后调用（传入 snapshot），避免持锁 await I/O。
-    async fn persist_state(&self, state: &WorkflowState) -> Result<()> {
+    async fn persist_state(&self, state: &WorkflowState) -> Result<(), WorkflowError> {
         // 同步共享 context 快照进 state，保证落盘的是最新 context。
         let mut state = state.clone();
         state.context = self.context_snapshot().await;
         if let Some(store) = &self.task_store {
-            store.save_workflow_state(&self.task_id, &state).await?;
+            store
+                .save_workflow_state(&self.task_id, &state)
+                .await?;
         }
         Ok(())
     }
@@ -1331,7 +1352,7 @@ impl WorkflowEngine {
         step: &Step,
         step_result: StepResult,
         transition: Transition,
-    ) -> Result<Option<StepId>> {
+    ) -> Result<Option<StepId>, WorkflowError> {
         let mut state = self.workflow_state.lock().await;
 
         // cancel 守卫：cancel() 已抢先置 Cancelled，不推 record、不覆盖状态。
@@ -1361,7 +1382,7 @@ impl WorkflowEngine {
                     let snapshot = state.clone();
                     drop(state);
                     self.persist_state(&snapshot).await?;
-                    anyhow::bail!(msg);
+                    return Err(WorkflowError::TaskFailed(msg));
                 }
                 let reachable = self
                     .workflow
@@ -1381,7 +1402,7 @@ impl WorkflowEngine {
                     let snapshot = state.clone();
                     drop(state);
                     self.persist_state(&snapshot).await?;
-                    anyhow::bail!(msg);
+                    return Err(WorkflowError::TaskFailed(msg));
                 }
                 let snapshot = state.clone();
                 drop(state);
@@ -1413,7 +1434,7 @@ impl WorkflowEngine {
                     let snapshot = state.clone();
                     drop(state);
                     self.persist_state(&snapshot).await?;
-                    anyhow::bail!(msg);
+                    return Err(WorkflowError::TaskFailed(msg));
                 }
                 let snapshot = state.clone();
                 drop(state);
@@ -1454,7 +1475,7 @@ impl WorkflowEngine {
     }
 
     /// 非阻塞：设 pause_requested 标志即返回。run() 在步边界检查并消费。
-    pub fn pause(&self, reason: &str) -> Result<()> {
+    pub fn pause(&self, reason: &str) -> Result<(), WorkflowError> {
         self.pause_requested
             .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut r) = self.pause_reason.lock() {
@@ -1477,7 +1498,7 @@ impl WorkflowEngine {
     /// step executor is responsible for deciding whether to recompute — a
     /// resumed `Failed` step will be re-driven by `run_loop`, and the executor
     /// decides to skip/recompute based on its own domain markers.
-    pub async fn resume(&self) -> Result<()> {
+    pub async fn resume(&self) -> Result<(), WorkflowError> {
         let mut state = self.workflow_state.lock().await;
         match state.status {
             WorkflowStatus::Paused => {}
@@ -1490,7 +1511,9 @@ impl WorkflowEngine {
                 state.ended_at = None;
             }
             ref s => {
-                anyhow::bail!("resume: task is not Paused/Failed (status={:?})", s);
+                return Err(WorkflowError::InvalidStatus {
+                    status: s.clone(),
+                });
             }
         }
         self.pause_requested
@@ -1517,7 +1540,7 @@ impl WorkflowEngine {
     /// cancel 只需置 Cancelled 状态 + reason，避免双记录导致 cost 双计。
     /// 若 apply_transition 尚未执行（record 最后一条不是 current_step），
     /// cancel 推入 { result: None, transition: Abort } 记录保证审计链完整。
-    pub async fn cancel(&self, reason: &str) -> Result<()> {
+    pub async fn cancel(&self, reason: &str) -> Result<(), WorkflowError> {
         if let Some(token) = self.current_abort.lock().await.take() {
             token.cancel();
         }
@@ -1553,7 +1576,7 @@ impl WorkflowEngine {
         Ok(())
     }
 
-    pub async fn checkpoint(&self, description: &str, payload: Value) -> Result<()> {
+    pub async fn checkpoint(&self, description: &str, payload: Value) -> Result<(), WorkflowError> {
         let cp = {
             let mut cps = self.checkpoints.lock().await;
             let seq = cps.len();
@@ -1568,7 +1591,9 @@ impl WorkflowEngine {
         };
         // I/O 在锁外执行。
         if let Some(store) = &self.task_store {
-            store.save_checkpoint(&self.task_id, &cp).await?;
+            store
+                .save_checkpoint(&self.task_id, &cp)
+                .await?;
         }
         Ok(())
     }
@@ -1674,6 +1699,7 @@ impl Plugin for HookPlugin {
 mod engine_tests {
     use super::*;
     use crate::spawn::spawner::JsonlSessionFactory;
+    use anyhow::Result; // StepExecutor::execute returns anyhow::Result
     use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
     use llm_harness_types::AgentError;
     use llm_harness_types::ExecutionEnv;
@@ -2792,11 +2818,7 @@ mod engine_tests {
         engine.pause("operator checkpoint").unwrap();
 
         let err = engine.run().await.unwrap_err();
-        let paused = err
-            .downcast_ref::<TaskError>()
-            .expect("pause should return TaskError::Paused");
-
-        assert!(matches!(paused, TaskError::Paused(reason) if reason == "operator checkpoint"));
+        assert!(matches!(err, WorkflowError::Paused(reason) if reason == "operator checkpoint"));
         assert_eq!(engine.state().await, WorkflowStatus::Paused);
         assert_eq!(engine.current_step().await, "s2");
         assert_eq!(engine.step_history().await.len(), 1);
@@ -2936,7 +2958,7 @@ mod engine_tests {
         assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
 
         let err = engine.resume().await.unwrap_err();
-        assert!(err.to_string().contains("not Paused/Failed"));
+        assert!(matches!(err, WorkflowError::InvalidStatus { .. }));
     }
 
     /// #36: restore() a persisted Failed task, then resume() + run() recovers.

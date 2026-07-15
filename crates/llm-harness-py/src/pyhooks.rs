@@ -138,7 +138,7 @@ impl BeforeTurnHook for PyBeforeTurnHook {
             })
             .await;
             if let Err(e) = result {
-                eprintln!("[llm-harness-py] BeforeTurnHook error: {e}");
+                tracing::warn!("BeforeTurnHook error: {e}");
             }
         })
     }
@@ -185,7 +185,7 @@ impl AfterTurnHook for PyAfterTurnHook {
             })
             .await;
             if let Err(e) = result {
-                eprintln!("[llm-harness-py] AfterTurnHook error: {e}");
+                tracing::warn!("AfterTurnHook error: {e}");
             }
         })
     }
@@ -355,7 +355,7 @@ impl AfterProviderResponseHook for PyAfterProviderResponseHook {
             })
             .await;
             if let Err(e) = result {
-                eprintln!("[llm-harness-py] AfterProviderResponseHook error: {e}");
+                tracing::warn!("AfterProviderResponseHook error: {e}");
             }
         })
     }
@@ -429,7 +429,7 @@ impl BeforeProviderRequestHook for PyBeforeProviderRequestHook {
             })
             .await;
             if let Err(e) = result {
-                eprintln!("[llm-harness-py] BeforeProviderRequestHook error: {e}");
+                tracing::warn!("BeforeProviderRequestHook error: {e}");
             }
         })
     }
@@ -490,7 +490,7 @@ impl BeforeToolCallHook for PyBeforeToolCallHook {
             match result {
                 Ok(Ok(d)) => d,
                 Ok(Err(e)) => {
-                    eprintln!("[llm-harness-py] BeforeToolCallHook error: {e}");
+                    tracing::warn!("BeforeToolCallHook error: {e}");
                     // Fail-closed: deny tool call on callback error
                     BeforeToolCallDecision::Deny(ToolResult {
                         content: vec![],
@@ -499,7 +499,7 @@ impl BeforeToolCallHook for PyBeforeToolCallHook {
                     })
                 }
                 Err(e) => {
-                    eprintln!("[llm-harness-py] BeforeToolCallHook join error: {e}");
+                    tracing::warn!("BeforeToolCallHook join error: {e}");
                     BeforeToolCallDecision::Deny(ToolResult {
                         content: vec![],
                         details: Value::Null,
@@ -647,11 +647,11 @@ impl AfterToolCallHook for PyAfterToolCallHook {
             match decision {
                 Ok(Ok(d)) => d,
                 Ok(Err(e)) => {
-                    eprintln!("[llm-harness-py] AfterToolCallHook error: {e}");
+                    tracing::warn!("AfterToolCallHook error: {e}");
                     AfterToolCallDecision::Passthrough
                 }
                 Err(e) => {
-                    eprintln!("[llm-harness-py] AfterToolCallHook join error: {e}");
+                    tracing::warn!("AfterToolCallHook join error: {e}");
                     AfterToolCallDecision::Passthrough
                 }
             }
@@ -751,11 +751,11 @@ impl ShouldStopHook for PyShouldStopHook {
             match result {
                 Ok(Ok(b)) => b,
                 Ok(Err(e)) => {
-                    eprintln!("[llm-harness-py] ShouldStopHook error: {e}");
+                    tracing::warn!("ShouldStopHook error: {e}");
                     true // fail-safe: stop on error
                 }
                 Err(e) => {
-                    eprintln!("[llm-harness-py] ShouldStopHook join error: {e}");
+                    tracing::warn!("ShouldStopHook join error: {e}");
                     true
                 }
             }
@@ -824,11 +824,11 @@ impl BeforeCompactHook for PyBeforeCompactHook {
             match result {
                 Ok(Ok(d)) => d,
                 Ok(Err(e)) => {
-                    eprintln!("[llm-harness-py] BeforeCompactHook error: {e}");
+                    tracing::warn!("BeforeCompactHook error: {e}");
                     BeforeCompactDecision::Proceed
                 }
                 Err(e) => {
-                    eprintln!("[llm-harness-py] BeforeCompactHook join error: {e}");
+                    tracing::warn!("BeforeCompactHook join error: {e}");
                     BeforeCompactDecision::Proceed
                 }
             }

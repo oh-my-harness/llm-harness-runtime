@@ -463,7 +463,6 @@ impl PyAgentHarness {
         Ok(events)
     }
 
-
     /// 一步到位：发送 prompt 并收集事件，直到 settled/aborted。
     ///
     /// 等价于先订阅事件再在后台执行 `prompt()`，避免了 `prompt()` 阻塞
@@ -487,9 +486,8 @@ impl PyAgentHarness {
             // Spawn prompt as a background task so we can collect events concurrently.
             let prompt_harness = harness.clone();
             let prompt_text = text.clone();
-            let prompt_task = handle.spawn(async move {
-                prompt_harness.prompt(&prompt_text).await
-            });
+            let prompt_task =
+                handle.spawn(async move { prompt_harness.prompt(&prompt_text).await });
 
             let mut events = Vec::new();
             let mut rx = rx;

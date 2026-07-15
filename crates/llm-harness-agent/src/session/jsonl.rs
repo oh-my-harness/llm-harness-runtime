@@ -89,8 +89,8 @@ impl JsonlSessionStorage {
                     // session. Forward-compat: a newer binary may have written
                     // an entry_type this binary doesn't recognize. The entry
                     // is lost to this binary but the session remains usable.
-                    eprintln!(
-                        "warn: session {:?}: skipping unparseable entry line: {e}",
+                    tracing::warn!(
+                        "session entry unparseable, skipping: {e}; path: {:?}",
                         inner.entries_path
                     );
                     continue;

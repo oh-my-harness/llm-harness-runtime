@@ -23,6 +23,7 @@ thiserror.workspace         = true
 tokio = { workspace = true, features = ["time", "fs"] }
 tokio-util.workspace        = true
 uuid.workspace              = true
+tracing.workspace              = true
 
 [dev-dependencies]
 llm-harness-loop = { workspace = true, features = ["test-utils"] }

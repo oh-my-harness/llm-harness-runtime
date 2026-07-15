@@ -14,10 +14,10 @@ use serde::Deserialize;
 
 use crate::lifecycle::task::TaskId;
 use crate::lifecycle::task_store::TaskStore;
+use crate::workflow::error::{EdgeEndpoint, WorkflowValidationError};
 use crate::workflow::model::{
     ConditionExpr, Edge, EdgeCondition, Step, StepExecutionPolicy, StepId, Workflow,
 };
-use anyhow::Result;
 
 const MAX_STEP_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_STEP_ATTEMPTS: u32 = 10;
@@ -32,14 +32,13 @@ const MAX_STEP_RETRY_BACKOFF_MS: u64 = 5 * 60 * 1000;
 /// - 每个 step（除 `entry_step`）至少有一条入边。
 /// - LLM step: prompt must be non-empty; allowed_tools entries must be non-empty.
 /// - Executor step: executor_name must be non-empty.
-pub fn validate_workflow(wf: &Workflow) -> Result<()> {
+pub fn validate_workflow(wf: &Workflow) -> Result<(), WorkflowValidationError> {
     // step.id 非空（空 id 会导致 entry_step / edge 匹配歧义）。
     for step in &wf.steps {
         if step.id().is_empty() {
-            anyhow::bail!(
-                "validate_workflow: step with empty id (name='{}')",
-                step.name()
-            );
+            return Err(WorkflowValidationError::EmptyStepId {
+                name: step.name().to_string(),
+            });
         }
     }
     // 重复 id 检测：HashSet 会去重，故 len 不符即有重复。
@@ -54,31 +53,37 @@ pub fn validate_workflow(wf: &Workflow) -> Result<()> {
             .find(|s| !seen.insert(s.id().as_str()))
             .map(|s| s.id().as_str())
             .unwrap_or("?");
-        anyhow::bail!("validate_workflow: duplicate step id '{}'", dup);
+        return Err(WorkflowValidationError::DuplicateStepId {
+            id: dup.to_string(),
+        });
     }
 
     if !step_ids.contains(wf.entry_step.as_str()) {
-        anyhow::bail!(
-            "validate_workflow: entry_step '{}' not in steps",
-            wf.entry_step
-        );
+        return Err(WorkflowValidationError::EntryStepNotFound {
+            entry_step: wf.entry_step.to_string(),
+        });
     }
     for edge in &wf.edges {
         if !step_ids.contains(edge.from.as_str()) {
-            anyhow::bail!("validate_workflow: edge from '{}' not in steps", edge.from);
+            return Err(WorkflowValidationError::EdgeEndpointNotFound {
+                which: EdgeEndpoint::From,
+                endpoint: edge.from.to_string(),
+            });
         }
         if !step_ids.contains(edge.to.as_str()) {
-            anyhow::bail!("validate_workflow: edge to '{}' not in steps", edge.to);
+            return Err(WorkflowValidationError::EdgeEndpointNotFound {
+                which: EdgeEndpoint::To,
+                endpoint: edge.to.to_string(),
+            });
         }
         validate_edge_condition(edge)?;
     }
     let has_incoming = |id: &str| wf.edges.iter().any(|e| e.to == id);
     for step in &wf.steps {
         if step.id() != &wf.entry_step && !has_incoming(step.id()) {
-            anyhow::bail!(
-                "validate_workflow: step '{}' has no incoming edge (orphan)",
-                step.id()
-            );
+            return Err(WorkflowValidationError::OrphanStep {
+                id: step.id().to_string(),
+            });
         }
     }
     for step in &wf.steps {
@@ -90,23 +95,23 @@ pub fn validate_workflow(wf: &Workflow) -> Result<()> {
                 ..
             } => {
                 if prompt.is_empty() {
-                    anyhow::bail!("validate_workflow: step '{}' has empty prompt", step.id());
+                    return Err(WorkflowValidationError::EmptyPrompt {
+                        id: step.id().to_string(),
+                    });
                 }
                 for tool in allowed_tools {
                     if tool.is_empty() {
-                        anyhow::bail!(
-                            "validate_workflow: step '{}' has empty tool name in allowed_tools",
-                            step.id()
-                        );
+                        return Err(WorkflowValidationError::EmptyToolName {
+                            id: step.id().to_string(),
+                        });
                     }
                 }
             }
             Step::Executor { executor_name, .. } => {
                 if executor_name.is_empty() {
-                    anyhow::bail!(
-                        "validate_workflow: step '{}' has empty executor_name",
-                        step.id()
-                    );
+                    return Err(WorkflowValidationError::EmptyExecutorName {
+                        id: step.id().to_string(),
+                    });
                 }
             }
         }
@@ -115,18 +120,16 @@ pub fn validate_workflow(wf: &Workflow) -> Result<()> {
     const MAX_STEPS: usize = 1000;
     const MAX_EDGES: usize = 5000;
     if wf.steps.len() > MAX_STEPS {
-        anyhow::bail!(
-            "validate_workflow: too many steps ({}, max {})",
-            wf.steps.len(),
-            MAX_STEPS
-        );
+        return Err(WorkflowValidationError::TooManySteps {
+            count: wf.steps.len(),
+            max: MAX_STEPS,
+        });
     }
     if wf.edges.len() > MAX_EDGES {
-        anyhow::bail!(
-            "validate_workflow: too many edges ({}, max {})",
-            wf.edges.len(),
-            MAX_EDGES
-        );
+        return Err(WorkflowValidationError::TooManyEdges {
+            count: wf.edges.len(),
+            max: MAX_EDGES,
+        });
     }
 
     // Warn: 同一步的出边不应混用 Expr 和 Label 条件。
@@ -146,8 +149,9 @@ pub fn validate_workflow(wf: &Workflow) -> Result<()> {
         let has_expr = conds.iter().any(|c| matches!(c, EdgeCondition::Expr(_)));
         let has_label = conds.iter().any(|c| matches!(c, EdgeCondition::Label(_)));
         if has_expr && has_label {
-            eprintln!(
-                "validate_workflow: warning: step '{}' has mixed Expr + Label edge conditions                  (Expr edges are evaluated by EdgeConditionJudge; Label edges require a custom judge)",
+            tracing::warn!(
+                "validate_workflow: step '{}' has mixed Expr + Label edge conditions \
+                 (Expr edges are evaluated by EdgeConditionJudge; Label edges require a custom judge)",
                 from
             );
         }
@@ -156,52 +160,56 @@ pub fn validate_workflow(wf: &Workflow) -> Result<()> {
     Ok(())
 }
 
-fn validate_step_policy(step_id: &str, policy: Option<&StepExecutionPolicy>) -> Result<()> {
+fn validate_step_policy(
+    step_id: &str,
+    policy: Option<&StepExecutionPolicy>,
+) -> Result<(), WorkflowValidationError> {
     let Some(policy) = policy else {
         return Ok(());
     };
     if let Some(timeout_ms) = policy.timeout_ms
         && (timeout_ms == 0 || timeout_ms > MAX_STEP_TIMEOUT_MS)
     {
-        anyhow::bail!(
-            "validate_workflow: step '{}' policy.timeout_ms must be between 1 and {}",
-            step_id,
-            MAX_STEP_TIMEOUT_MS
-        );
+        return Err(WorkflowValidationError::PolicyOutOfRange {
+            step_id: step_id.to_string(),
+            field: "timeout_ms",
+            min: 1,
+            max: MAX_STEP_TIMEOUT_MS,
+        });
     }
     if let Some(max_attempts) = policy.max_attempts
         && (max_attempts == 0 || max_attempts > MAX_STEP_ATTEMPTS)
     {
-        anyhow::bail!(
-            "validate_workflow: step '{}' policy.max_attempts must be between 1 and {}",
-            step_id,
-            MAX_STEP_ATTEMPTS
-        );
+        return Err(WorkflowValidationError::PolicyOutOfRange {
+            step_id: step_id.to_string(),
+            field: "max_attempts",
+            min: 1,
+            max: MAX_STEP_ATTEMPTS as u64,
+        });
     }
     if let Some(retry_backoff_ms) = policy.retry_backoff_ms
         && retry_backoff_ms > MAX_STEP_RETRY_BACKOFF_MS
     {
-        anyhow::bail!(
-            "validate_workflow: step '{}' policy.retry_backoff_ms must be <= {}",
-            step_id,
-            MAX_STEP_RETRY_BACKOFF_MS
-        );
+        return Err(WorkflowValidationError::PolicyOverMax {
+            step_id: step_id.to_string(),
+            field: "retry_backoff_ms",
+            max: MAX_STEP_RETRY_BACKOFF_MS,
+        });
     }
     Ok(())
 }
 
-fn validate_edge_condition(edge: &Edge) -> Result<()> {
+fn validate_edge_condition(edge: &Edge) -> Result<(), WorkflowValidationError> {
     let Some(condition) = &edge.condition else {
         return Ok(());
     };
     match condition {
         EdgeCondition::Label(label) => {
             if label.is_empty() {
-                anyhow::bail!(
-                    "validate_workflow: edge '{} -> {}' has empty condition label",
-                    edge.from,
-                    edge.to
-                );
+                return Err(WorkflowValidationError::EmptyConditionLabel {
+                    from: edge.from.to_string(),
+                    to: edge.to.to_string(),
+                });
             }
         }
         EdgeCondition::Expr(expr) => {
@@ -213,11 +221,10 @@ fn validate_edge_condition(edge: &Edge) -> Result<()> {
                 | ConditionExpr::Lte { value, .. }
                     if !value.is_finite() =>
                 {
-                    anyhow::bail!(
-                        "validate_workflow: edge '{} -> {}' numeric condition value must be finite",
-                        edge.from,
-                        edge.to
-                    );
+                    return Err(WorkflowValidationError::NonFiniteConditionValue {
+                        from: edge.from.to_string(),
+                        to: edge.to.to_string(),
+                    });
                 }
                 _ => {}
             }
@@ -226,15 +233,14 @@ fn validate_edge_condition(edge: &Edge) -> Result<()> {
     Ok(())
 }
 
-fn validate_condition_pointer(edge: &Edge, pointer: &str) -> Result<()> {
+fn validate_condition_pointer(edge: &Edge, pointer: &str) -> Result<(), WorkflowValidationError> {
     if pointer.is_empty() || pointer.starts_with('/') {
         return Ok(());
     }
-    anyhow::bail!(
-        "validate_workflow: edge '{} -> {}' condition pointer must be empty or start with '/'",
-        edge.from,
-        edge.to
-    )
+    Err(WorkflowValidationError::InvalidConditionPointer {
+        from: edge.from.to_string(),
+        to: edge.to.to_string(),
+    })
 }
 
 /// LLM 提交 workflow 计划的 tool。注入到规划阶段的自由 task。

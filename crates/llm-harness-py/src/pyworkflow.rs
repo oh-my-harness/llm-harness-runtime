@@ -14,6 +14,7 @@ use llm_harness_runtime::lifecycle::task::TaskId;
 use llm_harness_runtime::lifecycle::task_store::JsonlTaskStore;
 use llm_harness_runtime::spawn::spawner::{EnvFactory, JsonlSessionFactory};
 use llm_harness_runtime::workflow::engine::{WorkflowEngine, WorkflowEngineConfig, WorkflowEvent};
+use llm_harness_runtime::workflow::error::WorkflowError;
 use llm_harness_runtime::workflow::executor::{ExecutorCtx, StepExecutor};
 use llm_harness_runtime::workflow::judge::{StepCtx, StepTransitionJudge};
 use llm_harness_runtime::workflow::model::{
@@ -583,6 +584,23 @@ fn step_record_to_dict(py: Python<'_>, record: &StepRecord) -> PyResult<Py<PyAny
     Ok(dict.into_any().unbind())
 }
 
+/// 将 `WorkflowError` 映射为类型化的 Python 异常。
+///
+/// - `Validation` → `ValueError`（workflow 定义不合法）
+/// - `WorkflowNotFound` / `ExecutorNotFound` → `KeyError`（查找缺失）
+/// - `Paused` → `RuntimeError`（暂停是控制流，非错误，但仍需向上传播）
+/// - 其余 → `RuntimeError`
+fn workflow_error_to_pyerr(e: WorkflowError) -> PyErr {
+    match e {
+        WorkflowError::Validation(_) => {
+            pyo3::exceptions::PyValueError::new_err(e.to_string())
+        }
+        WorkflowError::WorkflowNotFound { .. } | WorkflowError::ExecutorNotFound { .. } => {
+            pyo3::exceptions::PyKeyError::new_err(e.to_string())
+        }
+        _ => pyo3::exceptions::PyRuntimeError::new_err(e.to_string()),
+    }
+}
 // ── PyWorkflowEngine ────────────────────────────────────────────────────────
 
 /// Python 侧的 `WorkflowEngine` 包装类。
@@ -631,7 +649,7 @@ impl PyWorkflowEngine {
 
         let engine = py.detach(|| {
             WorkflowEngine::new(workflow, config, judge_arc)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+                .map_err(workflow_error_to_pyerr)
         })?;
 
         Ok(Self {
@@ -678,7 +696,7 @@ impl PyWorkflowEngine {
                     WorkflowEngine::restore(store, task_id, config, judge_arc).await
                 })
             })
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(workflow_error_to_pyerr)?;
 
         Ok(Self {
             engine: Some(Arc::new(engine)),
@@ -904,7 +922,7 @@ impl PyWorkflowEngine {
         let rt = runtime(py);
         let result = py.detach(move || {
             rt.block_on(async move { engine_clone.run().await })
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+                .map_err(workflow_error_to_pyerr)
         });
         result?;
         Ok(())
@@ -966,7 +984,7 @@ impl PyWorkflowEngine {
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
         engine
             .pause(reason)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+            .map_err(workflow_error_to_pyerr)
     }
 
     /// 恢复已暂停或失败的 task。将状态重置为 Paused，随后 `run()` 可继续。
@@ -977,7 +995,7 @@ impl PyWorkflowEngine {
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
         let rt = runtime(py);
         let result = py.detach(move || rt.block_on(async move { engine.resume().await }));
-        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        result.map_err(workflow_error_to_pyerr)
     }
 
     /// 取消正在运行的 workflow。当前步记为 Abort，状态置为 Cancelled。
@@ -989,7 +1007,7 @@ impl PyWorkflowEngine {
         let reason = reason.to_string();
         let rt = runtime(py);
         let result = py.detach(move || rt.block_on(async move { engine.cancel(&reason).await }));
-        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        result.map_err(workflow_error_to_pyerr)
     }
 
     /// 创建检查点（append-only）。`description` 人类可读，`payload` 任意 JSON 可序列化对象。
@@ -1009,7 +1027,7 @@ impl PyWorkflowEngine {
         let result = py.detach(move || {
             rt.block_on(async move { engine.checkpoint(&description, payload_val).await })
         });
-        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        result.map_err(workflow_error_to_pyerr)
     }
 
     /// 返回累计 token/成本统计，dict。

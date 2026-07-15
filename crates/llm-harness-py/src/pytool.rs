@@ -35,7 +35,7 @@ impl PyTool {
             Ok::<_, PyErr>(is_coro)
         })
         .unwrap_or_else(|e| {
-            eprintln!("[llm-harness-py] failed to detect async callback, assuming sync: {e}");
+            tracing::debug!("failed to detect async callback, assuming sync: {e}");
             false
         });
         Self {

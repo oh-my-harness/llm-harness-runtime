@@ -20,6 +20,14 @@ pub mod value_conv;
 /// PyO3 module entry point.
 #[pymodule]
 fn llm_harness_py(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(tracing::level_filters::LevelFilter::WARN.into())
+                .from_env_lossy(),
+        )
+        .try_init();
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(to_json, m)?)?;
     m.add_function(wrap_pyfunction!(from_json, m)?)?;

@@ -137,7 +137,7 @@ impl Tool for WaitForExternalEventTool {
                     .await
             {
                 // 落盘失败不阻断 tool 本身的等待语义（最坏情况是重启后无法恢复该次等待）。
-                eprintln!("[warn] failed to save event_wait descriptor: {e}");
+                tracing::warn!("failed to save event_wait descriptor: {e}");
             }
 
             // 2. select! 等待：abort / event / timeout
@@ -173,7 +173,7 @@ impl Tool for WaitForExternalEventTool {
             if let Some(store) = &self.task_store
                 && let Err(e) = store.clear_event_wait(&self.task_id).await
             {
-                eprintln!("[warn] failed to clear event_wait descriptor: {e}");
+                tracing::warn!("failed to clear event_wait descriptor: {e}");
             }
 
             result

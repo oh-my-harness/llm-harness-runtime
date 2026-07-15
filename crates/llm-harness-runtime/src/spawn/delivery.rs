@@ -307,8 +307,8 @@ impl IdleWatcherHook for IdleWatcher {
                                 // channel 满（256）时丢弃（极端场景，优于卡死 watcher）。
                                 if cancel_token.is_cancelled() {
                                 if let Err(e) = bus.try_resend_event(c) {
-                                    eprintln!(
-                                        "warn: IdleWatcher: event dropped during cancel race \
+                                    tracing::warn!(
+                                        "IdleWatcher: event dropped during cancel race \
                                          (channel {e:?}) — sub-agent result may be lost"
                                     );
                                 }
