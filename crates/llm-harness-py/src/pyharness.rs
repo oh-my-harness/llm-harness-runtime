@@ -404,6 +404,67 @@ impl PyAgentHarness {
         Ok(events)
     }
 
+
+    /// 一步到位：发送 prompt 并收集事件，直到 settled/aborted。
+    ///
+    /// 等价于先订阅事件再在后台执行 `prompt()`，避免了 `prompt()` 阻塞
+    /// 完毕后 `collect_until_settled()` 拿不到事件的时序问题。
+    ///
+    /// 返回事件列表。若超时未收到 settled/aborted，返回已收集的事件。
+    #[pyo3(signature = (text, timeout_ms=30000))]
+    fn prompt_and_collect(
+        &self,
+        py: Python<'_>,
+        text: &str,
+        timeout_ms: u64,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let harness = self.harness.clone();
+        let text = text.to_string();
+        let rx = self.harness.subscribe();
+        let handle = runtime(py).handle().clone();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+
+        let events: Vec<Py<PyAny>> = py.detach(move || {
+            // Spawn prompt as a background task so we can collect events concurrently.
+            let prompt_harness = harness.clone();
+            let prompt_text = text.clone();
+            let prompt_task = handle.spawn(async move {
+                prompt_harness.prompt(&prompt_text).await
+            });
+
+            let mut events = Vec::new();
+            let mut rx = rx;
+            loop {
+                let recv =
+                    handle.block_on(async { tokio::time::timeout(timeout, rx.recv()).await });
+                match recv {
+                    Ok(Ok(event)) => {
+                        let is_settled = matches!(
+                            &*event,
+                            AgentHarnessEvent::Settled | AgentHarnessEvent::Aborted
+                        );
+                        Python::attach(|py| {
+                            if let Ok(dict) = harness_event_to_dict(py, &event) {
+                                events.push(dict);
+                            }
+                        });
+                        if is_settled {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+
+            // Ensure the prompt task has completed.
+            let _ = handle.block_on(prompt_task);
+
+            events
+        });
+
+        Ok(events)
+    }
+
     // ── Dynamic configuration ──────────────────────────────────────────────
 
     /// 动态切换模型。可选提供 `context_window` 和 `max_tokens`。
