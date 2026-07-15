@@ -1,7 +1,7 @@
 """Tests for PyAgentHarness wrapper and builder.provider()."""
 
 import pytest
-import llm_harness_py as lh
+import senza as lh
 
 
 def test_builder_with_provider_returns_harness():

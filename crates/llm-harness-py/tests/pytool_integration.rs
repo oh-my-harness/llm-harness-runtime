@@ -27,7 +27,7 @@ async fn pytool_executes_sync_callback() {
             .unbind();
         let schema =
             serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}});
-        Arc::new(llm_harness_py::pytool::PyTool::new(
+        Arc::new(senza::pytool::PyTool::new(
             "echo".into(),
             "echo".into(),
             schema,

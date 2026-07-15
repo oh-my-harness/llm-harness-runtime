@@ -2,7 +2,7 @@
 import json
 import tempfile
 import pytest
-import llm_harness_py as lh
+import senza as lh
 
 
 # ── WorkflowEngine new methods ──────────────────────────────────────────────

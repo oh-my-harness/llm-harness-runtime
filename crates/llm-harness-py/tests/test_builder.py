@@ -3,32 +3,32 @@ import json
 
 import pytest
 
-import llm_harness_py
+import senza
 
 
 def test_builder_creation():
     """HarnessBuilder can be created with a model string."""
-    builder = llm_harness_py.HarnessBuilder("claude-3-5-sonnet")
+    builder = senza.HarnessBuilder("claude-3-5-sonnet")
     assert builder is not None
 
 
 def test_builder_system_prompt():
     """system_prompt method returns self for chaining."""
-    builder = llm_harness_py.HarnessBuilder("claude-3-5-sonnet")
+    builder = senza.HarnessBuilder("claude-3-5-sonnet")
     result = builder.system_prompt("You are helpful")
     assert result is builder
 
 
 def test_builder_max_tokens():
     """max_tokens method returns self for chaining."""
-    builder = llm_harness_py.HarnessBuilder("claude-3-5-sonnet")
+    builder = senza.HarnessBuilder("claude-3-5-sonnet")
     result = builder.max_tokens(4096)
     assert result is builder
 
 
 def test_builder_temperature():
     """temperature method returns self for chaining."""
-    builder = llm_harness_py.HarnessBuilder("claude-3-5-sonnet")
+    builder = senza.HarnessBuilder("claude-3-5-sonnet")
     result = builder.temperature(0.7)
     assert result is builder
     # None should also be accepted (resets to default).
@@ -42,18 +42,18 @@ def test_builder_with_tool():
     def echo(args, ctx):
         return {"content": [], "terminate": False}
 
-    tool = llm_harness_py.create_tool(
+    tool = senza.create_tool(
         "echo", "Echo", json.dumps({"type": "object"}), echo
     )
-    builder = llm_harness_py.HarnessBuilder("claude-3-5-sonnet")
+    builder = senza.HarnessBuilder("claude-3-5-sonnet")
     result = builder.tool(tool)
     assert result is builder
 
 
 def test_builder_with_plugin():
     """plugin method accepts a Plugin and returns self."""
-    plugin = llm_harness_py.create_plugin("test-plugin")
-    builder = llm_harness_py.HarnessBuilder("claude-3-5-sonnet")
+    plugin = senza.create_plugin("test-plugin")
+    builder = senza.HarnessBuilder("claude-3-5-sonnet")
     result = builder.plugin(plugin)
     assert result is builder
 
@@ -63,13 +63,13 @@ def test_builder_chaining():
     def echo(args, ctx):
         return {"content": [], "terminate": False}
 
-    tool = llm_harness_py.create_tool(
+    tool = senza.create_tool(
         "echo", "Echo", json.dumps({"type": "object"}), echo
     )
-    plugin = llm_harness_py.create_plugin("p1", tools=[tool])
+    plugin = senza.create_plugin("p1", tools=[tool])
 
     builder = (
-        llm_harness_py.HarnessBuilder("claude-3-5-sonnet")
+        senza.HarnessBuilder("claude-3-5-sonnet")
         .system_prompt("You are helpful")
         .max_tokens(2048)
         .temperature(0.5)
@@ -81,6 +81,6 @@ def test_builder_chaining():
 
 def test_builder_build_without_provider_raises():
     """build() without a provider raises RuntimeError."""
-    builder = llm_harness_py.HarnessBuilder("claude-3-5-sonnet")
+    builder = senza.HarnessBuilder("claude-3-5-sonnet")
     with pytest.raises(RuntimeError):
         builder.build()

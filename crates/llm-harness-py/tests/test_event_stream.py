@@ -3,12 +3,12 @@
 import threading
 import time
 
-import llm_harness_py
+import senza
 
 
 def test_event_stream_yields_events():
     """events() yields a non-empty stream of event dicts with a 'type' field."""
-    agent = llm_harness_py.Agent(model="mock-model")
+    agent = senza.Agent(model="mock-model")
     events = []
     it = agent.events(timeout_ms=5000)
 
@@ -32,7 +32,7 @@ def test_event_stream_yields_events():
 
 def test_event_stream_contains_agent_start():
     """The first event should be agent_start."""
-    agent = llm_harness_py.Agent(model="mock-model")
+    agent = senza.Agent(model="mock-model")
     events = []
     it = agent.events(timeout_ms=5000)
 
@@ -54,7 +54,7 @@ def test_event_stream_contains_agent_start():
 
 def test_event_stream_contains_text_delta():
     """TextDelta events should appear for mock LLM text responses."""
-    agent = llm_harness_py.Agent(model="mock-model")
+    agent = senza.Agent(model="mock-model")
     events = []
     it = agent.events(timeout_ms=5000)
 
@@ -77,7 +77,7 @@ def test_event_stream_contains_text_delta():
 
 def test_event_stream_agent_end_has_new_messages():
     """agent_end event should include new_messages_count."""
-    agent = llm_harness_py.Agent(model="mock-model")
+    agent = senza.Agent(model="mock-model")
     events = []
     it = agent.events(timeout_ms=5000)
 
@@ -101,7 +101,7 @@ def test_event_stream_agent_end_has_new_messages():
 
 def test_event_stream_timeout_returns_empty():
     """When no prompt is issued, the iterator times out and returns empty."""
-    agent = llm_harness_py.Agent(model="mock-model")
+    agent = senza.Agent(model="mock-model")
     it = agent.events(timeout_ms=100)
     events = list(it)
     assert events == []
@@ -109,7 +109,7 @@ def test_event_stream_timeout_returns_empty():
 
 def test_event_stream_text_delta_has_text_field():
     """TextDelta events should have a 'text' field."""
-    agent = llm_harness_py.Agent(model="mock-model")
+    agent = senza.Agent(model="mock-model")
     events = []
     it = agent.events(timeout_ms=5000)
 
@@ -133,14 +133,14 @@ def test_event_stream_text_delta_has_text_field():
 
 def test_event_stream_iterator_protocol():
     """__iter__ returns self, making the object a valid iterator."""
-    agent = llm_harness_py.Agent(model="mock-model")
+    agent = senza.Agent(model="mock-model")
     it = agent.events(timeout_ms=100)
     assert iter(it) is it
 
 
 def test_event_stream_multiple_subscriptions():
     """Multiple iterators can subscribe to the same agent independently."""
-    agent = llm_harness_py.Agent(model="mock-model")
+    agent = senza.Agent(model="mock-model")
     events1 = []
     events2 = []
     it1 = agent.events(timeout_ms=5000)

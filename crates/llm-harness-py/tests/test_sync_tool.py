@@ -2,7 +2,7 @@
 
 import json
 
-import llm_harness_py
+import senza
 
 
 def test_sync_tool_creation():
@@ -15,7 +15,7 @@ def test_sync_tool_creation():
             "terminate": False,
         }
 
-    tool = llm_harness_py.create_sync_tool(
+    tool = senza.create_sync_tool(
         "echo",
         "Echo text back",
         json.dumps({"type": "object", "properties": {"text": {"type": "string"}}}),
@@ -34,7 +34,7 @@ def test_sync_tool_context_methods():
         captured["is_cancelled_val"] = ctx.is_cancelled()
         return {"content": [], "terminate": False}
 
-    tool = llm_harness_py.create_sync_tool(
+    tool = senza.create_sync_tool(
         "check_ctx",
         "Check context",
         json.dumps({"type": "object", "properties": {}}),
@@ -60,7 +60,7 @@ def test_sync_tool_echo_roundtrip():
             "terminate": False,
         }
 
-    tool = llm_harness_py.create_sync_tool(
+    tool = senza.create_sync_tool(
         "echo",
         "Echo text back",
         json.dumps({"type": "object", "properties": {"text": {"type": "string"}}}),
@@ -80,7 +80,7 @@ def test_sync_tool_terminate_flag():
     def stopper(args, ctx):
         return {"content": [], "terminate": True}
 
-    tool = llm_harness_py.create_sync_tool(
+    tool = senza.create_sync_tool(
         "stop",
         "Stop the loop",
         json.dumps({"type": "object", "properties": {}}),

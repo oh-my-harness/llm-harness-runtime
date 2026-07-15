@@ -19,7 +19,7 @@ pub mod value_conv;
 
 /// PyO3 module entry point.
 #[pymodule]
-fn llm_harness_py(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn senza(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -36,6 +36,8 @@ fn llm_harness_py(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pyworkflow::PyJudgeWrapper>()?;
     m.add_class::<pyworkflow::PyExecutorWrapper>()?;
     m.add_class::<pyhooks::PyHookWrapper>()?;
+    m.add_class::<pytool::PyToolWrapper>()?;
+    m.add_class::<pytool::PyToolContext>()?;
     m.add_function(wrap_pyfunction!(create_sync_tool, m)?)?;
     m.add_function(wrap_pyfunction!(create_tool, m)?)?;
     m.add_function(wrap_pyfunction!(create_judge, m)?)?;

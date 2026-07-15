@@ -1,6 +1,6 @@
 """Integration test: full SDK flow."""
 import json
-import llm_harness_py as lh
+import senza as lh
 
 
 def test_workflow_engine_full_construction():

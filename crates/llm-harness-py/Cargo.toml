@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [lib]
-name = "llm_harness_py"
+name = "senza"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

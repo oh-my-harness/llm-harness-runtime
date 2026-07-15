@@ -2,7 +2,7 @@
 
 import json
 import pytest
-import llm_harness_py as lh
+import senza as lh
 
 
 def _make_workflow():

@@ -3,7 +3,7 @@
 import asyncio
 import json
 
-import llm_harness_py
+import senza
 
 
 def test_async_tool_creation():
@@ -17,7 +17,7 @@ def test_async_tool_creation():
             "terminate": False,
         }
 
-    tool = llm_harness_py.create_tool(
+    tool = senza.create_tool(
         "async_echo",
         "Async echo",
         json.dumps({"type": "object", "properties": {"text": {"type": "string"}}}),
@@ -37,7 +37,7 @@ def test_async_tool_echo_roundtrip():
             "terminate": False,
         }
 
-    tool = llm_harness_py.create_tool(
+    tool = senza.create_tool(
         "async_echo",
         "Async echo",
         json.dumps({"type": "object", "properties": {"text": {"type": "string"}}}),
@@ -61,7 +61,7 @@ def test_sync_tool_still_works():
             "terminate": False,
         }
 
-    tool = llm_harness_py.create_tool(
+    tool = senza.create_tool(
         "sync_echo",
         "Sync echo",
         json.dumps({"type": "object", "properties": {"text": {"type": "string"}}}),
@@ -79,7 +79,7 @@ def test_async_tool_terminate_flag():
         await asyncio.sleep(0.01)
         return {"content": [], "terminate": True}
 
-    tool = llm_harness_py.create_tool(
+    tool = senza.create_tool(
         "async_stop",
         "Async stop",
         json.dumps({"type": "object", "properties": {}}),

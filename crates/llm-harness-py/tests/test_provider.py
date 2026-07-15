@@ -1,4 +1,4 @@
-import llm_harness_py as lh
+import senza as lh
 
 
 def test_create_openai_provider():

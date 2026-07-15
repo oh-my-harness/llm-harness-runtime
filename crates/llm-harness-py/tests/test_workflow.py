@@ -1,6 +1,6 @@
 """Tests for PyJudge and PyExecutor — workflow trait callback wrappers."""
 
-import llm_harness_py
+import senza
 
 
 # ── PyJudge creation tests ───────────────────────────────────────────────────
@@ -14,13 +14,13 @@ def test_create_judge():
             return "to:next_step"
         return "retry"
 
-    judge = llm_harness_py.create_judge(judge_fn)
+    judge = senza.create_judge(judge_fn)
     assert judge is not None
 
 
 def test_create_judge_with_lambda():
     """create_judge accepts a lambda callback."""
-    judge = llm_harness_py.create_judge(lambda ctx: "to:step2")
+    judge = senza.create_judge(lambda ctx: "to:step2")
     assert judge is not None
 
 
@@ -36,13 +36,13 @@ def test_create_executor():
             "structured": {"result": "done"},
         }
 
-    executor = llm_harness_py.create_executor(exec_fn)
+    executor = senza.create_executor(exec_fn)
     assert executor is not None
 
 
 def test_create_executor_with_lambda():
     """create_executor accepts a lambda callback."""
-    executor = llm_harness_py.create_executor(
+    executor = senza.create_executor(
         lambda ctx: {"output": "hello", "structured": {"ok": True}}
     )
     assert executor is not None
@@ -57,8 +57,8 @@ def test_create_executor_with_lambda():
 
 def test_judge_and_executor_together():
     """Both a judge and executor can be created in the same session."""
-    judge = llm_harness_py.create_judge(lambda ctx: "retry")
-    executor = llm_harness_py.create_executor(
+    judge = senza.create_judge(lambda ctx: "retry")
+    executor = senza.create_executor(
         lambda ctx: {"output": "result", "structured": None}
     )
     assert judge is not None
@@ -67,15 +67,15 @@ def test_judge_and_executor_together():
 
 def test_multiple_judges():
     """Multiple judge instances are independent."""
-    j1 = llm_harness_py.create_judge(lambda ctx: "to:s1")
-    j2 = llm_harness_py.create_judge(lambda ctx: "to:s2")
+    j1 = senza.create_judge(lambda ctx: "to:s1")
+    j2 = senza.create_judge(lambda ctx: "to:s2")
     assert j1 is not None
     assert j2 is not None
 
 
 def test_multiple_executors():
     """Multiple executor instances are independent."""
-    e1 = llm_harness_py.create_executor(lambda ctx: {"output": "e1"})
-    e2 = llm_harness_py.create_executor(lambda ctx: {"output": "e2"})
+    e1 = senza.create_executor(lambda ctx: {"output": "e1"})
+    e2 = senza.create_executor(lambda ctx: {"output": "e2"})
     assert e1 is not None
     assert e2 is not None

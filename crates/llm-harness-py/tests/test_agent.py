@@ -1,11 +1,11 @@
 """Tests for PyAgent — verifies Agent wrapping + tokio runtime + GIL interaction."""
 
-import llm_harness_py
+import senza
 
 
 def test_agent_prompt_returns_response():
     """prompt() returns the mock LLM response text."""
-    agent = llm_harness_py.Agent(model="mock-model")
+    agent = senza.Agent(model="mock-model")
     response = agent.prompt("hello")
     assert isinstance(response, str)
     assert len(response) > 0
@@ -14,8 +14,8 @@ def test_agent_prompt_returns_response():
 
 def test_agent_multiple_instances():
     """Multiple Agent instances can be created and prompted independently."""
-    a1 = llm_harness_py.Agent()
-    a2 = llm_harness_py.Agent()
+    a1 = senza.Agent()
+    a2 = senza.Agent()
     r1 = a1.prompt("test1")
     r2 = a2.prompt("test2")
     assert isinstance(r1, str)
@@ -26,7 +26,7 @@ def test_agent_multiple_instances():
 
 def test_agent_message_count_after_prompt():
     """After prompt, the transcript contains user + assistant messages."""
-    agent = llm_harness_py.Agent()
+    agent = senza.Agent()
     assert agent.message_count() == 0
     agent.prompt("hello")
     # At least user message + assistant message
@@ -35,7 +35,7 @@ def test_agent_message_count_after_prompt():
 
 def test_agent_phase_is_idle():
     """Agent phase is idle before and after prompt."""
-    agent = llm_harness_py.Agent()
+    agent = senza.Agent()
     assert agent.phase() == "idle"
     agent.prompt("hello")
     assert agent.phase() == "idle"
@@ -43,7 +43,7 @@ def test_agent_phase_is_idle():
 
 def test_agent_repeated_prompts():
     """The same agent can handle multiple sequential prompts."""
-    agent = llm_harness_py.Agent()
+    agent = senza.Agent()
     r1 = agent.prompt("first")
     r2 = agent.prompt("second")
     assert "hello from mock" in r1
