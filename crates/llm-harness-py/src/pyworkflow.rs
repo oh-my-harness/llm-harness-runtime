@@ -872,6 +872,25 @@ impl PyWorkflowEngine {
         Ok(())
     }
 
+    /// 读取共享 context 变量。返回 None 如果 key 不存在。
+    fn get_context_variable(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
+        let ctx = engine.context();
+        let guard = ctx.try_lock().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to lock workflow context: {e}"
+            ))
+        })?;
+        match guard.variables.get(key) {
+            Some(val) => value_to_pyobject(py, val),
+            None => Ok(py.None()),
+        }
+    }
+
+
     /// 启动/恢复执行。阻塞直到 workflow 完成。
     ///
     /// 释放 GIL 后在 tokio runtime 上运行 `engine.run()`。
@@ -1015,6 +1034,44 @@ impl PyWorkflowEngine {
         let handle = runtime(py).handle().clone();
         let iter = PyWorkflowEventIterator::new(rx, timeout_ms, handle);
         Py::new(py, iter)
+    }
+
+    /// Context manager entry.
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    /// Context manager exit: cancels any running workflow.
+    fn __exit__(
+        &mut self,
+        _exc_type: &Bound<'_, PyAny>,
+        _exc_value: &Bound<'_, PyAny>,
+        _traceback: &Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        if let Some(engine) = self.engine.as_ref() {
+            let engine_clone = engine.clone();
+            let py = _exc_type.py();
+            let rt = runtime(py);
+            let _ = py.detach(move || {
+                rt.block_on(async { engine_clone.cancel("context manager exit").await })
+            });
+        }
+        Ok(false)
+    }
+
+    /// 返回引擎状态摘要。
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
+        let task_id = engine.task_id().0.clone();
+        let engine_clone = engine.clone();
+        let rt = runtime(py);
+        let state = py.detach(move || {
+            rt.block_on(async { workflow_status_to_str(&engine_clone.state().await).to_string() })
+        });
+        Ok(format!("WorkflowEngine(task_id={}, state={})", task_id, state))
     }
 }
 

@@ -212,6 +212,19 @@ pub struct PyToolWrapper {
 
 #[pymethods]
 impl PyToolWrapper {
+    /// 返回 tool 的名称。
+    #[getter]
+    fn name(&self) -> &str {
+        self.tool.name()
+    }
+
+    /// 返回 tool 的描述。
+    #[getter]
+    fn description(&self) -> &str {
+        self.tool.description()
+    }
+
+
     /// 同步驱动 tool.execute：在独立 tokio runtime 上运行 async future。
     ///
     /// 仅供测试/验证使用；真实场景由 agent loop 调用 `execute`。

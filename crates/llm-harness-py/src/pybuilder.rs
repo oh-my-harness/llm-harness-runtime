@@ -14,6 +14,7 @@ use llm_harness_types::{ExecutionEnv, Tool, UnsupportedEnv};
 use pyo3::prelude::*;
 
 use crate::pyagent::runtime;
+use crate::pyharness::parse_thinking_level;
 use crate::pyharness::PyAgentHarness;
 use crate::pyplugin::PyPluginWrapper;
 use crate::pyprovider::PyProvider;
@@ -96,6 +97,25 @@ impl PyHarnessBuilder {
             slf.builder = Some(b.provider(pattern, client));
         }
         slf
+    }
+
+    /// 设置 thinking level（构建时）。
+    ///
+    /// 接受: "off", "minimal", "low", "medium", "high", "xhigh", 或 "budget:<tokens>"。
+    fn thinking_level<'a>(mut slf: PyRefMut<'a, Self>, level: &str) -> PyResult<PyRefMut<'a, Self>> {
+        if let Some(b) = slf.builder.take() {
+            let tl = parse_thinking_level(level)?;
+            slf.builder = Some(b.thinking_level(tl));
+        }
+        Ok(slf)
+    }
+
+    /// 返回 builder 状态摘要。
+    fn __repr__(&self) -> String {
+        match &self.builder {
+            Some(_) => "HarnessBuilder(pending)".to_string(),
+            None => "HarnessBuilder(consumed)".to_string(),
+        }
     }
 
     /// 构建 harness 并返回 `AgentHarness`。

@@ -20,6 +20,7 @@ use pyo3::types::{PyDict, PyList};
 use tokio::sync::broadcast;
 
 use crate::event_stream::agent_event_to_dict;
+use crate::value_conv::value_to_pyobject;
 use crate::pyagent::runtime;
 use crate::pyworkflow::cost_aggregate_to_dict;
 
@@ -272,7 +273,7 @@ impl PyHarnessEventIterator {
 /// 将字符串解析为 `ThinkingLevel`。
 ///
 /// 接受: "off", "minimal", "low", "medium", "high", "xhigh", 或 "budget:<tokens>"。
-fn parse_thinking_level(s: &str) -> PyResult<ThinkingLevel> {
+pub(crate) fn parse_thinking_level(s: &str) -> PyResult<ThinkingLevel> {
     match s.to_lowercase().as_str() {
         "off" => Ok(ThinkingLevel::Off),
         "minimal" => Ok(ThinkingLevel::Minimal),
@@ -331,6 +332,64 @@ impl PyAgentHarness {
         let result = py.detach(move || rt.block_on(async move { harness.build_context().await }));
         match result {
             Ok(ctx) => Ok(ctx.messages.len()),
+            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+        }
+    }
+
+    /// 返回当前会话的完整消息列表（user / assistant / tool_result 等）。
+    ///
+    /// 每条消息是一个 dict，包含 `role` 字段和对应的消息内容。
+    /// 可用于检查对话历史、调试 prompt、提取 LLM 回复文本。
+    fn get_messages(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let harness = self.harness.clone();
+        let rt = runtime(py);
+        let result = py.detach(move || rt.block_on(async move { harness.build_context().await }));
+        match result {
+            Ok(ctx) => {
+                let mut messages = Vec::new();
+                for msg in &ctx.messages {
+                    let json = serde_json::to_value(msg)
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                    let py_msg = value_to_pyobject(py, &json)?;
+                    messages.push(py_msg);
+                }
+                Ok(messages)
+            }
+            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+        }
+    }
+
+    /// 返回最近一条 assistant 消息的文本内容。
+    ///
+    /// 从 `build_context()` 的消息列表中反向查找最后一条 `role=assistant` 消息，
+    /// 提取其 `content` 中的 Text 块拼接返回。
+    /// 若没有 assistant 消息则返回空字符串。
+    fn last_response(&self, py: Python<'_>) -> PyResult<String> {
+        let harness = self.harness.clone();
+        let rt = runtime(py);
+        let result = py.detach(move || rt.block_on(async move { harness.build_context().await }));
+        match result {
+            Ok(ctx) => {
+                for msg in ctx.messages.iter().rev() {
+                    let json = serde_json::to_value(msg)
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                    if json.get("role").and_then(|r| r.as_str()) == Some("assistant") {
+                        if let Some(content) = json.get("content").and_then(|c| c.as_array()) {
+                            let text: String = content.iter()
+                                .filter_map(|block| {
+                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                        block.get("text").and_then(|t| t.as_str()).map(String::from)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>().join("");
+                            return Ok(text);
+                        }
+                    }
+                }
+                Ok(String::new())
+            }
             Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
         }
     }
@@ -594,6 +653,12 @@ impl PyAgentHarness {
     }
 
     // ── Context manager ─────────────────────────────────────────────────────
+
+    /// 返回 harness 状态摘要。
+    fn __repr__(&self) -> String {
+        let state = self.harness.state();
+        format!("AgentHarness(model={}, phase={})", state.model, phase_str(state.phase))
+    }
 
     /// Context manager entry: returns self for use in `with` statements.
     ///
