@@ -110,6 +110,30 @@ impl PyHarnessBuilder {
         Ok(slf)
     }
 
+    /// Enable or disable auto-compaction (enabled by default).
+    fn auto_compact<'a>(mut slf: PyRefMut<'a, Self>, enabled: bool) -> PyRefMut<'a, Self> {
+        if let Some(b) = slf.builder.take() {
+            slf.builder = Some(b.auto_compact(enabled));
+        }
+        slf
+    }
+
+    /// Set the token budget reserved for system prompt + new response during compaction.
+    fn compaction_reserve_tokens<'a>(mut slf: PyRefMut<'a, Self>, tokens: Option<u32>) -> PyRefMut<'a, Self> {
+        if let Some(b) = slf.builder.take() {
+            slf.builder = Some(b.compaction_reserve_tokens(tokens));
+        }
+        slf
+    }
+
+    /// Set how many recent tokens to keep unsummarized during compaction.
+    fn compaction_keep_recent_tokens<'a>(mut slf: PyRefMut<'a, Self>, tokens: Option<u32>) -> PyRefMut<'a, Self> {
+        if let Some(b) = slf.builder.take() {
+            slf.builder = Some(b.compaction_keep_recent_tokens(tokens));
+        }
+        slf
+    }
+
     /// 返回 builder 状态摘要。
     fn __repr__(&self) -> String {
         match &self.builder {

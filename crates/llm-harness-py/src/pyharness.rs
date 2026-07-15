@@ -11,6 +11,8 @@
 //! agent 事件，其余变体是 harness 级事件（phase change、compaction 等）。
 //! 本模块实现独立的 `PyHarnessEventIterator` 处理此类型。
 
+use std::collections::HashSet;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use llm_harness_agent::{AgentHarness, AgentHarnessEvent};
@@ -650,6 +652,147 @@ impl PyAgentHarness {
         Ok(())
     }
 
+    // ── Queue management ────────────────────────────────────────────────────
+
+    /// Drain the steering queue. Only callable when Idle.
+    fn clear_steering_queue(&self) -> PyResult<()> {
+        self.harness.clear_steering_queue()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Drain the follow-up queue. Only callable when Idle.
+    fn clear_follow_up_queue(&self) -> PyResult<()> {
+        self.harness.clear_follow_up_queue()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Drain all queues (steer, follow-up, next_turn). Only callable when Idle.
+    fn clear_all_queues(&self) -> PyResult<()> {
+        self.harness.clear_all_queues()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Returns True if any queue is non-empty.
+    fn has_queued_messages(&self) -> bool {
+        self.harness.has_queued_messages()
+    }
+
+    // ── Active tools ────────────────────────────────────────────────────────
+
+    /// Limit the active tool subset for the next turn. `None` enables all tools.
+    #[pyo3(signature = (tools=None))]
+    fn set_active_tools(&self, py: Python<'_>, tools: Option<Vec<String>>) -> PyResult<()> {
+        let harness = self.harness.clone();
+        let active = tools.map(|v| v.into_iter().collect::<HashSet<String>>());
+        let rt = runtime(py);
+        let result = py.detach(move || {
+            rt.block_on(async move { harness.set_active_tools(active).await })
+        });
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    // ── Session / Branch management ─────────────────────────────────────────
+
+    /// Fork the session at a given entry. Returns the new leaf entry ID.
+    #[pyo3(signature = (from_entry, label=None))]
+    fn fork_branch(&self, py: Python<'_>, from_entry: &str, label: Option<String>) -> PyResult<String> {
+        let harness = self.harness.clone();
+        let entry = llm_harness_types::EntryId::from_str(from_entry)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let rt = runtime(py);
+        let result = py.detach(move || {
+            rt.block_on(async move { harness.fork_branch(entry, label).await })
+        });
+        result.map(|id| id.to_string())
+              .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Switch the active cursor to a target entry.
+    fn navigate_tree(&self, py: Python<'_>, target: &str) -> PyResult<()> {
+        let harness = self.harness.clone();
+        let entry = llm_harness_types::EntryId::from_str(target)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let rt = runtime(py);
+        let result = py.detach(move || {
+            rt.block_on(async move { harness.navigate_tree(entry).await })
+        });
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// List all branches (leaves) in the session.
+    fn list_branches(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let harness = self.harness.clone();
+        let rt = runtime(py);
+        let branches = py.detach(move || {
+            rt.block_on(async move { harness.list_branches().await })
+        });
+        let branches = branches.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let mut result = Vec::new();
+        for b in branches {
+            let dict = PyDict::new(py);
+            dict.set_item("leaf_id", b.leaf_id.to_string())?;
+            dict.set_item("label", b.label)?;
+            dict.set_item("message_count", b.message_count)?;
+            dict.set_item("last_activity", b.last_activity.to_rfc3339())?;
+            dict.set_item("summary", b.summary)?;
+            result.push(dict.into_any().unbind());
+        }
+        Ok(result)
+    }
+
+    /// Return all entries on the active cursor's path (root-first).
+    fn read_active_path(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let harness = self.harness.clone();
+        let rt = runtime(py);
+        let entries = py.detach(move || {
+            rt.block_on(async move { harness.read_active_path().await })
+        });
+        let entries = entries.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(session_entries_to_list(py, &entries))
+    }
+
+    /// Return all session entries (every node in the tree).
+    fn read_all_entries(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        let harness = self.harness.clone();
+        let rt = runtime(py);
+        let entries = py.detach(move || {
+            rt.block_on(async move { harness.read_all_entries().await })
+        });
+        let entries = entries.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(session_entries_to_list(py, &entries))
+    }
+
+    /// Delete the branch ending at a leaf entry.
+    fn delete_branch(&self, py: Python<'_>, leaf: &str) -> PyResult<()> {
+        let harness = self.harness.clone();
+        let entry = llm_harness_types::EntryId::from_str(leaf)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let rt = runtime(py);
+        let result = py.detach(move || {
+            rt.block_on(async move { harness.delete_branch(entry).await })
+        });
+        result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Generate an AI summary for the branch ending at a leaf entry.
+    fn generate_branch_summary(&self, py: Python<'_>, leaf: &str) -> PyResult<Py<PyAny>> {
+        let harness = self.harness.clone();
+        let entry = llm_harness_types::EntryId::from_str(leaf)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let rt = runtime(py);
+        let result = py.detach(move || {
+            rt.block_on(async move { harness.generate_branch_summary(entry).await })
+        });
+        let summary = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let dict = PyDict::new(py);
+        dict.set_item("leaf_id", summary.leaf_id.to_string())?;
+        dict.set_item("from_entry", summary.from_entry.to_string())?;
+        dict.set_item("summary", &summary.summary)?;
+        dict.set_item("token_count", summary.token_count)?;
+        Ok(dict.into_any().unbind())
+    }
+
+
     // ── Context manager ─────────────────────────────────────────────────────
 
     /// 返回 harness 状态摘要。
@@ -681,4 +824,22 @@ impl PyAgentHarness {
         self.harness.abort();
         Ok(false) // don't suppress exceptions
     }
+}
+
+
+/// Convert a Vec<SessionEntry> to a list of Python dicts.
+fn session_entries_to_list(py: Python<'_>, entries: &[llm_harness_agent::session::SessionEntry]) -> Vec<Py<PyAny>> {
+    let mut result = Vec::new();
+    for entry in entries {
+        let dict = PyDict::new(py);
+        dict.set_item("id", entry.id.to_string()).ok();
+        dict.set_item("parent_id", entry.parent_id.map(|id| id.to_string())).ok();
+        dict.set_item("timestamp", entry.timestamp.to_rfc3339()).ok();
+        // Serialize payload to JSON then convert to Python
+        if let Ok(payload_val) = serde_json::to_value(&entry.payload) {
+            dict.set_item("payload", crate::value_conv::value_to_pyobject(py, &payload_val).unwrap_or(py.None())).ok();
+        }
+        result.push(dict.into_any().unbind());
+    }
+    result
 }
