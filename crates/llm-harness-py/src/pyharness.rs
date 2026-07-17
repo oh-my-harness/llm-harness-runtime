@@ -314,6 +314,11 @@ impl PyAgentHarness {
     /// `AgentHarness::prompt()` 返回 `Result<(), HarnessError>`——
     /// 不返回回复文本（回复通过事件流或 `build_context()` 获取）。
     /// 成功时返回 None。
+    ///
+    /// **警告**: `prompt()` 完全阻塞直到 LLM 完成，所有事件在这期间发出。
+    /// 在 `prompt()` 之后再调用 `collect_until_settled()` 会拿到空列表——
+    /// broadcast channel 不回放已发送的事件。如需同时发送 prompt 并收集事件，
+    /// 请使用 `prompt_and_collect()`。
     fn prompt(&self, py: Python<'_>, text: &str) -> PyResult<()> {
         let harness = self.harness.clone();
         let text = text.to_string();
@@ -431,6 +436,10 @@ impl PyAgentHarness {
     /// ```
     ///
     /// 返回事件列表。若超时未收到 settled/aborted，返回已收集的事件。
+    ///
+    /// **警告**: 仅在 `subscribe()` 之后、`prompt()` 之前调用才有效。
+    /// 如果先调用 `prompt()`（阻塞）再调用本方法，所有事件已发出，
+    /// 将拿到空列表。请改用 `prompt_and_collect()` 一步完成。
     #[pyo3(signature = (timeout_ms=30000))]
     fn collect_until_settled(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<Vec<Py<PyAny>>> {
         let rx = self.harness.subscribe();
@@ -472,7 +481,8 @@ impl PyAgentHarness {
     /// 等价于先订阅事件再在后台执行 `prompt()`，避免了 `prompt()` 阻塞
     /// 完毕后 `collect_until_settled()` 拿不到事件的时序问题。
     ///
-    /// 返回事件列表。若超时未收到 settled/aborted，返回已收集的事件。
+    /// 若 LLM 调用失败（网络错误、API key 无效等），抛出 `RuntimeError`。
+    /// 若超时未收到 settled/aborted，中止 LLM 任务并返回已收集的事件。
     #[pyo3(signature = (text, timeout_ms=30000))]
     fn prompt_and_collect(
         &self,
@@ -486,7 +496,7 @@ impl PyAgentHarness {
         let handle = runtime(py).handle().clone();
         let timeout = std::time::Duration::from_millis(timeout_ms);
 
-        let events: Vec<Py<PyAny>> = py.detach(move || {
+        let events: PyResult<Vec<Py<PyAny>>> = py.detach(move || {
             // Spawn prompt as a background task so we can collect events concurrently.
             let prompt_harness = harness.clone();
             let prompt_text = text.clone();
@@ -495,6 +505,7 @@ impl PyAgentHarness {
 
             let mut events = Vec::new();
             let mut rx = rx;
+            let mut got_terminal = false;
             loop {
                 let recv =
                     handle.block_on(async { tokio::time::timeout(timeout, rx.recv()).await });
@@ -510,6 +521,7 @@ impl PyAgentHarness {
                             }
                         });
                         if is_settled {
+                            got_terminal = true;
                             break;
                         }
                     }
@@ -517,13 +529,39 @@ impl PyAgentHarness {
                 }
             }
 
-            // Ensure the prompt task has completed.
-            let _ = handle.block_on(prompt_task);
+            // If the event loop timed out without a terminal event, abort
+            // the prompt task so we don't block indefinitely waiting for
+            // the LLM to finish.
+            if !got_terminal {
+                prompt_task.abort();
+            }
 
-            events
+            // Join the prompt task. If it completed naturally (after
+            // Settled/Aborted) this returns immediately. If we aborted
+            // it, we get a cancelled JoinError and return partial events.
+            match handle.block_on(prompt_task) {
+                Ok(Ok(())) => {
+                    // prompt() returns Ok even when the LLM call fails —
+                    // the error is stored in state.error_message. Check
+                    // it here so callers see failures instead of empty
+                    // event lists. (issue #58)
+                    if let Some(msg) = &harness.state().error_message {
+                        Err(pyo3::exceptions::PyRuntimeError::new_err(msg.clone()))
+                    } else {
+                        Ok(events)
+                    }
+                }
+                Ok(Err(e)) => {
+                    Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+                }
+                Err(join_err) if join_err.is_cancelled() => Ok(events),
+                Err(e) => {
+                    Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+                }
+            }
         });
 
-        Ok(events)
+        events
     }
 
     // ── Dynamic configuration ──────────────────────────────────────────────

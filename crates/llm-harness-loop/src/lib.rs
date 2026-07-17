@@ -45,7 +45,7 @@ pub use loop_fn::{agent_loop, agent_loop_continue};
 pub use llm_adapter::LlmError;
 pub use llm_adapter::StreamHandle;
 pub use llm_adapter::anthropic::AnthropicProvider;
-pub use llm_adapter::openai::OpenAIProvider;
+pub use llm_adapter::openai::{OpenAIProvider, ThinkingScheme};
 pub use llm_adapter::provider::Provider as LlmClient;
 pub use llm_adapter::provider::ProviderCapabilities;
 pub use llm_adapter::types::ChatRequest;

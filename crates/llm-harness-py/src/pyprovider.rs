@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use llm_harness_loop::{AnthropicProvider, LlmClient, OpenAIProvider};
+use llm_harness_loop::{AnthropicProvider, LlmClient, OpenAIProvider, ThinkingScheme};
 use pyo3::prelude::*;
 
 /// 不透明的 LLM provider 包装。持有 `Arc<dyn LlmClient>`。
@@ -17,15 +17,20 @@ pub struct PyProvider {
 
 /// 创建 OpenAI 兼容 provider。
 ///
-/// `base_url` 为空时使用默认 `https://api.openai.com`；
+/// `base_url` 为空时使用默认 `https://api.openai.com`。
+/// 当 `chat_path` 未指定时，自动去除 `base_url` 尾部的 `/v1` 以避免双重路径。
+/// `chat_path` 指定 chat completions 路径（默认 `/v1/chat/completions`）。
+/// `thinking_scheme` 指定 thinking 翻译策略：`"none"` / `"reasoning_effort"` / `"thinking_toggle"`。
 /// `parse_reasoning_content` 解析 DeepSeek 风格 reasoning_content；
 /// `tolerant_keepalive` 容忍流中 keepalive 消息（DeepSeek 兼容）。
 #[pyfunction]
-#[pyo3(signature = (api_key, base_url=None, parse_reasoning_content=true, tolerant_keepalive=true))]
+#[pyo3(signature = (api_key, base_url=None, chat_path=None, thinking_scheme=None, parse_reasoning_content=true, tolerant_keepalive=true))]
 pub fn create_openai_provider(
     py: Python<'_>,
     api_key: &str,
     base_url: Option<&str>,
+    chat_path: Option<&str>,
+    thinking_scheme: Option<&str>,
     parse_reasoning_content: bool,
     tolerant_keepalive: bool,
 ) -> PyResult<Py<PyProvider>> {
@@ -35,7 +40,36 @@ pub fn create_openai_provider(
     if let Some(url) = base_url
         && !url.is_empty()
     {
+        // When chat_path is not customised, auto-strip a trailing /v1
+        // from base_url to prevent the double-/v1 404 that affects
+        // most OpenAI-compatible deployments (e.g. vLLM, DeepSeek).
+        let url = if chat_path.is_none() {
+            let trimmed = url.trim_end_matches('/');
+            trimmed.strip_suffix("/v1").unwrap_or(trimmed)
+        } else {
+            url
+        };
         builder = builder.base_url(url);
+    }
+    if let Some(path) = chat_path
+        && !path.is_empty()
+    {
+        builder = builder.chat_path(path);
+    }
+    if let Some(scheme) = thinking_scheme
+        && !scheme.is_empty()
+    {
+        let scheme = match scheme.to_ascii_lowercase().as_str() {
+            "none" => ThinkingScheme::None,
+            "reasoning_effort" => ThinkingScheme::ReasoningEffort,
+            "thinking_toggle" => ThinkingScheme::ThinkingToggle,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown thinking_scheme '{other}': expected 'none', 'reasoning_effort', or 'thinking_toggle'"
+                )));
+            }
+        };
+        builder = builder.thinking_scheme(scheme);
     }
     let client: Arc<dyn LlmClient> = Arc::new(builder.build());
     Py::new(py, PyProvider { client })
