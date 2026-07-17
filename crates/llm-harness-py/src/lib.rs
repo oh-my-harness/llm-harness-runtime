@@ -142,7 +142,8 @@ fn create_judge<'py>(
 ) -> PyResult<Bound<'py, pyworkflow::PyJudgeWrapper>> {
     let judge = pyworkflow::PyJudge::new(callback);
     let wrapper = pyworkflow::PyJudgeWrapper {
-        judge: Arc::new(judge) as Arc<dyn llm_harness_runtime::workflow::judge::StepTransitionJudge>,
+        judge: Arc::new(judge)
+            as Arc<dyn llm_harness_runtime::workflow::judge::StepTransitionJudge>,
     };
     Py::new(py, wrapper).map(|p| p.into_bound(py))
 }

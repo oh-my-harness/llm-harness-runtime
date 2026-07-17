@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::workflow::model::{
-    ConditionExpr, Edge, EdgeCondition, Step, StepId, StepRecord, StepResult, Transition,
-    Workflow, WorkflowContext,
+    ConditionExpr, Edge, EdgeCondition, Step, StepId, StepRecord, StepResult, Transition, Workflow,
+    WorkflowContext,
 };
 
 /// 传递给 `StepTransitionJudge::decide` 的上下文。
@@ -320,7 +320,9 @@ mod tests {
     async fn composite_judge_uses_fallback_fn_for_unregistered_step() {
         let mut judge = CompositeJudge::new();
         judge.on("s1", |_| Transition::To("next".into()));
-        let judge = judge.fallback_fn(|_| Transition::Fail { reason: "fb".into() });
+        let judge = judge.fallback_fn(|_| Transition::Fail {
+            reason: "fb".into(),
+        });
 
         let step = make_step_with_id("unknown");
         let result = make_result();
@@ -352,7 +354,6 @@ mod tests {
         let t = judge.decide(&ctx).await;
         assert!(matches!(t, Transition::To(id) if id == "next"));
     }
-
 
     fn make_step() -> Step {
         Step::llm("s1", "Step 1", "do step 1", vec![])

@@ -150,7 +150,7 @@ instruction prompts → structured context → workflow → harness code → opt
 
 #### Q7：budget 控制——只管 cost，不管 iteration / time / compute
 
-**实现**：`BudgetControlAdapter` 读 `CostAggregate` 的 `total_cost`，超限时调 `BudgetExceededHook`。`max_steps`（默认 100）和 `max_retries`（默认 5）是独立的硬限制。
+**实现**：`BudgetControlAdapter` 读 `CostAggregate` 的 `total_cost`，超限时调 `BudgetExceededHook`。`max_steps`（默认 500）和 `max_retries`（默认 5）是独立的硬限制。
 
 **不够好**：
 - **budget 只看钱**：只有 USD cost 维度。没有 iteration count budget（AgenticPD 的 20 iterations）、wall-clock time budget、compute resource budget（CPU hours）。

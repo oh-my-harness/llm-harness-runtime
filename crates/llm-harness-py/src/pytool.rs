@@ -224,7 +224,6 @@ impl PyToolWrapper {
         self.tool.description()
     }
 
-
     /// 同步驱动 tool.execute：在独立 tokio runtime 上运行 async future。
     ///
     /// 仅供测试/验证使用；真实场景由 agent loop 调用 `execute`。

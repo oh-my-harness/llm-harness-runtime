@@ -313,7 +313,11 @@ impl PyCompositeJudge {
     /// callback signature: `callback(ctx: dict) -> str`
     /// Return value encoding: "to:<step_id>", "retry", "fail:<reason>", "abort:<reason>"
     fn on(&self, step: &str, callback: Py<PyAny>) -> PyResult<()> {
-        self.inner.handlers.lock().unwrap().insert(step.to_string(), callback);
+        self.inner
+            .handlers
+            .lock()
+            .unwrap()
+            .insert(step.to_string(), callback);
         Ok(())
     }
 
@@ -383,7 +387,6 @@ async fn call_python_judge(
         },
     }
 }
-
 
 /// 持有 `StepExecutor` 的不透明 Python 包装，供 Python 侧引用已注册的 executor。
 ///
@@ -650,7 +653,6 @@ impl Plugin for PyPluginAdapter {
     }
 }
 
-
 /// Extract `Arc<dyn StepTransitionJudge>` from a Python judge object.
 ///
 /// Accepts both `Judge` (from `create_judge()`) and `CompositeJudge`
@@ -669,9 +671,10 @@ fn extract_judge(
         let inner = composite.inner();
         // Auto-inject EdgeConditionJudge as fallback for unregistered steps
         // if the workflow has Expr edges.
-        let has_expr_edges = workflow.edges.iter().any(|e| {
-            matches!(e.condition, Some(EdgeCondition::Expr(_)))
-        });
+        let has_expr_edges = workflow
+            .edges
+            .iter()
+            .any(|e| matches!(e.condition, Some(EdgeCondition::Expr(_))));
         if has_expr_edges {
             inner.set_edge_fallback(EdgeConditionJudge::from_workflow(workflow));
         }
@@ -781,9 +784,7 @@ fn step_record_to_dict(py: Python<'_>, record: &StepRecord) -> PyResult<Py<PyAny
 /// - 其余 → `RuntimeError`
 fn workflow_error_to_pyerr(e: WorkflowError) -> PyErr {
     match e {
-        WorkflowError::Validation(_) => {
-            pyo3::exceptions::PyValueError::new_err(e.to_string())
-        }
+        WorkflowError::Validation(_) => pyo3::exceptions::PyValueError::new_err(e.to_string()),
         WorkflowError::WorkflowNotFound { .. } | WorkflowError::ExecutorNotFound { .. } => {
             pyo3::exceptions::PyKeyError::new_err(e.to_string())
         }
@@ -837,8 +838,7 @@ impl PyWorkflowEngine {
         };
 
         let engine = py.detach(|| {
-            WorkflowEngine::new(workflow, config, judge_arc)
-                .map_err(workflow_error_to_pyerr)
+            WorkflowEngine::new(workflow, config, judge_arc).map_err(workflow_error_to_pyerr)
         })?;
 
         Ok(Self {
@@ -870,7 +870,11 @@ impl PyWorkflowEngine {
         let client = provider.borrow().client.clone();
         // For restore, we don't have the workflow dict to auto-inject edge fallback.
         // The user should re-register handlers on a new CompositeJudge if needed.
-        let empty_workflow = Workflow { entry_step: String::new(), steps: vec![], edges: vec![] };
+        let empty_workflow = Workflow {
+            entry_step: String::new(),
+            steps: vec![],
+            edges: vec![],
+        };
         let judge_arc: Arc<dyn StepTransitionJudge> = extract_judge(py, judge, &empty_workflow)?;
 
         let config = WorkflowEngineConfig {
@@ -1100,7 +1104,6 @@ impl PyWorkflowEngine {
         }
     }
 
-
     /// 启动/恢复执行。阻塞直到 workflow 完成。
     ///
     /// 释放 GIL 后在 tokio runtime 上运行 `engine.run()`。
@@ -1174,9 +1177,7 @@ impl PyWorkflowEngine {
             .engine
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine not available"))?;
-        engine
-            .pause(reason)
-            .map_err(workflow_error_to_pyerr)
+        engine.pause(reason).map_err(workflow_error_to_pyerr)
     }
 
     /// 恢复已暂停或失败的 task。将状态重置为 Paused，随后 `run()` 可继续。
@@ -1281,7 +1282,10 @@ impl PyWorkflowEngine {
         let state = py.detach(move || {
             rt.block_on(async { workflow_status_to_str(&engine_clone.state().await).to_string() })
         });
-        Ok(format!("WorkflowEngine(task_id={}, state={})", task_id, state))
+        Ok(format!(
+            "WorkflowEngine(task_id={}, state={})",
+            task_id, state
+        ))
     }
 }
 

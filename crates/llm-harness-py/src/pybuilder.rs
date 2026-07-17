@@ -14,8 +14,8 @@ use llm_harness_types::{ExecutionEnv, Tool, UnsupportedEnv};
 use pyo3::prelude::*;
 
 use crate::pyagent::runtime;
-use crate::pyharness::parse_thinking_level;
 use crate::pyharness::PyAgentHarness;
+use crate::pyharness::parse_thinking_level;
 use crate::pyplugin::PyPluginWrapper;
 use crate::pyprovider::PyProvider;
 use crate::pytool::PyToolWrapper;
@@ -102,7 +102,10 @@ impl PyHarnessBuilder {
     /// 设置 thinking level（构建时）。
     ///
     /// 接受: "off", "minimal", "low", "medium", "high", "xhigh", 或 "budget:<tokens>"。
-    fn thinking_level<'a>(mut slf: PyRefMut<'a, Self>, level: &str) -> PyResult<PyRefMut<'a, Self>> {
+    fn thinking_level<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        level: &str,
+    ) -> PyResult<PyRefMut<'a, Self>> {
         if let Some(b) = slf.builder.take() {
             let tl = parse_thinking_level(level)?;
             slf.builder = Some(b.thinking_level(tl));
@@ -119,7 +122,10 @@ impl PyHarnessBuilder {
     }
 
     /// Set the token budget reserved for system prompt + new response during compaction.
-    fn compaction_reserve_tokens<'a>(mut slf: PyRefMut<'a, Self>, tokens: Option<u32>) -> PyRefMut<'a, Self> {
+    fn compaction_reserve_tokens<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        tokens: Option<u32>,
+    ) -> PyRefMut<'a, Self> {
         if let Some(b) = slf.builder.take() {
             slf.builder = Some(b.compaction_reserve_tokens(tokens));
         }
@@ -127,7 +133,10 @@ impl PyHarnessBuilder {
     }
 
     /// Set how many recent tokens to keep unsummarized during compaction.
-    fn compaction_keep_recent_tokens<'a>(mut slf: PyRefMut<'a, Self>, tokens: Option<u32>) -> PyRefMut<'a, Self> {
+    fn compaction_keep_recent_tokens<'a>(
+        mut slf: PyRefMut<'a, Self>,
+        tokens: Option<u32>,
+    ) -> PyRefMut<'a, Self> {
         if let Some(b) = slf.builder.take() {
             slf.builder = Some(b.compaction_keep_recent_tokens(tokens));
         }

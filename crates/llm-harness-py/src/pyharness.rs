@@ -22,9 +22,9 @@ use pyo3::types::{PyDict, PyList};
 use tokio::sync::broadcast;
 
 use crate::event_stream::agent_event_to_dict;
-use crate::value_conv::value_to_pyobject;
 use crate::pyagent::runtime;
 use crate::pyworkflow::cost_aggregate_to_dict;
+use crate::value_conv::value_to_pyobject;
 
 /// 将 `HarnessPhase` 转为字符串标识。
 fn phase_str(phase: HarnessPhase) -> &'static str {
@@ -377,7 +377,8 @@ impl PyAgentHarness {
                         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
                     if json.get("role").and_then(|r| r.as_str()) == Some("assistant") {
                         if let Some(content) = json.get("content").and_then(|c| c.as_array()) {
-                            let text: String = content.iter()
+                            let text: String = content
+                                .iter()
                                 .filter_map(|block| {
                                     if block.get("type").and_then(|t| t.as_str()) == Some("text") {
                                         block.get("text").and_then(|t| t.as_str()).map(String::from)
@@ -385,7 +386,8 @@ impl PyAgentHarness {
                                         None
                                     }
                                 })
-                                .collect::<Vec<_>>().join("");
+                                .collect::<Vec<_>>()
+                                .join("");
                             return Ok(text);
                         }
                     }
@@ -656,19 +658,22 @@ impl PyAgentHarness {
 
     /// Drain the steering queue. Only callable when Idle.
     fn clear_steering_queue(&self) -> PyResult<()> {
-        self.harness.clear_steering_queue()
+        self.harness
+            .clear_steering_queue()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Drain the follow-up queue. Only callable when Idle.
     fn clear_follow_up_queue(&self) -> PyResult<()> {
-        self.harness.clear_follow_up_queue()
+        self.harness
+            .clear_follow_up_queue()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Drain all queues (steer, follow-up, next_turn). Only callable when Idle.
     fn clear_all_queues(&self) -> PyResult<()> {
-        self.harness.clear_all_queues()
+        self.harness
+            .clear_all_queues()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -685,9 +690,8 @@ impl PyAgentHarness {
         let harness = self.harness.clone();
         let active = tools.map(|v| v.into_iter().collect::<HashSet<String>>());
         let rt = runtime(py);
-        let result = py.detach(move || {
-            rt.block_on(async move { harness.set_active_tools(active).await })
-        });
+        let result =
+            py.detach(move || rt.block_on(async move { harness.set_active_tools(active).await }));
         result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -695,16 +699,21 @@ impl PyAgentHarness {
 
     /// Fork the session at a given entry. Returns the new leaf entry ID.
     #[pyo3(signature = (from_entry, label=None))]
-    fn fork_branch(&self, py: Python<'_>, from_entry: &str, label: Option<String>) -> PyResult<String> {
+    fn fork_branch(
+        &self,
+        py: Python<'_>,
+        from_entry: &str,
+        label: Option<String>,
+    ) -> PyResult<String> {
         let harness = self.harness.clone();
         let entry = llm_harness_types::EntryId::from_str(from_entry)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let rt = runtime(py);
-        let result = py.detach(move || {
-            rt.block_on(async move { harness.fork_branch(entry, label).await })
-        });
-        result.map(|id| id.to_string())
-              .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+        let result =
+            py.detach(move || rt.block_on(async move { harness.fork_branch(entry, label).await }));
+        result
+            .map(|id| id.to_string())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
     /// Switch the active cursor to a target entry.
@@ -713,9 +722,8 @@ impl PyAgentHarness {
         let entry = llm_harness_types::EntryId::from_str(target)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let rt = runtime(py);
-        let result = py.detach(move || {
-            rt.block_on(async move { harness.navigate_tree(entry).await })
-        });
+        let result =
+            py.detach(move || rt.block_on(async move { harness.navigate_tree(entry).await }));
         result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -723,10 +731,9 @@ impl PyAgentHarness {
     fn list_branches(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let harness = self.harness.clone();
         let rt = runtime(py);
-        let branches = py.detach(move || {
-            rt.block_on(async move { harness.list_branches().await })
-        });
-        let branches = branches.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let branches = py.detach(move || rt.block_on(async move { harness.list_branches().await }));
+        let branches =
+            branches.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         let mut result = Vec::new();
         for b in branches {
             let dict = PyDict::new(py);
@@ -744,10 +751,10 @@ impl PyAgentHarness {
     fn read_active_path(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let harness = self.harness.clone();
         let rt = runtime(py);
-        let entries = py.detach(move || {
-            rt.block_on(async move { harness.read_active_path().await })
-        });
-        let entries = entries.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let entries =
+            py.detach(move || rt.block_on(async move { harness.read_active_path().await }));
+        let entries =
+            entries.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(session_entries_to_list(py, &entries))
     }
 
@@ -755,10 +762,10 @@ impl PyAgentHarness {
     fn read_all_entries(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
         let harness = self.harness.clone();
         let rt = runtime(py);
-        let entries = py.detach(move || {
-            rt.block_on(async move { harness.read_all_entries().await })
-        });
-        let entries = entries.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let entries =
+            py.detach(move || rt.block_on(async move { harness.read_all_entries().await }));
+        let entries =
+            entries.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         Ok(session_entries_to_list(py, &entries))
     }
 
@@ -768,9 +775,8 @@ impl PyAgentHarness {
         let entry = llm_harness_types::EntryId::from_str(leaf)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let rt = runtime(py);
-        let result = py.detach(move || {
-            rt.block_on(async move { harness.delete_branch(entry).await })
-        });
+        let result =
+            py.detach(move || rt.block_on(async move { harness.delete_branch(entry).await }));
         result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 
@@ -783,7 +789,8 @@ impl PyAgentHarness {
         let result = py.detach(move || {
             rt.block_on(async move { harness.generate_branch_summary(entry).await })
         });
-        let summary = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        let summary =
+            result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
         let dict = PyDict::new(py);
         dict.set_item("leaf_id", summary.leaf_id.to_string())?;
         dict.set_item("from_entry", summary.from_entry.to_string())?;
@@ -792,13 +799,16 @@ impl PyAgentHarness {
         Ok(dict.into_any().unbind())
     }
 
-
     // ── Context manager ─────────────────────────────────────────────────────
 
     /// 返回 harness 状态摘要。
     fn __repr__(&self) -> String {
         let state = self.harness.state();
-        format!("AgentHarness(model={}, phase={})", state.model, phase_str(state.phase))
+        format!(
+            "AgentHarness(model={}, phase={})",
+            state.model,
+            phase_str(state.phase)
+        )
     }
 
     /// Context manager entry: returns self for use in `with` statements.
@@ -826,18 +836,26 @@ impl PyAgentHarness {
     }
 }
 
-
 /// Convert a Vec<SessionEntry> to a list of Python dicts.
-fn session_entries_to_list(py: Python<'_>, entries: &[llm_harness_agent::session::SessionEntry]) -> Vec<Py<PyAny>> {
+fn session_entries_to_list(
+    py: Python<'_>,
+    entries: &[llm_harness_agent::session::SessionEntry],
+) -> Vec<Py<PyAny>> {
     let mut result = Vec::new();
     for entry in entries {
         let dict = PyDict::new(py);
         dict.set_item("id", entry.id.to_string()).ok();
-        dict.set_item("parent_id", entry.parent_id.map(|id| id.to_string())).ok();
-        dict.set_item("timestamp", entry.timestamp.to_rfc3339()).ok();
+        dict.set_item("parent_id", entry.parent_id.map(|id| id.to_string()))
+            .ok();
+        dict.set_item("timestamp", entry.timestamp.to_rfc3339())
+            .ok();
         // Serialize payload to JSON then convert to Python
         if let Ok(payload_val) = serde_json::to_value(&entry.payload) {
-            dict.set_item("payload", crate::value_conv::value_to_pyobject(py, &payload_val).unwrap_or(py.None())).ok();
+            dict.set_item(
+                "payload",
+                crate::value_conv::value_to_pyobject(py, &payload_val).unwrap_or(py.None()),
+            )
+            .ok();
         }
         result.push(dict.into_any().unbind());
     }

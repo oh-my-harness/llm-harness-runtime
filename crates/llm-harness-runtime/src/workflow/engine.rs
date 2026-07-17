@@ -34,7 +34,10 @@ use crate::workflow::plan::validate_workflow;
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// 默认步骤数上限。step_history.len() 超限 → Failed。
-const DEFAULT_MAX_STEPS: usize = 100;
+///
+/// 500 覆盖典型 agentic 循环：max_retries(5) × max_attempts(3) = 15 条/逻辑步，
+/// 约够 30+ 个带完整重试的步骤。可通过 `with_max_steps` 调整。
+const DEFAULT_MAX_STEPS: usize = 500;
 
 /// 默认 Retry 上限。连续 Retry 超限 → Failed。
 /// 语义：允许的连续 Retry 次数（不含原始执行）。max_retries=5 时第 6 次触发 Failed。
@@ -425,18 +428,15 @@ impl WorkflowEngine {
         config: WorkflowEngineConfig,
         judge: Arc<dyn StepTransitionJudge>,
     ) -> Result<Self, WorkflowError> {
-        let workflow = store
-            .load_workflow(&task_id)
-            .await?
-            .ok_or_else(|| WorkflowError::WorkflowNotFound {
+        let workflow = store.load_workflow(&task_id).await?.ok_or_else(|| {
+            WorkflowError::WorkflowNotFound {
                 task_id: task_id.0.clone(),
-            })?;
+            }
+        })?;
         // 信任边界外数据：恢复后同样校验。
         validate_workflow(&workflow)?;
         let judge = default_declarative_judge(&workflow, judge);
-        let saved_state = store
-            .load_workflow_state(&task_id)
-            .await?;
+        let saved_state = store.load_workflow_state(&task_id).await?;
         let state = saved_state.unwrap_or_else(|| WorkflowState::new(workflow.entry_step.clone()));
         let engine = Self::from_parts_with_state(
             workflow,
@@ -670,9 +670,7 @@ impl WorkflowEngine {
         };
         // 若有 task_store，保存 workflow 定义（供 restore 重建）。
         if let Some(store) = &self.task_store {
-            store
-                .save_workflow(&self.task_id, &self.workflow)
-                .await?;
+            store.save_workflow(&self.task_id, &self.workflow).await?;
         }
 
         // RAII 守卫：无论 run_loop 正常返回、Err 还是 panic，都清除重入标志。
@@ -997,10 +995,7 @@ impl WorkflowEngine {
             })?;
         let started_at = chrono::Utc::now();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let env = self
-            .config
-            .env_factory
-            .create(&cwd)?;
+        let env = self.config.env_factory.create(&cwd)?;
         let history = self.workflow_state.lock().await.step_history.clone();
         let prev_result = history.last().and_then(|record| record.result.as_ref());
         let ctx = ExecutorCtx {
@@ -1052,10 +1047,7 @@ impl WorkflowEngine {
 
         // a. 构造 env + session。
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let env = self
-            .config
-            .env_factory
-            .create(&cwd)?;
+        let env = self.config.env_factory.create(&cwd)?;
         let (storage, session_id) = self
             .config
             .session_factory
@@ -1336,9 +1328,7 @@ impl WorkflowEngine {
         let mut state = state.clone();
         state.context = self.context_snapshot().await;
         if let Some(store) = &self.task_store {
-            store
-                .save_workflow_state(&self.task_id, &state)
-                .await?;
+            store.save_workflow_state(&self.task_id, &state).await?;
         }
         Ok(())
     }
@@ -1511,9 +1501,7 @@ impl WorkflowEngine {
                 state.ended_at = None;
             }
             ref s => {
-                return Err(WorkflowError::InvalidStatus {
-                    status: s.clone(),
-                });
+                return Err(WorkflowError::InvalidStatus { status: s.clone() });
             }
         }
         self.pause_requested
@@ -1591,9 +1579,7 @@ impl WorkflowEngine {
         };
         // I/O 在锁外执行。
         if let Some(store) = &self.task_store {
-            store
-                .save_checkpoint(&self.task_id, &cp)
-                .await?;
+            store.save_checkpoint(&self.task_id, &cp).await?;
         }
         Ok(())
     }
