@@ -555,6 +555,31 @@ impl WorkflowEngine {
     }
 
     #[must_use]
+    /// 从指定步骤开始执行（`--restart-from` 场景）。
+    ///
+    /// 与 [`WorkflowEngine::new`] 相同，但 `current_step` 设为 `step` 而非
+    /// `workflow.entry_step`，跳过其前的步骤。调用方负责确保 `step` 存在于
+    /// workflow 且已清理该步骤及下游的缓存（done marker 等），使目标步骤真正重跑。
+    pub fn new_from_step(
+        workflow: Workflow,
+        config: WorkflowEngineConfig,
+        judge: Arc<dyn StepTransitionJudge>,
+        step: impl Into<StepId>,
+    ) -> Result<Self, WorkflowError> {
+        validate_workflow(&workflow)?;
+        let judge = default_declarative_judge(&workflow, judge);
+        let mut state = WorkflowState::new(step.into());
+        state.context = WorkflowContext::new();
+        Ok(Self::from_parts_with_state(
+            workflow,
+            config,
+            judge,
+            None,
+            TaskId(format!("task-{}", uuid::Uuid::new_v4())),
+            state,
+        ))
+    }
+
     pub fn with_max_steps(mut self, max: usize) -> Self {
         self.max_steps = max;
         self
