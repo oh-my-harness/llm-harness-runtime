@@ -13,7 +13,7 @@ VENV="$VENV_DIR/bin"
 # 自动创建 venv（含 maturin + pytest）如果不存在
 if [ ! -d "$VENV_DIR" ]; then
   echo "── 创建 Python venv ($VENV_DIR) ──────────"
-  python3 -m venv "$VENV_DIR"
+  python3.14 -m venv "$VENV_DIR"
   "$VENV/pip" install --upgrade pip maturin pytest
 fi
 

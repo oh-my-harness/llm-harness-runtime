@@ -380,21 +380,21 @@ impl PyAgentHarness {
                 for msg in ctx.messages.iter().rev() {
                     let json = serde_json::to_value(msg)
                         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                    if json.get("role").and_then(|r| r.as_str()) == Some("assistant") {
-                        if let Some(content) = json.get("content").and_then(|c| c.as_array()) {
-                            let text: String = content
-                                .iter()
-                                .filter_map(|block| {
-                                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                        block.get("text").and_then(|t| t.as_str()).map(String::from)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("");
-                            return Ok(text);
-                        }
+                    if json.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                        && let Some(content) = json.get("content").and_then(|c| c.as_array())
+                    {
+                        let text: String = content
+                            .iter()
+                            .filter_map(|block| {
+                                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                    block.get("text").and_then(|t| t.as_str()).map(String::from)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                        return Ok(text);
                     }
                 }
                 Ok(String::new())
@@ -551,13 +551,9 @@ impl PyAgentHarness {
                         Ok(events)
                     }
                 }
-                Ok(Err(e)) => {
-                    Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-                }
+                Ok(Err(e)) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
                 Err(join_err) if join_err.is_cancelled() => Ok(events),
-                Err(e) => {
-                    Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-                }
+                Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
             }
         });
 
