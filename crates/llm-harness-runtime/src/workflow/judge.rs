@@ -246,6 +246,9 @@ fn evaluate_condition(expr: &ConditionExpr, structured: Option<&Value>) -> bool 
         ConditionExpr::Lte { pointer, value } => {
             compare_number(structured, pointer, *value, f64::le)
         }
+        ConditionExpr::All { exprs } => exprs.iter().all(|e| evaluate_condition(e, structured)),
+        ConditionExpr::Any { exprs } => exprs.iter().any(|e| evaluate_condition(e, structured)),
+        ConditionExpr::Not { expr } => !evaluate_condition(expr, structured),
     }
 }
 
@@ -505,5 +508,150 @@ mod tests {
         assert!(
             matches!(transition, Transition::Fail { reason } if reason.contains("requires a custom judge"))
         );
+    }
+
+    #[tokio::test]
+    async fn edge_condition_all_requires_all_true() {
+        let judge = EdgeConditionJudge::new(vec![edge(
+            "next",
+            Some(EdgeCondition::Expr(ConditionExpr::All {
+                exprs: vec![
+                    ConditionExpr::Gte {
+                        pointer: "/score".into(),
+                        value: 0.8,
+                    },
+                    ConditionExpr::Eq {
+                        pointer: "/status".into(),
+                        value: serde_json::json!("ok"),
+                    },
+                ],
+            })),
+        )]);
+        let step = make_step();
+
+        // Both true → match
+        let result = make_structured_result(serde_json::json!({"score": 0.9, "status": "ok"}));
+        let ctx = StepCtx {
+            current_step: &step,
+            last_result: &result,
+            step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
+        };
+        let t = judge.decide(&ctx).await;
+        assert!(matches!(t, Transition::To(id) if id == "next"));
+
+        // One false → no match
+        let result = make_structured_result(serde_json::json!({"score": 0.9, "status": "bad"}));
+        let ctx = StepCtx {
+            current_step: &step,
+            last_result: &result,
+            step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
+        };
+        let t = judge.decide(&ctx).await;
+        assert!(matches!(t, Transition::Fail { .. }));
+    }
+
+    #[tokio::test]
+    async fn edge_condition_any_matches_first_true() {
+        let judge = EdgeConditionJudge::new(vec![edge(
+            "next",
+            Some(EdgeCondition::Expr(ConditionExpr::Any {
+                exprs: vec![
+                    ConditionExpr::Eq {
+                        pointer: "/status".into(),
+                        value: serde_json::json!("bad"),
+                    },
+                    ConditionExpr::Gte {
+                        pointer: "/score".into(),
+                        value: 0.8,
+                    },
+                ],
+            })),
+        )]);
+        let step = make_step();
+        let result = make_structured_result(serde_json::json!({"score": 0.9, "status": "ok"}));
+        let ctx = StepCtx {
+            current_step: &step,
+            last_result: &result,
+            step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
+        };
+        let t = judge.decide(&ctx).await;
+        assert!(matches!(t, Transition::To(id) if id == "next"));
+    }
+
+    #[tokio::test]
+    async fn edge_condition_not_inverts() {
+        let judge = EdgeConditionJudge::new(vec![edge(
+            "next",
+            Some(EdgeCondition::Expr(ConditionExpr::Not {
+                expr: Box::new(ConditionExpr::Exists {
+                    pointer: "/error".into(),
+                }),
+            })),
+        )]);
+        let step = make_step();
+
+        // No error → Not(Exists) = true → match
+        let result = make_structured_result(serde_json::json!({"score": 0.9}));
+        let ctx = StepCtx {
+            current_step: &step,
+            last_result: &result,
+            step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
+        };
+        let t = judge.decide(&ctx).await;
+        assert!(matches!(t, Transition::To(id) if id == "next"));
+
+        // Error present → Not(Exists) = false → no match
+        let result = make_structured_result(serde_json::json!({"error": "fail"}));
+        let ctx = StepCtx {
+            current_step: &step,
+            last_result: &result,
+            step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
+        };
+        let t = judge.decide(&ctx).await;
+        assert!(matches!(t, Transition::Fail { .. }));
+    }
+
+    #[tokio::test]
+    async fn edge_condition_nested_composite() {
+        // (score >= 0.8 AND status == "ok") OR error exists
+        let judge = EdgeConditionJudge::new(vec![edge(
+            "next",
+            Some(EdgeCondition::Expr(ConditionExpr::Any {
+                exprs: vec![
+                    ConditionExpr::All {
+                        exprs: vec![
+                            ConditionExpr::Gte {
+                                pointer: "/score".into(),
+                                value: 0.8,
+                            },
+                            ConditionExpr::Eq {
+                                pointer: "/status".into(),
+                                value: serde_json::json!("ok"),
+                            },
+                        ],
+                    },
+                    ConditionExpr::Exists {
+                        pointer: "/error".into(),
+                    },
+                ],
+            })),
+        )]);
+        let step = make_step();
+
+        // error exists → match (via Any second branch)
+        let result = make_structured_result(serde_json::json!({"score": 0.1, "error": "fail"}));
+        let ctx = StepCtx {
+            current_step: &step,
+            last_result: &result,
+            step_history: &[],
+            context: Box::leak(Box::new(WorkflowContext::new())),
+        };
+        let t = judge.decide(&ctx).await;
+        assert!(matches!(t, Transition::To(id) if id == "next"));
     }
 }

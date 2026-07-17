@@ -15,6 +15,7 @@ use serde::Deserialize;
 use crate::lifecycle::task::TaskId;
 use crate::lifecycle::task_store::TaskStore;
 use crate::workflow::error::{EdgeEndpoint, WorkflowValidationError};
+#[allow(unused_imports)]
 use crate::workflow::model::{
     ConditionExpr, Edge, EdgeCondition, Step, StepExecutionPolicy, StepId, Workflow,
 };
@@ -213,20 +214,16 @@ fn validate_edge_condition(edge: &Edge) -> Result<(), WorkflowValidationError> {
             }
         }
         EdgeCondition::Expr(expr) => {
-            validate_condition_pointer(edge, expr.pointer())?;
-            match expr {
-                ConditionExpr::Gt { value, .. }
-                | ConditionExpr::Gte { value, .. }
-                | ConditionExpr::Lt { value, .. }
-                | ConditionExpr::Lte { value, .. }
-                    if !value.is_finite() =>
-                {
-                    return Err(WorkflowValidationError::NonFiniteConditionValue {
-                        from: edge.from.to_string(),
-                        to: edge.to.to_string(),
-                    });
-                }
-                _ => {}
+            // Validate all pointers recursively (handles All/Any/Not composites).
+            for ptr in expr.all_pointers() {
+                validate_condition_pointer(edge, ptr)?;
+            }
+            // Check for non-finite values in any numeric sub-expression.
+            if expr.has_non_finite_value() {
+                return Err(WorkflowValidationError::NonFiniteConditionValue {
+                    from: edge.from.to_string(),
+                    to: edge.to.to_string(),
+                });
             }
         }
     }

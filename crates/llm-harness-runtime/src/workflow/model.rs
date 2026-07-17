@@ -326,6 +326,18 @@ pub enum ConditionExpr {
         pointer: String,
         value: f64,
     },
+    /// Logical AND — all sub-expressions must be true.
+    All {
+        exprs: Vec<ConditionExpr>,
+    },
+    /// Logical OR — at least one sub-expression must be true.
+    Any {
+        exprs: Vec<ConditionExpr>,
+    },
+    /// Logical NOT — inverts the sub-expression.
+    Not {
+        expr: Box<ConditionExpr>,
+    },
 }
 
 impl ConditionExpr {
@@ -339,6 +351,46 @@ impl ConditionExpr {
             | Self::Gte { pointer, .. }
             | Self::Lt { pointer, .. }
             | Self::Lte { pointer, .. } => pointer,
+            // Composite conditions have no single pointer.
+            Self::All { .. } | Self::Any { .. } | Self::Not { .. } => "",
+        }
+    }
+
+    /// Collect all JSON pointers referenced by this condition (recursively).
+    /// Used for validation of composite (All/Any/Not) conditions.
+    pub fn all_pointers(&self) -> Vec<&str> {
+        match self {
+            Self::Exists { pointer }
+            | Self::Missing { pointer }
+            | Self::Eq { pointer, .. }
+            | Self::Ne { pointer, .. }
+            | Self::Gt { pointer, .. }
+            | Self::Gte { pointer, .. }
+            | Self::Lt { pointer, .. }
+            | Self::Lte { pointer, .. } => vec![pointer.as_str()],
+            Self::All { exprs } | Self::Any { exprs } => {
+                exprs.iter().flat_map(|e| e.all_pointers()).collect()
+            }
+            Self::Not { expr } => expr.all_pointers(),
+        }
+    }
+
+    /// Check if any numeric sub-expression has a non-finite value (NaN/Infinity).
+    pub fn has_non_finite_value(&self) -> bool {
+        match self {
+            Self::Gt { value, .. }
+            | Self::Gte { value, .. }
+            | Self::Lt { value, .. }
+            | Self::Lte { value, .. }
+                if !value.is_finite() =>
+            {
+                true
+            }
+            Self::All { exprs } | Self::Any { exprs } => {
+                exprs.iter().any(|e| e.has_non_finite_value())
+            }
+            Self::Not { expr } => expr.has_non_finite_value(),
+            _ => false,
         }
     }
 }
