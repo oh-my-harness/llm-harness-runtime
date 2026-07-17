@@ -23,12 +23,11 @@ use llm_harness_runtime::workflow::model::{
 };
 use llm_harness_types::{AgentError, CostAggregate, ExecutionEnv, Tool, UnsupportedEnv};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyDict;
 use serde_json::Value;
 
 use crate::pyagent::runtime;
 use crate::pyeventstream::PyWaitForExternalEventTool;
-use crate::pyhooks::HookKind;
 use crate::pyplugin::PyPluginWrapper;
 use crate::pyprovider::PyProvider;
 use crate::pytool::PyToolWrapper;
@@ -246,6 +245,12 @@ pub struct PyCompositeJudgeInner {
     edge_fallback: std::sync::Mutex<Option<EdgeConditionJudge>>,
 }
 
+impl Default for PyCompositeJudgeInner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PyCompositeJudgeInner {
     pub fn new() -> Self {
         Self {
@@ -304,6 +309,12 @@ impl StepTransitionJudge for PyCompositeJudgeInner {
 #[pyclass(name = "CompositeJudge")]
 pub struct PyCompositeJudge {
     inner: Arc<PyCompositeJudgeInner>,
+}
+
+impl Default for PyCompositeJudge {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[pymethods]
@@ -795,7 +806,7 @@ fn workflow_error_to_pyerr(e: WorkflowError) -> PyErr {
 
 /// Python 侧的 `WorkflowEngine` 包装类。
 ///
-/// 暴露 fluent API：`with_tool()` / `with_hooks()` / `with_step_plugin()` /
+/// 暴露 fluent API：`with_tool()` / `with_step_plugin()` /
 /// `with_executor()` / `run()` / `subscribe()` / `task_id()`。
 ///
 /// 内部持有 `Option<Arc<WorkflowEngine>>`。`with_*` 方法通过 `Arc::try_unwrap`
@@ -835,6 +846,7 @@ impl PyWorkflowEngine {
             env_factory: Arc::new(UnsupportedEnvFactory),
             session_factory: Arc::new(JsonlSessionFactory),
             session_base_dir: std::path::PathBuf::from(session_base_dir),
+            customize_builder: None,
         };
 
         let engine = py.detach(|| {
@@ -883,6 +895,7 @@ impl PyWorkflowEngine {
             env_factory: Arc::new(UnsupportedEnvFactory),
             session_factory: Arc::new(JsonlSessionFactory),
             session_base_dir: std::path::PathBuf::from(session_base_dir),
+            customize_builder: None,
         };
 
         let rt = runtime(py);
@@ -934,16 +947,19 @@ impl PyWorkflowEngine {
     }
 
     /// 注入额外 hooks。返回 self 以支持链式调用。
+    ///
+    /// 通过 `customize_builder` 配置：每步构造 harness 时应用。
+    /// 多次调用累加（后续 hooks 追加到已有 customize 闭包之后）。
     fn with_hooks<'a>(
         mut slf: PyRefMut<'a, Self>,
-        hooks_list: &Bound<'_, PyList>,
+        hooks_list: &Bound<'_, pyo3::types::PyList>,
     ) -> PyResult<PyRefMut<'a, Self>> {
         let arc = slf
             .engine
             .take()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("engine already consumed"))?;
 
-        let engine = Arc::try_unwrap(arc).map_err(|_| {
+        let mut engine = Arc::try_unwrap(arc).map_err(|_| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "engine is shared (running?); cannot add hooks",
             )
@@ -953,6 +969,7 @@ impl PyWorkflowEngine {
         for item in hooks_list.iter() {
             let wrapper = item.cast::<crate::pyhooks::PyHookWrapper>()?;
             let kind = &wrapper.borrow().kind;
+            use crate::pyhooks::HookKind;
             match kind {
                 HookKind::BeforeTurn(h) => harness_hooks.before_turn.push(h.clone()),
                 HookKind::AfterTurn(h) => harness_hooks.after_turn.push(h.clone()),
@@ -972,8 +989,34 @@ impl PyWorkflowEngine {
             }
         }
 
-        slf.engine = Some(Arc::new(engine.with_hooks(harness_hooks)));
+        let prev = engine.config_customize_builder().clone();
+        engine.set_customize_builder(Arc::new(move |b| {
+            let b = if let Some(p) = &prev { p(b) } else { b };
+            b.hooks(harness_hooks.clone())
+        }));
+        slf.engine = Some(Arc::new(engine));
         Ok(slf)
+    }
+
+    /// 设置每步 LLM 调用的最大输出 token 数。
+    ///
+    /// 通过 `customize_builder` 配置：每步构造 harness 时应用。
+    /// 多次调用累加（后调覆盖先调，语义同 builder last-write-wins）。
+    fn with_max_tokens<'a>(mut slf: PyRefMut<'a, Self>, max_tokens: u32) -> PyRefMut<'a, Self> {
+        if let Some(arc) = slf.engine.take() {
+            match Arc::try_unwrap(arc) {
+                Ok(mut engine) => {
+                    let prev = engine.config_customize_builder().clone();
+                    engine.set_customize_builder(Arc::new(move |b| {
+                        let b = if let Some(p) = &prev { p(b) } else { b };
+                        b.max_tokens(max_tokens)
+                    }));
+                    slf.engine = Some(Arc::new(engine));
+                }
+                Err(arc) => slf.engine = Some(arc),
+            }
+        }
+        slf
     }
 
     /// 为指定 step 安装 plugin。返回 self 以支持链式调用。
@@ -1008,19 +1051,6 @@ impl PyWorkflowEngine {
                 Ok(engine) => {
                     let e = executor.borrow().executor.clone();
                     slf.engine = Some(Arc::new(engine.with_executor(name, e)));
-                }
-                Err(arc) => slf.engine = Some(arc),
-            }
-        }
-        slf
-    }
-
-    /// 设置每步 LLM 调用的最大输出 token 数。
-    fn with_max_tokens<'a>(mut slf: PyRefMut<'a, Self>, max_tokens: u32) -> PyRefMut<'a, Self> {
-        if let Some(arc) = slf.engine.take() {
-            match Arc::try_unwrap(arc) {
-                Ok(engine) => {
-                    slf.engine = Some(Arc::new(engine.with_max_tokens(Some(max_tokens))));
                 }
                 Err(arc) => slf.engine = Some(arc),
             }

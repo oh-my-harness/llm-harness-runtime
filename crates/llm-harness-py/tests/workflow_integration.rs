@@ -34,6 +34,7 @@ fn make_config(
         env_factory: Arc::new(NoopEnvFactory),
         session_factory: Arc::new(JsonlSessionFactory),
         session_base_dir: dir.join("sessions"),
+        customize_builder: None,
     }
 }
 

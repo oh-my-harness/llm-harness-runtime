@@ -256,6 +256,28 @@ impl HarnessBuilder {
         self
     }
 
+    /// Set hook collections directly. Push semantics: the provided hooks
+    /// are appended to the builder's existing hooks. Call multiple times
+    /// to compose hooks from multiple sources.
+    pub fn hooks(mut self, hooks: HarnessHooks) -> Self {
+        self.hooks.before_run.extend(hooks.before_run);
+        self.hooks.before_turn.extend(hooks.before_turn);
+        self.hooks.after_turn.extend(hooks.after_turn);
+        self.hooks.before_tool_call.extend(hooks.before_tool_call);
+        self.hooks.after_tool_call.extend(hooks.after_tool_call);
+        self.hooks.transform_context.extend(hooks.transform_context);
+        self.hooks.prepare_next_turn.extend(hooks.prepare_next_turn);
+        self.hooks.should_stop.extend(hooks.should_stop);
+        self.hooks
+            .before_provider_request
+            .extend(hooks.before_provider_request);
+        self.hooks
+            .after_provider_response
+            .extend(hooks.after_provider_response);
+        self.hooks.before_compact.extend(hooks.before_compact);
+        self
+    }
+
     /// 设置 pricing provider，用于成本计算。
     ///
     /// 设置后，builder 注入一个 `CostAccumulatorHook`，计算每次调用的

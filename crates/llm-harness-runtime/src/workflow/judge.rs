@@ -152,14 +152,16 @@ impl StepTransitionJudge for EdgeConditionJudge {
     }
 }
 
+type JudgeHandler = Arc<dyn Fn(&StepCtx) -> Transition + Send + Sync>;
+
 /// Composite judge: dispatches to per-step handlers instead of one big decide.
 ///
 /// Register a handler for each step that needs custom routing logic.
 /// Steps without a registered handler fall through to the fallback
 /// (user-set handler, EdgeConditionJudge, or Abort).
 pub struct CompositeJudge {
-    handlers: HashMap<StepId, Arc<dyn Fn(&StepCtx) -> Transition + Send + Sync>>,
-    fallback: Option<Arc<dyn Fn(&StepCtx) -> Transition + Send + Sync>>,
+    handlers: HashMap<StepId, JudgeHandler>,
+    fallback: Option<JudgeHandler>,
     edge_fallback: Option<EdgeConditionJudge>,
 }
 

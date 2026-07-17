@@ -1,0 +1,2154 @@
+use super::*;
+use crate::spawn::spawner::{EnvFactory, JsonlSessionFactory};
+use anyhow::Result; // StepExecutor::execute returns anyhow::Result
+use futures::future::BoxFuture;
+use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
+use llm_harness_types::{
+    AgentError, BeforeTurnCtx, BeforeTurnHook, ContentBlock, ExecutionEnv, ToolContext, ToolError,
+    ToolResult,
+};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct TestEnvFactory;
+impl EnvFactory for TestEnvFactory {
+    fn create(
+        &self,
+        _cwd: &std::path::Path,
+    ) -> std::result::Result<Arc<dyn ExecutionEnv>, AgentError> {
+        Ok(Arc::new(llm_harness_loop::test_utils::NoOpEnv))
+    }
+}
+
+#[tokio::test]
+async fn free_task_smoke_succeeds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
+        "The answer is 42.",
+    )]));
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new_free_task("what is 6*7?".into(), vec![], config).unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Idle);
+    let result = engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert!(result.final_message.as_deref().unwrap_or("").contains("42"));
+}
+
+use crate::lifecycle::task_store::JsonlTaskStore;
+use crate::workflow::judge::NoopJudge;
+use crate::workflow::model::{ConditionExpr, Edge, EdgeCondition};
+
+struct FixedExecutor;
+impl StepExecutor for FixedExecutor {
+    fn execute<'a>(&'a self, ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        Box::pin(async move {
+            let prev = ctx
+                .prev_result
+                .expect("executor should see previous result");
+            let suffix = ctx
+                .current_step
+                .executor_config()
+                .and_then(|config| config.get("suffix"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("done");
+            Ok(StepResult {
+                output: format!("executor {suffix} after {}", prev.output),
+                structured: Some(serde_json::json!({
+                    "executor": true,
+                    "previous_output": prev.output,
+                    "history_len": ctx.step_history.len(),
+                })),
+                tool_calls_count: 0,
+                session_id: String::new(),
+                cost: CostAggregate::default(),
+                started_at: None,
+                ended_at: None,
+            })
+        })
+    }
+}
+
+struct StructuredExecutor;
+impl StepExecutor for StructuredExecutor {
+    fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        Box::pin(async move {
+            Ok(StepResult {
+                output: "structured ok".into(),
+                structured: Some(serde_json::json!({"status": "ok"})),
+                tool_calls_count: 0,
+                session_id: String::new(),
+                cost: CostAggregate::default(),
+                started_at: None,
+                ended_at: None,
+            })
+        })
+    }
+}
+
+struct BlockingExecutor;
+impl StepExecutor for BlockingExecutor {
+    fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        Box::pin(async move { std::future::pending::<Result<StepResult>>().await })
+    }
+}
+
+struct FlakyExecutor {
+    attempts: Arc<AtomicUsize>,
+}
+
+impl StepExecutor for FlakyExecutor {
+    fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        Box::pin(async move {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == 1 {
+                anyhow::bail!("transient executor failure");
+            }
+            Ok(StepResult {
+                output: format!("ok on attempt {attempt}"),
+                structured: Some(serde_json::json!({ "attempt": attempt })),
+                tool_calls_count: 0,
+                session_id: String::new(),
+                cost: CostAggregate::default(),
+                started_at: None,
+                ended_at: None,
+            })
+        })
+    }
+}
+
+fn completed_result(output: &str) -> StepResult {
+    StepResult {
+        output: output.into(),
+        structured: None,
+        tool_calls_count: 0,
+        session_id: format!("session-{output}"),
+        cost: CostAggregate::default(),
+        started_at: Some(chrono::Utc::now()),
+        ended_at: Some(chrono::Utc::now()),
+    }
+}
+
+fn completed_record(step_id: &str, output: &str, transition: Transition) -> StepRecord {
+    let now = chrono::Utc::now();
+    StepRecord {
+        step_id: step_id.into(),
+        started_at: now,
+        ended_at: now,
+        result: Some(completed_result(output)),
+        transition,
+    }
+}
+
+#[test]
+fn step_history_summary_includes_structured_before_output() {
+    let mut record = completed_record(
+        "measure",
+        "measurement complete",
+        Transition::To("decide".into()),
+    );
+    record.result.as_mut().unwrap().structured = Some(serde_json::json!({
+        "voltage": 3.3,
+        "passed": true,
+    }));
+
+    let summary = format_step_history_summary(&[record]);
+
+    assert!(summary.contains("- step 'measure'"));
+    assert!(summary.contains("structured:"));
+    assert!(summary.contains("\"voltage\":3.3"));
+    assert!(summary.contains("\"passed\":true"));
+    assert!(summary.contains("output: measurement complete"));
+    assert!(
+        summary.find("structured:").unwrap() < summary.find("output:").unwrap(),
+        "structured result should be shown before output preview"
+    );
+}
+
+#[test]
+fn step_history_summary_uses_longer_output_preview() {
+    let output = "x".repeat(350);
+    let record = completed_record(
+        "answer",
+        &output,
+        Transition::Abort {
+            reason: "done".into(),
+        },
+    );
+
+    let summary = format_step_history_summary(&[record]);
+
+    assert!(
+        summary.contains(&output),
+        "output under the 1000 character preview limit should not be truncated"
+    );
+}
+
+struct BlockingTool;
+
+impl Tool for BlockingTool {
+    fn name(&self) -> &str {
+        "block_forever"
+    }
+
+    fn description(&self) -> &str {
+        "blocks until the tool context is aborted"
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| serde_json::json!({}));
+        &SCHEMA
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolError>> {
+        Box::pin(async move {
+            ctx.abort.cancelled().await;
+            Err(ToolError::Aborted)
+        })
+    }
+}
+
+struct TwoStepJudge;
+
+impl StepTransitionJudge for TwoStepJudge {
+    fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+        let cur = ctx.current_step.id().clone();
+        Box::pin(async move {
+            if cur == "s1" {
+                Transition::To("s2".into())
+            } else {
+                Transition::Abort {
+                    reason: "done".into(),
+                }
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn free_task_crash_recovery() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new_free_task("do work".into(), vec![], config)
+        .unwrap()
+        .with_task_store(store.clone());
+    let task_id = engine.task_id().clone();
+    engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+
+    // restore：workflow + state 从 store load。
+    let config2 = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let restored = WorkflowEngine::restore(store, task_id, config2, Arc::new(NoopJudge))
+        .await
+        .unwrap();
+    assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+}
+
+#[tokio::test]
+async fn running_restore_continues_from_transition_target() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restore-linear".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: None,
+        }],
+    };
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Running;
+    state.started_at = Some(chrono::Utc::now());
+    // Simulates a crash after s1's transition record was persisted but
+    // before current_step was updated to s2.
+    state.current_step = "s1".into();
+    state.step_history = vec![completed_record(
+        "s1",
+        "step1 done",
+        Transition::To("s2".into()),
+    )];
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    struct RestoreJudge;
+    impl StepTransitionJudge for RestoreJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            Box::pin(async move {
+                if step_id == "s1" {
+                    Transition::To("s2".into())
+                } else {
+                    Transition::Abort {
+                        reason: "done".into(),
+                    }
+                }
+            })
+        }
+    }
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step2 done")]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let restored = WorkflowEngine::restore(store, task_id, config, Arc::new(RestoreJudge))
+        .await
+        .unwrap();
+
+    let result = restored.run().await.unwrap();
+    let history = restored.step_history().await;
+
+    assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].step_id, "s1");
+    assert_eq!(history[1].step_id, "s2");
+    assert_eq!(result.final_message.as_deref(), Some("step2 done"));
+}
+
+#[tokio::test]
+async fn running_restore_continues_from_rework_target() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restore-rework".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![
+            Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            },
+            Edge {
+                from: "s2".into(),
+                to: "s1".into(),
+                condition: None,
+            },
+        ],
+    };
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Running;
+    state.started_at = Some(chrono::Utc::now());
+    // Simulates a crash after s2 decided to rework s1 but before
+    // current_step was persisted as s1.
+    state.current_step = "s2".into();
+    state.step_history = vec![
+        completed_record("s1", "step1 done", Transition::To("s2".into())),
+        completed_record("s2", "needs rework", Transition::To("s1".into())),
+    ];
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    struct AbortAfterRestoreJudge;
+    impl StepTransitionJudge for AbortAfterRestoreJudge {
+        fn decide<'a>(&'a self, _ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            Box::pin(async {
+                Transition::Abort {
+                    reason: "done".into(),
+                }
+            })
+        }
+    }
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
+        "reworked step1",
+    )]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let restored =
+        WorkflowEngine::restore(store, task_id, config, Arc::new(AbortAfterRestoreJudge))
+            .await
+            .unwrap();
+
+    let result = restored.run().await.unwrap();
+    let history = restored.step_history().await;
+
+    assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        history
+            .iter()
+            .map(|record| record.step_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["s1", "s2", "s1"]
+    );
+    assert_eq!(result.final_message.as_deref(), Some("reworked step1"));
+}
+
+#[tokio::test]
+async fn running_restore_terminal_fail_does_not_rerun_step() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restore-fail".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+        edges: vec![],
+    };
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Running;
+    state.started_at = Some(chrono::Utc::now());
+    state.step_history = vec![completed_record(
+        "s1",
+        "step1 done",
+        Transition::Fail {
+            reason: "route failed".into(),
+        },
+    )];
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let restored = WorkflowEngine::restore(store, task_id, config, Arc::new(NoopJudge))
+        .await
+        .unwrap();
+
+    let err = restored.run().await.unwrap_err();
+    let history = restored.step_history().await;
+
+    assert!(err.to_string().contains("route failed"));
+    assert_eq!(restored.state().await, WorkflowStatus::Failed);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 0);
+    assert_eq!(history.len(), 1);
+    assert!(matches!(history[0].transition, Transition::Fail { .. }));
+}
+
+#[tokio::test]
+async fn running_restore_terminal_abort_does_not_rerun_step() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restore-abort".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+        edges: vec![],
+    };
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Running;
+    state.started_at = Some(chrono::Utc::now());
+    state.step_history = vec![completed_record(
+        "s1",
+        "final answer",
+        Transition::Abort {
+            reason: "done".into(),
+        },
+    )];
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let restored = WorkflowEngine::restore(store, task_id, config, Arc::new(NoopJudge))
+        .await
+        .unwrap();
+
+    let result = restored.run().await.unwrap();
+    let history = restored.step_history().await;
+
+    assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 0);
+    assert_eq!(history.len(), 1);
+    assert!(matches!(history[0].transition, Transition::Abort { .. }));
+    assert_eq!(result.turns, 1);
+    assert_eq!(result.final_message.as_deref(), Some("final answer"));
+}
+
+#[tokio::test]
+async fn multi_step_linear_workflow() {
+    // 2 步线性流程：s1 → s2。
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("step1 done"),
+        MockResponse::text("step2 done"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: None,
+        }],
+    };
+    // judge：s1 → s2 → Abort。
+    struct LinearJudge;
+    impl StepTransitionJudge for LinearJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let cur = ctx.current_step.id().clone();
+            Box::pin(async move {
+                if cur == "s1" {
+                    Transition::To("s2".into())
+                } else {
+                    Transition::Abort {
+                        reason: "done".into(),
+                    }
+                }
+            })
+        }
+    }
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge)).unwrap();
+    let result = engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(result.turns, 2); // 2 步历史
+}
+
+/// Regression: when the model calls `submit_step_result`, the loop must
+/// terminate immediately and NOT issue a follow-up LLM call. Before the
+/// `terminate: true` fix, the model would emit a plain-text EndTurn after
+/// submitting, which downstream `NonEmptyResponseHook` agents mis-flagged
+/// as an empty response and retried until giving up.
+#[tokio::test]
+async fn submit_step_result_terminates_without_extra_llm_call() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Single preset: the model calls submit_step_result with a result.
+    // If the loop wrongly continues, the mock falls back to a text
+    // EndTurn — we detect that via call_count > 1.
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
+        "tu-1",
+        SUBMIT_STEP_RESULT_TOOL_NAME,
+        r#"{"result":{"passed":true}}"#,
+    )]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+    let result = engine.run().await.unwrap();
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    // Exactly one LLM call: the submit_step_result tool call. No follow-up.
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+    // Structured result captured from the submit tool.
+    let history = engine.step_history().await;
+    let structured = history[0]
+        .result
+        .as_ref()
+        .and_then(|r| r.structured.clone())
+        .expect("structured result should be captured");
+    assert_eq!(structured["passed"], serde_json::json!(true));
+    // Turns counts executed turns in history; the submit call is one turn.
+    assert_eq!(result.turns, 1);
+}
+/// Regression (judge-driven multi-step path): `submit_step_result` must
+/// terminate the step's agent loop immediately even in a judged workflow
+/// with outgoing edges. Before the `terminate: true` fix, the model would
+/// emit a follow-up plain-text EndTurn after submitting, inflating the
+/// LLM call count and risking downstream `NonEmptyResponseHook` retries.
+/// Unlike the free-task test above, this exercises the `decide_transition`
+/// → judge → `Transition::To` path rather than the free-task Abort shortcut.
+#[tokio::test]
+async fn submit_step_result_terminates_in_judged_multi_step_workflow() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // s1: submit_step_result (tool call). s2: plain text.
+    // If the loop wrongly continues after s1's submit, the mock falls
+    // back to "(no more mock responses)" text → EndTurn, consuming an
+    // extra LLM call before the judge runs. That would make call_count 3.
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::tool_use(
+            "tu-1",
+            SUBMIT_STEP_RESULT_TOOL_NAME,
+            r#"{"result":{"passed":true}}"#,
+        ),
+        MockResponse::text("step2 done"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: None,
+        }],
+    };
+    // judge: s1 → s2 → Abort.
+    struct LinearJudge;
+    impl StepTransitionJudge for LinearJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let cur = ctx.current_step.id().clone();
+            Box::pin(async move {
+                if cur == "s1" {
+                    Transition::To("s2".into())
+                } else {
+                    Transition::Abort {
+                        reason: "done".into(),
+                    }
+                }
+            })
+        }
+    }
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge)).unwrap();
+    let result = engine.run().await.unwrap();
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    // Exactly two LLM calls: s1's submit_step_result + s2's text. No
+    // follow-up call after s1 submits (would be 3 if terminate were false).
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
+    // s1's structured result captured via the submit tool.
+    let history = engine.step_history().await;
+    let s1_structured = history[0]
+        .result
+        .as_ref()
+        .and_then(|r| r.structured.clone())
+        .expect("s1 structured result should be captured");
+    assert_eq!(s1_structured["passed"], serde_json::json!(true));
+    // Both steps executed.
+    assert_eq!(result.turns, 2);
+}
+
+#[tokio::test]
+async fn noop_judge_uses_declarative_edge_conditions_by_default() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step2 done")]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::executor("s1", "Structured Step", "structured", None),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: Some(EdgeCondition::Expr(ConditionExpr::Eq {
+                pointer: "/status".into(),
+                value: serde_json::json!("ok"),
+            })),
+        }],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+        .unwrap()
+        .with_executor("structured", Arc::new(StructuredExecutor));
+
+    let result = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        history
+            .iter()
+            .map(|record| record.step_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["s1", "s2"]
+    );
+    assert_eq!(result.final_message.as_deref(), Some("step2 done"));
+}
+
+fn test_msg(content: Vec<ContentBlock>) -> llm_harness_types::AssistantMessage {
+    use llm_harness_types::{AssistantMessage, AssistantMessageKind};
+    AssistantMessage {
+        kind: AssistantMessageKind::FinalAnswer,
+        message_id: "msg_1".into(),
+        turn_id: "turn_1".into(),
+        content,
+        stop_reason: None,
+        timestamp: chrono::Utc::now(),
+        provider: None,
+        api: None,
+        model: None,
+        usage: None,
+        error_message: None,
+    }
+}
+
+#[test]
+fn step_progress_from_maps_coarse_events() {
+    use llm_harness_types::{AssistantMessageKind, ToolError, ToolResult};
+
+    // ToolCallStart
+    let ev = AgentEvent::ToolCallStart {
+        message_id: "m1".into(),
+        tool_use_id: "tu-1".into(),
+        name: "search".into(),
+    };
+    match step_progress_from(&ev) {
+        Some(StepProgress::ToolCallStart { tool_use_id, name }) => {
+            assert_eq!(tool_use_id, "tu-1");
+            assert_eq!(name, "search");
+        }
+        other => panic!("expected ToolCallStart, got {other:?}"),
+    }
+
+    // ToolCallEnd
+    let ev = AgentEvent::ToolCallEnd {
+        tool_use_id: "tu-1".into(),
+        args: serde_json::json!({"q": "rust"}),
+    };
+    match step_progress_from(&ev) {
+        Some(StepProgress::ToolCallEnd { tool_use_id, args }) => {
+            assert_eq!(tool_use_id, "tu-1");
+            assert_eq!(args["q"], "rust");
+        }
+        other => panic!("expected ToolCallEnd, got {other:?}"),
+    }
+
+    // ToolExecutionStart
+    let ev = AgentEvent::ToolExecutionStart {
+        tool_use_id: "tu-1".into(),
+        tool_name: "search".into(),
+        args: serde_json::json!({}),
+    };
+    match step_progress_from(&ev) {
+        Some(StepProgress::ToolExecutionStart {
+            tool_use_id,
+            tool_name,
+        }) => {
+            assert_eq!(tool_use_id, "tu-1");
+            assert_eq!(tool_name, "search");
+        }
+        other => panic!("expected ToolExecutionStart, got {other:?}"),
+    }
+
+    // ToolExecutionEnd — Ok
+    let ev = AgentEvent::ToolExecutionEnd {
+        tool_use_id: "tu-1".into(),
+        result: Ok(ToolResult {
+            content: vec![],
+            details: serde_json::Value::Null,
+            terminate: false,
+        }),
+    };
+    match step_progress_from(&ev) {
+        Some(StepProgress::ToolExecutionEnd {
+            tool_use_id,
+            ok,
+            error,
+        }) => {
+            assert_eq!(tool_use_id, "tu-1");
+            assert!(ok);
+            assert!(error.is_none());
+        }
+        other => panic!("expected ToolExecutionEnd Ok, got {other:?}"),
+    }
+
+    // ToolExecutionEnd — Err
+    let ev = AgentEvent::ToolExecutionEnd {
+        tool_use_id: "tu-1".into(),
+        result: Err(ToolError::Aborted),
+    };
+    match step_progress_from(&ev) {
+        Some(StepProgress::ToolExecutionEnd { ok, error, .. }) => {
+            assert!(!ok);
+            assert!(error.is_some());
+        }
+        other => panic!("expected ToolExecutionEnd Err, got {other:?}"),
+    }
+
+    // TurnEnd
+    let ev = AgentEvent::TurnEnd {
+        index: 3,
+        message: test_msg(vec![]),
+        tool_results: vec![],
+    };
+    match step_progress_from(&ev) {
+        Some(StepProgress::TurnEnd { index }) => assert_eq!(index, 3),
+        other => panic!("expected TurnEnd, got {other:?}"),
+    }
+
+    // MessageEnd
+    let ev = AgentEvent::MessageEnd {
+        message_id: "m1".into(),
+        message: test_msg(vec![ContentBlock::Text { text: "hi".into() }]),
+    };
+    match step_progress_from(&ev) {
+        Some(StepProgress::MessageEnd { message_id, kind }) => {
+            assert_eq!(message_id, "m1");
+            assert_eq!(kind, AssistantMessageKind::FinalAnswer);
+        }
+        other => panic!("expected MessageEnd, got {other:?}"),
+    }
+}
+
+#[test]
+fn step_progress_from_returns_none_for_filtered_events() {
+    // TextDelta — filtered (high frequency)
+    let ev = AgentEvent::TextDelta {
+        message_id: "m1".into(),
+        text: "hel".into(),
+    };
+    assert!(step_progress_from(&ev).is_none());
+
+    // ThinkingDelta — filtered
+    let ev = AgentEvent::ThinkingDelta {
+        message_id: "m1".into(),
+        thinking: "th".into(),
+        signature: None,
+    };
+    assert!(step_progress_from(&ev).is_none());
+
+    // ToolCallArgsDelta — filtered
+    let ev = AgentEvent::ToolCallArgsDelta {
+        tool_use_id: "tu-1".into(),
+        partial_input: "{".into(),
+    };
+    assert!(step_progress_from(&ev).is_none());
+
+    // AgentStart — filtered
+    assert!(step_progress_from(&AgentEvent::AgentStart).is_none());
+
+    // TurnStart — filtered
+    let ev = AgentEvent::TurnStart { index: 0 };
+    assert!(step_progress_from(&ev).is_none());
+
+    // MessageStart — filtered
+    let ev = AgentEvent::MessageStart {
+        message_id: "m1".into(),
+    };
+    assert!(step_progress_from(&ev).is_none());
+}
+
+/// Integration: a free-task LLM step that calls submit_step_result should
+/// emit StepStarted → StepProgress(ToolCallStart) → StepProgress(ToolCallEnd)
+/// → StepProgress(ToolExecutionStart) → StepProgress(ToolExecutionEnd)
+/// → StepFinished, in order.
+#[tokio::test]
+async fn step_progress_events_emitted_in_order() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
+        "tu-1",
+        SUBMIT_STEP_RESULT_TOOL_NAME,
+        r#"{"result":{"passed":true}}"#,
+    )]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = Arc::new(WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap());
+    let mut rx = engine.subscribe();
+    let engine_clone = engine.clone();
+    let mut run_handle = tokio::spawn(async move { engine_clone.run().await });
+
+    // Collect events until the task finishes.
+    let mut events = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            ev = rx.recv() => {
+                match ev {
+                    Ok(e) => events.push(e),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+            _ = &mut run_handle => break,
+        }
+    }
+
+    // Assert the sequence contains the expected progress variants in order.
+    let mut saw_step_started = false;
+    let mut saw_tool_call_start = false;
+    let mut saw_tool_call_end = false;
+    let mut saw_tool_execution_start = false;
+    let mut saw_tool_execution_end = false;
+    let mut saw_step_finished = false;
+    for ev in &events {
+        match ev {
+            WorkflowEvent::StepStarted { .. } => saw_step_started = true,
+            WorkflowEvent::StepProgress {
+                progress: StepProgress::ToolCallStart { .. },
+                ..
+            } => {
+                assert!(saw_step_started);
+                saw_tool_call_start = true;
+            }
+            WorkflowEvent::StepProgress {
+                progress: StepProgress::ToolCallEnd { .. },
+                ..
+            } => {
+                assert!(saw_tool_call_start);
+                saw_tool_call_end = true;
+            }
+            WorkflowEvent::StepProgress {
+                progress: StepProgress::ToolExecutionStart { .. },
+                ..
+            } => {
+                assert!(saw_tool_call_end);
+                saw_tool_execution_start = true;
+            }
+            WorkflowEvent::StepProgress {
+                progress: StepProgress::ToolExecutionEnd { .. },
+                ..
+            } => {
+                assert!(saw_tool_execution_start);
+                saw_tool_execution_end = true;
+            }
+            WorkflowEvent::StepFinished { .. } => {
+                assert!(saw_tool_execution_end);
+                saw_step_finished = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_step_started, "missing StepStarted");
+    assert!(saw_tool_call_start, "missing ToolCallStart");
+    assert!(saw_tool_call_end, "missing ToolCallEnd");
+    assert!(saw_tool_execution_start, "missing ToolExecutionStart");
+    assert!(saw_tool_execution_end, "missing ToolExecutionEnd");
+    assert!(saw_step_finished, "missing StepFinished");
+}
+/// Abort: when a step is cancelled mid-flight, no StepProgress events
+/// should arrive after the Cancelled event. Residual events are discarded.
+#[tokio::test]
+async fn step_progress_events_stop_after_cancel() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+            .unwrap()
+            .with_executor("blocking", Arc::new(BlockingExecutor)),
+    );
+    let mut rx = engine.subscribe();
+    let engine_clone = engine.clone();
+    let mut run_handle = tokio::spawn(async move { engine_clone.run().await });
+
+    // Give the step time to start, then cancel.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    engine.cancel("test abort").await.unwrap();
+
+    // Collect events until run finishes.
+    let mut events = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            ev = rx.recv() => {
+                match ev {
+                    Ok(e) => events.push(e),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+            _ = &mut run_handle => break,
+        }
+    }
+
+    // StepStarted should arrive, then Cancelled. No StepProgress for an
+    // executor step (it has no AgentEvent stream), and none after cancel.
+    let mut saw_cancelled = false;
+    for ev in &events {
+        match ev {
+            WorkflowEvent::Cancelled { .. } => saw_cancelled = true,
+            WorkflowEvent::StepProgress { .. } => {
+                // Executor steps don't emit progress; if any arrived it
+                // must be before Cancelled.
+                assert!(!saw_cancelled, "StepProgress after Cancelled");
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_cancelled, "missing Cancelled event");
+}
+
+#[tokio::test]
+async fn restore_noop_judge_uses_declarative_edge_conditions_by_default() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restore-declarative".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::executor("s1", "Structured Step", "structured", None),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: Some(EdgeCondition::Expr(ConditionExpr::Eq {
+                pointer: "/status".into(),
+                value: serde_json::json!("ok"),
+            })),
+        }],
+    };
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step2 done")]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let restored = WorkflowEngine::restore(store, task_id, config, Arc::new(NoopJudge))
+        .await
+        .unwrap()
+        .with_executor("structured", Arc::new(StructuredExecutor));
+
+    let result = restored.run().await.unwrap();
+    let history = restored.step_history().await;
+
+    assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        history
+            .iter()
+            .map(|record| record.step_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["s1", "s2"]
+    );
+    assert_eq!(result.final_message.as_deref(), Some("step2 done"));
+}
+
+#[tokio::test]
+async fn pause_then_run_continues_from_next_step() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("step1 done"),
+        MockResponse::text("step2 done"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: None,
+        }],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(TwoStepJudge)).unwrap();
+    engine.pause("operator checkpoint").unwrap();
+
+    let err = engine.run().await.unwrap_err();
+    assert!(matches!(err, WorkflowError::Paused(reason) if reason == "operator checkpoint"));
+    assert_eq!(engine.state().await, WorkflowStatus::Paused);
+    assert_eq!(engine.current_step().await, "s2");
+    assert_eq!(engine.step_history().await.len(), 1);
+
+    let result = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        history
+            .iter()
+            .map(|record| record.step_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["s1", "s2"]
+    );
+    assert_eq!(result.final_message.as_deref(), Some("step2 done"));
+}
+
+#[tokio::test]
+async fn resume_then_run_does_not_enter_crash_recovery() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("step1 done"),
+        MockResponse::text("step2 done"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: None,
+        }],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(TwoStepJudge)).unwrap();
+    engine.pause("operator checkpoint").unwrap();
+    engine.run().await.unwrap_err();
+
+    engine.resume().await.unwrap();
+
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Paused,
+        "resume should not pre-set Running; run() owns the transition"
+    );
+
+    let result = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        history
+            .iter()
+            .map(|record| record.step_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["s1", "s2"]
+    );
+    assert_eq!(result.final_message.as_deref(), Some("step2 done"));
+}
+
+/// #36: a task that enters `Failed` due to a transient error (e.g. LLM 403)
+/// can be resumed via `resume()` (Failed → Paused) and then `run()` picks it
+/// up from `current_step`, retrying the failed step.
+#[tokio::test]
+async fn failed_task_can_be_resumed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+        edges: vec![],
+    };
+    // Simulate a task that already entered Failed (e.g. transient LLM error).
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Failed;
+    state.error = Some(TaskError::Internal("step 's1' failed: LLM 403".into()));
+    state.started_at = Some(chrono::Utc::now());
+    state.ended_at = Some(chrono::Utc::now());
+    let task_id = TaskId("failed-resume".into());
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step1 done")]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::restore(store, task_id, config, Arc::new(NoopJudge))
+        .await
+        .unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Failed);
+
+    // resume() resets Failed → Paused.
+    engine.resume().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Paused);
+
+    // run() retries from current_step (s1), succeeds.
+    engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+}
+
+/// #36: `Succeeded` is terminal — resume() must reject it.
+#[tokio::test]
+async fn succeeded_task_cannot_be_resumed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+    engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+
+    let err = engine.resume().await.unwrap_err();
+    assert!(matches!(err, WorkflowError::InvalidStatus { .. }));
+}
+
+/// #36: restore() a persisted Failed task, then resume() + run() recovers.
+#[tokio::test]
+async fn restore_failed_then_resume_recovers() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restore-failed".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+        edges: vec![],
+    };
+    // Persist a Failed state.
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Failed;
+    state.error = Some(TaskError::Internal("LLM 403".into()));
+    state.started_at = Some(chrono::Utc::now());
+    state.ended_at = Some(chrono::Utc::now());
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    // restore() loads the Failed task.
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step1 done")]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let restored = WorkflowEngine::restore(store, task_id, config, Arc::new(NoopJudge))
+        .await
+        .unwrap();
+    assert_eq!(restored.state().await, WorkflowStatus::Failed);
+
+    // resume() + run() recovers.
+    restored.resume().await.unwrap();
+    restored.run().await.unwrap();
+    assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn transition_fail_marks_task_failed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step1 done")]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: None,
+        }],
+    };
+    struct FailingJudge;
+    impl StepTransitionJudge for FailingJudge {
+        fn decide<'a>(&'a self, _ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            Box::pin(async {
+                Transition::Fail {
+                    reason: "route failed".into(),
+                }
+            })
+        }
+    }
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(FailingJudge)).unwrap();
+
+    let err = engine.run().await.unwrap_err();
+    let history = engine.step_history().await;
+
+    assert_eq!(engine.state().await, WorkflowStatus::Failed);
+    assert!(err.to_string().contains("route failed"));
+    assert_eq!(history.len(), 1);
+    assert!(matches!(history[0].transition, Transition::Fail { .. }));
+}
+
+#[tokio::test]
+async fn mixed_llm_and_executor_workflow() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step1 done")]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::executor(
+                "s2",
+                "Executor Step",
+                "fixed",
+                Some(serde_json::json!({"suffix": "done"})),
+            ),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: None,
+        }],
+    };
+    struct LinearJudge;
+    impl StepTransitionJudge for LinearJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let cur = ctx.current_step.id().clone();
+            Box::pin(async move {
+                if cur == "s1" {
+                    Transition::To("s2".into())
+                } else {
+                    Transition::Abort {
+                        reason: "done".into(),
+                    }
+                }
+            })
+        }
+    }
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge))
+        .unwrap()
+        .with_executor("fixed", Arc::new(FixedExecutor));
+
+    let result = engine.run().await.unwrap();
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(result.turns, 2);
+    assert!(
+        result
+            .final_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("executor done after step1 done")
+    );
+    assert_eq!(
+        client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
+async fn builtin_json_transform_executor_runs_without_manual_registration() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "transform".into(),
+        steps: vec![Step::executor(
+            "transform",
+            "Transform",
+            "json_transform",
+            Some(serde_json::json!({
+                "source": "config.input",
+                "input": {
+                    "measurement": {
+                        "voltage": 3.3,
+                        "unit": "V"
+                    }
+                },
+                "fields": {
+                    "voltage": "/measurement/voltage",
+                    "unit": "/measurement/unit"
+                }
+            })),
+        )],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+
+    let result = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(result.turns, 1);
+    assert_eq!(
+        history[0]
+            .result
+            .as_ref()
+            .and_then(|r| r.structured.clone()),
+        Some(serde_json::json!({"unit": "V", "voltage": 3.3}))
+    );
+    assert_eq!(
+        client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn step_policy_retries_executor_failure() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "flaky".into(),
+        steps: vec![Step::executor("flaky", "Flaky", "flaky", None).with_policy(
+            crate::workflow::model::StepExecutionPolicy {
+                timeout_ms: Some(1_000),
+                max_attempts: Some(2),
+                retry_backoff_ms: Some(0),
+            },
+        )],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+        .unwrap()
+        .with_executor(
+            "flaky",
+            Arc::new(FlakyExecutor {
+                attempts: attempts.clone(),
+            }),
+        );
+
+    let result = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].result.as_ref().unwrap().output,
+        "ok on attempt 2"
+    );
+    assert_eq!(result.turns, 1);
+}
+
+#[tokio::test]
+async fn step_policy_times_out_blocking_executor() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "blocked".into(),
+        steps: vec![
+            Step::executor("blocked", "Blocked", "blocking", None).with_policy(
+                crate::workflow::model::StepExecutionPolicy {
+                    timeout_ms: Some(20),
+                    max_attempts: Some(1),
+                    retry_backoff_ms: Some(0),
+                },
+            ),
+        ],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+        .unwrap()
+        .with_executor("blocking", Arc::new(BlockingExecutor));
+
+    let err = engine.run().await.unwrap_err();
+
+    assert_eq!(engine.state().await, WorkflowStatus::Failed);
+    assert!(err.to_string().contains("timed out"));
+}
+
+#[tokio::test]
+async fn unregistered_executor_fails_task() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Executor Step", "missing", None)],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+
+    let err = engine.run().await.unwrap_err();
+
+    assert_eq!(engine.state().await, WorkflowStatus::Failed);
+    assert!(
+        err.to_string()
+            .contains("executor 'missing' not registered")
+    );
+}
+
+#[tokio::test]
+async fn cancel_executor_step_marks_task_cancelled() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+            .unwrap()
+            .with_executor("blocking", Arc::new(BlockingExecutor)),
+    );
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    engine.cancel("stop").await.unwrap();
+
+    let result = runner.await.unwrap().unwrap();
+
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(result.turns, 0);
+    assert!(result.final_message.is_none());
+}
+
+#[tokio::test]
+async fn cancel_then_restore_remains_cancelled() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+            .unwrap()
+            .with_task_store(store.clone())
+            .with_executor("blocking", Arc::new(BlockingExecutor)),
+    );
+    let task_id = engine.task_id().clone();
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    engine.cancel("stop").await.unwrap();
+
+    let result = runner.await.unwrap().unwrap();
+
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(result.turns, 0);
+
+    let restored = WorkflowEngine::restore(
+        store,
+        task_id,
+        WorkflowEngineConfig {
+            client,
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions-restore"),
+            customize_builder: None,
+        },
+        Arc::new(NoopJudge),
+    )
+    .await
+    .unwrap();
+    let history = restored.step_history().await;
+
+    assert_eq!(restored.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(history.len(), 1);
+    assert!(history[0].result.is_none());
+    assert!(matches!(history[0].transition, Transition::Abort { .. }));
+}
+
+#[tokio::test]
+async fn cancel_llm_step_discards_partial_result() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut response = MockResponse::tool_use("block_1", "block_forever", "{}");
+    response.events.insert(
+        0,
+        Ok(llm_harness_loop::AdapterStreamEvent::TextDelta {
+            index: 0,
+            text: "partial output".into(),
+        }),
+    );
+    let client = Arc::new(MockLlmClient::new(vec![response]));
+    let call_count = client.call_count.clone();
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new_free_task(
+            "stream partial then block".into(),
+            vec!["block_forever".into()],
+            config,
+        )
+        .unwrap()
+        .with_tool(Arc::new(BlockingTool)),
+    );
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while call_count.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    engine.cancel("stop").await.unwrap();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), runner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let history = engine.step_history().await;
+
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(result.turns, 0);
+    assert!(result.final_message.is_none());
+    assert_eq!(history.len(), 1);
+    assert!(history[0].result.is_none());
+    assert!(matches!(history[0].transition, Transition::Abort { .. }));
+}
+
+// ── WorkflowContext 共享状态测试 ──────────────────────────────
+
+/// executor 写 context，后续 executor 读到写入的值。
+struct ContextWriter;
+impl StepExecutor for ContextWriter {
+    fn execute<'a>(&'a self, ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        Box::pin(async move {
+            let mut ctx_data = ctx.context.lock().await;
+            ctx_data
+                .variables
+                .insert("focus".into(), serde_json::json!(0.42));
+            ctx_data
+                .variables
+                .insert("metro_p".into(), serde_json::json!(1.5));
+            drop(ctx_data);
+            Ok(StepResult {
+                output: "wrote context".into(),
+                structured: None,
+                tool_calls_count: 0,
+                session_id: String::new(),
+                cost: CostAggregate::default(),
+                started_at: None,
+                ended_at: None,
+            })
+        })
+    }
+}
+
+/// executor 读 context，验证上游 executor 写入的值。
+struct ContextReader;
+impl StepExecutor for ContextReader {
+    fn execute<'a>(&'a self, ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        Box::pin(async move {
+            let ctx_data = ctx.context.lock().await;
+            let focus = ctx_data.variables.get("focus").cloned();
+            let metro_p = ctx_data.variables.get("metro_p").cloned();
+            drop(ctx_data);
+            Ok(StepResult {
+                output: format!("focus={focus:?} metro_p={metro_p:?}"),
+                structured: Some(serde_json::json!({
+                    "focus": focus,
+                    "metro_p": metro_p,
+                })),
+                tool_calls_count: 0,
+                session_id: String::new(),
+                cost: CostAggregate::default(),
+                started_at: None,
+                ended_at: None,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn executor_writes_context_and_downstream_reads_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "writer".into(),
+        steps: vec![
+            Step::executor("writer", "Writer", "ctx_writer", None),
+            Step::executor("reader", "Reader", "ctx_reader", None),
+        ],
+        edges: vec![Edge {
+            from: "writer".into(),
+            to: "reader".into(),
+            condition: None,
+        }],
+    };
+    struct LinearJudge;
+    impl StepTransitionJudge for LinearJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let id = ctx.current_step.id().clone();
+            Box::pin(async move {
+                if id == "writer" {
+                    Transition::To("reader".into())
+                } else {
+                    Transition::Abort {
+                        reason: "done".into(),
+                    }
+                }
+            })
+        }
+    }
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge))
+        .unwrap()
+        .with_executor("ctx_writer", Arc::new(ContextWriter))
+        .with_executor("ctx_reader", Arc::new(ContextReader));
+
+    let result = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    // reader 的 structured 应包含 writer 写入的值。
+    use serde_json::Value;
+    let reader_structured: Value = history[1]
+        .result
+        .as_ref()
+        .and_then(|r| r.structured.clone())
+        .unwrap();
+    assert_eq!(reader_structured["focus"], serde_json::json!(0.42));
+    assert_eq!(reader_structured["metro_p"], serde_json::json!(1.5));
+    assert!(result.final_message.unwrap().contains("focus"));
+}
+
+#[tokio::test]
+async fn context_survives_crash_recovery() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "writer".into(),
+        steps: vec![
+            Step::executor("writer", "Writer", "ctx_writer", None),
+            Step::executor("reader", "Reader", "ctx_reader", None),
+        ],
+        edges: vec![Edge {
+            from: "writer".into(),
+            to: "reader".into(),
+            condition: None,
+        }],
+    };
+    struct LinearJudge;
+    impl StepTransitionJudge for LinearJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let id = ctx.current_step.id().clone();
+            Box::pin(async move {
+                if id == "writer" {
+                    Transition::To("reader".into())
+                } else {
+                    Transition::Abort {
+                        reason: "done".into(),
+                    }
+                }
+            })
+        }
+    }
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge))
+        .unwrap()
+        .with_executor("ctx_writer", Arc::new(ContextWriter))
+        .with_executor("ctx_reader", Arc::new(ContextReader))
+        .with_task_store(store.clone());
+    let task_id = engine.task_id().clone();
+
+    // 從獨立 context 寫入，再手動觸發 persist。
+    // persist_state 內部會從 self.context 取 snapshot 覆蓋 state.context。
+    engine
+        .context()
+        .lock()
+        .await
+        .variables
+        .insert("survives".into(), serde_json::json!(true));
+    // save_workflow + persist_state（模拟 run() 启动时的落盘）。
+    store
+        .save_workflow(&task_id, &engine.workflow)
+        .await
+        .unwrap();
+    // 手动触发一次 persist（模拟 run() 启动时的 persist）。
+    let snapshot = engine.workflow_state.lock().await.clone();
+    engine.persist_state(&snapshot).await.unwrap();
+
+    // restore 后 context 应包含写入的值。
+    let config2 = WorkflowEngineConfig {
+        client: Arc::new(MockLlmClient::new(vec![])),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let restored = WorkflowEngine::restore(store, task_id, config2, Arc::new(LinearJudge))
+        .await
+        .unwrap();
+    let ctx_arc = restored.context();
+    let ctx = ctx_arc.lock().await;
+    assert_eq!(
+        ctx.variables.get("survives"),
+        Some(&serde_json::json!(true))
+    );
+}
+/// 共享 customize_builder 设置 system_prompt，验证 step harness 实际生效。
+#[tokio::test]
+async fn shared_builder_customize_applies_system_prompt() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    }
+    .with_builder_customize(|b| b.system_prompt(Some("You are a test agent.".into())));
+    let engine = WorkflowEngine::new_free_task("say done".into(), vec![], config).unwrap();
+    let result = engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert!(
+        result
+            .final_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("done")
+    );
+}
+
+/// per-step 闭包覆盖共享闭包的 max_tokens 设置。
+#[tokio::test]
+async fn per_step_builder_overrides_shared_max_tokens() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    }
+    .with_builder_customize(|b| b.max_tokens(4096));
+    let engine = WorkflowEngine::new_free_task("say done".into(), vec![], config)
+        .unwrap()
+        .with_step_builder("run", |b| b.max_tokens(8192));
+    engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    // Priority is structurally guaranteed: shared closure (4096) → per-step
+    // closure (8192). Last write wins on builder.
+    // Verify the per-step override (8192) actually reached the ChatRequest.
+    let captured = client.captured_requests.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "expected exactly one LLM call, got {}",
+        captured.len()
+    );
+    assert_eq!(
+        captured[0].params().max_tokens(),
+        8192,
+        "per-step builder should override shared max_tokens"
+    );
+}
+
+// ── with_hooks 累加语义测试 ──────────────────────────────────────────────────
+
+/// 计数 before_turn hook。用于验证多次 with_hooks 调用后两组 hooks 都生效。
+struct CountingBeforeTurnHook {
+    count: Arc<AtomicUsize>,
+}
+
+impl BeforeTurnHook for CountingBeforeTurnHook {
+    fn before_turn<'a>(&'a self, _ctx: BeforeTurnCtx<'a>) -> BoxFuture<'a, ()> {
+        let c = self.count.clone();
+        Box::pin(async move {
+            c.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+}
+
+/// 模拟 Python 侧两次 `with_hooks` 调用：每次调用读取 `config_customize_builder()`
+/// 并包装前一个闭包，使新 hooks 追加到已有闭包之后。验证累加语义 ——
+/// 两组 hooks 都应触发（计数 = 2），而非第二次覆盖第一次（计数 = 1）。
+#[tokio::test]
+async fn double_with_hooks_accumulates() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let mut engine = WorkflowEngine::new_free_task("say done".into(), vec![], config).unwrap();
+
+    // 第一次 with_hooks：注入 count=1 的 hook
+    let count1 = Arc::new(AtomicUsize::new(0));
+    let h1 = HarnessHooks {
+        before_turn: vec![Arc::new(CountingBeforeTurnHook {
+            count: count1.clone(),
+        })],
+        ..HarnessHooks::none()
+    };
+    let prev = engine.config_customize_builder().clone();
+    engine.set_customize_builder(Arc::new(move |b| {
+        let b = if let Some(p) = &prev { p(b) } else { b };
+        b.hooks(h1.clone())
+    }));
+
+    // 第二次 with_hooks：注入 count=2 的 hook，包装前一个闭包
+    let count2 = Arc::new(AtomicUsize::new(0));
+    let h2 = HarnessHooks {
+        before_turn: vec![Arc::new(CountingBeforeTurnHook {
+            count: count2.clone(),
+        })],
+        ..HarnessHooks::none()
+    };
+    let prev = engine.config_customize_builder().clone();
+    engine.set_customize_builder(Arc::new(move |b| {
+        let b = if let Some(p) = &prev { p(b) } else { b };
+        b.hooks(h2.clone())
+    }));
+
+    engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+
+    // 累加语义：两组 hooks 都应触发（各 1 次 = 总 2 次）。
+    // 若为 last-write-wins，第二次会覆盖第一次，count1=0、count2=1。
+    assert_eq!(
+        count1.load(Ordering::SeqCst),
+        1,
+        "first with_hooks hooks must still fire (accumulate semantics)"
+    );
+    assert_eq!(
+        count2.load(Ordering::SeqCst),
+        1,
+        "second with_hooks hooks must fire (accumulate semantics)"
+    );
+}
+#[test]
+fn aggregate_cost_merges_per_model_cache_tokens() {
+    use crate::workflow::model::{StepRecord, StepResult, Transition};
+    use llm_harness_types::{CostAggregate, ModelCost};
+
+    let now = chrono::Utc::now();
+    let mk_record = |read: u64, write: u64| StepRecord {
+        step_id: "s1".to_string(),
+        started_at: now,
+        ended_at: now,
+        result: Some(StepResult {
+            output: String::new(),
+            structured: None,
+            tool_calls_count: 0,
+            session_id: String::new(),
+            cost: CostAggregate {
+                total_cache_read_tokens: read,
+                total_cache_write_tokens: write,
+                by_model: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(
+                        "anthropic/claude-sonnet".to_string(),
+                        ModelCost {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            cache_read_tokens: read,
+                            cache_write_tokens: write,
+                            reasoning_tokens: 0,
+                            cost: 0.0,
+                            call_count: 1,
+                        },
+                    );
+                    m
+                },
+                ..Default::default()
+            },
+            started_at: None,
+            ended_at: None,
+        }),
+        transition: Transition::To("s2".to_string()),
+    };
+
+    let history = vec![mk_record(200, 100), mk_record(300, 50)];
+    let total = aggregate_cost(&history);
+
+    let mc = total
+        .by_model
+        .get("anthropic/claude-sonnet")
+        .expect("merged by_model entry");
+    assert_eq!(
+        mc.cache_read_tokens, 500,
+        "per-model cache_read must sum across steps"
+    );
+    assert_eq!(
+        mc.cache_write_tokens, 150,
+        "per-model cache_write must sum across steps"
+    );
+    assert_eq!(mc.call_count, 2);
+    // Top-level totals must also reflect the merge.
+    assert_eq!(total.total_cache_read_tokens, 500);
+    assert_eq!(total.total_cache_write_tokens, 150);
+}

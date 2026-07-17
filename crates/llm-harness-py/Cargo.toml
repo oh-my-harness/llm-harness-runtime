@@ -27,6 +27,7 @@ tracing-subscriber.workspace    = true
 [dev-dependencies]
 pyo3 = { version = "0.29", features = ["macros", "py-clone", "auto-initialize"] }
 tempfile.workspace = true
+llm-harness-loop = { workspace = true, features = ["test-utils"] }
 
 [features]
 # extension-module 仅在构建 cdylib 时启用；cargo test 默认不启用，

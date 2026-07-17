@@ -7,16 +7,13 @@ use crate::spawn::spawn_types::{
 };
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use llm_harness_agent::ModelInfo;
 use llm_harness_agent::{
     AgentHarnessEvent, Plugin, Session,
     session::SessionStorage,
     session::{JsonlSessionRepo, SessionRepo, types::CreateSessionOptions},
 };
-use llm_harness_loop::{FinalAnswerMode, LlmClient, RetryConfig};
-use llm_harness_types::{
-    AgentError, AgentEvent, ExecutionEnv, HarnessError, HarnessPhase, StreamOptions, ThinkingLevel,
-};
+use llm_harness_loop::LlmClient;
+use llm_harness_types::{AgentError, AgentEvent, ExecutionEnv, HarnessError, HarnessPhase};
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::{HarnessBuildError, HarnessBuilder};
@@ -78,15 +75,8 @@ pub struct HarnessSubAgentSpawner {
     /// 共享 MessageBus。`spawn_async` 把 sub-agent 注册到 bus 并 track，
     /// 完成后结果经 event channel 投递回主 agent。
     message_bus: Arc<MessageBus>,
-    /// 以下字段继承主 agent 的 LLM 行为配置，构建 sub-agent harness 时注入。
-    /// 全部 `None` 表示用 harness 默认值。
-    max_tokens: Option<u32>,
-    temperature: Option<f32>,
-    thinking_level: Option<ThinkingLevel>,
-    retry: Option<RetryConfig>,
-    stream_options: Option<StreamOptions>,
-    final_answer_mode: Option<FinalAnswerMode>,
-    model_info: Option<ModelInfo>,
+    /// builder 定制闭包（与 WorkflowEngine 的共享闭包同源）。
+    builder_customize: Option<Arc<dyn Fn(HarnessBuilder) -> HarnessBuilder + Send + Sync>>,
     /// Maximum concurrent in-flight sub-agents. `None` = unlimited.
     max_concurrent: Option<usize>,
 }
@@ -122,13 +112,7 @@ impl HarnessSubAgentSpawner {
             session_factory: Arc::new(NoOpSessionFactory),
             session_base_dir,
             message_bus: bus,
-            max_tokens: None,
-            temperature: None,
-            thinking_level: None,
-            retry: None,
-            stream_options: None,
-            final_answer_mode: None,
-            model_info: None,
+            builder_customize: None,
             max_concurrent: None,
         }
     }
@@ -159,45 +143,13 @@ impl HarnessSubAgentSpawner {
         self.session_factory = factory;
         self
     }
-    /// 设置最大输出 token 数。`None` 用 harness 默认值 (8192)。
-    pub fn max_tokens(mut self, max: Option<u32>) -> Self {
-        self.max_tokens = max;
-        self
-    }
 
-    /// 设置采样温度。`None` 用 provider 默认值。
-    pub fn temperature(mut self, temp: Option<f32>) -> Self {
-        self.temperature = temp;
-        self
-    }
-
-    /// 设置推理深度级别。`None` 用 harness 默认值。
-    pub fn thinking_level(mut self, level: Option<ThinkingLevel>) -> Self {
-        self.thinking_level = level;
-        self
-    }
-
-    /// 设置临时错误重试配置。`None` 禁用重试。
-    pub fn retry(mut self, config: Option<RetryConfig>) -> Self {
-        self.retry = config;
-        self
-    }
-
-    /// 设置流式请求选项（超时等）。`None` 用 harness 默认值。
-    pub fn stream_options(mut self, opts: Option<StreamOptions>) -> Self {
-        self.stream_options = opts;
-        self
-    }
-
-    /// 设置 final-answer 分类模式。`None` 用 harness 默认值。
-    pub fn final_answer_mode(mut self, mode: Option<FinalAnswerMode>) -> Self {
-        self.final_answer_mode = mode;
-        self
-    }
-
-    /// 设置模型元数据（context_window 等）。`None` 用 harness 默认值。
-    pub fn model_info(mut self, info: Option<ModelInfo>) -> Self {
-        self.model_info = info;
+    /// 设置 builder 定制闭包。可覆盖任意 builder 设置。
+    pub fn builder_customize(
+        mut self,
+        customize: Option<Arc<dyn Fn(HarnessBuilder) -> HarnessBuilder + Send + Sync>>,
+    ) -> Self {
+        self.builder_customize = customize;
         self
     }
 
@@ -232,13 +184,7 @@ impl HarnessSubAgentSpawner {
         let session_factory = self.session_factory.clone();
         let session_base_dir = self.session_base_dir.clone();
         let bus = self.message_bus.clone();
-        let max_tokens = self.max_tokens;
-        let temperature = self.temperature;
-        let thinking_level = self.thinking_level;
-        let retry = self.retry.clone();
-        let stream_options = self.stream_options.clone();
-        let final_answer_mode = self.final_answer_mode.clone();
-        let model_info = self.model_info.clone();
+        let builder_customize = self.builder_customize.clone();
 
         async move {
             // 1. 解析 provider。
@@ -273,26 +219,8 @@ impl HarnessSubAgentSpawner {
             let mut builder = HarnessBuilder::new(&model)
                 .install(sub_plugin.as_ref())
                 .provider(&model, client);
-            if let Some(v) = max_tokens {
-                builder = builder.max_tokens(v);
-            }
-            if let Some(v) = temperature {
-                builder = builder.temperature(Some(v));
-            }
-            if let Some(v) = thinking_level {
-                builder = builder.thinking_level(v);
-            }
-            if let Some(v) = &retry {
-                builder = builder.retry(Some(v.clone()));
-            }
-            if let Some(v) = &stream_options {
-                builder = builder.stream_options(Some(v.clone()));
-            }
-            if let Some(v) = &final_answer_mode {
-                builder = builder.final_answer_mode(v.clone());
-            }
-            if let Some(v) = &model_info {
-                builder = builder.model_info(Some(v.clone()));
+            if let Some(customize) = &builder_customize {
+                builder = customize(builder);
             }
             let harness = builder
                 .build_with_session(env, Session::new(storage))

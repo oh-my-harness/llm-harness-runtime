@@ -75,6 +75,12 @@ def test_workflow_engine_with_hooks():
     assert result is engine
 
 
+def test_workflow_engine_with_max_tokens():
+    """with_max_tokens() sets max tokens and returns self."""
+    engine = lh.WorkflowEngine(_make_workflow(), _make_provider(), "gpt-4o", _make_judge())
+    result = engine.with_max_tokens(4096)
+    assert result is engine
+
 def test_workflow_engine_with_step_plugin():
     """with_step_plugin() accepts a step_id and plugin."""
     plugin = lh.create_plugin("my_plugin")

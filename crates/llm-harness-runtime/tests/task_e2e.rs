@@ -56,6 +56,7 @@ fn make_config(client: Arc<MockLlmClient>, subdir: &str) -> WorkflowEngineConfig
         }),
         session_factory: Arc::new(JsonlSessionFactory),
         session_base_dir: std::env::temp_dir().join(subdir),
+        customize_builder: None,
     }
 }
 
@@ -114,7 +115,7 @@ async fn workflow_engine_multi_turn_tool_then_text() {
 
 // ── Test 3: tracing ───────────────────────────────────────────────────────────
 
-/// TracingHookAdapter wired via with_hooks() exports spans to InMemoryTraceExporter.
+/// TracingHookAdapter wired via with_builder_customize() exports spans to InMemoryTraceExporter.
 #[tokio::test]
 async fn workflow_engine_tracing_emits_spans() {
     use llm_harness_runtime::observability::tracer::{CaptureLevel, SpanCaptureConfig, SpanStatus};
@@ -140,13 +141,9 @@ async fn workflow_engine_tracing_emits_spans() {
     hooks.after_tool_call.push(adapter.clone());
     hooks.after_turn.push(adapter.clone());
 
-    let engine = WorkflowEngine::new_free_task(
-        "trace me".into(),
-        vec![],
-        make_config(client, "task-e2e-tracing"),
-    )
-    .unwrap()
-    .with_hooks(hooks);
+    let config = make_config(client, "task-e2e-tracing")
+        .with_builder_customize(move |b| b.hooks(hooks.clone()));
+    let engine = WorkflowEngine::new_free_task("trace me".into(), vec![], config).unwrap();
     engine.run().await.unwrap();
     adapter.end_task("trace-test", SpanStatus::Ok);
 

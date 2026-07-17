@@ -32,4 +32,4 @@ echo ""
 echo "── cargo test (py crate, 含 --ignored) ──────"
 PYO3_PYTHON="$(pwd)/$VENV/python3" \
   CARGO_HTTP_PROXY="" \
-  cargo test -p llm-harness-py --no-default-features --features test-utils -- --ignored
+  cargo test -p llm-harness-py --no-default-features -- --ignored
