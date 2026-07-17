@@ -88,9 +88,9 @@ def test_workflow_engine_with_max_steps_and_retries():
 def test_workflow_engine_restore_classmethod():
     """restore() is accessible as a classmethod."""
     assert hasattr(lh.WorkflowEngine, "restore")
-    # Calling restore on a non-existent task should raise RuntimeError
+    # Calling restore on a non-existent task should raise KeyError
     with tempfile.TemporaryDirectory() as d:
-        with pytest.raises(RuntimeError, match="workflow not found"):
+        with pytest.raises(KeyError, match="workflow not found"):
             lh.WorkflowEngine.restore(d, "task-nonexistent", _make_provider(), "gpt-4o", _make_judge())
 
 

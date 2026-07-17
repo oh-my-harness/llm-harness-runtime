@@ -116,6 +116,17 @@ impl StepExecutor for JsonTransformExecutor {
 /// This executor is intentionally not registered by default. Callers must
 /// explicitly inject it with `WorkflowEngine::with_executor`, usually with a
 /// narrow command allowlist and a sandbox-backed `ExecutionEnv`.
+///
+/// Config schema:
+/// - `command`: required, command name (must be in the allowlist).
+/// - `args`: optional array of strings.
+/// - `env`: optional object mapping env-var names to string values.
+/// - `cwd`: optional relative path (no parent traversal).
+/// - `timeout_ms`: optional, defaults to the executor's configured timeout.
+/// - `output_truncation`: optional, one of `head` (default), `tail`, `head_tail`.
+///   Controls which part of stdout/stderr is kept when output exceeds
+///   `max_output_bytes`. `tail` preserves error messages and final results;
+///   `head_tail` keeps both ends with a `... [truncated N bytes] ...` marker line.
 #[derive(Debug, Clone)]
 pub struct ShellExecutor {
     allowed_commands: HashSet<String>,
@@ -166,6 +177,7 @@ impl StepExecutor for ShellExecutor {
             }
             let env_entries = parse_env_entries(config.get("env"))?;
             let cwd = parse_shell_cwd(config.get("cwd"), ctx.env.working_dir())?;
+            let truncation_strategy = TruncationStrategy::parse(config.get("output_truncation"))?;
             let timeout = config
                 .get("timeout_ms")
                 .and_then(Value::as_u64)
@@ -190,8 +202,10 @@ impl StepExecutor for ShellExecutor {
                     },
                 )
                 .await?;
-            let (stdout, stdout_truncated) = truncate_utf8(&output.stdout, self.max_output_bytes);
-            let (stderr, stderr_truncated) = truncate_utf8(&output.stderr, self.max_output_bytes);
+            let (stdout, stdout_truncated) =
+                truncate_utf8(&output.stdout, self.max_output_bytes, truncation_strategy);
+            let (stderr, stderr_truncated) =
+                truncate_utf8(&output.stderr, self.max_output_bytes, truncation_strategy);
             let structured = serde_json::json!({
                 "command": command,
                 "args": args,
@@ -1003,15 +1017,87 @@ fn quote_shell_arg(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
-fn truncate_utf8(value: &str, max_bytes: usize) -> (String, bool) {
+/// Shell output truncation strategy when content exceeds `max_output_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TruncationStrategy {
+    /// Keep the first `max_bytes` (default, backward-compatible).
+    #[default]
+    Head,
+    /// Keep the last `max_bytes` — useful for error messages and final results.
+    Tail,
+    /// Keep the first `max_bytes / 2` and the last `max_bytes / 2`, joining
+    /// them with a marker line. Preserves both the start and the end of
+    /// long outputs.
+    HeadTail,
+}
+
+impl TruncationStrategy {
+    fn parse(value: Option<&Value>) -> Result<Self> {
+        let Some(value) = value else {
+            return Ok(Self::default());
+        };
+        match value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("shell config 'output_truncation' must be a string"))?
+        {
+            "head" => Ok(Self::Head),
+            "tail" => Ok(Self::Tail),
+            "head_tail" => Ok(Self::HeadTail),
+            other => anyhow::bail!(
+                "shell config 'output_truncation' '{}' is not supported",
+                other
+            ),
+        }
+    }
+}
+
+fn format_truncation_marker(omitted_bytes: usize) -> String {
+    format!("\n... [truncated {omitted_bytes} bytes] ...\n")
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize, strategy: TruncationStrategy) -> (String, bool) {
     if value.len() <= max_bytes {
         return (value.to_string(), false);
     }
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
+    match strategy {
+        TruncationStrategy::Head => {
+            let end = value.floor_char_boundary(max_bytes);
+            (value[..end].to_string(), true)
+        }
+        TruncationStrategy::Tail => {
+            let start = value.ceil_char_boundary(value.len() - max_bytes);
+            (value[start..].to_string(), true)
+        }
+        TruncationStrategy::HeadTail => {
+            // Reserve marker budget using the maximum possible omitted-byte
+            // count (value.len()), so the final marker — which reports the
+            // actual omitted bytes — can never grow a digit and overflow.
+            let max_marker = format_truncation_marker(value.len());
+            if max_marker.len() >= max_bytes {
+                let end = value.floor_char_boundary(max_bytes);
+                return (value[..end].to_string(), true);
+            }
+            let budget = max_bytes - max_marker.len();
+            let half = budget / 2;
+            let head_end = value.floor_char_boundary(half);
+            // Tail gets the remaining budget; floor on head_end may have
+            // rounded down, so give the slack to the tail.
+            let tail_budget = budget - head_end;
+            let tail_start = value
+                .ceil_char_boundary(value.len().saturating_sub(tail_budget))
+                .max(head_end);
+            let actual_omitted = tail_start - head_end;
+            let marker = format_truncation_marker(actual_omitted);
+            let mut result =
+                String::with_capacity(head_end + marker.len() + (value.len() - tail_start));
+            result.push_str(&value[..head_end]);
+            result.push_str(&marker);
+            result.push_str(&value[tail_start..]);
+            // Invariant: result.len() <= head_end + max_marker.len() + tail_budget
+            //          = budget + max_marker.len() = max_bytes.
+            (result, true)
+        }
     }
-    (value[..end].to_string(), true)
 }
 
 fn select_input(config: &Map<String, Value>, ctx: &ExecutorCtx<'_>) -> Result<Value> {
@@ -1261,6 +1347,7 @@ mod tests {
             "input": {"device": {"voltage": 3.3}},
             "pointer": "/device/voltage"
         }));
+
         let ctx = ctx_for(&step, None);
 
         let result = JsonTransformExecutor.execute(&ctx).await.unwrap();
@@ -1315,18 +1402,36 @@ mod tests {
         assert!(err.to_string().contains("pointer '/missing' not found"));
     }
 
-    #[derive(Default)]
     struct FakeEnv {
         last_cmd: Mutex<Option<String>>,
         last_timeout: Mutex<Option<Duration>>,
         last_env: Mutex<Vec<(String, String)>>,
+        stdout: Mutex<Option<String>>,
+    }
+
+    impl Default for FakeEnv {
+        fn default() -> Self {
+            Self {
+                last_cmd: Mutex::new(None),
+                last_timeout: Mutex::new(None),
+                last_env: Mutex::new(vec![]),
+                stdout: Mutex::new(None),
+            }
+        }
+    }
+
+    impl FakeEnv {
+        fn with_stdout(stdout: impl Into<String>) -> Self {
+            let env = Self::default();
+            *env.stdout.lock().unwrap() = Some(stdout.into());
+            env
+        }
     }
 
     impl ExecutionEnv for FakeEnv {
         fn working_dir(&self) -> &Path {
             Path::new("/workspace")
         }
-
         fn read_text_file<'a>(
             &'a self,
             path: &'a Path,
@@ -1439,8 +1544,14 @@ mod tests {
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                 .collect();
             Box::pin(async {
+                let stdout = self
+                    .stdout
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "ok\n".to_string());
                 Ok(ShellOutput {
-                    stdout: "ok\n".into(),
+                    stdout,
                     stderr: String::new(),
                     exit_code: 0,
                 })
@@ -1531,6 +1642,248 @@ mod tests {
         let err = executor.execute(&ctx).await.unwrap_err();
 
         assert!(err.to_string().contains("parent traversal"));
+    }
+
+    #[tokio::test]
+    async fn shell_executor_tail_truncation_keeps_end() {
+        let long_output = "HEAD1234567890TAIL";
+        let step = Step::executor(
+            "shell",
+            "Shell",
+            SHELL_EXECUTOR_NAME,
+            Some(serde_json::json!({
+                "command": "echo",
+                "args": ["x"],
+                "output_truncation": "tail"
+            })),
+        );
+        let env = Arc::new(FakeEnv::with_stdout(long_output));
+        let ctx = ExecutorCtx {
+            current_step: &step,
+            prev_result: None,
+            step_history: &[],
+            env: env.clone(),
+            abort: CancellationToken::new(),
+            context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+        };
+        let executor = ShellExecutor::new(["echo"]).with_max_output_bytes(8);
+
+        let result = executor.execute(&ctx).await.unwrap();
+        let structured = result.structured.unwrap();
+
+        assert_eq!(structured["stdout"], "7890TAIL");
+        assert_eq!(structured["stdout_truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn shell_executor_head_tail_truncation_keeps_both_ends() {
+        let long_output = "AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLL"; // 48 bytes
+        let step = Step::executor(
+            "shell",
+            "Shell",
+            SHELL_EXECUTOR_NAME,
+            Some(serde_json::json!({
+                "command": "echo",
+                "args": ["x"],
+                "output_truncation": "head_tail"
+            })),
+        );
+        let env = Arc::new(FakeEnv::with_stdout(long_output));
+        let ctx = ExecutorCtx {
+            current_step: &step,
+            prev_result: None,
+            step_history: &[],
+            env: env.clone(),
+            abort: CancellationToken::new(),
+            context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+        };
+        let executor = ShellExecutor::new(["echo"]).with_max_output_bytes(40);
+
+        let result = executor.execute(&ctx).await.unwrap();
+        let structured = result.structured.unwrap();
+        let stdout = structured["stdout"].as_str().unwrap();
+
+        assert!(stdout.starts_with("AAAA"));
+        assert!(stdout.ends_with("LLLL"));
+        assert!(
+            stdout.contains("[truncated "),
+            "expected byte-count marker in: {stdout}"
+        );
+        assert!(
+            stdout.len() <= 40,
+            "head_tail output must respect max_output_bytes, got {} bytes: {stdout}",
+            stdout.len()
+        );
+        assert_eq!(structured["stdout_truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn shell_executor_truncation_respects_multibyte_utf8() {
+        // Each '中' is 3 bytes in UTF-8; 10 chars = 30 bytes. With max_bytes
+        // = 8 and the head strategy, the cut point lands inside a multi-byte
+        // sequence and must snap back to a char boundary.
+        let long_output = "中中中中中中中中中中";
+        let step = Step::executor(
+            "shell",
+            "Shell",
+            SHELL_EXECUTOR_NAME,
+            Some(serde_json::json!({
+                "command": "echo",
+                "args": ["x"],
+                "output_truncation": "head"
+            })),
+        );
+        let env = Arc::new(FakeEnv::with_stdout(long_output));
+        let ctx = ExecutorCtx {
+            current_step: &step,
+            prev_result: None,
+            step_history: &[],
+            env: env.clone(),
+            abort: CancellationToken::new(),
+            context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+        };
+        let executor = ShellExecutor::new(["echo"]).with_max_output_bytes(8);
+
+        let result = executor.execute(&ctx).await.unwrap();
+        let structured = result.structured.unwrap();
+        let stdout = structured["stdout"].as_str().unwrap();
+
+        // 8 bytes / 3 bytes-per-char → floor to 6 bytes (2 chars). No partial
+        // code units, no replacement chars, within budget.
+        assert_eq!(stdout, "中中");
+        assert!(stdout.len() <= 8, "got {} bytes", stdout.len());
+        assert_eq!(structured["stdout_truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn shell_executor_tail_truncation_respects_multibyte_utf8() {
+        // 10× '中' = 30 bytes. Tail with max_bytes=8 must keep the last 2
+        // complete chars (6 bytes), snapping forward to a char boundary.
+        let long_output = "中中中中中中中中中中";
+        let step = Step::executor(
+            "shell",
+            "Shell",
+            SHELL_EXECUTOR_NAME,
+            Some(serde_json::json!({
+                "command": "echo",
+                "args": ["x"],
+                "output_truncation": "tail"
+            })),
+        );
+        let env = Arc::new(FakeEnv::with_stdout(long_output));
+        let ctx = ExecutorCtx {
+            current_step: &step,
+            prev_result: None,
+            step_history: &[],
+            env: env.clone(),
+            abort: CancellationToken::new(),
+            context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+        };
+        let executor = ShellExecutor::new(["echo"]).with_max_output_bytes(8);
+
+        let result = executor.execute(&ctx).await.unwrap();
+        let structured = result.structured.unwrap();
+        let stdout = structured["stdout"].as_str().unwrap();
+
+        assert_eq!(stdout, "中中");
+        assert!(stdout.len() <= 8, "got {} bytes", stdout.len());
+        assert_eq!(structured["stdout_truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn shell_executor_head_tail_truncation_respects_multibyte_utf8() {
+        // 100× '中' = 300 bytes. head_tail with a budget large enough for the
+        // marker must keep both ends on char boundaries and stay within budget.
+        let long_output = "中".repeat(100); // 300 bytes
+        let step = Step::executor(
+            "shell",
+            "Shell",
+            SHELL_EXECUTOR_NAME,
+            Some(serde_json::json!({
+                "command": "echo",
+                "args": ["x"],
+                "output_truncation": "head_tail"
+            })),
+        );
+        let env = Arc::new(FakeEnv::with_stdout(long_output));
+        let ctx = ExecutorCtx {
+            current_step: &step,
+            prev_result: None,
+            step_history: &[],
+            env: env.clone(),
+            abort: CancellationToken::new(),
+            context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+        };
+        let executor = ShellExecutor::new(["echo"]).with_max_output_bytes(60);
+
+        let result = executor.execute(&ctx).await.unwrap();
+        let structured = result.structured.unwrap();
+        let stdout = structured["stdout"].as_str().unwrap();
+
+        assert!(
+            stdout.len() <= 60,
+            "head_tail must respect max_output_bytes, got {} bytes: {stdout}",
+            stdout.len()
+        );
+        assert!(
+            stdout.contains("[truncated "),
+            "expected marker in: {stdout}"
+        );
+        // String is still valid UTF-8 (no replacement char) — `as_str` above
+        // would have panicked otherwise. Verify it starts and ends with '中'.
+        assert!(stdout.starts_with('中'));
+        assert!(stdout.ends_with('中'));
+        assert_eq!(structured["stdout_truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn shell_executor_default_truncation_is_head() {
+        let long_output = "AAAABBBBCCCCDDDD";
+        let step = Step::executor(
+            "shell",
+            "Shell",
+            SHELL_EXECUTOR_NAME,
+            Some(serde_json::json!({
+                "command": "echo",
+                "args": ["x"]
+            })),
+        );
+        let env = Arc::new(FakeEnv::with_stdout(long_output));
+        let ctx = ExecutorCtx {
+            current_step: &step,
+            prev_result: None,
+            step_history: &[],
+            env: env.clone(),
+            abort: CancellationToken::new(),
+            context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+        };
+        let executor = ShellExecutor::new(["echo"]).with_max_output_bytes(8);
+
+        let result = executor.execute(&ctx).await.unwrap();
+        let structured = result.structured.unwrap();
+
+        assert_eq!(structured["stdout"], "AAAABBBB");
+        assert_eq!(structured["stdout_truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn shell_executor_rejects_invalid_truncation_strategy() {
+        let step = Step::executor(
+            "shell",
+            "Shell",
+            SHELL_EXECUTOR_NAME,
+            Some(serde_json::json!({
+                "command": "echo",
+                "args": ["x"],
+                "output_truncation": "middle"
+            })),
+        );
+        let ctx = ctx_for(&step, None);
+        let executor = ShellExecutor::new(["echo"]);
+
+        let err = executor.execute(&ctx).await.unwrap_err();
+
+        assert!(err.to_string().contains("not supported"));
     }
 
     #[tokio::test]
