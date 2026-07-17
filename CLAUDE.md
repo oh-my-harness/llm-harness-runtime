@@ -87,6 +87,8 @@ Strong success criteria let the LLM loop independently. Weak criteria ("make it 
 2. 运行 `cargo clippy --all-targets --all-features` — 修复所有 clippy 警告（除非有充分理由保留）
 3. 运行 `./scripts/test.sh` — 一键跑 Rust workspace 测试 + PyO3 Python 模块测试（maturin develop + pytest），能提前发现 Python FFI 绑定的错误
 
+> **环境注意**：clippy 和 test.sh 需设 `PYO3_PYTHON=/usr/local/bin/python3.14`，否则会找到系统 python3.6 报错。test.sh 的 venv 也已改为 `python3.14 -m venv`。
+
 这三项检查是 CI 的硬要求，在本地提前发现能避免提交被拒。
 
 
