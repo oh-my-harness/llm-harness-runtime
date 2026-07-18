@@ -85,7 +85,7 @@ Strong success criteria let the LLM loop independently. Weak criteria ("make it 
 
 1. 运行 `cargo fmt` — 确保代码格式统一
 2. 运行 `cargo clippy --all-targets --all-features` — 修复所有 clippy 警告（除非有充分理由保留）
-3. 运行 `./scripts/test.sh` — 跑 Rust workspace 测试
+3. 运行 `CARGO_HTTP_PROXY="" cargo test --workspace` — 跑 Rust workspace 测试
 
 > **环境注意**：clippy 需设 `PYO3_PYTHON=/usr/local/bin/python3.14`，否则会找到系统 python3.6 报错。
 
@@ -244,7 +244,7 @@ pub struct HarnessHooks {
 **运行测试：**
 - 一键跑全部 Rust workspace 测试：
   ```
-  ./scripts/test.sh
+  CARGO_HTTP_PROXY="" cargo test --workspace
   ```
 - 仅跑特定 crate：
   ```

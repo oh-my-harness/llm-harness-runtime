@@ -51,31 +51,6 @@ impl super::WorkflowEngine {
         Ok(Self::from_parts(workflow, config, judge, None))
     }
 
-    /// 从指定步骤开始执行（`--restart-from` 场景）。
-    ///
-    /// 与 [`WorkflowEngine::new`] 相同，但 `current_step` 设为 `step` 而非
-    /// `workflow.entry_step`，跳过其前的步骤。调用方负责确保 `step` 存在于
-    /// workflow 且已清理该步骤及下游的缓存（done marker 等），使目标步骤真正重跑。
-    pub fn new_from_step(
-        workflow: Workflow,
-        config: WorkflowEngineConfig,
-        judge: Arc<dyn StepTransitionJudge>,
-        step: impl Into<StepId>,
-    ) -> Result<Self, WorkflowError> {
-        validate_workflow(&workflow)?;
-        let judge = default_declarative_judge(&workflow, judge);
-        let mut state = WorkflowState::new(step.into());
-        state.context = WorkflowContext::new();
-        Ok(Self::from_parts_with_state(
-            workflow,
-            config,
-            judge,
-            None,
-            TaskId(format!("task-{}", uuid::Uuid::new_v4())),
-            state,
-        ))
-    }
-
     /// 自由 task 构造器 = 单步 workflow。
     /// 1 个 step（id="run"，prompt 作为 step.prompt）、无 edges、allowed_tools 由业务层显式传入。
     /// judge 用 NoopJudge（流程走完即结束）。
@@ -103,6 +78,78 @@ impl super::WorkflowEngine {
         config: WorkflowEngineConfig,
         judge: Arc<dyn StepTransitionJudge>,
     ) -> Result<Self, WorkflowError> {
+        let (engine, _state) = Self::load_and_build(store, task_id, config, judge).await?;
+        Ok(engine)
+    }
+
+    /// 从指定 step 恢复并重跑（`--restart-from` 场景）。
+    ///
+    /// 加载 task store 中 task_id 的完整上下文（workflow + state + checkpoints），
+    /// 截断 step_history 中目标 step 及其下游所有 record，将 current_step 指向 step，
+    /// status 置 Paused。调用方随后调 [`WorkflowEngine::run`] 从 step 重新执行。
+    ///
+    /// # 语义
+    /// - step_history：保留目标 step 之前的上游 record，截断目标 step 及下游。
+    /// - context 黑板：不回滚，保留当前累积值（无法恢复到 step 执行前快照）。
+    /// - task_id / planned_by / checkpoints：全部从 store 恢复。
+    /// - status 置 Paused，run() 不会用历史末尾 transition 覆写 current_step。
+    ///
+    /// # 错误
+    /// - [`WorkflowError::WorkflowNotFound`]：workflow 或 state 不在 store。
+    /// - [`WorkflowError::CurrentStepNotFound`]：step 不在 workflow steps。
+    /// - [`WorkflowError::StepNotInHistory`]：step 从未执行过（不在 step_history）。
+    pub async fn restore_from_step(
+        store: Arc<dyn TaskStore>,
+        task_id: TaskId,
+        step: impl Into<StepId>,
+        config: WorkflowEngineConfig,
+        judge: Arc<dyn StepTransitionJudge>,
+    ) -> Result<Self, WorkflowError> {
+        let target: StepId = step.into();
+        let (engine, mut state) = Self::load_and_build(store, task_id, config, judge).await?;
+
+        // 校验 target step 存在于 workflow。
+        if !engine.workflow.steps.iter().any(|s| s.id() == &target) {
+            return Err(WorkflowError::CurrentStepNotFound {
+                step_id: target.clone(),
+            });
+        }
+
+        // 截断 step_history：删除 target step 及其下游所有 record。
+        // target 必须在 step_history 中（回退重跑语义要求该步曾执行过）。
+        let truncate_pos = state.step_history.iter().rposition(|r| r.step_id == target);
+        let pos = truncate_pos.ok_or_else(|| WorkflowError::StepNotInHistory {
+            step_id: target.clone(),
+        })?;
+        state.step_history.truncate(pos);
+
+        // 改写 current_step + status 置 Paused。
+        state.current_step = target;
+        state.status = WorkflowStatus::Paused;
+        state.reason = None;
+        state.result = None;
+        state.error = None;
+        state.ended_at = None;
+
+        // 把改写后的 state 写回 engine 的 workflow_state + persist 落盘。
+        {
+            let mut ws = engine.workflow_state.lock().await;
+            *ws = state.clone();
+        }
+        engine.persist_state(&state).await?;
+
+        Ok(engine)
+    }
+
+    /// restore / restore_from_step 共用的加载逻辑：
+    /// load workflow + state + checkpoints，validate，组装 engine。
+    /// 返回 (engine, 加载到的 state)。调用方可对 state 做后处理后再 persist。
+    async fn load_and_build(
+        store: Arc<dyn TaskStore>,
+        task_id: TaskId,
+        config: WorkflowEngineConfig,
+        judge: Arc<dyn StepTransitionJudge>,
+    ) -> Result<(Self, WorkflowState), WorkflowError> {
         let workflow = store.load_workflow(&task_id).await?.ok_or_else(|| {
             WorkflowError::WorkflowNotFound {
                 task_id: task_id.0.clone(),
@@ -119,13 +166,13 @@ impl super::WorkflowEngine {
             judge,
             Some(store.clone()),
             task_id,
-            state,
+            state.clone(),
         );
         // 从 store 重载 checkpoints 到内存缓存。
         if let Ok(cps) = store.list_checkpoints(&engine.task_id).await {
             *engine.checkpoints.lock().await = cps;
         }
-        Ok(engine)
+        Ok((engine, state))
     }
 
     /// 公共构造：从已校验的 workflow + config 组装 engine（new 路径，新 task_id）。

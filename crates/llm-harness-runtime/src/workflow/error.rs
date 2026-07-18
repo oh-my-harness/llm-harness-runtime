@@ -102,6 +102,8 @@ pub enum WorkflowError {
 
     #[error("run: current_step '{step_id}' not in workflow")]
     CurrentStepNotFound { step_id: String },
+    #[error("restore_from_step: step '{step_id}' not in step_history (never executed)")]
+    StepNotInHistory { step_id: String },
 
     #[error("step '{id}' aborted")]
     StepAborted { id: String },

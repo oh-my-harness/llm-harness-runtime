@@ -2152,3 +2152,576 @@ fn aggregate_cost_merges_per_model_cache_tokens() {
     assert_eq!(total.total_cache_read_tokens, 500);
     assert_eq!(total.total_cache_write_tokens, 150);
 }
+
+#[tokio::test]
+async fn restore_from_step_truncates_downstream_history() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restart-truncate".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+            Step::llm("s3", "Step 3", "do step 3", vec![]),
+        ],
+        edges: vec![
+            Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            },
+            Edge {
+                from: "s2".into(),
+                to: "s3".into(),
+                condition: None,
+            },
+        ],
+    };
+    // 模拟 s1/s2/s3 都已跑完，current_step 停在 s3。
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Succeeded;
+    state.started_at = Some(chrono::Utc::now());
+    state.ended_at = Some(chrono::Utc::now());
+    state.current_step = "s3".into();
+    state.step_history = vec![
+        completed_record("s1", "step1 done", Transition::To("s2".into())),
+        completed_record("s2", "step2 done", Transition::To("s3".into())),
+        completed_record(
+            "s3",
+            "step3 done",
+            Transition::Abort {
+                reason: "done".into(),
+            },
+        ),
+    ];
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    // restore_from_step(s2)：应截断 s2 及 s3 的 record，只留 s1。
+    struct RestartJudge;
+    impl StepTransitionJudge for RestartJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            Box::pin(async move {
+                match step_id.as_str() {
+                    "s1" => Transition::To("s2".into()),
+                    "s2" => Transition::To("s3".into()),
+                    _ => Transition::Abort {
+                        reason: "done".into(),
+                    },
+                }
+            })
+        }
+    }
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("step2 redone"),
+        MockResponse::text("step3 redone"),
+    ]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::restore_from_step(
+        store.clone(),
+        task_id.clone(),
+        "s2",
+        config,
+        Arc::new(RestartJudge),
+    )
+    .await
+    .unwrap();
+
+    // 构造后 status=Paused, current_step=s2, step_history 只剩 s1。
+    assert_eq!(engine.state().await, WorkflowStatus::Paused);
+    assert_eq!(engine.current_step().await, "s2");
+    let history = engine.step_history().await;
+    assert_eq!(
+        history.len(),
+        1,
+        "step_history should only contain s1 after truncation"
+    );
+    assert_eq!(history[0].step_id, "s1");
+
+    let result = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+    // 重跑后：s1(旧) + s2(新) + s3(新)。
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0].step_id, "s1");
+    assert_eq!(history[1].step_id, "s2");
+    assert_eq!(history[2].step_id, "s3");
+    // turns = count_executed_turns(history)：s1(旧,retained) + s2(新) + s3(新) = 3。
+    // 截断已删旧 s2/s3，故不含它们的旧 record；s1 旧 record 仍计数。
+    assert_eq!(
+        result.turns, 3,
+        "turns counts all result:Some records in retained history"
+    );
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+}
+
+#[tokio::test]
+async fn restore_from_step_target_not_in_workflow() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restart-bad-step".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+        edges: vec![],
+    };
+    let state = WorkflowState::new("s1".into());
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let result = WorkflowEngine::restore_from_step(
+        store,
+        task_id,
+        "nonexistent",
+        config,
+        Arc::new(NoopJudge),
+    )
+    .await;
+    let err = match result {
+        Ok(_) => panic!("expected CurrentStepNotFound, got Ok"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, WorkflowError::CurrentStepNotFound { ref step_id } if step_id == "nonexistent"),
+        "expected CurrentStepNotFound, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn restore_from_step_target_not_in_history() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restart-unrun-step".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+            Step::llm("s3", "Step 3", "do step 3", vec![]),
+        ],
+        edges: vec![
+            Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            },
+            Edge {
+                from: "s2".into(),
+                to: "s3".into(),
+                condition: None,
+            },
+        ],
+    };
+    // 只跑了 s1，停在 s2（current_step=s2 但 s2 未完成）。
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Running;
+    state.started_at = Some(chrono::Utc::now());
+    state.current_step = "s2".into();
+    state.step_history = vec![completed_record(
+        "s1",
+        "step1 done",
+        Transition::To("s2".into()),
+    )];
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    // restore_from_step(s3)：s3 在 workflow 里但从未在 step_history 中执行过。
+    // 设计变更后：target step 不在 step_history 返回 StepNotInHistory，
+    // 构造器本身失败，不执行 run()。使用 NoopJudge 和空 MockLlmClient。
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let result =
+        WorkflowEngine::restore_from_step(store, task_id, "s3", config, Arc::new(NoopJudge)).await;
+    let err = match result {
+        Ok(_) => panic!("expected StepNotInHistory for s3, got Ok"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, WorkflowError::StepNotInHistory { ref step_id } if step_id == "s3"),
+        "expected StepNotInHistory for s3, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn restore_from_step_context_not_rolled_back() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restart-context".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: None,
+        }],
+    };
+    // s1 写 context k=1，s2 写 k=2，s2 跑完后 context 里有 k=2。
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Succeeded;
+    state.started_at = Some(chrono::Utc::now());
+    state.ended_at = Some(chrono::Utc::now());
+    state.current_step = "s2".into();
+    state.step_history = vec![
+        completed_record("s1", "step1 done", Transition::To("s2".into())),
+        completed_record(
+            "s2",
+            "step2 done",
+            Transition::Abort {
+                reason: "done".into(),
+            },
+        ),
+    ];
+    // 模拟 s2 执行后 context 累积了 k=2。
+    state
+        .context
+        .variables
+        .insert("k".into(), serde_json::Value::Number(2.into()));
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    // restore_from_step(s2)：context 不回滚，s2 重跑时应读到 k=2。
+    struct ContextCheckJudge;
+    impl StepTransitionJudge for ContextCheckJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let k = ctx
+                .context
+                .variables
+                .get("k")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+            Box::pin(async move {
+                assert_eq!(k, 2, "context should not be rolled back, k should be 2");
+                Transition::Abort {
+                    reason: "done".into(),
+                }
+            })
+        }
+    }
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("s2 redo")]));
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::restore_from_step(
+        store,
+        task_id,
+        "s2",
+        config,
+        Arc::new(ContextCheckJudge),
+    )
+    .await
+    .unwrap();
+    engine.run().await.unwrap();
+}
+
+#[tokio::test]
+async fn restore_from_step_persists_truncated_state() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restart-persist".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+            Step::llm("s3", "Step 3", "do step 3", vec![]),
+        ],
+        edges: vec![
+            Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            },
+            Edge {
+                from: "s2".into(),
+                to: "s3".into(),
+                condition: None,
+            },
+        ],
+    };
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Succeeded;
+    state.current_step = "s3".into();
+    state.step_history = vec![
+        completed_record("s1", "step1 done", Transition::To("s2".into())),
+        completed_record("s2", "step2 done", Transition::To("s3".into())),
+        completed_record(
+            "s3",
+            "step3 done",
+            Transition::Abort {
+                reason: "done".into(),
+            },
+        ),
+    ];
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let _engine = WorkflowEngine::restore_from_step(
+        store.clone(),
+        task_id.clone(),
+        "s2",
+        config.clone(),
+        Arc::new(NoopJudge),
+    )
+    .await
+    .unwrap();
+
+    // 重新 restore：盘上 state 应是截断后的（current_step=s2, status=Paused, history=[s1]）。
+    let restored = WorkflowEngine::restore(store, task_id, config, Arc::new(NoopJudge))
+        .await
+        .unwrap();
+    assert_eq!(restored.current_step().await, "s2");
+    assert_eq!(restored.state().await, WorkflowStatus::Paused);
+    let history = restored.step_history().await;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].step_id, "s1");
+}
+
+/// rposition 语义：step_history 中 target 出现多次（Retry/rework）时，
+/// 截断最后一次出现及其后所有 record，保留之前的完整执行链。
+#[tokio::test]
+async fn restore_from_step_rposition_truncates_last_occurrence() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restart-rposition".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+            Step::llm("s3", "Step 3", "do step 3", vec![]),
+        ],
+        edges: vec![
+            Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            },
+            Edge {
+                from: "s2".into(),
+                to: "s3".into(),
+                condition: None,
+            },
+        ],
+    };
+    // 模拟 rework 场景：s1→s2→s3→(s2 rework)→s3，s2 出现两次。
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Succeeded;
+    state.current_step = "s3".into();
+    state.step_history = vec![
+        completed_record("s1", "s1 first", Transition::To("s2".into())),
+        completed_record("s2", "s2 first", Transition::To("s3".into())),
+        completed_record("s3", "s3 first", Transition::To("s2".into())),
+        completed_record("s2", "s2 rework", Transition::To("s3".into())),
+        completed_record(
+            "s3",
+            "s3 rework",
+            Transition::Abort {
+                reason: "done".into(),
+            },
+        ),
+    ];
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine =
+        WorkflowEngine::restore_from_step(store, task_id, "s2", config, Arc::new(NoopJudge))
+            .await
+            .unwrap();
+
+    // rposition 截断最后一次 s2（index 3）及其后（s3 rework），
+    // 保留 [s1, s2 first, s3 first, s2 rework] 之前的三条？不——
+    // rposition 找最后一条 step_id=="s2"，即 index 3。
+    // truncate(3) 保留 index 0..2 = [s1, s2 first, s3 first]。
+    let history = engine.step_history().await;
+    assert_eq!(
+        history.len(),
+        3,
+        "should keep records before last s2 occurrence"
+    );
+    assert_eq!(history[0].step_id, "s1");
+    assert_eq!(history[1].step_id, "s2");
+    assert_eq!(history[2].step_id, "s3");
+    // current_step = s2（最后一次出现的 s2），status = Paused。
+    assert_eq!(engine.current_step().await, "s2");
+    assert_eq!(engine.state().await, WorkflowStatus::Paused);
+}
+
+/// 盘上 status=Running 时调 restore_from_step：构造器应覆写为 Paused，
+/// 防止 run() Running arm 用历史末尾 transition 覆写 current_step。
+#[tokio::test]
+async fn restore_from_step_from_running_status_sets_paused() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restart-from-running".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+            Step::llm("s3", "Step 3", "do step 3", vec![]),
+        ],
+        edges: vec![
+            Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            },
+            Edge {
+                from: "s2".into(),
+                to: "s3".into(),
+                condition: None,
+            },
+        ],
+    };
+    // 模拟崩溃：status 仍为 Running，current_step 停在 s3。
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Running;
+    state.started_at = Some(chrono::Utc::now());
+    state.current_step = "s3".into();
+    state.step_history = vec![
+        completed_record("s1", "s1 done", Transition::To("s2".into())),
+        completed_record("s2", "s2 done", Transition::To("s3".into())),
+        completed_record(
+            "s3",
+            "s3 done",
+            Transition::Abort {
+                reason: "done".into(),
+            },
+        ),
+    ];
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine =
+        WorkflowEngine::restore_from_step(store, task_id, "s2", config, Arc::new(NoopJudge))
+            .await
+            .unwrap();
+
+    // 构造器必须把 Running 覆写为 Paused，否则 run() 会走 Running arm。
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Paused,
+        "restore_from_step must set Paused even if disk status was Running"
+    );
+    assert_eq!(engine.current_step().await, "s2");
+    let history = engine.step_history().await;
+    assert_eq!(history.len(), 1, "truncated to s1 only");
+}
+
+/// target=entry_step（pos=0）：截断整个 step_history，从入口重跑。
+#[tokio::test]
+async fn restore_from_step_to_entry_step_clears_history() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restart-entry".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: None,
+        }],
+    };
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Succeeded;
+    state.current_step = "s2".into();
+    state.step_history = vec![
+        completed_record("s1", "s1 done", Transition::To("s2".into())),
+        completed_record(
+            "s2",
+            "s2 done",
+            Transition::Abort {
+                reason: "done".into(),
+            },
+        ),
+    ];
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine =
+        WorkflowEngine::restore_from_step(store, task_id, "s1", config, Arc::new(NoopJudge))
+            .await
+            .unwrap();
+
+    // truncate(0)：step_history 清空，current_step=s1。
+    assert_eq!(engine.current_step().await, "s1");
+    assert_eq!(engine.state().await, WorkflowStatus::Paused);
+    let history = engine.step_history().await;
+    assert!(
+        history.is_empty(),
+        "history should be fully cleared when target is entry_step"
+    );
+}
