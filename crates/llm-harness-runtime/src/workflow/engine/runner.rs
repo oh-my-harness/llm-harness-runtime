@@ -958,6 +958,9 @@ impl super::WorkflowEngine {
         let mut tool_calls_count = 0u32;
         let mut settled = false;
         let mut aborted = false;
+        // AgentEvent::Error（非 Aborted）捕获：循环结束后翻成 StepFailed。
+        // Aborted 由 biased select 的 step_abort.cancelled() 路径接管，这里忽略。
+        let mut step_error: Option<WorkflowError> = None;
         loop {
             tokio::select! {
                 biased;
@@ -972,18 +975,32 @@ impl super::WorkflowEngine {
                             AgentHarnessEvent::Agent(AgentEvent::TextDelta { text, .. }) => {
                                 text_delta_output.push_str(text);
                             }
-                            AgentHarnessEvent::Agent(ev) => {
-                                if let Some((_, _, text)) = ev.as_final_answer() {
-                                    final_answer_output = Some(text);
-                                }
-                                // Forward coarse-grained progress to workflow subscribers.
-                                if let Some(progress) = step_progress_from(ev) {
-                                    let _ = self.event_tx.send(WorkflowEvent::StepProgress {
-                                        step_id: step.id().clone(),
-                                        progress,
+                            AgentHarnessEvent::Agent(ev) => match ev {
+                                // Aborted：忽略。与 step_abort.cancelled() 同源，
+                                // biased select 会让 step_abort.cancelled() 优先返回 StepAborted。
+                                AgentEvent::Error(AgentError::Aborted) => {}
+                                // 非 Aborted 的 Error：捕获并跳出，循环后翻成 StepFailed。
+                                // 含 StreamIncomplete / provider timeout / stream ended 等。
+                                AgentEvent::Error(e) => {
+                                    step_error = Some(WorkflowError::StepFailed {
+                                        id: step.id().to_string(),
+                                        source: anyhow::anyhow!("{e}"),
                                     });
+                                    break;
                                 }
-                            }
+                                _ => {
+                                    if let Some((_, _, text)) = ev.as_final_answer() {
+                                        final_answer_output = Some(text);
+                                    }
+                                    // Forward coarse-grained progress to workflow subscribers.
+                                    if let Some(progress) = step_progress_from(ev) {
+                                        let _ = self.event_tx.send(WorkflowEvent::StepProgress {
+                                            step_id: step.id().clone(),
+                                            progress,
+                                        });
+                                    }
+                                }
+                            },
                             AgentHarnessEvent::ToolCallStart { .. } => tool_calls_count += 1,
                             AgentHarnessEvent::Settled | AgentHarnessEvent::Aborted => {
                                 settled = true;
@@ -1015,6 +1032,25 @@ impl super::WorkflowEngine {
             prompt_result?;
             return Err(WorkflowError::StepAborted {
                 id: step.id().to_string(),
+            });
+        }
+        if let Some(err) = step_error {
+            // 事件流出现 AgentEvent::Error（非 Aborted）：翻成 StepFailed。
+            // prompt_result? 优先：若 prompt() 本身也错（如 panic 后 JoinError），
+            // 透传更具体的错误；否则返回事件流捕获的错误。
+            prompt_result?;
+            return Err(err);
+        }
+        // 兜底：事件流可能因 Lagged 丢失 AgentEvent::Error，但 drive_loop 会把
+        // 非 Aborted 错误写进 harness.state().error_message。若 step_error 未捕获
+        // 但 state 里记了错误，翻成 StepFailed（与事件流路径一致）。
+        // 走到这里 step_error 必为 None：上面的 `if let Some(err) = step_error`
+        // 已提前 return。
+        if let Some(msg) = harness.state().error_message.clone() {
+            prompt_result?;
+            return Err(WorkflowError::StepFailed {
+                id: step.id().to_string(),
+                source: anyhow::anyhow!("{msg}"),
             });
         }
         if !settled {

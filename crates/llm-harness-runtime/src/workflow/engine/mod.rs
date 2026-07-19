@@ -19,7 +19,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use llm_harness_agent::{AgentHarnessEvent, HarnessHooks, Plugin, Session};
-use llm_harness_types::{AgentEvent, SPAWN_AGENT_TOOL_NAME, SUBMIT_STEP_RESULT_TOOL_NAME, Tool};
+use llm_harness_types::{
+    AgentError, AgentEvent, SPAWN_AGENT_TOOL_NAME, SUBMIT_STEP_RESULT_TOOL_NAME, Tool,
+};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;

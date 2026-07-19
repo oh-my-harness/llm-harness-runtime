@@ -218,6 +218,30 @@ impl MockResponse {
             stream_error: Some(LlmError::RateLimit { retry_after: None }),
         }
     }
+    /// Preset that emits a couple of text deltas then terminates abnormally
+    /// with `LlmError::StreamIncomplete` mid-stream (no `MessageStop`).
+    ///
+    /// Reproduces the issue #69 scenario: a dropped SSE connection surfaces
+    /// as `Err(StreamIncomplete)` inside the event stream, which `loop_fn`
+    /// converts to `AgentEvent::Error(Provider(...))`.
+    pub fn stream_dropped_mid(partial_text: &str, received_chunks: u32) -> Self {
+        let t = partial_text.to_owned();
+        Self {
+            model: "mock-model".into(),
+            stream_error: None,
+            events: vec![
+                Ok(StreamEvent::ContentStart {
+                    index: 0,
+                    kind: llm_adapter::types::ContentKind::Text,
+                }),
+                Ok(StreamEvent::TextDelta { index: 0, text: t }),
+                Err(LlmError::StreamIncomplete {
+                    received_chunks,
+                    finish_reason: None,
+                }),
+            ],
+        }
+    }
 }
 
 /// LLM client mock that returns pre-configured responses in sequence.

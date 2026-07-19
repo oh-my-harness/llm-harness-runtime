@@ -13,6 +13,7 @@ use std::sync::Arc;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_runtime::spawn::spawner::{EnvFactory, JsonlSessionFactory};
 use llm_harness_runtime::workflow::engine::{WorkflowEngine, WorkflowEngineConfig};
+use llm_harness_runtime::workflow::error::WorkflowError;
 use llm_harness_runtime::workflow::model::WorkflowStatus;
 use llm_harness_runtime_sandbox_os::OsEnvSandbox;
 use llm_harness_types::{AgentError, ExecutionEnv};
@@ -153,4 +154,155 @@ async fn workflow_engine_tracing_emits_spans() {
         !exporter.exported_spans().is_empty(),
         "expected at least one exported span"
     );
+}
+
+// ── Test 4: stream error propagation (issue #69) ─────────────────────────────
+
+/// A stream that drops mid-way (emits `Err(StreamIncomplete)` as a stream
+/// event) must surface as `WorkflowError::StepFailed`, not an empty success.
+///
+/// Reproduces issue #69: `AgentEvent::Error(Provider("stream incomplete: ..."))`
+/// was silently swallowed by `run_llm_step`'s event loop, causing the step to
+/// be marked succeeded with `tool_calls_count=0, output=""`.
+#[tokio::test]
+async fn workflow_engine_stream_incomplete_fails_step() {
+    // MockResponse with a mid-stream Err(StreamIncomplete): a couple of text
+    // deltas arrive, then the stream terminates abnormally.
+    let dropped_response = MockResponse::stream_dropped_mid("partial", 2);
+    let client = Arc::new(MockLlmClient::new(vec![dropped_response]));
+    let engine = WorkflowEngine::new_free_task(
+        "do something".into(),
+        vec![],
+        make_config(client, "task-e2e-stream-incomplete"),
+    )
+    .unwrap();
+
+    let result = engine.run().await;
+
+    // run() must return Err mentioning the stream-incomplete failure —
+    // NOT Ok with empty/partial output. The engine wraps step errors as
+    // TaskFailed("step '{id}' failed: {step_error}"), so we match on that.
+    let err = result.expect_err("stream-incomplete must fail the step, not succeed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("stream incomplete"),
+        "error should mention stream incomplete, got: {msg}"
+    );
+    assert!(
+        msg.contains("step 'run' failed"),
+        "error should identify the failed step, got: {msg}"
+    );
+
+    // Engine state must be Failed.
+    assert_eq!(engine.state().await, WorkflowStatus::Failed);
+}
+
+// ── Test 5: AgentEvent::Error(Aborted) preserves StepAborted (issue #69 guard) ──
+
+/// A tool that blocks until its abort token fires. Signals `ready` once it
+/// has entered the blocking select, so the test can cancel deterministically
+/// *during* tool execution (not before the step starts).
+struct BlockUntilAborted {
+    ready: Arc<tokio::sync::Notify>,
+}
+
+impl llm_harness_types::Tool for BlockUntilAborted {
+    fn name(&self) -> &str {
+        "block_until_aborted"
+    }
+    fn description(&self) -> &str {
+        "Blocks until aborted; used to test cancel."
+    }
+    fn parameters_schema(&self) -> &serde_json::Value {
+        static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+        SCHEMA
+            .get_or_init(|| serde_json::json!({"type": "object", "properties": {}, "required": []}))
+    }
+    fn execute<'a>(
+        &'a self,
+        _args: serde_json::Value,
+        ctx: &'a llm_harness_types::ToolContext,
+    ) -> futures::future::BoxFuture<
+        'a,
+        Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>,
+    > {
+        let ready = self.ready.clone();
+        Box::pin(async move {
+            // Signal that the tool is now blocking on the abort token,
+            // then wait for cancellation. This guarantees cancel lands
+            // *during* tool execution, so `AgentEvent::Error(Aborted)`
+            // is actually emitted and reaches the runner's select loop.
+            ready.notify_one();
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                    Ok(llm_harness_types::ToolResult {
+                        content: vec![llm_harness_types::ContentBlock::Text { text: "done".into() }],
+                        details: serde_json::Value::Null,
+                        terminate: false,
+                    })
+                }
+                _ = ctx.abort.cancelled() => {
+                    Err(llm_harness_types::ToolError::Aborted)
+                }
+            }
+        })
+    }
+}
+
+/// When cancellation fires during step execution, the engine must surface
+/// `StepAborted` (or the Cancelled short-circuit) — NOT `StepFailed`. This
+/// guards the invariant that the new `AgentEvent::Error` arm must not capture
+/// `AgentEvent::Error(AgentError::Aborted)`.
+#[tokio::test]
+async fn workflow_engine_cancel_preserves_step_aborted_not_failed() {
+    // LLM calls block_until_aborted, which blocks until abort fires.
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
+        "call_1",
+        "block_until_aborted",
+        "{}",
+    )]));
+    let engine = Arc::new(
+        WorkflowEngine::new_free_task(
+            "run then block".into(),
+            vec!["block_until_aborted".into()],
+            make_config(client, "task-e2e-cancel-aborted"),
+        )
+        .unwrap()
+        .with_tool(Arc::new(BlockUntilAborted {
+            ready: ready.clone(),
+        })),
+    );
+
+    let run_handle = {
+        let e = Arc::clone(&engine);
+        tokio::spawn(async move { e.run().await })
+    };
+    // Wait until the tool is blocking on the abort token (deterministic),
+    // then cancel. This ensures cancel lands *during* tool execution, so
+    // the agent loop yields `AgentEvent::Error(Aborted)` and the runner's
+    // new Error arm is actually exercised.
+    ready.notified().await;
+
+    engine.cancel("test").await.unwrap();
+
+    let outcome = run_handle.await.expect("run task panicked");
+    // On cancel, run() returns Ok(TaskResult) via the Cancelled short-circuit
+    // (runner.rs:472), OR an Err if cancel landed before that path. Either way,
+    // it must NOT be a StepFailed stemming from the new Error arm.
+    match outcome {
+        Ok(_) => {
+            assert_eq!(
+                engine.state().await,
+                WorkflowStatus::Cancelled,
+                "cancel should produce Cancelled status, not Succeeded/Failed"
+            );
+        }
+        Err(e) => {
+            assert!(
+                matches!(e, WorkflowError::StepAborted { .. }),
+                "cancel must surface StepAborted, got: {e:?}"
+            );
+        }
+    }
 }
