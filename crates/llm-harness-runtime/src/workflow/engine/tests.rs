@@ -194,6 +194,106 @@ fn step_history_summary_uses_longer_output_preview() {
     );
 }
 
+#[test]
+fn step_history_summary_transition_uses_serde_not_debug() {
+    // Issue #68 fix 2: transition should be serialized as JSON, not Debug format.
+    let record = completed_record("s1", "done", Transition::To("s2".into()));
+    let summary = format_step_history_summary(&[record]);
+    // serde produces {"to":"s2"}, not To("s2") from Debug
+    assert!(
+        summary.contains(r#"{"to":"s2"}"#),
+        "transition should use serde JSON format, got: {summary}"
+    );
+    assert!(
+        !summary.contains(r#"To("s2")"#),
+        "transition should not use Debug format, got: {summary}"
+    );
+}
+
+#[test]
+fn step_history_summary_truncation_metadata() {
+    // Issue #68 fix 3: truncation should report how many chars were cut.
+    let output = "y".repeat(1500);
+    let record = completed_record("big", &output, Transition::To("next".into()));
+    let summary = format_step_history_summary(&[record]);
+    assert!(
+        summary.contains("... (truncated "),
+        "truncated output should include metadata, got: {summary}"
+    );
+    assert!(
+        summary.contains(" chars)"),
+        "truncation metadata should end with 'chars)', got: {summary}"
+    );
+}
+
+#[test]
+fn step_history_summary_no_result_includes_timing() {
+    // Issue #68 fix 4: (no result) records should include started_at/ended_at.
+    let now = chrono::Utc::now();
+    let record = StepRecord {
+        step_id: "retry_step".into(),
+        started_at: now,
+        ended_at: now,
+        result: None,
+        transition: Transition::Retry,
+    };
+    let summary = format_step_history_summary(&[record]);
+    assert!(
+        summary.contains("(no result)"),
+        "should still show (no result), got: {summary}"
+    );
+    // Should include time hints (HH:MM:SS format from both timestamps)
+    assert!(
+        summary.contains(now.format("%H:%M:%S").to_string().as_str()),
+        "should include timing info, got: {summary}"
+    );
+    // Transition should be serde-serialized as "retry"
+    assert!(
+        summary.contains("\"retry\""),
+        "transition should be serde format, got: {summary}"
+    );
+}
+
+#[test]
+fn step_history_summary_total_budget_drops_oldest() {
+    // Issue #68 fix 1: when total exceeds budget, oldest records are dropped.
+    let mut records = Vec::new();
+    // 800 chars per step × 30 steps = ~24000 chars, exceeding the 20000 budget.
+    for i in 0..30 {
+        let output = format!("output for step {i} padding {}", "x".repeat(750));
+        records.push(completed_record(
+            &format!("step_{i}"),
+            &output,
+            Transition::To(format!("step_{}", i + 1).into()),
+        ));
+    }
+    let summary = format_step_history_summary(&records);
+    // Should indicate some steps were omitted
+    assert!(
+        summary.contains("steps omitted)"),
+        "should report omitted steps, got first 200 chars: {}",
+        &summary[..200.min(summary.len())]
+    );
+    // Most recent step should be present
+    assert!(
+        summary.contains("step_29"),
+        "most recent step should be kept, got: {summary}"
+    );
+    // Oldest step should be dropped
+    assert!(
+        !summary.contains(
+            "step_0
+"
+        ),
+        "oldest step should be dropped (not as first line)"
+    );
+}
+
+#[test]
+fn step_history_summary_empty_returns_empty() {
+    assert_eq!(format_step_history_summary(&[]), "");
+}
+
 struct BlockingTool;
 
 impl Tool for BlockingTool {
