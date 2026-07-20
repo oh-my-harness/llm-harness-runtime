@@ -457,6 +457,7 @@ impl Agent {
                 steer_rx: Some(steer_rx),
                 follow_up_rx: Some(follow_up_rx),
                 retry: None,
+                response_format: None,
             };
             (ctx, config)
         };

@@ -126,6 +126,9 @@ fn apply_next_turn_directive(
     if let Some(tools) = directive.tools {
         config.tools = tools;
     }
+    if let Some(rf) = directive.response_format {
+        config.response_format = rf;
+    }
     *active_tools = directive.active_tools;
     tools_for_turn(&config.tools, active_tools, &config.final_answer_mode).map(|_| ())
 }
@@ -240,6 +243,9 @@ fn run_loop(
             // 无条件注入：Off → Some(Off) 显式禁用（DeepSeek 注入 disabled），
             // 其他档位按 provider converter 翻译为 wire format。
             req_b = req_b.thinking(config.thinking_level);
+            if let Some(fmt) = &config.response_format {
+                req_b = req_b.response_format(fmt.clone());
+            }
             let req = req_b.build();
 
             // BeforeProviderRequestHook: allow callers to modify stream options.
@@ -752,6 +758,7 @@ mod tests {
             steer_rx: None,
             follow_up_rx: None,
             retry: None,
+            response_format: None,
         };
         (client, cfg)
     }
@@ -802,6 +809,7 @@ mod tests {
                 temperature: None,
                 tools: None,
                 active_tools: None,
+                response_format: None,
             },
         )
         .unwrap();
@@ -832,6 +840,7 @@ mod tests {
                 temperature: None,
                 tools: None,
                 active_tools: None,
+                response_format: None,
             },
         )
         .unwrap();
@@ -864,6 +873,7 @@ mod tests {
                 temperature: Some(None),
                 tools: None,
                 active_tools: None,
+                response_format: None,
             },
         )
         .unwrap();
@@ -892,11 +902,109 @@ mod tests {
                 temperature: Some(Some(0.3)),
                 tools: None,
                 active_tools: None,
+                response_format: None,
             },
         )
         .unwrap();
 
         assert_eq!(cfg.temperature, Some(0.3), "Some(Some(0.3)) must set value");
+    }
+    #[test]
+    fn directive_response_format_some_some_sets_value() {
+        let mut cfg = make_config(vec![]).1;
+        cfg.response_format = None;
+        let mut ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        let mut active = None;
+
+        apply_next_turn_directive(
+            &mut ctx,
+            &mut cfg,
+            &mut active,
+            NextTurnDirective {
+                context: None,
+                model: None,
+                thinking_level: None,
+                temperature: None,
+                tools: None,
+                active_tools: None,
+                response_format: Some(Some(crate::ResponseFormat::JsonObject)),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.response_format,
+            Some(crate::ResponseFormat::JsonObject),
+            "Some(Some(JsonObject)) must set response_format"
+        );
+    }
+
+    #[test]
+    fn directive_response_format_some_none_clears_value() {
+        let mut cfg = make_config(vec![]).1;
+        cfg.response_format = Some(crate::ResponseFormat::JsonObject);
+        let mut ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        let mut active = None;
+
+        apply_next_turn_directive(
+            &mut ctx,
+            &mut cfg,
+            &mut active,
+            NextTurnDirective {
+                context: None,
+                model: None,
+                thinking_level: None,
+                temperature: None,
+                tools: None,
+                active_tools: None,
+                response_format: Some(None),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.response_format, None,
+            "Some(None) must clear response_format"
+        );
+    }
+
+    #[test]
+    fn directive_response_format_none_preserves_current() {
+        let mut cfg = make_config(vec![]).1;
+        cfg.response_format = Some(crate::ResponseFormat::JsonObject);
+        let mut ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        let mut active = None;
+
+        apply_next_turn_directive(
+            &mut ctx,
+            &mut cfg,
+            &mut active,
+            NextTurnDirective {
+                context: None,
+                model: None,
+                thinking_level: None,
+                temperature: None,
+                tools: None,
+                active_tools: None,
+                response_format: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.response_format,
+            Some(crate::ResponseFormat::JsonObject),
+            "None directive must preserve current response_format"
+        );
     }
 
     #[tokio::test]
@@ -1624,6 +1732,32 @@ mod tests {
                 Some(llm_adapter::types::Message::System(s)) if s == "You are a test assistant."
             ),
             "system prompt must be the first message sent to the provider"
+        );
+    }
+    #[tokio::test]
+    async fn response_format_threaded_to_provider_request() {
+        let (client, mut cfg) = make_config(vec![MockResponse::text("hi")]);
+        cfg.response_format = Some(crate::ResponseFormat::JsonObject);
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let _events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        let captured = client.captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 1, "provider should be called exactly once");
+        assert_eq!(
+            captured[0].response_format(),
+            Some(&crate::ResponseFormat::JsonObject),
+            "response_format must be threaded to the ChatRequest sent to the provider"
         );
     }
 }

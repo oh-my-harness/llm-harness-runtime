@@ -1,8 +1,9 @@
 mod config;
 mod event;
+mod json_parse;
 mod prompt_context;
 mod runner;
-mod submit_tool;
+mod structured;
 
 #[cfg(test)]
 mod tests;
@@ -10,7 +11,6 @@ mod tests;
 pub use config::{BuilderCustomize, WorkflowEngineConfig};
 use event::{EVENT_CHANNEL_CAPACITY, step_progress_from};
 pub use event::{StepProgress, WorkflowEvent};
-use submit_tool::SubmitStepResultTool;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -19,9 +19,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use llm_harness_agent::{AgentHarnessEvent, HarnessHooks, Plugin, Session};
-use llm_harness_types::{
-    AgentError, AgentEvent, SPAWN_AGENT_TOOL_NAME, SUBMIT_STEP_RESULT_TOOL_NAME, Tool,
-};
+use llm_harness_types::{AgentError, AgentEvent, SPAWN_AGENT_TOOL_NAME, Tool};
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -35,8 +33,8 @@ use crate::workflow::error::WorkflowError;
 use crate::workflow::executor::{ExecutorCtx, StepExecutor, builtin_executors};
 use crate::workflow::judge::{EdgeConditionJudge, NoopJudge, StepCtx, StepTransitionJudge};
 use crate::workflow::model::{
-    EdgeCondition, Step, StepId, StepRecord, StepResult, Transition, Workflow, WorkflowContext,
-    WorkflowState, WorkflowStatus,
+    EdgeCondition, Step, StepId, StepRecord, StepResult, StructuredStatus, Transition, Workflow,
+    WorkflowContext, WorkflowState, WorkflowStatus,
 };
 use crate::workflow::plan::validate_workflow;
 

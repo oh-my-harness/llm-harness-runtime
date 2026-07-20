@@ -23,6 +23,8 @@ pub struct AgentHarnessOptions {
     pub thinking_level: ThinkingLevel,
     /// Initial sampling temperature; `None` uses provider default.
     pub temperature: Option<f32>,
+    /// Optional `response_format` for structured output (e.g. `JsonObject`).
+    pub response_format: Option<llm_harness_loop::ResponseFormat>,
     /// Initial tools.
     pub tools: Vec<Arc<dyn Tool>>,
     /// Final-answer classification mode.
@@ -73,6 +75,7 @@ impl AgentHarnessOptions {
             model_info: None,
             thinking_level: ThinkingLevel::Off,
             temperature: None,
+            response_format: None,
             tools: vec![],
             final_answer_mode: FinalAnswerMode::default(),
             system_prompt: None,

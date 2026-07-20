@@ -113,6 +113,7 @@ impl AgentHarness {
             model,
             thinking_level,
             temperature,
+            response_format,
             active_tools,
             final_answer_mode,
             max_tokens,
@@ -125,6 +126,7 @@ impl AgentHarness {
                 st.model.clone(),
                 st.thinking_level,
                 st.temperature,
+                st.response_format.clone(),
                 st.active_tools.clone(),
                 st.final_answer_mode.clone(),
                 inner.max_tokens,
@@ -211,6 +213,7 @@ impl AgentHarness {
             steer_rx: Some(steer_rx),
             follow_up_rx: Some(follow_up_rx),
             retry,
+            response_format,
         }
     }
 

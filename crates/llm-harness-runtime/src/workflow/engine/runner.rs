@@ -1,4 +1,7 @@
 use super::*;
+use crate::workflow::engine::structured::{
+    DEFAULT_MAX_UPGRADE_ATTEMPTS, StructuredOutputCoordinator,
+};
 
 // ── 自由函数 ─────────────────────────────────────────────────────────────
 
@@ -31,6 +34,37 @@ pub(super) fn aggregate_cost(history: &[StepRecord]) -> CostAggregate {
 /// 语义：只计 result: Some 的记录（正常完成的 step），Retry 和 cancel 不计。
 pub(super) fn count_executed_turns(history: &[StepRecord]) -> u32 {
     history.iter().filter(|r| r.result.is_some()).count() as u32
+}
+
+/// BeforeRunHook：在 system prompt 末尾追加结构化输出约束（Layer 1）。
+///
+/// 经 `BeforeRunCtx.system_prompt` 追加，保留 customize_builder 已设的 system prompt。
+fn structured_prompt_hook(segment: &'static str) -> Arc<dyn llm_harness_types::BeforeRunHook> {
+    Arc::new(StructuredPromptHook { segment })
+}
+
+/// 配合 [`structured_prompt_hook`]：把结构化输出约束追加到 system prompt。
+struct StructuredPromptHook {
+    segment: &'static str,
+}
+
+impl llm_harness_types::BeforeRunHook for StructuredPromptHook {
+    fn before_run<'a>(
+        &'a self,
+        ctx: llm_harness_types::BeforeRunCtx<'a>,
+    ) -> futures::future::BoxFuture<
+        'a,
+        std::result::Result<llm_harness_types::BeforeRunResult, llm_harness_types::AgentError>,
+    > {
+        Box::pin(async move {
+            let existing = ctx.system_prompt.take().unwrap_or_default();
+            *ctx.system_prompt = Some(format!("{existing}{seg}", seg = self.segment));
+            Ok(llm_harness_types::BeforeRunResult {
+                additional_messages: vec![],
+                system_prompt: None,
+            })
+        })
+    }
 }
 
 // ── impl WorkflowEngine ─────────────────────────────────────────────────
@@ -771,6 +805,7 @@ impl super::WorkflowEngine {
         let Step::Llm {
             prompt,
             allowed_tools,
+            structured,
             ..
         } = step
         else {
@@ -808,8 +843,8 @@ impl super::WorkflowEngine {
             builder = builder.install(plugin.as_ref());
         }
 
-        // d. 注册 extra tools + 异步 spawn tool 组（若该步允许）+ SubmitStepResultTool。
-        //    收集所有注入的 tool 名（extra_tools + submit_step_result），
+        // d. 注册 extra tools + 异步 spawn tool 组（若该步允许）。
+        //    收集所有注入的 tool 名（extra_tools + spawn 相关），
         //    传给 gate 让其不被过滤。
         let mut injected_tool_names: HashSet<String> = HashSet::new();
         for tool in &self.extra_tools {
@@ -853,7 +888,9 @@ impl super::WorkflowEngine {
             builder = builder.tool(Arc::new(crate::spawn::tools::AbortSubagentTool::new(
                 bus.clone(),
             )));
-            builder = builder.should_stop_hook(async_hook.clone());
+            // AsyncSpawnHook 注册为 after_turn（drain sub-agent 消息），
+            // 不再注册为 should_stop——避免 OR 语义压制 coordinator 升级。
+            // 实际注册在下方 hook_state.after_turn.push 处。
             // AsyncSpawnHook 注入 CustomMessage{type:"sub_agent_message"}，
             // 需注册 converter 否则 agent loop 报错。
             builder = builder.convert_to_llm(Some(Arc::new(
@@ -865,14 +902,22 @@ impl super::WorkflowEngine {
         } else {
             None
         };
-        // 每步注入 SubmitStepResultTool，让 step agent 能提交结构化结果。
-        let (submit_tool, structured_rx) = SubmitStepResultTool::new();
-        injected_tool_names.insert(SUBMIT_STEP_RESULT_TOOL_NAME.to_string());
-        builder = builder.tool(Arc::new(submit_tool));
+
+        let structured_coordinator: Option<StructuredOutputCoordinator> = match *structured {
+            Some(true) => {
+                let supports_json_schema = self.config.client.capabilities().supports_json_schema();
+                Some(StructuredOutputCoordinator::new(
+                    supports_json_schema,
+                    DEFAULT_MAX_UPGRADE_ATTEMPTS,
+                ))
+            }
+            _ => None,
+        };
 
         // e. 注入门禁 hook（第一道 PrepareNextTurn + 第二道 BeforeToolCall）。
         //    gate 的 active_tools = step.allowed_tools ∪ injected_tool_names，
-        //    确保 submit_step_result 等内置 tool 不被门禁滤掉。
+        //    确保注入的内置 tool 不被门禁滤掉。
+
         let state_arc = self.workflow_state.clone();
         let step_tools: HashMap<StepId, Vec<String>> = self.step_tools_cache.clone();
         let injected_vec: Vec<String> = injected_tool_names.iter().cloned().collect();
@@ -887,6 +932,20 @@ impl super::WorkflowEngine {
         let mut hook_state = HarnessHooks::none();
         hook_state.prepare_next_turn.push(gate_hook);
         hook_state.before_tool_call.push(approval_hook);
+        if let Some((ref async_hook, _)) = post_build_spawn_setup {
+            hook_state.after_turn.push(async_hook.clone());
+        }
+        if let Some(ref coord) = structured_coordinator {
+            // Layer 1：BeforeRunHook 在 system prompt 追加结构化输出约束。
+            hook_state
+                .before_run
+                .push(structured_prompt_hook(coord.system_prompt_segment()));
+            // Layer 2/3：should_stop 提取 JSON / prepare_next_turn 注入 response_format。
+            hook_state.should_stop.push(coord.should_stop_hook());
+            hook_state
+                .prepare_next_turn
+                .push(coord.prepare_next_turn_hook());
+        }
         builder = builder.hooks(hook_state);
 
         // f. build + set_abort_token + prompt。
@@ -1065,13 +1124,21 @@ impl super::WorkflowEngine {
         }
         let cost = harness.usage();
         let ended_at = chrono::Utc::now();
-        // 从 SubmitStepResultTool 读取结构化结果。
-        let structured = structured_rx.lock().await.take();
+        // 从 coordinator 取结构化结果（若有）。先读 status 再 take_structured：
+        // take 会把状态重置为 Idle，之后 status() 误报 Failed。
+        let (structured, structured_status) = if let Some(ref coord) = structured_coordinator {
+            let status = coord.status();
+            let value = coord.take_structured();
+            (value, status)
+        } else {
+            (None, StructuredStatus::NotRequired)
+        };
         let output = final_answer_output.unwrap_or(text_delta_output);
 
         Ok(StepResult {
             output,
             structured,
+            structured_status,
             tool_calls_count,
             session_id,
             cost,

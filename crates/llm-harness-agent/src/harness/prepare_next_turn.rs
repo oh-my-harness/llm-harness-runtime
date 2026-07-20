@@ -21,13 +21,14 @@ impl PrepareNextTurnHook for DefaultPrepareNextTurn {
     ) -> futures::future::BoxFuture<'a, Result<NextTurnDirective, AgentError>> {
         Box::pin(async move {
             // Short lock: read current config, then release immediately.
-            let (model, thinking_level, temperature, tools, active_tools) = {
+            let (model, thinking_level, temperature, response_format, tools, active_tools) = {
                 let g = self.inner.lock().unwrap();
                 let st = &g.state;
                 (
                     st.model.clone(),
                     st.thinking_level,
                     st.temperature,
+                    st.response_format.clone(),
                     st.tools.clone(),
                     st.active_tools.clone(),
                 )
@@ -40,6 +41,7 @@ impl PrepareNextTurnHook for DefaultPrepareNextTurn {
                 temperature: Some(temperature),
                 tools: Some(tools),
                 active_tools,
+                response_format: Some(response_format),
             };
 
             // Chain user-provided hook: its non-None fields win.
@@ -62,6 +64,9 @@ impl PrepareNextTurnHook for DefaultPrepareNextTurn {
                 }
                 if user.active_tools.is_some() {
                     directive.active_tools = user.active_tools;
+                }
+                if user.response_format.is_some() {
+                    directive.response_format = user.response_format;
                 }
             }
 

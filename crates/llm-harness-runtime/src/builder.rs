@@ -27,8 +27,8 @@ use llm_harness_agent::{
 };
 use llm_harness_loop::{ConvertToLlmHook, FinalAnswerMode, LlmClient, RetryConfig};
 use llm_harness_types::{
-    AfterProviderResponseHook, CostAggregate, ExecutionEnv, PricingProvider, ShouldStopHook,
-    StreamOptions, ThinkingLevel, Tool,
+    AfterProviderResponseHook, AfterTurnHook, CostAggregate, ExecutionEnv, PricingProvider,
+    ShouldStopHook, StreamOptions, ThinkingLevel, Tool,
 };
 
 use crate::control::{
@@ -137,6 +137,8 @@ pub struct HarnessBuilder {
     thinking_level: Option<ThinkingLevel>,
     /// Initial sampling temperature.
     temperature: Option<f32>,
+    /// Optional `response_format` for structured output (e.g. `JsonObject`).
+    response_format: Option<llm_harness_loop::ResponseFormat>,
     /// Optional model metadata (context_window, etc.).
     model_info: Option<ModelInfo>,
     /// Retry config for transient provider errors.
@@ -185,6 +187,7 @@ impl HarnessBuilder {
             system_prompt: None,
             thinking_level: None,
             temperature: None,
+            response_format: None,
             model_info: None,
             retry: None,
             final_answer_mode: None,
@@ -253,6 +256,16 @@ impl HarnessBuilder {
     /// registration order does not affect correctness (every hook always runs).
     pub fn should_stop_hook(mut self, hook: Arc<dyn ShouldStopHook>) -> Self {
         self.hooks.should_stop.push(hook);
+        self
+    }
+
+    /// Register an `AfterTurnHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.after_turn`. Call multiple times to
+    /// compose multiple hooks — `CompositeAfterTurnHook` is all-execute, so
+    /// registration order does not affect correctness (every hook always runs).
+    pub fn after_turn_hook(mut self, hook: Arc<dyn AfterTurnHook>) -> Self {
+        self.hooks.after_turn.push(hook);
         self
     }
 
@@ -364,6 +377,12 @@ impl HarnessBuilder {
     /// Set the initial sampling temperature. `None` resets to provider default.
     pub fn temperature(mut self, temp: Option<f32>) -> Self {
         self.temperature = temp;
+        self
+    }
+
+    /// Set the `response_format` for structured output. `None` resets to default.
+    pub fn response_format(mut self, fmt: Option<llm_harness_loop::ResponseFormat>) -> Self {
+        self.response_format = fmt;
         self
     }
 
@@ -610,6 +629,9 @@ impl HarnessBuilder {
         }
         if let Some(temp) = self.temperature {
             opts.temperature = Some(temp);
+        }
+        if let Some(ref fmt) = self.response_format {
+            opts.response_format = Some(fmt.clone());
         }
         if let Some(ref info) = self.model_info {
             opts.model_info = Some(info.clone());
@@ -1134,6 +1156,7 @@ mod tests {
             .final_answer_mode(FinalAnswerMode::default())
             .convert_to_llm(None)
             .stream_options(Some(StreamOptions::default()))
+            .response_format(Some(llm_harness_loop::ResponseFormat::JsonObject))
             .compaction_reserve_tokens(Some(1024))
             .compaction_keep_recent_tokens(Some(2048))
             .queue_capacity(Some(64));
@@ -1171,6 +1194,44 @@ mod tests {
             .temperature(None)
             .build_options(None);
         assert_eq!(opts.temperature, None);
+    }
+
+    #[test]
+    fn build_options_applies_response_format() {
+        use llm_harness_loop::ResponseFormat;
+        let opts = HarnessBuilder::new("m")
+            .response_format(Some(ResponseFormat::JsonObject))
+            .build_options(None);
+        assert_eq!(
+            opts.response_format,
+            Some(ResponseFormat::JsonObject),
+            "response_format setter must propagate to opts"
+        );
+    }
+
+    #[test]
+    fn build_options_response_format_none_is_default() {
+        use llm_harness_loop::ResponseFormat;
+        let opts = HarnessBuilder::new("m").build_options(None);
+        assert_eq!(
+            opts.response_format, None,
+            "default response_format is None"
+        );
+        // Confirm type is the loop re-export, not some local alias.
+        let _: Option<ResponseFormat> = opts.response_format;
+    }
+
+    #[test]
+    fn build_options_response_format_none_resets() {
+        use llm_harness_loop::ResponseFormat;
+        let opts = HarnessBuilder::new("m")
+            .response_format(Some(ResponseFormat::JsonObject))
+            .response_format(None)
+            .build_options(None);
+        assert_eq!(
+            opts.response_format, None,
+            "calling response_format(None) must reset to None"
+        );
     }
 
     #[test]
@@ -1252,6 +1313,7 @@ mod tests {
         assert_eq!(opts.system_prompt, None);
         assert_eq!(opts.thinking_level, ThinkingLevel::Off);
         assert_eq!(opts.temperature, None);
+        assert_eq!(opts.response_format, None);
         assert!(opts.model_info.is_none());
         assert!(opts.retry.is_none());
         assert_eq!(opts.final_answer_mode, FinalAnswerMode::default());

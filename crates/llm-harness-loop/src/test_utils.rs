@@ -210,6 +210,38 @@ impl MockResponse {
         }
     }
 
+    /// Like [`MockResponse::tool_use`] but terminates with `EndTurn` instead of
+    /// `ToolUse`. Used to simulate Anthropic-style providers that return a
+    /// `structured_result` tool_use block as a terminal structured output
+    /// (no tool execution expected).
+    pub fn tool_use_end_turn(tool_use_id: &str, tool_name: &str, args_json: &str) -> Self {
+        let id = tool_use_id.to_owned();
+        let name = tool_name.to_owned();
+        let args = args_json.to_owned();
+        Self {
+            model: "mock-model".into(),
+            stream_error: None,
+            events: vec![
+                Ok(StreamEvent::ContentStart {
+                    index: 0,
+                    kind: llm_adapter::types::ContentKind::ToolInvocation { id, name },
+                }),
+                Ok(StreamEvent::ToolDelta {
+                    index: 0,
+                    arguments: args,
+                }),
+                Ok(StreamEvent::ContentStop {
+                    index: 0,
+                    signature: None,
+                }),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                }),
+            ],
+        }
+    }
+
     /// Preset that causes `chat_stream` to return a `RateLimit` error.
     pub fn rate_limit_error() -> Self {
         Self {
@@ -254,8 +286,10 @@ pub struct MockLlmClient {
     pub call_count: Arc<std::sync::atomic::AtomicUsize>,
     /// All `ChatRequest` values passed to `chat_stream`, captured for test assertions.
     pub captured_requests: Mutex<Vec<ChatRequest>>,
+    /// Capabilities reported by [`Provider::capabilities`]. Defaults to all-false;
+    /// override via [`MockLlmClient::with_capabilities`].
+    capabilities: ProviderCapabilities,
 }
-
 impl MockLlmClient {
     /// Create from a list of preset responses.
     pub fn new(responses: Vec<MockResponse>) -> Self {
@@ -263,6 +297,7 @@ impl MockLlmClient {
             responses: Mutex::new(responses),
             call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             captured_requests: Mutex::new(Vec::new()),
+            capabilities: ProviderCapabilities::new(false, false, false),
         }
     }
 
@@ -270,12 +305,20 @@ impl MockLlmClient {
     pub fn with_single(r: MockResponse) -> Self {
         Self::new(vec![r])
     }
+
+    /// Set the capabilities this mock reports (e.g. `supports_json_schema`).
+    /// Returns `self` for chaining. Used by integration tests that need the
+    /// structured-output upgrade path to engage.
+    pub fn with_capabilities(mut self, caps: ProviderCapabilities) -> Self {
+        self.capabilities = caps;
+        self
+    }
 }
 
 #[async_trait]
 impl Provider for MockLlmClient {
     fn capabilities(&self) -> ProviderCapabilities {
-        ProviderCapabilities::new(false, false, false)
+        self.capabilities.clone()
     }
 
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {

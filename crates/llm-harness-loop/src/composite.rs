@@ -300,6 +300,7 @@ impl PrepareNextTurnHook for CompositePrepareNextTurnHook {
                 temperature: None,
                 tools: None,
                 active_tools: None,
+                response_format: None,
             };
 
             for hook in &self.hooks {
@@ -327,6 +328,9 @@ impl PrepareNextTurnHook for CompositePrepareNextTurnHook {
                 }
                 if result.active_tools.is_some() {
                     directive.active_tools = result.active_tools;
+                }
+                if result.response_format.is_some() {
+                    directive.response_format = result.response_format;
                 }
             }
 
@@ -478,6 +482,79 @@ mod tests {
         fn _accept(_: &dyn PrepareNextTurnHook) {}
         let composite = CompositePrepareNextTurnHook::new(vec![]);
         _accept(&composite);
+    }
+    #[tokio::test]
+    async fn composite_prepare_next_turn_merges_response_format_last_wins() {
+        use crate::ResponseFormat;
+        use llm_harness_types::{
+            AgentError, ContentBlock, NextTurnDirective, ToolError, ToolResult,
+        };
+
+        struct StaticHook(Option<Option<ResponseFormat>>);
+        impl PrepareNextTurnHook for StaticHook {
+            fn prepare<'a>(
+                &'a self,
+                _ctx: PrepareNextTurnCtx<'a>,
+            ) -> BoxFuture<'a, Result<NextTurnDirective, AgentError>> {
+                let rf = self.0.clone();
+                Box::pin(async move {
+                    Ok(NextTurnDirective {
+                        context: None,
+                        model: None,
+                        thinking_level: None,
+                        temperature: None,
+                        tools: None,
+                        active_tools: None,
+                        response_format: rf,
+                    })
+                })
+            }
+        }
+
+        let assistant = crate::test_utils::test_assistant_message(vec![ContentBlock::Text {
+            text: "x".into(),
+        }]);
+        let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+        let mk_ctx = || PrepareNextTurnCtx {
+            turn_index: 0,
+            last_message: &assistant,
+            last_tool_results: &results,
+        };
+
+        // None hook leaves response_format unset; second hook sets it.
+        let composite = CompositePrepareNextTurnHook::new(vec![
+            Arc::new(StaticHook(None)),
+            Arc::new(StaticHook(Some(Some(ResponseFormat::JsonObject)))),
+        ]);
+        let d = composite.prepare(mk_ctx()).await.unwrap();
+        assert_eq!(
+            d.response_format,
+            Some(Some(ResponseFormat::JsonObject)),
+            "later hook's response_format must win"
+        );
+
+        // Later non-None overrides earlier non-None.
+        let composite = CompositePrepareNextTurnHook::new(vec![
+            Arc::new(StaticHook(Some(Some(ResponseFormat::JsonObject)))),
+            Arc::new(StaticHook(Some(None))),
+        ]);
+        let d = composite.prepare(mk_ctx()).await.unwrap();
+        assert_eq!(
+            d.response_format,
+            Some(None),
+            "later Some(None) must override earlier Some(Some(_))"
+        );
+
+        // All None → merged stays None.
+        let composite = CompositePrepareNextTurnHook::new(vec![
+            Arc::new(StaticHook(None)),
+            Arc::new(StaticHook(None)),
+        ]);
+        let d = composite.prepare(mk_ctx()).await.unwrap();
+        assert_eq!(
+            d.response_format, None,
+            "all-None hooks must leave response_format as None"
+        );
     }
 
     #[test]

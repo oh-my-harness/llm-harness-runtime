@@ -65,6 +65,7 @@ impl StepExecutor for FixedExecutor {
                     "previous_output": prev.output,
                     "history_len": ctx.step_history.len(),
                 })),
+                structured_status: StructuredStatus::NotRequired,
                 tool_calls_count: 0,
                 session_id: String::new(),
                 cost: CostAggregate::default(),
@@ -82,6 +83,7 @@ impl StepExecutor for StructuredExecutor {
             Ok(StepResult {
                 output: "structured ok".into(),
                 structured: Some(serde_json::json!({"status": "ok"})),
+                structured_status: StructuredStatus::NotRequired,
                 tool_calls_count: 0,
                 session_id: String::new(),
                 cost: CostAggregate::default(),
@@ -113,6 +115,7 @@ impl StepExecutor for FlakyExecutor {
             Ok(StepResult {
                 output: format!("ok on attempt {attempt}"),
                 structured: Some(serde_json::json!({ "attempt": attempt })),
+                structured_status: StructuredStatus::NotRequired,
                 tool_calls_count: 0,
                 session_id: String::new(),
                 cost: CostAggregate::default(),
@@ -127,6 +130,7 @@ fn completed_result(output: &str) -> StepResult {
     StepResult {
         output: output.into(),
         structured: None,
+        structured_status: StructuredStatus::NotRequired,
         tool_calls_count: 0,
         session_id: format!("session-{output}"),
         cost: CostAggregate::default(),
@@ -214,6 +218,41 @@ impl Tool for BlockingTool {
         Box::pin(async move {
             ctx.abort.cancelled().await;
             Err(ToolError::Aborted)
+        })
+    }
+}
+
+/// A trivial tool that returns a text result immediately. Used by tests that
+/// need a real tool-call event sequence without the now-removed submit tool.
+struct EchoTool;
+
+impl Tool for EchoTool {
+    fn name(&self) -> &str {
+        "echo"
+    }
+
+    fn description(&self) -> &str {
+        "echoes back a fixed message"
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| serde_json::json!({}));
+        &SCHEMA
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolError>> {
+        Box::pin(async move {
+            Ok(ToolResult {
+                content: vec![ContentBlock::Text {
+                    text: "echo".into(),
+                }],
+                details: serde_json::json!({}),
+                terminate: false,
+            })
         })
     }
 }
@@ -561,129 +600,6 @@ async fn multi_step_linear_workflow() {
     assert_eq!(result.turns, 2); // 2 步历史
 }
 
-/// Regression: when the model calls `submit_step_result`, the loop must
-/// terminate immediately and NOT issue a follow-up LLM call. Before the
-/// `terminate: true` fix, the model would emit a plain-text EndTurn after
-/// submitting, which downstream `NonEmptyResponseHook` agents mis-flagged
-/// as an empty response and retried until giving up.
-#[tokio::test]
-async fn submit_step_result_terminates_without_extra_llm_call() {
-    let dir = tempfile::TempDir::new().unwrap();
-    // Single preset: the model calls submit_step_result with a result.
-    // If the loop wrongly continues, the mock falls back to a text
-    // EndTurn — we detect that via call_count > 1.
-    let client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
-        "tu-1",
-        SUBMIT_STEP_RESULT_TOOL_NAME,
-        r#"{"result":{"passed":true}}"#,
-    )]));
-    let workflow = Workflow {
-        entry_step: "s1".into(),
-        steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
-        edges: vec![],
-    };
-    let config = WorkflowEngineConfig {
-        client: client.clone(),
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
-    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
-    let result = engine.run().await.unwrap();
-
-    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
-    // Exactly one LLM call: the submit_step_result tool call. No follow-up.
-    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
-    // Structured result captured from the submit tool.
-    let history = engine.step_history().await;
-    let structured = history[0]
-        .result
-        .as_ref()
-        .and_then(|r| r.structured.clone())
-        .expect("structured result should be captured");
-    assert_eq!(structured["passed"], serde_json::json!(true));
-    // Turns counts executed turns in history; the submit call is one turn.
-    assert_eq!(result.turns, 1);
-}
-/// Regression (judge-driven multi-step path): `submit_step_result` must
-/// terminate the step's agent loop immediately even in a judged workflow
-/// with outgoing edges. Before the `terminate: true` fix, the model would
-/// emit a follow-up plain-text EndTurn after submitting, inflating the
-/// LLM call count and risking downstream `NonEmptyResponseHook` retries.
-/// Unlike the free-task test above, this exercises the `decide_transition`
-/// → judge → `Transition::To` path rather than the free-task Abort shortcut.
-#[tokio::test]
-async fn submit_step_result_terminates_in_judged_multi_step_workflow() {
-    let dir = tempfile::TempDir::new().unwrap();
-    // s1: submit_step_result (tool call). s2: plain text.
-    // If the loop wrongly continues after s1's submit, the mock falls
-    // back to "(no more mock responses)" text → EndTurn, consuming an
-    // extra LLM call before the judge runs. That would make call_count 3.
-    let client = Arc::new(MockLlmClient::new(vec![
-        MockResponse::tool_use(
-            "tu-1",
-            SUBMIT_STEP_RESULT_TOOL_NAME,
-            r#"{"result":{"passed":true}}"#,
-        ),
-        MockResponse::text("step2 done"),
-    ]));
-    let workflow = Workflow {
-        entry_step: "s1".into(),
-        steps: vec![
-            Step::llm("s1", "Step 1", "do step 1", vec![]),
-            Step::llm("s2", "Step 2", "do step 2", vec![]),
-        ],
-        edges: vec![Edge {
-            from: "s1".into(),
-            to: "s2".into(),
-            condition: None,
-        }],
-    };
-    // judge: s1 → s2 → Abort.
-    struct LinearJudge;
-    impl StepTransitionJudge for LinearJudge {
-        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
-            let cur = ctx.current_step.id().clone();
-            Box::pin(async move {
-                if cur == "s1" {
-                    Transition::To("s2".into())
-                } else {
-                    Transition::Abort {
-                        reason: "done".into(),
-                    }
-                }
-            })
-        }
-    }
-    let config = WorkflowEngineConfig {
-        client: client.clone(),
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
-    let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge)).unwrap();
-    let result = engine.run().await.unwrap();
-
-    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
-    // Exactly two LLM calls: s1's submit_step_result + s2's text. No
-    // follow-up call after s1 submits (would be 3 if terminate were false).
-    assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
-    // s1's structured result captured via the submit tool.
-    let history = engine.step_history().await;
-    let s1_structured = history[0]
-        .result
-        .as_ref()
-        .and_then(|r| r.structured.clone())
-        .expect("s1 structured result should be captured");
-    assert_eq!(s1_structured["passed"], serde_json::json!(true));
-    // Both steps executed.
-    assert_eq!(result.turns, 2);
-}
-
 #[tokio::test]
 async fn noop_judge_uses_declarative_edge_conditions_by_default() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -893,7 +809,7 @@ fn step_progress_from_returns_none_for_filtered_events() {
     assert!(step_progress_from(&ev).is_none());
 }
 
-/// Integration: a free-task LLM step that calls submit_step_result should
+/// Integration: a free-task LLM step that calls a registered tool should
 /// emit StepStarted → StepProgress(ToolCallStart) → StepProgress(ToolCallEnd)
 /// → StepProgress(ToolExecutionStart) → StepProgress(ToolExecutionEnd)
 /// → StepFinished, in order.
@@ -901,13 +817,11 @@ fn step_progress_from_returns_none_for_filtered_events() {
 async fn step_progress_events_emitted_in_order() {
     let dir = tempfile::TempDir::new().unwrap();
     let client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
-        "tu-1",
-        SUBMIT_STEP_RESULT_TOOL_NAME,
-        r#"{"result":{"passed":true}}"#,
+        "tu-1", "echo", r#"{}"#,
     )]));
     let workflow = Workflow {
         entry_step: "s1".into(),
-        steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+        steps: vec![Step::llm("s1", "Step 1", "do step 1", vec!["echo".into()])],
         edges: vec![],
     };
     let config = WorkflowEngineConfig {
@@ -918,7 +832,11 @@ async fn step_progress_events_emitted_in_order() {
         session_base_dir: dir.path().join("sessions"),
         customize_builder: None,
     };
-    let engine = Arc::new(WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap());
+    let engine = Arc::new(
+        WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+            .unwrap()
+            .with_tool(Arc::new(EchoTool)),
+    );
     let mut rx = engine.subscribe();
     let engine_clone = engine.clone();
     let mut run_handle = tokio::spawn(async move { engine_clone.run().await });
@@ -1773,6 +1691,7 @@ impl StepExecutor for ContextWriter {
             Ok(StepResult {
                 output: "wrote context".into(),
                 structured: None,
+                structured_status: StructuredStatus::NotRequired,
                 tool_calls_count: 0,
                 session_id: String::new(),
                 cost: CostAggregate::default(),
@@ -1798,6 +1717,7 @@ impl StepExecutor for ContextReader {
                     "focus": focus,
                     "metro_p": metro_p,
                 })),
+                structured_status: StructuredStatus::NotRequired,
                 tool_calls_count: 0,
                 session_id: String::new(),
                 cost: CostAggregate::default(),
@@ -2103,6 +2023,7 @@ fn aggregate_cost_merges_per_model_cache_tokens() {
         result: Some(StepResult {
             output: String::new(),
             structured: None,
+            structured_status: StructuredStatus::NotRequired,
             tool_calls_count: 0,
             session_id: String::new(),
             cost: CostAggregate {
@@ -2723,5 +2644,289 @@ async fn restore_from_step_to_entry_step_clears_history() {
     assert!(
         history.is_empty(),
         "history should be fully cleared when target is entry_step"
+    );
+}
+
+// ── Structured 输出集成测试 (issue #72 Task 10) ──────────────────────────────
+//
+// 端到端验证 StructuredOutputCoordinator 接入 run_llm_step 后的行为：
+// 1. happy path：首轮合法 JSON → Ok
+// 2. 升级路径：首轮非 JSON → response_format 升级 → 二轮 JSON → Ok
+// 3. 达上限：持续非 JSON → Failed
+// 4. 未声明 structured → NotRequired
+// 5. spawn + structured 交互
+// 6. supports_json_schema=false → 直接 Failed
+//
+// 注意：升级路径/达上限需要 mock 报告 supports_json_schema=true，否则
+// 协调器在首次 should_stop 失败后直接走 Layer 3（Failed），无法验证升级。
+// Anthropic 合成工具(structured_result)提取已删除(P1-1: 无来源校验,LLM
+// 可伪造 ToolUse 绕过文本解析)。
+
+/// 构造一个 `structured: Some(true)` 的 LLM step（使用公共 `with_structured` API）。
+fn structured_llm_step(id: &str, prompt: &str) -> Step {
+    Step::llm(id, id, prompt, vec![]).with_structured(Some(true))
+}
+
+/// 报告 supports_json_schema 的 mock client（升级路径所需）。
+fn json_schema_mock(responses: Vec<MockResponse>) -> Arc<MockLlmClient> {
+    Arc::new(MockLlmClient::new(responses).with_capabilities(
+        llm_harness_loop::ProviderCapabilities::new(false, false, true),
+    ))
+}
+
+#[tokio::test]
+async fn structured_step_parses_json_on_first_try() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
+        r#"{"passed":true}"#,
+    )]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![structured_llm_step("s1", "do step 1")],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+    let _ = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+    let result = history[0].result.as_ref().unwrap();
+    assert_eq!(result.structured_status, StructuredStatus::Ok);
+    assert_eq!(result.structured.as_ref().unwrap()["passed"], true);
+    // 首轮即成功：只调用了一次 provider。
+    assert_eq!(
+        client.call_count.load(Ordering::SeqCst),
+        1,
+        "happy path should consume exactly one LLM call"
+    );
+}
+
+#[tokio::test]
+async fn non_structured_step_status_not_required() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
+        "just plain text, no JSON",
+    )]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![Step::llm("s1", "Step 1", "do", vec![])],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+    let _ = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+    let result = history[0].result.as_ref().unwrap();
+    assert_eq!(result.structured_status, StructuredStatus::NotRequired);
+    assert!(result.structured.is_none());
+    // 未声明 structured：coordinator 未挂载，不应有升级开销。
+    assert_eq!(
+        client.call_count.load(Ordering::SeqCst),
+        1,
+        "non-structured step should make exactly one LLM call"
+    );
+}
+
+#[tokio::test]
+async fn structured_step_upgrades_after_first_failure() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Turn 1: 纯文本（非 JSON）→ should_stop 失败 → 请求升级。
+    // Turn 2: 合法 JSON → should_stop 成功 → Ok。
+    let client = json_schema_mock(vec![
+        MockResponse::text("I cannot produce JSON, sorry"),
+        MockResponse::text(r#"{"passed":true}"#),
+    ]);
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![structured_llm_step("s1", "do")],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+    let _ = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+    let result = history[0].result.as_ref().unwrap();
+    assert_eq!(result.structured_status, StructuredStatus::Ok);
+    assert_eq!(result.structured.as_ref().unwrap()["passed"], true);
+    // 升级一次 → 共 2 次 provider 调用。
+    assert_eq!(
+        client.call_count.load(Ordering::SeqCst),
+        2,
+        "upgrade path should consume two LLM calls"
+    );
+    // 验证第二轮请求确实注入了 JsonObject response_format（Layer 2 生效）。
+    let captured = client.captured_requests.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    assert!(
+        captured[1].response_format().is_some(),
+        "second turn should carry an upgraded response_format"
+    );
+}
+
+#[tokio::test]
+async fn structured_step_fails_after_max_attempts() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // DEFAULT_MAX_UPGRADE_ATTEMPTS = 2 → 最多 3 轮（初始 + 2 次升级），全失败 → Failed。
+    let client = json_schema_mock(vec![
+        MockResponse::text("not json"),
+        MockResponse::text("still not json"),
+        MockResponse::text("never gonna be json"),
+    ]);
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![structured_llm_step("s1", "do")],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+    let _ = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+    let result = history[0].result.as_ref().unwrap();
+    assert_eq!(result.structured_status, StructuredStatus::Failed);
+    assert!(result.structured.is_none());
+    // DEFAULT_MAX_UPGRADE_ATTEMPTS=2 意味着 3 轮 LLM 调用：
+    // Turn 1 失败 → 请求升级；Turn 2 失败 → 升级到 Upgraded{2}；
+    // Turn 3 失败 → should_stop 发现 attempts(2) >= max(2)，直接置 Failed 并停止。
+    // 不再需要第 4 次"Failed 确认"调用。
+    assert_eq!(
+        client.call_count.load(Ordering::SeqCst),
+        3,
+        "max attempts exhausted: 3 upgrade turns, then should_stop fails fast"
+    );
+}
+
+/// #3: structured step 同时允许 spawn 工具时,coordinator 不压制 spawn 的
+/// after_turn drain,sub-agent 完成后主 agent 仍能产出合法 JSON → Ok。
+///
+/// 主 agent Turn 1 调 spawn_agent(ToolUse,stop_reason=ToolUse → tool 分支,
+/// 不调 should_stop);sub-agent 异步跑完;主 agent Turn 2 输出 JSON →
+/// coordinator should_stop 提取成功 → Ok。
+#[tokio::test]
+async fn structured_step_with_spawn_succeeds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // 预设响应：首个是 spawn_agent tool_use,后续全是合法 JSON 文本。
+    // 主 agent Turn 2 与 sub-agent 的 chat_stream 会竞争预设响应,但两者
+    // 拿到 JSON 文本都能正常处理（主 agent coordinator 解析,sub-agent
+    // EndTurn 停止）。提供充足数量避免耗尽回退到 "(no more mock responses)"。
+    let mut responses = vec![MockResponse::tool_use(
+        "call_1",
+        "spawn_agent",
+        r#"{"prompt":"compute sub-task"}"#,
+    )];
+    for _ in 0..8 {
+        responses.push(MockResponse::text(r#"{"spawned":true}"#));
+    }
+    let client = json_schema_mock(responses);
+    let mut step = Step::llm(
+        "s1",
+        "s1",
+        "spawn a sub-agent then output JSON",
+        vec!["spawn_agent".into()],
+    );
+    if let Step::Llm { structured, .. } = &mut step {
+        *structured = Some(true);
+    }
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![step],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+    let _ = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+    let result = history[0].result.as_ref().unwrap();
+    assert_eq!(
+        result.structured_status,
+        StructuredStatus::Ok,
+        "structured + spawn: coordinator must extract JSON after sub-agent completes"
+    );
+    let structured = result
+        .structured
+        .as_ref()
+        .expect("structured value present");
+    assert_eq!(structured["spawned"], true);
+    // 主 agent 至少 2 次调用（spawn turn + JSON turn）,sub-agent 至少 1 次。
+    assert!(
+        client.call_count.load(Ordering::SeqCst) >= 3,
+        "expected >=3 LLM calls (main spawn + main json + sub-agent), got {}",
+        client.call_count.load(Ordering::SeqCst)
+    );
+}
+
+/// #6: provider 不支持 JsonObject 时,coordinator 首次失败后不注入 response_format,
+/// 直接走 Layer 3（Failed）。覆盖 supports_json_schema=false 的端到端路径。
+#[tokio::test]
+async fn structured_step_fails_when_provider_lacks_json_schema() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // supports_json_schema=false 的 mock（默认 capabilities 全 false）。
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("not json"),
+        MockResponse::text("still not json"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![structured_llm_step("s1", "do")],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+    let _ = engine.run().await.unwrap();
+    let history = engine.step_history().await;
+    let result = history[0].result.as_ref().unwrap();
+    assert_eq!(result.structured_status, StructuredStatus::Failed);
+    assert!(result.structured.is_none());
+    // supports=false：Turn 1 失败 → UpgradeRequested{0} → prepare(!supports → Failed)；
+    // Turn 2 should_stop 看到 Failed → true。共 2 次调用,且第二轮不应注入 response_format。
+    assert_eq!(
+        client.call_count.load(Ordering::SeqCst),
+        2,
+        "supports=false: 1 failure turn + 1 Failed-confirmation turn"
+    );
+    let captured = client.captured_requests.lock().unwrap();
+    assert!(
+        captured.iter().all(|r| r.response_format().is_none()),
+        "supports=false: no turn should carry response_format"
     );
 }

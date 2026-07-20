@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::control::cost::CostAggregate;
-use crate::workflow::model::{Step, StepRecord, StepResult, WorkflowContext};
+use crate::workflow::model::{Step, StepRecord, StepResult, StructuredStatus, WorkflowContext};
 use anyhow::Result;
 
 pub const JSON_TRANSFORM_EXECUTOR_NAME: &str = "json_transform";
@@ -101,6 +101,7 @@ impl StepExecutor for JsonTransformExecutor {
             Ok(StepResult {
                 output,
                 structured: Some(transformed),
+                structured_status: StructuredStatus::NotRequired,
                 tool_calls_count: 0,
                 session_id: String::new(),
                 cost: CostAggregate::default(),
@@ -218,6 +219,7 @@ impl StepExecutor for ShellExecutor {
             Ok(StepResult {
                 output: serde_json::to_string(&structured)?,
                 structured: Some(structured),
+                structured_status: StructuredStatus::NotRequired,
                 tool_calls_count: 0,
                 session_id: String::new(),
                 cost: CostAggregate::default(),
@@ -438,6 +440,7 @@ impl StepExecutor for HttpCallExecutor {
                 return Ok(StepResult {
                     output: serde_json::to_string(&structured)?,
                     structured: Some(structured),
+                    structured_status: StructuredStatus::NotRequired,
                     tool_calls_count: 0,
                     session_id: String::new(),
                     cost: CostAggregate::default(),
@@ -1208,11 +1211,11 @@ mod tests {
     fn http_step(config: Value) -> Step {
         Step::executor("http", "HTTP", HTTP_CALL_EXECUTOR_NAME, Some(config))
     }
-
     fn prev_result(structured: Option<Value>, output: impl Into<String>) -> StepResult {
         StepResult {
             output: output.into(),
             structured,
+            structured_status: StructuredStatus::NotRequired,
             tool_calls_count: 0,
             session_id: "prev".into(),
             cost: CostAggregate::default(),

@@ -107,6 +107,7 @@ impl AgentHarness {
             model_info: opts.model_info,
             thinking_level: opts.thinking_level,
             temperature: opts.temperature,
+            response_format: opts.response_format,
             tools: opts.tools,
             active_tools: None,
             final_answer_mode: opts.final_answer_mode,

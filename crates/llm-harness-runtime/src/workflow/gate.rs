@@ -18,12 +18,12 @@ use crate::workflow::model::{StepId, WorkflowState};
 /// 第一道闸：按当前步收窄工具集。实现 `PrepareNextTurnHook`。
 ///
 /// 每 turn 前，读 `engine_state.current_step`，把 harness 工具集收窄到
-/// 该步 `allowed_tools` ∪ `extra_tool_names`（引擎内置 tool 如 submit_step_result）。
+/// 该步 `allowed_tools` ∪ `extra_tool_names`（引擎注入的内置 tool 如 spawn_agent）。
 /// 空 Vec = 不允许任何工具。
 pub struct WorkflowGateHook {
     engine_state: Arc<Mutex<WorkflowState>>,
     step_tools: HashMap<StepId, Vec<String>>,
-    /// 引擎每步注入的内置 tool 名（如 submit_step_result），不受 step.allowed_tools 限制。
+    /// 引擎每步注入的内置 tool 名（如 spawn_agent），不受 step.allowed_tools 限制。
     extra_tool_names: HashSet<String>,
 }
 
@@ -64,6 +64,7 @@ impl PrepareNextTurnHook for WorkflowGateHook {
                 temperature: None,
                 tools: None,
                 active_tools: Some(active),
+                response_format: None,
             };
             Ok(directive)
         })
@@ -71,9 +72,8 @@ impl PrepareNextTurnHook for WorkflowGateHook {
 }
 
 /// 构建第二道闸（越界兜底）的 `RuleBasedApprovalHook`。
-/// 规则：`tool_name ∈ (allowed_tools ∪ injected_tool_names) → Allow, fallback Deny`。
-/// `injected_tool_names` 是引擎每步注入的内置 tool（如 submit_step_result），
-/// 不受 step.allowed_tools 限制但必须放行，否则 step agent 无法提交结果。
+/// `injected_tool_names` 是引擎每步注入的内置 tool（如 spawn_agent），
+/// 不受 step.allowed_tools 限制但必须放行，否则 step agent 无法调用。
 pub(crate) fn build_gate_approval_hook(
     allowed_tools: &[String],
     injected_tool_names: &[String],
@@ -155,11 +155,11 @@ mod tests {
 
     #[tokio::test]
     async fn gate_unions_extra_tool_names() {
-        // extra_tool_names（如 submit_step_result）始终在 active_tools 里，不受 allowed_tools 限制。
+        // extra_tool_names（如 spawn_agent）始终在 active_tools 里，不受 allowed_tools 限制。
         let state = Arc::new(Mutex::new(WorkflowState::new("s1".into())));
         let mut tools = HashMap::new();
         tools.insert("s1".to_string(), vec!["tool_a".into()]);
-        let extra: HashSet<String> = ["submit_step_result".into()].into_iter().collect();
+        let extra: HashSet<String> = ["spawn_agent".into()].into_iter().collect();
         let hook = WorkflowGateHook::new(state, tools, extra);
         let msg = make_empty_msg();
         let ctx = PrepareNextTurnCtx {
@@ -170,7 +170,7 @@ mod tests {
         let d = hook.prepare(ctx).await.unwrap();
         let set = d.active_tools.unwrap();
         assert!(set.contains("tool_a"));
-        assert!(set.contains("submit_step_result"));
+        assert!(set.contains("spawn_agent"));
     }
 
     fn make_empty_msg() -> llm_harness_types::AssistantMessage {

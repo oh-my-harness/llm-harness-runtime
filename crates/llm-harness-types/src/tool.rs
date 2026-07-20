@@ -44,7 +44,6 @@ pub enum ToolLevel {
 pub const FINAL_ANSWER_TOOL_NAME: &str = "final_answer";
 pub const WAIT_FOR_EXTERNAL_EVENT_TOOL_NAME: &str = "wait_for_external_event";
 pub const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
-pub const SUBMIT_STEP_RESULT_TOOL_NAME: &str = "submit_step_result";
 pub const SUBMIT_WORKFLOW_TOOL_NAME: &str = "submit_workflow";
 pub const SKILL_READ_TOOL_NAME: &str = "skill_read";
 
@@ -60,7 +59,6 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     FINAL_ANSWER_TOOL_NAME,
     WAIT_FOR_EXTERNAL_EVENT_TOOL_NAME,
     SPAWN_AGENT_TOOL_NAME,
-    SUBMIT_STEP_RESULT_TOOL_NAME,
     SUBMIT_WORKFLOW_TOOL_NAME,
     SKILL_READ_TOOL_NAME,
     MESSAGE_SUBAGENT_TOOL_NAME,

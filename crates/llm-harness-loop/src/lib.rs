@@ -19,7 +19,7 @@ pub(crate) mod stream_state;
 
 mod type_bridge;
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
 // Top-level re-exports
@@ -52,6 +52,7 @@ pub use llm_adapter::types::ChatRequest;
 pub use llm_adapter::types::ChatResponse;
 pub use llm_adapter::types::Message as LlmMessage;
 pub use llm_adapter::types::RequestContent;
+pub use llm_adapter::types::ResponseFormat;
 pub use llm_adapter::types::StreamEvent as AdapterStreamEvent;
 
 #[cfg(test)]

@@ -120,7 +120,7 @@ async fn async_delivery_running_period_sub_completes_during_loop() {
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
-        .should_stop_hook(async_hook.clone())
+        .after_turn_hook(async_hook.clone())
         .convert_to_llm(Some(Arc::new(
             DefaultConvertToLlm::new().with_custom_converter(Arc::new(SubAgentMessageConverter)),
         )))
@@ -226,7 +226,7 @@ async fn async_delivery_idle_period_watcher_wakes_main() {
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
-        .should_stop_hook(async_hook.clone())
+        .after_turn_hook(async_hook.clone())
         .convert_to_llm(Some(Arc::new(
             DefaultConvertToLlm::new().with_custom_converter(Arc::new(SubAgentMessageConverter)),
         )))
@@ -368,7 +368,7 @@ async fn continue_run_idle_path_no_wasted_llm_call() {
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
-        .should_stop_hook(async_hook.clone())
+        .after_turn_hook(async_hook.clone())
         .convert_to_llm(Some(Arc::new(
             DefaultConvertToLlm::new().with_custom_converter(Arc::new(SubAgentMessageConverter)),
         )))

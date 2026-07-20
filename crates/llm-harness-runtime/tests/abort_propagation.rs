@@ -118,7 +118,7 @@ async fn abort_cancels_inflight_subagent() {
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
-        .should_stop_hook(async_hook.clone())
+        .after_turn_hook(async_hook.clone())
         .build(env.clone())
         .await
         .unwrap();
@@ -230,7 +230,7 @@ async fn abort_does_not_affect_future_spawns() {
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
-        .should_stop_hook(async_hook.clone())
+        .after_turn_hook(async_hook.clone())
         .build(env.clone())
         .await
         .unwrap();
@@ -370,7 +370,7 @@ async fn idle_watcher_abort() {
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
-        .should_stop_hook(async_hook.clone())
+        .after_turn_hook(async_hook.clone())
         .build(env.clone())
         .await
         .unwrap();

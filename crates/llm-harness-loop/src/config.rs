@@ -123,6 +123,9 @@ pub struct LoopConfig {
     // === Retry ===
     /// Retry config for transient provider errors; `None` disables retry.
     pub retry: Option<RetryConfig>,
+    // === Structured output ===
+    /// Optional `response_format` for structured output (e.g. `JsonObject`).
+    pub response_format: Option<crate::ResponseFormat>,
 }
 
 #[cfg(test)]
@@ -157,6 +160,45 @@ mod tests {
             steer_rx: None,
             follow_up_rx: None,
             retry: None,
+            response_format: None,
         };
+    }
+    #[test]
+    #[cfg(feature = "test-utils")]
+    fn loop_config_accepts_response_format() {
+        use crate::convert::DefaultConvertToLlm;
+        use crate::test_utils::NoOpEnv;
+        use crate::{FinalAnswerMode, LoopConfig, ResponseFormat};
+        use llm_harness_types::{StreamOptions, ThinkingLevel, ToolExecutionMode};
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+        let cfg = LoopConfig {
+            model: "test-model".into(),
+            max_tokens: 1024,
+            temperature: None,
+            thinking_level: ThinkingLevel::Off,
+            tools: vec![],
+            active_tools: None,
+            default_execution_mode: ToolExecutionMode::Parallel,
+            final_answer_mode: FinalAnswerMode::default(),
+            env: Arc::new(NoOpEnv),
+            abort: CancellationToken::new(),
+            stream_options: StreamOptions::default(),
+            convert_to_llm: Arc::new(DefaultConvertToLlm::new()),
+            transform_context: None,
+            prepare_next_turn: None,
+            should_stop: None,
+            before_provider_request: None,
+            after_provider_response: None,
+            steer_rx: None,
+            follow_up_rx: None,
+            retry: None,
+            response_format: Some(ResponseFormat::JsonObject),
+        };
+        assert!(cfg.response_format.is_some());
+        assert_eq!(
+            cfg.response_format.as_ref().unwrap(),
+            &ResponseFormat::JsonObject
+        );
     }
 }

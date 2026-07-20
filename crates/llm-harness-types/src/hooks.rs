@@ -46,6 +46,9 @@ pub struct NextTurnDirective {
     pub tools: Option<Vec<Arc<dyn Tool>>>,
     /// 仅控制激活工具子集（在当前或已替换的全集中过滤）；`None` 表示激活全部。
     pub active_tools: Option<HashSet<String>>,
+    /// 替换下一轮的 response_format；`None` 表示沿用当前值。
+    /// `Some(Some(fmt))` = 设为 fmt，`Some(None)` = 清除，`None` = 沿用。
+    pub response_format: Option<Option<llm_adapter::types::ResponseFormat>>,
 }
 
 /// 每个 turn 结束后调用，返回下一轮的配置。
@@ -339,5 +342,19 @@ mod tests {
         fn _j(_: &dyn BeforeTurnHook) {}
         fn _k(_: &dyn AfterTurnHook) {}
         fn _l(_: &dyn BeforeCompactHook) {}
+    }
+
+    #[test]
+    fn next_turn_directive_response_format_field_exists() {
+        let directive = NextTurnDirective {
+            context: None,
+            model: None,
+            thinking_level: None,
+            temperature: None,
+            tools: None,
+            active_tools: None,
+            response_format: Some(Some(llm_adapter::types::ResponseFormat::JsonObject)),
+        };
+        assert!(directive.response_format.is_some());
     }
 }

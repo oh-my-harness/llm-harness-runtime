@@ -28,6 +28,8 @@ pub struct HarnessState {
     pub thinking_level: ThinkingLevel,
     /// 采样温度；`None` 表示走 provider 默认。
     pub temperature: Option<f32>,
+    /// Optional `response_format` for structured output (e.g. `JsonObject`).
+    pub response_format: Option<llm_harness_loop::ResponseFormat>,
     /// Full registered tool list.
     pub tools: Vec<Arc<dyn Tool>>,
     /// Active tool subset; `None` means all tools are active.

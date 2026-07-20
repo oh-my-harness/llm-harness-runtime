@@ -56,6 +56,9 @@ pub enum Step {
         /// 本步允许的工具集。空 Vec = 不允许任何工具（字面语义，无 sentinel）。
         #[serde(default)]
         allowed_tools: Vec<String>,
+        /// 是否要求 final answer 是合法 JSON。`None`（默认）= 不要求。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured: Option<bool>,
         /// Optional runtime execution policy for this step.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy: Option<StepExecutionPolicy>,
@@ -109,6 +112,8 @@ impl<'de> Deserialize<'de> for Step {
                 #[serde(default)]
                 allowed_tools: Vec<String>,
                 #[serde(default)]
+                structured: Option<bool>,
+                #[serde(default)]
                 policy: Option<StepExecutionPolicy>,
             },
             Executor {
@@ -138,19 +143,20 @@ impl<'de> Deserialize<'de> for Step {
             Tagged(TaggedStep),
             LegacyLlm(LegacyLlmStep),
         }
-
         match StepCompat::deserialize(deserializer)? {
             StepCompat::Tagged(TaggedStep::Llm {
                 id,
                 name,
                 prompt,
                 allowed_tools,
+                structured,
                 policy,
             }) => Ok(Self::Llm {
                 id,
                 name,
                 prompt,
                 allowed_tools,
+                structured,
                 policy,
             }),
             StepCompat::Tagged(TaggedStep::Executor {
@@ -176,6 +182,7 @@ impl<'de> Deserialize<'de> for Step {
                 name,
                 prompt,
                 allowed_tools,
+                structured: None,
                 policy: None,
             }),
         }
@@ -194,6 +201,7 @@ impl Step {
             name: name.into(),
             prompt: prompt.into(),
             allowed_tools,
+            structured: None,
             policy: None,
         }
     }
@@ -219,6 +227,24 @@ impl Step {
             Self::Llm { policy: slot, .. } | Self::Executor { policy: slot, .. } => {
                 *slot = Some(policy);
             }
+        }
+        self
+    }
+
+    /// Set whether this LLM step requires a JSON structured output.
+    ///
+    /// `Some(true)` enables the `StructuredOutputCoordinator`: the engine will
+    /// try to extract a JSON object from the final answer and fill
+    /// `StepResult.structured`. `None` (default) = not required.
+    ///
+    /// No-op for executor steps.
+    #[must_use]
+    pub fn with_structured(mut self, structured: Option<bool>) -> Self {
+        if let Self::Llm {
+            structured: slot, ..
+        } = &mut self
+        {
+            *slot = structured;
         }
         self
     }
@@ -461,16 +487,32 @@ impl WorkflowState {
     }
 }
 
+/// LLM step 结构化输出的状态。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StructuredStatus {
+    /// step 未要求结构化输出。
+    #[default]
+    NotRequired,
+    /// 要求结构化输出且解析成功。
+    Ok,
+    /// 要求结构化输出但解析失败。上层决策。
+    Failed,
+}
+
 /// 单步执行结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepResult {
     /// 所有 turn 的 TextDelta 拼接的完整文本输出。
     pub output: String,
-    /// step agent 经 submit_step_result tool 提交的结构化结果。
-    /// judge 直接读 ctx.last_result.structured，不用自己经 TaskStore 反查 checkpoint。
-    /// None 表示 step agent 未调 submit_step_result（judge 需 fallback 到解析 output 或读 checkpoint）。
+    /// 引擎从 final answer 提取的结构化结果（JSON）。
+    /// 仅当 step 声明了 `structured: Some(true)` 时填充：由 StructuredOutputCoordinator
+    /// 在 agent loop 结束后提取。None 表示未声明 structured 或提取失败（见 structured_status）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured: Option<serde_json::Value>,
+    /// 结构化输出的状态。
+    #[serde(default)]
+    pub structured_status: StructuredStatus,
     /// 本次执行共调用了几次工具。
     pub tool_calls_count: u32,
     /// 本步 session ID（供调试和审计）。
@@ -671,5 +713,86 @@ mod tests {
     fn workflow_status_serializes_snake_case() {
         let json = serde_json::to_string(&WorkflowStatus::Running).unwrap();
         assert_eq!(json, "\"running\"");
+    }
+
+    #[test]
+    fn structured_status_default_is_not_required() {
+        assert_eq!(StructuredStatus::default(), StructuredStatus::NotRequired);
+    }
+
+    #[test]
+    fn structured_status_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&StructuredStatus::NotRequired).unwrap(),
+            "\"not_required\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StructuredStatus::Ok).unwrap(),
+            "\"ok\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StructuredStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+    }
+
+    #[test]
+    fn structured_status_roundtrip() {
+        for status in [
+            StructuredStatus::NotRequired,
+            StructuredStatus::Ok,
+            StructuredStatus::Failed,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let back: StructuredStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, status);
+        }
+    }
+
+    #[test]
+    fn llm_step_structured_field_default_none() {
+        let step = Step::llm("s1", "Step 1", "do step 1", vec![]);
+        match &step {
+            Step::Llm { structured, .. } => assert!(structured.is_none()),
+            _ => panic!("expected Llm step"),
+        }
+    }
+
+    #[test]
+    fn llm_step_structured_field_serializes() {
+        let step = Step::llm("s1", "Step 1", "do step 1", vec![]);
+        let json = serde_json::to_string(&step).unwrap();
+        // structured defaults to None and should not appear in serialized output.
+        assert!(!json.contains("structured"));
+
+        let back: Step = serde_json::from_str(&json).unwrap();
+        match &back {
+            Step::Llm { structured, .. } => assert!(structured.is_none()),
+            _ => panic!("expected Llm step"),
+        }
+    }
+
+    #[test]
+    fn step_result_structured_status_defaults_not_required() {
+        // A StepResult JSON without structured_status should deserialize to NotRequired.
+        let result = StepResult {
+            output: "done".into(),
+            structured: None,
+            structured_status: StructuredStatus::Ok,
+            tool_calls_count: 0,
+            session_id: "s1".into(),
+            cost: CostAggregate::default(),
+            started_at: None,
+            ended_at: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        // Manually remove structured_status from JSON to simulate old data.
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("structured_status");
+        let json_no_status = serde_json::to_string(&v).unwrap();
+        let back: StepResult = serde_json::from_str(&json_no_status).unwrap();
+        assert_eq!(back.structured_status, StructuredStatus::NotRequired);
+        // Verify the original was Ok (sanity).
+        assert_eq!(result.structured_status, StructuredStatus::Ok);
     }
 }

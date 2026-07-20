@@ -271,6 +271,7 @@ fn compare_number(
 mod tests {
     use super::*;
     use crate::control::cost::CostAggregate;
+    use crate::workflow::model::StructuredStatus;
 
     fn make_step_with_id(id: &str) -> Step {
         Step::llm(id, id, "do", vec![])
@@ -368,6 +369,7 @@ mod tests {
         StepResult {
             output: "done".into(),
             structured: None,
+            structured_status: StructuredStatus::NotRequired,
             tool_calls_count: 0,
             session_id: "sess1".into(),
             cost: CostAggregate::default(),
@@ -375,7 +377,6 @@ mod tests {
             ended_at: None,
         }
     }
-
     fn make_structured_result(structured: serde_json::Value) -> StepResult {
         StepResult {
             structured: Some(structured),
