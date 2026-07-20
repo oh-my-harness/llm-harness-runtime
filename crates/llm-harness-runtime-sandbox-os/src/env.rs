@@ -93,6 +93,11 @@ impl ExecutionEnv for OsEnv {
                 .map_err(|e| match e.kind() {
                     std::io::ErrorKind::NotFound => EnvError::NotFound(full),
                     std::io::ErrorKind::PermissionDenied => EnvError::PermissionDenied(full),
+                    // `read_to_string` returns `InvalidData` for non-UTF-8
+                    // bytes; surface it as `InvalidUtf8` so callers (e.g.
+                    // `ReadTool`) can fall back to binary handling instead of
+                    // treating it as a generic I/O failure.
+                    std::io::ErrorKind::InvalidData => EnvError::InvalidUtf8(full),
                     _ => EnvError::Io(e),
                 })
         }
@@ -580,6 +585,29 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, EnvError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn read_text_file_binary_returns_invalid_utf8() {
+        // Non-UTF-8 bytes must surface as `InvalidUtf8` (not `Io`) so that
+        // `ReadTool` can fall back to binary-file handling.
+        let tmp = tempfile::tempdir().unwrap();
+        let env = OsEnv::new(tmp.path());
+        let abort = CancellationToken::new();
+
+        env.write_file(
+            Path::new("bin.dat"),
+            &[0xFF, 0xFE, 0x00, 0x01],
+            abort.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = env
+            .read_text_file(Path::new("bin.dat"), abort)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EnvError::InvalidUtf8(_)), "got {err:?}");
     }
     #[tokio::test]
     async fn execute_shell_streams_stdout_callback() {
