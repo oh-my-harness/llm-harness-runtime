@@ -116,6 +116,54 @@ body {
 .block-text { white-space: pre-wrap; word-break: break-word; }
 .block-text.empty { color: var(--fg-muted); font-style: italic; }
 
+/* Markdown rendering */
+.block-text.md { white-space: normal; line-height: 1.7; }
+.block-text.md h1, .block-text.md h2, .block-text.md h3,
+.block-text.md h4, .block-text.md h5, .block-text.md h6 {
+  margin: 12px 0 6px; font-weight: 600; line-height: 1.3;
+}
+.block-text.md h1 { font-size: 1.5em; }
+.block-text.md h2 { font-size: 1.3em; }
+.block-text.md h3 { font-size: 1.15em; }
+.block-text.md h4 { font-size: 1em; }
+.block-text.md p { margin: 6px 0; }
+.block-text.md ul, .block-text.md ol { margin: 6px 0; padding-left: 24px; }
+.block-text.md li { margin: 2px 0; }
+.block-text.md code {
+  font-family: monospace; font-size: 0.9em;
+  background: var(--code-bg); padding: 1px 5px; border-radius: 3px;
+}
+.block-text.md pre {
+  background: var(--code-bg); padding: 10px 14px; border-radius: 4px;
+  overflow-x: auto; margin: 8px 0;
+}
+.block-text.md pre code { padding: 0; background: none; font-size: 12px; }
+.block-text.md blockquote {
+  border-left: 3px solid var(--border); margin: 8px 0; padding: 4px 12px;
+  color: var(--fg-dim);
+}
+.block-text.md a { color: var(--accent); text-decoration: none; }
+.block-text.md a:hover { text-decoration: underline; }
+.block-text.md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.block-text.md table { border-collapse: collapse; margin: 8px 0; }
+.block-text.md th, .block-text.md td {
+  border: 1px solid var(--border); padding: 4px 10px; text-align: left;
+}
+.block-text.md th { background: var(--bg-3); font-weight: 600; }
+
+/* View toggle */
+.view-toggle {
+  display: inline-flex; gap: 0; margin-bottom: 4px;
+  border: 1px solid var(--border); border-radius: 4px; overflow: hidden;
+}
+.view-toggle button {
+  font-size: 11px; padding: 2px 10px; cursor: pointer;
+  background: var(--bg-3); color: var(--fg-muted); border: none;
+  transition: background 0.15s, color 0.15s;
+}
+.view-toggle button:hover { color: var(--fg); }
+.view-toggle button.active { background: var(--accent); color: #000; }
+
 .block-thinking {
   background: rgba(124,58,237,0.08); border: 1px solid rgba(124,58,237,0.2);
   border-radius: 4px; margin: 4px 0;
@@ -198,6 +246,25 @@ body {
   const data = JSON.parse(document.getElementById("viewer-data").textContent);
   let activeSessionIdx = -1;
   let activeBranchIdx = 0;
+  // "md" = markdown rendering (requires marked.js loaded), "raw" = plain text.
+  let viewMode = "raw"; // start raw; upgraded to "md" once marked loads.
+  let markedFn = null; // set to marked.parse if CDN load succeeds.
+
+  // Async-load marked.js from CDN; on success, switch to markdown mode and
+  // re-render. On failure (offline), stay in raw mode.
+  (function loadMarked() {
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/marked@12/marked.min.js";
+    s.onload = () => {
+      if (window.marked && typeof window.marked.parse === "function") {
+        markedFn = window.marked.parse;
+        viewMode = "md";
+        if (activeSessionIdx >= 0) renderMain();
+      }
+    };
+    s.onerror = () => { /* stay raw — no network */ };
+    document.head.appendChild(s);
+  })();
 
   const $ = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
@@ -315,6 +382,18 @@ body {
       if (!e) return;
       container.appendChild(renderEntry(e, s));
     });
+
+    // Delegate view-toggle clicks.
+    container.querySelectorAll(".view-toggle button").forEach((btn) => {
+      btn.onclick = (ev) => {
+        ev.stopPropagation();
+        const mode = btn.dataset.mode;
+        if (mode && mode !== viewMode) {
+          viewMode = mode;
+          renderMain(); // re-render with new mode
+        }
+      };
+    });
   }
 
   // ── Render one entry ──────────────────────────────────────────────
@@ -412,13 +491,38 @@ body {
     return `${tag}<span>${detail}</span>`;
   }
 
+  // ── Text rendering: markdown vs raw ───────────────────────────────
+  // Returns HTML for a text string, using marked.js if available + viewMode=="md".
+  function renderTextContent(text) {
+    if (viewMode === "md" && markedFn) {
+      // marked already escapes HTML inside; its output is safe.
+      return markedFn(text);
+    }
+    return esc(text);
+  }
+
+  // Build a view-toggle button pair for a block. `key` is a unique string
+  // used to identify which toggle was clicked (though we re-render globally).
+  function viewToggle() {
+    if (!markedFn) return ""; // no toggle if marked never loaded
+    const mdActive = viewMode === "md" ? " active" : "";
+    const rawActive = viewMode === "raw" ? " active" : "";
+    return `<div class="view-toggle" data-action="toggle-view">`
+      + `<button data-mode="md"${mdActive}>Markdown</button>`
+      + `<button data-mode="raw"${rawActive}>Raw</button>`
+      + `</div>`;
+  }
+
   // ── Render content blocks ─────────────────────────────────────────
   function renderBlock(b) {
-    if (!b || !b.type) return "";
     switch (b.type) {
       case "text": {
         const empty = !b.text;
-        return `<div class="block block-text${empty ? " empty" : ""}">${empty ? "(empty text)" : esc(b.text)}</div>`;
+        if (empty) {
+          return `<div class="block block-text empty">(empty text)</div>`;
+        }
+        const cls = viewMode === "md" && markedFn ? "block block-text md" : "block block-text";
+        return viewToggle() + `<div class="${cls}">${renderTextContent(b.text)}</div>`;
       }
       case "thinking":
         return (
@@ -452,7 +556,7 @@ body {
   }
 
   function renderToolResult(p) {
-    const cls = "tool-result-content" + (p.is_error ? " is-error" : "");
+    const isError = p.is_error;
     let text = "";
     if (p.content && Array.isArray(p.content)) {
       text = p.content.map((b) => {
@@ -460,7 +564,13 @@ body {
         return JSON.stringify(b);
       }).join("\n");
     }
-    return `<div class="${cls}">${esc(text) || "(empty)"}</div>`;
+    if (!text) return `<div class="tool-result-content${isError ? " is-error" : ""}">(empty)</div>`;
+    // In md mode, tool results render as markdown too (often contain formatted output).
+    if (viewMode === "md" && markedFn) {
+      return viewToggle()
+        + `<div class="tool-result-content md${isError ? " is-error" : ""}">${renderTextContent(text)}</div>`;
+    }
+    return `<div class="tool-result-content${isError ? " is-error" : ""}">${esc(text)}</div>`;
   }
 
   // ── Init ──────────────────────────────────────────────────────────
