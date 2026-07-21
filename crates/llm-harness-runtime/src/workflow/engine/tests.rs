@@ -43,6 +43,8 @@ async fn free_task_smoke_succeeds() {
 
 use crate::lifecycle::task_store::JsonlTaskStore;
 use crate::workflow::judge::NoopJudge;
+use crate::workflow::model::StepCache;
+use crate::workflow::model::StepExecutionPolicy;
 use crate::workflow::model::{ConditionExpr, Edge, EdgeCondition};
 
 struct FixedExecutor;
@@ -147,6 +149,7 @@ fn completed_record(step_id: &str, output: &str, transition: Transition) -> Step
         ended_at: now,
         result: Some(completed_result(output)),
         transition,
+        cache_key: None,
     }
 }
 
@@ -236,6 +239,7 @@ fn step_history_summary_no_result_includes_timing() {
         ended_at: now,
         result: None,
         transition: Transition::Retry,
+        cache_key: None,
     };
     let summary = format_step_history_summary(&[record]);
     assert!(
@@ -1520,6 +1524,7 @@ async fn step_policy_retries_executor_failure() {
                 timeout_ms: Some(1_000),
                 max_attempts: Some(2),
                 retry_backoff_ms: Some(0),
+                cache: None,
             },
         )],
         edges: vec![],
@@ -1566,6 +1571,7 @@ async fn step_policy_times_out_blocking_executor() {
                     timeout_ms: Some(20),
                     max_attempts: Some(1),
                     retry_backoff_ms: Some(0),
+                    cache: None,
                 },
             ),
         ],
@@ -2151,6 +2157,7 @@ fn aggregate_cost_merges_per_model_cache_tokens() {
             ended_at: None,
         }),
         transition: Transition::To("s2".to_string()),
+        cache_key: None,
     };
 
     let history = vec![mk_record(200, 100), mk_record(300, 50)];
@@ -3186,6 +3193,7 @@ async fn policy_retry_creates_separate_attempt_dirs() {
                 timeout_ms: None,
                 max_attempts: Some(2),
                 retry_backoff_ms: Some(0),
+                cache: None,
             }),
         ],
         edges: vec![],
@@ -3473,5 +3481,301 @@ async fn restore_keeps_session_under_same_task_dir() {
         !session_subdirs.is_empty(),
         "at least one session subdir should exist under {:?}",
         task_dir
+    );
+}
+
+// ── Step-level result cache tests (issue #41) ──────────────────────────
+
+/// Executor that counts executions. Reads `design_version` from context
+/// (set by an upstream step) to verify cache behavior.
+struct CacheableExecutor {
+    call_count: Arc<AtomicUsize>,
+}
+
+impl StepExecutor for CacheableExecutor {
+    fn execute<'a>(&'a self, ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        Box::pin(async move {
+            let n = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let ctx_data = ctx.context.lock().await;
+            let dv = ctx_data
+                .variables
+                .get("design_version")
+                .cloned()
+                .unwrap_or(serde_json::json!("unknown"));
+            drop(ctx_data);
+            Ok(StepResult {
+                output: format!("computed for {dv} (call {n})"),
+                structured: None,
+                structured_status: StructuredStatus::NotRequired,
+                tool_calls_count: 0,
+                session_id: String::new(),
+                cost: CostAggregate::default(),
+                started_at: None,
+                ended_at: None,
+            })
+        })
+    }
+}
+
+/// Writes `design_version` to context. Only meant to run once (entry step).
+struct VersionWriter;
+impl StepExecutor for VersionWriter {
+    fn execute<'a>(&'a self, ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        Box::pin(async move {
+            let mut ctx_data = ctx.context.lock().await;
+            ctx_data
+                .variables
+                .insert("design_version".into(), serde_json::json!("v1"));
+            drop(ctx_data);
+            Ok(StepResult {
+                output: "wrote v1".into(),
+                structured: None,
+                structured_status: StructuredStatus::NotRequired,
+                tool_calls_count: 0,
+                session_id: String::new(),
+                cost: CostAggregate::default(),
+                started_at: None,
+                ended_at: None,
+            })
+        })
+    }
+}
+
+/// Judge for 3-step workflow s0→s1→s2 with a backjump s2→s1→s2→abort.
+struct BackjumpJudge {
+    call_count: Arc<AtomicUsize>,
+    backjump_target: String,
+}
+
+impl StepTransitionJudge for BackjumpJudge {
+    fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+        let count = self.call_count.clone();
+        let step_id = ctx.current_step.id().clone();
+        Box::pin(async move {
+            let n = count.fetch_add(1, Ordering::SeqCst) + 1;
+            match (step_id.as_str(), n) {
+                ("s0", _) => Transition::To("s1".into()),
+                ("s1", _) => Transition::To("s2".into()),
+                // s2 1st time → backjump; s2 2nd time → done
+                ("s2", 3) => Transition::To(self.backjump_target.clone()),
+                ("s2", _) => Transition::Abort {
+                    reason: "done".into(),
+                },
+                _ => Transition::Abort {
+                    reason: "unexpected".into(),
+                },
+            }
+        })
+    }
+}
+
+impl BackjumpJudge {
+    fn backjump_to(target: &str) -> Self {
+        Self {
+            call_count: Arc::new(AtomicUsize::new(0)),
+            backjump_target: target.into(),
+        }
+    }
+}
+
+impl BackjumpJudge {
+    fn with_call_count(mut self, count: Arc<AtomicUsize>) -> Self {
+        self.call_count = count;
+        self
+    }
+}
+
+fn cache_test_workflow() -> Workflow {
+    Workflow {
+        entry_step: "s0".into(),
+        steps: vec![
+            Step::executor("s0", "Writer", "writer", None),
+            Step::executor("s1", "Cacheable", "cacheable", None).with_policy(StepExecutionPolicy {
+                timeout_ms: None,
+                max_attempts: Some(1),
+                retry_backoff_ms: None,
+                cache: Some(StepCache {
+                    key_pointer: "/design_version".into(),
+                    ttl_secs: None,
+                }),
+            }),
+            Step::executor("s2", "Reader", "reader", None),
+        ],
+        edges: vec![
+            Edge {
+                from: "s0".into(),
+                to: "s1".into(),
+                condition: None,
+            },
+            Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            },
+            Edge {
+                from: "s2".into(),
+                to: "s1".into(),
+                condition: None,
+            },
+        ],
+    }
+}
+
+fn cache_test_config(dir: &tempfile::TempDir, client: Arc<MockLlmClient>) -> WorkflowEngineConfig {
+    WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    }
+}
+
+#[tokio::test]
+async fn step_cache_skips_reexecution_on_backjump() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let exec_calls = Arc::new(AtomicUsize::new(0));
+    let judge_calls = Arc::new(AtomicUsize::new(0));
+
+    let engine = WorkflowEngine::new(
+        cache_test_workflow(),
+        cache_test_config(&dir, client),
+        Arc::new(BackjumpJudge::backjump_to("s1").with_call_count(judge_calls)),
+    )
+    .unwrap()
+    .with_executor("writer", Arc::new(VersionWriter))
+    .with_executor(
+        "cacheable",
+        Arc::new(CacheableExecutor {
+            call_count: exec_calls.clone(),
+        }),
+    )
+    .with_executor("reader", Arc::new(ContextReader));
+
+    let result = engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+
+    // Flow: s0(writes v1) → s1(executes, cache_key=v1) → s2 → backjump s1
+    // → cache hit (design_version still v1) → s2 → abort.
+    // s1 should execute only once.
+    assert_eq!(
+        exec_calls.load(Ordering::SeqCst),
+        1,
+        "cached step should not re-execute on backjump"
+    );
+    assert!(result.final_message.is_some());
+}
+
+#[tokio::test]
+async fn step_cache_misses_when_key_changes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let exec_calls = Arc::new(AtomicUsize::new(0));
+    let judge_calls = Arc::new(AtomicUsize::new(0));
+
+    // VersionWriter that increments the version on every call, so the
+    // cache key always changes → s1 always re-executes on backjump.
+    struct IncrementingWriter {
+        call_count: Arc<AtomicUsize>,
+    }
+    impl StepExecutor for IncrementingWriter {
+        fn execute<'a>(&'a self, ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+            Box::pin(async move {
+                let n = self.call_count.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut ctx_data = ctx.context.lock().await;
+                ctx_data
+                    .variables
+                    .insert("design_version".into(), serde_json::json!(format!("v{n}")));
+                drop(ctx_data);
+                Ok(StepResult {
+                    output: format!("wrote v{n}"),
+                    structured: None,
+                    structured_status: StructuredStatus::NotRequired,
+                    tool_calls_count: 0,
+                    session_id: String::new(),
+                    cost: CostAggregate::default(),
+                    started_at: None,
+                    ended_at: None,
+                })
+            })
+        }
+    }
+
+    // Modify workflow: backjump goes to s0 (not s1) so s0 re-runs and
+    // changes design_version before s1 sees it again.
+    let mut wf = cache_test_workflow();
+    wf.edges[2] = Edge {
+        from: "s2".into(),
+        to: "s0".into(),
+        condition: None,
+    };
+
+    let engine = WorkflowEngine::new(
+        wf,
+        cache_test_config(&dir, client),
+        Arc::new(BackjumpJudge::backjump_to("s0").with_call_count(judge_calls)),
+    )
+    .unwrap()
+    .with_executor(
+        "writer",
+        Arc::new(IncrementingWriter {
+            call_count: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .with_executor(
+        "cacheable",
+        Arc::new(CacheableExecutor {
+            call_count: exec_calls.clone(),
+        }),
+    )
+    .with_executor("reader", Arc::new(ContextReader));
+
+    engine.run().await.unwrap();
+
+    // Flow: s0(v1) → s1(executes, key=v1) → s2 → backjump s0(v2) → s1
+    // (key=v2, cache miss) → s2 → abort.
+    // s1 executes twice.
+    assert_eq!(
+        exec_calls.load(Ordering::SeqCst),
+        2,
+        "cache should miss when key changes"
+    );
+}
+
+#[tokio::test]
+async fn step_cache_no_policy_always_executes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let exec_calls = Arc::new(AtomicUsize::new(0));
+    let judge_calls = Arc::new(AtomicUsize::new(0));
+
+    // Same 3-step workflow but s1 has NO cache policy → always re-executes.
+    let mut wf = cache_test_workflow();
+    wf.steps[1] = Step::executor("s1", "Cacheable", "cacheable", None);
+
+    let engine = WorkflowEngine::new(
+        wf,
+        cache_test_config(&dir, client),
+        Arc::new(BackjumpJudge::backjump_to("s1").with_call_count(judge_calls)),
+    )
+    .unwrap()
+    .with_executor("writer", Arc::new(VersionWriter))
+    .with_executor(
+        "cacheable",
+        Arc::new(CacheableExecutor {
+            call_count: exec_calls.clone(),
+        }),
+    )
+    .with_executor("reader", Arc::new(ContextReader));
+
+    engine.run().await.unwrap();
+
+    // No cache policy → s1 executes on every visit (2 times).
+    assert_eq!(
+        exec_calls.load(Ordering::SeqCst),
+        2,
+        "step without cache policy should always execute"
     );
 }

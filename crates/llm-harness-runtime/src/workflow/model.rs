@@ -95,6 +95,32 @@ pub struct StepExecutionPolicy {
     /// Fixed delay before retrying a failed attempt, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_backoff_ms: Option<u64>,
+    /// Step-level result cache. When set, the engine checks `step_history`
+    /// for a cached `StepResult` before executing. If the cache key (resolved
+    /// from `WorkflowContext` variables via JSON pointer) matches a previous
+    /// successful execution and the TTL hasn't expired, execution is skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<StepCache>,
+}
+
+/// Step-level result cache configuration.
+///
+/// The engine resolves `key_pointer` (RFC 6901 JSON pointer) against
+/// `WorkflowContext.variables` before each execution. If a previous
+/// `StepRecord` for the same step has a matching `cache_key` value and is
+/// within TTL, its `StepResult` is reused and execution is skipped.
+///
+/// Cache invalidation is automatic: when the resolved key value changes,
+/// the cache misses and the step re-executes. This is the generic equivalent
+/// of EDA Agent's domain-specific done markers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepCache {
+    /// JSON pointer (RFC 6901) into `WorkflowContext.variables`.
+    /// Example: `/design_version` resolves `variables["design_version"]`.
+    pub key_pointer: String,
+    /// TTL in seconds. `None` = never expires (until key value changes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for Step {
@@ -539,6 +565,10 @@ pub struct StepRecord {
     /// 执行结果（若该步正常完成）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<StepResult>,
+    /// Resolved cache key value (when step cache is enabled). Used to
+    /// determine cache hits on subsequent visits (e.g., backjumps).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<serde_json::Value>,
     /// 该步结束时的跳转决策。
     pub transition: Transition,
 }
@@ -669,6 +699,7 @@ mod tests {
                 timeout_ms: Some(1_000),
                 max_attempts: Some(3),
                 retry_backoff_ms: Some(25),
+                cache: None,
             },
         );
         let json = serde_json::to_string(&step).unwrap();
@@ -682,6 +713,7 @@ mod tests {
                 timeout_ms: Some(1_000),
                 max_attempts: Some(3),
                 retry_backoff_ms: Some(25),
+                cache: None,
             })
         );
     }

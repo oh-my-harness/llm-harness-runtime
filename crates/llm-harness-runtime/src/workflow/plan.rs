@@ -384,6 +384,22 @@ fn step_policy_schema() -> serde_json::Value {
                 "minimum": 0,
                 "maximum": MAX_STEP_RETRY_BACKOFF_MS,
                 "description": "Fixed delay before retrying a failed attempt"
+            },
+            "cache": {
+                "type": "object",
+                "description": "Step-level result cache: reuse a cached StepResult when the cache key (resolved from context variables) hasn't changed. Skips execution on cache hit.",
+                "properties": {
+                    "key_pointer": {
+                        "type": "string",
+                        "description": "JSON pointer (RFC 6901) into WorkflowContext variables, e.g. /design_version"
+                    },
+                    "ttl_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Cache TTL in seconds. Omit for no expiry (cache invalidated only when key changes)."
+                    }
+                },
+                "required": ["key_pointer"]
             }
         }
     })
@@ -566,6 +582,7 @@ mod tests {
                         timeout_ms: Some(1_000),
                         max_attempts: Some(0),
                         retry_backoff_ms: Some(0),
+                        cache: None,
                     },
                 ),
             ],

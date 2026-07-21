@@ -467,6 +467,43 @@ impl super::WorkflowEngine {
         }
     }
 
+    /// Resolve the cache key for a step from the current `WorkflowContext`.
+    /// Returns `None` if the step has no cache policy or the pointer doesn't resolve.
+    async fn resolve_cache_key(&self, step: &Step) -> Option<serde_json::Value> {
+        let cache = step.policy()?.cache.as_ref()?;
+        let ctx = self.context.lock().await;
+        let ctx_value = serde_json::Value::Object(ctx.variables.clone());
+        ctx_value.pointer(&cache.key_pointer).cloned()
+    }
+
+    /// Search `step_history` (reverse) for a cached result matching the given key.
+    /// A match requires: same `step_id`, `cache_key` equals `key`, has a `result`,
+    /// and within TTL (if configured).
+    async fn find_cached_result(&self, step: &Step, key: &serde_json::Value) -> Option<StepResult> {
+        let cache = step.policy()?.cache.as_ref()?;
+        let now = chrono::Utc::now();
+        let state = self.workflow_state.lock().await;
+        for record in state.step_history.iter().rev() {
+            if record.step_id != *step.id() {
+                continue;
+            }
+            if record.cache_key.as_ref() != Some(key) {
+                continue;
+            }
+            let Some(result) = record.result.as_ref() else {
+                continue;
+            };
+            if let Some(ttl) = cache.ttl_secs {
+                let elapsed = now.signed_duration_since(record.ended_at);
+                if elapsed.num_seconds() > ttl as i64 {
+                    continue;
+                }
+            }
+            return Some(result.clone());
+        }
+        None
+    }
+
     /// run() 的主循环。拆出以降低 run() 圈复杂度。
     async fn run_loop(&self) -> Result<TaskResult, WorkflowError> {
         loop {
@@ -504,39 +541,53 @@ impl super::WorkflowEngine {
                 *ca = Some(step_abort.clone());
             }
 
-            // 4. Execute the step.
-            let step_result = match self.run_step_with_policy(&step, step_abort.clone()).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let state = self.workflow_state.lock().await;
-                    if state.status == WorkflowStatus::Cancelled {
-                        return Ok(state.result.clone().unwrap_or_else(|| TaskResult {
-                            cost: aggregate_cost(&state.step_history),
-                            turns: count_executed_turns(&state.step_history),
-                            final_message: None,
-                        }));
+            // 4. Resolve cache key + check for a cached result (issue #41).
+            //    If the step has a cache policy and a previous successful
+            //    execution with the same key value exists in step_history,
+            //    reuse its StepResult and skip execution.
+            let cache_key = self.resolve_cache_key(&step).await;
+            let cached_result = if let Some(ref key) = cache_key {
+                self.find_cached_result(&step, key).await
+            } else {
+                None
+            };
+
+            // 5. Execute the step (or reuse cached result on cache hit).
+            let step_result = match cached_result {
+                Some(cached) => cached,
+                None => match self.run_step_with_policy(&step, step_abort.clone()).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let state = self.workflow_state.lock().await;
+                        if state.status == WorkflowStatus::Cancelled {
+                            return Ok(state.result.clone().unwrap_or_else(|| TaskResult {
+                                cost: aggregate_cost(&state.step_history),
+                                turns: count_executed_turns(&state.step_history),
+                                final_message: None,
+                            }));
+                        }
+                        drop(state);
+                        // step agent 失败 → task Failed。
+                        return self
+                            .fail_task(format!("step '{}' failed: {}", step.id(), e))
+                            .await;
                     }
-                    drop(state);
-                    // step agent 失败 → task Failed。
-                    return self
-                        .fail_task(format!("step '{}' failed: {}", step.id(), e))
-                        .await;
-                }
+                },
             };
             let _ = self.event_tx.send(WorkflowEvent::StepFinished {
                 step_id: step.id().clone(),
                 result: step_result.clone(),
             });
 
-            // 5. 据 Transition 更新 state + 记录 step_history。
+            // 6. 据 Transition 更新 state + 记录 step_history。
             //    apply_transition 内部检查 status==Cancelled 守卫：
             //    若 cancel() 已抢先置 Cancelled，则不推 record、不覆盖状态。
             let transition = self.decide_transition(&step, &step_result).await;
             let next_step = self
-                .apply_transition(&step, step_result, transition.clone())
+                .apply_transition(&step, step_result, transition.clone(), cache_key)
                 .await?;
 
-            // 6. 检查 cancel 守卫：cancel() 可能在 run_step 期间抢先置 Cancelled。
+            // 7. 检查 cancel 守卫：cancel() 可能在 run_step 期间抢先置 Cancelled。
             //    apply_transition 已跳过 record 推入，此处确认并返回。
             {
                 let state = self.workflow_state.lock().await;
@@ -1231,6 +1282,7 @@ impl super::WorkflowEngine {
         step: &Step,
         step_result: StepResult,
         transition: Transition,
+        cache_key: Option<serde_json::Value>,
     ) -> Result<Option<StepId>, WorkflowError> {
         let mut state = self.workflow_state.lock().await;
 
@@ -1246,6 +1298,7 @@ impl super::WorkflowEngine {
             ended_at: step_result.ended_at.unwrap_or(now),
             result: Some(step_result),
             transition: transition.clone(),
+            cache_key,
         };
         state.step_history.push(record);
 
@@ -1447,6 +1500,7 @@ impl super::WorkflowEngine {
                 transition: Transition::Abort {
                     reason: format!("cancelled: {}", reason),
                 },
+                cache_key: None,
             });
         }
         state.status = WorkflowStatus::Cancelled;
