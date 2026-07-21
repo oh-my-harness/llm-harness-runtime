@@ -3030,3 +3030,448 @@ async fn structured_step_fails_when_provider_lacks_json_schema() {
         "supports=false: no turn should carry response_format"
     );
 }
+
+// ── session 路径隔离 (issue #73) ──────────────────────────────────────────
+
+#[tokio::test]
+async fn llm_step_session_lands_in_task_step_attempt_dir() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new_free_task("do work".into(), vec![], config).unwrap();
+    let _ = engine.run().await.unwrap();
+
+    // 期望:sessions/<task_id>/run-1/<session_id>/ 存在
+    let task_dirs: Vec<_> = std::fs::read_dir(dir.path().join("sessions"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("task-"))
+        .collect();
+    assert_eq!(task_dirs.len(), 1, "exactly one task-<uuid> dir");
+    let task_dir = task_dirs[0].path();
+
+    let step_dirs: Vec<_> = std::fs::read_dir(&task_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy() == "run-1")
+        .collect();
+    assert_eq!(step_dirs.len(), 1, "exactly one 'run-1' dir");
+    let step_dir = step_dirs[0].path();
+
+    // <session_id>/ 子目录(jsonl session repo 创建,uuid 动态)
+    let session_dirs: Vec<_> = std::fs::read_dir(&step_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect();
+    assert_eq!(
+        session_dirs.len(),
+        1,
+        "exactly one <session_id> dir under run-1"
+    );
+}
+
+/// Judge: 首次返回 Retry,第二次返回 Abort（流程结束）。
+///
+/// 注:brief 原文用 `new_free_task` + `Transition::To(cur)` 结束流程,但
+/// (1) `new_free_task` 硬编码 `NoopJudge` 且 `decide_transition` 对自由 task
+///     (单步无 edge)短路返回 `Abort`,judge 永不被调用;
+/// (2) `Transition::To` 不结束 run_loop(只有 Abort/Fail/max_steps 终止)。
+/// 故改为 2-step workflow + `RetryOnceJudge` + `Abort`,真正覆盖 retry 路径。
+struct RetryOnceJudge;
+impl StepTransitionJudge for RetryOnceJudge {
+    fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+        let cur = ctx.current_step.id().clone();
+        // step_history 中同 step_id 的 record 数决定是第几次执行
+        let n = ctx.step_history.iter().filter(|r| r.step_id == cur).count();
+        Box::pin(async move {
+            if cur == "run" {
+                if n < 2 {
+                    Transition::Retry
+                } else {
+                    // 第二次完成后,跳到 done 让流程结束。
+                    Transition::To("done".into())
+                }
+            } else {
+                Transition::Abort {
+                    reason: "done".into(),
+                }
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn retry_creates_separate_attempt_dirs() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("first attempt"),
+        MockResponse::text("second attempt"),
+        MockResponse::text("done step"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "run".into(),
+        steps: vec![
+            Step::llm("run", "Run", "do work", vec![]),
+            Step::llm("done", "Done", "finish", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "run".into(),
+            to: "done".into(),
+            condition: None,
+        }],
+    };
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(RetryOnceJudge)).unwrap();
+    let _ = engine.run().await.unwrap();
+
+    // 期望:sessions/<task_id>/run-1/ 和 run-2/ 都存在(retry 产生两个 attempt 目录)
+    let task_dirs: Vec<_> = std::fs::read_dir(dir.path().join("sessions"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("task-"))
+        .collect();
+    assert_eq!(task_dirs.len(), 1);
+    let task_dir = task_dirs[0].path();
+
+    let attempt_dirs: Vec<String> = std::fs::read_dir(&task_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        attempt_dirs.iter().any(|d| d == "run-1"),
+        "run-1 should exist: {:?}",
+        attempt_dirs
+    );
+    assert!(
+        attempt_dirs.iter().any(|d| d == "run-2"),
+        "run-2 should exist: {:?}",
+        attempt_dirs
+    );
+}
+/// #73 final review: `StepExecutionPolicy.max_attempts > 1` must produce
+/// distinct session dirs per policy attempt. Before the fix, no StepRecord
+/// was pushed between policy attempts, so `attempt_seq` stayed at 1 and all
+/// attempts collided in `run-1/`.
+#[tokio::test]
+async fn policy_retry_creates_separate_attempt_dirs() {
+    use crate::workflow::model::StepExecutionPolicy;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    // First attempt: provider RateLimit error → StepFailed → policy retries.
+    // Second attempt: success.
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::rate_limit_error(),
+        MockResponse::text("done"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "run".into(),
+        steps: vec![
+            Step::llm("run", "Run", "do work", vec![]).with_policy(StepExecutionPolicy {
+                timeout_ms: None,
+                max_attempts: Some(2),
+                retry_backoff_ms: Some(0),
+            }),
+        ],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
+    let _ = engine.run().await.unwrap();
+
+    let task_dirs: Vec<_> = std::fs::read_dir(dir.path().join("sessions"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("task-"))
+        .collect();
+    assert_eq!(task_dirs.len(), 1, "exactly one task-<uuid> dir");
+    let task_dir = task_dirs[0].path();
+
+    let attempt_dirs: Vec<String> = std::fs::read_dir(&task_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        attempt_dirs.iter().any(|d| d == "run-1"),
+        "run-1 should exist (attempt 1): {:?}",
+        attempt_dirs
+    );
+    assert!(
+        attempt_dirs.iter().any(|d| d == "run-2"),
+        "run-2 should exist (attempt 2, policy retry): {:?}",
+        attempt_dirs
+    );
+}
+
+/// #73 final review: executor steps must NOT create any session directory.
+/// `run_executor_step` never calls `session_factory.create`, so no
+/// `<task_id>/` dir should appear under `session_base_dir`.
+#[tokio::test]
+async fn executor_step_creates_no_session_dir() {
+    struct NoopExecutor;
+    impl StepExecutor for NoopExecutor {
+        fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+            Box::pin(async move {
+                Ok(StepResult {
+                    output: "executor ok".into(),
+                    structured: None,
+                    structured_status: StructuredStatus::NotRequired,
+                    tool_calls_count: 0,
+                    session_id: String::new(),
+                    cost: CostAggregate::default(),
+                    started_at: None,
+                    ended_at: None,
+                })
+            })
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Exec", "noop", None)],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+        .unwrap()
+        .with_executor("noop", Arc::new(NoopExecutor));
+
+    let _ = engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+
+    // session_base_dir may not exist at all (factory never called → no
+    // create_dir_all). If it exists, it must contain no task-*/ dir.
+    let session_base = dir.path().join("sessions");
+    let task_dirs: Vec<_> = match std::fs::read_dir(&session_base) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("task-"))
+            .collect(),
+        Err(_) => vec![],
+    };
+    assert!(
+        task_dirs.is_empty(),
+        "executor step must not create a session dir, found: {:?}",
+        task_dirs
+    );
+}
+
+/// #73 Task 4: sub-agent session 必须落在
+/// `<session_base_dir>/<task_id>/<step_id>-1/sub-agents/<session_id>/`。
+///
+/// Task 3 的 `retry_creates_separate_attempt_dirs` 未启用 spawn_agent,
+/// `build_step_spawner` 从未被调用。此测试直接调 `build_step_spawner`
+/// 构造 spawner 并 spawn 一个最小 sub-agent,验证 on-disk 目录结构。
+#[tokio::test]
+async fn subagent_session_lands_in_subagents_subdir() {
+    use crate::spawn::message_bus::message_bus_pair;
+    use crate::spawn::spawn_types::{ContextMode, ProviderSelection, SpawnOptions};
+    use crate::spawn::spawner::HarnessSubAgentSpawner;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("sub done")]));
+    let config = WorkflowEngineConfig {
+        client: client.clone(),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new_free_task("do work".into(), vec![], config).unwrap();
+    let bus = message_bus_pair();
+    // 取出 event_rx guard,用于等待 sub-agent 完成事件(避免 tokio 运行时
+    // 关闭时仍有挂起的后台 task)。
+    let mut event_guard = bus.take_event_rx().expect("event_rx available");
+    let spawner: HarnessSubAgentSpawner = engine.build_step_spawner(bus, &"run".into(), 1);
+
+    // spawn 一个最小 sub-agent。spawn_async 返回 session_id(String)。
+    let session_id = spawner
+        .spawn_async(SpawnOptions {
+            prompt: "do sub work".into(),
+            provider: ProviderSelection::Inherit,
+            cwd: None,
+            context: ContextMode::None,
+        })
+        .await
+        .expect("spawn should succeed");
+    assert!(!session_id.is_empty(), "session_id should be non-empty");
+
+    // 等待 sub-agent 后台 task 完成并投递 Done 事件。
+    let done = event_guard.recv().await;
+    assert!(
+        matches!(
+            done,
+            Some(crate::spawn::message_bus::SubAgentEvent::Done { .. })
+        ),
+        "expected SubAgentEvent::Done, got {:?}",
+        done
+    );
+    drop(event_guard);
+
+    // 期望:sessions/<task_id>/run-1/sub-agents/<session_id>/ 存在
+    let task_dirs: Vec<_> = std::fs::read_dir(dir.path().join("sessions"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("task-"))
+        .collect();
+    assert_eq!(task_dirs.len(), 1, "exactly one task-<uuid> dir");
+    let task_dir = task_dirs[0].path();
+
+    let sub_agents_dir = task_dir.join("run-1").join("sub-agents");
+    assert!(
+        sub_agents_dir.exists(),
+        "sub-agents dir should exist at {:?}",
+        sub_agents_dir
+    );
+
+    let sub_session_dirs: Vec<_> = std::fs::read_dir(&sub_agents_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect();
+    assert!(
+        !sub_session_dirs.is_empty(),
+        "at least one sub-agent session dir should exist under {:?}",
+        sub_agents_dir
+    );
+    // session_id 对应的目录应在 sub-agents/ 下。
+    assert!(
+        sub_session_dirs
+            .iter()
+            .any(|e| e.file_name() == std::ffi::OsStr::new(&session_id)),
+        "session_id dir {:?} should exist under sub-agents/, found: {:?}",
+        session_id,
+        sub_session_dirs
+            .iter()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn restore_keeps_session_under_same_task_dir() {
+    // 不变量:restore 用调用方传入的 task_id 构造 engine,而 run_llm_step 用
+    // self.task_id.0 组装 <task_id>/<step_id>-<attempt_seq>/ 前缀 → restore 后
+    // 新 session 落在与原 run 相同的 <task_id>/ 目录下。
+    //
+    // 注:brief 原文用 new_free_task 跑完首 run 再 restore,但 new_free_task 单步
+    // 流程跑完即 Succeeded(终态),run() 拒绝在 Succeeded 上再跑(InvalidStatus)。
+    // 改为按现有 restore 测试模式(running_restore_continues_from_transition_target)
+    // 手动 seed 一个 Running state:s1 已完成、transition To s2、current_step=s1,
+    // 模拟"首 run 跑了 s1 后崩溃"。restore + run 执行 s2,产生真实 session。
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("restore-path-consistency".into());
+
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: None,
+        }],
+    };
+    // s1 已完成、transition To s2;status=Running 模拟崩溃后恢复。
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Running;
+    state.started_at = Some(chrono::Utc::now());
+    state.step_history = vec![completed_record(
+        "s1",
+        "step1 done",
+        Transition::To("s2".into()),
+    )];
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+
+    // restore 同一 task_id:engine 沿用传入的 task_id。
+    struct AbortOnS2;
+    impl StepTransitionJudge for AbortOnS2 {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            Box::pin(async move {
+                if step_id == "s1" {
+                    Transition::To("s2".into())
+                } else {
+                    Transition::Abort {
+                        reason: "done".into(),
+                    }
+                }
+            })
+        }
+    }
+    let config = WorkflowEngineConfig {
+        client: Arc::new(MockLlmClient::new(vec![MockResponse::text("step2 done")])),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let restored = WorkflowEngine::restore(store, task_id.clone(), config, Arc::new(AbortOnS2))
+        .await
+        .unwrap();
+    // restore 保留了传入的 task_id。
+    assert_eq!(restored.task_id(), &task_id);
+    restored.run().await.unwrap();
+    assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+
+    // 核心断言:sessions/ 下存在 <task_id.0>/ 目录(restore 保留 task_id,
+    // run_llm_step 用 self.task_id.0 组装前缀 → session 落在同一 <task_id>/ 下)。
+    let task_dir = dir.path().join("sessions").join(&task_id.0);
+    assert!(
+        task_dir.is_dir(),
+        "session dir {:?} should exist under sessions/",
+        task_dir
+    );
+
+    // <task_id>/ 下应有 run_llm_step 创建的 <step_id>-<attempt_seq>/ 子目录
+    // (s2 的 attempt_seq=1,因 step_history 仅含 s1)。不强求具体名,只要至少
+    // 一个子目录即证明 session 落在 <task_id>/ 下。
+    let session_subdirs: Vec<_> = std::fs::read_dir(&task_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .collect();
+    assert!(
+        !session_subdirs.is_empty(),
+        "at least one session subdir should exist under {:?}",
+        task_dir
+    );
+}

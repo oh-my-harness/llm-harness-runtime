@@ -420,7 +420,8 @@ impl SessionFactory for NoOpSessionFactory {
 
 /// 基于 JSONL 文件的 `SessionFactory` 实现。
 ///
-/// 每次 `create()` 在 `<base_dir>/sub-agents/` 下创建新的 session 目录。
+/// 每次 `create()` 在传入的 `base_dir` 下创建新的 session 目录。
+/// 调用方负责拼好完整路径前缀（如 `<task_id>/<step_id>-<attempt>/`）。
 pub struct JsonlSessionFactory;
 
 impl SessionFactory for JsonlSessionFactory {
@@ -429,7 +430,7 @@ impl SessionFactory for JsonlSessionFactory {
         base_dir: &Path,
         model: &str,
     ) -> BoxFuture<'_, Result<SessionCreateResult, AgentError>> {
-        let session_dir = base_dir.join("sub-agents");
+        let session_dir = base_dir.to_path_buf();
         let model = model.to_string();
         Box::pin(async move {
             tokio::fs::create_dir_all(&session_dir)

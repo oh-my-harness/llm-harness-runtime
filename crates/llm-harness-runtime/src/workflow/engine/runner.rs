@@ -659,9 +659,10 @@ impl super::WorkflowEngine {
         &self,
         step: &Step,
         step_abort: CancellationToken,
+        policy_attempt: usize,
     ) -> Result<StepResult, WorkflowError> {
         match step {
-            Step::Llm { .. } => self.run_llm_step(step, step_abort).await,
+            Step::Llm { .. } => self.run_llm_step(step, step_abort, policy_attempt).await,
             Step::Executor { .. } => self.run_executor_step(step, step_abort).await,
         }
     }
@@ -689,7 +690,7 @@ impl super::WorkflowEngine {
             }
             let attempt_abort = step_abort.child_token();
             let result = self
-                .run_step_attempt(step, attempt_abort.clone(), timeout)
+                .run_step_attempt(step, attempt_abort.clone(), timeout, attempt as usize)
                 .await;
             match result {
                 Ok(result) => return Ok(result),
@@ -727,14 +728,15 @@ impl super::WorkflowEngine {
         step: &Step,
         attempt_abort: CancellationToken,
         timeout: Option<Duration>,
+        policy_attempt: usize,
     ) -> Result<StepResult, WorkflowError> {
         let Some(timeout) = timeout else {
-            return self.run_step(step, attempt_abort).await;
+            return self.run_step(step, attempt_abort, policy_attempt).await;
         };
         tokio::select! {
             biased;
             _ = attempt_abort.cancelled() => Err(WorkflowError::StepAborted { id: step.id().to_string() }),
-            result = self.run_step(step, attempt_abort.clone()) => result,
+            result = self.run_step(step, attempt_abort.clone(), policy_attempt) => result,
             _ = tokio::time::sleep(timeout) => {
                 attempt_abort.cancel();
                 Err(WorkflowError::StepTimeout {
@@ -801,6 +803,7 @@ impl super::WorkflowEngine {
         &self,
         step: &Step,
         step_abort: CancellationToken,
+        policy_attempt: usize,
     ) -> Result<StepResult, WorkflowError> {
         let Step::Llm {
             prompt,
@@ -815,14 +818,33 @@ impl super::WorkflowEngine {
         };
         // 记录真实开始时间（用于 StepRecord）。
         let started_at = chrono::Utc::now();
-
         // a. 构造 env + session。
+        //    session 路径按 <task_id>/<step_id>-<attempt_seq>/ 隔离:
+        //    attempt_seq = step_history 中同 step_id 的 record 数 + policy_attempt
+        //    (本次 StepRecord 尚未 push,push 发生在 apply_transition)。
+        //    policy_attempt 从 1 开始:首次执行 = +1 (向后兼容);
+        //    policy retry 时无 record push,需靠 policy_attempt 递增避免路径碰撞。
+        //    judge Retry 会先 push record,故下一轮 history_count 已 +1。
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let env = self.config.env_factory.create(&cwd)?;
+        let attempt_seq = {
+            let state = self.workflow_state.lock().await;
+            state
+                .step_history
+                .iter()
+                .filter(|r| r.step_id == *step.id())
+                .count()
+                + policy_attempt
+        };
+        let session_dir = self
+            .config
+            .session_base_dir
+            .join(&self.task_id.0)
+            .join(format!("{}-{}", step.id(), attempt_seq));
         let (storage, session_id) = self
             .config
             .session_factory
-            .create(&self.config.session_base_dir, &self.config.model)
+            .create(&session_dir, &self.config.model)
             .await?;
 
         // b. 构造 builder。
@@ -857,7 +879,7 @@ impl super::WorkflowEngine {
         )> = if allowed_tools.iter().any(|t| t == SPAWN_AGENT_TOOL_NAME) {
             let bus = crate::spawn::message_bus::message_bus_pair();
             let async_hook = crate::spawn::delivery::async_spawn_pair(bus.clone());
-            let spawner = Arc::new(self.build_step_spawner(bus.clone()));
+            let spawner = Arc::new(self.build_step_spawner(bus.clone(), step.id(), attempt_seq));
             // Register the main agent on the bus. The main_id must match
             // what MessageMainTool / AwaitSubagentReplyTool use.
             bus.register(
@@ -1148,14 +1170,25 @@ impl super::WorkflowEngine {
     }
 
     /// 构造 step 内部 fan-out 用的 spawner（局部对象，step 结束丢弃）。
-    fn build_step_spawner(
+    ///
+    /// `step_id` + `attempt_seq` 用于拼 sub-agent session 路径:
+    /// `<session_base_dir>/<task_id>/<step_id>-<attempt_seq>/sub-agents/`。
+    pub(super) fn build_step_spawner(
         &self,
         bus: Arc<crate::spawn::message_bus::MessageBus>,
+        step_id: &StepId,
+        attempt_seq: usize,
     ) -> HarnessSubAgentSpawner {
+        let sub_agent_base = self
+            .config
+            .session_base_dir
+            .join(&self.task_id.0)
+            .join(format!("{}-{}", step_id, attempt_seq))
+            .join("sub-agents");
         HarnessSubAgentSpawner::new(
             self.config.model.clone(),
             self.config.client.clone(),
-            self.config.session_base_dir.clone(),
+            sub_agent_base,
             bus,
             |_cwd, _bus, _agent_id| Box::new(NoopPlugin),
         )
