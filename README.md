@@ -57,6 +57,8 @@ cargo run -p session-viewer --bin session_viewer -- /path/to/sessions [--port PO
 python -m senza.viewer /path/to/sessions [--port PORT]
 ```
 
+The Python viewer delegates JSONL parsing to the Rust `session-viewer` crate via `senza.read_sessions()` — no duplicate parsing logic.
+
 ```python
 import senza.viewer
 senza.viewer.serve("/path/to/sessions")  # blocks, opens browser
