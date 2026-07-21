@@ -13,6 +13,7 @@ members = [
     "crates/llm-harness-runtime-audit-jsonl",
     # pyo3 sdk
     # crates/llm-harness-py — 已迁移到 Senza 仓库 (github.com/oh-my-harness/Senza)
+    "crates/llm-harness-runtime-trace-otel",
     "crates/session-viewer",
     # examples
     # coding-agent is now a separate repo: https://github.com/oh-my-harness/coding-agent.git
