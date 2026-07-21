@@ -8,14 +8,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::lifecycle::task::{Checkpoint, TaskId};
-use crate::workflow::model::{Workflow, WorkflowState};
+use crate::workflow::model::{StepId, Workflow, WorkflowState, WorkflowStatus};
 use anyhow::Result;
 
 /// 事件等待记录（descriptor + runtime 写入的时间戳）。
@@ -26,6 +26,34 @@ pub struct EventWaitRecord {
     pub descriptor: Value,
     /// runtime 在 save_event_wait 时写入的 UTC 时间戳。
     pub saved_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Task 摘要（`list_tasks()` 返回）。
+///
+/// 包含从 `<task_id>/workflow.json` 读取的进度摘要信息，不含完整
+/// step_history 或 checkpoint payload。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSummary {
+    /// Task ID（形如 `task-<uuid>`）。
+    pub task_id: TaskId,
+    /// 生命周期状态（Idle/Running/Paused/Succeeded/Failed/Cancelled）。
+    pub status: WorkflowStatus,
+    /// 当前步骤。
+    pub current_step: StepId,
+    /// 已完成步骤数（step_history 长度）。
+    pub step_count: usize,
+    /// 启动时间（status != Idle 时有值）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// 结束时间（status ∈ {Succeeded, Failed, Cancelled} 时有值）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    /// 暂停/失败/取消原因。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 规划此 workflow 的 task ID（两阶段 LLM 场景）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_by: Option<TaskId>,
 }
 
 /// Task 持久化存储抽象。单进程独占（无需跨进程锁）。
@@ -71,6 +99,12 @@ pub trait TaskStore: Send + Sync {
 
     /// 清理（可选，task 完成后调用）。
     fn delete(&self, task_id: &TaskId) -> BoxFuture<'_, Result<()>>;
+
+    /// 枚举 store 中所有 task，返回摘要列表。
+    ///
+    /// 扫描 `base_dir` 的子目录，读取每个 `<task_id>/workflow.json` 获取
+    /// 状态摘要。无法读取的目录（损坏的 json、非 task 目录）会被跳过。
+    fn list_tasks(&self) -> BoxFuture<'_, Result<Vec<TaskSummary>>>;
 }
 
 /// 基于 JSONL 文件的 `TaskStore` 参考实现。
@@ -326,6 +360,64 @@ impl TaskStore for JsonlTaskStore {
             result
         })
     }
+
+    fn list_tasks(&self) -> BoxFuture<'_, Result<Vec<TaskSummary>>> {
+        Box::pin(async move {
+            let mut summaries = Vec::new();
+            // Scan base_dir for subdirectories — each is a potential task.
+            let mut entries = match tokio::fs::read_dir(&self.base_dir).await {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // base_dir doesn't exist yet — no tasks.
+                    return Ok(summaries);
+                }
+                Err(e) => return Err(e.into()),
+            };
+
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                // Extract task_id from directory name.
+                let task_id_str = match path.file_name().and_then(|n| n.to_str()) {
+                    Some(name) => name.to_string(),
+                    None => continue,
+                };
+                let task_id = TaskId(task_id_str);
+                if Self::validate_task_id(&task_id).is_err() {
+                    continue;
+                }
+
+                // Read workflow.json for the state summary.
+                let workflow_path = path.join("workflow.json");
+                let json = match tokio::fs::read_to_string(&workflow_path).await {
+                    Ok(json) => json,
+                    Err(_) => continue,
+                };
+                let state: WorkflowState = match serde_json::from_str(&json) {
+                    Ok(state) => state,
+                    Err(_) => continue,
+                };
+
+                summaries.push(TaskSummary {
+                    task_id,
+                    status: state.status,
+                    current_step: state.current_step,
+                    step_count: state.step_history.len(),
+                    started_at: state.started_at,
+                    ended_at: state.ended_at,
+                    reason: state.reason,
+                    planned_by: state.planned_by,
+                });
+            }
+
+            // Sort by started_at descending (most recent first).
+            summaries.sort_by_key(|t| std::cmp::Reverse(t.started_at));
+
+            Ok(summaries)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -457,5 +549,87 @@ mod tests {
         store.delete(&id).await.unwrap();
         assert!(store.load_workflow(&id).await.unwrap().is_none());
         assert!(store.load_workflow_state(&id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_tasks_empty_when_no_dir() {
+        let (_dir, store) = make_store();
+        let tasks = store.list_tasks().await.unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_tasks_returns_all_tasks() {
+        let (_dir, store) = make_store();
+        let id1 = TaskId("task-aaa".into());
+        let id2 = TaskId("task-bbb".into());
+
+        let mut state1 = WorkflowState::new("s1".into());
+        state1.status = WorkflowStatus::Succeeded;
+        state1.started_at = Some(Utc::now());
+        store.save_workflow_state(&id1, &state1).await.unwrap();
+
+        let state2 = WorkflowState::new("s1".into());
+        store.save_workflow_state(&id2, &state2).await.unwrap();
+
+        let tasks = store.list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 2);
+
+        // All tasks have correct ids
+        let ids: Vec<String> = tasks.iter().map(|t| t.task_id.0.clone()).collect();
+        assert!(ids.contains(&"task-aaa".to_string()));
+        assert!(ids.contains(&"task-bbb".to_string()));
+
+        // task-aaa should have Succeeded status
+        let task1 = tasks.iter().find(|t| t.task_id.0 == "task-aaa").unwrap();
+        assert_eq!(task1.status, WorkflowStatus::Succeeded);
+        assert!(task1.started_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn list_tasks_skips_corrupt_dirs() {
+        let (dir, store) = make_store();
+        let id = TaskId("task-good".into());
+        store
+            .save_workflow_state(&id, &WorkflowState::new("s1".into()))
+            .await
+            .unwrap();
+
+        // Create a corrupt task dir with invalid workflow.json
+        let bad_dir = dir.path().join("task-bad");
+        tokio::fs::create_dir_all(&bad_dir).await.unwrap();
+        tokio::fs::write(bad_dir.join("workflow.json"), "not json")
+            .await
+            .unwrap();
+
+        // Create a dir without workflow.json (not a task)
+        let empty_dir = dir.path().join("task-empty");
+        tokio::fs::create_dir_all(&empty_dir).await.unwrap();
+
+        let tasks = store.list_tasks().await.unwrap();
+        // Only the good task should be listed
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id.0, "task-good");
+    }
+
+    #[tokio::test]
+    async fn list_tasks_sorted_by_started_at_desc() {
+        let (_dir, store) = make_store();
+        let id1 = TaskId("task-old".into());
+        let id2 = TaskId("task-new".into());
+
+        let mut state1 = WorkflowState::new("s1".into());
+        state1.started_at = Some(Utc::now() - chrono::Duration::hours(1));
+        store.save_workflow_state(&id1, &state1).await.unwrap();
+
+        let mut state2 = WorkflowState::new("s1".into());
+        state2.started_at = Some(Utc::now());
+        store.save_workflow_state(&id2, &state2).await.unwrap();
+
+        let tasks = store.list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 2);
+        // Most recent first
+        assert_eq!(tasks[0].task_id.0, "task-new");
+        assert_eq!(tasks[1].task_id.0, "task-old");
     }
 }
