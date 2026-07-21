@@ -28,7 +28,7 @@ pub(crate) fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 pub(crate) fn structured_preview(value: &Value) -> String {
     let serialized = serde_json::to_string(value)
-        .unwrap_or_else(|err| format!("\"<failed to serialize structured result: {err}\""));
+        .unwrap_or_else(|err| format!("\"<failed to serialize structured result: {err}>\""));
     truncate_chars(&serialized, STEP_HISTORY_STRUCTURED_PREVIEW_CHARS)
 }
 
