@@ -555,6 +555,12 @@ pub enum Transition {
     Fail { reason: String },
     /// 终止流程。
     Abort { reason: String },
+    /// 暂停流程，等待外部恢复。reason 记录暂停原因。
+    ///
+    /// judge 在路由决策时可返回此变体主动暂停（对齐 LangGraph interrupt），
+    /// 而非只能通过外部 `engine.pause()` 信号触发。两者最终落到同一个
+    /// `Paused` 状态，走同一个 `resume()` 恢复路径。
+    Pause { reason: String },
 }
 
 #[cfg(test)]

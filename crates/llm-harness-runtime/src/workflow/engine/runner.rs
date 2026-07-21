@@ -419,6 +419,11 @@ impl super::WorkflowEngine {
                                 state.current_step = next;
                             }
                             Transition::Retry => {}
+                            Transition::Pause { reason } => {
+                                // 上次进程在 judge 返回 Pause 后异常退出。
+                                // 状态已为 Paused，无需覆盖。
+                                action = StartupAction::Fail(reason);
+                            }
                         }
                     }
                 }
@@ -582,6 +587,14 @@ impl super::WorkflowEngine {
                 (Transition::Retry, _) => {
                     // current_step 不变，重跑。
                     self.pause_if_requested().await?;
+                }
+                (Transition::Pause { reason }, _) => {
+                    // judge 主动暂停（对齐 LangGraph interrupt）。
+                    // 状态已在 apply_transition 中置为 Paused，这里发事件 + bail。
+                    let _ = self.event_tx.send(WorkflowEvent::Paused {
+                        reason: reason.clone(),
+                    });
+                    return Err(WorkflowError::Paused(reason));
                 }
             }
         }
@@ -1312,6 +1325,14 @@ impl super::WorkflowEngine {
                 Ok(None)
             }
             Transition::Abort { .. } => {
+                let snapshot = state.clone();
+                drop(state);
+                self.persist_state(&snapshot).await?;
+                Ok(None)
+            }
+            Transition::Pause { reason } => {
+                state.status = WorkflowStatus::Paused;
+                state.reason = Some(reason.clone());
                 let snapshot = state.clone();
                 drop(state);
                 self.persist_state(&snapshot).await?;
