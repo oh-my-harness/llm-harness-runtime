@@ -33,8 +33,42 @@ crates/
 ├── llm-harness-runtime-sandbox-*/  # sandbox backends (bwrap, seatbelt, os)
 ├── llm-harness-runtime-mcp/        # MCP integration
 ├── llm-harness-runtime-audit-jsonl/ # audit logging
-└── llm-harness-runtime-trace-otel/  # OpenTelemetry tracing
+├── llm-harness-runtime-trace-otel/  # OpenTelemetry tracing
+└── session-viewer/         # session viewer (visualize JsonlSessionRepo sessions)
 ```
+
+---
+
+## Session Viewer
+
+`session-viewer` visualizes agent sessions persisted by `JsonlSessionRepo` (the shared persistence layer used by both Senza and `llm-harness-runtime`). It reads the on-disk format (`meta.json` + `entries.jsonl`) directly — no runtime crate dependency — and renders a self-contained HTML page in the browser.
+
+### Rust (this repo)
+
+```bash
+cargo run -p session-viewer --bin session_viewer -- /path/to/sessions [--port PORT]
+```
+
+`<dir>` may be a sessions root (containing `<session_id>/` subdirs) or a single session directory.
+
+### Python (Senza)
+
+```bash
+python -m senza.viewer /path/to/sessions [--port PORT]
+```
+
+```python
+import senza.viewer
+senza.viewer.serve("/path/to/sessions")  # blocks, opens browser
+```
+
+### Features
+
+- Session tree with branch switching (active branch highlighted)
+- Message rendering: user / assistant / tool-result, with collapsible thinking and tool-use blocks
+- Token usage stats (input / output / reasoning / cache)
+- Config entries: model change, thinking level, active tools, compaction, labels, branch points
+- Image content inlined as base64
 
 ## Versioning
 

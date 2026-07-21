@@ -22,17 +22,25 @@ fn make_harness_with_response_format(rf: Option<ResponseFormat>) -> AgentHarness
 
 /// Build a `PrepareNextTurnCtx` with a trivial text assistant message and
 /// no tool results — enough to satisfy the hook signature.
-fn make_ctx<'a>() -> PrepareNextTurnCtx<'a> {
-    let assistant =
-        llm_harness_loop::test_utils::test_assistant_message(vec![ContentBlock::Text {
-            text: "x".into(),
-        }]);
-    let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+///
+/// `assistant` and `results` are borrowed from the caller to avoid returning
+/// references to local variables.
+fn make_ctx<'a>(
+    assistant: &'a AssistantMessage,
+    results: &'a [(String, Result<ToolResult, ToolError>)],
+) -> PrepareNextTurnCtx<'a> {
     PrepareNextTurnCtx {
         turn_index: 0,
-        last_message: &assistant,
-        last_tool_results: &results,
+        last_message: assistant,
+        last_tool_results: results,
     }
+}
+
+/// Helper: build a trivial assistant message for tests.
+fn test_assistant() -> AssistantMessage {
+    llm_harness_loop::test_utils::test_assistant_message(vec![ContentBlock::Text {
+        text: "x".into(),
+    }])
 }
 
 #[tokio::test]
@@ -45,7 +53,9 @@ async fn default_prepare_next_turn_threads_state_response_format() {
         user_hook: None,
     };
 
-    let directive = hook.prepare(make_ctx()).await.unwrap();
+    let assistant = test_assistant();
+    let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+    let directive = hook.prepare(make_ctx(&assistant, &results)).await.unwrap();
     assert_eq!(
         directive.response_format,
         Some(Some(ResponseFormat::JsonObject)),
@@ -64,7 +74,9 @@ async fn default_prepare_next_turn_threads_none_response_format() {
         user_hook: None,
     };
 
-    let directive = hook.prepare(make_ctx()).await.unwrap();
+    let assistant = test_assistant();
+    let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+    let directive = hook.prepare(make_ctx(&assistant, &results)).await.unwrap();
     assert_eq!(
         directive.response_format,
         Some(None),
@@ -79,7 +91,7 @@ impl PrepareNextTurnHook for StaticRfHook {
         &'a self,
         _ctx: PrepareNextTurnCtx<'a>,
     ) -> futures::future::BoxFuture<'a, Result<NextTurnDirective, AgentError>> {
-        let rf = self.0;
+        let rf = self.0.clone();
         Box::pin(async move {
             Ok(NextTurnDirective {
                 context: None,
@@ -109,7 +121,9 @@ async fn default_prepare_next_turn_user_hook_overrides_response_format() {
         user_hook: Some(Arc::new(StaticRfHook(Some(Some(json_schema.clone()))))),
     };
 
-    let directive = hook.prepare(make_ctx()).await.unwrap();
+    let assistant = test_assistant();
+    let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+    let directive = hook.prepare(make_ctx(&assistant, &results)).await.unwrap();
     assert_eq!(
         directive.response_format,
         Some(Some(json_schema)),
@@ -127,7 +141,9 @@ async fn default_prepare_next_turn_user_hook_none_preserves_base() {
         user_hook: Some(Arc::new(StaticRfHook(None))),
     };
 
-    let directive = hook.prepare(make_ctx()).await.unwrap();
+    let assistant = test_assistant();
+    let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+    let directive = hook.prepare(make_ctx(&assistant, &results)).await.unwrap();
     assert_eq!(
         directive.response_format,
         Some(Some(ResponseFormat::JsonObject)),
@@ -145,7 +161,9 @@ async fn default_prepare_next_turn_user_hook_clears_response_format() {
         user_hook: Some(Arc::new(StaticRfHook(Some(None)))),
     };
 
-    let directive = hook.prepare(make_ctx()).await.unwrap();
+    let assistant = test_assistant();
+    let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+    let directive = hook.prepare(make_ctx(&assistant, &results)).await.unwrap();
     assert_eq!(
         directive.response_format,
         Some(None),

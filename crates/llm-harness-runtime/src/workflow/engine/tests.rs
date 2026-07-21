@@ -264,7 +264,7 @@ fn step_history_summary_total_budget_drops_oldest() {
         records.push(completed_record(
             &format!("step_{i}"),
             &output,
-            Transition::To(format!("step_{}", i + 1).into()),
+            Transition::To(format!("step_{}", i + 1)),
         ));
     }
     let summary = format_step_history_summary(&records);
