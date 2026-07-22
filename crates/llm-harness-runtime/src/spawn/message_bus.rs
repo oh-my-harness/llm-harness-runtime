@@ -446,6 +446,15 @@ impl MessageBus {
             .insert(agent_id.to_string(), token);
     }
 
+    pub(crate) fn unregister_subagent_abort(&self, agent_id: &str) {
+        self.subagent_aborts.lock().remove(agent_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registered_abort_count(&self) -> usize {
+        self.subagent_aborts.lock().len()
+    }
+
     /// Cancel a specific sub-agent's abort token (if registered).
     pub fn abort_agent(&self, id: &str) {
         if let Some(token) = self.subagent_aborts.lock().get(id) {

@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use futures::future::BoxFuture;
 use llm_harness_types::{
-    AfterProviderResponseHook, AfterToolCallCtx, AfterToolCallDecision, AfterToolCallHook,
-    AfterTurnCtx, AfterTurnHook, BeforeProviderRequestHook, ProviderResponseInfo, StreamOptions,
+    AfterProviderResponseCtx, AfterProviderResponseHook, AfterToolCallCtx, AfterToolCallDecision,
+    AfterToolCallHook, AfterTurnCtx, AfterTurnHook, BeforeProviderRequestCtx,
+    BeforeProviderRequestHook,
 };
 
 use crate::observability::tracer::{
@@ -177,7 +178,7 @@ impl TracingHookAdapter {
 }
 
 impl BeforeProviderRequestHook for TracingHookAdapter {
-    fn before_request<'a>(&'a self, _opts: &'a mut StreamOptions) -> BoxFuture<'a, ()> {
+    fn before_request<'a>(&'a self, _ctx: BeforeProviderRequestCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let mut spans = self.active_spans.lock().unwrap();
             if let Some(turn_idx) = spans.current_turn_index {
@@ -197,8 +198,9 @@ impl BeforeProviderRequestHook for TracingHookAdapter {
 }
 
 impl AfterProviderResponseHook for TracingHookAdapter {
-    fn after_response<'a>(&'a self, info: &'a ProviderResponseInfo) -> BoxFuture<'a, ()> {
+    fn after_response<'a>(&'a self, ctx: AfterProviderResponseCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            let info = ctx.info;
             let mut attrs = HashMap::new();
             attrs.insert(
                 "gen_ai.usage.input_tokens".into(),

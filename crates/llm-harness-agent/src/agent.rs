@@ -431,12 +431,14 @@ impl Agent {
             let final_answer_mode = inner.state.final_answer_mode.clone();
             let messages = inner.state.messages.clone();
             let max_tokens = inner.max_tokens;
+            let run = Arc::new(RunContext::new(RunRequest::new(initial.clone())));
 
             let ctx = AgentContext {
                 system_prompt: snapshot.system_prompt,
                 messages,
             };
             let config = LoopConfig {
+                run,
                 model: snapshot.model,
                 max_tokens,
                 temperature: snapshot.temperature,
@@ -643,6 +645,12 @@ mod tests {
     #[tokio::test]
     async fn clear_steering_queue_drains_pending_messages() {
         let agent = make_agent(vec![MockResponse::text("response")]);
+
+        // Agent 在 Idle 时没有 active loop receiver；为这个队列单元测试
+        // 安装一个存活的 receiver，避免把 Closed channel 当成待清理队列。
+        let cap = agent.inner.lock().unwrap().queue_capacity;
+        let (steer_tx, _steer_rx) = mpsc::channel(cap);
+        agent.inner.lock().unwrap().steer_tx = steer_tx;
 
         // Enqueue a steer message while Idle, then drain it.
         agent

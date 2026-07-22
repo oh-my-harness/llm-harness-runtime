@@ -25,11 +25,17 @@ fn make_harness_with_response_format(rf: Option<ResponseFormat>) -> AgentHarness
 ///
 /// `assistant` and `results` are borrowed from the caller to avoid returning
 /// references to local variables.
+fn test_run() -> &'static llm_harness_types::RunContext {
+    static RUN: std::sync::OnceLock<llm_harness_types::RunContext> = std::sync::OnceLock::new();
+    RUN.get_or_init(|| llm_harness_types::RunContext::new(llm_harness_types::RunRequest::default()))
+}
+
 fn make_ctx<'a>(
     assistant: &'a AssistantMessage,
     results: &'a [(String, Result<ToolResult, ToolError>)],
 ) -> PrepareNextTurnCtx<'a> {
     PrepareNextTurnCtx {
+        run: test_run(),
         turn_index: 0,
         last_message: assistant,
         last_tool_results: results,

@@ -66,8 +66,14 @@ fn make_assistant() -> AssistantMessage {
     m
 }
 
+fn test_run() -> &'static llm_harness_types::RunContext {
+    static RUN: std::sync::OnceLock<llm_harness_types::RunContext> = std::sync::OnceLock::new();
+    RUN.get_or_init(|| llm_harness_types::RunContext::new(llm_harness_types::RunRequest::default()))
+}
+
 fn make_ctx<'a>(assistant: &'a AssistantMessage) -> ShouldStopCtx<'a> {
     ShouldStopCtx {
+        run: test_run(),
         last_assistant: assistant,
         stop_reason: StopReason::EndTurn,
         turn_index: 0,

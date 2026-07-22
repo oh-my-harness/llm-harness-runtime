@@ -53,6 +53,7 @@ impl AgentHarness {
 
     pub(super) async fn run_before_run_hook(
         &self,
+        run: &RunContext,
         mut initial: Vec<AgentMessage>,
     ) -> Result<Vec<AgentMessage>, HarnessError> {
         if self.hooks.before_run.is_empty() {
@@ -84,6 +85,7 @@ impl AgentHarness {
         let mut system_prompt = self.inner.lock().unwrap().state.system_prompt.clone();
         let result = composite
             .before_run(BeforeRunCtx {
+                run,
                 prompt_text: &prompt_text,
                 initial_messages: &mut initial,
                 system_prompt: &mut system_prompt,
@@ -102,6 +104,7 @@ impl AgentHarness {
 
     fn build_loop_config(
         &self,
+        run: Arc<RunContext>,
         steer_rx: mpsc::Receiver<AgentMessage>,
         follow_up_rx: mpsc::Receiver<AgentMessage>,
         abort: CancellationToken,
@@ -178,6 +181,7 @@ impl AgentHarness {
         });
 
         LoopConfig {
+            run,
             model,
             max_tokens,
             temperature,
@@ -217,7 +221,11 @@ impl AgentHarness {
         }
     }
 
-    pub(super) async fn run_loop(&self, initial: Vec<AgentMessage>) -> Result<(), HarnessError> {
+    pub(super) async fn run_loop(
+        &self,
+        run: Arc<RunContext>,
+        initial: Vec<AgentMessage>,
+    ) -> Result<(), HarnessError> {
         // 1. Setup: channels, abort token, system prompt, hooks.
         let (steer_rx, follow_up_rx, abort, system_prompt, original_tools, async_hook, watcher) = {
             let mut inner = self.inner.lock().unwrap();
@@ -240,7 +248,7 @@ impl AgentHarness {
         }
 
         let result = self
-            .drive_loop(initial, steer_rx, follow_up_rx, abort, system_prompt)
+            .drive_loop(run, initial, steer_rx, follow_up_rx, abort, system_prompt)
             .await;
 
         // Cleanup always runs, success or failure.
@@ -284,6 +292,7 @@ impl AgentHarness {
 
     async fn drive_loop(
         &self,
+        run: Arc<RunContext>,
         initial: Vec<AgentMessage>,
         steer_rx: mpsc::Receiver<AgentMessage>,
         follow_up_rx: mpsc::Receiver<AgentMessage>,
@@ -301,7 +310,7 @@ impl AgentHarness {
         };
 
         // 3. Build LoopConfig.
-        let config = self.build_loop_config(steer_rx, follow_up_rx, abort.clone());
+        let config = self.build_loop_config(run.clone(), steer_rx, follow_up_rx, abort.clone());
 
         // 4. Drive the stream. Push initial messages to pending before the loop starts
         //    (AgentStart is a signal-only event; initial messages are persisted here).
@@ -333,6 +342,7 @@ impl AgentHarness {
                         };
                         composite
                             .before_turn(BeforeTurnCtx {
+                                run: &run,
                                 turn_index: *index,
                                 snapshot: &snapshot,
                             })
@@ -427,6 +437,7 @@ impl AgentHarness {
                             Arc::new(CompositeAfterTurnHook::new(self.hooks.after_turn.clone()));
                         composite
                             .after_turn(AfterTurnCtx {
+                                run: &run,
                                 turn_index: *index,
                                 new_messages: &turn_messages,
                             })

@@ -193,6 +193,9 @@ mod tests {
         use tokio_util::sync::CancellationToken;
 
         let ctx = ToolContext {
+            run: Arc::new(llm_harness_types::RunContext::new(
+                llm_harness_types::RunRequest::default(),
+            )),
             env: Arc::new(UnsupportedEnv::new()),
             abort: CancellationToken::new(),
             tool_use_id: "t1".into(),

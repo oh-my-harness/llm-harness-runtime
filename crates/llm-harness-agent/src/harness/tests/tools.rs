@@ -1,6 +1,148 @@
 use super::*;
 
 #[tokio::test]
+async fn run_request_context_is_shared_by_hooks_and_tools() {
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone)]
+    struct AccessMarker(&'static str);
+
+    #[derive(Clone, Copy)]
+    enum Observer {
+        BeforeRun,
+        Tool,
+        AfterTool,
+    }
+
+    type Observation = (Observer, RunId, String);
+
+    struct CaptureBeforeRun(Arc<StdMutex<Vec<Observation>>>);
+    impl BeforeRunHook for CaptureBeforeRun {
+        fn before_run<'a>(
+            &'a self,
+            ctx: BeforeRunCtx<'a>,
+        ) -> futures::future::BoxFuture<'a, Result<BeforeRunResult, AgentError>> {
+            let id = ctx.run.id();
+            let marker = ctx
+                .run
+                .extension::<AccessMarker>()
+                .expect("access marker must reach BeforeRun")
+                .0
+                .to_string();
+            self.0
+                .lock()
+                .unwrap()
+                .push((Observer::BeforeRun, id, marker));
+            Box::pin(async {
+                Ok(BeforeRunResult {
+                    additional_messages: vec![],
+                    system_prompt: None,
+                })
+            })
+        }
+    }
+
+    struct CaptureTool {
+        observations: Arc<StdMutex<Vec<Observation>>>,
+        schema: serde_json::Value,
+    }
+    impl Tool for CaptureTool {
+        fn name(&self) -> &str {
+            "capture_run"
+        }
+        fn description(&self) -> &str {
+            "captures the current run context"
+        }
+        fn parameters_schema(&self) -> &serde_json::Value {
+            &self.schema
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: serde_json::Value,
+            ctx: &'a ToolContext,
+        ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolError>> {
+            let id = ctx.run.id();
+            let marker = ctx
+                .run
+                .extension::<AccessMarker>()
+                .expect("access marker must reach ToolContext")
+                .0
+                .to_string();
+            self.observations
+                .lock()
+                .unwrap()
+                .push((Observer::Tool, id, marker));
+            Box::pin(async {
+                Ok(ToolResult {
+                    content: vec![ContentBlock::Text { text: "ok".into() }],
+                    details: serde_json::Value::Null,
+                    terminate: false,
+                })
+            })
+        }
+    }
+
+    struct CaptureAfterTool(Arc<StdMutex<Vec<Observation>>>);
+    impl AfterToolCallHook for CaptureAfterTool {
+        fn on_complete<'a>(
+            &'a self,
+            ctx: AfterToolCallCtx<'a>,
+        ) -> futures::future::BoxFuture<'a, AfterToolCallDecision> {
+            let id = ctx.run.id();
+            let marker = ctx
+                .run
+                .extension::<AccessMarker>()
+                .expect("access marker must reach AfterToolCall")
+                .0
+                .to_string();
+            self.0
+                .lock()
+                .unwrap()
+                .push((Observer::AfterTool, id, marker));
+            Box::pin(async { AfterToolCallDecision::Passthrough })
+        }
+    }
+
+    let observations = Arc::new(StdMutex::new(Vec::new()));
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::tool_use("id-1", "capture_run", "{}"),
+        MockResponse::text("done"),
+    ]));
+    let env = Arc::new(NoOpEnv);
+    let opts = AgentHarnessOptions {
+        tools: vec![Arc::new(CaptureTool {
+            observations: observations.clone(),
+            schema: serde_json::json!({"type":"object","properties":{}}),
+        })],
+        hooks: HarnessHooks {
+            before_run: vec![Arc::new(CaptureBeforeRun(observations.clone()))],
+            after_tool_call: vec![Arc::new(CaptureAfterTool(observations.clone()))],
+            ..HarnessHooks::none()
+        },
+        ..AgentHarnessOptions::new("test-model")
+    };
+    let harness = AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await;
+
+    harness
+        .run(RunRequest::from_text("use capture_run").with_extension(AccessMarker("tenant-a")))
+        .await
+        .unwrap();
+
+    let observations = observations.lock().unwrap();
+    assert_eq!(observations.len(), 3);
+    assert!(matches!(observations[0].0, Observer::BeforeRun));
+    assert!(matches!(observations[1].0, Observer::Tool));
+    assert!(matches!(observations[2].0, Observer::AfterTool));
+    let expected_id = observations[0].1;
+    assert!(observations.iter().all(|(_, id, _)| *id == expected_id));
+    assert!(
+        observations
+            .iter()
+            .all(|(_, _, marker)| marker == "tenant-a")
+    );
+}
+
+#[tokio::test]
 async fn tool_call_end_event_carries_tool_name() {
     use std::sync::Mutex as StdMutex;
 

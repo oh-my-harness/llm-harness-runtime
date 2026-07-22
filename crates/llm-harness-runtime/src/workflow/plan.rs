@@ -617,6 +617,9 @@ mod tests {
 
     fn make_tool_ctx() -> ToolContext {
         ToolContext {
+            run: Arc::new(llm_harness_types::RunContext::new(
+                llm_harness_types::RunRequest::default(),
+            )),
             env: Arc::new(llm_harness_loop::test_utils::NoOpEnv),
             abort: CancellationToken::new(),
             tool_use_id: "tu_1".into(),

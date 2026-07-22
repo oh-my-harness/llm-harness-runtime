@@ -183,12 +183,7 @@ impl AgentHarness {
 
     /// Start a new run from a text prompt.
     pub async fn prompt(&self, text: impl Into<String>) -> Result<(), HarnessError> {
-        let text = text.into();
-        let user_msg = AgentMessage::User(UserMessage {
-            content: vec![ContentBlock::Text { text: text.clone() }],
-            timestamp: chrono::Utc::now(),
-        });
-        self.prompt_with_messages(vec![user_msg]).await
+        self.run(RunRequest::from_text(text)).await
     }
 
     /// Start a new run with an explicit initial message list.
@@ -204,6 +199,14 @@ impl AgentHarness {
         &self,
         messages: Vec<AgentMessage>,
     ) -> Result<(), HarnessError> {
+        self.run(RunRequest::new(messages)).await
+    }
+
+    /// Start a new run from an explicit request and its typed extensions.
+    pub async fn run(&self, request: RunRequest) -> Result<(), HarnessError> {
+        let run = Arc::new(RunContext::new(request));
+        let messages = run.initial_messages().to_vec();
+
         // 1. Guard Idle phase; consume queued_next_turn; clone watcher.
         let (queued, watcher) = {
             let mut inner = self.inner.lock().unwrap();
@@ -228,10 +231,10 @@ impl AgentHarness {
         let initial: Vec<AgentMessage> = queued.into_iter().chain(messages).collect();
 
         // 3. before_run hook.
-        let initial = self.run_before_run_hook(initial).await?;
+        let initial = self.run_before_run_hook(&run, initial).await?;
 
         // 4. Drive the loop.
-        self.run_loop(initial).await
+        self.run_loop(run, initial).await
     }
 
     /// Expand `name` as a skill invocation and start a run.
@@ -771,7 +774,9 @@ impl AgentHarness {
         // a sub-agent completion. The completion result (if any) is now in
         // `initial` and will be persisted by run_loop. Auto-compaction runs at
         // prompt_with_messages entry instead.
-        self.run_loop(initial).await
+        let run = Arc::new(RunContext::new(RunRequest::new(initial)));
+        let initial = run.initial_messages().to_vec();
+        self.run_loop(run, initial).await
     }
 
     /// Buffer a text message to be injected at the start of the next `prompt()`.

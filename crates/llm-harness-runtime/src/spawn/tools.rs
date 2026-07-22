@@ -775,6 +775,9 @@ mod tests {
         let env: Arc<dyn ExecutionEnv> = Arc::new(NoOpEnv);
         let (update_tx, _update_rx) = tokio::sync::mpsc::channel(8);
         ToolContext {
+            run: Arc::new(llm_harness_types::RunContext::new(
+                llm_harness_types::RunRequest::default(),
+            )),
             env,
             abort: CancellationToken::new(),
             tool_use_id: "test".into(),
@@ -790,6 +793,9 @@ mod tests {
         let env: Arc<dyn ExecutionEnv> = Arc::new(NoOpEnv);
         let (update_tx, _update_rx) = tokio::sync::mpsc::channel(8);
         ToolContext {
+            run: Arc::new(llm_harness_types::RunContext::new(
+                llm_harness_types::RunRequest::default(),
+            )),
             env,
             abort,
             tool_use_id: "test".into(),

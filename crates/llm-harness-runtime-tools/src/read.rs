@@ -344,7 +344,8 @@ fn format_output(
 
     let mut out = String::new();
     if let Some(tag) = tag {
-        out.push_str(&format!("[{}#{}]\n", path.display(), tag));
+        let display_path = path.to_string_lossy().replace('\\', "/");
+        out.push_str(&format!("[{display_path}#{tag}]\n"));
     }
     for (i, line) in lines.iter().enumerate() {
         let line_no = display_start + i + 1;
@@ -421,6 +422,9 @@ mod tests {
     fn make_ctx(env: Arc<MockExecutionEnv>) -> ToolContext {
         let (tx, _rx) = mpsc::channel(1);
         ToolContext {
+            run: Arc::new(llm_harness_types::RunContext::new(
+                llm_harness_types::RunRequest::default(),
+            )),
             env,
             abort: CancellationToken::new(),
             tool_use_id: "tu_read".into(),

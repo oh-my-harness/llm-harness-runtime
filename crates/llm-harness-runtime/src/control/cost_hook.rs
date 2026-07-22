@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 use llm_harness_types::{
-    AfterProviderResponseHook, CostAggregate, PricingProvider, ProviderResponseInfo,
+    AfterProviderResponseCtx, AfterProviderResponseHook, CostAggregate, PricingProvider,
 };
 
 /// Accumulates token usage and cost from each provider response into a shared
@@ -47,8 +47,9 @@ impl CostAccumulatorHook {
 }
 
 impl AfterProviderResponseHook for CostAccumulatorHook {
-    fn after_response<'a>(&'a self, info: &'a ProviderResponseInfo) -> BoxFuture<'a, ()> {
+    fn after_response<'a>(&'a self, ctx: AfterProviderResponseCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            let info = ctx.info;
             let Some(usage) = &info.usage else {
                 return;
             };
@@ -101,7 +102,10 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_types::{TokenPrice, TokenUsage};
+    use llm_harness_types::{
+        AfterProviderResponseCtx, ProviderResponseInfo, RunContext, RunRequest, TokenPrice,
+        TokenUsage,
+    };
 
     struct FixedPricing;
     impl PricingProvider for FixedPricing {
@@ -139,6 +143,16 @@ mod tests {
         }
     }
 
+    async fn record_response(hook: &CostAccumulatorHook, info: &ProviderResponseInfo) {
+        let run = RunContext::new(RunRequest::default());
+        hook.after_response(AfterProviderResponseCtx {
+            run: &run,
+            turn_index: 0,
+            info,
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn accumulates_token_counts_without_pricing() {
         let cost = Arc::new(Mutex::new(CostAggregate::default()));
@@ -151,8 +165,7 @@ mod tests {
             cache_creation_tokens: 100,
             reasoning_tokens: 300,
         };
-        hook.after_response(&make_info(usage, "claude-sonnet", "anthropic"))
-            .await;
+        record_response(&hook, &make_info(usage, "claude-sonnet", "anthropic")).await;
 
         let c = hook.current_cost();
         assert_eq!(c.total_input_tokens, 1000);
@@ -176,8 +189,7 @@ mod tests {
             cache_creation_tokens: 0,
             reasoning_tokens: 0,
         };
-        hook.after_response(&make_info(usage, "claude-sonnet", "anthropic"))
-            .await;
+        record_response(&hook, &make_info(usage, "claude-sonnet", "anthropic")).await;
 
         let c = hook.current_cost();
         assert!(
@@ -207,10 +219,8 @@ mod tests {
             input_tokens: 500_000,
             ..Default::default()
         };
-        hook.after_response(&make_info(u1, "claude-sonnet", "anthropic"))
-            .await;
-        hook.after_response(&make_info(u2, "claude-sonnet", "anthropic"))
-            .await;
+        record_response(&hook, &make_info(u1, "claude-sonnet", "anthropic")).await;
+        record_response(&hook, &make_info(u2, "claude-sonnet", "anthropic")).await;
 
         let c = hook.current_cost();
         assert_eq!(c.total_input_tokens, 1_000_000);
@@ -232,7 +242,7 @@ mod tests {
             model: Some("claude-sonnet".into()),
             provider: Some("anthropic".into()),
         };
-        hook.after_response(&info).await;
+        record_response(&hook, &info).await;
 
         let c = hook.current_cost();
         assert_eq!(c.total_input_tokens, 0);
@@ -253,8 +263,7 @@ mod tests {
             cache_creation_tokens: 0,
             reasoning_tokens: 0,
         };
-        hook.after_response(&make_info_no_provider(usage, "claude-sonnet"))
-            .await;
+        record_response(&hook, &make_info_no_provider(usage, "claude-sonnet")).await;
 
         let c = hook.current_cost();
         assert!(
@@ -283,8 +292,7 @@ mod tests {
             cache_creation_tokens: 100,
             reasoning_tokens: 50,
         };
-        hook.after_response(&make_info(usage, "claude-sonnet", "anthropic"))
-            .await;
+        record_response(&hook, &make_info(usage, "claude-sonnet", "anthropic")).await;
 
         let c = hook.current_cost();
         let mc = c

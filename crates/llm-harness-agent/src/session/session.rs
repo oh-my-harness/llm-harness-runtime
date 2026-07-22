@@ -687,6 +687,10 @@ mod tests {
         // Verify the orphan entry is gone.
         let entries = session.storage.all_entries().await.unwrap();
         assert!(
+            entries.iter().any(|e| e.id == root),
+            "shared root must remain after deleting the alternate subtree"
+        );
+        assert!(
             !entries.iter().any(|e| e.id == turn3_alt),
             "turn3_alt (child of deleted alt_leaf) must be removed"
         );
