@@ -120,31 +120,46 @@ impl Session {
         Ok(bp_id)
     }
 
-    /// Delete the branch ending at `leaf`.
+    /// Delete the branch rooted at `leaf` and its entire subtree.
     ///
-    /// Walks up via `parent_id`, collecting entries to delete until it hits a
-    /// parent that has other children (shared ancestor). The shared ancestor is
-    /// preserved. If the active cursor was on a deleted entry, it is reset to
-    /// the nearest surviving ancestor.
+    /// First collects all descendants of `leaf` (subtree), then walks up via
+    /// `parent_id`, collecting ancestor entries until it hits a parent that
+    /// has other children (shared ancestor). The shared ancestor is preserved.
+    /// If the active cursor was on a deleted entry, it is reset to the nearest
+    /// surviving ancestor.
     pub async fn delete_branch(&self, leaf: EntryId) -> Result<(), SessionError> {
         let mut to_delete: Vec<EntryId> = Vec::new();
-        let mut current = leaf;
 
+        // 1. Collect all descendants of `leaf` (subtree, top-down).
+        let mut stack = vec![leaf];
+        while let Some(id) = stack.pop() {
+            to_delete.push(id);
+            let children = self.storage.children(id).await?;
+            for child in children {
+                stack.push(child.id);
+            }
+        }
+
+        // 2. Walk up from `leaf`, collecting ancestor chain until a shared ancestor.
+        let mut current = leaf;
         loop {
             let entry = self
                 .storage
                 .get_entry(current)
                 .await?
                 .ok_or(SessionError::EntryNotFound(current))?;
-            to_delete.push(current);
             match entry.parent_id {
                 None => break, // reached root
                 Some(parent_id) => {
+                    if to_delete.contains(&parent_id) {
+                        break; // already collected as a descendant
+                    }
                     let siblings = self.storage.children(parent_id).await?;
                     if siblings.len() > 1 {
                         // Parent has other children — stop before deleting it.
                         break;
                     }
+                    to_delete.push(parent_id);
                     current = parent_id;
                 }
             }
@@ -627,5 +642,57 @@ mod tests {
         let branches = session.list_branches().await.unwrap();
         assert_eq!(branches.len(), 1, "only branch B should remain");
         assert_eq!(branches[0].leaf_id, b_leaf);
+    }
+
+    /// Regression: delete_branch on a node with children must delete the
+    /// entire subtree, not just the node itself. Without the fix, children
+    /// become orphans (parent_id points to a deleted entry), causing
+    /// list_branches to fail with EntryNotFound.
+    ///
+    /// Tree shape:
+    ///   root → turn1 → turn2_main (main_leaf)
+    ///                ↘ fork → alt_leaf → turn3_alt
+    ///
+    /// delete_branch(alt_leaf) must delete [alt_leaf, turn3_alt] + the
+    /// unique ancestor chain up to turn1 (which is shared, so preserved).
+    /// After deletion, only the main branch should remain.
+    #[tokio::test]
+    async fn delete_branch_with_subtree_no_orphan() {
+        let session = make_session().await;
+        let root = session.append_message(user_msg("root")).await.unwrap();
+        let turn1 = session
+            .append_message(assistant_msg("turn1"))
+            .await
+            .unwrap();
+        let main_leaf = session.append_message(assistant_msg("main")).await.unwrap();
+
+        // Fork from turn1, then extend the forked branch.
+        let alt_leaf = session.fork_branch(turn1, None).await.unwrap();
+        session.navigate_to(alt_leaf).await.unwrap();
+        let turn3_alt = session
+            .append_message(assistant_msg("alt_turn3"))
+            .await
+            .unwrap();
+
+        // Navigate back to main branch, then delete the alt branch root.
+        // alt_leaf is NOT a true leaf — it has child turn3_alt.
+        session.navigate_to(main_leaf).await.unwrap();
+        session.delete_branch(alt_leaf).await.unwrap();
+
+        // list_branches must not fail with EntryNotFound.
+        let branches = session.list_branches().await.unwrap();
+        assert_eq!(branches.len(), 1, "only main branch should remain");
+        assert_eq!(branches[0].leaf_id, main_leaf);
+
+        // Verify the orphan entry is gone.
+        let entries = session.storage.all_entries().await.unwrap();
+        assert!(
+            !entries.iter().any(|e| e.id == turn3_alt),
+            "turn3_alt (child of deleted alt_leaf) must be removed"
+        );
+        assert!(
+            !entries.iter().any(|e| e.id == alt_leaf),
+            "alt_leaf must be removed"
+        );
     }
 }
