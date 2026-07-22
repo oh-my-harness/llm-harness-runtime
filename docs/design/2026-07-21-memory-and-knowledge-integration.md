@@ -1688,6 +1688,22 @@ memory.capture.skipped/completed/failed
 | Transient Attachment | 在一个明确 capability 中 opt-in 自动召回 | 资料当前 run 可见且不进 Session |
 | Workflow/Subagent delegation | 研究流程按 step/subagent 收窄知识能力 | 未授权 Tool/source 不可访问 |
 
+#### A1 下游兼容性审计（2026-07-22）
+
+以 `llm-tutor` 提交 `07afabb` 为基线，将其六个 runtime 依赖从固定的
+`e200c12`（0.2.0）切换到本地 0.3.0 workspace 后执行
+`cargo check -p tutor-agent`。检查确认 `llm-tutor` 没有直接实现 A1 改签名的
+`TransformContextHook`、`BeforeProviderRequestHook` 或 `AfterProviderResponseHook`，
+但完整升级仍被既有的 0.2→0.3 breaking changes 阻塞：
+
+- `control::human_approval` 已不在 0.3 runtime 中；
+- `SYNC_SPAWN_TOOL_NAME` 已不在 0.3 types 根模块中；
+- `ConvertToLlmHook` 的输出类型与 `llm-tutor` 固定的旧 `llm_adapter` revision 不一致。
+
+因此 A1 不声明 `llm-tutor` 已可直接升级，也不在 runtime 中恢复旧模块、常量或双套
+Hook 签名。`llm-tutor` 在采用任何 Knowledge/Memory 切片前，必须先用单独迁移提交完成
+0.3 baseline 升级；该迁移应直接采用最终 API，并删除被替代的 0.2 调用点。
+
 如果迁移需要在 `llm-tutor` 中复制 runtime 生命周期、解析魔法 metadata 或维护厚适配层，
 暂停迁移并修改 runtime 协议。迁移 PR 必须包含边界测试，并记录与旧产品行为的
 差异。

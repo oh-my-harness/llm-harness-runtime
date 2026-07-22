@@ -587,6 +587,38 @@ mod tests {
         }
     }
 
+    /// Session factory that suspends inside `create()` until its caller drops
+    /// the future. Tests use it to exercise cancellation at a real await point.
+    struct BlockingSessionFactory {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl BlockingSessionFactory {
+        fn new() -> Self {
+            Self {
+                entered: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        async fn wait_until_entered(&self) {
+            self.entered.notified().await;
+        }
+    }
+
+    impl SessionFactory for BlockingSessionFactory {
+        fn create(
+            &self,
+            _base_dir: &Path,
+            _model: &str,
+        ) -> BoxFuture<'_, Result<SessionCreateResult, AgentError>> {
+            let entered = self.entered.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                std::future::pending::<Result<SessionCreateResult, AgentError>>().await
+            })
+        }
+    }
+
     // ── NoopPlugin ─────────────────────────────────────────────────────────────
 
     struct NoopPlugin;
@@ -993,6 +1025,50 @@ mod tests {
             0,
             "dropped future must free its slot"
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_spawn_future_during_session_create_cleans_pending_state() {
+        let bus = message_bus_pair();
+        let factory = Arc::new(BlockingSessionFactory::new());
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let dir = tempfile::tempdir().unwrap();
+        let spawner = HarnessSubAgentSpawner::new(
+            "test-model",
+            client,
+            dir.path().to_path_buf(),
+            bus.clone(),
+            |_, _, _| Box::new(NoopPlugin),
+        )
+        .env_factory(Arc::new(NoopEnvFactory))
+        .session_factory(factory.clone())
+        .max_concurrent(Some(1));
+        let opts = SpawnOptions {
+            prompt: "say hi".into(),
+            provider: ProviderSelection::Inherit,
+            cwd: None,
+            context: ContextMode::None,
+        };
+
+        let spawn_task = tokio::spawn(async move { spawner.spawn_async(opts).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            factory.wait_until_entered(),
+        )
+        .await
+        .expect("spawn must reach SessionFactory::create");
+
+        assert_eq!(bus.in_flight_count(), 1);
+        assert_eq!(bus.registered_abort_count(), 1);
+        bus.cancel_all();
+
+        spawn_task.abort();
+        let join_error = spawn_task
+            .await
+            .expect_err("dropping the in-flight spawn must cancel its task");
+        assert!(join_error.is_cancelled());
+        assert_eq!(bus.in_flight_count(), 0);
+        assert_eq!(bus.registered_abort_count(), 0);
     }
 
     /// max_concurrent with successful spawn: in_flight must return to 0

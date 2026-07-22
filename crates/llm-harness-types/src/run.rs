@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     fmt,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use chrono::{DateTime, Utc};
@@ -68,7 +68,7 @@ impl<'de> Deserialize<'de> for RunId {
 ///
 /// 该类型不实现 `Serialize` 或 `Debug`，避免认证上下文等请求数据被通用日志或
 /// Session 持久化意外输出。`RunContext` 创建后只暴露只读访问。
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct RunExtensions {
     values: HashMap<TypeId, SharedRunValue>,
 }
@@ -134,14 +134,18 @@ impl RunLocalState {
         Self::default()
     }
 
+    fn lock_values(&self) -> MutexGuard<'_, HashMap<TypeId, SharedRunValue>> {
+        self.values
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// 插入或替换一种类型的状态，返回被替换的旧值。
     pub fn insert<T>(&self, value: T) -> Option<Arc<T>>
     where
         T: Send + Sync + 'static,
     {
-        self.values
-            .lock()
-            .unwrap()
+        self.lock_values()
             .insert(TypeId::of::<T>(), Arc::new(value))
             .and_then(|value| value.downcast::<T>().ok())
     }
@@ -151,9 +155,7 @@ impl RunLocalState {
     where
         T: Send + Sync + 'static,
     {
-        self.values
-            .lock()
-            .unwrap()
+        self.lock_values()
             .get(&TypeId::of::<T>())
             .cloned()
             .and_then(|value| value.downcast::<T>().ok())
@@ -164,7 +166,7 @@ impl RunLocalState {
     where
         T: Send + Sync + 'static,
     {
-        let mut values = self.values.lock().unwrap();
+        let mut values = self.lock_values();
         let type_id = TypeId::of::<T>();
         if let Some(value) = values.get(&type_id) {
             return value
@@ -180,12 +182,12 @@ impl RunLocalState {
 
     /// 返回当前状态类型数量。
     pub fn len(&self) -> usize {
-        self.values.lock().unwrap().len()
+        self.lock_values().len()
     }
 
     /// 返回状态容器是否为空。
     pub fn is_empty(&self) -> bool {
-        self.values.lock().unwrap().is_empty()
+        self.lock_values().is_empty()
     }
 }
 
@@ -231,15 +233,15 @@ impl RunRequest {
 /// `Serialize` 或 `Debug`。
 pub struct RunContext {
     /// 本次 run 的唯一标识。
-    pub id: RunId,
+    id: RunId,
     /// 本次 run 的创建时间。
-    pub started_at: DateTime<Utc>,
+    started_at: DateTime<Utc>,
     /// 应用请求中的原始输入，不包含 Hook 或 runtime 后续注入的内容。
-    pub initial_messages: Arc<[AgentMessage]>,
+    initial_messages: Arc<[AgentMessage]>,
     /// 应用提供的只读 typed 请求上下文。
-    pub extensions: RunExtensions,
+    extensions: RunExtensions,
     /// runtime 和 Plugin 使用的单次 run typed state。
-    pub local: RunLocalState,
+    local: RunLocalState,
 }
 
 impl RunContext {
@@ -252,6 +254,42 @@ impl RunContext {
             extensions: request.extensions,
             local: RunLocalState::new(),
         }
+    }
+
+    /// 返回本次 run 的唯一标识。
+    pub fn id(&self) -> RunId {
+        self.id
+    }
+
+    /// 返回本次 run 的创建时间。
+    pub fn started_at(&self) -> &DateTime<Utc> {
+        &self.started_at
+    }
+
+    /// 返回应用请求中的原始输入消息。
+    pub fn initial_messages(&self) -> &[AgentMessage] {
+        &self.initial_messages
+    }
+
+    /// 读取应用提供的一种 typed request extension。
+    pub fn extension<T>(&self) -> Option<&T>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.extensions.get::<T>()
+    }
+
+    /// 克隆应用提供的一种共享 typed request extension。
+    pub fn extension_arc<T>(&self) -> Option<Arc<T>>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.extensions.get_arc::<T>()
+    }
+
+    /// 返回本次 run 的进程内 typed state。
+    pub fn local(&self) -> &RunLocalState {
+        &self.local
     }
 }
 
@@ -287,17 +325,6 @@ mod tests {
     }
 
     #[test]
-    fn cloned_extensions_share_values() {
-        let mut extensions = RunExtensions::new();
-        extensions.insert(String::from("shared"));
-        let cloned = extensions.clone();
-
-        let left = extensions.get_arc::<String>().unwrap();
-        let right = cloned.get_arc::<String>().unwrap();
-        assert!(Arc::ptr_eq(&left, &right));
-    }
-
-    #[test]
     fn local_state_initializes_each_type_once() {
         let local = RunLocalState::new();
         let calls = AtomicUsize::new(0);
@@ -316,17 +343,30 @@ mod tests {
     }
 
     #[test]
+    fn local_state_recovers_after_initializer_panics() {
+        let local = RunLocalState::new();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            local.get_or_insert_with::<String>(|| panic!("initializer failed"));
+        }));
+        assert!(panic.is_err());
+
+        let recovered = local.get_or_insert_with(|| String::from("recovered"));
+        assert_eq!(recovered.as_str(), "recovered");
+        assert_eq!(local.len(), 1);
+    }
+
+    #[test]
     fn run_context_freezes_request_input_and_extensions() {
         let context = RunContext::new(
             RunRequest::from_text("hello").with_extension(AccessContext("tenant-a")),
         );
 
-        assert_eq!(context.initial_messages.len(), 1);
+        assert_eq!(context.initial_messages().len(), 1);
         assert_eq!(
-            context.extensions.get::<AccessContext>(),
+            context.extension::<AccessContext>(),
             Some(&AccessContext("tenant-a"))
         );
-        assert!(context.local.is_empty());
+        assert!(context.local().is_empty());
     }
 
     #[test]

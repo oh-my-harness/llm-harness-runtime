@@ -205,7 +205,7 @@ impl AgentHarness {
     /// Start a new run from an explicit request and its typed extensions.
     pub async fn run(&self, request: RunRequest) -> Result<(), HarnessError> {
         let run = Arc::new(RunContext::new(request));
-        let messages = run.initial_messages.iter().cloned().collect::<Vec<_>>();
+        let messages = run.initial_messages().to_vec();
 
         // 1. Guard Idle phase; consume queued_next_turn; clone watcher.
         let (queued, watcher) = {
@@ -775,7 +775,7 @@ impl AgentHarness {
         // `initial` and will be persisted by run_loop. Auto-compaction runs at
         // prompt_with_messages entry instead.
         let run = Arc::new(RunContext::new(RunRequest::new(initial)));
-        let initial = run.initial_messages.iter().cloned().collect();
+        let initial = run.initial_messages().to_vec();
         self.run_loop(run, initial).await
     }
 

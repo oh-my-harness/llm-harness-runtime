@@ -22,11 +22,10 @@ async fn run_request_context_is_shared_by_hooks_and_tools() {
             &'a self,
             ctx: BeforeRunCtx<'a>,
         ) -> futures::future::BoxFuture<'a, Result<BeforeRunResult, AgentError>> {
-            let id = ctx.run.id;
+            let id = ctx.run.id();
             let marker = ctx
                 .run
-                .extensions
-                .get::<AccessMarker>()
+                .extension::<AccessMarker>()
                 .expect("access marker must reach BeforeRun")
                 .0
                 .to_string();
@@ -62,11 +61,10 @@ async fn run_request_context_is_shared_by_hooks_and_tools() {
             _args: serde_json::Value,
             ctx: &'a ToolContext,
         ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolError>> {
-            let id = ctx.run.id;
+            let id = ctx.run.id();
             let marker = ctx
                 .run
-                .extensions
-                .get::<AccessMarker>()
+                .extension::<AccessMarker>()
                 .expect("access marker must reach ToolContext")
                 .0
                 .to_string();
@@ -90,11 +88,10 @@ async fn run_request_context_is_shared_by_hooks_and_tools() {
             &'a self,
             ctx: AfterToolCallCtx<'a>,
         ) -> futures::future::BoxFuture<'a, AfterToolCallDecision> {
-            let id = ctx.run.id;
+            let id = ctx.run.id();
             let marker = ctx
                 .run
-                .extensions
-                .get::<AccessMarker>()
+                .extension::<AccessMarker>()
                 .expect("access marker must reach AfterToolCall")
                 .0
                 .to_string();
