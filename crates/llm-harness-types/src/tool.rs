@@ -4,7 +4,7 @@ use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{AssistantMessage, ContentBlock, ExecutionEnv, ToolError};
+use crate::{AssistantMessage, ContentBlock, ExecutionEnv, RunContext, ToolError};
 
 /// 工具执行结果。
 #[derive(Debug, Clone)]
@@ -193,6 +193,8 @@ pub fn check_tool_name_conflicts(tools: &[Arc<dyn Tool>]) -> Result<(), String> 
 
 /// Tool 执行上下文，每次调用时由 loop 构造后传入。
 pub struct ToolContext {
+    /// 当前 tool call 所属的 run 上下文。
+    pub run: Arc<RunContext>,
     /// 执行环境（文件系统 + shell）。
     pub env: Arc<dyn ExecutionEnv>,
     /// 用户取消信号。

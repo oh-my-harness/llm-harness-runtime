@@ -481,11 +481,14 @@ pub fn resolve_skill_resource(
             .canonicalize()
             .map_err(|e| format!("failed to canonicalize source: {e}")),
         Some(rel) => {
-            if Path::new(rel)
-                .components()
-                .any(|c| c == std::path::Component::ParentDir)
-                || Path::new(rel).is_absolute()
-            {
+            if Path::new(rel).components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            }) {
                 return Err("path traversal or absolute path not allowed".into());
             }
             let resolved = skill.base_dir.join(rel);
@@ -894,6 +897,9 @@ mod tests {
     #[cfg(feature = "test-utils")]
     fn make_test_ctx(tmp: &Path) -> ToolContext {
         ToolContext {
+            run: Arc::new(llm_harness_types::RunContext::new(
+                llm_harness_types::RunRequest::default(),
+            )),
             env: Arc::new(OsEnv::new(tmp)),
             abort: CancellationToken::new(),
             tool_use_id: "test".into(),

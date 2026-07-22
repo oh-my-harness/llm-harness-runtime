@@ -929,6 +929,9 @@ async fn spawn_agent_tool_e2e_test() {
     let env: Arc<dyn ExecutionEnv> = Arc::new(NoOpEnv);
     let (update_tx, _update_rx) = tokio::sync::mpsc::channel(8);
     let ctx = ToolContext {
+        run: Arc::new(llm_harness_types::RunContext::new(
+            llm_harness_types::RunRequest::default(),
+        )),
         env,
         abort: CancellationToken::new(),
         tool_use_id: "test-call".into(),

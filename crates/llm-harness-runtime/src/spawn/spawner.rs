@@ -81,6 +81,44 @@ pub struct HarnessSubAgentSpawner {
     max_concurrent: Option<usize>,
 }
 
+/// Owns the provisional cancellation registration and in-flight slot while a
+/// sub-agent is being constructed. Dropping the spawn future must release both;
+/// async tool cancellation can drop it at any await point without returning an
+/// error through the normal control flow.
+struct PendingSpawnReservation {
+    bus: Arc<MessageBus>,
+    pending_id: String,
+    slot_acquired: bool,
+}
+
+impl PendingSpawnReservation {
+    fn new(bus: Arc<MessageBus>, pending_id: String) -> Self {
+        Self {
+            bus,
+            pending_id,
+            slot_acquired: false,
+        }
+    }
+
+    fn mark_slot_acquired(&mut self) {
+        self.slot_acquired = true;
+    }
+
+    fn commit(mut self) {
+        self.bus.unregister_subagent_abort(&self.pending_id);
+        self.slot_acquired = false;
+    }
+}
+
+impl Drop for PendingSpawnReservation {
+    fn drop(&mut self) {
+        self.bus.unregister_subagent_abort(&self.pending_id);
+        if self.slot_acquired {
+            self.bus.release_slot();
+        }
+    }
+}
+
 impl HarnessSubAgentSpawner {
     /// 创建新的 spawner。
     ///
@@ -168,9 +206,18 @@ impl HarnessSubAgentSpawner {
     /// harness 被包裹在 `Arc` 中：一个 clone 注册到 `MessageBus` 的 `AgentEntry`，
     /// 另一个 clone move 进 tokio::spawn task。所有 harness 方法取 `&self`，
     /// 因此 `Arc<AgentHarness>` 直接可用于 `subscribe()` / `steer()` / `prompt()`。
+    #[cfg(test)]
     fn spawn_inner(
         &self,
         opts: SpawnOptions,
+    ) -> BoxFuture<'_, Result<(SubAgentHandle, String), AgentError>> {
+        self.spawn_inner_with_abort(opts, CancellationToken::new())
+    }
+
+    fn spawn_inner_with_abort(
+        &self,
+        opts: SpawnOptions,
+        abort_token: CancellationToken,
     ) -> BoxFuture<'_, Result<(SubAgentHandle, String), AgentError>> {
         let default_model = self.default_model.clone();
         let default_client = self.default_client.clone();
@@ -187,6 +234,10 @@ impl HarnessSubAgentSpawner {
         let builder_customize = self.builder_customize.clone();
 
         async move {
+            if abort_token.is_cancelled() {
+                return Err(AgentError::Aborted);
+            }
+
             // 1. 解析 provider。
             let (client, model) = match &opts.provider {
                 ProviderSelection::Inherit => (default_client.clone(), default_model),
@@ -209,6 +260,9 @@ impl HarnessSubAgentSpawner {
             // 3. 创建 session（通过 SessionFactory，不写死后端）。
             //    先创建 session 以获得 session_id，再传给 plugin factory。
             let (storage, session_id) = session_factory.create(&session_base_dir, &model).await?;
+            if abort_token.is_cancelled() {
+                return Err(AgentError::Aborted);
+            }
 
             // 4. 创建 sub-agent plugin（不含 SpawnAgentTool）。
             //    传 bus 克隆：plugin 可据此注册通信工具。
@@ -239,9 +293,8 @@ impl HarnessSubAgentSpawner {
                 }
             };
 
-            // 8. 创建 abort token。预注册到 bus 的 subagent_aborts，
-            //    使 cancel_all 可在 spawn 后、track insert 前触发时覆盖。
-            let abort_token = CancellationToken::new();
+            // 8. 注册 abort token。spawn_async 在进入异步构建前还会用临时 ID
+            //    预注册同一个 token，以覆盖 session_id 尚未生成的窗口。
             bus.register_subagent_abort(&session_id, abort_token.clone());
             // 注册到 agent registry，使 bus 可 steer / subscribe。
             bus.register(
@@ -360,6 +413,14 @@ impl HarnessSubAgentSpawner {
         let bus = self.message_bus.clone();
         let max_concurrent = self.max_concurrent;
         Box::pin(async move {
+            // Register cancellation before exposing the in-flight slot. Otherwise
+            // abort() can observe in_flight=1 while spawn_inner is still creating
+            // the session and miss the not-yet-registered token.
+            let pending_id = format!("pending-spawn-{}", uuid::Uuid::new_v4());
+            let abort_token = CancellationToken::new();
+            bus.register_subagent_abort(&pending_id, abort_token.clone());
+            let mut reservation = PendingSpawnReservation::new(bus.clone(), pending_id);
+
             // Atomically acquire an in-flight slot before spawning to close
             // the TOCTOU window: concurrent spawn_async calls (parallel tool
             // execution) would each pass the old check-then-act test.
@@ -374,13 +435,15 @@ impl HarnessSubAgentSpawner {
                 }
                 None => bus.acquire_slot(),
             }
-            let (handle, session_id) = match self.spawn_inner(opts).await {
-                Ok(v) => v,
-                Err(e) => {
-                    bus.release_slot();
-                    return Err(e);
-                }
-            };
+            reservation.mark_slot_acquired();
+            let (handle, session_id) =
+                match self.spawn_inner_with_abort(opts, abort_token.clone()).await {
+                    Ok(v) => v,
+                    Err(e) => return Err(e),
+                };
+            // spawn_inner has registered the same token under session_id, so
+            // removing the temporary key does not open a cancellation gap.
+            reservation.commit();
             let async_handle = bus.track_with_oneshot(handle, session_id);
             Ok(async_handle.agent_id().to_string())
         })
@@ -909,6 +972,27 @@ mod tests {
             .expect("should succeed after failure released the slot");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(bus.in_flight_count(), 0);
+    }
+
+    #[test]
+    fn pending_spawn_reservation_is_cancelled_and_releases_slot_on_drop() {
+        let bus = message_bus_pair();
+        let token = CancellationToken::new();
+        let pending_id = "pending-test".to_string();
+        bus.register_subagent_abort(&pending_id, token.clone());
+        bus.acquire_slot();
+
+        let mut reservation = PendingSpawnReservation::new(bus.clone(), pending_id);
+        reservation.mark_slot_acquired();
+        bus.cancel_all();
+
+        assert!(token.is_cancelled(), "abort must reach a pending spawn");
+        drop(reservation);
+        assert_eq!(
+            bus.in_flight_count(),
+            0,
+            "dropped future must free its slot"
+        );
     }
 
     /// max_concurrent with successful spawn: in_flight must return to 0

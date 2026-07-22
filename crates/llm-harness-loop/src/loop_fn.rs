@@ -196,7 +196,14 @@ fn run_loop(
 
             // TransformContextHook
             if let Some(h) = &config.transform_context {
-                match h.transform(ctx).await {
+                match h
+                    .transform(TransformContextCtx {
+                        run: &config.run,
+                        turn_index,
+                        context: ctx,
+                    })
+                    .await
+                {
                     Ok(new_ctx) => ctx = new_ctx,
                     Err(e) => {
                         yield AgentEvent::Error(e);
@@ -251,7 +258,12 @@ fn run_loop(
             // BeforeProviderRequestHook: allow callers to modify stream options.
             let mut stream_opts = config.stream_options.clone();
             if let Some(h) = &config.before_provider_request {
-                h.before_request(&mut stream_opts).await;
+                h.before_request(BeforeProviderRequestCtx {
+                    run: &config.run,
+                    turn_index,
+                    options: &mut stream_opts,
+                })
+                .await;
             }
 
             // Call LLM (with optional retry on transient errors)
@@ -366,7 +378,12 @@ fn run_loop(
                     model: assistant_msg.model.clone(),
                     provider: assistant_msg.provider.clone(),
                 };
-                h.after_response(&info).await;
+                h.after_response(AfterProviderResponseCtx {
+                    run: &config.run,
+                    turn_index,
+                    info: &info,
+                })
+                .await;
             }
 
             let assistant_agent_msg = AgentMessage::Assistant(assistant_msg.clone());
@@ -422,6 +439,7 @@ fn run_loop(
                 }
 
                 let assistant_arc = Arc::new(assistant_msg.clone());
+                let run = config.run.clone();
                 let env = config.env.clone();
                 let abort = config.abort.clone();
                 let turn_idx = turn_index;
@@ -455,6 +473,7 @@ fn run_loop(
                             });
 
                             ToolContext {
+                                run: run.clone(),
                                 env: env.clone(),
                                 abort: abort.clone(),
                                 tool_use_id,
@@ -572,6 +591,7 @@ fn run_loop(
                 // Call PrepareNextTurnHook before consuming results into TurnEnd
                 if !should_terminate && let Some(h) = &config.prepare_next_turn {
                     match h.prepare(PrepareNextTurnCtx {
+                        run: &config.run,
                         turn_index,
                         last_message: &assistant_msg,
                         last_tool_results: &results,
@@ -637,6 +657,7 @@ fn run_loop(
 
             let should_stop = if let Some(h) = &config.should_stop {
                 h.should_stop(ShouldStopCtx {
+                    run: &config.run,
                     last_assistant: &assistant_msg,
                     stop_reason,
                     turn_index,
@@ -662,6 +683,7 @@ fn run_loop(
             // should_stop = false → call PrepareNextTurnHook and continue
             if let Some(h) = &config.prepare_next_turn {
                 match h.prepare(PrepareNextTurnCtx {
+                    run: &config.run,
                     turn_index,
                     last_message: &assistant_msg,
                     last_tool_results: &[],
@@ -738,6 +760,7 @@ mod tests {
     fn make_config(responses: Vec<MockResponse>) -> (Arc<MockLlmClient>, LoopConfig) {
         let client = Arc::new(MockLlmClient::new(responses));
         let cfg = LoopConfig {
+            run: Arc::new(RunContext::new(RunRequest::default())),
             model: "test-model".into(),
             max_tokens: 1024,
             temperature: None,

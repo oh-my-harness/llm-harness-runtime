@@ -197,11 +197,13 @@ mod tests {
         ];
         let env_clone = env.clone();
         let msg_clone = assistant_message.clone();
+        let run = Arc::new(RunContext::new(RunRequest::default()));
         let results = execute_tool_batch(
             calls,
             move |tool_use_id| {
                 let (tx, _) = mpsc::channel(1);
                 ToolContext {
+                    run: run.clone(),
                     env: env_clone.clone(),
                     abort: CancellationToken::new(),
                     tool_use_id,

@@ -46,9 +46,17 @@ mod tests {
     use crate::rules::rule::Rule;
     use llm_harness_types::AssistantMessage;
 
+    fn test_run() -> &'static llm_harness_types::RunContext {
+        static RUN: std::sync::OnceLock<llm_harness_types::RunContext> = std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            llm_harness_types::RunContext::new(llm_harness_types::RunRequest::default())
+        })
+    }
+
     /// 构造一个最小的 ctx。`msg` 必须比 ctx 活得久——调用方持有 msg。
     fn make_ctx<'a>(msg: &'a AssistantMessage, tool_name: &'a str) -> BeforeToolCallCtx<'a> {
         BeforeToolCallCtx {
+            run: test_run(),
             assistant_message: msg,
             tool_use_id: "tu_1",
             tool_name,

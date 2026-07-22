@@ -4,18 +4,28 @@ use futures::future::BoxFuture;
 
 use crate::{
     AgentContext, AgentError, AgentHarnessResources, AgentMessage, AssistantMessage,
-    CompactionResult, ContentBlock, EntryId, StopReason, StreamOptions, Tool, ToolError,
-    ToolResult, TurnSnapshot,
+    CompactionResult, ContentBlock, EntryId, RunContext, StopReason, StreamOptions, Tool,
+    ToolError, ToolResult, TurnSnapshot,
 };
 
 // ── TransformContextHook ──────────────────────────────────────────────────────
+
+/// 传递给 `TransformContextHook::transform` 的上下文。
+pub struct TransformContextCtx<'a> {
+    /// 当前 run 上下文。
+    pub run: &'a RunContext,
+    /// 当前 turn 编号（从 0 开始）。
+    pub turn_index: u32,
+    /// 待转换的结构化 Agent 上下文。
+    pub context: AgentContext,
+}
 
 /// 每次 LLM 调用前对上下文做转换。
 pub trait TransformContextHook: Send + Sync {
     /// 对 `ctx` 做变换后返回新的上下文。
     fn transform<'a>(
         &'a self,
-        ctx: AgentContext,
+        ctx: TransformContextCtx<'a>,
     ) -> BoxFuture<'a, Result<AgentContext, AgentError>>;
 }
 
@@ -23,6 +33,8 @@ pub trait TransformContextHook: Send + Sync {
 
 /// 传递给 `PrepareNextTurnHook::prepare` 的上下文。
 pub struct PrepareNextTurnCtx<'a> {
+    /// 当前 run 上下文。
+    pub run: &'a RunContext,
     /// 当前 turn 编号（从 0 开始）。
     pub turn_index: u32,
     /// 上一轮的完整 LLM 回复。
@@ -64,6 +76,8 @@ pub trait PrepareNextTurnHook: Send + Sync {
 
 /// 传递给 `BeforeToolCallHook::on_call` 的上下文。
 pub struct BeforeToolCallCtx<'a> {
+    /// 当前 run 上下文。
+    pub run: &'a RunContext,
     /// 触发本次 tool call 的 LLM 回复。
     pub assistant_message: &'a AssistantMessage,
     /// 当前 tool call 的唯一 ID。
@@ -96,6 +110,8 @@ pub trait BeforeToolCallHook: Send + Sync {
 
 /// 传递给 `AfterToolCallHook::on_complete` 的上下文。
 pub struct AfterToolCallCtx<'a> {
+    /// 当前 run 上下文。
+    pub run: &'a RunContext,
     /// 触发本次 tool call 的 LLM 回复。
     pub assistant_message: &'a AssistantMessage,
     /// 当前 tool call 的唯一 ID。
@@ -139,6 +155,8 @@ pub trait AfterToolCallHook: Send + Sync {
 
 /// 传递给 `ShouldStopHook::should_stop` 的上下文。
 pub struct ShouldStopCtx<'a> {
+    /// 当前 run 上下文。
+    pub run: &'a RunContext,
     /// 最后一条 LLM 回复。
     pub last_assistant: &'a AssistantMessage,
     /// LLM 停止原因。
@@ -158,13 +176,23 @@ pub trait ShouldStopHook: Send + Sync {
 
 // ── Provider Request/Response Hooks ───────────────────────────────────────────
 
+/// 传递给 `BeforeProviderRequestHook::before_request` 的上下文。
+pub struct BeforeProviderRequestCtx<'a> {
+    /// 当前 run 上下文。
+    pub run: &'a RunContext,
+    /// 当前 turn 编号（从 0 开始）。
+    pub turn_index: u32,
+    /// 当前请求使用的传输层配置，可由 Hook 原地修改。
+    pub options: &'a mut StreamOptions,
+}
+
 /// LLM provider 请求前拦截 hook；可原地修改传输层配置。
 pub trait BeforeProviderRequestHook: Send + Sync {
     /// 在 LLM 调用前修改 `StreamOptions`。
     ///
     /// 当前 loop 直接应用 timeout/retry 字段；headers、metadata 和 cache 配置需要
     /// provider adapter 支持 per-request 传输配置后才能透传。
-    fn before_request<'a>(&'a self, opts: &'a mut StreamOptions) -> BoxFuture<'a, ()>;
+    fn before_request<'a>(&'a self, ctx: BeforeProviderRequestCtx<'a>) -> BoxFuture<'a, ()>;
 }
 
 /// Provider 响应的元数据信息。
@@ -183,16 +211,28 @@ pub struct ProviderResponseInfo {
     pub provider: Option<String>,
 }
 
+/// 传递给 `AfterProviderResponseHook::after_response` 的上下文。
+pub struct AfterProviderResponseCtx<'a> {
+    /// 当前 run 上下文。
+    pub run: &'a RunContext,
+    /// 当前 turn 编号（从 0 开始）。
+    pub turn_index: u32,
+    /// Provider 响应元数据。
+    pub info: &'a ProviderResponseInfo,
+}
+
 /// LLM provider 响应后的观测 hook；用于配额追踪、成本监控等。
 pub trait AfterProviderResponseHook: Send + Sync {
     /// 在收到 provider 响应后调用（纯观测，无返回值）。
-    fn after_response<'a>(&'a self, info: &'a ProviderResponseInfo) -> BoxFuture<'a, ()>;
+    fn after_response<'a>(&'a self, ctx: AfterProviderResponseCtx<'a>) -> BoxFuture<'a, ()>;
 }
 
 // ── Turn 边界 Hooks ───────────────────────────────────────────────────────────
 
 /// 传递给 `BeforeRunHook::before_run` 的上下文。
 pub struct BeforeRunCtx<'a> {
+    /// 当前 run 上下文。
+    pub run: &'a RunContext,
     /// 用户输入的提示文本。
     pub prompt_text: &'a str,
     /// 本次运行注入的初始消息列表（可修改）。
@@ -222,6 +262,8 @@ pub trait BeforeRunHook: Send + Sync {
 
 /// 传递给 `BeforeTurnHook::before_turn` 的上下文。
 pub struct BeforeTurnCtx<'a> {
+    /// 当前 run 上下文。
+    pub run: &'a RunContext,
     /// 当前 turn 编号（从 0 开始）。
     pub turn_index: u32,
     /// Turn 开始时的配置快照。
@@ -230,6 +272,8 @@ pub struct BeforeTurnCtx<'a> {
 
 /// 传递给 `AfterTurnHook::after_turn` 的上下文。
 pub struct AfterTurnCtx<'a> {
+    /// 当前 run 上下文。
+    pub run: &'a RunContext,
     /// 当前 turn 编号（从 0 开始）。
     pub turn_index: u32,
     /// 本 turn 新增的消息列表。

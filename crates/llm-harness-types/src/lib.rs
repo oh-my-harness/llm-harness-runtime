@@ -19,6 +19,7 @@ pub mod identity;
 pub mod messages;
 pub mod misc;
 pub mod resources;
+pub mod run;
 pub mod skills;
 pub mod tool;
 
@@ -33,5 +34,6 @@ pub use identity::*;
 pub use messages::*;
 pub use misc::*;
 pub use resources::*;
+pub use run::*;
 pub use skills::*;
 pub use tool::*;

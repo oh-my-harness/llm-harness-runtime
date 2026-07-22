@@ -109,7 +109,7 @@ llm-harness-runtime/          ← 本仓库根
 ├── Cargo.toml                (workspace)
 ├── CLAUDE.md
 ├── crates/
-│   ├── llm-harness-types/    (Hook/Tool trait + 所有共享类型)
+│   ├── llm-harness-types/    (Run/Hook/Tool trait + 所有共享类型)
 │   ├── llm-harness-loop/     (agent loop 引擎)
 │   ├── llm-harness-agent/    (AgentHarness, Session, skills)
 │   ├── llm-harness-runtime/  (CompositeHook, ToolRegistry, TaskRunner)
@@ -203,6 +203,12 @@ pub struct HarnessHooks {
 ```
 
 用户可为任何插槽注入多个自定义 hook，或留空 `vec![]`（框架跳过该阶段）。多个 hook 的合成语义由各 Composite 包装器实现。
+
+所有 run 内 Hook context 都携带同一个只读 `&RunContext`，`ToolContext` 携带对应的
+`Arc<RunContext>`。应用通过 `AgentHarness::run(RunRequest)` 提供 typed `RunExtensions`；
+Plugin 的单次运行状态只能写入 `RunContext.local`，不能保存在可复用 Hook 或 Plugin 实例上。
+`BeforeCompactHook` 同时服务手动 compaction，不属于必然存在 run 的 Hook，因此不携带
+`RunContext`。
 
 ### Hook 与 Event 的分工
 

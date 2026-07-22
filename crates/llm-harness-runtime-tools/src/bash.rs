@@ -234,6 +234,9 @@ mod tests {
     fn make_ctx(env: Arc<MockExecutionEnv>) -> ToolContext {
         let (tx, _rx) = mpsc::channel(1);
         ToolContext {
+            run: Arc::new(llm_harness_types::RunContext::new(
+                llm_harness_types::RunRequest::default(),
+            )),
             env,
             abort: CancellationToken::new(),
             tool_use_id: "tu_bash".into(),

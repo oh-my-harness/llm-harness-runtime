@@ -556,8 +556,16 @@ mod tests {
         assert!(bus.take_event_rx().is_none(), "rx now in hook");
     }
 
+    fn test_run() -> &'static llm_harness_types::RunContext {
+        static RUN: std::sync::OnceLock<llm_harness_types::RunContext> = std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            llm_harness_types::RunContext::new(llm_harness_types::RunRequest::default())
+        })
+    }
+
     fn make_after_turn_ctx<'a>(msgs: &'a [AgentMessage]) -> AfterTurnCtx<'a> {
         AfterTurnCtx {
+            run: test_run(),
             turn_index: 0,
             new_messages: msgs,
         }

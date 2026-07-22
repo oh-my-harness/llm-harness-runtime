@@ -52,6 +52,7 @@ impl Tool for HookedTool {
             // Apply before-hook
             let effective_args = if let Some(h) = &self.before {
                 let before_ctx = BeforeToolCallCtx {
+                    run: &ctx.run,
                     assistant_message: &ctx.assistant_message,
                     tool_use_id: &ctx.tool_use_id,
                     tool_name: self.inner.name(),
@@ -72,6 +73,7 @@ impl Tool for HookedTool {
             // Apply after-hook
             if let Some(h) = &self.after {
                 let after_ctx = AfterToolCallCtx {
+                    run: &ctx.run,
                     assistant_message: &ctx.assistant_message,
                     tool_use_id: &ctx.tool_use_id,
                     tool_name: self.inner.name(),
@@ -135,6 +137,7 @@ mod tests {
     fn make_ctx() -> ToolContext {
         let (tx, _) = mpsc::channel(1);
         ToolContext {
+            run: Arc::new(RunContext::new(RunRequest::default())),
             env: Arc::new(crate::test_utils::NoOpEnv),
             abort: CancellationToken::new(),
             tool_use_id: "c1".into(),

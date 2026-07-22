@@ -368,11 +368,12 @@ impl ExecutionEnv for OsEnv {
             if opts.abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            // Windows 没有 `sh`；用 `cmd.exe /C`。Unix 保持 `sh -c`。
+            // Windows 没有 `sh`；用 `cmd.exe /D /Q /C`。`/D` 禁用 AutoRun，
+            // `/Q` 关闭命令回显，避免循环等复合命令污染 stdout。Unix 保持 `sh -c`。
             #[cfg(target_os = "windows")]
             let mut shell_cmd = {
                 let mut c = tokio::process::Command::new("cmd.exe");
-                c.args(["/C", cmd]);
+                c.args(["/D", "/Q", "/C", cmd]);
                 c
             };
             #[cfg(not(target_os = "windows"))]
@@ -481,6 +482,12 @@ impl ExecutionEnv for OsEnv {
                     },
                 }
             };
+
+            // ExecutionEnv exposes text rather than platform-native byte streams.
+            // Normalize Windows newlines so callers and tool output see the same
+            // representation on every platform.
+            #[cfg(target_os = "windows")]
+            let (stdout, stderr) = (stdout.replace("\r\n", "\n"), stderr.replace("\r\n", "\n"));
 
             if !status.success() {
                 Err(EnvError::ShellFailed {
@@ -673,7 +680,7 @@ mod tests {
         #[cfg(not(target_os = "windows"))]
         let cmd = "echo err1 >&2; echo err2 >&2";
         #[cfg(target_os = "windows")]
-        let cmd = "echo err1 1>&2 & echo err2 1>&2";
+        let cmd = "echo err1>&2&&echo err2>&2";
 
         let out = env.execute_shell(cmd, opts).await.unwrap();
         assert_eq!(out.exit_code, 0);

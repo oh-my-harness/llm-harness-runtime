@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use llm_harness_types::{
-    AfterProviderResponseHook, AfterToolCallCtx, AfterToolCallDecision, AfterToolCallHook,
-    AfterTurnCtx, AfterTurnHook, AgentContext, AgentError, BeforeCompactCtx, BeforeCompactDecision,
-    BeforeCompactHook, BeforeProviderRequestHook, BeforeRunCtx, BeforeRunHook, BeforeRunResult,
-    BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook, BeforeTurnCtx, BeforeTurnHook,
-    PrepareNextTurnCtx, PrepareNextTurnHook, ProviderResponseInfo, ShouldStopCtx, ShouldStopHook,
-    StreamOptions, TransformContextHook,
+    AfterProviderResponseCtx, AfterProviderResponseHook, AfterToolCallCtx, AfterToolCallDecision,
+    AfterToolCallHook, AfterTurnCtx, AfterTurnHook, AgentContext, AgentError, BeforeCompactCtx,
+    BeforeCompactDecision, BeforeCompactHook, BeforeProviderRequestCtx, BeforeProviderRequestHook,
+    BeforeRunCtx, BeforeRunHook, BeforeRunResult, BeforeToolCallCtx, BeforeToolCallDecision,
+    BeforeToolCallHook, BeforeTurnCtx, BeforeTurnHook, PrepareNextTurnCtx, PrepareNextTurnHook,
+    ShouldStopCtx, ShouldStopHook, TransformContextCtx, TransformContextHook,
 };
 
 /// Chains multiple `AfterProviderResponseHook` implementations (all-execute semantics).
@@ -25,10 +25,15 @@ impl CompositeAfterProviderResponseHook {
 }
 
 impl AfterProviderResponseHook for CompositeAfterProviderResponseHook {
-    fn after_response<'a>(&'a self, info: &'a ProviderResponseInfo) -> BoxFuture<'a, ()> {
+    fn after_response<'a>(&'a self, ctx: AfterProviderResponseCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             for hook in &self.hooks {
-                hook.after_response(info).await;
+                hook.after_response(AfterProviderResponseCtx {
+                    run: ctx.run,
+                    turn_index: ctx.turn_index,
+                    info: ctx.info,
+                })
+                .await;
             }
         })
     }
@@ -61,6 +66,7 @@ impl AfterToolCallHook for CompositeAfterToolCallHook {
             for hook in &self.hooks {
                 // Each hook sees the original, unpatched result.
                 let hook_ctx = AfterToolCallCtx {
+                    run: ctx.run,
                     assistant_message: ctx.assistant_message,
                     tool_use_id: ctx.tool_use_id,
                     tool_name: ctx.tool_name,
@@ -101,6 +107,7 @@ impl BeforeToolCallHook for CompositeBeforeToolCallHook {
             for hook in &self.hooks {
                 // Reconstruct ctx for each hook (BeforeToolCallCtx is not Clone).
                 let hook_ctx = BeforeToolCallCtx {
+                    run: ctx.run,
                     assistant_message: ctx.assistant_message,
                     tool_use_id: ctx.tool_use_id,
                     tool_name: ctx.tool_name,
@@ -136,6 +143,7 @@ impl AfterTurnHook for CompositeAfterTurnHook {
         Box::pin(async move {
             for hook in &self.hooks {
                 let hook_ctx = AfterTurnCtx {
+                    run: ctx.run,
                     turn_index: ctx.turn_index,
                     new_messages: ctx.new_messages,
                 };
@@ -160,10 +168,15 @@ impl CompositeBeforeProviderRequestHook {
 }
 
 impl BeforeProviderRequestHook for CompositeBeforeProviderRequestHook {
-    fn before_request<'a>(&'a self, opts: &'a mut StreamOptions) -> BoxFuture<'a, ()> {
+    fn before_request<'a>(&'a self, ctx: BeforeProviderRequestCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             for hook in &self.hooks {
-                hook.before_request(opts).await;
+                hook.before_request(BeforeProviderRequestCtx {
+                    run: ctx.run,
+                    turn_index: ctx.turn_index,
+                    options: &mut *ctx.options,
+                })
+                .await;
             }
         })
     }
@@ -196,6 +209,7 @@ impl BeforeRunHook for CompositeBeforeRunHook {
             for hook in &self.hooks {
                 let result = hook
                     .before_run(BeforeRunCtx {
+                        run: ctx.run,
                         prompt_text: ctx.prompt_text,
                         initial_messages: ctx.initial_messages,
                         system_prompt: ctx.system_prompt,
@@ -236,6 +250,7 @@ impl BeforeTurnHook for CompositeBeforeTurnHook {
         Box::pin(async move {
             for hook in &self.hooks {
                 let hook_ctx = BeforeTurnCtx {
+                    run: ctx.run,
                     turn_index: ctx.turn_index,
                     snapshot: ctx.snapshot,
                 };
@@ -262,13 +277,20 @@ impl CompositeTransformContextHook {
 impl TransformContextHook for CompositeTransformContextHook {
     fn transform<'a>(
         &'a self,
-        mut ctx: AgentContext,
+        ctx: TransformContextCtx<'a>,
     ) -> BoxFuture<'a, Result<AgentContext, AgentError>> {
         Box::pin(async move {
+            let mut context = ctx.context;
             for hook in &self.hooks {
-                ctx = hook.transform(ctx).await?;
+                context = hook
+                    .transform(TransformContextCtx {
+                        run: ctx.run,
+                        turn_index: ctx.turn_index,
+                        context,
+                    })
+                    .await?;
             }
-            Ok(ctx)
+            Ok(context)
         })
     }
 }
@@ -306,6 +328,7 @@ impl PrepareNextTurnHook for CompositePrepareNextTurnHook {
             for hook in &self.hooks {
                 let result = hook
                     .prepare(PrepareNextTurnCtx {
+                        run: ctx.run,
                         turn_index: ctx.turn_index,
                         last_message: ctx.last_message,
                         last_tool_results: ctx.last_tool_results,
@@ -365,6 +388,7 @@ impl ShouldStopHook for CompositeShouldStopHook {
             let mut any_true = false;
             for hook in &self.hooks {
                 let hook_ctx = ShouldStopCtx {
+                    run: ctx.run,
                     last_assistant: ctx.last_assistant,
                     stop_reason: ctx.stop_reason,
                     turn_index: ctx.turn_index,
@@ -515,7 +539,9 @@ mod tests {
             text: "x".into(),
         }]);
         let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+        let run = llm_harness_types::RunContext::new(llm_harness_types::RunRequest::default());
         let mk_ctx = || PrepareNextTurnCtx {
+            run: &run,
             turn_index: 0,
             last_message: &assistant,
             last_tool_results: &results,
@@ -609,7 +635,9 @@ mod tests {
             m.stop_reason = Some(StopReason::EndTurn);
             m
         };
+        let run = llm_harness_types::RunContext::new(llm_harness_types::RunRequest::default());
         let ctx = ShouldStopCtx {
+            run: &run,
             last_assistant: &assistant,
             stop_reason: StopReason::EndTurn,
             turn_index: 0,

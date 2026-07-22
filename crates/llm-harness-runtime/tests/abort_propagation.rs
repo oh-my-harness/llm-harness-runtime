@@ -17,7 +17,7 @@ use llm_harness_runtime::spawn::message_bus::message_bus_pair;
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_runtime::spawn::tools::SpawnAgentTool;
 use llm_harness_runtime_sandbox_os::{OsEnv, OsEnvFactory};
-use llm_harness_types::ExecutionEnv;
+use llm_harness_types::{ExecutionEnv, HarnessPhase};
 /// 一个长跑 tool：sleep 直到完成或被 abort。
 /// 用于让 sub-agent 在 tool 执行阶段阻塞，使 abort 可在 sub-agent in-flight 时触发。
 struct BlockingTool;
@@ -397,7 +397,7 @@ async fn idle_watcher_abort() {
     // 等待主 agent 进 Idle + sub-agent in-flight（watcher 应已启动）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
-        if registry.in_flight_count() == 1 {
+        if registry.in_flight_count() == 1 && harness.state().phase == HarnessPhase::Idle {
             break;
         }
         if std::time::Instant::now() > deadline {
@@ -409,6 +409,11 @@ async fn idle_watcher_abort() {
         registry.in_flight_count(),
         1,
         "sub-agent should be in-flight"
+    );
+    assert_eq!(
+        harness.state().phase,
+        HarnessPhase::Idle,
+        "main agent should be idle before testing watcher cancellation"
     );
 
     // 此时主 agent 在 Idle（spawn tool 返回后 LLM 第二 turn 无响应 → Idle）

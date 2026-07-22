@@ -95,6 +95,13 @@ pub(crate) fn build_gate_approval_hook(
 mod tests {
     use super::*;
 
+    fn test_run() -> &'static llm_harness_types::RunContext {
+        static RUN: std::sync::OnceLock<llm_harness_types::RunContext> = std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            llm_harness_types::RunContext::new(llm_harness_types::RunRequest::default())
+        })
+    }
+
     #[tokio::test]
     async fn gate_returns_empty_set_when_empty_allowed() {
         // 空 Vec = 不允许任何工具 → Some(空集)，而非 None（None = 激活全部）。
@@ -104,6 +111,7 @@ mod tests {
         let hook = WorkflowGateHook::new(state, tools, HashSet::new());
         let msg = make_empty_msg();
         let ctx = PrepareNextTurnCtx {
+            run: test_run(),
             turn_index: 0,
             last_message: &msg,
             last_tool_results: &[],
@@ -123,6 +131,7 @@ mod tests {
         let hook = WorkflowGateHook::new(state, tools, HashSet::new());
         let msg = make_empty_msg();
         let ctx = PrepareNextTurnCtx {
+            run: test_run(),
             turn_index: 0,
             last_message: &msg,
             last_tool_results: &[],
@@ -142,6 +151,7 @@ mod tests {
         let hook = WorkflowGateHook::new(state, tools, HashSet::new());
         let msg = make_empty_msg();
         let ctx = PrepareNextTurnCtx {
+            run: test_run(),
             turn_index: 0,
             last_message: &msg,
             last_tool_results: &[],
@@ -163,6 +173,7 @@ mod tests {
         let hook = WorkflowGateHook::new(state, tools, extra);
         let msg = make_empty_msg();
         let ctx = PrepareNextTurnCtx {
+            run: test_run(),
             turn_index: 0,
             last_message: &msg,
             last_tool_results: &[],

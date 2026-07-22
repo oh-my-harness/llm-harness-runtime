@@ -63,6 +63,10 @@ pub(crate) fn is_retryable(e: &LlmError) -> bool {
 
 /// Agent loop 的配置。`agent_loop` 会消费此结构（所有权转移）。
 pub struct LoopConfig {
+    // === Run context ===
+    /// 当前 loop 所属的不可变 run 上下文。
+    pub run: Arc<RunContext>,
+
     // === LLM sampling ===
     /// 模型 ID（例如: `"claude-sonnet-4-6"`）。
     pub model: String,
@@ -136,10 +140,13 @@ mod tests {
         use crate::convert::DefaultConvertToLlm;
         use crate::test_utils::NoOpEnv;
         use crate::{FinalAnswerMode, LoopConfig};
-        use llm_harness_types::{StreamOptions, ThinkingLevel, ToolExecutionMode};
+        use llm_harness_types::{
+            RunContext, RunRequest, StreamOptions, ThinkingLevel, ToolExecutionMode,
+        };
         use std::sync::Arc;
         use tokio_util::sync::CancellationToken;
         let _cfg = LoopConfig {
+            run: Arc::new(RunContext::new(RunRequest::default())),
             model: "test-model".into(),
             max_tokens: 1024,
             temperature: None,
@@ -169,10 +176,13 @@ mod tests {
         use crate::convert::DefaultConvertToLlm;
         use crate::test_utils::NoOpEnv;
         use crate::{FinalAnswerMode, LoopConfig, ResponseFormat};
-        use llm_harness_types::{StreamOptions, ThinkingLevel, ToolExecutionMode};
+        use llm_harness_types::{
+            RunContext, RunRequest, StreamOptions, ThinkingLevel, ToolExecutionMode,
+        };
         use std::sync::Arc;
         use tokio_util::sync::CancellationToken;
         let cfg = LoopConfig {
+            run: Arc::new(RunContext::new(RunRequest::default())),
             model: "test-model".into(),
             max_tokens: 1024,
             temperature: None,

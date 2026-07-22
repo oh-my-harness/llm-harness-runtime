@@ -327,8 +327,16 @@ mod tests {
         }
     }
 
+    fn test_run() -> &'static llm_harness_types::RunContext {
+        static RUN: std::sync::OnceLock<llm_harness_types::RunContext> = std::sync::OnceLock::new();
+        RUN.get_or_init(|| {
+            llm_harness_types::RunContext::new(llm_harness_types::RunRequest::default())
+        })
+    }
+
     fn mk_stop_ctx<'a>(msg: &'a AssistantMessage) -> ShouldStopCtx<'a> {
         ShouldStopCtx {
+            run: test_run(),
             last_assistant: msg,
             stop_reason: StopReason::EndTurn,
             turn_index: 0,
@@ -338,6 +346,7 @@ mod tests {
     /// 构造 `PrepareNextTurnCtx`，借用传入的消息。
     fn mk_prepare_ctx<'a>(msg: &'a AssistantMessage) -> PrepareNextTurnCtx<'a> {
         PrepareNextTurnCtx {
+            run: test_run(),
             turn_index: 0,
             last_message: msg,
             last_tool_results: &[],

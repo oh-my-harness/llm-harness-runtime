@@ -243,6 +243,9 @@ mod tests {
     /// 构造一个最小的 ToolContext（无真实 env，仅 abort token）。
     fn make_tool_ctx(abort: CancellationToken) -> ToolContext {
         ToolContext {
+            run: Arc::new(llm_harness_types::RunContext::new(
+                llm_harness_types::RunRequest::default(),
+            )),
             env: Arc::new(llm_harness_loop::test_utils::NoOpEnv),
             abort,
             tool_use_id: "tu_1".into(),
