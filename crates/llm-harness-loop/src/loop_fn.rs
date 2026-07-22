@@ -359,10 +359,10 @@ fn run_loop(
             // AfterProviderResponseHook: observation hook for quota tracking, cost monitoring.
             if let Some(h) = &config.after_provider_response {
                 let info = ProviderResponseInfo {
-                    status_code: None,
+                    status_code: handle.status_code(),
                     response_headers: vec![],
                     usage: assistant_msg.usage.clone(),
-                    latency_ms: 0,
+                    latency_ms: handle.latency_ms(),
                     model: assistant_msg.model.clone(),
                     provider: assistant_msg.provider.clone(),
                 };
