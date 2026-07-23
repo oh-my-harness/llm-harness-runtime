@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use llm_harness_types::{
-    ContentBlock, Tool, ToolContext, ToolError, ToolExecutionMode, ToolLevel, ToolResult,
+    DataBlock, Tool, ToolContext, ToolExecutionMode, ToolFailure, ToolLevel, ToolResult,
     WAIT_FOR_EXTERNAL_EVENT_TOOL_NAME,
 };
 use serde_json::Value;
@@ -37,8 +37,8 @@ pub trait EventStream: Send {
 /// 事件载荷。content 给 LLM 看，details 供程序判断。
 #[derive(Debug, Clone)]
 pub struct Event {
-    /// 与 ToolResult.content 同构。
-    pub content: Vec<ContentBlock>,
+    /// 与 ToolResult.model_content 同构。
+    pub content: Vec<DataBlock>,
     /// 结构化数据，供程序判断。
     pub details: Value,
 }
@@ -128,7 +128,7 @@ impl Tool for WaitForExternalEventTool {
         &'a self,
         _args: serde_json::Value,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             // 1. 落盘等待描述符（若注入了 task_store）。
             if let Some(store) = &self.task_store
@@ -145,26 +145,20 @@ impl Tool for WaitForExternalEventTool {
             let result = tokio::select! {
                 biased;
                 _ = ctx.abort.cancelled() => {
-                    Err(ToolError::Aborted)
+                    Err(ToolFailure::aborted())
                 }
                 ev = stream.next() => {
                     match ev {
-                        Some(event) => Ok(ToolResult {
-                            content: event.content,
-                            details: event.details,
-                            terminate: false,
-                        }),
-                        None => Err(ToolError::Execution("event stream closed".into())),
+                        Some(event) => Ok(ToolResult::full(event.content, event.details, false)),
+                        None => Err(ToolFailure::new("event_stream_closed", "Event stream closed.")),
                     }
                 }
                 _ = tokio::time::sleep(self.timeout) => {
-                    Ok(ToolResult {
-                        content: vec![ContentBlock::Text {
-                            text: "(no event within timeout)".into(),
-                        }],
-                        details: serde_json::json!({"status": "timeout"}),
-                        terminate: false,
-                    })
+                    Ok(ToolResult::full(
+                        vec![DataBlock::text("(no event within timeout)")],
+                        serde_json::json!({"status": "timeout"}),
+                        false,
+                    ))
                 }
             };
 
@@ -187,8 +181,8 @@ mod tests {
     use super::*;
     use crate::lifecycle::task::TaskId;
     use crate::lifecycle::task_store::JsonlTaskStore;
-    use llm_harness_types::ContentBlock;
-    use llm_harness_types::{Tool, ToolContext, ToolError};
+    use llm_harness_types::DataBlock;
+    use llm_harness_types::{Tool, ToolContext};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
@@ -208,17 +202,13 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         let mut stream = ChannelStream { rx };
         tx.send(Event {
-            content: vec![ContentBlock::Text {
-                text: "first".into(),
-            }],
+            content: vec![DataBlock::text("first")],
             details: serde_json::json!({"n": 1}),
         })
         .await
         .unwrap();
         tx.send(Event {
-            content: vec![ContentBlock::Text {
-                text: "second".into(),
-            }],
+            content: vec![DataBlock::text("second")],
             details: serde_json::json!({"n": 2}),
         })
         .await
@@ -274,9 +264,7 @@ mod tests {
 
         // 发送一个事件
         tx.send(Event {
-            content: vec![ContentBlock::Text {
-                text: "done".into(),
-            }],
+            content: vec![DataBlock::text("done")],
             details: serde_json::json!({"status": "ok"}),
         })
         .await
@@ -287,8 +275,8 @@ mod tests {
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         assert!(!result.terminate);
         // content 含 "done"
-        match &result.content[0] {
-            ContentBlock::Text { text } => assert_eq!(text, "done"),
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => assert_eq!(text, "done"),
             _ => panic!("expected text"),
         }
     }
@@ -306,8 +294,8 @@ mod tests {
         let ctx = make_tool_ctx(abort);
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
         // 超时返回提示文本（非错误）
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert!(text.contains("timeout") || text.contains("no "))
             }
             _ => panic!("expected text"),
@@ -328,7 +316,7 @@ mod tests {
         // 立刻 abort
         abort.cancel();
         let result = tool.execute(serde_json::json!({}), &ctx).await;
-        assert!(matches!(result, Err(ToolError::Aborted)));
+        assert!(matches!(result, Err(failure) if failure.code == "aborted"));
     }
 
     #[tokio::test]
@@ -349,7 +337,7 @@ mod tests {
         .with_timeout(Duration::from_secs(5));
 
         tx.send(Event {
-            content: vec![ContentBlock::Text { text: "ok".into() }],
+            content: vec![DataBlock::text("ok")],
             details: serde_json::json!({}),
         })
         .await
@@ -382,6 +370,6 @@ mod tests {
         let abort = CancellationToken::new();
         let ctx = make_tool_ctx(abort);
         let result = tool.execute(serde_json::json!({}), &ctx).await;
-        assert!(matches!(result, Err(ToolError::Execution(_))));
+        assert!(matches!(result, Err(failure) if failure.code == "event_stream_closed"));
     }
 }

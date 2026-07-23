@@ -393,28 +393,21 @@ impl AgentHarness {
                         .remove(tool_use_id.as_str());
 
                     // Build ToolResultMessage for session persistence.
-                    let (content, is_error) = match result {
-                        Ok(r) => (r.content.clone(), false),
-                        Err(e) => (
-                            vec![ContentBlock::Text {
-                                text: e.to_string(),
-                            }],
-                            true,
-                        ),
-                    };
-                    let msg = AgentMessage::ToolResult(ToolResultMessage {
-                        tool_use_id: tool_use_id.clone(),
-                        content,
-                        is_error,
-                        timestamp: chrono::Utc::now(),
-                    });
+                    let is_error = result.is_err();
+                    let timestamp = chrono::Utc::now();
+                    let msg = match result {
+                        Ok(result) => result.session_message(tool_use_id.clone(), timestamp),
+                        Err(failure) => failure.session_message(tool_use_id.clone(), timestamp),
+                    }
+                    .map(AgentMessage::ToolResult)
+                    .map_err(|error| AgentError::Internal(error.to_string()))?;
                     self.push_pending_write(SessionEntryPayload::Message(msg.clone()));
                     turn_messages.push(msg);
 
                     // Emit ToolCallEnd harness event.
                     let details = match result {
                         Ok(r) => r.details.clone(),
-                        Err(_) => serde_json::Value::Null,
+                        Err(failure) => failure.details.clone(),
                     };
                     let resolved_name = self
                         .inner

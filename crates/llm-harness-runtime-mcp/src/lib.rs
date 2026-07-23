@@ -27,7 +27,7 @@ use llm_harness_runtime::platform::prompt::{ArgumentDef, PromptSource, PromptSou
 use llm_harness_runtime::platform::resource::{
     ResourceContent, ResourceDescriptor, ResourceProvider,
 };
-use llm_harness_types::{ContentBlock, Tool, ToolContext, ToolError, ToolResult};
+use llm_harness_types::{DataBlock, Tool, ToolContext, ToolFailure, ToolResult};
 use serde_json::Value;
 
 use crate::types::{McpContent, McpResourceContent};
@@ -82,27 +82,38 @@ impl Tool for McpToolAdapter {
         &'a self,
         args: Value,
         _ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let result = self
                 .manager
                 .call_tool(&self.full_name, args)
                 .await
-                .map_err(|error| ToolError::Execution(error.to_string()))?;
+                .map_err(|_| {
+                    ToolFailure::new("mcp_call_failed", "MCP tool communication failed.")
+                })?;
             let details = result.structured_content.unwrap_or(Value::Null);
-            let mut content = format_mcp_content(result.content);
+            let content = format_mcp_content(result.content);
             if result.is_error {
-                for block in &mut content {
-                    if let ContentBlock::Text { text } = block {
-                        *text = format!("Error: {text}");
-                    }
-                }
+                let message = content
+                    .iter()
+                    .filter_map(|block| match block {
+                        DataBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let mut failure = ToolFailure::new(
+                    "mcp_tool_error",
+                    if message.is_empty() {
+                        "MCP tool execution failed.".to_owned()
+                    } else {
+                        message
+                    },
+                );
+                failure.details = details;
+                return Err(failure);
             }
-            Ok(ToolResult {
-                content,
-                details,
-                terminate: false,
-            })
+            Ok(ToolResult::full(content, details, false))
         })
     }
 }
@@ -194,7 +205,7 @@ impl ResourceProvider for McpResourceProvider {
     }
 }
 
-fn format_mcp_content(content: Vec<McpContent>) -> Vec<ContentBlock> {
+fn format_mcp_content(content: Vec<McpContent>) -> Vec<DataBlock> {
     content
         .into_iter()
         .map(|content| {
@@ -214,7 +225,7 @@ fn format_mcp_content(content: Vec<McpContent>) -> Vec<ContentBlock> {
                     None => format!("[Resource: {}]", resource.uri),
                 },
             };
-            ContentBlock::Text { text }
+            DataBlock::text(text)
         })
         .collect()
 }
@@ -241,9 +252,9 @@ mod tests {
 
     use super::*;
 
-    fn text(block: &ContentBlock) -> &str {
+    fn text(block: &DataBlock) -> &str {
         match block {
-            ContentBlock::Text { text } => text,
+            DataBlock::Text { text, .. } => text,
             _ => panic!("expected text content"),
         }
     }

@@ -60,7 +60,7 @@ async fn run_request_context_is_shared_by_hooks_and_tools() {
             &'a self,
             _args: serde_json::Value,
             ctx: &'a ToolContext,
-        ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolError>> {
+        ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolFailure>> {
             let id = ctx.run.id();
             let marker = ctx
                 .run
@@ -73,11 +73,11 @@ async fn run_request_context_is_shared_by_hooks_and_tools() {
                 .unwrap()
                 .push((Observer::Tool, id, marker));
             Box::pin(async {
-                Ok(ToolResult {
-                    content: vec![ContentBlock::Text { text: "ok".into() }],
-                    details: serde_json::Value::Null,
-                    terminate: false,
-                })
+                Ok(ToolResult::full(
+                    vec![DataBlock::text("ok")],
+                    serde_json::Value::Null,
+                    false,
+                ))
             })
         }
     }

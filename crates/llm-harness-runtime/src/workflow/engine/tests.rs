@@ -4,8 +4,8 @@ use anyhow::Result; // StepExecutor::execute returns anyhow::Result
 use futures::future::BoxFuture;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_types::{
-    AgentError, BeforeTurnCtx, BeforeTurnHook, ContentBlock, ExecutionEnv, ToolContext, ToolError,
-    ToolResult,
+    AgentError, BeforeTurnCtx, BeforeTurnHook, ContentBlock, DataBlock, ExecutionEnv, ToolContext,
+    ToolFailure, ToolResult,
 };
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -318,10 +318,10 @@ impl Tool for BlockingTool {
         &'a self,
         _args: serde_json::Value,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             ctx.abort.cancelled().await;
-            Err(ToolError::Aborted)
+            Err(ToolFailure::aborted())
         })
     }
 }
@@ -348,15 +348,13 @@ impl Tool for EchoTool {
         &'a self,
         _args: serde_json::Value,
         _ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
-            Ok(ToolResult {
-                content: vec![ContentBlock::Text {
-                    text: "echo".into(),
-                }],
-                details: serde_json::json!({}),
-                terminate: false,
-            })
+            Ok(ToolResult::full(
+                vec![DataBlock::text("echo")],
+                serde_json::json!({}),
+                false,
+            ))
         })
     }
 }
@@ -769,7 +767,7 @@ fn test_msg(content: Vec<ContentBlock>) -> llm_harness_types::AssistantMessage {
 
 #[test]
 fn step_progress_from_maps_coarse_events() {
-    use llm_harness_types::{AssistantMessageKind, ToolError, ToolResult};
+    use llm_harness_types::{AssistantMessageKind, ToolResult};
 
     // ToolCallStart
     let ev = AgentEvent::ToolCallStart {
@@ -818,11 +816,7 @@ fn step_progress_from_maps_coarse_events() {
     // ToolExecutionEnd — Ok
     let ev = AgentEvent::ToolExecutionEnd {
         tool_use_id: "tu-1".into(),
-        result: Ok(ToolResult {
-            content: vec![],
-            details: serde_json::Value::Null,
-            terminate: false,
-        }),
+        result: Ok(ToolResult::full(vec![], serde_json::Value::Null, false)),
     };
     match step_progress_from(&ev) {
         Some(StepProgress::ToolExecutionEnd {
@@ -840,7 +834,7 @@ fn step_progress_from_maps_coarse_events() {
     // ToolExecutionEnd — Err
     let ev = AgentEvent::ToolExecutionEnd {
         tool_use_id: "tu-1".into(),
-        result: Err(ToolError::Aborted),
+        result: Err(ToolFailure::aborted()),
     };
     match step_progress_from(&ev) {
         Some(StepProgress::ToolExecutionEnd { ok, error, .. }) => {

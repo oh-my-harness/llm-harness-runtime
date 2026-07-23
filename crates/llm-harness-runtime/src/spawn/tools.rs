@@ -15,8 +15,9 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use llm_harness_types::{
     ABORT_SUBAGENT_TOOL_NAME, AWAIT_MAIN_MESSAGE_TOOL_NAME, AWAIT_SUBAGENT_REPLY_TOOL_NAME,
-    ContentBlock, MESSAGE_MAIN_TOOL_NAME, MESSAGE_SUBAGENT_TOOL_NAME, QUERY_SUBAGENT_TOOL_NAME,
-    SPAWN_AGENT_TOOL_NAME, Tool, ToolContext, ToolError, ToolExecutionMode, ToolLevel, ToolResult,
+    DataBlock, MESSAGE_MAIN_TOOL_NAME, MESSAGE_SUBAGENT_TOOL_NAME, QUERY_SUBAGENT_TOOL_NAME,
+    SPAWN_AGENT_TOOL_NAME, Tool, ToolContext, ToolError, ToolExecutionMode, ToolFailure, ToolLevel,
+    ToolResult,
 };
 
 use crate::spawn::message_bus::{
@@ -114,12 +115,12 @@ impl Tool for SpawnAgentTool {
         &'a self,
         args: serde_json::Value,
         _ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let prompt = args
                 .get("prompt")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| ToolError::Execution("missing prompt".into()))?
+                .ok_or_else(|| ToolFailure::invalid_arguments("missing prompt"))?
                 .to_string();
             let context = args
                 .get("context")
@@ -146,13 +147,13 @@ impl Tool for SpawnAgentTool {
                 .await
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
 
-            Ok(ToolResult {
-                content: vec![ContentBlock::Text {
-                    text: format!("Spawned agent '{agent_id}'. Results will arrive when done."),
-                }],
-                details: serde_json::json!({"agent_id": agent_id}),
-                terminate: false,
-            })
+            Ok(ToolResult::full(
+                vec![DataBlock::text(format!(
+                    "Spawned agent '{agent_id}'. Results will arrive when done."
+                ))],
+                serde_json::json!({"agent_id": agent_id}),
+                false,
+            ))
         })
     }
 }
@@ -221,28 +222,29 @@ impl Tool for MessageSubagentTool {
         &'a self,
         args: serde_json::Value,
         _ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let to = args
                 .get("to")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| ToolError::Execution("missing to".into()))?
+                .ok_or_else(|| ToolFailure::invalid_arguments("missing to"))?
                 .to_string();
             let message = args
                 .get("message")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| ToolError::Execution("missing message".into()))?
+                .ok_or_else(|| ToolFailure::invalid_arguments("missing message"))?
                 .to_string();
 
             match self.bus.send(&self.main_id, &to, &message).await {
-                SendReceipt::Injected => Ok(ToolResult {
-                    content: vec![ContentBlock::Text {
-                        text: format!("Message sent to agent '{to}'"),
-                    }],
-                    details: serde_json::json!({"to": to}),
-                    terminate: false,
-                }),
-                SendReceipt::Failed(reason) => Err(ToolError::Execution(reason)),
+                SendReceipt::Injected => Ok(ToolResult::full(
+                    vec![DataBlock::text(format!("Message sent to agent '{to}'"))],
+                    serde_json::json!({"to": to}),
+                    false,
+                )),
+                SendReceipt::Failed(_) => Err(ToolFailure::new(
+                    "message_delivery_failed",
+                    format!("Unable to deliver message to agent '{to}'."),
+                )),
             }
         })
     }
@@ -316,7 +318,7 @@ impl Tool for AwaitSubagentReplyTool {
         &'a self,
         args: serde_json::Value,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let from = args
                 .get("from")
@@ -340,13 +342,13 @@ impl Tool for AwaitSubagentReplyTool {
                 None => format!("No message within {}s.", timeout.as_secs()),
             };
 
-            Ok(ToolResult {
-                content: vec![ContentBlock::Text { text }],
-                details: serde_json::json!({
+            Ok(ToolResult::full(
+                vec![DataBlock::text(text)],
+                serde_json::json!({
                     "status": if received { "received" } else { "timeout" }
                 }),
-                terminate: false,
-            })
+                false,
+            ))
         })
     }
 }
@@ -417,7 +419,7 @@ impl Tool for QuerySubagentTool {
         &'a self,
         args: serde_json::Value,
         _ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let agent_id = args.get("agent_id").and_then(|v| v.as_str());
             let snapshots = self.bus.query_status(agent_id);
@@ -441,11 +443,11 @@ impl Tool for QuerySubagentTool {
                 }).collect::<Vec<_>>()
             });
 
-            Ok(ToolResult {
-                content: vec![ContentBlock::Text { text }],
+            Ok(ToolResult::full(
+                vec![DataBlock::text(text)],
                 details,
-                terminate: false,
-            })
+                false,
+            ))
         })
     }
 }
@@ -505,12 +507,12 @@ impl Tool for AbortSubagentTool {
         &'a self,
         args: serde_json::Value,
         _ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let agent_id = args
                 .get("agent_id")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| ToolError::Execution("missing agent_id".into()))?;
+                .ok_or_else(|| ToolFailure::invalid_arguments("missing agent_id"))?;
 
             let snapshots = self.bus.query_status(Some(agent_id));
             let exists = snapshots
@@ -518,24 +520,24 @@ impl Tool for AbortSubagentTool {
                 .any(|s| matches!(s.status, AgentStatus::Running));
 
             if !exists {
-                return Ok(ToolResult {
-                    content: vec![ContentBlock::Text {
-                        text: format!("Agent '{agent_id}' not found or not running."),
-                    }],
-                    details: serde_json::json!({"agent_id": agent_id, "aborted": false}),
-                    terminate: false,
-                });
+                return Ok(ToolResult::full(
+                    vec![DataBlock::text(format!(
+                        "Agent '{agent_id}' not found or not running."
+                    ))],
+                    serde_json::json!({"agent_id": agent_id, "aborted": false}),
+                    false,
+                ));
             }
 
             self.bus.abort_agent(agent_id);
 
-            Ok(ToolResult {
-                content: vec![ContentBlock::Text {
-                    text: format!("Agent '{agent_id}' abort signal sent."),
-                }],
-                details: serde_json::json!({"agent_id": agent_id, "aborted": true}),
-                terminate: false,
-            })
+            Ok(ToolResult::full(
+                vec![DataBlock::text(format!(
+                    "Agent '{agent_id}' abort signal sent."
+                ))],
+                serde_json::json!({"agent_id": agent_id, "aborted": true}),
+                false,
+            ))
         })
     }
 }
@@ -600,12 +602,12 @@ impl Tool for MessageMainTool {
         &'a self,
         args: serde_json::Value,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let message = args
                 .get("message")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| ToolError::Execution("missing message".into()))?
+                .ok_or_else(|| ToolFailure::invalid_arguments("missing message"))?
                 .to_string();
 
             // select! on ctx.abort so the sub-agent is not stuck forever if
@@ -613,19 +615,20 @@ impl Tool for MessageMainTool {
             let receipt = tokio::select! {
                 r = self.bus.send(&self.sub_id, MAIN_AGENT_ID, &message) => r,
                 _ = ctx.abort.cancelled() => {
-                    return Err(ToolError::Execution("aborted".into()));
+                    return Err(ToolFailure::aborted());
                 }
             };
 
             match receipt {
-                SendReceipt::Injected => Ok(ToolResult {
-                    content: vec![ContentBlock::Text {
-                        text: "Message reported to main agent".to_string(),
-                    }],
-                    details: serde_json::json!({}),
-                    terminate: false,
-                }),
-                SendReceipt::Failed(reason) => Err(ToolError::Execution(reason)),
+                SendReceipt::Injected => Ok(ToolResult::full(
+                    vec![DataBlock::text("Message reported to main agent")],
+                    serde_json::json!({}),
+                    false,
+                )),
+                SendReceipt::Failed(_) => Err(ToolFailure::new(
+                    "message_delivery_failed",
+                    "Unable to deliver message to the main agent.",
+                )),
             }
         })
     }
@@ -696,7 +699,7 @@ impl Tool for AwaitMainMessageTool {
         &'a self,
         args: serde_json::Value,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let timeout = parse_timeout(&args);
 
@@ -711,13 +714,13 @@ impl Tool for AwaitMainMessageTool {
                 None => format!("No message within {}s.", timeout.as_secs()),
             };
 
-            Ok(ToolResult {
-                content: vec![ContentBlock::Text { text }],
-                details: serde_json::json!({
+            Ok(ToolResult::full(
+                vec![DataBlock::text(text)],
+                serde_json::json!({
                     "status": if received { "received" } else { "timeout" }
                 }),
-                terminate: false,
-            })
+                false,
+            ))
         })
     }
 }
@@ -870,8 +873,8 @@ mod tests {
         assert!(!result.terminate);
         let agent_id = result.details.get("agent_id").unwrap().as_str().unwrap();
         assert!(!agent_id.is_empty());
-        match &result.content[0] {
-            ContentBlock::Text { text } => assert!(text.contains("Spawned agent")),
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => assert!(text.contains("Spawned agent")),
             _ => panic!("expected text"),
         }
         // Let the track task finish.
@@ -885,7 +888,7 @@ mod tests {
         let ctx = make_tool_context();
         let args = serde_json::json!({});
         let err = tool.execute(args, &ctx).await.unwrap_err();
-        assert!(matches!(err, ToolError::Execution(_)));
+        assert_eq!(err.code, "invalid_arguments");
     }
 
     #[tokio::test]
@@ -936,7 +939,7 @@ mod tests {
         let ctx = make_tool_context();
         let args = serde_json::json!({"to": "ghost", "message": "hello"});
         let err = tool.execute(args, &ctx).await.unwrap_err();
-        assert!(matches!(err, ToolError::Execution(_)));
+        assert_eq!(err.code, "message_delivery_failed");
     }
 
     #[tokio::test]
@@ -950,7 +953,7 @@ mod tests {
             .execute(serde_json::json!({"message": "hi"}), &ctx)
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::Execution(_)));
+        assert_eq!(err.code, "invalid_arguments");
     }
 
     // ── Tool 3: AwaitSubagentReplyTool ────────────────────────────────────
@@ -985,8 +988,8 @@ mod tests {
         let _ = bus_clone.send("sub-1", MAIN_AGENT_ID, "hi main").await;
 
         let result = wait_handle.await.unwrap().unwrap();
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert_eq!(text, "[from:sub-1] hi main");
             }
             _ => panic!("expected text"),
@@ -1006,8 +1009,8 @@ mod tests {
         let ctx = make_tool_context();
         let args = serde_json::json!({"timeout": 0.05});
         let result = tool.execute(args, &ctx).await.unwrap();
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert!(text.starts_with("No message within"));
             }
             _ => panic!("expected text"),
@@ -1070,8 +1073,8 @@ mod tests {
 
         let result = wait_handle.await.unwrap().unwrap();
         // On abort, bus.wait returns None → timeout-formatted text.
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert!(text.starts_with("No message within"));
             }
             _ => panic!("expected text"),
@@ -1100,8 +1103,8 @@ mod tests {
         let _ = bus.send("sub-2", MAIN_AGENT_ID, "from sub-2").await;
 
         let result = wait_handle.await.unwrap().unwrap();
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert_eq!(text, "[from:sub-2] from sub-2");
             }
             _ => panic!("expected text"),
@@ -1130,8 +1133,8 @@ mod tests {
         let tool = QuerySubagentTool::new(bus);
         let ctx = make_tool_context();
         let result = tool.execute(serde_json::json!({}), &ctx).await.unwrap();
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert!(text.contains("Main: running"));
                 assert!(text.contains("sub-1: running"));
                 assert!(text.contains("sub-2: running"));
@@ -1154,8 +1157,8 @@ mod tests {
             .execute(serde_json::json!({"agent_id": "sub-1"}), &ctx)
             .await
             .unwrap();
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert_eq!(text, "sub-1: running");
             }
             _ => panic!("expected text"),
@@ -1173,8 +1176,8 @@ mod tests {
             .execute(serde_json::json!({"agent_id": "ghost"}), &ctx)
             .await
             .unwrap();
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert_eq!(text, "No agents found.");
             }
             _ => panic!("expected text"),
@@ -1199,8 +1202,8 @@ mod tests {
             .execute(serde_json::json!({"agent_id": "sub-1"}), &ctx)
             .await
             .unwrap();
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert_eq!(text, "sub-1: done");
             }
             _ => panic!("expected text"),
@@ -1230,8 +1233,8 @@ mod tests {
         let ctx = make_tool_context();
         let args = serde_json::json!({"message": "reporting in"});
         let result = tool.execute(args, &ctx).await.unwrap();
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert_eq!(text, "Message reported to main agent");
             }
             _ => panic!("expected text"),
@@ -1246,7 +1249,7 @@ mod tests {
         let tool = MessageMainTool::new(bus, "sub-1");
         let ctx = make_tool_context();
         let err = tool.execute(serde_json::json!({}), &ctx).await.unwrap_err();
-        assert!(matches!(err, ToolError::Execution(_)));
+        assert_eq!(err.code, "invalid_arguments");
     }
 
     #[tokio::test]
@@ -1259,7 +1262,7 @@ mod tests {
             .execute(serde_json::json!({"message": "hi"}), &ctx)
             .await
             .unwrap_err();
-        assert!(matches!(err, ToolError::Execution(_)));
+        assert_eq!(err.code, "message_delivery_failed");
     }
 
     // ── Tool 6: AwaitMainMessageTool ──────────────────────────────────────
@@ -1292,8 +1295,8 @@ mod tests {
         let _ = bus.send(MAIN_AGENT_ID, "sub-1", "do this").await;
 
         let result = wait_handle.await.unwrap().unwrap();
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert_eq!(text, "[from:Main] do this");
             }
             _ => panic!("expected text"),
@@ -1309,8 +1312,8 @@ mod tests {
         let ctx = make_tool_context();
         let args = serde_json::json!({"timeout": 0.05});
         let result = tool.execute(args, &ctx).await.unwrap();
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert!(text.starts_with("No message within"));
             }
             _ => panic!("expected text"),
@@ -1336,8 +1339,8 @@ mod tests {
         abort_clone.cancel();
 
         let result = wait_handle.await.unwrap().unwrap();
-        match &result.content[0] {
-            ContentBlock::Text { text } => {
+        match &result.model_content[0] {
+            DataBlock::Text { text, .. } => {
                 assert!(text.starts_with("No message within"));
             }
             _ => panic!("expected text"),

@@ -1,5 +1,6 @@
 use crate::{
-    AgentError, AgentMessage, AssistantMessage, AssistantMessageKind, ToolError, ToolResult,
+    AgentError, AgentMessage, AssistantMessage, AssistantMessageKind, ToolFailure, ToolProgress,
+    ToolResult,
 };
 
 /// Agent 产生的完整事件流。
@@ -24,7 +25,7 @@ pub enum AgentEvent {
         /// 本轮 LLM 回复。
         message: AssistantMessage,
         /// 本轮所有 tool 执行结果；key 为 `tool_use_id`。
-        tool_results: Vec<(String, Result<ToolResult, ToolError>)>,
+        tool_results: Vec<(String, Result<ToolResult, ToolFailure>)>,
     },
 
     // === 消息级（assistant message 边界） ===
@@ -77,12 +78,12 @@ pub enum AgentEvent {
     /// 长时间运行的 tool 推送的中间结果。
     ToolExecutionUpdate {
         tool_use_id: String,
-        partial: ToolResult,
+        partial: ToolProgress,
     },
     /// Tool 执行完毕；携带 Rust 层面的执行结果。
     ToolExecutionEnd {
         tool_use_id: String,
-        result: Result<ToolResult, ToolError>,
+        result: Result<ToolResult, ToolFailure>,
     },
 
     /// Loop 遇到不可恢复的错误；之后 `AgentEnd` 将立即到达。
@@ -169,11 +170,8 @@ mod tests {
 
     #[test]
     fn turn_end_carries_tool_results() {
-        let result: Result<ToolResult, crate::ToolError> = Ok(ToolResult {
-            content: vec![],
-            details: serde_json::Value::Null,
-            terminate: false,
-        });
+        let result: Result<ToolResult, crate::ToolFailure> =
+            Ok(ToolResult::full(vec![], serde_json::Value::Null, false));
         let ev = AgentEvent::TurnEnd {
             index: 0,
             message: make_assistant(),

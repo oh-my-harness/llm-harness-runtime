@@ -57,10 +57,12 @@ pub mod prelude {
         Skill, SkillDiagnostic, SourcedSkill,
     };
     pub use llm_harness_types::{
-        AgentError, AgentEvent, AgentMessage, AssistantMessage, BranchSummaryMessage,
-        CompactionError, CompactionSummaryMessage, ContentBlock, DiagnosticLevel, EntryId,
-        EnvError, ExecutionEnv, FileInfo, HarnessError, HarnessPhase, ImageSource, ShellOptions,
-        ShellOutput, StopReason, StreamOptions, ThinkingLevel, TokenUsage, Tool, ToolContext,
-        ToolError, ToolExecutionMode, ToolResult, UnsupportedEnv, UserMessage,
+        AgentError, AgentEvent, AgentMessage, AssistantMessage, BinarySource, BranchSummaryMessage,
+        CompactionError, CompactionSummaryMessage, ContentBlock, DataBlock, DiagnosticLevel,
+        EntryId, EnvError, ExecutionEnv, FileInfo, HarnessError, HarnessPhase, ImageSource,
+        PersistedEnvelope, PersistedToolProjection, ProjectionMetadata, ShellOptions, ShellOutput,
+        StopReason, StreamOptions, ThinkingLevel, TokenUsage, Tool, ToolContext, ToolError,
+        ToolExecutionMode, ToolFailure, ToolProgress, ToolProjectionKind, ToolResult,
+        ToolResultExtensions, ToolSessionProjection, UnsupportedEnv, UserMessage,
     };
 }

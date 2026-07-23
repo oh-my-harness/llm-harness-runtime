@@ -55,7 +55,9 @@ impl ConvertToLlmHook for DefaultConvertToLlm {
         messages: &'a [AgentMessage],
     ) -> BoxFuture<'a, Result<Vec<AdapterMessage>, AgentError>> {
         Box::pin(async move {
-            use crate::type_bridge::{content_block_to_request, content_block_to_response};
+            use crate::type_bridge::{
+                content_block_to_request, content_block_to_response, data_block_to_request,
+            };
             let mut out = Vec::with_capacity(messages.len());
             for msg in messages {
                 match msg {
@@ -70,8 +72,11 @@ impl ConvertToLlmHook for DefaultConvertToLlm {
                         out.push(AdapterMessage::Assistant(content));
                     }
                     AgentMessage::ToolResult(t) => {
-                        let content =
-                            t.content.iter().filter_map(content_block_to_request).collect();
+                        let content = t
+                            .content
+                            .iter()
+                            .map(data_block_to_request)
+                            .collect::<Result<Vec<_>, _>>()?;
                         out.push(AdapterMessage::Tool {
                             invocation_id: t.tool_use_id.clone(),
                             content,
@@ -111,6 +116,13 @@ mod tests {
 
     fn text_block(s: &str) -> ContentBlock {
         ContentBlock::Text { text: s.into() }
+    }
+
+    fn persisted_full() -> PersistedToolProjection {
+        PersistedToolProjection {
+            kind: ToolProjectionKind::Full,
+            metadata: ProjectionMetadata::default(),
+        }
     }
 
     #[tokio::test]
@@ -161,8 +173,9 @@ mod tests {
         let conv = DefaultConvertToLlm::new();
         let msg = AgentMessage::ToolResult(ToolResultMessage {
             tool_use_id: "c1".into(),
-            content: vec![text_block("done")],
+            content: vec![DataBlock::text("done")],
             is_error: false,
+            projection: persisted_full(),
             timestamp: Utc::now(),
         });
         let result = conv.convert(&[msg]).await.unwrap();
@@ -254,8 +267,9 @@ mod tests {
         let msgs = vec![
             AgentMessage::ToolResult(ToolResultMessage {
                 tool_use_id: "c1".into(),
-                content: vec![text_block("done")],
+                content: vec![DataBlock::text("done")],
                 is_error: false,
+                projection: persisted_full(),
                 timestamp: Utc::now(),
             }),
             AgentMessage::User(UserMessage {
@@ -277,14 +291,16 @@ mod tests {
         let msgs = vec![
             AgentMessage::ToolResult(ToolResultMessage {
                 tool_use_id: "c1".into(),
-                content: vec![text_block("first")],
+                content: vec![DataBlock::text("first")],
                 is_error: false,
+                projection: persisted_full(),
                 timestamp: Utc::now(),
             }),
             AgentMessage::ToolResult(ToolResultMessage {
                 tool_use_id: "c2".into(),
-                content: vec![text_block("second")],
+                content: vec![DataBlock::text("second")],
                 is_error: false,
+                projection: persisted_full(),
                 timestamp: Utc::now(),
             }),
         ];
@@ -316,14 +332,16 @@ mod tests {
             }),
             AgentMessage::ToolResult(ToolResultMessage {
                 tool_use_id: "c1".into(),
-                content: vec![text_block("first done")],
+                content: vec![DataBlock::text("first done")],
                 is_error: false,
+                projection: persisted_full(),
                 timestamp: Utc::now(),
             }),
             AgentMessage::ToolResult(ToolResultMessage {
                 tool_use_id: "c2".into(),
-                content: vec![text_block("second done")],
+                content: vec![DataBlock::text("second done")],
                 is_error: false,
+                projection: persisted_full(),
                 timestamp: Utc::now(),
             }),
         ];

@@ -25,4 +25,5 @@ test-utils = ["llm-harness-loop/test-utils"]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 async-trait.workspace = true
+llm_adapter.workspace = true
 llm-harness-runtime-sandbox-os = { path = "../llm-harness-runtime-sandbox-os" }

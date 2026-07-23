@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// 图片数据来源。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
     /// Base64 编码的内联图片。
@@ -11,6 +11,61 @@ pub enum ImageSource {
         /// Base64 编码的图片数据。
         data: String,
     },
+}
+
+/// Binary data that is safe to pass through the runtime as data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BinarySource {
+    /// Base64-encoded bytes owned by the current value.
+    Base64 { data: String },
+    /// Opaque handle to a runtime-owned blob. Handles are intentionally not
+    /// persistable in a Session projection.
+    Blob { id: String },
+}
+
+/// External or tool-produced data that may be shown to a model.
+///
+/// Unlike [`ContentBlock`], this type cannot represent model reasoning or a
+/// tool invocation. That distinction is the security boundary used by
+/// Knowledge, Memory, and Session Projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DataBlock {
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
+    Image {
+        source: ImageSource,
+    },
+    Document {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        media_type: String,
+        data: BinarySource,
+    },
+}
+
+impl DataBlock {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text {
+            text: text.into(),
+            mime_type: None,
+        }
+    }
+
+    /// Whether this block can be stored durably in a Session.
+    pub fn is_persistable(&self) -> bool {
+        !matches!(
+            self,
+            Self::Document {
+                data: BinarySource::Blob { .. },
+                ..
+            }
+        )
+    }
 }
 
 /// 消息内容的最小单元。
@@ -101,5 +156,26 @@ mod tests {
             ),
             "expected signature to round-trip as None, got: {json}"
         );
+    }
+
+    #[test]
+    fn data_block_cannot_represent_instruction_blocks() {
+        let block = DataBlock::text("external data");
+        let json = serde_json::to_value(block).unwrap();
+        assert_eq!(json["type"], "text");
+        assert!(json.get("thinking").is_none());
+        assert!(json.get("tool_use").is_none());
+    }
+
+    #[test]
+    fn runtime_blob_is_not_persistable() {
+        let block = DataBlock::Document {
+            name: Some("report.pdf".into()),
+            media_type: "application/pdf".into(),
+            data: BinarySource::Blob {
+                id: "blob-1".into(),
+            },
+        };
+        assert!(!block.is_persistable());
     }
 }

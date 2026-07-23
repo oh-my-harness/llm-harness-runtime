@@ -5,7 +5,6 @@ use llm_harness_runtime::observability::tracer::{CaptureLevel, SpanCaptureConfig
 use llm_harness_runtime::observability::tracing_adapter::TracingHookAdapter;
 use llm_harness_runtime_trace_otel::InMemoryTraceExporter;
 use llm_harness_types::{BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook};
-use serde_json::Value;
 
 // ── Test 1: TracingHookAdapter lifecycle produces no panics ─────────────────
 
@@ -73,7 +72,7 @@ fn tracing_is_independent_of_budget_state() {
 #[test]
 fn custom_before_tool_call_hook_satisfies_harness_hooks() {
     use futures::future::BoxFuture;
-    use llm_harness_types::{ContentBlock, ToolResult};
+    use llm_harness_types::ToolFailure;
 
     struct AlwaysDenyHook;
 
@@ -83,13 +82,10 @@ fn custom_before_tool_call_hook_satisfies_harness_hooks() {
             ctx: BeforeToolCallCtx<'a>,
         ) -> BoxFuture<'a, BeforeToolCallDecision> {
             Box::pin(async move {
-                BeforeToolCallDecision::Deny(ToolResult {
-                    content: vec![ContentBlock::Text {
-                        text: format!("blocked: {}", ctx.tool_name),
-                    }],
-                    details: Value::Null,
-                    terminate: true,
-                })
+                BeforeToolCallDecision::Deny(ToolFailure::new(
+                    "test_denied",
+                    format!("blocked: {}", ctx.tool_name),
+                ))
             })
         }
     }

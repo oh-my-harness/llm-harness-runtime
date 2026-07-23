@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{ContentBlock, StopReason};
+use crate::{ContentBlock, DataBlock, PersistedToolProjection, StopReason};
 
 /// 单次 LLM 调用的 token 用量。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -107,9 +107,11 @@ pub struct ToolResultMessage {
     /// 对应的 LLM tool call ID。
     pub tool_use_id: String,
     /// 发送给 LLM 的结果内容块。
-    pub content: Vec<ContentBlock>,
+    pub content: Vec<DataBlock>,
     /// 工具执行是否失败。
     pub is_error: bool,
+    /// How this message was projected from the current-run tool result.
+    pub projection: PersistedToolProjection,
     /// 消息创建时间。
     pub timestamp: DateTime<Utc>,
 }
@@ -211,8 +213,12 @@ mod tests {
     fn tool_result_message_serde() {
         let msg = AgentMessage::ToolResult(ToolResultMessage {
             tool_use_id: "call_1".into(),
-            content: vec![text_block("result")],
+            content: vec![DataBlock::text("result")],
             is_error: false,
+            projection: PersistedToolProjection {
+                kind: crate::ToolProjectionKind::Full,
+                metadata: crate::ProjectionMetadata::default(),
+            },
             timestamp: chrono::Utc::now(),
         });
         let json = serde_json::to_string(&msg).unwrap();

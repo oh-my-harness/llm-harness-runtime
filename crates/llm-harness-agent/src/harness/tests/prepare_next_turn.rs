@@ -2,7 +2,7 @@ use super::*;
 
 use llm_harness_loop::ResponseFormat;
 use llm_harness_types::{
-    ContentBlock, PrepareNextTurnCtx, PrepareNextTurnHook, ToolError, ToolResult,
+    ContentBlock, PrepareNextTurnCtx, PrepareNextTurnHook, ToolFailure, ToolResult,
 };
 
 use crate::harness::prepare_next_turn::DefaultPrepareNextTurn;
@@ -32,7 +32,7 @@ fn test_run() -> &'static llm_harness_types::RunContext {
 
 fn make_ctx<'a>(
     assistant: &'a AssistantMessage,
-    results: &'a [(String, Result<ToolResult, ToolError>)],
+    results: &'a [(String, Result<ToolResult, ToolFailure>)],
 ) -> PrepareNextTurnCtx<'a> {
     PrepareNextTurnCtx {
         run: test_run(),
@@ -60,7 +60,7 @@ async fn default_prepare_next_turn_threads_state_response_format() {
     };
 
     let assistant = test_assistant();
-    let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+    let results: [(String, Result<ToolResult, ToolFailure>); 0] = [];
     let directive = hook.prepare(make_ctx(&assistant, &results)).await.unwrap();
     assert_eq!(
         directive.response_format,
@@ -81,7 +81,7 @@ async fn default_prepare_next_turn_threads_none_response_format() {
     };
 
     let assistant = test_assistant();
-    let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+    let results: [(String, Result<ToolResult, ToolFailure>); 0] = [];
     let directive = hook.prepare(make_ctx(&assistant, &results)).await.unwrap();
     assert_eq!(
         directive.response_format,
@@ -128,7 +128,7 @@ async fn default_prepare_next_turn_user_hook_overrides_response_format() {
     };
 
     let assistant = test_assistant();
-    let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+    let results: [(String, Result<ToolResult, ToolFailure>); 0] = [];
     let directive = hook.prepare(make_ctx(&assistant, &results)).await.unwrap();
     assert_eq!(
         directive.response_format,
@@ -148,7 +148,7 @@ async fn default_prepare_next_turn_user_hook_none_preserves_base() {
     };
 
     let assistant = test_assistant();
-    let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+    let results: [(String, Result<ToolResult, ToolFailure>); 0] = [];
     let directive = hook.prepare(make_ctx(&assistant, &results)).await.unwrap();
     assert_eq!(
         directive.response_format,
@@ -168,7 +168,7 @@ async fn default_prepare_next_turn_user_hook_clears_response_format() {
     };
 
     let assistant = test_assistant();
-    let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+    let results: [(String, Result<ToolResult, ToolFailure>); 0] = [];
     let directive = hook.prepare(make_ctx(&assistant, &results)).await.unwrap();
     assert_eq!(
         directive.response_format,

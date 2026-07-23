@@ -43,12 +43,12 @@ pub(crate) async fn execute_tool_batch(
     calls: Vec<(String, serde_json::Value, Arc<dyn Tool>)>,
     ctx_factory: impl Fn(String) -> ToolContext,
     default_mode: ToolExecutionMode,
-) -> Vec<(String, Result<ToolResult, ToolError>)> {
+) -> Vec<(String, Result<ToolResult, ToolFailure>)> {
     let tools: Vec<Arc<dyn Tool>> = calls.iter().map(|(_, _, t)| t.clone()).collect();
     let groups = group_by_sequential(&tools, default_mode);
 
     let n = calls.len();
-    let mut results: Vec<Option<(String, Result<ToolResult, ToolError>)>> =
+    let mut results: Vec<Option<(String, Result<ToolResult, ToolFailure>)>> =
         (0..n).map(|_| None).collect();
 
     for group in groups {
@@ -104,14 +104,8 @@ mod tests {
                 &'a self,
                 _: serde_json::Value,
                 _: &'a ToolContext,
-            ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolError>> {
-                Box::pin(async {
-                    Ok(ToolResult {
-                        content: vec![],
-                        details: serde_json::Value::Null,
-                        terminate: false,
-                    })
-                })
+            ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
             }
         }
         Arc::new(PT { name })
@@ -139,14 +133,8 @@ mod tests {
                 &'a self,
                 _: serde_json::Value,
                 _: &'a ToolContext,
-            ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolError>> {
-                Box::pin(async {
-                    Ok(ToolResult {
-                        content: vec![],
-                        details: serde_json::Value::Null,
-                        terminate: false,
-                    })
-                })
+            ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
             }
         }
         Arc::new(ST { name })

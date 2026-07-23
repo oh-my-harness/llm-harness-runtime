@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use llm_harness_types::{
-    SUBMIT_WORKFLOW_TOOL_NAME, Tool, ToolContext, ToolError, ToolLevel, ToolResult,
+    SUBMIT_WORKFLOW_TOOL_NAME, Tool, ToolContext, ToolError, ToolFailure, ToolLevel, ToolResult,
 };
 use serde::Deserialize;
 
@@ -449,7 +449,7 @@ impl Tool for PlanWorkflowTool {
         &'a self,
         args: serde_json::Value,
         _ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, std::result::Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let plan: PlanInput = serde_json::from_value(args)
                 .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
@@ -464,17 +464,15 @@ impl Tool for PlanWorkflowTool {
                 .save_workflow(&self.task_id, &workflow)
                 .await
                 .map_err(|e| ToolError::Execution(format!("save_workflow failed: {e}")))?;
-            Ok(ToolResult {
-                content: vec![llm_harness_types::ContentBlock::Text {
-                    text: format!(
-                        "Workflow plan accepted ({} steps). task_id={}",
-                        workflow.steps.len(),
-                        self.task_id.0
-                    ),
-                }],
-                details: serde_json::json!({ "task_id": self.task_id.0, "step_count": workflow.steps.len() }),
-                terminate: false,
-            })
+            Ok(ToolResult::full(
+                vec![llm_harness_types::DataBlock::text(format!(
+                    "Workflow plan accepted ({} steps). task_id={}",
+                    workflow.steps.len(),
+                    self.task_id.0
+                ))],
+                serde_json::json!({ "task_id": self.task_id.0, "step_count": workflow.steps.len() }),
+                false,
+            ))
         })
     }
 }

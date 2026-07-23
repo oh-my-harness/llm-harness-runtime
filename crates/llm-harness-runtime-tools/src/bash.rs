@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use llm_harness_types::{
-    ContentBlock, EnvError, ShellOptions, ShellOutput, Tool, ToolContext, ToolError, ToolResult,
+    DataBlock, EnvError, ShellOptions, ShellOutput, Tool, ToolContext, ToolError, ToolFailure,
+    ToolResult,
 };
 
 use crate::resolve_path;
@@ -25,7 +26,7 @@ const MAX_TIMEOUT_SECS: u64 = 3600;
 /// are merged (stdout first) into the returned text. An exit code of 0 yields a
 /// normal result; a non-zero exit code is conveyed via a trailing
 /// `Command exited with code <n>` line and a `details.exit_code` field rather
-/// than as a `ToolError` (the command *ran*, it just failed).
+/// than as a `ToolFailure` (the command *ran*, it just failed).
 pub struct BashTool;
 
 impl BashTool {
@@ -86,7 +87,7 @@ impl Tool for BashTool {
         &'a self,
         args: serde_json::Value,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let command = args
                 .get("command")
@@ -138,15 +139,15 @@ impl Tool for BashTool {
 
             let output = match ctx.env.execute_shell(command, opts).await {
                 Ok(o) => o,
-                Err(EnvError::Aborted) => return Err(ToolError::Aborted),
+                Err(EnvError::Aborted) => return Err(ToolFailure::aborted()),
                 // The real `OsEnv` signals a command timeout as
                 // `EnvError::ShellFailed { exit_code: -1, stderr: "timeout" }`
                 // (env.rs:458-464; asserted by `execute_shell_timeout_returns_shell_failed`).
                 // Per spec (design.md line 157) a timeout must surface as a
-                // `ToolError` carrying any captured output — not as a normal
+                // `ToolFailure` carrying no captured output — not as a normal
                 // `ToolResult`. We detect the timeout via the `stderr ==
                 // "timeout"` sentinel (OsEnv's documented contract) and route
-                // it to `ToolError::Execution` with the partial stdout/stderr.
+                // it to a sanitized execution failure.
                 Err(EnvError::ShellFailed {
                     exit_code: _,
                     stdout,
@@ -161,11 +162,11 @@ impl Tool for BashTool {
                         msg.push_str("; stderr: ");
                         msg.push_str(&stderr);
                     }
-                    return Err(ToolError::Execution(msg));
+                    return Err(ToolError::Execution(msg).into());
                 }
                 // Non-zero exit: the real OsEnv returns `EnvError::ShellFailed`
                 // carrying the captured stdout/stderr. Convert it to a
-                // `ToolResult` (not `ToolError`) so the LLM can see the command
+                // `ToolResult` (not `ToolFailure`) so the LLM can see the command
                 // output and adjust — matching the spec's "ran but failed"
                 // semantics.
                 Err(EnvError::ShellFailed {
@@ -177,7 +178,7 @@ impl Tool for BashTool {
                     stderr,
                     exit_code,
                 },
-                Err(e) => return Err(ToolError::Execution(e.to_string())),
+                Err(e) => return Err(ToolError::Execution(e.to_string()).into()),
             };
 
             // Merge stdout then stderr.
@@ -197,11 +198,11 @@ impl Tool for BashTool {
                 } else {
                     text
                 };
-                Ok(ToolResult {
-                    content: vec![ContentBlock::Text { text }],
+                Ok(ToolResult::full(
+                    vec![DataBlock::text(text)],
                     details,
-                    terminate: false,
-                })
+                    false,
+                ))
             } else {
                 // Non-zero exit: the command ran but failed. Surface the exit
                 // code both in the text and in `details`.
@@ -209,11 +210,11 @@ impl Tool for BashTool {
                     text.push('\n');
                 }
                 text.push_str(&format!("Command exited with code {}", output.exit_code));
-                Ok(ToolResult {
-                    content: vec![ContentBlock::Text { text }],
+                Ok(ToolResult::full(
+                    vec![DataBlock::text(text)],
                     details,
-                    terminate: false,
-                })
+                    false,
+                ))
             }
         })
     }
@@ -259,9 +260,9 @@ mod tests {
     }
 
     fn text_of(res: &ToolResult) -> String {
-        match res.content.as_slice() {
-            [ContentBlock::Text { text }] => text.clone(),
-            _ => panic!("expected a single text block, got {:?}", res.content),
+        match res.model_content.as_slice() {
+            [DataBlock::Text { text, .. }] => text.clone(),
+            _ => panic!("expected a single text block, got {:?}", res.model_content),
         }
     }
 
@@ -323,15 +324,8 @@ mod tests {
             .await
             .expect_err("missing command should error");
 
-        match err {
-            ToolError::InvalidArguments(msg) => {
-                assert!(
-                    msg.contains("command"),
-                    "error should mention command: {msg}"
-                );
-            }
-            other => panic!("expected InvalidArguments, got {other:?}"),
-        }
+        assert_eq!(err.code, "invalid_arguments");
+        assert!(err.model_message.contains("command"));
     }
 
     #[tokio::test]
@@ -402,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn bash_shell_failed_yields_tool_result() {
         // After the mock contract fix, `false` returns Err(ShellFailed).
-        // BashTool must convert that into a ToolResult (not ToolError), and
+        // BashTool must convert that into a ToolResult (not ToolFailure), and
         // still record that execute_shell was invoked.
         let env = Arc::new(MockExecutionEnv::new());
         let ctx = make_ctx(env.clone());
@@ -411,7 +405,7 @@ mod tests {
         let res = tool
             .execute(serde_json::json!({ "command": "false" }), &ctx)
             .await
-            .expect("ShellFailed must become a ToolResult, not a ToolError");
+            .expect("ShellFailed must become a ToolResult, not a ToolFailure");
         let text = text_of(&res);
         assert!(text.contains("Command exited with code 1"), "got: {text}");
         assert_eq!(res.details["exit_code"], 1);
@@ -421,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn bash_timeout_routes_to_tool_error_with_captured_output() {
         // OsEnv signals timeout as ShellFailed { stderr: "timeout", .. }.
-        // BashTool must surface it as a ToolError (not a ToolResult) and
+        // BashTool must surface it as a ToolFailure (not a ToolResult) and
         // preserve any partial stdout/stderr in the error message.
         let env = Arc::new(MockExecutionEnv::new());
         let ctx = make_ctx(env);
@@ -430,14 +424,8 @@ mod tests {
         let err = tool
             .execute(serde_json::json!({ "command": "__timeout__" }), &ctx)
             .await
-            .expect_err("timeout must produce a ToolError");
-        match err {
-            ToolError::Execution(msg) => {
-                assert!(msg.contains("timed out"), "missing 'timed out': {msg}");
-                assert!(msg.contains("partial output"), "lost stdout: {msg}");
-                assert!(msg.contains("timeout"), "lost stderr: {msg}");
-            }
-            other => panic!("expected ToolError::Execution for timeout, got {other:?}"),
-        }
+            .expect_err("timeout must produce a ToolFailure");
+        assert_eq!(err.code, "execution_failed");
+        assert_eq!(err.model_message, "Tool execution failed.");
     }
 }

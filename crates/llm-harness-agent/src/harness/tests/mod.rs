@@ -201,16 +201,14 @@ impl llm_harness_types::Tool for DummyTool {
         _ctx: &'a llm_harness_types::ToolContext,
     ) -> futures::future::BoxFuture<
         'a,
-        Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>,
+        Result<llm_harness_types::ToolResult, llm_harness_types::ToolFailure>,
     > {
         Box::pin(async {
-            Ok(llm_harness_types::ToolResult {
-                content: vec![llm_harness_types::ContentBlock::Text {
-                    text: "ok".to_string(),
-                }],
-                details: serde_json::Value::Null,
-                terminate: false,
-            })
+            Ok(llm_harness_types::ToolResult::full(
+                vec![llm_harness_types::DataBlock::text("ok")],
+                serde_json::Value::Null,
+                false,
+            ))
         })
     }
 }
@@ -238,14 +236,14 @@ impl llm_harness_types::Tool for BuiltInLevelTool {
         _: &'a llm_harness_types::ToolContext,
     ) -> futures::future::BoxFuture<
         'a,
-        Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>,
+        Result<llm_harness_types::ToolResult, llm_harness_types::ToolFailure>,
     > {
         Box::pin(async {
-            Ok(llm_harness_types::ToolResult {
-                content: vec![],
-                details: serde_json::Value::Null,
-                terminate: false,
-            })
+            Ok(llm_harness_types::ToolResult::full(
+                vec![],
+                serde_json::Value::Null,
+                false,
+            ))
         })
     }
 }
