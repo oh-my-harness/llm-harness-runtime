@@ -1802,14 +1802,14 @@ A1/A2 是 Knowledge 真正需要的两个核心切片，不要求 runtime-owned 
 AfterRun Capture 和完整 Router 先完成。A3/A4 在依赖允许时可与 A1/A2 并行开发，A5 负责
 最终集成。
 
-### Milestone B：显式 Memory 垂直切片（1/3）
+### Milestone B：显式 Memory 垂直切片（2/3）
 
 目标交付：Agent 可以在明确用户意图和 AccessControl 下记住/遗忘信息，后续 run 通过
 Memory read source 检索。不包含自动 Capture。
 
 - [x] **B1 — Read/write composition**：独立 MemoryStore trait、MemoryService、read-source/write-store
    一致性和 receipt 协议。
-- [ ] **B2 — Explicit tools**：`memory_write/forget`、write policy、provenance、TTL、
+- [x] **B2 — Explicit tools**：`memory_write/forget`、write policy、provenance、TTL、
    idempotency、secret rejection 和授权测试。
 - [ ] **B3 — `llm-tutor` Memory migration**：把现有文件 Memory 读取面与写面迁移到组合
    协议，保留其 revision、evidence refs、review/apply 交互和删除语义。
