@@ -33,6 +33,7 @@ crates/
 ├── llm-harness-agent/      # agent harness
 ├── llm-harness-runtime/    # runtime: workflow engine, executors, event stream, builder
 ├── llm-harness-runtime-knowledge/ # backend-neutral knowledge and access contracts
+├── llm-harness-runtime-knowledge-local/ # root-confined Markdown/Text knowledge source
 ├── llm-harness-runtime-sandbox-*/  # sandbox backends (bwrap, seatbelt, os)
 ├── llm-harness-runtime-mcp/        # MCP integration
 ├── llm-harness-runtime-audit-jsonl/ # audit logging
