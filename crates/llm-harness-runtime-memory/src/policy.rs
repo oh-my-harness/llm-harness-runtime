@@ -16,6 +16,19 @@ pub enum MemoryPolicyRejection {
     Other,
 }
 
+impl MemoryPolicyRejection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EmptyContent => "empty_content",
+            Self::ContentTooLarge => "content_too_large",
+            Self::SensitiveContent => "sensitive_content",
+            Self::UnsupportedKind => "unsupported_kind",
+            Self::InvalidTtl => "invalid_ttl",
+            Self::Other => "rejected",
+        }
+    }
+}
+
 #[derive(thiserror::Error, Clone, PartialEq, Eq)]
 pub enum MemoryPolicyError {
     #[error("memory write was rejected by policy")]
