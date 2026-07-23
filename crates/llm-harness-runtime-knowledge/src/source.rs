@@ -208,6 +208,23 @@ pub enum KnowledgeErrorCode {
     Backend,
 }
 
+impl KnowledgeErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::NotFound => "not_found",
+            Self::StaleReference => "stale_reference",
+            Self::InvalidCursor => "invalid_cursor",
+            Self::InvalidFilter => "invalid_filter",
+            Self::UnsupportedCapability => "unsupported_capability",
+            Self::RateLimited => "rate_limited",
+            Self::Timeout => "timeout",
+            Self::Aborted => "aborted",
+            Self::Backend => "backend",
+        }
+    }
+}
+
 /// Sanitized source failure included in a partially successful federated page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFailure {
