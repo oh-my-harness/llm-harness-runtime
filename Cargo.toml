@@ -10,6 +10,7 @@ members = [
     "crates/llm-harness-runtime-sandbox-seatbelt",
     "crates/llm-harness-runtime-mcp",
     "crates/llm-harness-runtime-tools",
+    "crates/llm-harness-runtime-knowledge",
     "crates/llm-harness-runtime-audit-jsonl",
     # pyo3 sdk
     # crates/llm-harness-py — 已迁移到 Senza 仓库 (github.com/oh-my-harness/Senza)
@@ -34,6 +35,7 @@ llm-harness-agent  = { path = "crates/llm-harness-agent" }
 # Runtime (within this workspace)
 llm-harness-runtime = { path = "crates/llm-harness-runtime" }
 llm-harness-runtime-tools = { path = "crates/llm-harness-runtime-tools" }
+llm-harness-runtime-knowledge = { path = "crates/llm-harness-runtime-knowledge" }
 
 # API adapter — separate repo
 llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "16a22ad284b8deb8c3a77664a0876f565f4a6eb9" }
