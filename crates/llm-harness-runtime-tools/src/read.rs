@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use llm_harness_types::{ContentBlock, Tool, ToolContext, ToolError, ToolResult};
+use llm_harness_types::{DataBlock, Tool, ToolContext, ToolError, ToolFailure, ToolResult};
 use parking_lot::RwLock;
 
 use crate::resolve_path;
@@ -94,7 +94,7 @@ impl Tool for ReadTool {
         &'a self,
         args: serde_json::Value,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let path_str = args
                 .get("path")
@@ -131,11 +131,11 @@ impl Tool for ReadTool {
                 (body, meta)
             };
 
-            Ok(ToolResult {
-                content: vec![ContentBlock::Text { text }],
+            Ok(ToolResult::full(
+                vec![DataBlock::text(text)],
                 details,
-                terminate: false,
-            })
+                false,
+            ))
         })
     }
 }
@@ -448,8 +448,8 @@ mod tests {
 
     /// Extract the single text block from a `ToolResult`.
     fn text_of(res: ToolResult) -> String {
-        match res.content.as_slice() {
-            [ContentBlock::Text { text }] => text.clone(),
+        match res.model_content.as_slice() {
+            [DataBlock::Text { text, .. }] => text.clone(),
             _ => panic!("expected a single text block"),
         }
     }
@@ -629,15 +629,7 @@ mod tests {
             .execute(serde_json::json!({ "path": "nope.txt" }), &ctx)
             .await
             .expect_err("missing file should error");
-        match err {
-            ToolError::Execution(msg) => {
-                assert!(
-                    msg.contains("not found"),
-                    "error should mention not found: {msg}"
-                );
-            }
-            other => panic!("expected Execution error, got {other:?}"),
-        }
+        assert_eq!(err.code, "execution_failed");
     }
 
     #[tokio::test]

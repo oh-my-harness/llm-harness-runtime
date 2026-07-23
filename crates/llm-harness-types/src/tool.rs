@@ -1,20 +1,325 @@
-use std::sync::Arc;
+use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
+    fmt,
+    sync::Arc,
+};
 
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{AssistantMessage, ContentBlock, ExecutionEnv, RunContext, ToolError};
+use serde::{Deserialize, Serialize};
+
+use crate::{AssistantMessage, DataBlock, ExecutionEnv, RunContext, ToolError};
+
+#[derive(Default, Clone)]
+pub struct ToolResultExtensions {
+    values: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+}
+
+impl ToolResultExtensions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert<T: Send + Sync + 'static>(&mut self, value: T) -> Option<Arc<T>> {
+        self.values
+            .insert(TypeId::of::<T>(), Arc::new(value))
+            .and_then(|old| Arc::downcast::<T>(old).ok())
+    }
+
+    pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.values
+            .get(&TypeId::of::<T>())
+            .and_then(|value| value.downcast_ref::<T>())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+impl fmt::Debug for ToolResultExtensions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolResultExtensions")
+            .field("len", &self.values.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersistedEnvelope {
+    pub namespace: String,
+    pub schema_version: u32,
+    pub value: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProjectionMetadata {
+    pub envelopes: Vec<PersistedEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolSessionProjection {
+    Full {
+        metadata: ProjectionMetadata,
+    },
+    Projected {
+        content: Vec<DataBlock>,
+        metadata: ProjectionMetadata,
+    },
+    Ephemeral {
+        summary: String,
+        metadata: ProjectionMetadata,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolProjectionKind {
+    Full,
+    Projected,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersistedToolProjection {
+    pub kind: ToolProjectionKind,
+    pub metadata: ProjectionMetadata,
+}
+
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionError {
+    #[error("session projection contains a runtime-only blob")]
+    RuntimeOnlyBlob,
+}
+
+impl ToolSessionProjection {
+    pub fn full() -> Self {
+        Self::Full {
+            metadata: ProjectionMetadata::default(),
+        }
+    }
+
+    pub fn projected(content: Vec<DataBlock>) -> Self {
+        Self::Projected {
+            content,
+            metadata: ProjectionMetadata::default(),
+        }
+    }
+
+    pub fn ephemeral(summary: impl Into<String>) -> Self {
+        Self::Ephemeral {
+            summary: summary.into(),
+            metadata: ProjectionMetadata::default(),
+        }
+    }
+
+    pub fn materialize(
+        &self,
+        model_content: &[DataBlock],
+    ) -> Result<(Vec<DataBlock>, PersistedToolProjection), ProjectionError> {
+        let (content, kind, metadata) = match self {
+            Self::Full { metadata } => (model_content.to_vec(), ToolProjectionKind::Full, metadata),
+            Self::Projected { content, metadata } => {
+                (content.clone(), ToolProjectionKind::Projected, metadata)
+            }
+            Self::Ephemeral { summary, metadata } => (
+                vec![DataBlock::text(summary)],
+                ToolProjectionKind::Ephemeral,
+                metadata,
+            ),
+        };
+        if content.iter().any(|block| !block.is_persistable()) {
+            return Err(ProjectionError::RuntimeOnlyBlob);
+        }
+        Ok((
+            content,
+            PersistedToolProjection {
+                kind,
+                metadata: metadata.clone(),
+            },
+        ))
+    }
+}
 
 /// 工具执行结果。
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     /// 发送给 LLM 的内容块列表。
-    pub content: Vec<ContentBlock>,
+    pub model_content: Vec<DataBlock>,
     /// 不发送给 LLM 的结构化数据，用于 UI 渲染或审计日志。
     pub details: serde_json::Value,
+    /// 进程内 typed extensions；不发给模型，也不序列化。
+    pub extensions: ToolResultExtensions,
     /// 当 batch 中所有 tool 均返回 `true` 时，agent loop 提前停止。
     pub terminate: bool,
+    /// Session 中保存的显式安全投影。
+    pub session_projection: ToolSessionProjection,
+}
+
+impl ToolResult {
+    pub fn full(
+        model_content: Vec<DataBlock>,
+        details: serde_json::Value,
+        terminate: bool,
+    ) -> Self {
+        Self {
+            model_content,
+            details,
+            extensions: ToolResultExtensions::new(),
+            terminate,
+            session_projection: ToolSessionProjection::full(),
+        }
+    }
+
+    pub fn projected(
+        model_content: Vec<DataBlock>,
+        projected_content: Vec<DataBlock>,
+        details: serde_json::Value,
+        terminate: bool,
+    ) -> Self {
+        Self {
+            model_content,
+            details,
+            extensions: ToolResultExtensions::new(),
+            terminate,
+            session_projection: ToolSessionProjection::projected(projected_content),
+        }
+    }
+
+    pub fn ephemeral(
+        model_content: Vec<DataBlock>,
+        summary: impl Into<String>,
+        details: serde_json::Value,
+        terminate: bool,
+    ) -> Self {
+        Self {
+            model_content,
+            details,
+            extensions: ToolResultExtensions::new(),
+            terminate,
+            session_projection: ToolSessionProjection::ephemeral(summary),
+        }
+    }
+
+    pub fn session_message(
+        &self,
+        tool_use_id: String,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::ToolResultMessage, ProjectionError> {
+        let (content, projection) = self.session_projection.materialize(&self.model_content)?;
+        Ok(crate::ToolResultMessage {
+            tool_use_id,
+            content,
+            is_error: false,
+            projection,
+            timestamp,
+        })
+    }
+
+    pub fn model_message(
+        &self,
+        tool_use_id: String,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::ToolResultMessage, ProjectionError> {
+        let (_, projection) = self.session_projection.materialize(&self.model_content)?;
+        Ok(crate::ToolResultMessage {
+            tool_use_id,
+            content: self.model_content.clone(),
+            is_error: false,
+            projection,
+            timestamp,
+        })
+    }
+}
+
+#[derive(thiserror::Error, Debug, Clone, PartialEq)]
+#[error("{code}: {model_message}")]
+pub struct ToolFailure {
+    pub code: String,
+    pub model_message: String,
+    pub retryable: bool,
+    pub details: serde_json::Value,
+    pub session_projection: ToolSessionProjection,
+}
+
+impl ToolFailure {
+    pub fn new(code: impl Into<String>, model_message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            model_message: model_message.into(),
+            retryable: false,
+            details: serde_json::Value::Null,
+            session_projection: ToolSessionProjection::full(),
+        }
+    }
+
+    pub fn invalid_arguments(message: impl Into<String>) -> Self {
+        Self::new("invalid_arguments", message)
+    }
+
+    pub fn aborted() -> Self {
+        Self::new("aborted", "Tool execution was aborted.")
+    }
+
+    pub fn execution_failed() -> Self {
+        Self::new("execution_failed", "Tool execution failed.")
+    }
+
+    pub fn model_content(&self) -> Vec<DataBlock> {
+        vec![DataBlock::text(&self.model_message)]
+    }
+
+    pub fn session_message(
+        &self,
+        tool_use_id: String,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::ToolResultMessage, ProjectionError> {
+        let model_content = self.model_content();
+        let (content, projection) = self.session_projection.materialize(&model_content)?;
+        Ok(crate::ToolResultMessage {
+            tool_use_id,
+            content,
+            is_error: true,
+            projection,
+            timestamp,
+        })
+    }
+
+    pub fn model_result_message(
+        &self,
+        tool_use_id: String,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::ToolResultMessage, ProjectionError> {
+        let model_content = self.model_content();
+        let (_, projection) = self.session_projection.materialize(&model_content)?;
+        Ok(crate::ToolResultMessage {
+            tool_use_id,
+            content: model_content,
+            is_error: true,
+            projection,
+            timestamp,
+        })
+    }
+}
+
+impl From<ToolError> for ToolFailure {
+    fn from(error: ToolError) -> Self {
+        match error {
+            ToolError::InvalidArguments(message) => Self::invalid_arguments(message),
+            ToolError::Aborted => Self::aborted(),
+            ToolError::Execution(_) | ToolError::Other(_) => Self::execution_failed(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolProgress {
+    pub content: Vec<DataBlock>,
+    pub details: serde_json::Value,
 }
 
 /// 工具执行模式——决定 tool 在同一 batch 中的并发策略。
@@ -206,7 +511,7 @@ pub struct ToolContext {
     /// 触发本次 tool call 的完整 LLM 响应；同一消息的多个 tool call 共享同一 Arc。
     pub assistant_message: Arc<AssistantMessage>,
     /// 长时间运行的 tool 通过此 channel 推送部分结果；接收端转发为 `AgentEvent::ToolExecutionUpdate`。
-    pub update_tx: mpsc::Sender<ToolResult>,
+    pub update_tx: mpsc::Sender<ToolProgress>,
 }
 
 /// 工具 trait——框架调用工具的唯一接口。
@@ -235,33 +540,26 @@ pub trait Tool: Send + Sync {
         ToolExecutionMode::Parallel
     }
 
-    /// 在 schema 校验前对 LLM 原始参数做兼容转换；默认 identity（不转换）。
-    fn prepare_arguments(&self, raw: serde_json::Value) -> Result<serde_json::Value, ToolError> {
-        Ok(raw)
-    }
-
     /// 执行工具；返回结果或错误。
     fn execute<'a>(
         &'a self,
         args: serde_json::Value,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>>;
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ContentBlock;
+    use crate::DataBlock;
 
     #[test]
     fn tool_result_defaults_terminate_false() {
-        let r = ToolResult {
-            content: vec![ContentBlock::Text {
-                text: "done".into(),
-            }],
-            details: serde_json::Value::Null,
-            terminate: false,
-        };
+        let r = ToolResult::full(
+            vec![DataBlock::text("done")],
+            serde_json::Value::Null,
+            false,
+        );
         assert!(!r.terminate);
     }
 
@@ -282,14 +580,8 @@ mod tests {
                 &'a self,
                 _args: serde_json::Value,
                 _ctx: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, crate::ToolError>> {
-                Box::pin(async {
-                    Ok(ToolResult {
-                        content: vec![],
-                        details: serde_json::Value::Null,
-                        terminate: false,
-                    })
-                })
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
             }
         }
         let t = MyTool;
@@ -337,16 +629,62 @@ mod tests {
                 &'a self,
                 _: serde_json::Value,
                 _: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, crate::ToolError>> {
-                Box::pin(async {
-                    Ok(ToolResult {
-                        content: vec![],
-                        details: serde_json::Value::Null,
-                        terminate: false,
-                    })
-                })
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
             }
         }
         assert_eq!(MyTool.level(), ToolLevel::User);
+    }
+
+    #[test]
+    fn ephemeral_projection_keeps_only_summary_and_metadata() {
+        let metadata = ProjectionMetadata {
+            envelopes: vec![PersistedEnvelope {
+                namespace: "knowledge.evidence".into(),
+                schema_version: 1,
+                value: serde_json::json!({"ref": "doc-1"}),
+            }],
+        };
+        let projection = ToolSessionProjection::Ephemeral {
+            summary: "Read document doc-1".into(),
+            metadata: metadata.clone(),
+        };
+
+        let (content, persisted) = projection
+            .materialize(&[DataBlock::text("sensitive document body")])
+            .unwrap();
+
+        assert_eq!(content, vec![DataBlock::text("Read document doc-1")]);
+        assert_eq!(persisted.kind, ToolProjectionKind::Ephemeral);
+        assert_eq!(persisted.metadata, metadata);
+    }
+
+    #[test]
+    fn full_projection_rejects_runtime_blob_handles() {
+        let projection = ToolSessionProjection::full();
+        let content = vec![DataBlock::Document {
+            name: Some("report.pdf".into()),
+            media_type: "application/pdf".into(),
+            data: crate::BinarySource::Blob {
+                id: "blob-1".into(),
+            },
+        }];
+
+        assert_eq!(
+            projection.materialize(&content),
+            Err(ProjectionError::RuntimeOnlyBlob)
+        );
+    }
+
+    #[test]
+    fn tool_result_extensions_are_typed() {
+        #[derive(Debug, PartialEq)]
+        struct Evidence(&'static str);
+
+        let mut extensions = ToolResultExtensions::new();
+        extensions.insert(Evidence("receipt-1"));
+
+        assert_eq!(extensions.get::<Evidence>(), Some(&Evidence("receipt-1")));
+        assert!(extensions.get::<String>().is_none());
     }
 }

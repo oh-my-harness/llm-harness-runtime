@@ -48,19 +48,19 @@ impl llm_harness_types::Tool for BlockingTool {
         ctx: &'a llm_harness_types::ToolContext,
     ) -> futures::future::BoxFuture<
         'a,
-        Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>,
+        Result<llm_harness_types::ToolResult, llm_harness_types::ToolFailure>,
     > {
         Box::pin(async move {
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                    Ok(llm_harness_types::ToolResult {
-                        content: vec![llm_harness_types::ContentBlock::Text { text: "done".into() }],
-                        details: serde_json::Value::Null,
-                        terminate: false,
-                    })
+                    Ok(llm_harness_types::ToolResult::full(
+                        vec![llm_harness_types::DataBlock::text("done")],
+                        serde_json::Value::Null,
+                        false,
+                    ))
                 }
                 _ = ctx.abort.cancelled() => {
-                    Err(llm_harness_types::ToolError::Aborted)
+                    Err(llm_harness_types::ToolFailure::aborted())
                 }
             }
         })

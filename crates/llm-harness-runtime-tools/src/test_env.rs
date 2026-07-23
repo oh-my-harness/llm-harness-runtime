@@ -382,7 +382,7 @@ impl ExecutionEnv for MockExecutionEnv {
             } else if trimmed == "__timeout__" {
                 // Simulate the OsEnv timeout contract: partial stdout + the
                 // "timeout" stderr sentinel. Used to verify BashTool routes
-                // timeouts to `ToolError` with captured output.
+                // timeouts to a sanitized tool failure.
                 Err(EnvError::ShellFailed {
                     exit_code: -1,
                     stdout: "partial output".to_string(),

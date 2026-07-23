@@ -666,14 +666,14 @@ mod tests {
             _ctx: &'a llm_harness_types::ToolContext,
         ) -> BoxFuture<
             'a,
-            std::result::Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>,
+            std::result::Result<llm_harness_types::ToolResult, llm_harness_types::ToolFailure>,
         > {
             Box::pin(async {
-                Ok(llm_harness_types::ToolResult {
-                    content: vec![],
-                    details: serde_json::Value::Null,
-                    terminate: false,
-                })
+                Ok(llm_harness_types::ToolResult::full(
+                    vec![],
+                    serde_json::Value::Null,
+                    false,
+                ))
             })
         }
     }

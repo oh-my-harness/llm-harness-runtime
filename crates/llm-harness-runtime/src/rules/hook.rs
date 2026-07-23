@@ -2,7 +2,7 @@
 
 use futures::future::BoxFuture;
 use llm_harness_types::{
-    BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook, ContentBlock, ToolResult,
+    BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook, ToolFailure,
 };
 
 use crate::rules::chain::RuleChain;
@@ -27,13 +27,10 @@ impl BeforeToolCallHook for RuleBasedApprovalHook {
         Box::pin(async move {
             match decision {
                 Decision::Allow => BeforeToolCallDecision::Allow,
-                Decision::Deny => BeforeToolCallDecision::Deny(ToolResult {
-                    content: vec![ContentBlock::Text {
-                        text: "rule denied".into(),
-                    }],
-                    details: serde_json::Value::Null,
-                    terminate: false,
-                }),
+                Decision::Deny => BeforeToolCallDecision::Deny(ToolFailure::new(
+                    "rule_denied",
+                    "Tool call denied by policy.",
+                )),
             }
         })
     }

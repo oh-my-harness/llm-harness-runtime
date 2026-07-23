@@ -82,7 +82,7 @@ fn terminal_text_classification(mode: &FinalAnswerMode) -> TerminalTextClassific
 fn final_answer_text_from_results(
     tool_name: &str,
     tool_calls: &[(String, String, serde_json::Value)],
-    results: &[(String, Result<ToolResult, ToolError>)],
+    results: &[(String, Result<ToolResult, ToolFailure>)],
 ) -> Option<String> {
     tool_calls
         .iter()
@@ -446,7 +446,7 @@ fn run_loop(
 
                 // Aggregate per-tool update channels so partial tool results can be
                 // tagged with their originating tool_use_id before being emitted.
-                let (update_tx, mut update_rx) = mpsc::channel::<(String, ToolResult)>(64);
+                let (update_tx, mut update_rx) = mpsc::channel::<(String, ToolProgress)>(64);
 
                 let batch = execute_tool_batch(
                     calls,
@@ -457,7 +457,7 @@ fn run_loop(
                         let update_tx = update_tx.clone();
                         move |tool_use_id| {
                             let (tool_update_tx, mut tool_update_rx) =
-                                mpsc::channel::<ToolResult>(16);
+                                mpsc::channel::<ToolProgress>(16);
                             let aggregate_tx = update_tx.clone();
                             let update_tool_use_id = tool_use_id.clone();
                             tokio::spawn(async move {
@@ -515,7 +515,10 @@ fn run_loop(
                 for (id, name) in unmatched {
                     results.push((
                         id,
-                        Err(ToolError::Execution(format!("Unknown tool: {name}"))),
+                        Err(ToolFailure::new(
+                            "unknown_tool",
+                            format!("Unknown tool: {name}"),
+                        )),
                     ));
                 }
 
@@ -523,26 +526,26 @@ fn run_loop(
                 for (id, result) in &results {
                     yield AgentEvent::ToolExecutionEnd {
                         tool_use_id: id.clone(),
-                        result: match result {
-                            Ok(r) => Ok(r.clone()),
-                            Err(e) => Err(ToolError::Execution(e.to_string())),
-                        },
+                        result: result.clone(),
                     };
-                    let (content, is_error) = match result {
-                        Ok(r) => (r.content.clone(), false),
-                        Err(e) => (
-                            vec![ContentBlock::Text { text: e.to_string() }],
-                            true,
-                        ),
+                    let timestamp = chrono::Utc::now();
+                    let model_message = match result {
+                        Ok(result) => result.model_message(id.clone(), timestamp),
+                        Err(failure) => failure.model_result_message(id.clone(), timestamp),
                     };
-                    let tool_result_msg = AgentMessage::ToolResult(ToolResultMessage {
-                        tool_use_id: id.clone(),
-                        content,
-                        is_error,
-                        timestamp: chrono::Utc::now(),
-                    });
-                    ctx.messages.push(tool_result_msg.clone());
-                    new_messages.push(tool_result_msg);
+                    let session_message = match result {
+                        Ok(result) => result.session_message(id.clone(), timestamp),
+                        Err(failure) => failure.session_message(id.clone(), timestamp),
+                    };
+                    let (model_message, session_message) = match (model_message, session_message) {
+                        (Ok(model_message), Ok(session_message)) => (model_message, session_message),
+                        (Err(error), _) | (_, Err(error)) => {
+                            yield AgentEvent::Error(AgentError::Internal(error.to_string()));
+                            return;
+                        }
+                    };
+                    ctx.messages.push(AgentMessage::ToolResult(model_message));
+                    new_messages.push(AgentMessage::ToolResult(session_message));
                 }
 
                 let final_answer_message = current_final_answer_tool
@@ -746,14 +749,8 @@ mod tests {
             &'a self,
             _: serde_json::Value,
             _: &'a ToolContext,
-        ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
-            Box::pin(async {
-                Ok(ToolResult {
-                    content: vec![],
-                    details: serde_json::Value::Null,
-                    terminate: false,
-                })
-            })
+        ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+            Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
         }
     }
 
@@ -1111,15 +1108,9 @@ mod tests {
                 &'a self,
                 _: serde_json::Value,
                 _: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
                 self.called.store(true, std::sync::atomic::Ordering::SeqCst);
-                Box::pin(async {
-                    Ok(ToolResult {
-                        content: vec![],
-                        details: serde_json::Value::Null,
-                        terminate: false,
-                    })
-                })
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
             }
         }
 
@@ -1305,26 +1296,21 @@ mod tests {
                 &'a self,
                 _: serde_json::Value,
                 ctx: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
                 Box::pin(async move {
                     ctx.update_tx
-                        .send(ToolResult {
-                            content: vec![ContentBlock::Text {
-                                text: "partial".into(),
-                            }],
+                        .send(ToolProgress {
+                            content: vec![DataBlock::text("partial")],
                             details: serde_json::json!({"step": 1}),
-                            terminate: false,
                         })
                         .await
                         .unwrap();
 
-                    Ok(ToolResult {
-                        content: vec![ContentBlock::Text {
-                            text: "done".into(),
-                        }],
-                        details: serde_json::Value::Null,
-                        terminate: true,
-                    })
+                    Ok(ToolResult::full(
+                        vec![DataBlock::text("done")],
+                        serde_json::Value::Null,
+                        true,
+                    ))
                 })
             }
         }
@@ -1349,7 +1335,7 @@ mod tests {
                 e,
                 AgentEvent::ToolExecutionUpdate { tool_use_id, partial }
                     if tool_use_id == "c1"
-                        && matches!(&partial.content[0], ContentBlock::Text { text } if text == "partial")
+                        && matches!(&partial.content[0], DataBlock::Text { text, .. } if text == "partial")
             )
         }));
     }
@@ -1372,14 +1358,8 @@ mod tests {
                 &'a self,
                 _: serde_json::Value,
                 _: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
-                Box::pin(async {
-                    Ok(ToolResult {
-                        content: vec![],
-                        details: serde_json::Value::Null,
-                        terminate: true,
-                    })
-                })
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, true)) })
             }
         }
 

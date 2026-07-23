@@ -12,3 +12,4 @@ docs/issues
 __pycache__
 .superpowers/
 .worktrees/
+/AGENTS.md

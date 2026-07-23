@@ -151,7 +151,7 @@ pub struct Agent {
     client: Arc<dyn LlmClient>,
     env: Arc<dyn ExecutionEnv>,
     inner: Arc<Mutex<AgentInner>>,
-    // AgentEvent is not Clone (ToolError carries anyhow::Error), so we wrap in Arc.
+    // Events are shared across subscribers without copying their payloads.
     event_tx: broadcast::Sender<Arc<AgentEvent>>,
     /// Used by `wait_for_idle` to detect phase transitions.
     phase_tx: watch::Sender<AgentPhase>,

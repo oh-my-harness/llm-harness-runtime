@@ -52,6 +52,25 @@ pub(crate) fn content_block_to_request(cb: &ContentBlock) -> Option<RequestConte
     }
 }
 
+/// Convert a data-only block produced by a Tool into provider request content.
+pub(crate) fn data_block_to_request(cb: &DataBlock) -> Result<RequestContent, AgentError> {
+    match cb {
+        DataBlock::Text { text, .. } => Ok(RequestContent::Text(text.clone())),
+        DataBlock::Image { source } => {
+            let src = match source {
+                ImageSource::Base64 { media_type, data } => AdapterImageSource::Base64 {
+                    media_type: media_type.clone(),
+                    data: data.clone(),
+                },
+            };
+            Ok(RequestContent::Image(src))
+        }
+        DataBlock::Document { media_type, .. } => Err(AgentError::Internal(format!(
+            "provider adapter does not support document data blocks ({media_type})"
+        ))),
+    }
+}
+
 /// Convert a harness ContentBlock to adapter ResponseContent (for Assistant messages).
 pub(crate) fn content_block_to_response(cb: &ContentBlock) -> Option<ResponseContent> {
     match cb {
@@ -149,14 +168,8 @@ mod tests {
                 &'a self,
                 _: serde_json::Value,
                 _: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
-                Box::pin(async {
-                    Ok(ToolResult {
-                        content: vec![],
-                        details: serde_json::Value::Null,
-                        terminate: false,
-                    })
-                })
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
             }
         }
         let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(EchoTool)];

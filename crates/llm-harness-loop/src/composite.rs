@@ -64,7 +64,7 @@ impl AfterToolCallHook for CompositeAfterToolCallHook {
             let mut final_decision = AfterToolCallDecision::Passthrough;
 
             for hook in &self.hooks {
-                // Each hook sees the original, unpatched result.
+                // Each hook sees the original result; replacement is atomic.
                 let hook_ctx = AfterToolCallCtx {
                     run: ctx.run,
                     assistant_message: ctx.assistant_message,
@@ -77,7 +77,7 @@ impl AfterToolCallHook for CompositeAfterToolCallHook {
 
                 let decision = hook.on_complete(hook_ctx).await;
 
-                if let AfterToolCallDecision::Patch(_) = decision {
+                if let AfterToolCallDecision::Replace(_) = decision {
                     final_decision = decision;
                 }
             }
@@ -511,7 +511,7 @@ mod tests {
     async fn composite_prepare_next_turn_merges_response_format_last_wins() {
         use crate::ResponseFormat;
         use llm_harness_types::{
-            AgentError, ContentBlock, NextTurnDirective, ToolError, ToolResult,
+            AgentError, ContentBlock, NextTurnDirective, ToolFailure, ToolResult,
         };
 
         struct StaticHook(Option<Option<ResponseFormat>>);
@@ -538,7 +538,7 @@ mod tests {
         let assistant = crate::test_utils::test_assistant_message(vec![ContentBlock::Text {
             text: "x".into(),
         }]);
-        let results: [(String, Result<ToolResult, ToolError>); 0] = [];
+        let results: [(String, Result<ToolResult, ToolFailure>); 0] = [];
         let run = llm_harness_types::RunContext::new(llm_harness_types::RunRequest::default());
         let mk_ctx = || PrepareNextTurnCtx {
             run: &run,

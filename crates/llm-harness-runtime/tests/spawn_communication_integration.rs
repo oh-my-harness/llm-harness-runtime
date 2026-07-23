@@ -489,7 +489,7 @@ async fn idle_watcher_wake_test() {
 // sleeps until cancelled. The abort should cause the sub to terminate with
 // Err(Aborted), and in_flight should return to 0.
 
-use llm_harness_types::{Tool as ToolTrait, ToolContext, ToolError, ToolResult};
+use llm_harness_types::{Tool as ToolTrait, ToolContext, ToolFailure, ToolResult};
 
 /// A tool that blocks until the abort token is cancelled, then returns
 /// `AgentError::Aborted`. This keeps the sub-agent in-flight so we can
@@ -515,13 +515,13 @@ impl ToolTrait for BlockingTool {
         &'a self,
         _args: serde_json::Value,
         ctx: &'a ToolContext,
-    ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             // Block until the abort token fires, then return Aborted.
-            // The harness recognizes ToolError::Aborted and terminates
+            // The harness recognizes ToolFailure::aborted and terminates
             // the sub-agent with Err(AgentError::Aborted).
             ctx.abort.cancelled().await;
-            Err(ToolError::Aborted)
+            Err(ToolFailure::aborted())
         })
     }
 }

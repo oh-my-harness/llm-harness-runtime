@@ -211,7 +211,7 @@ async fn abort_emits_aborted_event() {
             ctx: &'a llm_harness_types::ToolContext,
         ) -> futures::future::BoxFuture<
             'a,
-            Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>,
+            Result<llm_harness_types::ToolResult, llm_harness_types::ToolFailure>,
         > {
             let ready = self.ready.clone();
             Box::pin(async move {
@@ -219,7 +219,7 @@ async fn abort_emits_aborted_event() {
                 // then wait for cancellation.
                 ready.notify_one();
                 ctx.abort.cancelled().await;
-                Err(llm_harness_types::ToolError::Aborted)
+                Err(llm_harness_types::ToolFailure::aborted())
             })
         }
     }

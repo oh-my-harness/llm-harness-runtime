@@ -4,8 +4,8 @@ use futures::future::BoxFuture;
 
 use crate::{
     AgentContext, AgentError, AgentHarnessResources, AgentMessage, AssistantMessage,
-    CompactionResult, ContentBlock, EntryId, RunContext, StopReason, StreamOptions, Tool,
-    ToolError, ToolResult, TurnSnapshot,
+    CompactionResult, EntryId, RunContext, StopReason, StreamOptions, Tool, ToolFailure,
+    ToolResult, TurnSnapshot,
 };
 
 // ── TransformContextHook ──────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ pub struct PrepareNextTurnCtx<'a> {
     /// 上一轮的完整 LLM 回复。
     pub last_message: &'a AssistantMessage,
     /// 上一轮所有 tool 执行结果；key 为 `tool_use_id`。
-    pub last_tool_results: &'a [(String, Result<ToolResult, ToolError>)],
+    pub last_tool_results: &'a [(String, Result<ToolResult, ToolFailure>)],
 }
 
 /// `PrepareNextTurnHook::prepare` 的返回值；`None` 字段表示沿用当前值。
@@ -96,8 +96,8 @@ pub enum BeforeToolCallDecision {
     Allow,
     /// 以修改后的参数执行工具。
     Modify(serde_json::Value),
-    /// 拒绝执行，直接返回指定的 `ToolResult`。
-    Deny(ToolResult),
+    /// 拒绝执行，返回经过脱敏且可投影的公开失败。
+    Deny(ToolFailure),
 }
 
 /// 工具执行前的拦截 hook。
@@ -121,27 +121,17 @@ pub struct AfterToolCallCtx<'a> {
     /// 工具调用参数。
     pub args: &'a serde_json::Value,
     /// 工具执行结果。
-    pub result: &'a Result<ToolResult, ToolError>,
+    pub result: &'a Result<ToolResult, ToolFailure>,
     /// 当前轮次索引。
     pub turn_index: u32,
-}
-
-/// `ToolResult` 的部分覆盖补丁；`None` 字段表示保持原值。
-pub struct ToolResultPatch {
-    /// 覆盖内容块列表。
-    pub content: Option<Vec<ContentBlock>>,
-    /// 覆盖扩展数据。
-    pub details: Option<serde_json::Value>,
-    /// 覆盖终止标志。
-    pub terminate: Option<bool>,
 }
 
 /// `AfterToolCallHook::on_complete` 的返回决策。
 pub enum AfterToolCallDecision {
     /// 照常使用工具执行结果，不做修改。
     Passthrough,
-    /// 部分覆盖执行结果。
-    Patch(ToolResultPatch),
+    /// 原子替换整个结果，保持 model content、extensions 和 projection 一致。
+    Replace(Result<ToolResult, ToolFailure>),
 }
 
 /// 工具执行后的结果拦截 hook。
@@ -348,16 +338,6 @@ mod tests {
     fn after_tool_call_decision_passthrough() {
         let d = AfterToolCallDecision::Passthrough;
         assert!(matches!(d, AfterToolCallDecision::Passthrough));
-    }
-
-    #[test]
-    fn tool_result_patch_all_none() {
-        let p = ToolResultPatch {
-            content: None,
-            details: None,
-            terminate: None,
-        };
-        assert!(p.content.is_none());
     }
 
     #[test]

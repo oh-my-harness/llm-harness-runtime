@@ -170,6 +170,20 @@ fn estimate_tokens_for_content_blocks(blocks: &[ContentBlock]) -> usize {
         .sum()
 }
 
+fn estimate_tokens_for_data_blocks(blocks: &[DataBlock]) -> usize {
+    blocks
+        .iter()
+        .map(|block| match block {
+            DataBlock::Text { text, .. } => estimate_tokens_for_text(text),
+            DataBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
+            DataBlock::Document { data, .. } => match data {
+                BinarySource::Base64 { data } => (data.len() / CHARS_PER_TOKEN).max(1),
+                BinarySource::Blob { .. } => 1,
+            },
+        })
+        .sum()
+}
+
 fn estimate_tokens_for_message(msg: &AgentMessage) -> usize {
     match msg {
         AgentMessage::User(u) => estimate_tokens_for_content_blocks(&u.content),
@@ -181,7 +195,7 @@ fn estimate_tokens_for_message(msg: &AgentMessage) -> usize {
             }
             estimate_tokens_for_content_blocks(&a.content)
         }
-        AgentMessage::ToolResult(t) => estimate_tokens_for_content_blocks(&t.content),
+        AgentMessage::ToolResult(t) => estimate_tokens_for_data_blocks(&t.content),
         AgentMessage::CompactionSummary(cs) => estimate_tokens_for_text(&cs.summary),
         AgentMessage::BranchSummary(bs) => estimate_tokens_for_text(&bs.summary),
         AgentMessage::Custom(c) => estimate_tokens_for_text(&c.data.to_string()),
@@ -482,7 +496,7 @@ fn append_message_text(out: &mut String, msg: &AgentMessage) {
             write!(out, "[Assistant]\n{text}").expect("writing to String cannot fail");
         }
         AgentMessage::ToolResult(t) => {
-            let text = content_blocks_to_text(&t.content);
+            let text = data_blocks_to_text(&t.content);
             let status = if t.is_error { " (error)" } else { "" };
             write!(out, "[Tool Result{status}]\n{text}").expect("writing to String cannot fail");
         }
@@ -508,6 +522,23 @@ fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
             ContentBlock::Thinking { thinking, .. } => thinking.clone(),
             ContentBlock::ToolUse { name, input, .. } => format!("[Tool: {name}({input})]"),
             ContentBlock::Image { .. } => "[image]".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn data_blocks_to_text(blocks: &[DataBlock]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            DataBlock::Text { text, .. } => text.clone(),
+            DataBlock::Image { .. } => "[image]".to_string(),
+            DataBlock::Document {
+                name, media_type, ..
+            } => format!(
+                "[document: {} ({media_type})]",
+                name.as_deref().unwrap_or("unnamed")
+            ),
         })
         .collect::<Vec<_>>()
         .join("\n")

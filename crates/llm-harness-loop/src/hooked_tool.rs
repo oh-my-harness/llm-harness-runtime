@@ -13,19 +13,6 @@ pub struct HookedTool {
     pub after: Option<Arc<dyn AfterToolCallHook>>,
 }
 
-fn apply_patch(mut result: ToolResult, patch: ToolResultPatch) -> ToolResult {
-    if let Some(c) = patch.content {
-        result.content = c;
-    }
-    if let Some(d) = patch.details {
-        result.details = d;
-    }
-    if let Some(t) = patch.terminate {
-        result.terminate = t;
-    }
-    result
-}
-
 impl Tool for HookedTool {
     fn name(&self) -> &str {
         self.inner.name()
@@ -47,7 +34,7 @@ impl Tool for HookedTool {
         &'a self,
         args: serde_json::Value,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             // Apply before-hook
             let effective_args = if let Some(h) = &self.before {
@@ -62,7 +49,7 @@ impl Tool for HookedTool {
                 match h.on_call(before_ctx).await {
                     BeforeToolCallDecision::Allow => args,
                     BeforeToolCallDecision::Modify(new_args) => new_args,
-                    BeforeToolCallDecision::Deny(result) => return Ok(result),
+                    BeforeToolCallDecision::Deny(failure) => return Err(failure),
                 }
             } else {
                 args
@@ -83,7 +70,7 @@ impl Tool for HookedTool {
                 };
                 return match h.on_complete(after_ctx).await {
                     AfterToolCallDecision::Passthrough => result,
-                    AfterToolCallDecision::Patch(patch) => result.map(|r| apply_patch(r, patch)),
+                    AfterToolCallDecision::Replace(replacement) => replacement,
                 };
             }
 
@@ -119,17 +106,15 @@ mod tests {
             &'a self,
             _: serde_json::Value,
             _: &'a ToolContext,
-        ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+        ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
             self.called.store(true, Ordering::SeqCst);
             let terminate = self.terminate;
             Box::pin(async move {
-                Ok(ToolResult {
-                    content: vec![ContentBlock::Text {
-                        text: "spy result".into(),
-                    }],
-                    details: serde_json::Value::Null,
+                Ok(ToolResult::full(
+                    vec![DataBlock::text("spy result")],
+                    serde_json::Value::Null,
                     terminate,
-                })
+                ))
             })
         }
     }
@@ -226,15 +211,9 @@ mod tests {
                 &'a self,
                 args: serde_json::Value,
                 _: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
                 *self.received.lock().unwrap() = args;
-                Box::pin(async {
-                    Ok(ToolResult {
-                        content: vec![],
-                        details: serde_json::Value::Null,
-                        terminate: false,
-                    })
-                })
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
             }
         }
 
@@ -265,13 +244,7 @@ mod tests {
                 _: BeforeToolCallCtx<'a>,
             ) -> BoxFuture<'a, BeforeToolCallDecision> {
                 Box::pin(async {
-                    BeforeToolCallDecision::Deny(ToolResult {
-                        content: vec![ContentBlock::Text {
-                            text: "denied".into(),
-                        }],
-                        details: serde_json::Value::Null,
-                        terminate: false,
-                    })
+                    BeforeToolCallDecision::Deny(ToolFailure::new("denied", "denied"))
                 })
             }
         }
@@ -283,13 +256,12 @@ mod tests {
             before: Some(Arc::new(DenyHook)),
             after: None,
         };
-        let r = t.execute(serde_json::json!({}), &make_ctx()).await.unwrap();
+        let failure = t
+            .execute(serde_json::json!({}), &make_ctx())
+            .await
+            .unwrap_err();
         assert!(!called.load(Ordering::SeqCst));
-        if let ContentBlock::Text { text } = &r.content[0] {
-            assert_eq!(text, "denied");
-        } else {
-            panic!("unexpected");
-        }
+        assert_eq!(failure.code, "denied");
     }
 
     #[tokio::test]
@@ -312,7 +284,7 @@ mod tests {
             after: Some(Arc::new(PassthroughHook)),
         };
         let r = t.execute(serde_json::json!({}), &make_ctx()).await.unwrap();
-        if let ContentBlock::Text { text } = &r.content[0] {
+        if let DataBlock::Text { text, .. } = &r.model_content[0] {
             assert_eq!(text, "spy result");
         } else {
             panic!("unexpected");
@@ -320,7 +292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn after_patch_overrides_terminate() {
+    async fn after_replace_is_atomic() {
         struct PatchHook;
         impl AfterToolCallHook for PatchHook {
             fn on_complete<'a>(
@@ -328,11 +300,12 @@ mod tests {
                 _: AfterToolCallCtx<'a>,
             ) -> BoxFuture<'a, AfterToolCallDecision> {
                 Box::pin(async {
-                    AfterToolCallDecision::Patch(ToolResultPatch {
-                        content: None,
-                        details: None,
-                        terminate: Some(true),
-                    })
+                    AfterToolCallDecision::Replace(Ok(ToolResult::projected(
+                        vec![DataBlock::text("replacement")],
+                        vec![DataBlock::text("persisted replacement")],
+                        serde_json::json!({"replaced": true}),
+                        true,
+                    )))
                 })
             }
         }
@@ -346,5 +319,10 @@ mod tests {
         };
         let r = t.execute(serde_json::json!({}), &make_ctx()).await.unwrap();
         assert!(r.terminate);
+        assert_eq!(r.details, serde_json::json!({"replaced": true}));
+        assert!(matches!(
+            r.session_projection,
+            ToolSessionProjection::Projected { .. }
+        ));
     }
 }

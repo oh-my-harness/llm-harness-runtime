@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use llm_harness_types::{ContentBlock, Tool, ToolContext, ToolError, ToolLevel, ToolResult};
+use llm_harness_types::{
+    DataBlock, Tool, ToolContext, ToolError, ToolFailure, ToolLevel, ToolResult,
+};
 
 use futures::future::BoxFuture;
 
@@ -107,7 +109,7 @@ impl Tool for BuiltinFinalAnswerTool {
         &'a self,
         args: serde_json::Value,
         _ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let text = args
                 .get("text")
@@ -119,11 +121,7 @@ impl Tool for BuiltinFinalAnswerTool {
                 "kind": "final_answer",
                 "text": text,
             });
-            Ok(ToolResult {
-                content: vec![ContentBlock::Text { text }],
-                details,
-                terminate: true,
-            })
+            Ok(ToolResult::full(vec![DataBlock::text(text)], details, true))
         })
     }
 }

@@ -101,20 +101,51 @@ impl Tool for EchoTool {
         &'a self,
         args: serde_json::Value,
         _ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         let input = args
             .get("input")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
         Box::pin(async move {
-            Ok(ToolResult {
-                content: vec![ContentBlock::Text {
-                    text: format!("echo:{}", input),
-                }],
-                details: serde_json::Value::Null,
-                terminate: false,
-            })
+            Ok(ToolResult::full(
+                vec![DataBlock::text(format!("echo:{}", input))],
+                serde_json::Value::Null,
+                false,
+            ))
+        })
+    }
+}
+
+struct EphemeralReadTool;
+
+impl Tool for EphemeralReadTool {
+    fn name(&self) -> &str {
+        "ephemeral_read"
+    }
+
+    fn description(&self) -> &str {
+        "returns a body that must not be persisted"
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        static SCHEMA: std::sync::LazyLock<serde_json::Value> =
+            std::sync::LazyLock::new(|| serde_json::json!({"type": "object"}));
+        &SCHEMA
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+        Box::pin(async {
+            Ok(ToolResult::ephemeral(
+                vec![DataBlock::text("private document body")],
+                "Read document ref doc-1",
+                serde_json::json!({"ref": "doc-1"}),
+                false,
+            ))
         })
     }
 }
@@ -205,7 +236,7 @@ async fn tool_call_writes_tool_result_to_session() {
     let has_tool_result = ctx.messages.iter().any(|m| {
         if let AgentMessage::ToolResult(tr) = m {
             tr.content.iter().any(|c| {
-                if let ContentBlock::Text { text } = c {
+                if let DataBlock::Text { text, .. } = c {
                     text.contains("echo:ping")
                 } else {
                     false
@@ -216,6 +247,58 @@ async fn tool_call_writes_tool_result_to_session() {
         }
     });
     assert!(has_tool_result, "echo tool result not found in session");
+}
+
+#[tokio::test]
+async fn ephemeral_result_is_full_for_current_run_and_projected_in_session() {
+    use llm_adapter::types::{Message, RequestContent};
+
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::tool_use("call-1", "ephemeral_read", "{}"),
+        MockResponse::text("answer based on document"),
+    ]));
+    let env = Arc::new(NoOpEnv);
+    let mut opts = AgentHarnessOptions::new("test-model");
+    opts.tools = vec![Arc::new(EphemeralReadTool)];
+    let harness =
+        AgentHarness::new_in_memory(client.clone() as Arc<dyn LlmClient>, env, opts).await;
+
+    harness.prompt("read it").await.unwrap();
+
+    {
+        let requests = client.captured_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages().iter().any(|message| {
+            matches!(
+                message,
+                Message::Tool { content, .. }
+                    if content.iter().any(|block| matches!(
+                        block,
+                        RequestContent::Text(text) if text == "private document body"
+                    ))
+            )
+        }));
+    }
+
+    let context = harness.build_context().await.unwrap();
+    let persisted = context
+        .messages
+        .iter()
+        .find_map(|message| match message {
+            AgentMessage::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .expect("tool result must remain paired in Session");
+    assert_eq!(persisted.projection.kind, ToolProjectionKind::Ephemeral);
+    assert!(matches!(
+        persisted.content.as_slice(),
+        [DataBlock::Text { text, .. }] if text == "Read document ref doc-1"
+    ));
+    assert!(
+        !serde_json::to_string(persisted)
+            .unwrap()
+            .contains("private document body")
+    );
 }
 
 #[tokio::test]

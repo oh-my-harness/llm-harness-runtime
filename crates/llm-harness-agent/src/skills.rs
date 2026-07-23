@@ -590,12 +590,12 @@ impl Tool for SkillReadTool {
         &'a self,
         args: Value,
         ctx: &'a ToolContext,
-    ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let skill_name = args
                 .get("skill_name")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| ToolError::Execution("missing 'skill_name' parameter".into()))?;
+                .ok_or_else(|| ToolFailure::invalid_arguments("missing 'skill_name' parameter"))?;
 
             let path = args.get("path").and_then(|v| v.as_str());
 
@@ -605,24 +605,36 @@ impl Tool for SkillReadTool {
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .find(|s| s.name == skill_name)
-                .ok_or_else(|| ToolError::Execution(format!("unknown skill: {skill_name}")))?
+                .ok_or_else(|| {
+                    ToolFailure::new("skill_not_found", format!("Unknown skill: {skill_name}"))
+                })?
                 .clone();
 
-            let resolved = resolve_skill_resource(&skill, path).map_err(ToolError::Execution)?;
+            let resolved = resolve_skill_resource(&skill, path).map_err(|_| {
+                ToolFailure::new(
+                    "invalid_skill_path",
+                    "Requested path is invalid or outside the skill directory.",
+                )
+            })?;
 
             let content = self
                 .env
                 .read_text_file(&resolved, ctx.abort.clone())
                 .await
-                .map_err(|e| ToolError::Execution(format!("{e}")))?;
+                .map_err(|_| {
+                    ToolFailure::new(
+                        "skill_read_failed",
+                        "Unable to read the requested skill file.",
+                    )
+                })?;
 
             let text = truncate_content(&content);
 
-            Ok(ToolResult {
-                content: vec![ContentBlock::Text { text }],
-                details: serde_json::Value::Null,
-                terminate: false,
-            })
+            Ok(ToolResult::full(
+                vec![DataBlock::text(text)],
+                serde_json::Value::Null,
+                false,
+            ))
         })
     }
 }
@@ -1316,8 +1328,8 @@ mod tests {
         let ctx = make_test_ctx(tmp.path());
         let args = serde_json::json!({"skill_name": "my-skill"});
         let result = tool.execute(args, &ctx).await.unwrap();
-        assert!(result.content.iter().any(|c| {
-            matches!(c, llm_harness_types::ContentBlock::Text { text } if text.contains("Main body content"))
+        assert!(result.model_content.iter().any(|c| {
+            matches!(c, llm_harness_types::DataBlock::Text { text, .. } if text.contains("Main body content"))
         }));
     }
 
@@ -1352,8 +1364,8 @@ mod tests {
         let ctx = make_test_ctx(tmp.path());
         let args = serde_json::json!({"skill_name": "my-skill", "path": "references/guide.md"});
         let result = tool.execute(args, &ctx).await.unwrap();
-        assert!(result.content.iter().any(|c| {
-            matches!(c, llm_harness_types::ContentBlock::Text { text } if text.contains("Guide content here"))
+        assert!(result.model_content.iter().any(|c| {
+            matches!(c, llm_harness_types::DataBlock::Text { text, .. } if text.contains("Guide content here"))
         }));
     }
 
@@ -1372,7 +1384,8 @@ mod tests {
         let result = tool.execute(args, &ctx).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(format!("{err}").contains("unknown skill"));
+        assert_eq!(err.code, "skill_not_found");
+        assert!(err.model_message.contains("Unknown skill"));
     }
 
     #[cfg(feature = "test-utils")]
@@ -1406,7 +1419,8 @@ mod tests {
         let result = tool.execute(args, &ctx).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(format!("{err}").contains("path traversal"));
+        assert_eq!(err.code, "invalid_skill_path");
+        assert!(!err.model_message.contains("passwd"));
     }
 
     #[test]
@@ -1459,10 +1473,10 @@ mod tests {
         let args = serde_json::json!({"skill_name": "my-skill"});
         let result = tool.execute(args, &ctx).await.unwrap();
         let text = result
-            .content
+            .model_content
             .iter()
             .find_map(|c| match c {
-                llm_harness_types::ContentBlock::Text { text } => Some(text),
+                llm_harness_types::DataBlock::Text { text, .. } => Some(text),
                 _ => None,
             })
             .unwrap();

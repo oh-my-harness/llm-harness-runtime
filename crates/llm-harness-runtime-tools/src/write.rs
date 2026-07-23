@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use llm_harness_types::{ContentBlock, Tool, ToolContext, ToolError, ToolResult};
+use llm_harness_types::{DataBlock, Tool, ToolContext, ToolError, ToolFailure, ToolResult};
 use parking_lot::RwLock;
 
 use crate::resolve_path;
@@ -62,7 +62,7 @@ impl Tool for WriteTool {
         &'a self,
         args: serde_json::Value,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
             let path_str = args
                 .get("path")
@@ -105,14 +105,14 @@ impl Tool for WriteTool {
             }
 
             let text = format!("Wrote {n} bytes to {}", path.display());
-            Ok(ToolResult {
-                content: vec![ContentBlock::Text { text }],
-                details: serde_json::json!({
+            Ok(ToolResult::full(
+                vec![DataBlock::text(text)],
+                serde_json::json!({
                     "path": path,
                     "bytes": n,
                 }),
-                terminate: false,
-            })
+                false,
+            ))
         })
     }
 }
@@ -172,8 +172,8 @@ mod tests {
             .await
             .expect("write should succeed");
 
-        let text = match res.content.as_slice() {
-            [ContentBlock::Text { text }] => text.clone(),
+        let text = match res.model_content.as_slice() {
+            [DataBlock::Text { text, .. }] => text.clone(),
             _ => panic!("expected a single text block"),
         };
         assert!(text.contains("Wrote 8 bytes to"), "got: {text}");
@@ -259,11 +259,7 @@ mod tests {
             .await
             .expect_err("missing path should error");
 
-        match err {
-            ToolError::InvalidArguments(msg) => {
-                assert!(msg.contains("path"), "error should mention path: {msg}");
-            }
-            other => panic!("expected InvalidArguments, got {other:?}"),
-        }
+        assert_eq!(err.code, "invalid_arguments");
+        assert!(err.model_message.contains("path"));
     }
 }

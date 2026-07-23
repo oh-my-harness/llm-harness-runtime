@@ -756,16 +756,14 @@ mod tests {
             _ctx: &'a llm_harness_types::ToolContext,
         ) -> futures::future::BoxFuture<
             'a,
-            Result<llm_harness_types::ToolResult, llm_harness_types::ToolError>,
+            Result<llm_harness_types::ToolResult, llm_harness_types::ToolFailure>,
         > {
             Box::pin(async {
-                Ok(llm_harness_types::ToolResult {
-                    content: vec![llm_harness_types::ContentBlock::Text {
-                        text: "mock result".into(),
-                    }],
-                    details: serde_json::Value::Null,
-                    terminate: false,
-                })
+                Ok(llm_harness_types::ToolResult::full(
+                    vec![llm_harness_types::DataBlock::text("mock result")],
+                    serde_json::Value::Null,
+                    false,
+                ))
             })
         }
     }
@@ -1038,7 +1036,7 @@ mod tests {
     #[test]
     fn builder_tool_appends_to_tools_list() {
         use futures::future::BoxFuture;
-        use llm_harness_types::{Tool, ToolContext, ToolError, ToolResult};
+        use llm_harness_types::{Tool, ToolContext, ToolFailure, ToolResult};
         use std::sync::Arc;
 
         struct DummyTool;
@@ -1057,7 +1055,7 @@ mod tests {
                 &'a self,
                 _args: serde_json::Value,
                 _ctx: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, ToolError>> {
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
                 Box::pin(async { unreachable!() })
             }
         }

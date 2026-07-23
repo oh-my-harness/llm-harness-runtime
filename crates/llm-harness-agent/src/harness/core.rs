@@ -41,7 +41,7 @@ pub struct AgentHarness {
     pub(super) session: Session,
     pub(super) env: Arc<dyn ExecutionEnv>,
     pub(super) inner: Arc<Mutex<HarnessInner>>,
-    // AgentHarnessEvent is not Clone (wraps AgentEvent which wraps ToolError<anyhow::Error>).
+    // Harness events are shared across subscribers without copying their payloads.
     pub(super) event_tx: broadcast::Sender<Arc<AgentHarnessEvent>>,
     pub(super) phase_tx: watch::Sender<HarnessPhase>,
     pub(super) phase_rx: watch::Receiver<HarnessPhase>,
