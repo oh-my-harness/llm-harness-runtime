@@ -1741,79 +1741,79 @@ Hook 签名。`llm-tutor` 在采用任何 Knowledge/Memory 切片前，必须先
 以下 Milestone 表示产品能力和依赖顺序，不表示一个大 PR。每个 Milestone 由多个可独立
 合并的 PR 组成；各 PR 只增加最终态能力，后续切片在其上扩展，不引入随后需要删除的过渡协议。
 
-### Milestone A：显式 Knowledge 垂直切片
+### Milestone A：显式 Knowledge 垂直切片（5/6）
 
 目标交付：Agent 在现有 Harness 中使用正式协议搜索本地文档、读取 section、带可验证
 citation 回答，且正文不进入 Session。
 
-建议 PR 序列：
+实施清单：
 
-1. **A1 — Run request context**：加入最终 `RunId/RunRequest/RunContext/RunExtensions/
+- [x] **A1 — Run request context**：加入最终 `RunId/RunRequest/RunContext/RunExtensions/
    RunLocalState`，在同一调用链中传入 Hook/ToolContext；迁移仓库内调用点，不保留第二套
    context 协议。
-2. **A2 — Session Projection**：引入 `DataBlock/ToolResult/ToolFailure/ToolProgress`、安全投影和
+- [x] **A2 — Session Projection**：引入 `DataBlock/ToolResult/ToolFailure/ToolProgress`、安全投影和
    replay 语义，一次性迁移仓库内所有 Tool/Hook；不引入隐式 `Full`。
-3. **A3 — Knowledge contracts**：新增 KnowledgeSource/Ref/Hit/Content/Error、AccessControl/
+- [x] **A3 — Knowledge contracts**：新增 KnowledgeSource/Ref/Hit/Content/Error、AccessControl/
    Authorizer 和共享 source contract tests。单用户测试通过显式 `AllowAllAuthorizer`。
-4. **A4 — LocalDocumentSource**：Markdown/Text catalog、BM25、section read、revision、
+- [x] **A4 — LocalDocumentSource**：Markdown/Text catalog、BM25、section read、revision、
    canonical root 与路径对抗测试。
-5. **A5 — Knowledge Tools and citations**：Registry 单源路径、`knowledge_search/read`、
+- [x] **A5 — Knowledge Tools and citations**：Registry 单源路径、`knowledge_search/read`、
    EvidenceAuthority、citation validator 和端到端测试。这个切片不等 Router/Attachment/RunHandle。
-6. **A6 — `llm-tutor` RAG migration**：迁移真实课程知识库、删除被替代的产品侧检索
+- [ ] **A6 — `llm-tutor` RAG migration**：迁移真实课程知识库、删除被替代的产品侧检索
    边界，记录质量、延迟和 Session 尺寸基线。
 
 A1/A2 是 Knowledge 真正需要的两个核心切片，不要求 runtime-owned RunHandle、auto-retrieval、
 AfterRun Capture 和完整 Router 先完成。A3/A4 在依赖允许时可与 A1/A2 并行开发，A5 负责
 最终集成。
 
-### Milestone B：显式 Memory 垂直切片
+### Milestone B：显式 Memory 垂直切片（0/3）
 
 目标交付：Agent 可以在明确用户意图和 AccessControl 下记住/遗忘信息，后续 run 通过
 Memory read source 检索。不包含自动 Capture。
 
-1. **B1 — Read/write composition**：独立 MemoryStore trait、MemoryService、read-source/write-store
+- [ ] **B1 — Read/write composition**：独立 MemoryStore trait、MemoryService、read-source/write-store
    一致性和 receipt 协议。
-2. **B2 — Explicit tools**：`memory_write/forget`、write policy、provenance、TTL、
+- [ ] **B2 — Explicit tools**：`memory_write/forget`、write policy、provenance、TTL、
    idempotency、secret rejection 和授权测试。
-3. **B3 — `llm-tutor` Memory migration**：把现有文件 Memory 读取面与写面迁移到组合
+- [ ] **B3 — `llm-tutor` Memory migration**：把现有文件 Memory 读取面与写面迁移到组合
    协议，保留其 revision、evidence refs、review/apply 交互和删除语义。
 
-### Milestone C：Transient Attachment 与自动召回
+### Milestone C：Transient Attachment 与自动召回（0/4）
 
 目标交付：应用可 opt-in 自动召回，资料通过正式 Attachment 进入当前 run，不进 system
 prompt、Session 或 compaction。
 
-1. **C1 — ContextAttachment**：AgentContext 与 provider converter 支持只数据 attachment，
+- [ ] **C1 — ContextAttachment**：AgentContext 与 provider converter 支持只数据 attachment，
    覆盖各 provider 边界测试。
-2. **C2 — Retrieval pipeline**：deterministic Router、Planner、Coordinator、Assembler、预算、
+- [ ] **C2 — Retrieval pipeline**：deterministic Router、Planner、Coordinator、Assembler、预算、
    partial failure 和 cancellation。
-3. **C3 — Auto retrieval**：在 `EnrichContext` 阶段生成 attachment，加入 citation 和
+- [ ] **C3 — Auto retrieval**：在 `EnrichContext` 阶段生成 attachment，加入 citation 和
    groundedness 验证。
-4. **C4 — `llm-tutor` opt-in validation**：选择一个合适 capability 开启自动召回，对比
+- [ ] **C4 — `llm-tutor` opt-in validation**：选择一个合适 capability 开启自动召回，对比
    Tool-first 模式的召回质量、token 和延迟。
 
 不允许使用 additional message 先合入一个临时版本。检索参数可以用独立实验验证，
 但产品路径等 C1 完成后再开启。
 
-### Milestone D：完整 Run 生命周期与受控委派
+### Milestone D：完整 Run 生命周期与受控委派（0/4）
 
 目标交付：取消、调用方 future 丢弃、Session 保存失败和 Hook 失败时，run 仍有唯一准确
 结果；Workflow/Subagent 只获得可验证的收窄权限。
 
-1. **D1 — Owned run driver**：Preparing/Turning/Finalizing、runtime-owned RunHandle、RunRecord/
+- [ ] **D1 — Owned run driver**：Preparing/Turning/Finalizing、runtime-owned RunHandle、RunRecord/
    RunCompletion、per-run usage 和单次 finalization。
-2. **D2 — AfterRun and capture**：BestEffort/Required Hook 报告、默认关闭的 CapturePolicy、
+- [ ] **D2 — AfterRun and capture**：BestEffort/Required Hook 报告、默认关闭的 CapturePolicy、
    幂等和强一致 Workflow 写入路径。
-3. **D3 — Delegation**：KnowledgeDelegator、grant proof、收窄 property tests、Workflow step 和
+- [ ] **D3 — Delegation**：KnowledgeDelegator、grant proof、收窄 property tests、Workflow step 和
    Subagent 集成。
-4. **D4 — `llm-tutor` workflow migration**：在真实 research workflow/subagent 中验证 tool gate、
+- [ ] **D4 — `llm-tutor` workflow migration**：在真实 research workflow/subagent 中验证 tool gate、
    delegation、abort 和 citation namespace。
 
-### Milestone E：多源与生产化
+### Milestone E：多源与生产化（0/3）
 
-- 企业搜索、PostgreSQL、向量检索、PDF/Word/OCR parser；
-- catalog search、联邦 cursor、rank fusion/reranker 和大规模故障演练；
-- 业务 Evidence Provider SDK、审计、性能基线和安全评测。
+- [ ] 企业搜索、PostgreSQL、向量检索、PDF/Word/OCR parser；
+- [ ] catalog search、联邦 cursor、rank fusion/reranker 和大规模故障演练；
+- [ ] 业务 Evidence Provider SDK、审计、性能基线和安全评测。
 
 每完成一个 Milestone，评审是否调整后续协议；已合并的能力本身就是目标架构的正式部分，
 不存在“等 Milestone D 再把 A/B/C 的临时语义全部替换”的二次重写。
