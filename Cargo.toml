@@ -11,6 +11,7 @@ members = [
     "crates/llm-harness-runtime-mcp",
     "crates/llm-harness-runtime-tools",
     "crates/llm-harness-runtime-knowledge",
+    "crates/llm-harness-runtime-knowledge-local",
     "crates/llm-harness-runtime-audit-jsonl",
     # pyo3 sdk
     # crates/llm-harness-py — 已迁移到 Senza 仓库 (github.com/oh-my-harness/Senza)
@@ -36,6 +37,7 @@ llm-harness-agent  = { path = "crates/llm-harness-agent" }
 llm-harness-runtime = { path = "crates/llm-harness-runtime" }
 llm-harness-runtime-tools = { path = "crates/llm-harness-runtime-tools" }
 llm-harness-runtime-knowledge = { path = "crates/llm-harness-runtime-knowledge" }
+llm-harness-runtime-knowledge-local = { path = "crates/llm-harness-runtime-knowledge-local" }
 
 # API adapter — separate repo
 llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "16a22ad284b8deb8c3a77664a0876f565f4a6eb9" }
@@ -46,6 +48,7 @@ async-stream       = "0.3"
 async-trait        = "0.1"
 chrono             = { version = "0.4", features = ["serde"] }
 futures            = "0.3"
+hmac               = "0.12"
 regex              = "1"
 parking_lot        = "0.12"
 serde              = { version = "1", features = ["derive"] }
