@@ -67,8 +67,9 @@ impl<'de> Deserialize<'de> for RunId {
 /// 应用在启动 run 时提供的进程内 typed extension 集合。
 ///
 /// 该类型不实现 `Serialize` 或 `Debug`，避免认证上下文等请求数据被通用日志或
-/// Session 持久化意外输出。`RunContext` 创建后只暴露只读访问。
-#[derive(Default)]
+/// Session 持久化意外输出。克隆该集合只复制类型映射，值继续共享同一个 `Arc`。
+/// `RunContext` 创建后只暴露只读访问。
+#[derive(Clone, Default)]
 pub struct RunExtensions {
     values: HashMap<TypeId, SharedRunValue>,
 }
@@ -223,6 +224,12 @@ impl RunRequest {
         T: Send + Sync + 'static,
     {
         self.extensions.insert(extension);
+        self
+    }
+
+    /// Replaces the request's complete typed extension set.
+    pub fn with_extensions(mut self, extensions: RunExtensions) -> Self {
+        self.extensions = extensions;
         self
     }
 }
