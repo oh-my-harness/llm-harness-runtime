@@ -100,6 +100,16 @@ impl HttpInner {
         Ok(headers)
     }
 
+    /// Mark the transport as closed and notify the manager via the close
+    /// callback, unless an explicit `close()` is already in progress.
+    fn mark_closed(&self) {
+        if self.connected.swap(false, Ordering::AcqRel)
+            && !self.closing.load(Ordering::Acquire)
+        {
+            self.callbacks.close();
+        }
+    }
+
     fn capture_session_id(&self, response: &Response) {
         let Some(value) = response.headers().get(MCP_SESSION_ID) else {
             return;
@@ -398,6 +408,7 @@ impl HttpInner {
                 }
                 Err(error) => {
                     tracing::debug!(%error, "MCP SSE listener could not resume");
+                    self.mark_closed();
                     return;
                 }
             }
@@ -741,5 +752,94 @@ mod tests {
                 .request_headers("application/json", None)
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn http_listen_failure_triggers_close_callback() {
+        // Create an HttpInner that will fail on open_get because the URL
+        // points to a non-existent server.
+        let inner = Arc::new(HttpInner {
+            url: Url::parse("http://127.0.0.1:1").unwrap(),
+            client: reqwest::Client::new(),
+            headers: RwLock::new(HashMap::new()),
+            session_id: RwLock::new(None),
+            protocol_version: RwLock::new(None),
+            connected: AtomicBool::new(true),
+            closing: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+            timeout_ms: 0,
+            callbacks: TransportCallbacks::default(),
+            cancellation: CancellationToken::new(),
+            listener_task: Mutex::new(None),
+            auth_refresh: RwLock::new(None),
+        });
+
+        let close_called = Arc::new(AtomicBool::new(false));
+        let close_flag = close_called.clone();
+        inner.callbacks.set_close(Arc::new(move || {
+            close_flag.store(true, Ordering::Release);
+        }));
+
+        // Simulate a response that immediately ends, then open_get fails.
+        // We call listen directly with a dummy response — but since we
+        // can't easily create a Response, test the mark_closed path:
+        inner.mark_closed();
+
+        assert!(close_called.load(Ordering::Acquire));
+        assert!(!inner.connected.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn http_listen_open_get_failure_notifies_close() {
+        // Serve a single SSE response whose stream ends, forcing listen to
+        // call open_get to resume. open_get points at an unreachable URL so
+        // it fails, and listen must trigger mark_closed -> close callback.
+        let sse = "retry: 0\n\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"params\":{}}\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            sse.len(),
+            sse
+        );
+        let response: &'static str = Box::leak(response.into_boxed_str());
+        let (url, _server) = serve_once(response).await;
+
+        // Build an HttpInner pointing at the served URL for the initial
+        // response, then swap the URL to an unreachable address so open_get
+        // fails on resume.
+        let inner = Arc::new(HttpInner {
+            url: Url::parse("http://127.0.0.1:1").unwrap(),
+            client: reqwest::Client::new(),
+            headers: RwLock::new(HashMap::new()),
+            session_id: RwLock::new(None),
+            protocol_version: RwLock::new(None),
+            connected: AtomicBool::new(true),
+            closing: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+            timeout_ms: 0,
+            callbacks: TransportCallbacks::default(),
+            cancellation: CancellationToken::new(),
+            listener_task: Mutex::new(None),
+            auth_refresh: RwLock::new(None),
+        });
+
+        let close_called = Arc::new(AtomicBool::new(false));
+        let close_flag = close_called.clone();
+        inner.callbacks.set_close(Arc::new(move || {
+            close_flag.store(true, Ordering::Release);
+        }));
+
+        // Fetch the initial response from the served URL, then run listen
+        // with the unreachable inner URL so the resume open_get fails.
+        let initial = reqwest::get(url).await.unwrap();
+        // Drive the listen loop to completion.
+        let inner_clone = Arc::clone(&inner);
+        let handle = tokio::spawn(async move {
+            inner_clone.listen(initial).await;
+        });
+        // Give the listener time to consume the stream and fail resuming.
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+        assert!(close_called.load(Ordering::Acquire), "close callback should fire on resume failure");
+        assert!(!inner.connected.load(Ordering::Acquire), "connected should be false after resume failure");
     }
 }
