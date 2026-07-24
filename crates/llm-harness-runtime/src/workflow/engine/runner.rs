@@ -683,6 +683,25 @@ impl super::WorkflowEngine {
 
     /// 判断 transition：自由 task 直接 Abort，否则调 judge.decide。
     async fn decide_transition(&self, step: &Step, step_result: &StepResult) -> Transition {
+        // Terminal steps short-circuit: no judge invocation.
+        if let Step::Terminal {
+            exit_code, message, ..
+        } = step
+        {
+            if *exit_code == 0 {
+                return Transition::Abort {
+                    reason: message
+                        .clone()
+                        .unwrap_or_else(|| "terminal: success".into()),
+                };
+            }
+            return Transition::Fail {
+                reason: message
+                    .clone()
+                    .unwrap_or_else(|| format!("terminal: exit_code {}", exit_code)),
+            };
+        }
+
         let is_free_task = self.workflow.edges.is_empty() && self.workflow.steps.len() == 1;
         if is_free_task {
             return Transition::Abort {
@@ -728,6 +747,27 @@ impl super::WorkflowEngine {
         match step {
             Step::Llm { .. } => self.run_llm_step(step, step_abort, policy_attempt).await,
             Step::Executor { .. } => self.run_executor_step(step, step_abort).await,
+            Step::Terminal {
+                exit_code, message, ..
+            } => {
+                // Terminal steps short-circuit: no LLM call, no executor.
+                // The actual success/fail transition is handled in
+                // decide_transition via the terminal check.
+                let _ = step_abort;
+                Ok(StepResult {
+                    output: message.clone().unwrap_or_default(),
+                    structured: Some(serde_json::json!({
+                        "exit_code": exit_code,
+                        "message": message,
+                    })),
+                    structured_status: StructuredStatus::Ok,
+                    tool_calls_count: 0,
+                    session_id: String::new(),
+                    cost: CostAggregate::default(),
+                    started_at: None,
+                    ended_at: None,
+                })
+            }
         }
     }
 
@@ -1342,6 +1382,61 @@ impl super::WorkflowEngine {
                 Ok(Some(next))
             }
             Transition::Retry => {
+                // Check for declarative LoopConfig on this step's policy.
+                // If present, the loop has its own counter and exit semantics
+                // that supersede the generic max_retries safety valve.
+                if let Some(loop_cfg) = step.policy().and_then(|p| p.r#loop.as_ref()) {
+                    // Count loop iterations for this step (consecutive Retry
+                    // records, including the one just pushed).
+                    let loop_count = state
+                        .step_history
+                        .iter()
+                        .rev()
+                        .take_while(|r| {
+                            r.step_id.as_str() == step.id().as_str()
+                                && matches!(r.transition, Transition::Retry)
+                        })
+                        .count() as u32;
+
+                    if loop_count > loop_cfg.max_iterations {
+                        // Loop exhausted: follow exit_route edge.
+                        if let Some(exit_label) = &loop_cfg.exit_route {
+                            // Strip "next_on_" prefix if present to get the
+                            // raw route key, then find a matching edge.
+                            let label = exit_label.strip_prefix("next_on_").unwrap_or(exit_label);
+                            if let Some(edge) = self.workflow.edges.iter().find(|e| {
+                                e.from.as_str() == step.id().as_str()
+                                    && matches!(
+                                        &e.condition,
+                                        Some(EdgeCondition::Label(l)) if l == label
+                                    )
+                            }) {
+                                let next = edge.to.clone();
+                                let snapshot = state.clone();
+                                drop(state);
+                                self.persist_state(&snapshot).await?;
+                                return Ok(Some(next));
+                            }
+                        }
+                        // No exit_route edge found: fall through to max_retries.
+                    } else {
+                        // Loop continues: jump to target_stage or re-run current.
+                        if let Some(target) = &loop_cfg.target_stage
+                            && target != step.id()
+                        {
+                            let snapshot = state.clone();
+                            drop(state);
+                            self.persist_state(&snapshot).await?;
+                            return Ok(Some(target.clone()));
+                        }
+                        // target_stage is None or same as current: re-run in place.
+                        let snapshot = state.clone();
+                        drop(state);
+                        self.persist_state(&snapshot).await?;
+                        return Ok(None);
+                    }
+                }
+
                 // max_retries 安全阀。统计当前步连续 Retry 次数。
                 // 语义：max_retries=N 允许 N 次 Retry。count 含刚 push 的这条，
                 // 故 count > max_retries 时超限（第 N+1 次触发 Failed）。

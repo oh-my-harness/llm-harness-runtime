@@ -101,7 +101,7 @@ impl EdgeConditionJudge {
         }
 
         let mut fallback: Option<&Edge> = None;
-        let mut legacy_labels = vec![];
+        let mut label_edges: Vec<(&str, &Edge)> = vec![];
         for edge in &outgoing {
             match &edge.condition {
                 None => {
@@ -115,7 +115,7 @@ impl EdgeConditionJudge {
                     }
                     fallback = Some(edge);
                 }
-                Some(EdgeCondition::Label(label)) => legacy_labels.push(label.as_str()),
+                Some(EdgeCondition::Label(label)) => label_edges.push((label.as_str(), edge)),
                 Some(EdgeCondition::Expr(expr)) => {
                     if evaluate_condition(expr, ctx.last_result.structured.as_ref()) {
                         return Transition::To(edge.to.clone());
@@ -124,17 +124,58 @@ impl EdgeConditionJudge {
             }
         }
 
-        if let Some(edge) = fallback {
-            return Transition::To(edge.to.clone());
-        }
-        if !legacy_labels.is_empty() {
+        // If we have label edges, try to match the route_key from
+        // structured output against them, with fallback semantics.
+        if !label_edges.is_empty() {
+            // Extract route_key from structured output (set by executor).
+            let route_key = ctx
+                .last_result
+                .structured
+                .as_ref()
+                .and_then(|s| s.get("route_key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("success");
+
+            // 1. Direct match: route_key matches a label.
+            if let Some((_, edge)) = label_edges.iter().find(|(label, _)| *label == route_key) {
+                return Transition::To(edge.to.clone());
+            }
+
+            // 2. Fallback: success/pass/done → "success" label.
+            if matches!(route_key, "success" | "pass" | "done")
+                && let Some((_, edge)) = label_edges.iter().find(|(label, _)| *label == "success")
+            {
+                return Transition::To(edge.to.clone());
+            }
+
+            // 3. Fallback: failure → "failure" label.
+            if route_key == "failure"
+                && let Some((_, edge)) = label_edges.iter().find(|(label, _)| *label == "failure")
+            {
+                return Transition::To(edge.to.clone());
+            }
+
+            // 4. No label matched: if there's an unconditional fallback, use it.
+            if let Some(edge) = fallback {
+                return Transition::To(edge.to.clone());
+            }
+
             return Transition::Fail {
                 reason: format!(
-                    "edge condition label '{}' from step '{}' requires a custom judge",
-                    legacy_labels[0],
-                    ctx.current_step.id()
+                    "no edge label matched route_key '{}' from step '{}' (labels: {})",
+                    route_key,
+                    ctx.current_step.id(),
+                    label_edges
+                        .iter()
+                        .map(|(l, _)| *l)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             };
+        }
+
+        if let Some(edge) = fallback {
+            return Transition::To(edge.to.clone());
         }
         Transition::Fail {
             reason: format!(
@@ -490,7 +531,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edge_condition_judge_fails_legacy_label_without_custom_judge() {
+    async fn edge_condition_judge_fails_legacy_label_without_matching_route_key() {
+        // Label edges are now matched against structured.route_key (with
+        // fallback to "success"). If no label matches the route_key and no
+        // unconditional fallback edge exists, the judge fails.
         let judge = EdgeConditionJudge::new(vec![edge(
             "next",
             Some(EdgeCondition::Label("business_label".into())),
@@ -506,8 +550,10 @@ mod tests {
 
         let transition = judge.decide(&ctx).await;
 
+        // make_result() has no route_key → defaults to "success".
+        // "business_label" != "success" → no match → Fail.
         assert!(
-            matches!(transition, Transition::Fail { reason } if reason.contains("requires a custom judge"))
+            matches!(transition, Transition::Fail { reason } if reason.contains("no edge label matched"))
         );
     }
 

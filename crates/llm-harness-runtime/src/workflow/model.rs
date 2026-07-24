@@ -78,6 +78,48 @@ pub enum Step {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy: Option<StepExecutionPolicy>,
     },
+    /// Terminal step: immediately ends the workflow with a success or failure.
+    ///
+    /// Unlike `Transition::Abort` (which loses exit semantics), terminal steps
+    /// carry an explicit `exit_code` and `message`. `exit_code == 0` → Succeeded,
+    /// non-zero → Failed. The engine short-circuits: no LLM call, no executor
+    /// invocation — just transition to terminal status.
+    Terminal {
+        /// 步骤唯一标识。
+        id: StepId,
+        /// 人类可读名称。
+        name: String,
+        /// Exit code: 0 = success, non-zero = failure.
+        #[serde(default)]
+        exit_code: i32,
+        /// Human-readable exit message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+}
+
+/// Declarative loop configuration for iterative workflows.
+///
+/// When attached to a step's `StepExecutionPolicy`, the engine tracks a
+/// per-step loop counter. When the judge returns `Transition::Retry` (or a
+/// route key that maps to a loop continuation), the engine increments the
+/// counter and jumps to `target_stage` (or re-runs the current step if
+/// `target_stage` is `None`). After `max_iterations` is reached, the engine
+/// follows `exit_route` (a declarative edge label) instead of looping.
+///
+/// This is the generic equivalent of EDA Agent's `LoopConfig`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopConfig {
+    /// Maximum loop iterations before forcing exit.
+    pub max_iterations: u32,
+    /// Target step to jump to on each loop iteration.
+    /// `None` = re-run the current step (same as `Transition::Retry`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_stage: Option<String>,
+    /// Route key to follow when the loop is exhausted (e.g. "next_on_success").
+    /// The engine looks up this label in the outgoing edges of the current step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_route: Option<String>,
 }
 
 /// Runtime policy applied uniformly to LLM and executor steps.
@@ -101,6 +143,11 @@ pub struct StepExecutionPolicy {
     /// successful execution and the TTL hasn't expired, execution is skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<StepCache>,
+    /// Declarative loop configuration. When set, the engine tracks a loop
+    /// counter for this step and follows `target_stage` on loop continuation
+    /// instead of re-running in-place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#loop: Option<LoopConfig>,
 }
 
 /// Step-level result cache configuration.
@@ -151,6 +198,14 @@ impl<'de> Deserialize<'de> for Step {
                 #[serde(default)]
                 policy: Option<StepExecutionPolicy>,
             },
+            Terminal {
+                id: StepId,
+                name: String,
+                #[serde(default)]
+                exit_code: i32,
+                #[serde(default)]
+                message: Option<String>,
+            },
         }
 
         #[derive(Deserialize)]
@@ -197,6 +252,17 @@ impl<'de> Deserialize<'de> for Step {
                 executor_name,
                 config,
                 policy,
+            }),
+            StepCompat::Tagged(TaggedStep::Terminal {
+                id,
+                name,
+                exit_code,
+                message,
+            }) => Ok(Self::Terminal {
+                id,
+                name,
+                exit_code,
+                message,
             }),
             StepCompat::LegacyLlm(LegacyLlmStep {
                 id,
@@ -247,12 +313,27 @@ impl Step {
         }
     }
 
+    pub fn terminal(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        exit_code: i32,
+        message: Option<String>,
+    ) -> Self {
+        Self::Terminal {
+            id: id.into(),
+            name: name.into(),
+            exit_code,
+            message,
+        }
+    }
+
     #[must_use]
     pub fn with_policy(mut self, policy: StepExecutionPolicy) -> Self {
         match &mut self {
             Self::Llm { policy: slot, .. } | Self::Executor { policy: slot, .. } => {
                 *slot = Some(policy);
             }
+            Self::Terminal { .. } => {}
         }
         self
     }
@@ -277,47 +358,50 @@ impl Step {
 
     pub fn id(&self) -> &StepId {
         match self {
-            Self::Llm { id, .. } | Self::Executor { id, .. } => id,
+            Self::Llm { id, .. } | Self::Executor { id, .. } | Self::Terminal { id, .. } => id,
         }
     }
 
     pub fn name(&self) -> &str {
         match self {
-            Self::Llm { name, .. } | Self::Executor { name, .. } => name,
+            Self::Llm { name, .. } | Self::Executor { name, .. } | Self::Terminal { name, .. } => {
+                name
+            }
         }
     }
 
     pub fn policy(&self) -> Option<&StepExecutionPolicy> {
         match self {
             Self::Llm { policy, .. } | Self::Executor { policy, .. } => policy.as_ref(),
+            Self::Terminal { .. } => None,
         }
     }
 
     pub fn allowed_tools(&self) -> &[String] {
         match self {
             Self::Llm { allowed_tools, .. } => allowed_tools.as_slice(),
-            Self::Executor { .. } => &[],
+            Self::Executor { .. } | Self::Terminal { .. } => &[],
         }
     }
 
     pub fn prompt(&self) -> Option<&str> {
         match self {
             Self::Llm { prompt, .. } => Some(prompt.as_str()),
-            Self::Executor { .. } => None,
+            Self::Executor { .. } | Self::Terminal { .. } => None,
         }
     }
 
     pub fn executor_name(&self) -> Option<&str> {
         match self {
             Self::Executor { executor_name, .. } => Some(executor_name.as_str()),
-            Self::Llm { .. } => None,
+            Self::Llm { .. } | Self::Terminal { .. } => None,
         }
     }
 
     pub fn executor_config(&self) -> Option<&serde_json::Value> {
         match self {
             Self::Executor { config, .. } => config.as_ref(),
-            Self::Llm { .. } => None,
+            Self::Llm { .. } | Self::Terminal { .. } => None,
         }
     }
 }
@@ -700,6 +784,7 @@ mod tests {
                 max_attempts: Some(3),
                 retry_backoff_ms: Some(25),
                 cache: None,
+                r#loop: None,
             },
         );
         let json = serde_json::to_string(&step).unwrap();
@@ -714,6 +799,7 @@ mod tests {
                 max_attempts: Some(3),
                 retry_backoff_ms: Some(25),
                 cache: None,
+                r#loop: None,
             })
         );
     }

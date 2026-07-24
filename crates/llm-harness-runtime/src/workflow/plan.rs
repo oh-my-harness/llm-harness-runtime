@@ -115,6 +115,10 @@ pub fn validate_workflow(wf: &Workflow) -> Result<(), WorkflowValidationError> {
                     });
                 }
             }
+            Step::Terminal { .. } => {
+                // Terminal steps are always valid: no prompt, no executor,
+                // no tools required. exit_code and message are optional.
+            }
         }
     }
     // 安全阀：限制 step/edge 数量，防止恶意或失控的 workflow 定义。
@@ -600,6 +604,7 @@ mod tests {
                         max_attempts: Some(0),
                         retry_backoff_ms: Some(0),
                         cache: None,
+                        r#loop: None,
                     },
                 ),
             ],

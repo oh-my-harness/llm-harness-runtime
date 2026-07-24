@@ -69,10 +69,17 @@ fn default_declarative_judge(
     workflow: &Workflow,
     judge: Arc<dyn StepTransitionJudge>,
 ) -> Arc<dyn StepTransitionJudge> {
-    let has_declarative_edges = workflow
-        .edges
-        .iter()
-        .any(|edge| matches!(edge.condition, Some(EdgeCondition::Expr(_))));
+    // Activate the built-in EdgeConditionJudge when the workflow has
+    // declarative edges (Expr conditions) OR label-based edges (string
+    // conditions like "pass"/"fail"/"success"). The latter enables
+    // route_key-based routing with fallback semantics, which is the generic
+    // equivalent of EDA Agent's resolve_next().
+    let has_declarative_edges = workflow.edges.iter().any(|edge| {
+        matches!(
+            &edge.condition,
+            Some(EdgeCondition::Expr(_)) | Some(EdgeCondition::Label(_))
+        )
+    });
     if has_declarative_edges && judge.is_noop() {
         Arc::new(EdgeConditionJudge::from_workflow(workflow))
     } else {
