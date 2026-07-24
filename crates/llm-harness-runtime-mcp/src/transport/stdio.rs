@@ -69,6 +69,12 @@ impl StdioInner {
             }
         }
     }
+    async fn cleanup_child(&self) {
+        if let Some(mut child) = self.child.lock().await.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
 
     async fn handle_message(self: &Arc<Self>, message: JsonRpcMessage) {
         match message {
@@ -238,25 +244,21 @@ impl McpTransport for StdioTransport {
     }
 
     async fn close(&self) -> TransportResult<()> {
-        if !self.inner.connected.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
+        let was_connected = self.inner.connected.swap(false, Ordering::AcqRel);
         self.inner.closing.store(true, Ordering::Release);
         self.inner.cancellation.cancel();
         self.inner.fail_pending(McpTransportError::Closed);
         self.inner.stdin.lock().await.take();
-
-        if let Some(mut child) = self.inner.child.lock().await.take() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
+        self.inner.cleanup_child().await;
         if let Some(handle) = self.inner.stdout_task.lock().take() {
             handle.abort();
         }
         if let Some(handle) = self.inner.stderr_task.lock().take() {
             handle.abort();
         }
-        self.inner.callbacks.close();
+        if was_connected {
+            self.inner.callbacks.close();
+        }
         Ok(())
     }
 
@@ -283,6 +285,14 @@ impl Drop for StdioTransport {
     fn drop(&mut self) {
         self.inner.closing.store(true, Ordering::Release);
         self.inner.cancellation.cancel();
+        // Best-effort synchronous kill: the child mutex is a tokio async
+        // mutex that cannot be locked synchronously in Drop, so we use
+        // try_lock. If it is contended, the close() path or kill_on_drop
+        if let Ok(mut guard) = self.inner.child.try_lock()
+            && let Some(mut child) = guard.take()
+        {
+            let _ = child.start_kill();
+        }
         if let Some(handle) = self.inner.stdout_task.lock().take() {
             handle.abort();
         }
@@ -423,5 +433,25 @@ mod tests {
         assert!(matches!(error, McpTransportError::Timeout { .. }));
         assert!(transport.inner.pending.lock().is_empty());
         transport.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdio_child_killed_when_close_called_after_mark_closed() {
+        // A script that stays alive until killed.
+        #[cfg(not(windows))]
+        let script = "sleep 30".to_owned();
+        #[cfg(windows)]
+        let script = "Start-Sleep -Seconds 30".to_owned();
+
+        let transport = StdioTransport::connect(&fixture_config(script))
+            .await
+            .unwrap();
+        // Simulate the read loop detecting EOF and calling mark_closed.
+        transport.inner.mark_closed();
+        // Now call close() — this used to skip kill+wait.
+        transport.close().await.unwrap();
+        // If we reach here without hanging, the child was cleaned up.
+        // Verify child is None.
+        assert!(transport.inner.child.lock().await.is_none());
     }
 }
