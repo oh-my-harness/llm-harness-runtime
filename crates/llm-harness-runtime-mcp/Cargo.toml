@@ -6,12 +6,24 @@ license.workspace = true
 
 [dependencies]
 llm-harness-runtime.workspace = true
+llm-harness-agent.workspace   = true
 llm-harness-types.workspace   = true
 anyhow.workspace              = true
+async-trait.workspace         = true
+base64.workspace              = true
 futures.workspace             = true
+parking_lot.workspace         = true
+reqwest = { workspace = true, features = ["stream"] }
+serde.workspace               = true
 serde_json.workspace          = true
+thiserror.workspace           = true
+tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "sync", "time"] }
+tokio-util.workspace          = true
+tracing.workspace             = true
+url = "2"
 
 [dev-dependencies]
 tokio     = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-util = { workspace = true }
 llm-harness-loop = { workspace = true, features = ["test-utils"] }
+tempfile.workspace = true

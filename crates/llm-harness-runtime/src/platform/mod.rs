@@ -4,7 +4,6 @@
 //! crate (`runtime-sandbox-*`, `runtime-audit-jsonl`, `runtime-trace-otel`,
 //! `runtime-mcp`, ...) implements. The runtime itself stays backend-agnostic.
 
-pub mod mcp;
 pub mod prompt;
 pub mod resource;
 pub mod sandbox;
