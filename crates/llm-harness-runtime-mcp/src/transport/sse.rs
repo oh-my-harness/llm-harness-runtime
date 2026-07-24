@@ -417,6 +417,25 @@ async fn read_event_stream(
     }
 }
 
+/// Ensure `candidate` shares the scheme, host and port of `base`.
+///
+/// The legacy SSE transport receives an `endpoint` event from the server and
+/// resolves it against the source URL with `Url::join`. An absolute URL in
+/// that event would otherwise override the source origin, letting a malicious
+/// server redirect authenticated POSTs (and their headers) elsewhere.
+fn validate_same_origin(base: &Url, candidate: &Url) -> TransportResult<()> {
+    if candidate.scheme() != base.scheme()
+        || candidate.host_str() != base.host_str()
+        || candidate.port_or_known_default() != base.port_or_known_default()
+    {
+        return Err(McpTransportError::InvalidConfig(format!(
+            "SSE endpoint '{}' does not match origin of source URL '{}'",
+            candidate, base
+        )));
+    }
+    Ok(())
+}
+
 async fn handle_sse_event(
     weak: &Weak<LegacySseInner>,
     event: SseEvent,
@@ -430,7 +449,11 @@ async fn handle_sse_event(
             let result = inner
                 .source_url
                 .join(event.data.trim())
-                .map_err(|error| McpTransportError::InvalidConfig(error.to_string()));
+                .map_err(|error| McpTransportError::InvalidConfig(error.to_string()))
+                .and_then(|endpoint| {
+                    validate_same_origin(&inner.source_url, &endpoint)?;
+                    Ok(endpoint)
+                });
             match result {
                 Ok(endpoint) => {
                     *inner.endpoint.write() = Some(endpoint);
@@ -468,5 +491,35 @@ mod tests {
             source.join("../messages?id=1").unwrap().as_str(),
             "https://example.com/messages?id=1"
         );
+    }
+
+    #[test]
+    fn validate_same_origin_rejects_foreign_url() {
+        use url::Url;
+        let base = Url::parse("https://mcp.example.com/sse").unwrap();
+        let foreign = Url::parse("https://attacker.com/capture").unwrap();
+        let result = validate_same_origin(&base, &foreign);
+        assert!(result.is_err(), "foreign origin must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, McpTransportError::InvalidConfig(ref msg) if msg.contains("origin")),
+            "expected InvalidConfig with origin message, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_same_origin_accepts_same_host_different_path() {
+        use url::Url;
+        let base = Url::parse("https://mcp.example.com/sse").unwrap();
+        let same = Url::parse("https://mcp.example.com/messages").unwrap();
+        assert!(validate_same_origin(&base, &same).is_ok());
+    }
+
+    #[test]
+    fn validate_same_origin_rejects_different_port() {
+        use url::Url;
+        let base = Url::parse("https://mcp.example.com:443/sse").unwrap();
+        let other = Url::parse("https://mcp.example.com:8443/capture").unwrap();
+        assert!(validate_same_origin(&base, &other).is_err());
     }
 }
