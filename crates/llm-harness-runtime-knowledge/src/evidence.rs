@@ -206,7 +206,11 @@ struct KnowledgeRunStateInner {
 }
 
 impl KnowledgeRunState {
-    pub fn register(&self, run_id: RunId, evidence: &PersistedKnowledgeEvidence) -> CitationRecord {
+    pub(crate) fn register(
+        &self,
+        run_id: RunId,
+        evidence: &PersistedKnowledgeEvidence,
+    ) -> CitationRecord {
         let mut inner = self.inner.lock().unwrap_or_else(|value| value.into_inner());
         inner.next += 1;
         let namespace_digest = Sha256::digest(run_id.to_string().as_bytes());
@@ -234,6 +238,15 @@ impl KnowledgeRunState {
             .citations
             .get(handle)
             .cloned()
+    }
+
+    pub fn has_citations(&self) -> bool {
+        !self
+            .inner
+            .lock()
+            .unwrap_or_else(|value| value.into_inner())
+            .citations
+            .is_empty()
     }
 }
 

@@ -8,6 +8,52 @@ use crate::{
     ToolResult, TurnSnapshot,
 };
 
+// ── FinalAnswerValidator ──────────────────────────────────────────────────────
+
+/// Context presented before a candidate final answer becomes a committed
+/// `MessageEnd`.
+///
+/// Streaming deltas are provisional. A rejected candidate is never appended to
+/// the agent context or persisted by `AgentHarness`.
+pub struct FinalAnswerValidationCtx<'a> {
+    /// Immutable context for the current run.
+    pub run: &'a RunContext,
+    /// Candidate final answer.
+    pub candidate: &'a AssistantMessage,
+    /// Current turn index.
+    pub turn_index: u32,
+}
+
+/// Public, sanitized reason for rejecting a candidate final answer.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[error("{code}: {message}")]
+pub struct FinalAnswerValidationError {
+    /// Stable machine-readable rejection code.
+    pub code: String,
+    /// Safe message that may be exposed to runtime consumers.
+    pub message: String,
+}
+
+impl FinalAnswerValidationError {
+    /// Creates a sanitized validation error.
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Validates a candidate final answer before it crosses the committed answer
+/// boundary.
+pub trait FinalAnswerValidator: Send + Sync {
+    /// Returns `Ok(())` to commit the answer, or a sanitized rejection.
+    fn validate<'a>(
+        &'a self,
+        ctx: FinalAnswerValidationCtx<'a>,
+    ) -> BoxFuture<'a, Result<(), FinalAnswerValidationError>>;
+}
+
 // ── TransformContextHook ──────────────────────────────────────────────────────
 
 /// 传递给 `TransformContextHook::transform` 的上下文。
@@ -355,6 +401,7 @@ mod tests {
 
     #[test]
     fn all_hook_traits_are_object_safe() {
+        fn _final(_: &dyn FinalAnswerValidator) {}
         fn _a(_: &dyn TransformContextHook) {}
         fn _b(_: &dyn PrepareNextTurnHook) {}
         fn _c(_: &dyn BeforeToolCallHook) {}

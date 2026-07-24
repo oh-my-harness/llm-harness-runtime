@@ -26,8 +26,8 @@ pub mod test_utils;
 pub use composite::{
     CompositeAfterProviderResponseHook, CompositeAfterToolCallHook, CompositeAfterTurnHook,
     CompositeBeforeCompactHook, CompositeBeforeProviderRequestHook, CompositeBeforeRunHook,
-    CompositeBeforeToolCallHook, CompositeBeforeTurnHook, CompositePrepareNextTurnHook,
-    CompositeShouldStopHook, CompositeTransformContextHook,
+    CompositeBeforeToolCallHook, CompositeBeforeTurnHook, CompositeFinalAnswerValidator,
+    CompositePrepareNextTurnHook, CompositeShouldStopHook, CompositeTransformContextHook,
 };
 pub use config::{LoopConfig, RetryConfig};
 pub use convert::{ConvertToLlmHook, CustomMessageConverter, DefaultConvertToLlm};

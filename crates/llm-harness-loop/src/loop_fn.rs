@@ -105,6 +105,27 @@ fn final_answer_text_from_results(
         .next_back()
 }
 
+async fn validate_final_answer(
+    config: &LoopConfig,
+    candidate: &AssistantMessage,
+    turn_index: u32,
+) -> Result<(), AgentError> {
+    let Some(validator) = &config.final_answer_validator else {
+        return Ok(());
+    };
+    validator
+        .validate(FinalAnswerValidationCtx {
+            run: &config.run,
+            candidate,
+            turn_index,
+        })
+        .await
+        .map_err(|error| AgentError::FinalAnswerRejected {
+            code: error.code,
+            message: error.message,
+        })
+}
+
 fn apply_next_turn_directive(
     ctx: &mut AgentContext,
     config: &mut LoopConfig,
@@ -346,6 +367,11 @@ fn run_loop(
                         for agent_event in state.process(adapter_event) {
                             if let AgentEvent::MessageEnd { ref message, .. } = agent_event {
                                 final_message = Some(message.clone());
+                                if message.kind == AssistantMessageKind::FinalAnswer {
+                                    // Final answers cross the committed event boundary only
+                                    // after validation below. Text deltas remain provisional.
+                                    continue;
+                                }
                             }
                             yield agent_event;
                         }
@@ -384,6 +410,19 @@ fn run_loop(
                     info: &info,
                 })
                 .await;
+            }
+
+            if assistant_msg.kind == AssistantMessageKind::FinalAnswer {
+                if let Err(error) =
+                    validate_final_answer(&config, &assistant_msg, turn_index).await
+                {
+                    yield AgentEvent::Error(error);
+                    break 'main;
+                }
+                yield AgentEvent::MessageEnd {
+                    message_id: assistant_msg.message_id.clone(),
+                    message: assistant_msg.clone(),
+                };
             }
 
             let assistant_agent_msg = AgentMessage::Assistant(assistant_msg.clone());
@@ -572,6 +611,12 @@ fn run_loop(
                     });
 
                 if let Some(final_message) = &final_answer_message {
+                    if let Err(error) =
+                        validate_final_answer(&config, final_message, turn_index).await
+                    {
+                        yield AgentEvent::Error(error);
+                        break 'main;
+                    }
                     let message_id = final_message.message_id.clone();
                     yield AgentEvent::MessageStart {
                         message_id: message_id.clone(),
@@ -754,6 +799,22 @@ mod tests {
         }
     }
 
+    struct RejectFinalAnswer;
+
+    impl FinalAnswerValidator for RejectFinalAnswer {
+        fn validate<'a>(
+            &'a self,
+            _: FinalAnswerValidationCtx<'a>,
+        ) -> BoxFuture<'a, Result<(), FinalAnswerValidationError>> {
+            Box::pin(async {
+                Err(FinalAnswerValidationError::new(
+                    "test_rejection",
+                    "candidate rejected",
+                ))
+            })
+        }
+    }
+
     fn make_config(responses: Vec<MockResponse>) -> (Arc<MockLlmClient>, LoopConfig) {
         let client = Arc::new(MockLlmClient::new(responses));
         let cfg = LoopConfig {
@@ -775,6 +836,7 @@ mod tests {
             should_stop: None,
             before_provider_request: None,
             after_provider_response: None,
+            final_answer_validator: None,
             steer_rx: None,
             follow_up_rx: None,
             retry: None,
@@ -1213,6 +1275,72 @@ mod tests {
                         && assistant.text_content() == "Done via tool."
             )));
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_heuristic_final_answer_never_emits_committed_message_end() {
+        let (client, mut cfg) = make_config(vec![MockResponse::text("untrusted answer")]);
+        cfg.final_answer_validator = Some(Arc::new(RejectFinalAnswer));
+
+        let events: Vec<AgentEvent> = agent_loop(
+            Arc::clone(&client) as Arc<dyn Provider>,
+            AgentContext {
+                system_prompt: None,
+                messages: vec![],
+            },
+            cfg,
+        )
+        .collect()
+        .await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(AgentError::FinalAnswerRejected { code, .. })
+                if code == "test_rejection"
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::MessageEnd { .. })),
+            "a rejected final answer must not cross the committed MessageEnd boundary"
+        );
+        let new_messages = events.iter().find_map(|event| match event {
+            AgentEvent::AgentEnd { new_messages } => Some(new_messages),
+            _ => None,
+        });
+        assert!(new_messages.is_some_and(Vec::is_empty));
+    }
+
+    #[tokio::test]
+    async fn rejected_synthetic_final_answer_is_not_committed() {
+        let (client, mut cfg) = make_config(vec![MockResponse::tool_use(
+            "answer_1",
+            "final_answer",
+            r#"{"text":"untrusted answer"}"#,
+        )]);
+        cfg.final_answer_mode = FinalAnswerMode::required_tool();
+        cfg.final_answer_validator = Some(Arc::new(RejectFinalAnswer));
+
+        let events: Vec<AgentEvent> = agent_loop(
+            Arc::clone(&client) as Arc<dyn Provider>,
+            AgentContext {
+                system_prompt: None,
+                messages: vec![],
+            },
+            cfg,
+        )
+        .collect()
+        .await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(AgentError::FinalAnswerRejected { code, .. })
+                if code == "test_rejection"
+        )));
+        assert!(
+            !events.iter().any(|event| event.as_final_answer().is_some()),
+            "the built-in final_answer tool must use the same validation boundary"
+        );
     }
 
     #[tokio::test]

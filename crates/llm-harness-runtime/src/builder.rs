@@ -287,6 +287,9 @@ impl HarnessBuilder {
         self.hooks
             .after_provider_response
             .extend(hooks.after_provider_response);
+        self.hooks
+            .final_answer_validator
+            .extend(hooks.final_answer_validator);
         self.hooks.before_compact.extend(hooks.before_compact);
         self
     }
@@ -780,6 +783,18 @@ mod tests {
         }
     }
 
+    struct AcceptFinalAnswer;
+
+    impl llm_harness_types::FinalAnswerValidator for AcceptFinalAnswer {
+        fn validate<'a>(
+            &'a self,
+            _: llm_harness_types::FinalAnswerValidationCtx<'a>,
+        ) -> futures::future::BoxFuture<'a, Result<(), llm_harness_types::FinalAnswerValidationError>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     /// Mock plugin for testing.
     struct MockPlugin {
         plugin_name: String,
@@ -859,6 +874,18 @@ mod tests {
         assert_eq!(builder.hooks.before_turn.len(), 1);
         assert_eq!(builder.tools.len(), 1);
         assert_eq!(builder.skills.len(), 1);
+    }
+
+    #[test]
+    fn builder_hooks_appends_final_answer_validators() {
+        let mut hooks = HarnessHooks::none();
+        hooks
+            .final_answer_validator
+            .push(Arc::new(AcceptFinalAnswer));
+
+        let builder = HarnessBuilder::new("claude-3-sonnet").hooks(hooks);
+
+        assert_eq!(builder.hooks.final_answer_validator.len(), 1);
     }
 
     /// Test 2: Install multiple plugins — verifies accumulation across plugins.

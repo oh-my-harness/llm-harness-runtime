@@ -76,6 +76,8 @@ pub enum AgentError {
     Provider(String),
     #[error("tool error: {tool_name}: {message}")]
     Tool { tool_name: String, message: String },
+    #[error("final answer rejected ({code}): {message}")]
+    FinalAnswerRejected { code: String, message: String },
     #[error("aborted")]
     Aborted,
     #[error("agent is not idle")]

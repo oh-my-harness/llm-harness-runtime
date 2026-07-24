@@ -31,6 +31,53 @@ async fn prompt_persists_final_answer_identity() {
 }
 
 #[tokio::test]
+async fn rejected_final_answer_is_not_persisted() {
+    struct RejectFinalAnswer;
+
+    impl FinalAnswerValidator for RejectFinalAnswer {
+        fn validate<'a>(
+            &'a self,
+            _: FinalAnswerValidationCtx<'a>,
+        ) -> BoxFuture<'a, Result<(), FinalAnswerValidationError>> {
+            Box::pin(async {
+                Err(FinalAnswerValidationError::new(
+                    "test_rejection",
+                    "candidate rejected",
+                ))
+            })
+        }
+    }
+
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
+        "untrusted answer",
+    )]));
+    let mut opts = AgentHarnessOptions::new("test-model");
+    opts.hooks = HarnessHooks {
+        final_answer_validator: vec![Arc::new(RejectFinalAnswer)],
+        ..HarnessHooks::none()
+    };
+    let h =
+        AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, Arc::new(NoOpEnv), opts).await;
+
+    h.prompt("question").await.unwrap();
+
+    assert!(
+        h.read_active_path().await.unwrap().is_empty(),
+        "the rejected turn must not leave a user or final-answer session entry"
+    );
+    assert!(
+        h.state()
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("test_rejection"))
+    );
+    assert!(
+        h.state().streaming_message.is_none(),
+        "a rejected provisional answer must not remain as the streaming snapshot"
+    );
+}
+
+#[tokio::test]
 async fn prompt_while_running_returns_not_idle() {
     let h = make_harness(vec![]);
     {
