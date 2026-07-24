@@ -28,6 +28,7 @@ use crate::json_rpc::{
 
 const MCP_SESSION_ID: &str = "mcp-session-id";
 const MCP_PROTOCOL_VERSION: &str = "mcp-protocol-version";
+const MAX_SSE_RESUME_RETRIES: usize = 10;
 
 pub type AuthRefresh =
     Arc<dyn Fn() -> BoxFuture<'static, TransportResult<HashMap<String, String>>> + Send + Sync>;
@@ -231,6 +232,7 @@ impl HttpInner {
         let mut decoder = SseDecoder::default();
         let mut last_event_id = None;
         let mut retry_ms = 0;
+        let mut resume_count = 0usize;
 
         loop {
             while let Some(chunk) =
@@ -267,6 +269,12 @@ impl HttpInner {
                     request_id: format!("{expected_id:?}"),
                 });
             };
+            if resume_count >= MAX_SSE_RESUME_RETRIES {
+                return Err(McpTransportError::NoResponse {
+                    request_id: format!("{expected_id:?}"),
+                });
+            }
+            resume_count += 1;
             if retry_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(retry_ms)).await;
             }
@@ -841,5 +849,9 @@ mod tests {
 
         assert!(close_called.load(Ordering::Acquire), "close callback should fire on resume failure");
         assert!(!inner.connected.load(Ordering::Acquire), "connected should be false after resume failure");
+    }
+    #[test]
+    fn sse_resume_limit_is_reasonable() {
+        assert_eq!(MAX_SSE_RESUME_RETRIES, 10);
     }
 }
