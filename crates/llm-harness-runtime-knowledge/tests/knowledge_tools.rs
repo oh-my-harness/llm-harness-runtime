@@ -6,7 +6,7 @@ use std::{
 use chrono::Utc;
 use futures::future::BoxFuture;
 use llm_adapter::types::{Message, RequestContent};
-use llm_harness_agent::{AgentHarness, AgentHarnessOptions, Plugin};
+use llm_harness_agent::{AgentHarness, AgentHarnessOptions, HarnessHooks, Plugin};
 use llm_harness_loop::{
     LlmClient,
     test_utils::{MockLlmClient, MockResponse, NoOpEnv},
@@ -106,8 +106,7 @@ fn access() -> KnowledgeAccessContext {
     )
 }
 
-#[tokio::test]
-async fn agent_searches_reads_and_persists_only_evidence_projection() {
+fn knowledge_plugin(config: KnowledgePluginConfig) -> KnowledgePlugin {
     let access_control = Arc::new(KnowledgeAccessControl::new(Arc::new(AllowAllAuthorizer)));
     let registry = Arc::new(
         KnowledgeRegistry::builder(access_control)
@@ -117,15 +116,17 @@ async fn agent_searches_reads_and_persists_only_evidence_projection() {
     );
     let provider = EvidenceProviderId("knowledge.registry".into());
     let authority = Arc::new(EvidenceAuthority::new(vec![5; 32], [provider.clone()]).unwrap());
-    let plugin = KnowledgePlugin::new(
-        registry,
-        authority,
-        provider,
-        KnowledgeToolConfig::default(),
-    )
-    .expect("knowledge plugin should build");
+    KnowledgePlugin::new(registry, authority, provider, config)
+        .expect("knowledge plugin should build")
+}
+
+#[tokio::test]
+async fn agent_searches_reads_and_persists_only_evidence_projection() {
+    let plugin = knowledge_plugin(KnowledgePluginConfig::default());
     let mut tools: Vec<Arc<dyn Tool>> = vec![];
+    let mut hooks = HarnessHooks::none();
     plugin.register_tools(&mut tools);
+    plugin.register_hooks(&mut hooks);
 
     let client = Arc::new(MockLlmClient::new(vec![
         MockResponse::tool_use(
@@ -142,6 +143,7 @@ async fn agent_searches_reads_and_persists_only_evidence_projection() {
     ]));
     let mut options = AgentHarnessOptions::new("test-model");
     options.tools = tools;
+    options.hooks = hooks;
     let harness = AgentHarness::new_in_memory(
         client.clone() as Arc<dyn LlmClient>,
         Arc::new(NoOpEnv),
@@ -184,4 +186,52 @@ async fn agent_searches_reads_and_persists_only_evidence_projection() {
     assert!(!serialized.contains("PRIVATE POLICY BODY"));
     assert!(serialized.contains("knowledge.evidence"));
     assert!(serialized.contains("rev-1"));
+}
+
+#[tokio::test]
+async fn strict_policy_rejects_an_uncited_answer_after_reading_evidence() {
+    let plugin = knowledge_plugin(KnowledgePluginConfig {
+        citation_policy: KnowledgeCitationPolicy::RequireWhenEvidenceRead,
+        ..KnowledgePluginConfig::default()
+    });
+    let mut tools: Vec<Arc<dyn Tool>> = vec![];
+    let mut hooks = HarnessHooks::none();
+    plugin.register_tools(&mut tools);
+    plugin.register_hooks(&mut hooks);
+
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::tool_use(
+            "read-1",
+            KNOWLEDGE_READ_TOOL_NAME,
+            r#"{"reference":{"source_id":"docs","item_id":"refund","revision":"rev-1"}}"#,
+        ),
+        MockResponse::text("Refunds are available for thirty days."),
+    ]));
+    let mut options = AgentHarnessOptions::new("test-model");
+    options.tools = tools;
+    options.hooks = hooks;
+    let harness =
+        AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, Arc::new(NoOpEnv), options).await;
+
+    harness
+        .run(RunRequest::from_text("What is the refund window?").with_extension(access()))
+        .await
+        .unwrap();
+
+    assert!(
+        harness
+            .state()
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("missing_knowledge_citation"))
+    );
+    let context = harness.build_context().await.unwrap();
+    assert!(
+        !context.messages.iter().any(|message| matches!(
+            message,
+            AgentMessage::Assistant(message)
+                if message.kind == llm_harness_types::AssistantMessageKind::FinalAnswer
+        )),
+        "the uncited candidate must not be persisted as a final answer"
+    );
 }

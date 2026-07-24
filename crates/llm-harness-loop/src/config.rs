@@ -117,6 +117,8 @@ pub struct LoopConfig {
     pub before_provider_request: Option<Arc<dyn BeforeProviderRequestHook>>,
     /// provider 响应后的观测钩子。
     pub after_provider_response: Option<Arc<dyn AfterProviderResponseHook>>,
+    /// Candidate final-answer validation before committed `MessageEnd`.
+    pub final_answer_validator: Option<Arc<dyn FinalAnswerValidator>>,
 
     // === Reactive injection ===
     /// 在 turn 间注入的消息（转向）。
@@ -164,6 +166,7 @@ mod tests {
             should_stop: None,
             before_provider_request: None,
             after_provider_response: None,
+            final_answer_validator: None,
             steer_rx: None,
             follow_up_rx: None,
             retry: None,
@@ -200,6 +203,7 @@ mod tests {
             should_stop: None,
             before_provider_request: None,
             after_provider_response: None,
+            final_answer_validator: None,
             steer_rx: None,
             follow_up_rx: None,
             retry: None,

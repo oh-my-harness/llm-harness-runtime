@@ -1366,16 +1366,22 @@ handle ID 在整个 Session 内不重用；UI 可显示为紧凑序号，但模�
 完整 ID。Session replay 中的历史 citation 保留原 run namespace，不会与当前 run 新证据冲突。
 
 ```rust
-pub enum CitationPolicy {
+pub enum KnowledgeCitationPolicy {
     Disabled,
-    BestEffort,
-    RequireValidCitations,
+    ValidateIfPresent,
+    RequireWhenEvidenceRead,
 }
 ```
 
-严格模式在本 run 使用过 Knowledge Evidence 时，要求 FinalAnswer Contract 返回非空 citation
-列表，并验证每个 handle 都指向本 run 实际读取的证据。它能拒绝伪造引用，但不能仅靠格式
-校验判断自然语言中的每个事实是否都已引用；引用覆盖率属于后续 groundedness 评测。
+Knowledge Plugin 把策略注册为通用 `FinalAnswerValidator`。Loop 会暂存候选最终答案的
+`MessageEnd`：所有 validator 通过后才发布正式事件、加入 AgentContext 并由 Harness 写入
+Session；拒绝时只保留此前已经流出的 provisional delta，候选答案不会成为正式消息或
+Session entry。普通文本终止和内置 `final_answer` Tool 生成的答案必须经过同一个边界。
+
+严格模式在本 run 使用过 Knowledge Evidence 时，要求最终答案包含至少一个 citation handle，
+并验证每个 handle 都指向本 run 实际读取的证据。`ValidateIfPresent` 不强制普通回答带引用，
+但会拒绝答案中伪造、跨 run 或格式损坏的 knowledge handle。它不能仅靠格式校验判断自然语言
+中的每个事实是否都已引用；引用覆盖率属于后续 groundedness 评测。
 
 ## LocalDocumentSource
 
@@ -1758,7 +1764,8 @@ citation 回答，且正文不进入 Session。
 - [x] **A4 — LocalDocumentSource**：Markdown/Text catalog、BM25、section read、revision、
    canonical root 与路径对抗测试。
 - [x] **A5 — Knowledge Tools and citations**：Registry 单源路径、`knowledge_search/read`、
-   EvidenceAuthority、citation validator 和端到端测试。这个切片不等 Router/Attachment/RunHandle。
+   EvidenceAuthority、最终答案提交边界、可配置 citation policy 和端到端测试。这个切片不等
+   Router/Attachment/RunHandle。
 - [ ] **A6 — `llm-tutor` RAG migration**：迁移真实课程知识库、删除被替代的产品侧检索
    边界，记录质量、延迟和 Session 尺寸基线。
 

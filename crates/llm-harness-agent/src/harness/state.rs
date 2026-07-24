@@ -82,6 +82,8 @@ pub struct HarnessHooks {
     pub before_provider_request: Vec<Arc<dyn BeforeProviderRequestHook>>,
     /// Called after each LLM provider response.
     pub after_provider_response: Vec<Arc<dyn AfterProviderResponseHook>>,
+    /// Called before a candidate final answer is committed.
+    pub final_answer_validator: Vec<Arc<dyn FinalAnswerValidator>>,
     /// Called before compaction to decide whether to proceed.
     pub before_compact: Vec<Arc<dyn BeforeCompactHook>>,
 }
@@ -100,6 +102,7 @@ impl HarnessHooks {
             should_stop: vec![],
             before_provider_request: vec![],
             after_provider_response: vec![],
+            final_answer_validator: vec![],
             before_compact: vec![],
         }
     }

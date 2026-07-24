@@ -6,8 +6,8 @@ use llm_harness_loop::CompositePrepareNextTurnHook;
 use llm_harness_loop::{
     CompositeAfterProviderResponseHook, CompositeAfterToolCallHook, CompositeAfterTurnHook,
     CompositeBeforeProviderRequestHook, CompositeBeforeRunHook, CompositeBeforeToolCallHook,
-    CompositeBeforeTurnHook, CompositeShouldStopHook, CompositeTransformContextHook, HookedTool,
-    LoopConfig, agent_loop,
+    CompositeBeforeTurnHook, CompositeFinalAnswerValidator, CompositeShouldStopHook,
+    CompositeTransformContextHook, HookedTool, LoopConfig, agent_loop,
 };
 use llm_harness_types::*;
 use tokio::sync::mpsc;
@@ -213,6 +213,11 @@ impl AgentHarness {
                 Arc::new(CompositeAfterProviderResponseHook::new(
                     self.hooks.after_provider_response.clone(),
                 )) as Arc<dyn AfterProviderResponseHook>
+            }),
+            final_answer_validator: (!self.hooks.final_answer_validator.is_empty()).then(|| {
+                Arc::new(CompositeFinalAnswerValidator::new(
+                    self.hooks.final_answer_validator.clone(),
+                )) as Arc<dyn FinalAnswerValidator>
             }),
             steer_rx: Some(steer_rx),
             follow_up_rx: Some(follow_up_rx),
@@ -454,6 +459,7 @@ impl AgentHarness {
                     // produce two consecutive user messages and cause Anthropic to reject.
                     {
                         let mut inner = self.inner.lock().unwrap();
+                        inner.state.streaming_message = None;
                         inner.state.pending_session_writes.clear();
                     }
                     if matches!(e, AgentError::Aborted) {

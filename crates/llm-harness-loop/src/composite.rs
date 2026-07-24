@@ -6,9 +6,45 @@ use llm_harness_types::{
     AfterToolCallHook, AfterTurnCtx, AfterTurnHook, AgentContext, AgentError, BeforeCompactCtx,
     BeforeCompactDecision, BeforeCompactHook, BeforeProviderRequestCtx, BeforeProviderRequestHook,
     BeforeRunCtx, BeforeRunHook, BeforeRunResult, BeforeToolCallCtx, BeforeToolCallDecision,
-    BeforeToolCallHook, BeforeTurnCtx, BeforeTurnHook, PrepareNextTurnCtx, PrepareNextTurnHook,
+    BeforeToolCallHook, BeforeTurnCtx, BeforeTurnHook, FinalAnswerValidationCtx,
+    FinalAnswerValidationError, FinalAnswerValidator, PrepareNextTurnCtx, PrepareNextTurnHook,
     ShouldStopCtx, ShouldStopHook, TransformContextCtx, TransformContextHook,
 };
+
+/// Chains final-answer validators in registration order.
+///
+/// Validation short-circuits on the first rejection, so no later validator can
+/// accidentally turn a rejected answer back into an accepted one.
+pub struct CompositeFinalAnswerValidator {
+    validators: Vec<Arc<dyn FinalAnswerValidator>>,
+}
+
+impl CompositeFinalAnswerValidator {
+    /// Creates a validator chain.
+    pub fn new(validators: Vec<Arc<dyn FinalAnswerValidator>>) -> Self {
+        Self { validators }
+    }
+}
+
+impl FinalAnswerValidator for CompositeFinalAnswerValidator {
+    fn validate<'a>(
+        &'a self,
+        ctx: FinalAnswerValidationCtx<'a>,
+    ) -> BoxFuture<'a, Result<(), FinalAnswerValidationError>> {
+        Box::pin(async move {
+            for validator in &self.validators {
+                validator
+                    .validate(FinalAnswerValidationCtx {
+                        run: ctx.run,
+                        candidate: ctx.candidate,
+                        turn_index: ctx.turn_index,
+                    })
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+}
 
 /// Chains multiple `AfterProviderResponseHook` implementations (all-execute semantics).
 ///
