@@ -518,6 +518,16 @@ Debug，避免认证上下文或临时证据被通用日志和 Session 序列化
 
 Knowledge Plugin 从这里读取 `KnowledgeAccessContext`。缺失时 fail-closed。
 
+Workflow 通过 `WorkflowEngine::run_with_request(WorkflowRunRequest)` 接收同一种 typed
+extension，并把它按共享只读所有权传给本次调用中每个 LLM step attempt 的 `RunRequest`。
+每个 step 仍创建独立 `RunId` 和 `RunLocalState`；request extension 不进入
+`WorkflowEngine` 字段、checkpoint、`WorkflowState` 或 Session，因此恢复执行时必须由调用方
+重新提供当前可信上下文。无上下文场景使用 `run()`，它委托给空的 `WorkflowRunRequest`。
+
+Executor step 不隐式获得进程内身份对象；它继续只读取可持久化的 `WorkflowContext`。
+step 内新建的子 Agent 也不自动继承父 step 的 extension，后续必须通过 D3 的显式 delegation
+生成收窄后的 grant，不能把父级权限整包复制过去。
+
 ### 原子 run 生命周期
 
 目标状态机：
@@ -1755,8 +1765,8 @@ citation 回答，且正文不进入 Session。
 实施清单：
 
 - [x] **A1 — Run request context**：加入最终 `RunId/RunRequest/RunContext/RunExtensions/
-   RunLocalState`，在同一调用链中传入 Hook/ToolContext；迁移仓库内调用点，不保留第二套
-   context 协议。
+   RunLocalState`，在同一调用链中传入 Hook/ToolContext，并通过 per-invocation request
+   进入 Workflow LLM steps；不保留第二套 context 协议。
 - [x] **A2 — Session Projection**：引入 `DataBlock/ToolResult/ToolFailure/ToolProgress`、安全投影和
    replay 语义，一次性迁移仓库内所有 Tool/Hook；不引入隐式 `Full`。
 - [x] **A3 — Knowledge contracts**：新增 KnowledgeSource/Ref/Hit/Content/Error、AccessControl/

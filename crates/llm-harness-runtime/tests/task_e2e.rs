@@ -8,15 +8,20 @@
 use llm_harness_runtime::platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use futures::future::BoxFuture;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_runtime::spawn::spawner::{EnvFactory, JsonlSessionFactory};
-use llm_harness_runtime::workflow::engine::{WorkflowEngine, WorkflowEngineConfig};
+use llm_harness_runtime::workflow::engine::{
+    WorkflowEngine, WorkflowEngineConfig, WorkflowRunRequest,
+};
 use llm_harness_runtime::workflow::error::WorkflowError;
 use llm_harness_runtime::workflow::model::WorkflowStatus;
 use llm_harness_runtime_sandbox_os::OsEnvSandbox;
-use llm_harness_types::{AgentError, ExecutionEnv};
+use llm_harness_types::{
+    AgentError, DataBlock, ExecutionEnv, Tool, ToolContext, ToolFailure, ToolResult,
+};
 
 // ── 辅助 ──────────────────────────────────────────────────────────────────────
 
@@ -111,6 +116,95 @@ async fn workflow_engine_multi_turn_tool_then_text() {
         result.turns >= 1,
         "expected >= 1 step, got {}",
         result.turns
+    );
+}
+
+#[derive(Clone)]
+struct TenantContext(String);
+
+struct CaptureTenantTool {
+    observed: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl Tool for CaptureTenantTool {
+    fn name(&self) -> &str {
+        "capture_tenant"
+    }
+
+    fn description(&self) -> &str {
+        "Captures the typed workflow request context visible to this step."
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+        SCHEMA.get_or_init(|| {
+            serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _: serde_json::Value,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+        Box::pin(async move {
+            let tenant = ctx
+                .run
+                .extension::<TenantContext>()
+                .map(|context| context.0.clone());
+            self.observed.lock().unwrap().push(tenant);
+            Ok(ToolResult::full(
+                vec![DataBlock::text("captured")],
+                serde_json::json!({"captured": true}),
+                false,
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn workflow_request_extensions_reach_llm_step_tools_without_cross_run_leakage() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::tool_use("capture-1", "capture_tenant", "{}"),
+        MockResponse::text("first done"),
+    ]));
+    let first = WorkflowEngine::new_free_task(
+        "capture the tenant".into(),
+        vec!["capture_tenant".into()],
+        make_config(client, "task-e2e-workflow-request-first"),
+    )
+    .unwrap()
+    .with_tool(Arc::new(CaptureTenantTool {
+        observed: observed.clone(),
+    }));
+    first
+        .run_with_request(
+            WorkflowRunRequest::new().with_extension(TenantContext("tenant-a".into())),
+        )
+        .await
+        .unwrap();
+
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::tool_use("capture-2", "capture_tenant", "{}"),
+        MockResponse::text("second done"),
+    ]));
+    let second = WorkflowEngine::new_free_task(
+        "capture the tenant".into(),
+        vec!["capture_tenant".into()],
+        make_config(client, "task-e2e-workflow-request-second"),
+    )
+    .unwrap()
+    .with_tool(Arc::new(CaptureTenantTool {
+        observed: observed.clone(),
+    }));
+    second.run().await.unwrap();
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![Some("tenant-a".into()), None],
+        "request extensions must be scoped to one workflow invocation"
     );
 }
 

@@ -355,8 +355,19 @@ impl super::WorkflowEngine {
 
     // ── 运行循环 ───────────────────────────────────────────────────────
 
-    /// 启动/恢复执行。
+    /// 启动/恢复执行，不向 LLM steps 注入 typed request extensions。
     pub async fn run(&self) -> Result<TaskResult, WorkflowError> {
+        self.run_with_request(WorkflowRunRequest::default()).await
+    }
+
+    /// 使用本次调用的可信 typed context 启动/恢复执行。
+    ///
+    /// 请求只沿当前调用链传给 LLM step 的 `RunContext`，不会写入
+    /// `WorkflowEngine`、checkpoint 或持久化状态。
+    pub async fn run_with_request(
+        &self,
+        request: WorkflowRunRequest,
+    ) -> Result<TaskResult, WorkflowError> {
         enum StartupAction {
             Continue,
             Return(TaskResult),
@@ -456,7 +467,7 @@ impl super::WorkflowEngine {
         let _guard = RunningGuard(&self.running);
 
         match startup_action {
-            StartupAction::Continue => self.run_loop().await,
+            StartupAction::Continue => self.run_loop(&request).await,
             StartupAction::Return(result) => Ok(result),
             StartupAction::Fail(error) => {
                 let _ = self.event_tx.send(WorkflowEvent::Failed {
@@ -505,7 +516,7 @@ impl super::WorkflowEngine {
     }
 
     /// run() 的主循环。拆出以降低 run() 圈复杂度。
-    async fn run_loop(&self) -> Result<TaskResult, WorkflowError> {
+    async fn run_loop(&self, request: &WorkflowRunRequest) -> Result<TaskResult, WorkflowError> {
         loop {
             // 2. 取 current_step + 检查 max_steps（合并为一次锁获取）。
             let (current_step_id, history_len) = {
@@ -572,7 +583,10 @@ impl super::WorkflowEngine {
             // 5. Execute the step (or reuse cached result on cache hit).
             let step_result = match cached_result {
                 Some(cached) => cached,
-                None => match self.run_step_with_policy(&step, step_abort.clone()).await {
+                None => match self
+                    .run_step_with_policy(&step, step_abort.clone(), request)
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) => {
                         let state = self.workflow_state.lock().await;
@@ -760,9 +774,13 @@ impl super::WorkflowEngine {
         step: &Step,
         step_abort: CancellationToken,
         policy_attempt: usize,
+        request: &WorkflowRunRequest,
     ) -> Result<StepResult, WorkflowError> {
         match step {
-            Step::Llm { .. } => self.run_llm_step(step, step_abort, policy_attempt).await,
+            Step::Llm { .. } => {
+                self.run_llm_step(step, step_abort, policy_attempt, request)
+                    .await
+            }
             Step::Executor { .. } => self.run_executor_step(step, step_abort).await,
             Step::Terminal {
                 exit_code, message, ..
@@ -797,6 +815,7 @@ impl super::WorkflowEngine {
         &self,
         step: &Step,
         step_abort: CancellationToken,
+        request: &WorkflowRunRequest,
     ) -> Result<StepResult, WorkflowError> {
         let policy = step.policy().cloned().unwrap_or_default();
         let max_attempts = policy.max_attempts.unwrap_or(1).max(1);
@@ -811,7 +830,13 @@ impl super::WorkflowEngine {
             }
             let attempt_abort = step_abort.child_token();
             let result = self
-                .run_step_attempt(step, attempt_abort.clone(), timeout, attempt as usize)
+                .run_step_attempt(
+                    step,
+                    attempt_abort.clone(),
+                    timeout,
+                    attempt as usize,
+                    request,
+                )
                 .await;
             match result {
                 Ok(result) => return Ok(result),
@@ -850,14 +875,17 @@ impl super::WorkflowEngine {
         attempt_abort: CancellationToken,
         timeout: Option<Duration>,
         policy_attempt: usize,
+        request: &WorkflowRunRequest,
     ) -> Result<StepResult, WorkflowError> {
         let Some(timeout) = timeout else {
-            return self.run_step(step, attempt_abort, policy_attempt).await;
+            return self
+                .run_step(step, attempt_abort, policy_attempt, request)
+                .await;
         };
         tokio::select! {
             biased;
             _ = attempt_abort.cancelled() => Err(WorkflowError::StepAborted { id: step.id().to_string() }),
-            result = self.run_step(step, attempt_abort.clone(), policy_attempt) => result,
+            result = self.run_step(step, attempt_abort.clone(), policy_attempt, request) => result,
             _ = tokio::time::sleep(timeout) => {
                 attempt_abort.cancel();
                 Err(WorkflowError::StepTimeout {
@@ -925,6 +953,7 @@ impl super::WorkflowEngine {
         step: &Step,
         step_abort: CancellationToken,
         policy_attempt: usize,
+        request: &WorkflowRunRequest,
     ) -> Result<StepResult, WorkflowError> {
         let Step::Llm {
             prompt,
@@ -1150,7 +1179,9 @@ impl super::WorkflowEngine {
         // before the consumer below starts — causing Lagged errors and missing
         // the Settled sentinel.
         let harness_clone = Arc::clone(&harness);
-        let prompt_task = tokio::spawn(async move { harness_clone.prompt(&prompt_text).await });
+        let step_request =
+            RunRequest::from_text(prompt_text).with_extensions(request.extensions().clone());
+        let prompt_task = tokio::spawn(async move { harness_clone.run(step_request).await });
 
         // h. 收集事件 → StepResult。
         //    哨兵：Settled（所有排队活动结束）或 Aborted（被 cancel）。

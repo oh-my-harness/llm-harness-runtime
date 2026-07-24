@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use llm_harness_agent::HarnessHooks;
-use llm_harness_runtime::workflow::engine::{WorkflowEngine, WorkflowEngineConfig};
+use llm_harness_runtime::workflow::engine::{
+    WorkflowEngine, WorkflowEngineConfig, WorkflowRunRequest,
+};
 use llm_harness_runtime::workflow::error::WorkflowError;
 use llm_harness_runtime::workflow::judge::StepTransitionJudge;
 use llm_harness_runtime::workflow::model::Workflow;
@@ -124,6 +126,13 @@ impl McpWorkflowEngine {
         &self,
     ) -> std::result::Result<llm_harness_runtime::lifecycle::task::TaskResult, WorkflowError> {
         self.inner.run().await
+    }
+
+    pub async fn run_with_request(
+        &self,
+        request: WorkflowRunRequest,
+    ) -> std::result::Result<llm_harness_runtime::lifecycle::task::TaskResult, WorkflowError> {
+        self.inner.run_with_request(request).await
     }
 
     pub fn prompts(&self) -> &Arc<McpPromptRegistry> {
