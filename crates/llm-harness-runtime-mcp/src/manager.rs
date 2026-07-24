@@ -517,6 +517,12 @@ async fn run_connection_attempt(
         std::env::var("OMP_MCP_TIMEOUT_MS").ok().as_deref(),
         config.timeout_ms(),
     );
+    // When the timeout cancels `connect`, the future is dropped.
+    // Transport cleanup happens via transport Drop impls:
+    // - StdioTransport::Drop calls start_kill on the child process
+    // - HttpTransport::Drop cancels the listener task
+    // - McpSession::connect closes the transport on Err, but on cancel
+    //   the transport Drop handles cleanup
     let connect = async {
         let session = (inner.connector)(config).await?;
         let tools = session.list_tools().await?;
@@ -1027,5 +1033,37 @@ mod tests {
         .unwrap();
 
         assert!(dropped.load(AtomicOrdering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn timed_out_connection_records_failure() {
+        let manager = McpManager::with_connector(
+            None,
+            Arc::new(|_config: McpServerConfig| {
+                Box::pin(async move {
+                    // Never completes — the timeout will cancel this future.
+                    std::future::pending::<SessionResult<Arc<McpSession>>>().await
+                })
+            }),
+        );
+
+        let config = McpServerConfig::Stdio {
+            command: "sh".to_owned(),
+            args: vec!["-c".to_owned(), "true".to_owned()],
+            env: std::collections::HashMap::new(),
+            cwd: None,
+            timeout: Some(50),
+        };
+
+        let _ = manager
+            .start_connection("test".to_owned(), config)
+            .unwrap();
+        // Wait for the timeout to fire and record the failure.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert!(
+            manager.inner.failures.read().contains_key("test"),
+            "timed-out connection must record a failure"
+        );
     }
 }
