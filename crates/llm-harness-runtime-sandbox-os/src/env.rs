@@ -875,12 +875,16 @@ mod tests {
         let cmd = "python -c \"import sys; sys.stdout.write('A'*5000 + '\u{4e2d}')\"";
 
         let out = env.execute_shell(cmd, opts).await;
-        // python3 可能不存在，跳过测试而非失败
+        // Python 可能未安装——此时 spawn 返回 Io(program not found)，跳过测试。
+        // 但若 Python 存在却执行失败（如 exit_code != 0 的 ShellFailed），必须 panic：
+        // 静默 return 会把命令执行失败伪装成"无 Python"，遮蔽真实问题（issue #85
+        // 的 multibyte 测试就曾因引号截断导致 Python SyntaxError 被静默跳过）。
         let out = match out {
             Ok(o) => o,
-            Err(_) => return, // 环境无 python3，跳过
+            Err(EnvError::Io(_)) => return, // 环境无 Python，跳过
+            Err(e) => panic!("execute_shell failed (Python should be installed): {e:?}"),
         };
-        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
 
         let chunks = collected.lock().unwrap();
         let joined = chunks.join("");
