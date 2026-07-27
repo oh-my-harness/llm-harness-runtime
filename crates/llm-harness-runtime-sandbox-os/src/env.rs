@@ -753,8 +753,10 @@ mod tests {
 
         #[cfg(not(target_os = "windows"))]
         let cmd = "sleep 30";
+        // issue #87: `timeout /t` 在 stdin 被重定向（非控制台）时立即报错退出，
+        // 无法模拟长时命令。改用 `ping -n 31`（每秒一包，约 30 秒），不依赖控制台。
         #[cfg(target_os = "windows")]
-        let cmd = "timeout /t 30 /nobreak >nul";
+        let cmd = "ping -n 31 127.0.0.1 >nul";
 
         // 50ms 后触发取消
         tokio::spawn(async move {
@@ -788,8 +790,10 @@ mod tests {
 
         #[cfg(not(target_os = "windows"))]
         let cmd = "sleep 30";
+        // issue #87: `timeout /t` 在 stdin 被重定向（非控制台）时立即报错退出，
+        // 无法模拟长时命令。改用 `ping -n 31`（每秒一包，约 30 秒），不依赖控制台。
         #[cfg(target_os = "windows")]
-        let cmd = "timeout /t 30 /nobreak >nul";
+        let cmd = "ping -n 31 127.0.0.1 >nul";
 
         let opts = ShellOptions {
             cwd: None,
