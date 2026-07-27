@@ -370,11 +370,22 @@ impl ExecutionEnv for OsEnv {
             }
             // Windows 没有 `sh`；用 `cmd.exe /D /Q /C`。`/D` 禁用 AutoRun，
             // `/Q` 关闭命令回显，避免循环等复合命令污染 stdout。Unix 保持 `sh -c`。
+            //
+            // 关键：命令字符串必须用 `raw_arg` 传递，绕过 Rust `Command` 在 Windows
+            // 上的 C runtime 参数转义。若用 `arg`/`args`，含引号的命令（如
+            // `python -c "..."`）会被转义成 `\"`，而 cmd.exe 不识别 `\"`、按自身
+            // `/C` 规则剥引号后把参数切碎，导致下游程序收到截断的参数（issue #81）。
+            // `raw_arg` 把字符串原样拼入 CreateProcessW 命令行，由 cmd.exe 按原生
+            // 引号规则解析，与用户在 cmd.exe 中手敲命令的行为一致。
             #[cfg(target_os = "windows")]
             let mut shell_cmd = {
-                let mut c = tokio::process::Command::new("cmd.exe");
-                c.args(["/D", "/Q", "/C", cmd]);
-                c
+                use std::os::windows::process::CommandExt;
+                let mut c = std::process::Command::new("cmd.exe");
+                c.raw_arg("/D");
+                c.raw_arg("/Q");
+                c.raw_arg("/C");
+                c.raw_arg(cmd);
+                tokio::process::Command::from(c)
             };
             #[cfg(not(target_os = "windows"))]
             let mut shell_cmd = {
@@ -554,6 +565,39 @@ mod tests {
         let out = env.execute_shell(cmd, opts).await.unwrap();
         assert_eq!(out.stdout.trim(), "hello");
         assert_eq!(out.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn execute_shell_preserves_quoted_command() {
+        // Regression test for issue #81: Windows 上 `cmd.exe /C` 与 Rust `Command`
+        // 的 C runtime `\"` 转义冲突，导致含引号的命令被静默截断。
+        //
+        // 用 `echo` 验证命令字符串中的引号被原样保留（不被转义成 `\"`、也不被
+        // 剥掉），不依赖任何外部程序，确定性可复现：
+        //   - Windows (cmd.exe): echo 原样打印参数，引号保留 -> `"hello world"`
+        //   - Unix (sh):         echo 经 shell 分词剥掉引号   -> `hello world`
+        // 旧实现（`args`）下 Windows 会输出 `\"hello world\"`（C runtime 转义后
+        // cmd.exe 剥引号的残留），本测试失败；改用 `raw_arg` 后输出干净引号。
+        let tmp = tempfile::tempdir().unwrap();
+        let env = OsEnv::new(tmp.path());
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+
+        let cmd = "echo \"hello world\"";
+
+        let out = env.execute_shell(cmd, opts).await.unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(out.stdout.trim(), "hello world");
+        #[cfg(target_os = "windows")]
+        assert_eq!(out.stdout.trim(), "\"hello world\"");
     }
 
     #[tokio::test]
