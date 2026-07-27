@@ -16,8 +16,8 @@ fn utf8_safe_boundary(bytes: &[u8]) -> usize {
     if len == 0 {
         return 0;
     }
-    // 从末尾往回找，最多回退 3 字节（UTF-8 最长 4 字节）
-    let start = len.saturating_sub(3);
+    // 从末尾往回找，最多回退 4 字节（UTF-8 最长 4 字节，需覆盖 4 字节字符的起始字节）
+    let start = len.saturating_sub(4);
     for i in (start..len).rev() {
         let b = bytes[i];
         // 找到一个 UTF-8 起始字节（非 continuation byte: 10xxxxxx）
@@ -393,6 +393,10 @@ impl ExecutionEnv for OsEnv {
                 c.args(["-c", cmd]);
                 c
             };
+            // 注入调用方指定的环境变量（如 PYTHONUTF8=1），否则 opts.env 会被静默丢弃。
+            for (key, val) in &opts.env {
+                shell_cmd.env(key, val);
+            }
             let mut child = shell_cmd
                 .current_dir(opts.cwd.unwrap_or(&self.working_dir))
                 .stdout(std::process::Stdio::piped())
@@ -845,9 +849,17 @@ mod tests {
         let collected: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let collected_clone = collected.clone();
+        // Windows 上 Python stdout 默认可能是系统代码页（如 cp936/GBK），导致非 ASCII
+        // 字节按非 UTF-8 编码，from_utf8_lossy 产生 U+FFFD。设 PYTHONUTF8=1 强制
+        // Python 以 UTF-8 输出，使本测试聚焦于 carry-over buffer 逻辑而非编码差异。
+        #[cfg(target_os = "windows")]
+        let env_vars: Vec<(&str, &str)> = vec![("PYTHONUTF8", "1")];
+        #[cfg(not(target_os = "windows"))]
+        let env_vars: Vec<(&str, &str)> = vec![];
+
         let opts = ShellOptions {
             cwd: None,
-            env: vec![],
+            env: env_vars,
             timeout: None,
             abort: CancellationToken::new(),
             on_stdout: Some(Box::new(move |chunk: &str| {
@@ -863,12 +875,16 @@ mod tests {
         let cmd = "python -c \"import sys; sys.stdout.write('A'*5000 + '\u{4e2d}')\"";
 
         let out = env.execute_shell(cmd, opts).await;
-        // python3 可能不存在，跳过测试而非失败
+        // Python 可能未安装——此时 spawn 返回 Io(program not found)，跳过测试。
+        // 但若 Python 存在却执行失败（如 exit_code != 0 的 ShellFailed），必须 panic：
+        // 静默 return 会把命令执行失败伪装成"无 Python"，遮蔽真实问题（issue #85
+        // 的 multibyte 测试就曾因引号截断导致 Python SyntaxError 被静默跳过）。
         let out = match out {
             Ok(o) => o,
-            Err(_) => return, // 环境无 python3，跳过
+            Err(EnvError::Io(_)) => return, // 环境无 Python，跳过
+            Err(e) => panic!("execute_shell failed (Python should be installed): {e:?}"),
         };
-        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
 
         let chunks = collected.lock().unwrap();
         let joined = chunks.join("");
@@ -883,5 +899,54 @@ mod tests {
         );
         // ShellOutput 也应完整
         assert!(out.stdout.ends_with('中'));
+    }
+
+    #[tokio::test]
+    async fn execute_shell_applies_env_vars() {
+        // Regression: opts.env 以前被静默丢弃，子进程收不到注入的环境变量。
+        // 通过 shell 读取变量值验证注入生效。
+        let tmp = tempfile::tempdir().unwrap();
+        let env = OsEnv::new(tmp.path());
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![("LLM_HARNESS_TEST_VAR", "injected_value_42")],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let cmd = "echo $LLM_HARNESS_TEST_VAR";
+        #[cfg(target_os = "windows")]
+        let cmd = "echo %LLM_HARNESS_TEST_VAR%";
+
+        let out = env.execute_shell(cmd, opts).await.unwrap();
+        assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+        assert_eq!(out.stdout.trim(), "injected_value_42");
+    }
+
+    #[test]
+    fn utf8_safe_boundary_handles_4_byte_char() {
+        // Regression for issue #85 问题 2：完整 4 字节 UTF-8 字符（如 emoji）在
+        // carry 末尾时，旧的 saturating_sub(3) 跳过起始字节，返回 0（整块不输出）。
+        // saturating_sub(4) 修复后应正确返回完整长度。
+        let mut bytes = vec![b'A'; 5000];
+        // U+1F600 (😀): F0 9F 98 80
+        bytes.extend_from_slice(&[0xF0, 0x9F, 0x98, 0x80]);
+        let split = utf8_safe_boundary(&bytes);
+        assert_eq!(split, bytes.len(), "完整 4 字节字符在末尾应返回完整长度");
+
+        // 不完整 4 字节字符（3/4）：起始字节在范围内，应保留到下一轮
+        let mut bytes2 = vec![b'A'; 5000];
+        bytes2.extend_from_slice(&[0xF0, 0x9F, 0x98]); // 缺最后 1 字节
+        let split2 = utf8_safe_boundary(&bytes2);
+        assert_eq!(split2, 5000, "不完整 4 字节字符应保留到下一轮");
+
+        // 4 字节字符跨块：起始字节在第 4093 位置，第 4096 字节是 continuation
+        let mut bytes3 = vec![b'A'; 4093];
+        bytes3.extend_from_slice(&[0xF0, 0x9F, 0x98]); // 3/4，恰好 4096 字节
+        let split3 = utf8_safe_boundary(&bytes3);
+        assert_eq!(split3, 4093, "跨块的不完整 4 字节字符应从起始字节处截断");
     }
 }
