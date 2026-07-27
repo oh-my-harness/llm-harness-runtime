@@ -1,5 +1,7 @@
 # llm-harness-runtime
 
+> **[MISSION.md](MISSION.md)** — 本仓库及 harness 小组的纲领文档。从第一性原理推导 harness 的本质与使命，所有开发/业务决策以此为准。
+
 Rust implementation of the oh-my-harness LLM agent orchestration runtime: workflow engine, agent harness, tools, event stream, and sandboxing.
 
 > **Private repo.** Source is not distributed. Public consumers receive only git rev crates for Rust downstreams.
