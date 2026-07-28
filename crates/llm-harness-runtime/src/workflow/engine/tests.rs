@@ -8,7 +8,8 @@ use llm_harness_types::{
     ToolFailure, ToolResult,
 };
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::Notify;
 
 struct TestEnvFactory;
 impl EnvFactory for TestEnvFactory {
@@ -3797,4 +3798,202 @@ async fn step_cache_no_policy_always_executes() {
         2,
         "step without cache policy should always execute"
     );
+}
+
+struct RejectCachedExecution {
+    validation_calls: Arc<AtomicUsize>,
+    execution_calls: Arc<AtomicUsize>,
+}
+
+impl StepExecutor for RejectCachedExecution {
+    fn validate_step(&self, step: &Step) -> Result<()> {
+        assert!(
+            step.policy()
+                .and_then(|policy| policy.cache.as_ref())
+                .is_some()
+        );
+        let call = self.validation_calls.fetch_add(1, Ordering::SeqCst);
+        if call > 0 {
+            anyhow::bail!("cached execution is no longer allowed")
+        }
+        Ok(())
+    }
+
+    fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        self.execution_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(completed_result("validated execution")) })
+    }
+}
+
+#[tokio::test]
+async fn executor_validation_runs_before_cache_lookup() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let validation_calls = Arc::new(AtomicUsize::new(0));
+    let execution_calls = Arc::new(AtomicUsize::new(0));
+
+    let engine = WorkflowEngine::new(
+        cache_test_workflow(),
+        cache_test_config(&dir, client),
+        Arc::new(BackjumpJudge::backjump_to("s1")),
+    )
+    .unwrap()
+    .with_executor("writer", Arc::new(VersionWriter))
+    .with_executor(
+        "cacheable",
+        Arc::new(RejectCachedExecution {
+            validation_calls: validation_calls.clone(),
+            execution_calls: execution_calls.clone(),
+        }),
+    )
+    .with_executor("reader", Arc::new(ContextReader));
+
+    let error = engine.run().await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("cached execution is no longer allowed")
+    );
+    assert_eq!(validation_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(execution_calls.load(Ordering::SeqCst), 1);
+}
+
+struct FinalizingExecutor {
+    started: Arc<Notify>,
+    cancelled: Arc<Notify>,
+    release: Arc<Notify>,
+    published: Arc<AtomicBool>,
+}
+
+impl StepExecutor for FinalizingExecutor {
+    fn cancellation_policy(&self) -> ExecutorCancellationPolicy {
+        ExecutorCancellationPolicy::Finalize
+    }
+
+    fn execute<'a>(&'a self, ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        Box::pin(async move {
+            self.started.notify_one();
+            ctx.abort.cancelled().await;
+            self.cancelled.notify_one();
+            self.release.notified().await;
+            ctx.context
+                .lock()
+                .await
+                .variables
+                .insert("finalized".into(), serde_json::json!(true));
+            self.published.store(true, Ordering::SeqCst);
+            Ok(completed_result("finalized"))
+        })
+    }
+}
+
+struct FinalizingExecutorFixture {
+    executor: Arc<FinalizingExecutor>,
+    started: Arc<Notify>,
+    cancelled: Arc<Notify>,
+    release: Arc<Notify>,
+    published: Arc<AtomicBool>,
+}
+
+fn finalizing_executor_fixture() -> FinalizingExecutorFixture {
+    let started = Arc::new(Notify::new());
+    let cancelled = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let published = Arc::new(AtomicBool::new(false));
+    FinalizingExecutorFixture {
+        executor: Arc::new(FinalizingExecutor {
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+            release: release.clone(),
+            published: published.clone(),
+        }),
+        started,
+        cancelled,
+        release,
+        published,
+    }
+}
+
+#[tokio::test]
+async fn finalizing_executor_completes_after_workflow_cancellation() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fixture = finalizing_executor_fixture();
+    let workflow = Workflow {
+        entry_step: "finalize".into(),
+        steps: vec![Step::executor("finalize", "Finalize", "finalizing", None)],
+        edges: vec![],
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            cache_test_config(&dir, Arc::new(MockLlmClient::new(vec![]))),
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_executor("finalizing", fixture.executor),
+    );
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+
+    fixture.started.notified().await;
+    engine.cancel("test cancellation").await.unwrap();
+    fixture.cancelled.notified().await;
+    assert!(!fixture.published.load(Ordering::SeqCst));
+    fixture.release.notify_one();
+    runner.await.unwrap().unwrap();
+
+    assert!(fixture.published.load(Ordering::SeqCst));
+    assert_eq!(engine.context().lock().await.variables["finalized"], true);
+    let history = engine.step_history().await;
+    assert_eq!(
+        history
+            .last()
+            .and_then(|record| record.result.as_ref())
+            .map(|result| result.output.as_str()),
+        Some("finalized")
+    );
+}
+
+#[tokio::test]
+async fn finalizing_executor_completes_after_step_timeout() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fixture = finalizing_executor_fixture();
+    let workflow = Workflow {
+        entry_step: "finalize".into(),
+        steps: vec![
+            Step::executor("finalize", "Finalize", "finalizing", None).with_policy(
+                StepExecutionPolicy {
+                    timeout_ms: Some(1),
+                    ..StepExecutionPolicy::default()
+                },
+            ),
+        ],
+        edges: vec![],
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            cache_test_config(&dir, Arc::new(MockLlmClient::new(vec![]))),
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_executor("finalizing", fixture.executor),
+    );
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+
+    fixture.started.notified().await;
+    fixture.cancelled.notified().await;
+    assert!(!fixture.published.load(Ordering::SeqCst));
+    fixture.release.notify_one();
+    let error = runner.await.unwrap().unwrap_err();
+
+    assert!(error.to_string().contains("timed out"));
+    assert!(fixture.published.load(Ordering::SeqCst));
+    assert_eq!(engine.context().lock().await.variables["finalized"], true);
 }

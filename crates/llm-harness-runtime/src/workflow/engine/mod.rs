@@ -32,7 +32,9 @@ use crate::lifecycle::task::{Checkpoint, TaskError, TaskId, TaskResult};
 use crate::lifecycle::task_store::TaskStore;
 use crate::spawn::spawner::HarnessSubAgentSpawner;
 use crate::workflow::error::WorkflowError;
-use crate::workflow::executor::{ExecutorCtx, StepExecutor, builtin_executors};
+use crate::workflow::executor::{
+    ExecutorCancellationPolicy, ExecutorCtx, StepExecutor, builtin_executors,
+};
 use crate::workflow::judge::{EdgeConditionJudge, NoopJudge, StepCtx, StepTransitionJudge};
 use crate::workflow::model::{
     EdgeCondition, Step, StepId, StepRecord, StepResult, StructuredStatus, Transition, Workflow,

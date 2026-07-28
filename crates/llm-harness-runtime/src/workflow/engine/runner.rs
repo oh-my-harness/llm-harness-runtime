@@ -515,6 +515,44 @@ impl super::WorkflowEngine {
         None
     }
 
+    fn executor_for_step(
+        &self,
+        step: &Step,
+    ) -> Result<Option<Arc<dyn StepExecutor>>, WorkflowError> {
+        let Step::Executor { executor_name, .. } = step else {
+            return Ok(None);
+        };
+        self.step_executors
+            .get(executor_name)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| WorkflowError::ExecutorNotFound {
+                name: executor_name.clone(),
+            })
+    }
+
+    fn validate_executor_step(&self, step: &Step) -> Result<(), WorkflowError> {
+        if let Some(executor) = self.executor_for_step(step)? {
+            executor
+                .validate_step(step)
+                .map_err(|source| WorkflowError::StepFailed {
+                    id: step.id().to_string(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    fn executor_cancellation_policy(
+        &self,
+        step: &Step,
+    ) -> Result<ExecutorCancellationPolicy, WorkflowError> {
+        Ok(self
+            .executor_for_step(step)?
+            .map(|executor| executor.cancellation_policy())
+            .unwrap_or_default())
+    }
+
     /// run() 的主循环。拆出以降低 run() 圈复杂度。
     async fn run_loop(&self, request: &WorkflowRunRequest) -> Result<TaskResult, WorkflowError> {
         loop {
@@ -537,6 +575,14 @@ impl super::WorkflowEngine {
             if history_len >= self.max_steps {
                 return self
                     .fail_task(format!("max_steps ({}) exceeded", self.max_steps))
+                    .await;
+            }
+
+            // Executor-owned policy must be checked before cache lookup because
+            // a cache hit skips execute() entirely.
+            if let Err(error) = self.validate_executor_step(&step) {
+                return self
+                    .fail_task(format!("step '{}' failed: {}", step.id(), error))
                     .await;
             }
 
@@ -877,6 +923,12 @@ impl super::WorkflowEngine {
         policy_attempt: usize,
         request: &WorkflowRunRequest,
     ) -> Result<StepResult, WorkflowError> {
+        if self.executor_cancellation_policy(step)? == ExecutorCancellationPolicy::Finalize {
+            return self
+                .run_finalizing_step_attempt(step, attempt_abort, timeout, policy_attempt, request)
+                .await;
+        }
+
         let Some(timeout) = timeout else {
             return self
                 .run_step(step, attempt_abort, policy_attempt, request)
@@ -896,24 +948,96 @@ impl super::WorkflowEngine {
         }
     }
 
+    async fn run_finalizing_step_attempt(
+        &self,
+        step: &Step,
+        attempt_abort: CancellationToken,
+        timeout: Option<Duration>,
+        policy_attempt: usize,
+        request: &WorkflowRunRequest,
+    ) -> Result<StepResult, WorkflowError> {
+        enum Interruption {
+            Aborted,
+            TimedOut(u64),
+        }
+
+        let execution = self.run_step(step, attempt_abort.clone(), policy_attempt, request);
+        tokio::pin!(execution);
+
+        let interruption = match timeout {
+            Some(timeout) => {
+                tokio::select! {
+                    biased;
+                    _ = attempt_abort.cancelled() => Interruption::Aborted,
+                    result = &mut execution => return result,
+                    _ = tokio::time::sleep(timeout) => {
+                        attempt_abort.cancel();
+                        Interruption::TimedOut(timeout.as_millis() as u64)
+                    }
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = attempt_abort.cancelled() => Interruption::Aborted,
+                    result = &mut execution => return result,
+                }
+            }
+        };
+
+        // The abort token stops participant work. The executor owns the scoped
+        // finalization boundary and must now resolve before runtime returns.
+        let finalized_result = execution.await;
+        self.persist_finalized_executor_state(step, finalized_result.as_ref().ok())
+            .await?;
+
+        match interruption {
+            Interruption::Aborted => Err(WorkflowError::StepAborted {
+                id: step.id().to_string(),
+            }),
+            Interruption::TimedOut(timeout_ms) => Err(WorkflowError::StepTimeout {
+                id: step.id().to_string(),
+                timeout_ms,
+            }),
+        }
+    }
+
+    async fn persist_finalized_executor_state(
+        &self,
+        step: &Step,
+        finalized_result: Option<&StepResult>,
+    ) -> Result<(), WorkflowError> {
+        let mut state = self.workflow_state.lock().await;
+        if state.status == WorkflowStatus::Cancelled
+            && let Some(result) = finalized_result
+            && let Some(record) = state
+                .step_history
+                .iter_mut()
+                .rev()
+                .find(|record| record.step_id == *step.id() && record.result.is_none())
+        {
+            record.result = Some(result.clone());
+            record.ended_at = chrono::Utc::now();
+        }
+        let snapshot = state.clone();
+        drop(state);
+        self.persist_state(&snapshot).await
+    }
+
     /// Run a deterministic non-LLM executor step.
     async fn run_executor_step(
         &self,
         step: &Step,
         step_abort: CancellationToken,
     ) -> Result<StepResult, WorkflowError> {
-        let Step::Executor { executor_name, .. } = step else {
+        let Step::Executor { .. } = step else {
             return Err(WorkflowError::Internal(
                 "run_executor_step called with non-executor step".into(),
             ));
         };
         let executor = self
-            .step_executors
-            .get(executor_name)
-            .cloned()
-            .ok_or_else(|| WorkflowError::ExecutorNotFound {
-                name: executor_name.clone(),
-            })?;
+            .executor_for_step(step)?
+            .expect("executor step must resolve an executor");
         let started_at = chrono::Utc::now();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let env = self.config.env_factory.create(&cwd)?;
@@ -927,13 +1051,21 @@ impl super::WorkflowEngine {
             abort: step_abort.clone(),
             context: self.context.clone(),
         };
-        let mut result = tokio::select! {
-            biased;
-            _ = step_abort.cancelled() => {
-                return Err(WorkflowError::StepAborted { id: step.id().to_string() });
-            }
-            r = executor.execute(&ctx) => r.map_err(|e| WorkflowError::StepFailed { id: step.id().to_string(), source: e })?,
-        };
+        let execution = executor.execute(&ctx);
+        let mut result = match executor.cancellation_policy() {
+            ExecutorCancellationPolicy::Interruptible => tokio::select! {
+                biased;
+                _ = step_abort.cancelled() => {
+                    return Err(WorkflowError::StepAborted { id: step.id().to_string() });
+                }
+                result = execution => result,
+            },
+            ExecutorCancellationPolicy::Finalize => execution.await,
+        }
+        .map_err(|source| WorkflowError::StepFailed {
+            id: step.id().to_string(),
+            source,
+        })?;
         let ended_at = chrono::Utc::now();
         if result.started_at.is_none() {
             result.started_at = Some(started_at);

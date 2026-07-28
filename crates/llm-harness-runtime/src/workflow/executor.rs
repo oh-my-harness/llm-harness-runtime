@@ -42,7 +42,35 @@ pub struct ExecutorCtx<'a> {
 }
 
 /// Deterministic executor for a non-LLM workflow step.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExecutorCancellationPolicy {
+    /// Drop the executor future as soon as cancellation or a step timeout wins.
+    #[default]
+    Interruptible,
+    /// Signal cancellation, then await the executor's scoped finalization before
+    /// returning the original cancellation or timeout result.
+    Finalize,
+}
+
 pub trait StepExecutor: Send + Sync {
+    /// Validate executor-specific step policy before runtime cache lookup.
+    ///
+    /// This hook must be deterministic and side-effect free. It exists because
+    /// a cache hit skips [`StepExecutor::execute`].
+    fn validate_step(&self, _step: &Step) -> Result<()> {
+        Ok(())
+    }
+
+    /// Declare how runtime cancellation and step timeout interact with this
+    /// executor.
+    ///
+    /// `Finalize` is intended for executors with a short commit/finalization
+    /// phase that must not be detached after publication starts. The executor
+    /// must still observe `ExecutorCtx::abort` before that phase.
+    fn cancellation_policy(&self) -> ExecutorCancellationPolicy {
+        ExecutorCancellationPolicy::Interruptible
+    }
+
     fn execute<'a>(&'a self, ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>>;
 }
 
