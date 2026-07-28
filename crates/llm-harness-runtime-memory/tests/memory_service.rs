@@ -15,11 +15,11 @@ use llm_harness_runtime_knowledge::{
     KnowledgeSourceDescriptor, PrincipalRef, SourceSearchPage, SourceSearchRequest,
 };
 use llm_harness_runtime_memory::{
-    MemoryConsistency, MemoryDeleteReceipt, MemoryPolicyError, MemoryProvenance,
-    MemoryReceiptViolation, MemoryService, MemoryServiceBuildError, MemoryServiceError,
-    MemorySessionId, MemoryStore, MemoryStoreDescriptor, MemoryVisibility, MemoryWrite,
-    MemoryWriteIntent, MemoryWriteOrigin, MemoryWritePolicy, MemoryWriteReceipt,
-    MemoryWriteViolation,
+    MemoryConsistency, MemoryDeleteReceipt, MemoryMutation, MemoryMutationGate,
+    MemoryMutationGateError, MemoryMutationOrigin, MemoryMutationRequest, MemoryPolicyError,
+    MemoryProvenance, MemoryReceiptViolation, MemoryService, MemoryServiceBuildError,
+    MemoryServiceError, MemorySessionId, MemoryStore, MemoryStoreDescriptor, MemoryVisibility,
+    MemoryWrite, MemoryWriteIntent, MemoryWritePolicy, MemoryWriteReceipt, MemoryWriteViolation,
 };
 use llm_harness_types::{RunContext, RunRequest};
 use tokio_util::sync::CancellationToken;
@@ -101,6 +101,48 @@ struct TestPolicy {
     tamper_provenance: bool,
 }
 
+struct TestMutationGate {
+    result: Mutex<Result<(), MemoryMutationGateError>>,
+    calls: Mutex<Vec<MemoryMutationRequest>>,
+}
+
+impl TestMutationGate {
+    fn allow() -> Self {
+        Self {
+            result: Mutex::new(Ok(())),
+            calls: Mutex::new(vec![]),
+        }
+    }
+
+    fn deny() -> Self {
+        Self {
+            result: Mutex::new(Err(MemoryMutationGateError::Denied)),
+            calls: Mutex::new(vec![]),
+        }
+    }
+}
+
+impl MemoryMutationGate for TestMutationGate {
+    fn authorize<'a>(
+        &'a self,
+        _ctx: KnowledgeRequestContext<'a>,
+        request: MemoryMutationRequest,
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), MemoryMutationGateError>> {
+        Box::pin(async move {
+            if abort.is_cancelled() {
+                return Err(MemoryMutationGateError::Aborted);
+            }
+            self.calls.lock().unwrap().push(request);
+            self.result.lock().unwrap().clone()
+        })
+    }
+}
+
+fn allowing_gate() -> Arc<TestMutationGate> {
+    Arc::new(TestMutationGate::allow())
+}
+
 impl TestPolicy {
     fn valid() -> Self {
         Self {
@@ -130,8 +172,8 @@ impl MemoryWritePolicy for TestPolicy {
                 write_provenance.run_id = RunContext::new(RunRequest::from_text("other")).id();
             }
             Ok(MemoryWrite {
-                content: intent.content,
-                kind: intent.kind,
+                content: intent.content.trim().to_string(),
+                kind: intent.kind.map(|kind| kind.trim().to_string()),
                 metadata: BTreeMap::new(),
                 provenance: write_provenance,
                 idempotency_key: "idem-1".into(),
@@ -269,6 +311,7 @@ fn build_rejects_read_write_source_mismatch() {
         source,
         Arc::new(store),
         Arc::new(TestPolicy::valid()),
+        allowing_gate(),
     ) {
         Ok(_) => panic!("mismatched read source must fail"),
         Err(error) => error,
@@ -292,6 +335,7 @@ fn build_requires_revisioned_read_source() {
         Arc::new(source),
         Arc::new(TestStore::immediate()),
         Arc::new(TestPolicy::valid()),
+        allowing_gate(),
     ) {
         Ok(_) => panic!("non-revisioned source must fail"),
         Err(error) => error,
@@ -312,6 +356,7 @@ async fn denied_write_stops_before_policy_and_store() {
         Arc::new(TestSource::memory()),
         store.clone(),
         policy.clone(),
+        allowing_gate(),
     )
     .unwrap();
     let run = RunContext::new(RunRequest::from_text("remember").with_extension(access()));
@@ -320,7 +365,7 @@ async fn denied_write_stops_before_policy_and_store() {
         .write(
             context(&run),
             intent(),
-            MemoryWriteOrigin::ExplicitTool {
+            MemoryMutationOrigin::ExplicitTool {
                 tool_use_id: "tool-1".into(),
             },
             CancellationToken::new(),
@@ -348,6 +393,7 @@ async fn write_builds_server_provenance_and_returns_exact_receipt() {
         Arc::new(TestSource::memory()),
         store.clone(),
         policy.clone(),
+        allowing_gate(),
     )
     .unwrap();
     let session = MemorySessionId::new("session-1").unwrap();
@@ -361,7 +407,7 @@ async fn write_builds_server_provenance_and_returns_exact_receipt() {
         .write(
             context(&run),
             intent(),
-            MemoryWriteOrigin::ExplicitTool {
+            MemoryMutationOrigin::ExplicitTool {
                 tool_use_id: "tool-1".into(),
             },
             CancellationToken::new(),
@@ -375,7 +421,7 @@ async fn write_builds_server_provenance_and_returns_exact_receipt() {
     assert_eq!(provenance.session_id.as_deref(), Some("session-1"));
     assert_eq!(
         provenance.origin,
-        MemoryWriteOrigin::ExplicitTool {
+        MemoryMutationOrigin::ExplicitTool {
             tool_use_id: "tool-1".into()
         }
     );
@@ -395,6 +441,7 @@ async fn policy_cannot_replace_server_provenance() {
         Arc::new(TestSource::memory()),
         store.clone(),
         policy,
+        allowing_gate(),
     )
     .unwrap();
     let run = RunContext::new(RunRequest::from_text("remember").with_extension(access()));
@@ -403,7 +450,7 @@ async fn policy_cannot_replace_server_provenance() {
         .write(
             context(&run),
             intent(),
-            MemoryWriteOrigin::Application {
+            MemoryMutationOrigin::Application {
                 operation_id: "request-1".into(),
             },
             CancellationToken::new(),
@@ -430,6 +477,7 @@ async fn receipt_must_match_declared_consistency() {
         Arc::new(TestSource::memory()),
         Arc::new(store),
         Arc::new(TestPolicy::valid()),
+        allowing_gate(),
     )
     .unwrap();
     let run = RunContext::new(RunRequest::from_text("remember").with_extension(access()));
@@ -438,7 +486,7 @@ async fn receipt_must_match_declared_consistency() {
         .write(
             context(&run),
             intent(),
-            MemoryWriteOrigin::Application {
+            MemoryMutationOrigin::Application {
                 operation_id: "request-1".into(),
             },
             CancellationToken::new(),
@@ -453,6 +501,111 @@ async fn receipt_must_match_declared_consistency() {
 }
 
 #[tokio::test]
+async fn mutation_gate_denial_stops_normalized_write_before_store() {
+    let (control, _) = control(AuthorizationDecision::Allow);
+    let policy = Arc::new(TestPolicy::valid());
+    let store = Arc::new(TestStore::immediate());
+    let gate = Arc::new(TestMutationGate::deny());
+    let service = MemoryService::new(
+        control,
+        Arc::new(TestSource::memory()),
+        store.clone(),
+        policy.clone(),
+        gate.clone(),
+    )
+    .unwrap();
+    let run = RunContext::new(RunRequest::from_text("remember").with_extension(access()));
+
+    let error = service
+        .write(
+            context(&run),
+            MemoryWriteIntent {
+                content: "  Prefers concise explanations  ".into(),
+                kind: Some(" preference ".into()),
+                requested_ttl: None,
+            },
+            MemoryMutationOrigin::ExplicitTool {
+                tool_use_id: "tool-1".into(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        MemoryServiceError::MutationGate(MemoryMutationGateError::Denied)
+    ));
+    assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.upserts.load(Ordering::SeqCst), 0);
+    let calls = gate.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(matches!(
+        &calls[0].mutation,
+        MemoryMutation::Write { write }
+            if write.content == "Prefers concise explanations"
+                && write.kind.as_deref() == Some("preference")
+                && write.idempotency_key == "idem-1"
+                && write.provenance.origin
+                    == MemoryMutationOrigin::ExplicitTool {
+                        tool_use_id: "tool-1".into(),
+                    }
+    ));
+    assert!(matches!(
+        &calls[0].origin,
+        MemoryMutationOrigin::ExplicitTool { tool_use_id } if tool_use_id == "tool-1"
+    ));
+}
+
+#[tokio::test]
+async fn mutation_gate_denial_stops_exact_delete_before_store() {
+    let (control, calls) = control(AuthorizationDecision::Allow);
+    let store = Arc::new(TestStore::immediate());
+    let gate = Arc::new(TestMutationGate::deny());
+    let service = MemoryService::new(
+        control,
+        Arc::new(TestSource::memory()),
+        store.clone(),
+        Arc::new(TestPolicy::valid()),
+        gate.clone(),
+    )
+    .unwrap();
+    let run = RunContext::new(RunRequest::from_text("forget").with_extension(access()));
+    let reference = llm_harness_runtime_knowledge::KnowledgeRef {
+        source_id: "memory".into(),
+        item_id: "item-1".into(),
+        revision: Some("rev-1".into()),
+    };
+
+    let error = service
+        .delete(
+            context(&run),
+            reference.clone(),
+            MemoryMutationOrigin::ExplicitTool {
+                tool_use_id: "tool-2".into(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        MemoryServiceError::MutationGate(MemoryMutationGateError::Denied)
+    ));
+    assert_eq!(*calls.lock().unwrap(), vec![KnowledgeAction::Delete]);
+    assert_eq!(store.deletes.load(Ordering::SeqCst), 0);
+    let gate_calls = gate.calls.lock().unwrap();
+    assert_eq!(gate_calls.len(), 1);
+    assert!(matches!(
+        &gate_calls[0].mutation,
+        MemoryMutation::Delete {
+            reference: received,
+        } if received == &reference
+    ));
+}
+
+#[tokio::test]
 async fn delete_rejects_reference_from_another_read_source() {
     let (control, calls) = control(AuthorizationDecision::Allow);
     let store = Arc::new(TestStore::immediate());
@@ -461,6 +614,7 @@ async fn delete_rejects_reference_from_another_read_source() {
         Arc::new(TestSource::memory()),
         store.clone(),
         Arc::new(TestPolicy::valid()),
+        allowing_gate(),
     )
     .unwrap();
     let run = RunContext::new(RunRequest::from_text("forget").with_extension(access()));
@@ -472,6 +626,9 @@ async fn delete_rejects_reference_from_another_read_source() {
                 source_id: "other".into(),
                 item_id: "item-1".into(),
                 revision: Some("rev-1".into()),
+            },
+            MemoryMutationOrigin::ExplicitTool {
+                tool_use_id: "tool-1".into(),
             },
             CancellationToken::new(),
         )
@@ -491,11 +648,13 @@ async fn pre_cancelled_write_has_no_side_effects() {
     let (control, calls) = control(AuthorizationDecision::Allow);
     let policy = Arc::new(TestPolicy::valid());
     let store = Arc::new(TestStore::immediate());
+    let gate = allowing_gate();
     let service = MemoryService::new(
         control,
         Arc::new(TestSource::memory()),
         store.clone(),
         policy.clone(),
+        gate.clone(),
     )
     .unwrap();
     let run = RunContext::new(RunRequest::from_text("remember").with_extension(access()));
@@ -506,7 +665,7 @@ async fn pre_cancelled_write_has_no_side_effects() {
         .write(
             context(&run),
             intent(),
-            MemoryWriteOrigin::Application {
+            MemoryMutationOrigin::Application {
                 operation_id: "request-1".into(),
             },
             abort,
@@ -521,6 +680,7 @@ async fn pre_cancelled_write_has_no_side_effects() {
     assert!(calls.lock().unwrap().is_empty());
     assert_eq!(policy.calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.upserts.load(Ordering::SeqCst), 0);
+    assert!(gate.calls.lock().unwrap().is_empty());
 }
 
 #[test]

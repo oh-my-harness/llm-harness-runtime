@@ -1257,13 +1257,12 @@ let memory_service = Arc::new(MemoryService::new(
     access_control,
     memory_read_source,
     memory_write_store,
-));
+    memory_write_policy,
+    memory_mutation_gate,
+)?);
 
-let memory = MemoryPlugin::builder(memory_service)
-    .enable_write_tool(write_policy)
-    .enable_forget_tool(forget_policy)
-    .capture_policy(capture_policy) // 不需要时不配置
-    .build()?;
+// 不需要 mutation 时不安装 MemoryPlugin；只读 Memory 仍是普通 KnowledgeSource。
+let memory = MemoryPlugin::new(memory_service);
 
 let harness = HarnessBuilder::new(model)
     .install(&knowledge)
@@ -1534,6 +1533,7 @@ pub struct MemoryService {
     read_source: Arc<dyn KnowledgeSource>,
     write_store: Arc<dyn MemoryStore>,
     write_policy: Arc<dyn MemoryWritePolicy>,
+    mutation_gate: Arc<dyn MemoryMutationGate>,
 }
 ```
 
@@ -1547,14 +1547,44 @@ read_source.descriptor().id`。`MemoryWriteReceipt` 返回读源命名空间中�
 KnowledgeRef 和可见性状态；即时一致后端立即可 read，最终一致后端返回 checkpoint/
 pending 状态，不伪装成已可读。同一后端可以用一个具体类型分别实现两个 trait。
 
+### 可信 Mutation Gate
+
+`MemoryMutationGate` 是所有 write/delete 的强制应用边界，不提供 permissive default。
+MemoryService 的固定调用顺序是：
+
+1. `KnowledgeAccessControl` 校验主体、source 和 action；
+2. write policy 校验 secret/kind/size，并把模型意图规范化为最终 content/kind/TTL；
+3. mutation gate 审批这次 run、可信 origin 和完整的规范化 mutation；
+4. 只有 gate 返回允许后才调用 MemoryStore。
+
+Gate 由应用实现，可以连接 Web 确认、CLI approver 或已授权的业务 Workflow。它负责随机
+request ID、run/session/Tool/参数绑定、单次使用、超时、断连、取消和 replay 防护。
+批准不能来自模型参数，不能替代 AccessControl、write policy 或 exact-ref delete 校验。
+未配置 mutation 能力的应用不构造 MemoryService、不安装 MemoryPlugin，因此不会暴露
+`memory_write/forget`。
+
 ### 显式 Memory 工具
 
 - `memory_write`、`memory_forget` 只有安装 Memory Plugin 才存在；
-- Tool 只调用 MemoryService，write/delete 分别经过共享 AccessControl；
+- Tool 只调用 MemoryService，write/delete 分别经过共享 AccessControl 和强制
+  MemoryMutationGate；
 - forget 只接受当前主体可见且已授权的 KnowledgeRef；
 - 写入返回稳定 ref/revision；
 - provenance 记录用户明确要求、Tool call、run/session 和 capture policy；
 - secret、认证信息和大段外部文档默认拒绝写入。
+
+### 强一致业务事务边界
+
+MemoryStore/MemoryService 的通用协议保持单项 upsert/delete，不增加产品 change-set、
+review selection 或 document-CAS 语义。需要 all-or-nothing 的 maintenance apply 是应用
+领域命令，应在 Workflow executor/业务 service 中调用产品后端的强一致事务，例如
+`apply_change_set(expected_revision, accepted_changes)`。
+
+这不是第二套 Agent-facing Memory 协议。产品事务和 runtime MemoryStore adapter 必须共享
+同一个底层 mutation primitive、锁、revision 模型与 undo snapshot 机制，从而保证普通
+Chat mutation 和 maintenance apply 竞争时不会丢更新。禁止循环调用单项
+MemoryService 并把结果宣称为原子事务；取消、commit point、retry/idempotency 和 undo
+语义由产品事务契约及其集成测试证明。
 
 ### 自动沉淀
 
@@ -1776,7 +1806,7 @@ Hook 签名。`llm-tutor` 在采用任何 Knowledge/Memory 切片前，必须先
 以下 Milestone 表示产品能力和依赖顺序，不表示一个大 PR。每个 Milestone 由多个可独立
 合并的 PR 组成；各 PR 只增加最终态能力，后续切片在其上扩展，不引入随后需要删除的过渡协议。
 
-### Milestone A：显式 Knowledge 垂直切片（5/6）
+### Milestone A：显式 Knowledge 垂直切片（6/6）
 
 目标交付：Agent 在现有 Harness 中使用正式协议搜索本地文档、读取 section、带可验证
 citation 回答，且正文不进入 Session。
@@ -1795,7 +1825,7 @@ citation 回答，且正文不进入 Session。
 - [x] **A5 — Knowledge Tools and citations**：Registry 单源路径、`knowledge_search/read`、
    EvidenceAuthority、最终答案提交边界、source/domain-aware citation policy 和端到端测试。这个切片不等
    Router/Attachment/RunHandle。
-- [ ] **A6 — `llm-tutor` RAG migration**：迁移真实课程知识库、删除被替代的产品侧检索
+- [x] **A6 — `llm-tutor` RAG migration**：迁移真实课程知识库、删除被替代的产品侧检索
    边界，记录质量、延迟和 Session 尺寸基线。
 
 A1/A2 是 Knowledge 真正需要的两个核心切片，不要求 runtime-owned RunHandle、auto-retrieval、
@@ -1810,7 +1840,7 @@ Memory read source 检索。不包含自动 Capture。
 - [x] **B1 — Read/write composition**：独立 MemoryStore trait、MemoryService、read-source/write-store
    一致性和 receipt 协议。
 - [x] **B2 — Explicit tools**：`memory_write/forget`、write policy、provenance、TTL、
-   idempotency、secret rejection 和授权测试。
+   idempotency、secret rejection、强制 mutation gate 和授权测试。
 - [ ] **B3 — `llm-tutor` Memory migration**：把现有文件 Memory 读取面与写面迁移到组合
    协议，保留其 revision、evidence refs、review/apply 交互和删除语义。
 

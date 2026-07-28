@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::{
-    MemoryPolicyError, MemoryPolicyRejection, MemoryProvenance, MemoryWrite, MemoryWriteIntent,
-    MemoryWriteOrigin, MemoryWritePolicy,
+    MemoryMutationOrigin, MemoryPolicyError, MemoryPolicyRejection, MemoryProvenance, MemoryWrite,
+    MemoryWriteIntent, MemoryWritePolicy,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -274,15 +274,15 @@ fn idempotency_key(
     update(&mut mac, &provenance.run_id.to_string());
     update(&mut mac, provenance.session_id.as_deref().unwrap_or(""));
     match &provenance.origin {
-        MemoryWriteOrigin::ExplicitTool { tool_use_id } => {
+        MemoryMutationOrigin::ExplicitTool { tool_use_id } => {
             update(&mut mac, "explicit_tool");
             update(&mut mac, tool_use_id);
         }
-        MemoryWriteOrigin::Application { operation_id } => {
+        MemoryMutationOrigin::Application { operation_id } => {
             update(&mut mac, "application");
             update(&mut mac, operation_id);
         }
-        MemoryWriteOrigin::Capture {
+        MemoryMutationOrigin::Capture {
             policy_id,
             candidate_id,
         } => {
@@ -348,7 +348,7 @@ mod tests {
         MemoryProvenance {
             run_id: run.id(),
             session_id: Some("session-1".into()),
-            origin: MemoryWriteOrigin::ExplicitTool {
+            origin: MemoryMutationOrigin::ExplicitTool {
                 tool_use_id: "tool-1".into(),
             },
             recorded_at: Utc::now(),

@@ -240,7 +240,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        MemoryDeleteReceipt, MemoryProvenance, MemoryStoreDescriptor, MemoryWriteOrigin,
+        MemoryDeleteReceipt, MemoryMutationOrigin, MemoryProvenance, MemoryStoreDescriptor,
         MemoryWriteReceipt,
     };
 
@@ -326,7 +326,7 @@ mod tests {
             provenance: MemoryProvenance {
                 run_id,
                 session_id: None,
-                origin: MemoryWriteOrigin::Application {
+                origin: MemoryMutationOrigin::Application {
                     operation_id: "contract".into(),
                 },
                 recorded_at: Utc::now(),
