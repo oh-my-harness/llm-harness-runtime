@@ -1686,14 +1686,35 @@ async fn cancel_then_restore_remains_cancelled() {
             .with_executor("blocking", Arc::new(BlockingExecutor)),
     );
     let task_id = engine.task_id().clone();
+
+    // Deterministically place cancel() ahead of run_loop's step-token
+    // registration. This covers cancellation during run() startup, after the
+    // state becomes Running but before the first executor can be aborted.
+    let abort_registration = engine.current_abort.lock().await;
+    let cancel_task = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.cancel("stop").await })
+    };
+    tokio::task::yield_now().await;
     let runner = {
         let engine = engine.clone();
         tokio::spawn(async move { engine.run().await })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    engine.cancel("stop").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while engine.state().await != WorkflowStatus::Running {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("run should enter startup");
+    drop(abort_registration);
+    cancel_task.await.unwrap().unwrap();
 
-    let result = runner.await.unwrap().unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), runner)
+        .await
+        .expect("cancel during startup must stop the first step")
+        .unwrap()
+        .unwrap();
 
     assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
     assert_eq!(result.turns, 0);
