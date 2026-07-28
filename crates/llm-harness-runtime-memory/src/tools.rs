@@ -8,8 +8,8 @@ use llm_harness_types::{
 };
 
 use crate::{
-    MemoryPolicyError, MemoryPolicyRejection, MemoryService, MemoryServiceError, MemoryWriteIntent,
-    MemoryWriteOrigin,
+    MemoryMutationGateError, MemoryMutationOrigin, MemoryPolicyError, MemoryPolicyRejection,
+    MemoryService, MemoryServiceError, MemoryWriteIntent,
 };
 
 pub const MEMORY_WRITE_TOOL_NAME: &str = "memory_write";
@@ -95,7 +95,7 @@ impl Tool for MemoryWriteTool {
                         kind,
                         requested_ttl,
                     },
-                    MemoryWriteOrigin::ExplicitTool {
+                    MemoryMutationOrigin::ExplicitTool {
                         tool_use_id: ctx.tool_use_id.clone(),
                     },
                     ctx.abort.clone(),
@@ -175,7 +175,14 @@ impl Tool for MemoryForgetTool {
                 KnowledgeRequestContext::from_run(&ctx.run).map_err(memory_knowledge_failure)?;
             let receipt = self
                 .service
-                .delete(request_context, reference, ctx.abort.clone())
+                .delete(
+                    request_context,
+                    reference,
+                    MemoryMutationOrigin::ExplicitTool {
+                        tool_use_id: ctx.tool_use_id.clone(),
+                    },
+                    ctx.abort.clone(),
+                )
                 .await
                 .map_err(memory_service_failure)?;
             let value =
@@ -213,12 +220,33 @@ fn memory_service_failure(error: MemoryServiceError) -> ToolFailure {
     match error {
         MemoryServiceError::Knowledge(error) => memory_knowledge_failure(error),
         MemoryServiceError::Policy(error) => memory_policy_failure(error),
-        MemoryServiceError::InvalidWrite(_) | MemoryServiceError::InvalidReceipt(_) => {
-            ToolFailure::new(
-                "memory_protocol_failed",
-                "Memory could not be updated safely.",
-            )
+        MemoryServiceError::MutationGate(error) => memory_mutation_gate_failure(error),
+        MemoryServiceError::InvalidOrigin
+        | MemoryServiceError::InvalidWrite(_)
+        | MemoryServiceError::InvalidReceipt(_) => ToolFailure::new(
+            "memory_protocol_failed",
+            "Memory could not be updated safely.",
+        ),
+    }
+}
+
+fn memory_mutation_gate_failure(error: MemoryMutationGateError) -> ToolFailure {
+    match error {
+        MemoryMutationGateError::Denied => ToolFailure::new(
+            "memory_approval_denied",
+            "Memory mutation was not approved.",
+        ),
+        MemoryMutationGateError::Unavailable => ToolFailure::new(
+            "memory_approval_unavailable",
+            "Memory mutation approval is unavailable.",
+        ),
+        MemoryMutationGateError::Aborted => {
+            ToolFailure::new("memory_aborted", "Memory operation was aborted.")
         }
+        MemoryMutationGateError::Backend(_) => ToolFailure::new(
+            "memory_approval_failed",
+            "Memory mutation could not be approved safely.",
+        ),
     }
 }
 

@@ -4,6 +4,7 @@
 //! independent [`MemoryStore`]. [`MemoryService`] joins them at the trusted
 //! application boundary without requiring both sides to use the same backend.
 
+mod mutation_gate;
 mod plugin;
 mod policy;
 mod safe_policy;
@@ -14,6 +15,7 @@ mod tools;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod contract;
 
+pub use mutation_gate::*;
 pub use plugin::*;
 pub use policy::*;
 pub use safe_policy::*;

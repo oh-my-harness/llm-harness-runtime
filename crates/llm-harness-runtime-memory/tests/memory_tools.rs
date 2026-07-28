@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use futures::future::BoxFuture;
@@ -17,7 +20,8 @@ use llm_harness_runtime_knowledge::{
 };
 use llm_harness_runtime_memory::{
     MEMORY_FORGET_TOOL_NAME, MEMORY_WRITE_TOOL_NAME, MemoryConsistency, MemoryDeleteReceipt,
-    MemoryPlugin, MemoryService, MemoryStore, MemoryStoreDescriptor, MemoryVisibility, MemoryWrite,
+    MemoryMutationGate, MemoryMutationGateError, MemoryMutationRequest, MemoryPlugin,
+    MemoryService, MemoryStore, MemoryStoreDescriptor, MemoryVisibility, MemoryWrite,
     MemoryWriteReceipt, SecureMemoryWritePolicy, SecureMemoryWritePolicyConfig,
 };
 use llm_harness_types::{AgentMessage, RunRequest, Tool};
@@ -25,6 +29,28 @@ use tokio_util::sync::CancellationToken;
 
 struct MemoryReadSource {
     descriptor: KnowledgeSourceDescriptor,
+}
+
+#[derive(Default)]
+struct ApprovingMutationGate {
+    calls: AtomicUsize,
+}
+
+impl MemoryMutationGate for ApprovingMutationGate {
+    fn authorize<'a>(
+        &'a self,
+        _ctx: KnowledgeRequestContext<'a>,
+        _request: MemoryMutationRequest,
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), MemoryMutationGateError>> {
+        Box::pin(async move {
+            if abort.is_cancelled() {
+                return Err(MemoryMutationGateError::Aborted);
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
 }
 
 impl MemoryReadSource {
@@ -169,12 +195,14 @@ async fn agent_writes_and_forgets_memory_through_projected_tools() {
         SecureMemoryWritePolicy::new(vec![8; 32], SecureMemoryWritePolicyConfig::default())
             .unwrap(),
     );
+    let mutation_gate = Arc::new(ApprovingMutationGate::default());
     let service = Arc::new(
         MemoryService::new(
             access_control,
             Arc::new(MemoryReadSource::new()),
             store.clone(),
             policy,
+            mutation_gate.clone(),
         )
         .unwrap(),
     );
@@ -217,6 +245,7 @@ async fn agent_writes_and_forgets_memory_through_projected_tools() {
         assert_eq!(state.deletes.len(), 1);
         assert_eq!(state.deletes[0].item_id, "preference-1");
     }
+    assert_eq!(mutation_gate.calls.load(Ordering::SeqCst), 2);
 
     let context = harness.build_context().await.unwrap();
     let results = context

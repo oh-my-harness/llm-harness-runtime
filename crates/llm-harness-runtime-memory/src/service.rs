@@ -8,9 +8,10 @@ use llm_harness_runtime_knowledge::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    MemoryConsistency, MemoryDeleteReceipt, MemoryPolicyError, MemoryProvenance, MemorySessionId,
-    MemoryStore, MemoryVisibility, MemoryWrite, MemoryWriteIntent, MemoryWriteOrigin,
-    MemoryWritePolicy, MemoryWriteReceipt,
+    MemoryConsistency, MemoryDeleteReceipt, MemoryMutation, MemoryMutationGate,
+    MemoryMutationGateError, MemoryMutationOrigin, MemoryMutationRequest, MemoryPolicyError,
+    MemoryProvenance, MemorySessionId, MemoryStore, MemoryVisibility, MemoryWrite,
+    MemoryWriteIntent, MemoryWritePolicy, MemoryWriteReceipt,
 };
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -28,7 +29,6 @@ pub enum MemoryServiceBuildError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryWriteViolation {
-    InvalidOrigin,
     EmptyContent,
     EmptyKind,
     EmptyIdempotencyKey,
@@ -52,6 +52,10 @@ pub enum MemoryServiceError {
     Knowledge(#[from] KnowledgeError),
     #[error(transparent)]
     Policy(#[from] MemoryPolicyError),
+    #[error(transparent)]
+    MutationGate(#[from] MemoryMutationGateError),
+    #[error("memory mutation origin is invalid")]
+    InvalidOrigin,
     #[error("memory write policy returned an invalid record")]
     InvalidWrite(MemoryWriteViolation),
     #[error("memory store returned an invalid receipt")]
@@ -63,6 +67,7 @@ pub struct MemoryService {
     read_source: Arc<dyn KnowledgeSource>,
     write_store: Arc<dyn MemoryStore>,
     write_policy: Arc<dyn MemoryWritePolicy>,
+    mutation_gate: Arc<dyn MemoryMutationGate>,
 }
 
 impl MemoryService {
@@ -71,6 +76,7 @@ impl MemoryService {
         read_source: Arc<dyn KnowledgeSource>,
         write_store: Arc<dyn MemoryStore>,
         write_policy: Arc<dyn MemoryWritePolicy>,
+        mutation_gate: Arc<dyn MemoryMutationGate>,
     ) -> Result<Self, MemoryServiceBuildError> {
         let read_descriptor = read_source.descriptor();
         if read_descriptor.id.trim().is_empty() {
@@ -97,6 +103,7 @@ impl MemoryService {
             read_source,
             write_store,
             write_policy,
+            mutation_gate,
         })
     }
 
@@ -112,7 +119,7 @@ impl MemoryService {
         &self,
         ctx: KnowledgeRequestContext<'_>,
         intent: MemoryWriteIntent,
-        origin: MemoryWriteOrigin,
+        origin: MemoryMutationOrigin,
         abort: CancellationToken,
     ) -> Result<MemoryWriteReceipt, MemoryServiceError> {
         abort_if_cancelled(&abort)?;
@@ -129,9 +136,7 @@ impl MemoryService {
             .await?;
         abort_if_cancelled(&abort)?;
         if !valid_origin(&origin) {
-            return Err(MemoryServiceError::InvalidWrite(
-                MemoryWriteViolation::InvalidOrigin,
-            ));
+            return Err(MemoryServiceError::InvalidOrigin);
         }
         let provenance = MemoryProvenance {
             run_id: ctx.run.id(),
@@ -139,7 +144,7 @@ impl MemoryService {
                 .run
                 .extension::<MemorySessionId>()
                 .map(|session| session.as_str().to_string()),
-            origin,
+            origin: origin.clone(),
             recorded_at: Utc::now(),
         };
         let write = self
@@ -148,6 +153,19 @@ impl MemoryService {
             .await?;
         abort_if_cancelled(&abort)?;
         validate_write(&write, &provenance)?;
+        self.mutation_gate
+            .authorize(
+                ctx,
+                MemoryMutationRequest {
+                    mutation: MemoryMutation::Write {
+                        write: write.clone(),
+                    },
+                    origin,
+                },
+                abort.clone(),
+            )
+            .await?;
+        abort_if_cancelled(&abort)?;
         let receipt = self.write_store.upsert(ctx, write, abort.clone()).await?;
         abort_if_cancelled(&abort)?;
         validate_receipt(
@@ -162,17 +180,34 @@ impl MemoryService {
         &self,
         ctx: KnowledgeRequestContext<'_>,
         reference: KnowledgeRef,
+        origin: MemoryMutationOrigin,
         abort: CancellationToken,
     ) -> Result<MemoryDeleteReceipt, MemoryServiceError> {
         abort_if_cancelled(&abort)?;
         if reference.source_id != self.read_source.descriptor().id {
             return Err(KnowledgeError::NotFound.into());
         }
+        if !valid_origin(&origin) {
+            return Err(MemoryServiceError::InvalidOrigin);
+        }
         self.access_control
             .authorize(
                 ctx.access,
                 KnowledgeAction::Delete,
                 KnowledgeResourceRef::Item(&reference),
+            )
+            .await?;
+        abort_if_cancelled(&abort)?;
+        self.mutation_gate
+            .authorize(
+                ctx,
+                MemoryMutationRequest {
+                    mutation: MemoryMutation::Delete {
+                        reference: reference.clone(),
+                    },
+                    origin,
+                },
+                abort.clone(),
             )
             .await?;
         abort_if_cancelled(&abort)?;
@@ -205,11 +240,11 @@ fn abort_if_cancelled(abort: &CancellationToken) -> Result<(), MemoryServiceErro
     }
 }
 
-fn valid_origin(origin: &MemoryWriteOrigin) -> bool {
+fn valid_origin(origin: &MemoryMutationOrigin) -> bool {
     match origin {
-        MemoryWriteOrigin::ExplicitTool { tool_use_id } => !tool_use_id.trim().is_empty(),
-        MemoryWriteOrigin::Application { operation_id } => !operation_id.trim().is_empty(),
-        MemoryWriteOrigin::Capture {
+        MemoryMutationOrigin::ExplicitTool { tool_use_id } => !tool_use_id.trim().is_empty(),
+        MemoryMutationOrigin::Application { operation_id } => !operation_id.trim().is_empty(),
+        MemoryMutationOrigin::Capture {
             policy_id,
             candidate_id,
         } => !policy_id.trim().is_empty() && !candidate_id.trim().is_empty(),

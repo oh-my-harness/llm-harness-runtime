@@ -15,13 +15,13 @@ pub struct MemoryWriteIntent {
     pub requested_ttl: Option<Duration>,
 }
 
-/// Trusted origin of a memory write.
+/// Trusted origin of a memory mutation.
 ///
 /// These values are supplied by runtime integration code, never deserialized
 /// directly from model tool arguments.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum MemoryWriteOrigin {
+pub enum MemoryMutationOrigin {
     ExplicitTool {
         tool_use_id: String,
     },
@@ -61,7 +61,7 @@ pub struct MemorySessionIdError;
 pub struct MemoryProvenance {
     pub run_id: RunId,
     pub session_id: Option<String>,
-    pub origin: MemoryWriteOrigin,
+    pub origin: MemoryMutationOrigin,
     pub recorded_at: DateTime<Utc>,
 }
 
