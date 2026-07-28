@@ -64,6 +64,16 @@ impl KnowledgeRegistry {
         }
     }
 
+    pub(crate) fn source_descriptor(&self, source_id: &str) -> Option<&KnowledgeSourceDescriptor> {
+        self.sources
+            .get(source_id)
+            .map(|source| source.descriptor())
+    }
+
+    pub(crate) fn source_descriptors(&self) -> impl Iterator<Item = &KnowledgeSourceDescriptor> {
+        self.sources.values().map(|source| source.descriptor())
+    }
+
     pub async fn visible_sources(
         &self,
         access: &KnowledgeAccessContext,
@@ -207,6 +217,7 @@ impl KnowledgeRegistry {
             .sources
             .get(&request.reference.source_id)
             .ok_or(KnowledgeError::NotFound)?;
+        let expected_source_id = source.descriptor().id.clone();
         self.access_control
             .authorize(
                 access,
@@ -214,16 +225,22 @@ impl KnowledgeRegistry {
                 KnowledgeResourceRef::Item(&request.reference),
             )
             .await?;
-        source
+        let content = source
             .read(KnowledgeRequestContext { run, access }, request, abort)
-            .await
+            .await?;
+        if content.reference.source_id != expected_source_id {
+            return Err(KnowledgeError::Backend(
+                "knowledge source returned a reference in another source namespace".into(),
+            ));
+        }
+        Ok(content)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeSet,
+        collections::{BTreeMap, BTreeSet},
         sync::{
             OnceLock,
             atomic::{AtomicBool, Ordering},
@@ -235,13 +252,16 @@ mod tests {
 
     use super::*;
     use crate::{
-        DenyAllAuthorizer, FreshnessClass, KnowledgeCapability, KnowledgeContent, KnowledgeHit,
-        KnowledgeScope, PrincipalRef, SourceSearchPage,
+        AllowAllAuthorizer, ContentSelector, DenyAllAuthorizer, FreshnessClass,
+        KnowledgeCapability, KnowledgeContent, KnowledgeHit, KnowledgeRef, KnowledgeScope,
+        PrincipalRef, SourceSearchPage,
     };
 
     struct GuardedSource {
         called: AtomicBool,
     }
+
+    struct ForeignReferenceSource;
 
     impl GuardedSource {
         fn new() -> Self {
@@ -291,6 +311,62 @@ mod tests {
         ) -> BoxFuture<'a, Result<KnowledgeContent, KnowledgeError>> {
             self.called.store(true, Ordering::SeqCst);
             Box::pin(async { Err(KnowledgeError::NotFound) })
+        }
+    }
+
+    impl KnowledgeSource for ForeignReferenceSource {
+        fn descriptor(&self) -> &KnowledgeSourceDescriptor {
+            static DESCRIPTOR: OnceLock<KnowledgeSourceDescriptor> = OnceLock::new();
+            DESCRIPTOR.get_or_init(|| KnowledgeSourceDescriptor {
+                id: "optional".into(),
+                name: "Optional".into(),
+                description: "Optional".into(),
+                domains: vec![],
+                capabilities: BTreeSet::from([
+                    KnowledgeCapability::Search,
+                    KnowledgeCapability::Read,
+                ]),
+                freshness: FreshnessClass::Static,
+                filter_fields: vec![],
+            })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _ctx: KnowledgeRequestContext<'a>,
+            _request: SourceSearchRequest,
+            _abort: CancellationToken,
+        ) -> BoxFuture<'a, Result<SourceSearchPage, KnowledgeError>> {
+            Box::pin(async {
+                Ok(SourceSearchPage {
+                    hits: vec![],
+                    next_cursor: None,
+                })
+            })
+        }
+
+        fn read<'a>(
+            &'a self,
+            _ctx: KnowledgeRequestContext<'a>,
+            request: KnowledgeReadRequest,
+            _abort: CancellationToken,
+        ) -> BoxFuture<'a, Result<KnowledgeContent, KnowledgeError>> {
+            Box::pin(async move {
+                Ok(KnowledgeContent {
+                    reference: KnowledgeRef {
+                        source_id: "strict".into(),
+                        ..request.reference
+                    },
+                    selector: request.selector,
+                    title: None,
+                    blocks: vec![],
+                    uri: None,
+                    updated_at: None,
+                    obtained_at: chrono::Utc::now(),
+                    truncated: false,
+                    metadata: BTreeMap::new(),
+                })
+            })
         }
     }
 
@@ -344,5 +420,37 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, KnowledgeError::Unauthorized);
         assert!(!source.called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn read_rejects_a_source_namespace_substitution() {
+        let registry = KnowledgeRegistry::builder(Arc::new(KnowledgeAccessControl::new(Arc::new(
+            AllowAllAuthorizer,
+        ))))
+        .source(Arc::new(ForeignReferenceSource))
+        .build()
+        .unwrap();
+        let run = RunContext::new(RunRequest::from_text("question"));
+
+        let error = registry
+            .read(
+                &run,
+                &access(),
+                KnowledgeReadRequest {
+                    reference: KnowledgeRef {
+                        source_id: "optional".into(),
+                        item_id: "item".into(),
+                        revision: Some("rev-1".into()),
+                    },
+                    selector: ContentSelector::Document,
+                    max_bytes: 1024,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), crate::KnowledgeErrorCode::Backend);
+        assert_eq!(error.to_string(), "knowledge backend failed");
     }
 }

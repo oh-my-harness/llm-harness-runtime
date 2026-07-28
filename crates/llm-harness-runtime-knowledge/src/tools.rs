@@ -8,8 +8,8 @@ use llm_harness_types::{
 
 use crate::{
     CitationRecord, ContentSelector, EvidenceAuthority, EvidenceProviderId, KnowledgeAccessContext,
-    KnowledgeError, KnowledgeEvidenceSet, KnowledgeReadRequest, KnowledgeRef, KnowledgeRegistry,
-    KnowledgeRunState, KnowledgeSearchRequest,
+    KnowledgeCitationPolicy, KnowledgeError, KnowledgeEvidenceSet, KnowledgeReadRequest,
+    KnowledgeRef, KnowledgeRegistry, KnowledgeRunState, KnowledgeSearchRequest,
 };
 
 pub const KNOWLEDGE_SEARCH_TOOL_NAME: &str = "knowledge_search";
@@ -166,6 +166,7 @@ pub struct KnowledgeReadTool {
     authority: Arc<EvidenceAuthority>,
     provider_id: EvidenceProviderId,
     config: KnowledgeToolConfig,
+    citation_policy: KnowledgeCitationPolicy,
 }
 
 impl KnowledgeReadTool {
@@ -174,12 +175,14 @@ impl KnowledgeReadTool {
         authority: Arc<EvidenceAuthority>,
         provider_id: EvidenceProviderId,
         config: KnowledgeToolConfig,
+        citation_policy: KnowledgeCitationPolicy,
     ) -> Self {
         Self {
             registry,
             authority,
             provider_id,
             config,
+            citation_policy,
         }
     }
 }
@@ -294,6 +297,11 @@ impl Tool for KnowledgeReadTool {
                 .run
                 .extension::<KnowledgeAccessContext>()
                 .ok_or_else(|| knowledge_failure(KnowledgeError::Unauthorized))?;
+            let citation_requirement = self
+                .registry
+                .source_descriptor(&reference.source_id)
+                .map(|descriptor| self.citation_policy.requirement_for(descriptor))
+                .ok_or_else(|| knowledge_failure(KnowledgeError::NotFound))?;
             let content = self
                 .registry
                 .read(
@@ -336,7 +344,8 @@ impl Tool for KnowledgeReadTool {
                 .run
                 .local()
                 .get_or_insert_with(KnowledgeRunState::default);
-            let citation: CitationRecord = state.register(ctx.run.id(), &persisted);
+            let citation: CitationRecord =
+                state.register(ctx.run.id(), &persisted, citation_requirement);
             let mut model_content = vec![DataBlock::text(format!(
                 "Citation handle: {}",
                 citation.handle

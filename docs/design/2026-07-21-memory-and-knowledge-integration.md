@@ -1247,7 +1247,10 @@ let retrieval = KnowledgeRetrieval::builder(registry.clone())
 let knowledge = KnowledgePlugin::builder(registry.clone())
     .tools(KnowledgeToolSet::SearchAndRead)
     .auto_retrieval(retrieval, auto_retrieval_policy) // 不需要时不配置
-    .citation_policy(CitationPolicy::RequireValidCitations)
+    .citation_policy(KnowledgeCitationPolicy::builder()
+        .source("course-documents", KnowledgeCitationRequirement::Required)
+        .source("learner-memory", KnowledgeCitationRequirement::Optional)
+        .build()?)
     .build()?;
 
 let memory_service = Arc::new(MemoryService::new(
@@ -1376,22 +1379,38 @@ handle ID 在整个 Session 内不重用；UI 可显示为紧凑序号，但模�
 完整 ID。Session replay 中的历史 citation 保留原 run namespace，不会与当前 run 新证据冲突。
 
 ```rust
-pub enum KnowledgeCitationPolicy {
-    Disabled,
-    ValidateIfPresent,
-    RequireWhenEvidenceRead,
+pub enum KnowledgeCitationRequirement {
+    Optional,
+    Required,
+}
+
+pub struct KnowledgeCitationPolicy {
+    default_requirement: KnowledgeCitationRequirement,
+    source_requirements: BTreeMap<String, KnowledgeCitationRequirement>,
+    domain_requirements: BTreeMap<String, KnowledgeCitationRequirement>,
 }
 ```
 
-Knowledge Plugin 把策略注册为通用 `FinalAnswerValidator`。Loop 会暂存候选最终答案的
+策略完全由服务端装配。精确 source 规则优先于 domain 规则；没有精确规则时，source 声明的
+全部 domain 规则按 fail-closed 合并，任一 `Required` 即为 Required；都未匹配时使用 default。
+Plugin 构建时拒绝未知 source/domain 和重复规则，模型提供的 query、filter、source selector
+或答案内容都不能改变策略。
+
+`knowledge_read` 成功后，runtime 使用 Registry 中的可信 source descriptor 求值，并把
+Required/Optional 与该 run 的已签发 citation 一起保存在 `KnowledgeRunState`。它不信任
+模型参数或 source 返回的 metadata 来选择策略；Registry 也拒绝后端把结果替换到另一个
+source namespace。`KnowledgeRef.source_id` 和内容 digest 仍受 Evidence receipt 保护。
+
+Knowledge Plugin 始终把 citation 校验注册为通用 `FinalAnswerValidator`。Loop 会暂存候选最终答案的
 `MessageEnd`：所有 validator 通过后才发布正式事件、加入 AgentContext 并由 Harness 写入
 Session；拒绝时只保留此前已经流出的 provisional delta，候选答案不会成为正式消息或
 Session entry。普通文本终止和内置 `final_answer` Tool 生成的答案必须经过同一个边界。
 
-严格模式在本 run 使用过 Knowledge Evidence 时，要求最终答案包含至少一个 citation handle，
-并验证每个 handle 都指向本 run 实际读取的证据。`ValidateIfPresent` 不强制普通回答带引用，
-但会拒绝答案中伪造、跨 run 或格式损坏的 knowledge handle。它不能仅靠格式校验判断自然语言
-中的每个事实是否都已引用；引用覆盖率属于后续 groundedness 评测。
+最终答案必须包含本 run 每个 Required evidence 的对应 handle。Optional evidence 可以静默使用；
+但 Optional handle 一旦出现在答案中，仍必须通过当前 run、receipt 和实际 read 集合校验。
+因此 mixed read 中 Optional citation 不能替代 Required citation，伪造、跨 run、未 read 或格式
+损坏的 handle 始终失败。校验器不能仅凭格式判断自然语言中的每个事实是否已引用；超出实际
+read 集合的 claim coverage 仍属于 groundedness 评测。
 
 ## LocalDocumentSource
 
@@ -1774,7 +1793,7 @@ citation 回答，且正文不进入 Session。
 - [x] **A4 — LocalDocumentSource**：Markdown/Text catalog、BM25、section read、revision、
    canonical root 与路径对抗测试。
 - [x] **A5 — Knowledge Tools and citations**：Registry 单源路径、`knowledge_search/read`、
-   EvidenceAuthority、最终答案提交边界、可配置 citation policy 和端到端测试。这个切片不等
+   EvidenceAuthority、最终答案提交边界、source/domain-aware citation policy 和端到端测试。这个切片不等
    Router/Attachment/RunHandle。
 - [ ] **A6 — `llm-tutor` RAG migration**：迁移真实课程知识库、删除被替代的产品侧检索
    边界，记录质量、延迟和 Session 尺寸基线。
