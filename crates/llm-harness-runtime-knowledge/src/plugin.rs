@@ -5,8 +5,9 @@ use llm_harness_types::Tool;
 use thiserror::Error;
 
 use crate::{
-    EvidenceAuthority, EvidenceProviderId, KnowledgeCitationPolicy, KnowledgeFinalAnswerValidator,
-    KnowledgeReadTool, KnowledgeRegistry, KnowledgeSearchTool, KnowledgeToolConfig,
+    EvidenceAuthority, EvidenceProviderId, KnowledgeCitationPolicy,
+    KnowledgeCitationPolicyScopeError, KnowledgeFinalAnswerValidator, KnowledgeReadTool,
+    KnowledgeRegistry, KnowledgeSearchTool, KnowledgeToolConfig,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -21,6 +22,8 @@ pub enum KnowledgePluginBuildError {
     UnregisteredEvidenceProvider,
     #[error("knowledge tool limits must be greater than zero")]
     InvalidToolLimits,
+    #[error(transparent)]
+    InvalidCitationPolicy(#[from] KnowledgeCitationPolicyScopeError),
 }
 
 pub struct KnowledgePlugin {
@@ -43,6 +46,9 @@ impl KnowledgePlugin {
         if config.tools.max_search_results == 0 || config.tools.max_read_bytes == 0 {
             return Err(KnowledgePluginBuildError::InvalidToolLimits);
         }
+        config
+            .citation_policy
+            .validate_sources(registry.source_descriptors())?;
 
         Ok(Self {
             registry,
@@ -68,16 +74,13 @@ impl Plugin for KnowledgePlugin {
             self.authority.clone(),
             self.provider_id.clone(),
             self.config.tools.clone(),
+            self.config.citation_policy.clone(),
         )));
     }
 
     fn register_hooks(&self, hooks: &mut HarnessHooks) {
-        if self.config.citation_policy != KnowledgeCitationPolicy::Disabled {
-            hooks
-                .final_answer_validator
-                .push(Arc::new(KnowledgeFinalAnswerValidator::new(
-                    self.config.citation_policy,
-                )));
-        }
+        hooks
+            .final_answer_validator
+            .push(Arc::new(KnowledgeFinalAnswerValidator::new()));
     }
 }

@@ -10,7 +10,7 @@ use llm_harness_types::{DataBlock, RunContext, RunId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{KnowledgeAccessContext, KnowledgeRef};
+use crate::{KnowledgeAccessContext, KnowledgeCitationRequirement, KnowledgeRef};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -202,7 +202,12 @@ pub struct KnowledgeRunState {
 #[derive(Default)]
 struct KnowledgeRunStateInner {
     next: u64,
-    citations: BTreeMap<String, CitationRecord>,
+    citations: BTreeMap<String, RegisteredCitation>,
+}
+
+struct RegisteredCitation {
+    record: CitationRecord,
+    requirement: KnowledgeCitationRequirement,
 }
 
 impl KnowledgeRunState {
@@ -210,6 +215,7 @@ impl KnowledgeRunState {
         &self,
         run_id: RunId,
         evidence: &PersistedKnowledgeEvidence,
+        requirement: KnowledgeCitationRequirement,
     ) -> CitationRecord {
         let mut inner = self.inner.lock().unwrap_or_else(|value| value.into_inner());
         inner.next += 1;
@@ -227,7 +233,13 @@ impl KnowledgeRunState {
             obtained_at: evidence.obtained_at,
             content_digest: evidence.content_digest.clone(),
         };
-        inner.citations.insert(handle, record.clone());
+        inner.citations.insert(
+            handle,
+            RegisteredCitation {
+                record: record.clone(),
+                requirement,
+            },
+        );
         record
     }
 
@@ -237,16 +249,19 @@ impl KnowledgeRunState {
             .unwrap_or_else(|value| value.into_inner())
             .citations
             .get(handle)
-            .cloned()
+            .map(|citation| citation.record.clone())
     }
 
-    pub fn has_citations(&self) -> bool {
-        !self
-            .inner
+    pub(crate) fn has_missing_required_citations(&self, cited: &BTreeSet<String>) -> bool {
+        self.inner
             .lock()
             .unwrap_or_else(|value| value.into_inner())
             .citations
-            .is_empty()
+            .iter()
+            .any(|(handle, citation)| {
+                citation.requirement == KnowledgeCitationRequirement::Required
+                    && !cited.contains(handle)
+            })
     }
 }
 
@@ -356,6 +371,9 @@ mod tests {
         assert!(authority.verify(&evidence, &run, &access, Some("call-1")));
         assert!(!authority.verify(&evidence, &other_run, &access, Some("call-1")));
         assert!(!authority.verify(&evidence, &run, &access, Some("call-2")));
+        let mut source_tampered = evidence.clone();
+        source_tampered.reference.source_id = "memory".into();
+        assert!(!authority.verify(&source_tampered, &run, &access, Some("call-1")));
         let mut tampered = evidence.clone();
         tampered.blocks = vec![DataBlock::text("changed")];
         assert!(!authority.verify(&tampered, &run, &access, Some("call-1")));
@@ -379,6 +397,7 @@ mod tests {
                 run_id: run.id(),
                 content_digest: "digest".into(),
             },
+            KnowledgeCitationRequirement::Optional,
         );
         assert_eq!(
             CitationValidator::validate(&run, std::slice::from_ref(&record.handle)).unwrap()[0],
