@@ -534,11 +534,28 @@ impl super::WorkflowEngine {
                 step_name: step.name().to_string(),
             });
 
-            // 3. 构造 abort token。
+            // 3. 构造 abort token，并与 cancel() 原子交接。
+            //
+            // current_abort 与 workflow_state 始终按这个顺序加锁。这样 cancel()
+            // 要么拿到本 token 并取消它，要么先把状态置为 Cancelled；不会出现
+            // cancel 已完成、run_loop 随后才注册一个永远收不到取消信号的 token。
             let step_abort = CancellationToken::new();
-            {
+            let cancelled_result = {
                 let mut ca = self.current_abort.lock().await;
-                *ca = Some(step_abort.clone());
+                let state = self.workflow_state.lock().await;
+                if state.status == WorkflowStatus::Cancelled {
+                    Some(state.result.clone().unwrap_or_else(|| TaskResult {
+                        cost: aggregate_cost(&state.step_history),
+                        turns: count_executed_turns(&state.step_history),
+                        final_message: None,
+                    }))
+                } else {
+                    *ca = Some(step_abort.clone());
+                    None
+                }
+            };
+            if let Some(result) = cancelled_result {
+                return Ok(result);
             }
 
             // 4. Resolve cache key + check for a cached result (issue #41).
@@ -1574,10 +1591,13 @@ impl super::WorkflowEngine {
     /// 若 apply_transition 尚未执行（record 最后一条不是 current_step），
     /// cancel 推入 { result: None, transition: Abort } 记录保证审计链完整。
     pub async fn cancel(&self, reason: &str) -> Result<(), WorkflowError> {
-        if let Some(token) = self.current_abort.lock().await.take() {
+        // 与 run_loop 注册 step token 使用同一锁顺序并保持两个 guard，确保
+        // "注册 token" 与 "置 Cancelled" 之间不存在丢失取消信号的窗口。
+        let mut current_abort = self.current_abort.lock().await;
+        let mut state = self.workflow_state.lock().await;
+        if let Some(token) = current_abort.take() {
             token.cancel();
         }
-        let mut state = self.workflow_state.lock().await;
         let now = chrono::Utc::now();
         let cancelled_step_id = state.current_step.clone();
 
@@ -1603,6 +1623,7 @@ impl super::WorkflowEngine {
         state.ended_at = Some(now);
         let snapshot = state.clone();
         drop(state);
+        drop(current_abort);
         self.persist_state(&snapshot).await?;
         let _ = self.event_tx.send(WorkflowEvent::Cancelled {
             reason: reason.to_string(),
