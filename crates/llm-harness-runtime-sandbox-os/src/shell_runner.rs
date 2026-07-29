@@ -5,7 +5,6 @@
 //! logic. Extracting it here avoids code duplication and keeps
 //! `utf8_safe_boundary` as an internal detail.
 
-
 use llm_harness_types::{EnvError, ShellOptions, ShellOutput};
 
 /// Find the index of the last complete UTF-8 character boundary in `bytes`.

@@ -34,6 +34,10 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
 
+      - name: Install bubblewrap (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -42,3 +46,7 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-features
+
+      - name: Run bwrap sandbox isolation tests (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo test -p llm-harness-runtime-sandbox-bwrap -- --include-ignored

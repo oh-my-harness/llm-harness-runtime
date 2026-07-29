@@ -777,5 +777,4 @@ mod tests {
         assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
         assert_eq!(out.stdout.trim(), "injected_value_42");
     }
-
 }
