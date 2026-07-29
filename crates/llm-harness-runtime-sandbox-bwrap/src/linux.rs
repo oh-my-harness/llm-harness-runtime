@@ -7,26 +7,65 @@ use anyhow::Result;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_runtime::platform::sandbox::{Sandbox, SandboxConfig};
-use llm_harness_runtime_sandbox_os::{OsEnv, utf8_safe_boundary};
+use llm_harness_runtime_sandbox_os::{OsEnv, drain_child_output};
 use llm_harness_types::{
     EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput,
 };
 use tokio_util::sync::CancellationToken;
 
+// ── Path sandboxing ────────────────────────────────────────────────────────
+
+/// Lexically normalize a path: resolve `.` and `..` components without
+/// touching the filesystem (so it works for non-existent paths too).
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {} // skip "."
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Check whether `path` falls within any of the allowed roots.
+/// Both the path and the roots are lexically normalized first; absolute paths
+/// outside the roots are rejected.
+fn is_path_allowed(path: &Path, allowed_roots: &[PathBuf]) -> bool {
+    let normalized = lexical_normalize(path);
+    for root in allowed_roots {
+        let normalized_root = lexical_normalize(root);
+        if normalized == normalized_root {
+            return true;
+        }
+        if normalized.starts_with(&normalized_root) {
+            return true;
+        }
+    }
+    false
+}
+
 // ── BwrapEnv ───────────────────────────────────────────────────────────────
 
-/// `ExecutionEnv` that delegates file operations to an inner `OsEnv` but
-/// runs shell commands inside a bubblewrap namespace, enforcing filesystem,
-/// network, and environment isolation.
+/// `ExecutionEnv` that enforces filesystem path restrictions on all file
+/// operations and runs shell commands inside a bubblewrap namespace.
 ///
-/// File operations (read/write/list/etc.) run on the host `OsEnv` restricted
-/// to the working directory. Shell commands run inside `bwrap --unshare-all`,
-/// which creates a fresh mount/net/pid namespace per invocation. The working
-/// directory and `fs_allowlist` entries are bind-mounted into the namespace so
-/// that shell commands and file operations see the same workspace.
+/// File operations (read/write/list/remove/etc.) are rejected if the resolved
+/// path falls outside the working directory or `fs_allowlist` entries. This
+/// prevents absolute-path, `..` traversal, and cross-directory escapes.
+///
+/// Shell commands run inside `bwrap --unshare-all`, which creates a fresh
+/// mount/net/pid namespace per invocation.
+#[derive(Debug)]
 pub struct BwrapEnv {
     inner: OsEnv,
     config: SandboxConfig,
+    /// Allowed path roots: working directory + fs_allowlist entries.
+    /// Computed once at construction time.
+    allowed_roots: Vec<PathBuf>,
 }
 
 impl BwrapEnv {
@@ -37,20 +76,41 @@ impl BwrapEnv {
             .clone()
             .unwrap_or_else(|| PathBuf::from("/tmp/sandbox-bwrap"));
         std::fs::create_dir_all(&work_dir).ok();
+
+        let mut allowed_roots = vec![work_dir.clone()];
+        allowed_roots.extend(config.fs_allowlist.iter().cloned());
+
         Self {
             inner: OsEnv::new(work_dir),
             config,
+            allowed_roots,
         }
     }
 
+    /// Resolve a path relative to the working directory, then check it is
+    /// within the allowed roots. Returns the resolved path on success.
+    fn check_path(&self, path: &Path) -> Result<PathBuf, EnvError> {
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.inner.working_dir().join(path)
+        };
+        if !is_path_allowed(&resolved, &self.allowed_roots) {
+            return Err(EnvError::PermissionDenied(resolved));
+        }
+        Ok(resolved)
+    }
+
     /// System directories bind-mounted read-only so that commands inside the
-    /// sandbox can find executables and shared libraries. Uses `--ro-bind-try`
-    /// so non-existent paths (e.g. `/lib64` on some distros) are silently
-    /// skipped instead of causing a failure.
+    /// sandbox can find executables and shared libraries.
+    ///
+    /// `/etc` is intentionally **not** bound: it contains host credentials
+    /// (`/etc/passwd`, `/etc/shadow`, API keys in `/etc/environment`, etc.).
+    /// Commands work fine without it because `env -i` provides a clean
+    /// environment and the dynamic linker does not require `/etc/ld.so.cache`.
     fn system_ro_binds() -> &'static [(&'static str, &'static str)] {
         &[
             ("/usr", "/usr"),
-            ("/etc", "/etc"),
             ("/bin", "/bin"),
             ("/lib", "/lib"),
             ("/lib64", "/lib64"),
@@ -67,6 +127,8 @@ impl BwrapEnv {
         ];
 
         // Share network only when the allowlist is non-empty.
+        // Note: --share-net opens the entire host network. Granular per-host
+        // filtering is not yet implemented; see validate_config().
         if !self.config.net_allowlist.is_empty() {
             args.push("--share-net".to_string());
         }
@@ -122,7 +184,12 @@ impl ExecutionEnv for BwrapEnv {
         path: &'a Path,
         abort: CancellationToken,
     ) -> BoxFuture<'a, Result<String, EnvError>> {
-        self.inner.read_text_file(path, abort)
+        let checked = self.check_path(path);
+        async move {
+            let resolved = checked?;
+            self.inner.read_text_file(&resolved, abort).await
+        }
+        .boxed()
     }
 
     fn read_text_lines<'a>(
@@ -131,7 +198,12 @@ impl ExecutionEnv for BwrapEnv {
         max_lines: Option<usize>,
         abort: CancellationToken,
     ) -> BoxFuture<'a, Result<Vec<String>, EnvError>> {
-        self.inner.read_text_lines(path, max_lines, abort)
+        let checked = self.check_path(path);
+        async move {
+            let resolved = checked?;
+            self.inner.read_text_lines(&resolved, max_lines, abort).await
+        }
+        .boxed()
     }
 
     fn read_binary_file<'a>(
@@ -139,7 +211,12 @@ impl ExecutionEnv for BwrapEnv {
         path: &'a Path,
         abort: CancellationToken,
     ) -> BoxFuture<'a, Result<Vec<u8>, EnvError>> {
-        self.inner.read_binary_file(path, abort)
+        let checked = self.check_path(path);
+        async move {
+            let resolved = checked?;
+            self.inner.read_binary_file(&resolved, abort).await
+        }
+        .boxed()
     }
 
     fn write_file<'a>(
@@ -148,7 +225,12 @@ impl ExecutionEnv for BwrapEnv {
         content: &'a [u8],
         abort: CancellationToken,
     ) -> BoxFuture<'a, Result<(), EnvError>> {
-        self.inner.write_file(path, content, abort)
+        let checked = self.check_path(path);
+        async move {
+            let resolved = checked?;
+            self.inner.write_file(&resolved, content, abort).await
+        }
+        .boxed()
     }
 
     fn append_file<'a>(
@@ -157,7 +239,12 @@ impl ExecutionEnv for BwrapEnv {
         content: &'a [u8],
         abort: CancellationToken,
     ) -> BoxFuture<'a, Result<(), EnvError>> {
-        self.inner.append_file(path, content, abort)
+        let checked = self.check_path(path);
+        async move {
+            let resolved = checked?;
+            self.inner.append_file(&resolved, content, abort).await
+        }
+        .boxed()
     }
 
     fn file_info<'a>(
@@ -165,7 +252,12 @@ impl ExecutionEnv for BwrapEnv {
         path: &'a Path,
         abort: CancellationToken,
     ) -> BoxFuture<'a, Result<FileInfo, EnvError>> {
-        self.inner.file_info(path, abort)
+        let checked = self.check_path(path);
+        async move {
+            let resolved = checked?;
+            self.inner.file_info(&resolved, abort).await
+        }
+        .boxed()
     }
 
     fn list_dir<'a>(
@@ -173,7 +265,12 @@ impl ExecutionEnv for BwrapEnv {
         path: &'a Path,
         abort: CancellationToken,
     ) -> BoxFuture<'a, Result<Vec<FileInfo>, EnvError>> {
-        self.inner.list_dir(path, abort)
+        let checked = self.check_path(path);
+        async move {
+            let resolved = checked?;
+            self.inner.list_dir(&resolved, abort).await
+        }
+        .boxed()
     }
 
     fn exists<'a>(
@@ -181,7 +278,12 @@ impl ExecutionEnv for BwrapEnv {
         path: &'a Path,
         abort: CancellationToken,
     ) -> BoxFuture<'a, Result<bool, EnvError>> {
-        self.inner.exists(path, abort)
+        let checked = self.check_path(path);
+        async move {
+            let resolved = checked?;
+            self.inner.exists(&resolved, abort).await
+        }
+        .boxed()
     }
 
     fn create_dir<'a>(
@@ -190,7 +292,12 @@ impl ExecutionEnv for BwrapEnv {
         recursive: bool,
         abort: CancellationToken,
     ) -> BoxFuture<'a, Result<(), EnvError>> {
-        self.inner.create_dir(path, recursive, abort)
+        let checked = self.check_path(path);
+        async move {
+            let resolved = checked?;
+            self.inner.create_dir(&resolved, recursive, abort).await
+        }
+        .boxed()
     }
 
     fn remove<'a>(
@@ -200,7 +307,12 @@ impl ExecutionEnv for BwrapEnv {
         force: bool,
         abort: CancellationToken,
     ) -> BoxFuture<'a, Result<(), EnvError>> {
-        self.inner.remove(path, recursive, force, abort)
+        let checked = self.check_path(path);
+        async move {
+            let resolved = checked?;
+            self.inner.remove(&resolved, recursive, force, abort).await
+        }
+        .boxed()
     }
 
     fn create_temp_dir<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<PathBuf, EnvError>> {
@@ -210,7 +322,7 @@ impl ExecutionEnv for BwrapEnv {
     fn execute_shell<'a>(
         &'a self,
         cmd: &'a str,
-        mut opts: ShellOptions<'a>,
+        opts: ShellOptions<'a>,
     ) -> BoxFuture<'a, Result<ShellOutput, EnvError>> {
         async move {
             if opts.abort.is_cancelled() {
@@ -237,7 +349,7 @@ impl ExecutionEnv for BwrapEnv {
             }
             shell_cmd.args(["sh", "-c", cmd]);
 
-            let mut child = shell_cmd
+            let child = shell_cmd
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -249,106 +361,7 @@ impl ExecutionEnv for BwrapEnv {
                     }
                 })?;
 
-            let mut stdout_handle = child.stdout.take();
-            let mut stderr_handle = child.stderr.take();
-
-            macro_rules! drain_pipe {
-                ($handle:expr, $cb:expr) => {
-                    async {
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = Vec::with_capacity(4096);
-                        let mut carry = Vec::new();
-                        if let Some(h) = $handle.as_mut() {
-                            let mut chunk = [0u8; 4096];
-                            loop {
-                                let n = h.read(&mut chunk).await.map_err(EnvError::Io)?;
-                                if n == 0 {
-                                    break;
-                                }
-                                buf.extend_from_slice(&chunk[..n]);
-                                if let Some(cb) = $cb.as_deref_mut() {
-                                    carry.extend_from_slice(&chunk[..n]);
-                                    let split = utf8_safe_boundary(&carry);
-                                    let s = String::from_utf8_lossy(&carry[..split]);
-                                    cb(&s);
-                                    carry = carry[split..].to_vec();
-                                }
-                            }
-                        }
-                        if let Some(cb) = $cb.as_deref_mut() {
-                            if !carry.is_empty() {
-                                let s = String::from_utf8_lossy(&carry);
-                                cb(&s);
-                            }
-                        }
-                        Ok::<String, EnvError>(String::from_utf8_lossy(&buf).into_owned())
-                    }
-                };
-            }
-
-            let drain = async {
-                let stdout_task = drain_pipe!(stdout_handle, opts.on_stdout);
-                let stderr_task = drain_pipe!(stderr_handle, opts.on_stderr);
-                let (stdout_res, stderr_res) = tokio::join!(stdout_task, stderr_task);
-                let stdout = stdout_res?;
-                let stderr = stderr_res?;
-                let status = child.wait().await.map_err(EnvError::Io)?;
-                Ok::<_, EnvError>((stdout, stderr, status))
-            };
-
-            let (stdout, stderr, status) = if let Some(timeout) = opts.timeout {
-                tokio::select! {
-                    biased;
-                    _ = opts.abort.cancelled() => {
-                        let _ = child.start_kill();
-                        return Err(EnvError::Aborted);
-                    }
-                    res = tokio::time::timeout(timeout, drain) => match res {
-                        Ok(Ok(v)) => v,
-                        Ok(Err(e)) => {
-                            let _ = child.start_kill();
-                            return Err(e);
-                        }
-                        Err(_) => {
-                            let _ = child.start_kill();
-                            return Err(EnvError::ShellFailed {
-                                exit_code: -1,
-                                stdout: String::new(),
-                                stderr: "timeout".into(),
-                            });
-                        }
-                    },
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    _ = opts.abort.cancelled() => {
-                        let _ = child.start_kill();
-                        return Err(EnvError::Aborted);
-                    }
-                    res = drain => match res {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = child.start_kill();
-                            return Err(e);
-                        }
-                    },
-                }
-            };
-
-            if !status.success() {
-                Err(EnvError::ShellFailed {
-                    exit_code: status.code().unwrap_or(-1),
-                    stdout,
-                    stderr,
-                })
-            } else {
-                Ok(ShellOutput {
-                    stdout,
-                    stderr,
-                    exit_code: status.code().unwrap_or(0),
-                })
-            }
+            drain_child_output(child, opts).await
         }
         .boxed()
     }
@@ -362,17 +375,20 @@ impl ExecutionEnv for BwrapEnv {
 
 /// Sandbox backed by bubblewrap(1) for OS-level permission isolation.
 ///
-/// `env()` returns a `BwrapEnv` whose `execute_shell` runs each command inside
-/// a fresh `bwrap --unshare-all` namespace. File operations are delegated to
-/// the host `OsEnv` restricted to the working directory.
+/// `env()` returns a `BwrapEnv` that:
+/// - Rejects file operations on paths outside the working directory or
+///   `fs_allowlist`.
+/// - Runs `execute_shell` inside `bwrap --unshare-all` (fresh mount/net/pid
+///   namespace per command).
+/// - Clears the environment via `env -i`; only `PATH`, `HOME`, and
+///   caller-specified variables are injected.
 ///
-/// Maps `SandboxConfig` to bwrap arguments:
-/// - `fs_allowlist` → `--bind` (read-write, in addition to the work dir)
-/// - `net_allowlist` → `--share-net` when non-empty; `--unshare-all` blocks
-///   network when empty
-/// - `resource_limits.timeout` → enforced via `tokio::time::timeout`
-/// - Environment is cleared via `env -i`; only `PATH`, `HOME`, and
-///   caller-specified variables are injected
+/// **Unimplemented policies** (fail-closed in `new()`):
+/// - `fs_denylist` — not enforced by bwrap; rejected at construction.
+/// - `net_allowlist` rules — bwrap only supports all-or-nothing network;
+///   non-empty allowlist opens the entire host network, so it is rejected.
+/// - `max_cpus`, `max_memory_mb`, `max_disk_mb` — not enforced; rejected.
+#[derive(Debug)]
 pub struct BwrapSandbox {
     env: Arc<BwrapEnv>,
     config: SandboxConfig,
@@ -380,14 +396,48 @@ pub struct BwrapSandbox {
 }
 
 impl BwrapSandbox {
-    /// Create a new `BwrapSandbox`. Requires `bwrap` to be installed.
-    pub fn new(config: SandboxConfig) -> Self {
+    /// Create a new `BwrapSandbox`.
+    ///
+    /// Returns an error if the configuration contains policies that this
+    /// backend cannot enforce (fail-closed). This prevents silent
+    /// downgrading of security guarantees.
+    pub fn new(config: SandboxConfig) -> Result<Self> {
+        Self::validate_config(&config)?;
         let env = Arc::new(BwrapEnv::new(config.clone()));
-        Self {
+        Ok(Self {
             env,
             config,
             running: AtomicBool::new(false),
+        })
+    }
+
+    /// Reject configurations with unimplemented policies instead of silently
+    /// downgrading them.
+    fn validate_config(config: &SandboxConfig) -> Result<()> {
+        if !config.fs_denylist.is_empty() {
+            anyhow::bail!(
+                "fs_denylist is not supported by BwrapSandbox; \
+                 remove denylist entries or use a backend that enforces them"
+            );
         }
+        if !config.net_allowlist.is_empty() {
+            anyhow::bail!(
+                "net_allowlist rules are not supported by BwrapSandbox; \
+                 bwrap only supports all-or-nothing network isolation. \
+                 Use an empty allowlist for full network isolation."
+            );
+        }
+        let limits = &config.resource_limits;
+        if limits.max_cpus.is_some() {
+            anyhow::bail!("max_cpus is not supported by BwrapSandbox");
+        }
+        if limits.max_memory_mb.is_some() {
+            anyhow::bail!("max_memory_mb is not supported by BwrapSandbox");
+        }
+        if limits.max_disk_mb.is_some() {
+            anyhow::bail!("max_disk_mb is not supported by BwrapSandbox");
+        }
+        Ok(())
     }
 
     /// Check whether `bwrap` is installed and functional.
@@ -406,6 +456,23 @@ impl BwrapSandbox {
             }
             Err(e) => Err(anyhow::anyhow!("failed to run bwrap: {e}")),
         }
+    }
+
+    /// Returns true if the work_dir is safe to reset (i.e. it is not a root
+    /// or ancestor path, and it is not the current working directory).
+    fn is_safe_disposable_root(path: &Path) -> bool {
+        // Reject root.
+        if path == Path::new("/") || path.parent().is_none() {
+            return false;
+        }
+        // Reject the process's current working directory or any ancestor of it
+        // (so reset() can never delete a directory the process relies on).
+        if let Ok(cwd) = std::env::current_dir()
+            && (path == cwd || (cwd.starts_with(path) && cwd != path))
+        {
+            return false;
+        }
+        true
     }
 }
 
@@ -426,6 +493,12 @@ impl Sandbox for BwrapSandbox {
     fn reset(&self) -> BoxFuture<'_, Result<()>> {
         async move {
             let work_dir = self.env.working_dir();
+            if !Self::is_safe_disposable_root(work_dir) {
+                anyhow::bail!(
+                    "refusing to reset work_dir {:?}: not a safe disposable root",
+                    work_dir
+                );
+            }
             if work_dir.exists() {
                 tokio::fs::remove_dir_all(work_dir).await?;
                 tokio::fs::create_dir_all(work_dir).await?;
@@ -449,4 +522,5 @@ impl Sandbox for BwrapSandbox {
 }
 
 #[cfg(test)]
-#[path = "tests.rs"] mod tests;
+#[path = "tests.rs"]
+mod tests;

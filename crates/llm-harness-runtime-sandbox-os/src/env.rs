@@ -6,52 +6,12 @@ use futures::future::BoxFuture;
 use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
 
-/// 找到 `bytes` 中最后一个完整 UTF-8 字符的边界索引。
-///
-/// 返回值 `split` 满足：`bytes[..split]` 是合法 UTF-8（可整块解码），
-/// `bytes[split..]` 是可能不完整的多字节序列尾部（留到下一轮处理）。
-/// 如果 `bytes` 全部是合法 UTF-8（或空），返回 `bytes.len()`。
-pub fn utf8_safe_boundary(bytes: &[u8]) -> usize {
-    let len = bytes.len();
-    if len == 0 {
-        return 0;
-    }
-    // 从末尾往回找，最多回退 4 字节（UTF-8 最长 4 字节，需覆盖 4 字节字符的起始字节）
-    let start = len.saturating_sub(4);
-    for i in (start..len).rev() {
-        let b = bytes[i];
-        // 找到一个 UTF-8 起始字节（非 continuation byte: 10xxxxxx）
-        if b & 0xC0 != 0x80 {
-            // 计算这个字符的预期长度
-            let expected = if b & 0x80 == 0 {
-                1
-            } else if b & 0xE0 == 0xC0 {
-                2
-            } else if b & 0xF0 == 0xE0 {
-                3
-            } else if b & 0xF8 == 0xF0 {
-                4
-            } else {
-                // 无效的起始字节，直接跳过（lossy 会处理）
-                continue;
-            };
-            let end = i + expected;
-            if end <= len {
-                // 完整字符在范围内
-                return end;
-            } else {
-                // 不完整——从这个字符开始都是残留
-                return i;
-            }
-        }
-    }
-    // 全是 continuation bytes（不应该发生，但 fallback：全部留到下一轮）
-    0
-}
+use crate::shell_runner::drain_child_output;
 
 /// Concrete `ExecutionEnv` backed by the real OS filesystem and shell.
 ///
 /// Reimplemented from `llm-harness-core` to bypass the `#[cfg(test)]` gate.
+#[derive(Debug)]
 pub struct OsEnv {
     working_dir: PathBuf,
 }
@@ -362,7 +322,7 @@ impl ExecutionEnv for OsEnv {
     fn execute_shell<'a>(
         &'a self,
         cmd: &'a str,
-        mut opts: ShellOptions<'a>,
+        opts: ShellOptions<'a>,
     ) -> BoxFuture<'a, Result<ShellOutput, EnvError>> {
         async move {
             if opts.abort.is_cancelled() {
@@ -397,126 +357,14 @@ impl ExecutionEnv for OsEnv {
             for (key, val) in &opts.env {
                 shell_cmd.env(key, val);
             }
-            let mut child = shell_cmd
+            let child = shell_cmd
                 .current_dir(opts.cwd.unwrap_or(&self.working_dir))
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
                 .map_err(EnvError::Io)?;
 
-            // 取走 piped handle；若 on_stdout/on_stderr 为 None，仍 drain 到缓冲以构造 ShellOutput。
-            let mut stdout_handle = child.stdout.take();
-            let mut stderr_handle = child.stderr.take();
-
-            // 读取一个 piped handle 直到 EOF，每读到一块数据：
-            // - 若有回调：用 carry-over buffer 处理跨块的 UTF-8 边界，把完整部分喂给回调
-            // - 累积全部原始字节到 buf，最终 lossy 转成 String 返回
-            macro_rules! drain_pipe {
-                ($handle:expr, $cb:expr) => {
-                    async {
-                        use tokio::io::AsyncReadExt;
-                        let mut buf = Vec::with_capacity(4096);
-                        let mut carry = Vec::new(); // 上一块尾部的不完整 UTF-8 字节
-                        if let Some(h) = $handle.as_mut() {
-                            let mut chunk = [0u8; 4096];
-                            loop {
-                                let n = h.read(&mut chunk).await.map_err(EnvError::Io)?;
-                                if n == 0 {
-                                    break;
-                                }
-                                buf.extend_from_slice(&chunk[..n]);
-                                if let Some(cb) = $cb.as_deref_mut() {
-                                    carry.extend_from_slice(&chunk[..n]);
-                                    // 找到最后一个完整 UTF-8 字符的边界
-                                    let split = utf8_safe_boundary(&carry);
-                                    let s = String::from_utf8_lossy(&carry[..split]);
-                                    cb(&s);
-                                    carry = carry[split..].to_vec();
-                                }
-                            }
-                        }
-                        // EOF 时把残留字节 lossy 喂给回调
-                        if let Some(cb) = $cb.as_deref_mut() {
-                            if !carry.is_empty() {
-                                let s = String::from_utf8_lossy(&carry);
-                                cb(&s);
-                            }
-                        }
-                        Ok::<String, EnvError>(String::from_utf8_lossy(&buf).into_owned())
-                    }
-                };
-            }
-
-            let drain = async {
-                let stdout_task = drain_pipe!(stdout_handle, opts.on_stdout);
-                let stderr_task = drain_pipe!(stderr_handle, opts.on_stderr);
-                let (stdout_res, stderr_res) = tokio::join!(stdout_task, stderr_task);
-                let stdout = stdout_res?;
-                let stderr = stderr_res?;
-                // 等待进程退出，拿 exit code
-                let status = child.wait().await.map_err(EnvError::Io)?;
-                Ok::<_, EnvError>((stdout, stderr, status))
-            };
-
-            let (stdout, stderr, status) = if let Some(timeout) = opts.timeout {
-                tokio::select! {
-                    biased;
-                    _ = opts.abort.cancelled() => {
-                        let _ = child.start_kill();
-                        return Err(EnvError::Aborted);
-                    }
-                    res = tokio::time::timeout(timeout, drain) => match res {
-                        Ok(Ok(v)) => v,
-                        Ok(Err(e)) => {
-                            let _ = child.start_kill();
-                            return Err(e);
-                        }
-                        Err(_) => {
-                            let _ = child.start_kill();
-                            return Err(EnvError::ShellFailed {
-                                exit_code: -1,
-                                stdout: String::new(),
-                                stderr: "timeout".into(),
-                            });
-                        }
-                    },
-                }
-            } else {
-                tokio::select! {
-                    biased;
-                    _ = opts.abort.cancelled() => {
-                        let _ = child.start_kill();
-                        return Err(EnvError::Aborted);
-                    }
-                    res = drain => match res {
-                        Ok(v) => v,
-                        Err(e) => {
-                            let _ = child.start_kill();
-                            return Err(e);
-                        }
-                    },
-                }
-            };
-
-            // ExecutionEnv exposes text rather than platform-native byte streams.
-            // Normalize Windows newlines so callers and tool output see the same
-            // representation on every platform.
-            #[cfg(target_os = "windows")]
-            let (stdout, stderr) = (stdout.replace("\r\n", "\n"), stderr.replace("\r\n", "\n"));
-
-            if !status.success() {
-                Err(EnvError::ShellFailed {
-                    exit_code: status.code().unwrap_or(-1),
-                    stdout,
-                    stderr,
-                })
-            } else {
-                Ok(ShellOutput {
-                    stdout,
-                    stderr,
-                    exit_code: status.code().unwrap_or(0),
-                })
-            }
+            drain_child_output(child, opts).await
         }
         .boxed()
     }
@@ -930,27 +778,4 @@ mod tests {
         assert_eq!(out.stdout.trim(), "injected_value_42");
     }
 
-    #[test]
-    fn utf8_safe_boundary_handles_4_byte_char() {
-        // Regression for issue #85 问题 2：完整 4 字节 UTF-8 字符（如 emoji）在
-        // carry 末尾时，旧的 saturating_sub(3) 跳过起始字节，返回 0（整块不输出）。
-        // saturating_sub(4) 修复后应正确返回完整长度。
-        let mut bytes = vec![b'A'; 5000];
-        // U+1F600 (😀): F0 9F 98 80
-        bytes.extend_from_slice(&[0xF0, 0x9F, 0x98, 0x80]);
-        let split = utf8_safe_boundary(&bytes);
-        assert_eq!(split, bytes.len(), "完整 4 字节字符在末尾应返回完整长度");
-
-        // 不完整 4 字节字符（3/4）：起始字节在范围内，应保留到下一轮
-        let mut bytes2 = vec![b'A'; 5000];
-        bytes2.extend_from_slice(&[0xF0, 0x9F, 0x98]); // 缺最后 1 字节
-        let split2 = utf8_safe_boundary(&bytes2);
-        assert_eq!(split2, 5000, "不完整 4 字节字符应保留到下一轮");
-
-        // 4 字节字符跨块：起始字节在第 4093 位置，第 4096 字节是 continuation
-        let mut bytes3 = vec![b'A'; 4093];
-        bytes3.extend_from_slice(&[0xF0, 0x9F, 0x98]); // 3/4，恰好 4096 字节
-        let split3 = utf8_safe_boundary(&bytes3);
-        assert_eq!(split3, 4093, "跨块的不完整 4 字节字符应从起始字节处截断");
-    }
 }
