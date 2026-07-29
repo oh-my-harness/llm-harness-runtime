@@ -10,7 +10,9 @@ llm-harness-runtime-sandbox-os          = { path = "../llm-harness-runtime-sandb
 llm-harness-types.workspace             = true
 anyhow.workspace                        = true
 futures.workspace                       = true
-tokio  = { workspace = true, features = ["process", "fs"] }
+tokio  = { workspace = true, features = ["process", "fs", "io-util", "time"] }
+tokio-util.workspace                    = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

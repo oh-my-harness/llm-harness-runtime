@@ -7,10 +7,9 @@ license.workspace = true
 [dependencies]
 llm-harness-runtime.workspace          = true
 anyhow.workspace                       = true
-llm-harness-runtime-sandbox-os         = { path = "../llm-harness-runtime-sandbox-os" }
 llm-harness-types.workspace            = true
 futures.workspace                      = true
-tokio  = { workspace = true, features = ["process", "fs"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util.workspace                   = true

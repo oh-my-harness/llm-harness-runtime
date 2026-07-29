@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 /// 返回值 `split` 满足：`bytes[..split]` 是合法 UTF-8（可整块解码），
 /// `bytes[split..]` 是可能不完整的多字节序列尾部（留到下一轮处理）。
 /// 如果 `bytes` 全部是合法 UTF-8（或空），返回 `bytes.len()`。
-fn utf8_safe_boundary(bytes: &[u8]) -> usize {
+pub fn utf8_safe_boundary(bytes: &[u8]) -> usize {
     let len = bytes.len();
     if len == 0 {
         return 0;

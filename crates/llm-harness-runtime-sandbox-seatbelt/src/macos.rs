@@ -6,16 +6,20 @@ use anyhow::Result;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_runtime::platform::sandbox::{Sandbox, SandboxConfig};
-use llm_harness_runtime_sandbox_os::OsEnv;
-use llm_harness_types::ExecutionEnv;
+use llm_harness_types::{EnvError, ExecutionEnv, UnsupportedEnv};
 
 /// Sandbox backed by macOS `sandbox(7)` / seatbelt for OS-level isolation.
 ///
-/// ## v0.2 scope
-/// Verifies `sandbox-exec` is available; full policy compilation
-/// (`SandboxConfig` → `.sb` file) is deferred to v0.3.
+/// ## Current status: fail-closed (not yet implemented)
+///
+/// Full `sandbox-exec` policy compilation (`SandboxConfig` → `.sb` file →
+/// `sandbox-exec` mediation) is not yet implemented. Until it is, this
+/// backend **fails closed**: `start()` returns an error and `env()` returns
+/// an `UnsupportedEnv` that rejects all operations.
+///
+/// This prevents callers from accidentally using an unrestricted `OsEnv`
+/// when they believe they have isolation. See issue #97.
 pub struct SeatbeltSandbox {
-    env: Arc<OsEnv>,
     config: SandboxConfig,
     running: AtomicBool,
 }
@@ -23,54 +27,36 @@ pub struct SeatbeltSandbox {
 impl SeatbeltSandbox {
     /// Create a new `SeatbeltSandbox`.
     pub fn new(config: SandboxConfig) -> Self {
-        let work_dir = config
-            .work_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("/tmp/sandbox-seatbelt"));
-        std::fs::create_dir_all(&work_dir).ok();
         Self {
-            env: Arc::new(OsEnv::new(work_dir)),
             config,
             running: AtomicBool::new(false),
         }
-    }
-
-    /// Build a minimal `.sb` policy string from `SandboxConfig`.
-    ///
-    /// v0.2: minimal policy. v0.3: full `SandboxConfig` → `.sb` compilation.
-    #[allow(dead_code)]
-    fn build_sandbox_profile(&self) -> String {
-        let mut profile = String::from(
-            "(version 1)\n\
-             (deny default)\n\
-             (allow file-read*)\n\
-             (allow file-write* (subpath \"/tmp\"))\n\
-             (allow process-exec)\n\
-             (allow sysctl-read)\n\
-             (allow network-outbound)\n",
-        );
-        for path in &self.config.fs_allowlist {
-            profile.push_str(&format!(
-                "(allow file-read* file-write* (subpath \"{}\"))\n",
-                path.to_string_lossy()
-            ));
-        }
-        profile
     }
 }
 
 impl Sandbox for SeatbeltSandbox {
     fn start(&self) -> BoxFuture<'_, Result<()>> {
         async move {
-            // macOS always has sandbox-exec; unconditionally mark running.
-            self.running.store(true, Ordering::SeqCst);
-            Ok(())
+            Err(anyhow::anyhow!(
+                "SeatbeltSandbox is not yet implemented; \
+                 sandbox-exec policy compilation is required for isolation. \
+                 Use OsEnvSandbox for development/testing or implement \
+                 sandbox-exec mediation before production use."
+            ))
         }
         .boxed()
     }
 
     fn env(&self) -> Arc<dyn ExecutionEnv> {
-        self.env.clone()
+        // Fail-closed: return UnsupportedEnv instead of an unrestricted OsEnv.
+        // This ensures no caller can accidentally perform host operations
+        // believing they are sandboxed.
+        let work_dir = self
+            .config
+            .work_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        Arc::new(UnsupportedEnv::with_working_dir(work_dir))
     }
 
     fn reset(&self) -> BoxFuture<'_, Result<()>> {
@@ -93,10 +79,10 @@ impl Sandbox for SeatbeltSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_runtime::platform::sandbox::{ResourceLimits, SandboxConfig};
+    use llm_harness_runtime::platform::sandbox::ResourceLimits;
 
     #[tokio::test]
-    async fn seatbelt_sandbox_starts() {
+    async fn seatbelt_start_fails_closed() {
         let config = SandboxConfig {
             fs_allowlist: vec![],
             fs_denylist: vec![],
@@ -110,15 +96,17 @@ mod tests {
             work_dir: None,
         };
         let sandbox = SeatbeltSandbox::new(config);
-        sandbox.start().await.unwrap();
-        assert!(sandbox.is_running());
-        Box::new(sandbox).shutdown().await.unwrap();
+        let result = sandbox.start().await;
+        assert!(
+            result.is_err(),
+            "start() must fail-closed until sandbox-exec is implemented"
+        );
     }
 
-    #[test]
-    fn sandbox_profile_contains_deny_default() {
+    #[tokio::test]
+    async fn seatbelt_env_returns_unsupported() {
         let config = SandboxConfig {
-            fs_allowlist: vec![PathBuf::from("/workspace")],
+            fs_allowlist: vec![],
             fs_denylist: vec![],
             net_allowlist: vec![],
             resource_limits: ResourceLimits {
@@ -130,8 +118,13 @@ mod tests {
             work_dir: None,
         };
         let sandbox = SeatbeltSandbox::new(config);
-        let profile = sandbox.build_sandbox_profile();
-        assert!(profile.contains("(deny default)"));
-        assert!(profile.contains("/workspace"));
+        let env = sandbox.env();
+        let result = env
+            .read_text_file(
+                std::path::Path::new("/etc/passwd"),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_err(), "env() must not allow any operations");
     }
 }

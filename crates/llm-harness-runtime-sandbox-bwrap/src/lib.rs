@@ -2,7 +2,7 @@
 mod linux;
 
 #[cfg(target_os = "linux")]
-pub use linux::BwrapSandbox;
+pub use linux::{BwrapEnv, BwrapSandbox};
 
 /// Stub — `BwrapSandbox` is only available on Linux.
 #[cfg(not(target_os = "linux"))]
