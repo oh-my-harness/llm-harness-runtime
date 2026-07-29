@@ -1,6 +1,7 @@
 //! Non-LLM workflow step execution.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Component, PathBuf};
 use std::sync::Arc;
@@ -13,20 +14,48 @@ use futures::stream::StreamExt;
 use llm_harness_types::{ExecutionEnv, ShellOptions};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LOCATION};
 use reqwest::{Method, StatusCode, Url};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::control::cost::CostAggregate;
-use crate::workflow::model::{Step, StepRecord, StepResult, StructuredStatus, WorkflowContext};
+use crate::lifecycle::task::TaskId;
+use crate::workflow::model::{
+    Step, StepId, StepRecord, StepResult, StructuredStatus, WorkflowContext,
+};
 use anyhow::Result;
 
 pub const JSON_TRANSFORM_EXECUTOR_NAME: &str = "json_transform";
 pub const SHELL_EXECUTOR_NAME: &str = "shell";
 pub const HTTP_CALL_EXECUTOR_NAME: &str = "http_call";
 
+/// Stable identity for one executor policy attempt.
+///
+/// The identity is derived from durable workflow state, so an executor sees
+/// the same value after a crash that occurred after its external commit but
+/// before the runtime persisted the resulting step transition.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct ExecutorExecutionId {
+    pub task_id: TaskId,
+    pub step_id: StepId,
+    pub attempt: usize,
+}
+
+impl fmt::Display for ExecutorExecutionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}:{}:{}",
+            self.task_id.0, self.step_id, self.attempt
+        )
+    }
+}
+
 /// Context passed to a deterministic non-LLM step executor.
 pub struct ExecutorCtx<'a> {
+    /// Stable identity for this executor attempt, including across restart.
+    pub execution_id: ExecutorExecutionId,
     /// Current executor step definition.
     pub current_step: &'a Step,
     /// Previous completed step result, if any.
@@ -69,6 +98,18 @@ pub trait StepExecutor: Send + Sync {
     /// must still observe `ExecutorCtx::abort` before that phase.
     fn cancellation_policy(&self) -> ExecutorCancellationPolicy {
         ExecutorCancellationPolicy::Interruptible
+    }
+
+    /// Recover a previously committed outcome for this execution identity.
+    ///
+    /// Side-effecting executors should durably bind their external commit to
+    /// `ctx.execution_id` and return the corresponding result here. Returning
+    /// `None` asks the runtime to call [`StepExecutor::execute`] normally.
+    fn recover<'a>(
+        &'a self,
+        _ctx: &'a ExecutorCtx<'a>,
+    ) -> BoxFuture<'a, Result<Option<StepResult>>> {
+        Box::pin(async { Ok(None) })
     }
 
     fn execute<'a>(&'a self, ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>>;
@@ -1256,8 +1297,17 @@ mod tests {
         Arc::new(llm_harness_loop::test_utils::NoOpEnv)
     }
 
+    fn execution_id(step: &Step) -> ExecutorExecutionId {
+        ExecutorExecutionId {
+            task_id: TaskId("test-task".into()),
+            step_id: step.id().clone(),
+            attempt: 1,
+        }
+    }
+
     fn ctx_for<'a>(step: &'a Step, prev_result: Option<&'a StepResult>) -> ExecutorCtx<'a> {
         ExecutorCtx {
+            execution_id: execution_id(step),
             current_step: step,
             prev_result,
             step_history: &[],
@@ -1625,6 +1675,7 @@ mod tests {
         );
         let env = Arc::new(FakeEnv::default());
         let ctx = ExecutorCtx {
+            execution_id: execution_id(&step),
             current_step: &step,
             prev_result: None,
             step_history: &[],
@@ -1690,6 +1741,7 @@ mod tests {
         );
         let env = Arc::new(FakeEnv::with_stdout(long_output));
         let ctx = ExecutorCtx {
+            execution_id: execution_id(&step),
             current_step: &step,
             prev_result: None,
             step_history: &[],
@@ -1721,6 +1773,7 @@ mod tests {
         );
         let env = Arc::new(FakeEnv::with_stdout(long_output));
         let ctx = ExecutorCtx {
+            execution_id: execution_id(&step),
             current_step: &step,
             prev_result: None,
             step_history: &[],
@@ -1766,6 +1819,7 @@ mod tests {
         );
         let env = Arc::new(FakeEnv::with_stdout(long_output));
         let ctx = ExecutorCtx {
+            execution_id: execution_id(&step),
             current_step: &step,
             prev_result: None,
             step_history: &[],
@@ -1803,6 +1857,7 @@ mod tests {
         );
         let env = Arc::new(FakeEnv::with_stdout(long_output));
         let ctx = ExecutorCtx {
+            execution_id: execution_id(&step),
             current_step: &step,
             prev_result: None,
             step_history: &[],
@@ -1838,6 +1893,7 @@ mod tests {
         );
         let env = Arc::new(FakeEnv::with_stdout(long_output));
         let ctx = ExecutorCtx {
+            execution_id: execution_id(&step),
             current_step: &step,
             prev_result: None,
             step_history: &[],
@@ -1881,6 +1937,7 @@ mod tests {
         );
         let env = Arc::new(FakeEnv::with_stdout(long_output));
         let ctx = ExecutorCtx {
+            execution_id: execution_id(&step),
             current_step: &step,
             prev_result: None,
             step_history: &[],

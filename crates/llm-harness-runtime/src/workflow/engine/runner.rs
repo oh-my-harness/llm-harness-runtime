@@ -827,7 +827,10 @@ impl super::WorkflowEngine {
                 self.run_llm_step(step, step_abort, policy_attempt, request)
                     .await
             }
-            Step::Executor { .. } => self.run_executor_step(step, step_abort).await,
+            Step::Executor { .. } => {
+                self.run_executor_step(step, step_abort, policy_attempt)
+                    .await
+            }
             Step::Terminal {
                 exit_code, message, ..
             } => {
@@ -889,6 +892,9 @@ impl super::WorkflowEngine {
                 Err(err) => {
                     attempt_abort.cancel();
                     if step_abort.is_cancelled() {
+                        return Err(err);
+                    }
+                    if matches!(&err, WorkflowError::ExecutorRecoveryFailed { .. }) {
                         return Err(err);
                     }
                     if attempt >= max_attempts {
@@ -1029,6 +1035,7 @@ impl super::WorkflowEngine {
         &self,
         step: &Step,
         step_abort: CancellationToken,
+        policy_attempt: usize,
     ) -> Result<StepResult, WorkflowError> {
         let Step::Executor { .. } = step else {
             return Err(WorkflowError::Internal(
@@ -1043,7 +1050,17 @@ impl super::WorkflowEngine {
         let env = self.config.env_factory.create(&cwd)?;
         let history = self.workflow_state.lock().await.step_history.clone();
         let prev_result = history.last().and_then(|record| record.result.as_ref());
+        let attempt = history
+            .iter()
+            .filter(|record| record.step_id == *step.id())
+            .count()
+            + policy_attempt;
         let ctx = ExecutorCtx {
+            execution_id: ExecutorExecutionId {
+                task_id: self.task_id.clone(),
+                step_id: step.id().clone(),
+                attempt,
+            },
             current_step: step,
             prev_result,
             step_history: &history,
@@ -1051,21 +1068,41 @@ impl super::WorkflowEngine {
             abort: step_abort.clone(),
             context: self.context.clone(),
         };
-        let execution = executor.execute(&ctx);
-        let mut result = match executor.cancellation_policy() {
+        let cancellation_policy = executor.cancellation_policy();
+        let recovery = executor.recover(&ctx);
+        let recovered = match cancellation_policy {
             ExecutorCancellationPolicy::Interruptible => tokio::select! {
                 biased;
                 _ = step_abort.cancelled() => {
                     return Err(WorkflowError::StepAborted { id: step.id().to_string() });
                 }
-                result = execution => result,
+                result = recovery => result,
             },
-            ExecutorCancellationPolicy::Finalize => execution.await,
+            ExecutorCancellationPolicy::Finalize => recovery.await,
         }
-        .map_err(|source| WorkflowError::StepFailed {
-            id: step.id().to_string(),
+        .map_err(|source| WorkflowError::ExecutorRecoveryFailed {
+            execution_id: ctx.execution_id.to_string(),
             source,
         })?;
+        let mut result = if let Some(recovered) = recovered {
+            recovered
+        } else {
+            let execution = executor.execute(&ctx);
+            match cancellation_policy {
+                ExecutorCancellationPolicy::Interruptible => tokio::select! {
+                    biased;
+                    _ = step_abort.cancelled() => {
+                        return Err(WorkflowError::StepAborted { id: step.id().to_string() });
+                    }
+                    result = execution => result,
+                },
+                ExecutorCancellationPolicy::Finalize => execution.await,
+            }
+            .map_err(|source| WorkflowError::StepFailed {
+                id: step.id().to_string(),
+                source,
+            })?
+        };
         let ended_at = chrono::Utc::now();
         if result.started_at.is_none() {
             result.started_at = Some(started_at);

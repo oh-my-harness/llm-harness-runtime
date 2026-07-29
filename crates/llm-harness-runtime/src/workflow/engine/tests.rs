@@ -129,6 +129,56 @@ impl StepExecutor for FlakyExecutor {
     }
 }
 
+struct RecoveringExecutor {
+    expected_id: ExecutorExecutionId,
+    recover_calls: AtomicUsize,
+    execute_calls: AtomicUsize,
+}
+
+impl StepExecutor for RecoveringExecutor {
+    fn recover<'a>(
+        &'a self,
+        ctx: &'a ExecutorCtx<'a>,
+    ) -> BoxFuture<'a, Result<Option<StepResult>>> {
+        Box::pin(async move {
+            assert_eq!(ctx.execution_id, self.expected_id);
+            self.recover_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(completed_result("recovered external outcome")))
+        })
+    }
+
+    fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        Box::pin(async move {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("execute must not run after recovery")
+        })
+    }
+}
+
+struct FailingRecoveryExecutor {
+    recover_calls: AtomicUsize,
+    execute_calls: AtomicUsize,
+}
+
+impl StepExecutor for FailingRecoveryExecutor {
+    fn recover<'a>(
+        &'a self,
+        _ctx: &'a ExecutorCtx<'a>,
+    ) -> BoxFuture<'a, Result<Option<StepResult>>> {
+        Box::pin(async move {
+            self.recover_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("recovery store unavailable")
+        })
+    }
+
+    fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        Box::pin(async move {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("execute must not run after a recovery error")
+        })
+    }
+}
+
 fn completed_result(output: &str) -> StepResult {
     StepResult {
         output: output.into(),
@@ -410,6 +460,109 @@ async fn free_task_crash_recovery() {
         .await
         .unwrap();
     assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+}
+
+#[tokio::test]
+async fn restored_executor_recovers_stable_attempt_without_reexecution() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(JsonlTaskStore::new(dir.path().join("tasks")));
+    let task_id = TaskId("recover-executor-outcome".into());
+    let step = Step::executor("review", "Review", "recovering", None);
+    let workflow = Workflow {
+        entry_step: "review".into(),
+        steps: vec![
+            step,
+            Step::terminal("done", "Done", 0, Some("complete".into())),
+        ],
+        edges: vec![Edge {
+            from: "review".into(),
+            to: "done".into(),
+            condition: None,
+        }],
+    };
+    let mut state = WorkflowState::new("review".into());
+    state.status = WorkflowStatus::Running;
+    state.started_at = Some(chrono::Utc::now());
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+    let executor = Arc::new(RecoveringExecutor {
+        expected_id: ExecutorExecutionId {
+            task_id: task_id.clone(),
+            step_id: "review".into(),
+            attempt: 1,
+        },
+        recover_calls: AtomicUsize::new(0),
+        execute_calls: AtomicUsize::new(0),
+    });
+    let config = WorkflowEngineConfig {
+        client: Arc::new(MockLlmClient::new(Vec::new())),
+        model: "unused".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::restore(store, task_id, config, Arc::new(NoopJudge))
+        .await
+        .unwrap()
+        .with_executor("recovering", executor.clone());
+
+    engine.run().await.unwrap();
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(executor.recover_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 0);
+    let history = engine.step_history().await;
+    assert_eq!(
+        history[0].result.as_ref().unwrap().output,
+        "recovered external outcome"
+    );
+}
+
+#[tokio::test]
+async fn executor_recovery_failure_is_not_retried_or_executed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let executor = Arc::new(FailingRecoveryExecutor {
+        recover_calls: AtomicUsize::new(0),
+        execute_calls: AtomicUsize::new(0),
+    });
+    let workflow = Workflow {
+        entry_step: "review".into(),
+        steps: vec![
+            Step::executor("review", "Review", "failing-recovery", None).with_policy(
+                StepExecutionPolicy {
+                    timeout_ms: None,
+                    max_attempts: Some(3),
+                    retry_backoff_ms: Some(0),
+                    cache: None,
+                    r#loop: None,
+                },
+            ),
+        ],
+        edges: vec![],
+    };
+    let config = WorkflowEngineConfig {
+        client: Arc::new(MockLlmClient::new(Vec::new())),
+        model: "unused".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
+        .unwrap()
+        .with_executor("failing-recovery", executor.clone());
+
+    let error = engine.run().await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("executor outcome recovery failed"),
+        "unexpected error: {error}",
+    );
+    assert_eq!(executor.recover_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -33,7 +33,7 @@ use crate::lifecycle::task_store::TaskStore;
 use crate::spawn::spawner::HarnessSubAgentSpawner;
 use crate::workflow::error::WorkflowError;
 use crate::workflow::executor::{
-    ExecutorCancellationPolicy, ExecutorCtx, StepExecutor, builtin_executors,
+    ExecutorCancellationPolicy, ExecutorCtx, ExecutorExecutionId, StepExecutor, builtin_executors,
 };
 use crate::workflow::judge::{EdgeConditionJudge, NoopJudge, StepCtx, StepTransitionJudge};
 use crate::workflow::model::{
