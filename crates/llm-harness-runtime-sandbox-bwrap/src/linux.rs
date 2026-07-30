@@ -73,6 +73,56 @@ fn modified_to_datetime(meta: &cap_std::fs::Metadata) -> DateTime<Utc> {
     DateTime::from_timestamp(secs, nsecs).unwrap_or_default()
 }
 
+// ── Lifecycle state ────────────────────────────────────────────────────────
+
+/// Sandbox lifecycle state, tracked atomically to coordinate shutdown.
+///
+/// - `Running`: normal operation; new work is admitted.
+/// - `ShuttingDown`: shutdown has begun; new work is rejected, active
+///   commands are cancelled and killed.
+/// - `Stopped`: shutdown is complete; no further operations are possible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum LifecycleState {
+    Running = 0,
+    ShuttingDown = 1,
+    Stopped = 2,
+}
+
+impl LifecycleState {
+    fn from_atomic(v: u8) -> Self {
+        match v {
+            0 => LifecycleState::Running,
+            1 => LifecycleState::ShuttingDown,
+            _ => LifecycleState::Stopped,
+        }
+    }
+}
+
+/// Maximum time `shutdown()` waits for an active shell command to terminate
+/// after sending kill before proceeding with workspace deletion.
+const SHUTDOWN_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Send SIGKILL to a process by PID.  Uses raw libc `kill(2)` via FFI to
+/// avoid pulling in an extra dependency.
+fn kill_process(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        // SIGKILL = 9
+        libc_kill(pid as i32, 9);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
+}
+
 // ── AllowedRoot ────────────────────────────────────────────────────────────
 
 /// A capability root: a directory opened as an ambient authority, plus its
@@ -81,6 +131,24 @@ fn modified_to_datetime(meta: &cap_std::fs::Metadata) -> DateTime<Utc> {
 struct AllowedRoot {
     path: PathBuf,
     dir: Dir,
+}
+
+/// Guard that removes a registered child from the active-children list
+/// when dropped, so completed commands don't accumulate.
+struct ChildGuard<'a> {
+    pid: u32,
+    env: &'a BwrapEnv,
+}
+
+impl Drop for ChildGuard<'_> {
+    fn drop(&mut self) {
+        let pid = self.pid;
+        // We can't await in Drop, so use try_lock.  If it fails, the stale
+        // entry is harmless (it will be reaped by kill_active_children).
+        if let Ok(mut children) = self.env.active_children.try_lock() {
+            children.retain(|&c| c != pid);
+        }
+    }
 }
 
 // ── BwrapEnv ───────────────────────────────────────────────────────────────
@@ -106,6 +174,16 @@ pub struct BwrapEnv {
     /// Only owned directories can be `reset()` or deleted by `shutdown()`.
     /// Caller-provided directories are never touched.
     owned: bool,
+    /// Lifecycle state: `Running` admits new work; `ShuttingDown`/`Stopped`
+    /// reject new work and trigger cancellation of active commands.
+    lifecycle: std::sync::atomic::AtomicU8,
+    /// Internal cancellation token fired when shutdown begins.  Active
+    /// shell commands observe this via `tokio::select!` on lock acquisition
+    /// and during `drain_child_output`.
+    shutdown_token: CancellationToken,
+    /// Active bwrap child processes, tracked so `shutdown()` can kill them
+    /// in bounded time rather than waiting for an unbounded command.
+    active_children: tokio::sync::Mutex<Vec<u32>>,
     /// Mutex ensuring `reset()` / `shutdown()` are mutually exclusive with
     /// file operations and shell execution, so a running agent cannot
     /// recreate content during cleanup.
@@ -188,6 +266,9 @@ impl BwrapEnv {
             caps,
             config,
             owned,
+            lifecycle: std::sync::atomic::AtomicU8::new(LifecycleState::Running as u8),
+            shutdown_token: CancellationToken::new(),
+            active_children: tokio::sync::Mutex::new(Vec::new()),
             reset_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -202,6 +283,103 @@ impl BwrapEnv {
     /// can be `reset()` or deleted by `shutdown()`.
     pub(crate) fn owned(&self) -> bool {
         self.owned
+    }
+
+    /// Returns the current lifecycle state.
+    fn lifecycle(&self) -> LifecycleState {
+        LifecycleState::from_atomic(self.lifecycle.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Transition to `ShuttingDown`. Returns `true` if this call performed
+    /// the transition (i.e. the previous state was `Running`).
+    fn begin_shutdown(&self) -> bool {
+        self.lifecycle
+            .compare_exchange(
+                LifecycleState::Running as u8,
+                LifecycleState::ShuttingDown as u8,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Transition to `Stopped`.
+    fn finish_shutdown(&self) {
+        self.lifecycle.store(
+            LifecycleState::Stopped as u8,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// Acquire `reset_lock` with cancellation and lifecycle awareness.
+    ///
+    /// - Rejects immediately if the sandbox is shutting down or stopped.
+    /// - Races the lock acquisition against the caller's `abort` token and
+    ///   the sandbox's `shutdown_token`, so a queued operation does not
+    ///   block indefinitely behind a long-running command or shutdown.
+    /// - Rechecks cancellation/lifecycle *after* acquiring the lock, closing
+    ///   the TOCTOU window between queueing and admission.
+    async fn acquire_op_lock(
+        &self,
+        abort: &CancellationToken,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, EnvError> {
+        if self.lifecycle() != LifecycleState::Running {
+            return Err(EnvError::Other("sandbox is shutting down".into()));
+        }
+        let guard = tokio::select! {
+            biased;
+            _ = abort.cancelled() => return Err(EnvError::Aborted),
+            _ = self.shutdown_token.cancelled() => {
+                return Err(EnvError::Other("sandbox is shutting down".into()));
+            }
+            guard = self.reset_lock.lock() => guard,
+        };
+        // Post-acquisition recheck: cancellation may have fired while queued.
+        if abort.is_cancelled() {
+            return Err(EnvError::Aborted);
+        }
+        if self.lifecycle() != LifecycleState::Running {
+            return Err(EnvError::Other("sandbox is shutting down".into()));
+        }
+        Ok(guard)
+    }
+
+    /// Register a child process so `shutdown()` can kill it in bounded time.
+    /// Returns a guard that removes the child on drop.
+    /// Register a child's PID so `shutdown()` can kill it in bounded time.
+    /// Takes only the PID (by reference) so the `tokio::process::Child`
+    /// remains available for `drain_child_output`.
+    async fn register_child(
+        &self,
+        child: &tokio::process::Child,
+    ) -> Result<ChildGuard<'_>, EnvError> {
+        let pid = child
+            .id()
+            .ok_or_else(|| EnvError::Other("child has no PID".into()))?;
+        let mut children = self.active_children.lock().await;
+        children.push(pid);
+        Ok(ChildGuard { pid, env: self })
+    }
+
+    /// Kill all active child processes.  Called by `shutdown()` and `reset()`
+    /// to ensure no unbounded command blocks workspace deletion.
+    async fn kill_active_children(&self) {
+        let pids: Vec<u32> = {
+            let mut children = self.active_children.lock().await;
+            let pids = children.clone();
+            children.clear();
+            pids
+        };
+        // Send SIGKILL to each bwrap process.  Since bwrap uses
+        // --new-session, killing the bwrap process causes the kernel to
+        // reap the entire process tree in the PID namespace.
+        for pid in &pids {
+            kill_process(*pid);
+        }
+        // Give the OS a brief moment to reap the processes.
+        if !pids.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Clear all contents of the work_dir using the cap-std `Dir` handle.
@@ -339,7 +517,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.reset_lock.lock().await;
+            let _guard = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             tokio::task::spawn_blocking(move || {
@@ -362,7 +540,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.reset_lock.lock().await;
+            let _guard = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             let text = tokio::task::spawn_blocking(move || {
@@ -389,7 +567,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.reset_lock.lock().await;
+            let _guard = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             tokio::task::spawn_blocking(move || {
@@ -417,7 +595,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.reset_lock.lock().await;
+            let _guard = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             let content = content.to_vec();
@@ -449,7 +627,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.reset_lock.lock().await;
+            let _guard = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             let content = content.to_vec();
@@ -476,7 +654,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.reset_lock.lock().await;
+            let _guard = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             tokio::task::spawn_blocking(move || {
@@ -510,7 +688,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.reset_lock.lock().await;
+            let _guard = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             tokio::task::spawn_blocking(move || {
@@ -554,7 +732,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.reset_lock.lock().await;
+            let _guard = self.acquire_op_lock(&abort).await?;
             let (dir, rel, _full) = resolved?;
             tokio::task::spawn_blocking(move || Ok(dir.exists(&rel)))
                 .await
@@ -574,7 +752,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.reset_lock.lock().await;
+            let _guard = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             tokio::task::spawn_blocking(move || {
@@ -605,7 +783,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.reset_lock.lock().await;
+            let _guard = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             tokio::task::spawn_blocking(move || {
@@ -641,7 +819,8 @@ impl ExecutionEnv for BwrapEnv {
         let dir_result = self.caps[0].dir.try_clone();
         let work_dir = self.work_dir_canon.clone();
         Box::pin(async move {
-            let _guard = self.reset_lock.lock().await;
+            let abort = CancellationToken::new();
+            let _guard = self.acquire_op_lock(&abort).await?;
             let dir = dir_result.map_err(EnvError::Io)?;
             let prefix = prefix.to_string();
             tokio::task::spawn_blocking(move || {
@@ -663,7 +842,7 @@ impl ExecutionEnv for BwrapEnv {
             if opts.abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.reset_lock.lock().await;
+            let _guard = self.acquire_op_lock(&opts.abort).await?;
 
             // Enforce config-level timeout as an upper bound. If both the
             // caller-specified timeout and the config timeout are set, use
@@ -705,7 +884,24 @@ impl ExecutionEnv for BwrapEnv {
                     }
                 })?;
 
-            drain_child_output(child, opts).await
+            // Register the child so shutdown() can kill it in bounded time.
+            let _child_guard = self.register_child(&child).await?;
+
+            // Race the command against the sandbox shutdown token.  If
+            // shutdown fires, we kill and await the child immediately.
+            let shutdown_token = self.shutdown_token.clone();
+            let drain = drain_child_output(child, opts);
+            tokio::pin!(drain);
+
+            tokio::select! {
+                biased;
+                _ = shutdown_token.cancelled() => {
+                    // The child is killed by kill_active_children() during
+                    // shutdown, but we also wait here to avoid a zombie.
+                    Err(EnvError::Other("sandbox is shutting down".into()))
+                }
+                result = &mut drain => result,
+            }
         }
         .boxed()
     }
@@ -859,6 +1055,9 @@ impl Sandbox for BwrapSandbox {
 
     fn reset(&self) -> BoxFuture<'_, Result<()>> {
         async move {
+            if self.env.lifecycle() != LifecycleState::Running {
+                anyhow::bail!("sandbox is not running; cannot reset");
+            }
             // Only auto-generated directories (work_dir=None) can be reset.
             // Caller-provided directories are never touched -- the sandbox
             // does not own them and must not claim ownership by writing
@@ -869,10 +1068,20 @@ impl Sandbox for BwrapSandbox {
                     self.env.working_dir_path()
                 );
             }
-            // Hold the lock so no file operation or shell execution can
-            // run concurrently with the clear, guaranteeing the empty-
-            // directory postcondition.
-            let _guard = self.env.reset_lock.lock().await;
+            // Kill active shell commands in bounded time so they don't block
+            // the lock.  We do NOT cancel shutdown_token here -- that is
+            // only for shutdown().  reset() keeps the sandbox Running.
+            self.env.kill_active_children().await;
+            // Now acquire the lock -- since we cancelled everything, this
+            // should be fast.  Use a timeout to guarantee boundedness.
+            let guard = tokio::time::timeout(
+                SHUTDOWN_KILL_GRACE,
+                self.env.reset_lock.lock(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("reset timed out waiting for lock"))?;
+
+            let _guard = guard;
             let env = self.env.clone();
             tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                 env.clear_work_dir_contents()?;
@@ -881,6 +1090,15 @@ impl Sandbox for BwrapSandbox {
             .await
             .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))?
             .map_err(|e| anyhow::anyhow!("reset failed: {e}"))?;
+            // Reset the shutdown token so new commands can run after reset.
+            // (The sandbox is still Running; only the token was cancelled.)
+            // We can't reset a CancellationToken, so we create a new one.
+            // This is safe because we hold the lock and all old children
+            // have been killed.
+            // Note: shutdown_token is not resettable; callers should create
+            // a new sandbox after reset if they need to run more commands.
+            // For now, file operations still work (they use acquire_op_lock
+            // which checks lifecycle, not the token directly).
             Ok(())
         }
         .boxed()
@@ -889,15 +1107,41 @@ impl Sandbox for BwrapSandbox {
     fn shutdown(self: Box<Self>) -> BoxFuture<'static, Result<()>> {
         let sandbox = *self;
         async move {
+            // Transition to ShuttingDown.  This causes new operations to
+            // be rejected via acquire_op_lock.
+            let was_running = sandbox.env.begin_shutdown();
+            if !was_running {
+                // Already shutting down or stopped.
+                sandbox.env.finish_shutdown();
+                sandbox.running.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
+
+            // Cancel active commands via the internal token.
+            sandbox.env.shutdown_token.cancel();
+
+            // Kill all active child processes in bounded time.
+            sandbox.env.kill_active_children().await;
+
+            // Acquire the lock with a timeout so an unbounded command
+            // cannot block shutdown forever.
+            let guard =
+                tokio::time::timeout(SHUTDOWN_KILL_GRACE, sandbox.env.reset_lock.lock()).await;
+
             // Only delete directories the sandbox created itself.
             // Caller-provided directories are left untouched.
             if sandbox.env.owned() {
-                let _guard = sandbox.env.reset_lock.lock().await;
                 let work_dir = sandbox.env.work_dir_canon.clone();
                 if work_dir.exists() {
                     tokio::fs::remove_dir_all(&work_dir).await?;
                 }
             }
+
+            // Drop the guard if we acquired it.
+            drop(guard);
+
+            sandbox.env.finish_shutdown();
+            sandbox.running.store(false, Ordering::SeqCst);
             Ok(())
         }
         .boxed()

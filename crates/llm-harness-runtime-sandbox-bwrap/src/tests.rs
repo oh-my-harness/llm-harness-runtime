@@ -1059,3 +1059,128 @@ async fn working_dir_returns_configured_path_not_canonical() {
         "working_dir() must return configured path, not canonicalized"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Lifecycle regression tests — bwrap required
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// P0: An unbounded shell command (no timeout) must not block shutdown().
+///
+/// `execute_shell()` acquires `reset_lock` and holds it through
+/// `drain_child_output()`. `shutdown()` must cancel/kill the active
+/// command and complete in bounded time, not wait for the lock forever.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn shutdown_completes_with_unbounded_command() {
+    require_bwrap();
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    sandbox.start().await.unwrap();
+    let env = sandbox.env();
+    let work_dir = env.working_dir().to_path_buf();
+
+    // Start a long-running command with NO timeout and NO abort.
+    let env_clone = env.clone();
+    let cmd_handle = tokio::spawn(async move {
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+        // This will be killed by shutdown; the result doesn't matter.
+        let _ = env_clone.execute_shell("sleep 30", opts).await;
+    });
+
+    // Give the command time to start.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Shutdown must complete in bounded time despite the unbounded command.
+    let start = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(15), Box::new(sandbox).shutdown()).await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_ok(),
+        "shutdown must complete within 15s even with an unbounded command"
+    );
+    assert!(result.unwrap().is_ok(), "shutdown must not return an error");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "shutdown must be bounded; took {elapsed:?}"
+    );
+
+    // The command task should also finish (killed by shutdown).
+    let _ = tokio::time::timeout(Duration::from_secs(5), cmd_handle).await;
+
+    // Owned directory must be deleted.
+    assert!(
+        !work_dir.exists(),
+        "owned work_dir must be deleted by shutdown"
+    );
+}
+
+/// P1: Cancellation while queued behind the lifecycle lock is observed.
+///
+/// When an operation is queued behind a long-running shell command,
+/// cancelling the caller's token must cause the queued operation to
+/// return `EnvError::Aborted` promptly, not block until the command
+/// finishes.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn cancellation_observed_while_queued() {
+    require_bwrap();
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    sandbox.start().await.unwrap();
+    let env = sandbox.env();
+
+    // Start a long-running shell command (holds the lock via
+    // execute_shell -> acquire_op_lock -> drain_child_output).
+    let env_clone = env.clone();
+    let cmd_handle = tokio::spawn(async move {
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: Some(Duration::from_secs(10)),
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+        let _ = env_clone.execute_shell("sleep 5", opts).await;
+    });
+
+    // Give the command time to acquire the lock.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Queue a read operation — it will be blocked behind the lock.
+    let abort = CancellationToken::new();
+    let abort_clone = abort.clone();
+    let env_clone2 = env.clone();
+    let read_handle = tokio::spawn(async move {
+        env_clone2
+            .read_text_file(Path::new("anyfile.txt"), abort_clone)
+            .await
+    });
+
+    // Cancel the queued read while it's waiting for the lock.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    abort.cancel();
+
+    // The queued operation must return Aborted within 2s (well before the
+    // 5s sleep finishes).
+    let result = tokio::time::timeout(Duration::from_secs(2), read_handle)
+        .await
+        .expect("cancelled operation must return within 2s")
+        .expect("task must not panic");
+
+    assert!(
+        matches!(result, Err(EnvError::Aborted)),
+        "queued operation must return Aborted after cancellation; got: {:?}",
+        result
+    );
+
+    // Clean up: let the command finish, then shutdown.
+    let _ = tokio::time::timeout(Duration::from_secs(15), cmd_handle).await;
+    Box::new(sandbox).shutdown().await.unwrap();
+}
