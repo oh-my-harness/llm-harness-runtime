@@ -35,6 +35,22 @@ fn default_config(work_dir: PathBuf) -> SandboxConfig {
     }
 }
 
+/// Config with work_dir=None (sandbox creates and owns the directory).
+fn owned_config() -> SandboxConfig {
+    SandboxConfig {
+        fs_allowlist: vec![],
+        fs_denylist: vec![],
+        net_allowlist: vec![],
+        resource_limits: ResourceLimits {
+            max_cpus: None,
+            max_memory_mb: None,
+            max_disk_mb: None,
+            timeout: None,
+        },
+        work_dir: None,
+    }
+}
+
 fn shell_opts() -> ShellOptions<'static> {
     ShellOptions {
         cwd: None,
@@ -348,52 +364,85 @@ async fn create_temp_dir_is_inside_workspace() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Reset safety — no bwrap required
+// ═══════════════════════════════════════════════════════════════════════════
+// Reset & ownership — no bwrap required
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Workspace reset only affects the work dir, not external paths.
+/// P0: reset() clears an owned (auto-generated) work_dir.
+///
+/// Only directories created by the sandbox (work_dir=None) can be reset.
+/// After reset, the directory must be empty (no sentinel, no leftover files).
 #[tokio::test]
-async fn reset_only_affects_work_dir() {
-    let dir = tempfile::tempdir().unwrap();
-    let work_dir = dir.path().join("workspace");
-    tokio::fs::create_dir_all(&work_dir).await.unwrap();
-
-    let outside_file = dir.path().join("outside.txt");
+async fn reset_clears_owned_work_dir() {
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("outside.txt");
     tokio::fs::write(&outside_file, "should_survive")
         .await
         .unwrap();
 
-    tokio::fs::write(work_dir.join("inside.txt"), "should_be_deleted")
-        .await
-        .unwrap();
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    let env = sandbox.env();
+    let work_dir = env.working_dir().to_path_buf();
 
-    let sandbox = BwrapSandbox::new(default_config(work_dir.clone())).unwrap();
+    env.write_file(
+        Path::new("inside.txt"),
+        b"should_be_deleted",
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
     sandbox.reset().await.unwrap();
 
-    // After reset, the work_dir must contain only the sentinel file.
+    // After reset, the work_dir must be completely empty.
     let entries: Vec<String> = std::fs::read_dir(&work_dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
         .collect();
     assert!(
-        entries.iter().all(|n| n == BwrapEnv::SENTINEL_NAME),
-        "work dir must only contain sentinel after reset; got: {:?}",
+        entries.is_empty(),
+        "work dir must be empty after reset; got: {:?}",
         entries
     );
 
-    // The pre-reset file must be gone.
-    assert!(
-        !work_dir.join("inside.txt").exists(),
-        "inside.txt must be deleted by reset"
-    );
-
+    // The outside file must survive.
     let content = tokio::fs::read_to_string(&outside_file).await.unwrap();
     assert_eq!(content, "should_survive");
+
+    // Cleanup.
+    let _ = std::fs::remove_dir_all(&work_dir);
 }
 
-/// P0: reset() refuses root path.
+/// P0: reset() refuses caller-provided directories.
+///
+/// The sandbox must not claim ownership of directories it did not create.
+/// A caller-provided work_dir (work_dir=Some(path)) can never be reset.
 #[tokio::test]
-async fn reset_refuses_unsafe_paths() {
+async fn reset_refuses_caller_provided_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let work_dir = dir.path().join("workspace");
+    tokio::fs::create_dir_all(&work_dir).await.unwrap();
+
+    let sandbox = BwrapSandbox::new(default_config(work_dir.clone())).unwrap();
+    let result = sandbox.reset().await;
+    assert!(
+        result.is_err(),
+        "reset must refuse caller-provided directory"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("does not own"),
+        "error must mention ownership; got: {}",
+        err
+    );
+
+    // The directory and its contents must be untouched.
+    assert!(work_dir.exists(), "caller directory must still exist");
+}
+
+/// P0: reset() refuses root path (caller-provided, not owned).
+#[tokio::test]
+async fn reset_refuses_root_path() {
     let config = SandboxConfig {
         fs_allowlist: vec![],
         fs_denylist: vec![],
@@ -411,7 +460,34 @@ async fn reset_refuses_unsafe_paths() {
     assert!(result.is_err(), "reset must refuse root path");
 }
 
-/// P0: reset() refuses `/tmp` (shallow path, would delete all temp files).
+/// P0: reset() refuses /var/lib (caller-provided, not owned).
+///
+/// The old sentinel model would claim /var/lib by writing a sentinel.
+/// The ownership model never claims caller-provided directories.
+#[tokio::test]
+async fn reset_refuses_var_lib() {
+    let config = SandboxConfig {
+        fs_allowlist: vec![],
+        fs_denylist: vec![],
+        net_allowlist: vec![],
+        resource_limits: ResourceLimits {
+            max_cpus: None,
+            max_memory_mb: None,
+            max_disk_mb: None,
+            timeout: None,
+        },
+        work_dir: Some(PathBuf::from("/var/lib")),
+    };
+    let sandbox = BwrapSandbox::new(config).unwrap();
+    let result = sandbox.reset().await;
+    assert!(result.is_err(), "reset must refuse /var/lib");
+    assert!(
+        result.unwrap_err().to_string().contains("does not own"),
+        "error must mention ownership"
+    );
+}
+
+/// P0: reset() refuses /tmp (caller-provided, not owned).
 #[tokio::test]
 async fn reset_refuses_tmp_directory() {
     let config = SandboxConfig {
@@ -428,17 +504,10 @@ async fn reset_refuses_tmp_directory() {
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let result = sandbox.reset().await;
-    assert!(result.is_err(), "reset must refuse /tmp (shallow path)");
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("safe disposable root"),
-        "error must mention disposable root"
-    );
+    assert!(result.is_err(), "reset must refuse /tmp");
 }
 
-/// P0: reset() refuses `.` (canonicalizes to cwd).
+/// P0: reset() refuses "." (caller-provided, not owned).
 #[tokio::test]
 async fn reset_refuses_dot_path() {
     let config = SandboxConfig {
@@ -455,13 +524,124 @@ async fn reset_refuses_dot_path() {
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let result = sandbox.reset().await;
+    assert!(result.is_err(), "reset must refuse '.' (not owned)");
+}
+
+/// P0: After reset(), file operations still work (Dir handle not invalidated).
+#[tokio::test]
+async fn reset_preserves_file_api_usability() {
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    let env = sandbox.env();
+    let work_dir = env.working_dir().to_path_buf();
+
+    env.write_file(Path::new("before.txt"), b"before", CancellationToken::new())
+        .await
+        .unwrap();
+
+    sandbox.reset().await.unwrap();
+
+    let result = env
+        .write_file(Path::new("after.txt"), b"after", CancellationToken::new())
+        .await;
     assert!(
-        result.is_err(),
-        "reset must refuse '.' (canonicalizes to cwd)"
+        result.is_ok(),
+        "write_file after reset must succeed; got: {:?}",
+        result
+    );
+
+    let _ = std::fs::remove_dir_all(&work_dir);
+}
+
+/// P0: Auto-generated workspace has 0700 permissions.
+///
+/// create_dir_all() is subject to umask and typically yields 0755, allowing
+/// other Unix users to read agent files. The sandbox must use 0700.
+#[tokio::test]
+async fn auto_generated_dir_has_0700_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    let work_dir = sandbox.env().working_dir().to_path_buf();
+
+    let meta = std::fs::metadata(&work_dir).unwrap();
+    let mode = meta.permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o700,
+        "auto-generated work_dir must have 0700 permissions; got {:04o}",
+        mode & 0o777
+    );
+
+    let _ = std::fs::remove_dir_all(&work_dir);
+}
+
+/// P0: Agent cannot break reset by modifying the workspace.
+///
+/// The old sentinel model placed a sentinel file inside the agent-writable
+/// workspace; the agent could delete it to permanently disable reset().
+/// The ownership model tracks ownership in memory, so the agent cannot
+/// tamper with it.
+#[tokio::test]
+async fn agent_cannot_break_reset() {
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    let env = sandbox.env();
+    let work_dir = env.working_dir().to_path_buf();
+
+    // Agent writes and deletes files in the workspace.
+    env.write_file(Path::new("file1.txt"), b"data", CancellationToken::new())
+        .await
+        .unwrap();
+    env.remove(
+        Path::new("file1.txt"),
+        false,
+        true,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    // Reset must still work — ownership is in memory, not the filesystem.
+    sandbox.reset().await.unwrap();
+
+    let entries: Vec<String> = std::fs::read_dir(&work_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(entries.is_empty(), "work dir must be empty after reset");
+
+    let _ = std::fs::remove_dir_all(&work_dir);
+}
+
+/// P1: shutdown() deletes owned (auto-generated) directories.
+#[tokio::test]
+async fn shutdown_deletes_owned_directory() {
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    let work_dir = sandbox.env().working_dir().to_path_buf();
+    assert!(work_dir.exists(), "work_dir must exist before shutdown");
+
+    Box::new(sandbox).shutdown().await.unwrap();
+
+    assert!(
+        !work_dir.exists(),
+        "owned work_dir must be deleted by shutdown"
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
+/// P1: shutdown() does NOT delete caller-provided directories.
+#[tokio::test]
+async fn shutdown_preserves_caller_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let work_dir = dir.path().join("workspace");
+    tokio::fs::create_dir_all(&work_dir).await.unwrap();
+
+    let sandbox = BwrapSandbox::new(default_config(work_dir.clone())).unwrap();
+    Box::new(sandbox).shutdown().await.unwrap();
+
+    assert!(
+        work_dir.exists(),
+        "caller-provided work_dir must NOT be deleted by shutdown"
+    );
+}
+
 // Lifecycle — bwrap required
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -829,82 +1009,34 @@ async fn config_timeout_enforced_as_upper_bound() {
     );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Reset ownership & capability lifecycle — no bwrap required
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// P0: After reset(), file operations still work (Dir handle not invalidated).
-///
-/// reset() clears directory contents via the cap-std Dir handle rather than
-/// removing and recreating the directory, so the capability handle remains
-/// valid.
-#[tokio::test]
-async fn reset_preserves_file_api_usability() {
-    let dir = tempfile::tempdir().unwrap();
-    let work_dir = dir.path().join("workspace");
-    tokio::fs::create_dir_all(&work_dir).await.unwrap();
-
-    let sandbox = BwrapSandbox::new(default_config(work_dir.clone())).unwrap();
-    let env = sandbox.env();
-
-    env.write_file(Path::new("before.txt"), b"before", CancellationToken::new())
-        .await
-        .unwrap();
-
-    sandbox.reset().await.unwrap();
-
-    // This should succeed but fails if Dir handle is stale.
-    let result = env
-        .write_file(Path::new("after.txt"), b"after", CancellationToken::new())
-        .await;
-    assert!(
-        result.is_ok(),
-        "write_file after reset must succeed; got: {:?}",
-        result
-    );
-}
-
-/// P0: is_safe_disposable_root rejects well-known system directories
-/// like /var/lib that have sufficient path components but must never be
-/// used as disposable roots.
-#[tokio::test]
-async fn is_safe_disposable_root_rejects_system_directories() {
-    // /var/lib has 2 path components and is not cwd.
-    let result = BwrapSandbox::is_safe_disposable_root(Path::new("/var/lib"));
-    assert!(
-        !result,
-        "/var/lib must NOT be considered a safe disposable root"
-    );
-}
-
-/// P0: work_dir=None generates a unique directory per sandbox to prevent
-/// cross-agent file leakage and mutual reset.
+/// P0: work_dir=None generates a unique directory per sandbox with 0700
+/// permissions to prevent cross-agent file leakage and mutual reset.
 #[tokio::test]
 async fn work_dir_none_generates_unique_directory() {
-    let config_none = SandboxConfig {
-        fs_allowlist: vec![],
-        fs_denylist: vec![],
-        net_allowlist: vec![],
-        resource_limits: ResourceLimits {
-            max_cpus: None,
-            max_memory_mb: None,
-            max_disk_mb: None,
-            timeout: None,
-        },
-        work_dir: None,
-    };
+    use std::os::unix::fs::PermissionsExt;
 
-    let sandbox1 = BwrapSandbox::new(config_none.clone()).unwrap();
-    let sandbox2 = BwrapSandbox::new(config_none).unwrap();
+    let sandbox1 = BwrapSandbox::new(owned_config()).unwrap();
+    let sandbox2 = BwrapSandbox::new(owned_config()).unwrap();
 
     let dir1 = sandbox1.env().working_dir().to_path_buf();
     let dir2 = sandbox2.env().working_dir().to_path_buf();
 
+    assert_ne!(dir1, dir2, "work_dir=None must generate unique directories");
+
+    // Both must have 0700 permissions.
+    for d in [&dir1, &dir2] {
+        let mode = std::fs::metadata(d).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "auto-generated dir must have 0700; got {:04o}",
+            mode & 0o777
+        );
+    }
+
     // Clean up.
     let _ = std::fs::remove_dir_all(&dir1);
     let _ = std::fs::remove_dir_all(&dir2);
-
-    assert_ne!(dir1, dir2, "work_dir=None must generate unique directories");
 }
 
 /// P0: working_dir() returns the configured path, not the canonicalized
