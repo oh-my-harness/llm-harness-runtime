@@ -364,7 +364,7 @@ impl ExecutionEnv for OsEnv {
                 .spawn()
                 .map_err(EnvError::Io)?;
 
-            drain_child_output(child, opts).await
+            drain_child_output(child, opts, None).await
         }
         .boxed()
     }

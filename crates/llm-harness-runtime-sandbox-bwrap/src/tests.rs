@@ -1184,3 +1184,283 @@ async fn cancellation_observed_while_queued() {
     let _ = tokio::time::timeout(Duration::from_secs(15), cmd_handle).await;
     Box::new(sandbox).shutdown().await.unwrap();
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Round 7 lifecycle fixes — P0 regression tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// P0: shutdown() must NOT delete the workspace when lock acquisition times out.
+///
+/// If an operation holds the lock longer than `SHUTDOWN_KILL_GRACE`,
+/// `shutdown()` must return an error and leave the workspace intact rather
+/// than deleting it while work may still be in progress.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn shutdown_preserves_workspace_on_lock_timeout() {
+    require_bwrap();
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    sandbox.start().await.unwrap();
+    let env = sandbox.env.clone(); // Arc<BwrapEnv> — access private fields
+    let work_dir = env.working_dir().to_path_buf();
+
+    // Hold the reset_lock in a separate task so shutdown cannot acquire it
+    // within the timeout.  The task holds the lock for 8s (> 5s grace).
+    let env_for_lock = env.clone();
+    let lock_handle = tokio::spawn(async move {
+        let guard = env_for_lock.reset_lock.lock().await;
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        drop(guard);
+    });
+
+    // Give the lock-holder time to acquire.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let start = std::time::Instant::now();
+    let result = Box::new(sandbox).shutdown().await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_err(),
+        "shutdown must return Err when lock times out"
+    );
+    assert!(
+        elapsed >= Duration::from_secs(4),
+        "shutdown should wait at least ~4s before timing out; took {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(7),
+        "shutdown should time out before the lock holder releases; took {elapsed:?}"
+    );
+    assert!(
+        work_dir.exists(),
+        "workspace must be preserved when lock acquisition times out"
+    );
+
+    // Clean up: wait for the lock holder to release, then delete manually.
+    let _ = lock_handle.await;
+    let _ = std::fs::remove_dir_all(&work_dir);
+}
+
+/// P0: No spawn/register race — a command started concurrently with shutdown
+/// must be killed, and shutdown must complete in bounded time.
+///
+/// This tests the race where shutdown fires before drain_child_output has
+/// started polling.  With kill_on_drop(true) and the shutdown token wired
+/// into drain, the child is killed regardless of the timing.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn shutdown_race_with_command_start() {
+    require_bwrap();
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    sandbox.start().await.unwrap();
+    let env = sandbox.env();
+    let work_dir = env.working_dir().to_path_buf();
+
+    // Start a long-running command with NO timeout and NO abort.
+    let env_clone = env.clone();
+    let cmd_handle = tokio::spawn(async move {
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+        let _ = env_clone.execute_shell("sleep 30", opts).await;
+    });
+
+    // Shutdown immediately — no delay to let the command start.
+    let start = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(15), Box::new(sandbox).shutdown()).await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_ok(),
+        "shutdown must complete within 15s even when racing with command start"
+    );
+    assert!(result.unwrap().is_ok(), "shutdown must not return an error");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "shutdown must be bounded; took {elapsed:?}"
+    );
+
+    // The command task must finish (child killed by shutdown).
+    let cmd_result = tokio::time::timeout(Duration::from_secs(5), cmd_handle).await;
+    assert!(
+        cmd_result.is_ok(),
+        "command task must complete after shutdown"
+    );
+
+    assert!(
+        !work_dir.exists(),
+        "owned work_dir must be deleted by shutdown"
+    );
+}
+
+/// P0: Dropping an execute_shell future must kill the child (kill_on_drop).
+///
+/// If the caller abandons the future, the child process must not survive.
+/// We verify by starting a command that creates a sentinel file after a
+/// delay, dropping the future, and checking the sentinel never appears.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn dropped_future_kills_child() {
+    require_bwrap();
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    sandbox.start().await.unwrap();
+    let env = sandbox.env();
+    let work_dir = env.working_dir().to_path_buf();
+
+    // Start a command that sleeps then creates a sentinel.
+    let env_clone = env.clone();
+    let handle = tokio::spawn(async move {
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+        let _ = env_clone
+            .execute_shell("sleep 3 && touch sentinel.txt", opts)
+            .await;
+    });
+
+    // Give the command time to start and acquire the lock.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Abort the task — this drops the execute_shell future.
+    handle.abort();
+
+    // Wait long enough that the sleep would have completed if the child
+    // were still alive (3s sleep + margin).
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    assert!(
+        !work_dir.join("sentinel.txt").exists(),
+        "child must have been killed when future was dropped — sentinel must not exist"
+    );
+
+    // Sandbox should still be usable.
+    let result = env.execute_shell("echo alive", shell_opts()).await;
+    assert!(
+        result.is_ok(),
+        "sandbox should still be usable after dropped future"
+    );
+
+    Box::new(sandbox).shutdown().await.unwrap();
+}
+
+/// P0: reset() must interrupt a running command (no timeout) via token swap.
+///
+/// reset() swaps in a fresh shutdown token and cancels the old one.
+/// drain_child_output observes the cancellation, kills+waits the child,
+/// and reset acquires the lock in bounded time.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn reset_interrupts_running_command() {
+    require_bwrap();
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    sandbox.start().await.unwrap();
+    let env = sandbox.env();
+
+    // Start a long-running command with NO timeout and NO abort.
+    let env_clone = env.clone();
+    let cmd_handle = tokio::spawn(async move {
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+        let _ = env_clone.execute_shell("sleep 30", opts).await;
+    });
+
+    // Give the command time to start.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Reset must complete in bounded time despite the running command.
+    let start = std::time::Instant::now();
+    sandbox.reset().await.unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "reset must complete quickly despite running command; took {elapsed:?}"
+    );
+
+    // The command task must finish (killed by reset's token swap).
+    let cmd_result = tokio::time::timeout(Duration::from_secs(5), cmd_handle).await;
+    assert!(cmd_result.is_ok(), "command task must complete after reset");
+
+    // Sandbox should still be usable after reset (fresh token installed).
+    let result = env.execute_shell("echo alive", shell_opts()).await;
+    assert!(result.is_ok(), "sandbox should still be usable after reset");
+
+    Box::new(sandbox).shutdown().await.unwrap();
+}
+
+/// P0: No orphan bwrap processes remain after shutdown kills a running command.
+///
+/// Verifies the full kill+wait path: shutdown cancels the token,
+/// drain_child_output kills and reaps the child, and no zombie or orphan
+/// survives.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn no_orphan_after_shutdown() {
+    require_bwrap();
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    sandbox.start().await.unwrap();
+    let env = sandbox.env();
+
+    // Start a long-running command.
+    let env_clone = env.clone();
+    let cmd_handle = tokio::spawn(async move {
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+        let _ = env_clone.execute_shell("sleep 30", opts).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Count bwrap processes before shutdown.
+    let before = count_bwrap_processes();
+
+    Box::new(sandbox).shutdown().await.unwrap();
+
+    // Command task must finish.
+    let _ = tokio::time::timeout(Duration::from_secs(5), cmd_handle).await;
+
+    // Give the OS a moment to reap any remaining zombies.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let after = count_bwrap_processes();
+    assert!(
+        after <= before,
+        "no new bwrap processes should remain after shutdown; before={before}, after={after}"
+    );
+}
+
+/// Helper: count bwrap processes on the system.
+fn count_bwrap_processes() -> usize {
+    std::process::Command::new("pgrep")
+        .arg("-c")
+        .arg("bwrap")
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}

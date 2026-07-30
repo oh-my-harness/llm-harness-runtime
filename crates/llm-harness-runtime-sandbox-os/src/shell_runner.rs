@@ -6,6 +6,7 @@
 //! `utf8_safe_boundary` as an internal detail.
 
 use llm_harness_types::{EnvError, ShellOptions, ShellOutput};
+use tokio_util::sync::CancellationToken;
 
 /// Find the index of the last complete UTF-8 character boundary in `bytes`.
 ///
@@ -43,14 +44,24 @@ fn utf8_safe_boundary(bytes: &[u8]) -> usize {
 }
 
 /// Drain stdout/stderr from an already-spawned child process, applying
-/// timeout and abort semantics.
+/// timeout, abort, and shutdown semantics.
 ///
-/// On timeout or abort, sends `start_kill()` **and waits** for the child to
-/// exit so no zombie or orphan processes remain.
+/// On timeout, abort, or shutdown cancellation, sends `start_kill()` **and
+/// waits** for the child to exit so no zombie or orphan processes remain.
+///
+/// When `shutdown` is `Some(token)`, cancellation of that token also kills
+/// and waits the child.  This lets sandbox backends (e.g. `BwrapEnv`) wire
+/// their internal shutdown signal into the same kill-and-reap path without
+/// duplicating process-handling logic.  `OsEnv` passes `None`.
 pub async fn drain_child_output(
     mut child: tokio::process::Child,
     opts: ShellOptions<'_>,
+    shutdown: Option<CancellationToken>,
 ) -> Result<ShellOutput, EnvError> {
+    // Use a never-cancelled token when the caller has no shutdown signal so
+    // the select branches below can use it unconditionally.
+    let shutdown_token = shutdown.unwrap_or_default();
+
     let mut stdout_handle = child.stdout.take();
     let mut stderr_handle = child.stderr.take();
 
@@ -103,6 +114,11 @@ pub async fn drain_child_output(
     let (stdout, stderr, status) = if let Some(timeout) = opts.timeout {
         tokio::select! {
             biased;
+            _ = shutdown_token.cancelled() => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(EnvError::Other("sandbox is shutting down".into()));
+            }
             _ = opts.abort.cancelled() => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
@@ -129,6 +145,11 @@ pub async fn drain_child_output(
     } else {
         tokio::select! {
             biased;
+            _ = shutdown_token.cancelled() => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(EnvError::Other("sandbox is shutting down".into()));
+            }
             _ = opts.abort.cancelled() => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
