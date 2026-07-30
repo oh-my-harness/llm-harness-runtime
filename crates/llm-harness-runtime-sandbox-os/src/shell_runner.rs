@@ -166,85 +166,203 @@ pub async fn drain_child_output(
 
 // ── Guarded drain with shutdown token + guaranteed reap ────────────────────
 
-/// A centralized, single-threaded child process reaper.
+/// Bounded capacity of the reaper queue.
+const REAPER_QUEUE_CAPACITY: usize = 256;
+
+/// Number of worker threads processing kill+reap requests.
+const REAPER_WORKERS: usize = 4;
+
+/// Per-child timeout in a worker before moving the child to the stuck list.
+/// Prevents one stuck (D-state) child from blocking a worker indefinitely.
+const REAP_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often the stuck reaper thread checks stuck children.
+const STUCK_REAPER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A centralized, multi-worker child process reaper.
 ///
 /// Instead of spawning one OS thread per dropped child (which risks
 /// unbounded thread creation and panics in `Drop` when thread creation
-/// fails), this struct owns a **single** dedicated reaper thread that
-/// processes kill+reap requests from an MPSC channel.
+/// fails), this struct owns a pool of dedicated reaper threads that
+/// process kill+reap requests from a **bounded** MPSC channel.  Multiple
+/// workers ensure one stuck child cannot block reaping of others.
 ///
-/// The reaper thread is created lazily on first use.  If thread creation
+/// Children that don't exit within [`REAP_WORKER_TIMEOUT`] are moved to a
+/// stuck list and revisited periodically by a dedicated thread — their
+/// handles are never dropped until `try_wait` confirms exit, so no zombie
+/// survives.
+///
+/// The reaper threads are created lazily on first use.  If thread creation
 /// fails (extreme resource exhaustion), `global()` returns `None` and
-/// callers must fall back to SIGKILL-only (init reaps the zombie when the
-/// parent process exits).
+/// callers fall back to reaping in a dedicated fallback thread (or inline
+/// if even that fails).  No path drops the child handle without reaping.
 struct ChildReaper {
-    sender: std::sync::mpsc::Sender<tokio::process::Child>,
+    sender: std::sync::mpsc::SyncSender<tokio::process::Child>,
+    /// Kept alive so worker threads and the stuck reaper can access the
+    /// shared list; not read directly after construction.
+    #[allow(dead_code)]
+    stuck: std::sync::Arc<std::sync::Mutex<Vec<tokio::process::Child>>>,
 }
 
 impl ChildReaper {
-    /// Returns the global reaper instance, or `None` if the reaper thread
+    /// Returns the global reaper instance, or `None` if the reaper threads
     /// could not be created.
     fn global() -> Option<&'static ChildReaper> {
         static REAPER: std::sync::OnceLock<Option<ChildReaper>> = std::sync::OnceLock::new();
         REAPER
             .get_or_init(|| {
-                let (sender, receiver) = std::sync::mpsc::channel::<tokio::process::Child>();
-                match std::thread::Builder::new()
-                    .name("child-reaper".to_string())
-                    .spawn(move || Self::reaper_loop(receiver))
-                {
-                    Ok(_) => Some(ChildReaper { sender }),
-                    Err(_) => None,
+                let (sender, receiver) =
+                    std::sync::mpsc::sync_channel::<tokio::process::Child>(REAPER_QUEUE_CAPACITY);
+                let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+                let stuck = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+                for i in 0..REAPER_WORKERS {
+                    let rx = receiver.clone();
+                    let stuck = stuck.clone();
+                    if std::thread::Builder::new()
+                        .name(format!("child-reaper-{i}"))
+                        .spawn(move || Self::worker_loop(rx, stuck))
+                        .is_err()
+                    {
+                        return None;
+                    }
                 }
+
+                let stuck_clone = stuck.clone();
+                if std::thread::Builder::new()
+                    .name("child-reaper-stuck".to_string())
+                    .spawn(move || Self::stuck_loop(stuck_clone))
+                    .is_err()
+                {
+                    return None;
+                }
+
+                Some(ChildReaper { sender, stuck })
             })
             .as_ref()
     }
 
-    /// The reaper thread's main loop.  Receives children from the channel
-    /// and kills+reaps each one sequentially.
-    fn reaper_loop(receiver: std::sync::mpsc::Receiver<tokio::process::Child>) {
-        while let Ok(mut child) = receiver.recv() {
-            let _ = child.start_kill();
-            Self::reap_one(&mut child);
-        }
-    }
-
-    /// Kill and reap a single child, with bounded retry on `try_wait()`
-    /// errors and a timeout for stuck (D-state) processes.
-    fn reap_one(child: &mut tokio::process::Child) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut consecutive_errors = 0u32;
+    /// Worker thread main loop.  Receives children from the shared
+    /// receiver and kills+reaps each one with a bounded timeout.  Children
+    /// that don't exit within the timeout are moved to the stuck list so
+    /// their handles are not dropped.
+    fn worker_loop(
+        receiver: std::sync::Arc<
+            std::sync::Mutex<std::sync::mpsc::Receiver<tokio::process::Child>>,
+        >,
+        stuck: std::sync::Arc<std::sync::Mutex<Vec<tokio::process::Child>>>,
+    ) {
         loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break, // Reaped successfully.
-                Ok(None) => {
-                    consecutive_errors = 0;
-                    if std::time::Instant::now() >= deadline {
-                        // Child didn't exit within 10s after SIGKILL
-                        // (e.g., D-state / uninterruptible sleep).
-                        // Give up — init will reap when parent exits.
-                        break;
+            let child = match receiver.lock() {
+                Ok(rx) => rx.recv(),
+                Err(_) => break, // Mutex poisoned — exit.
+            };
+            match child {
+                Ok(mut child) => {
+                    let _ = child.start_kill();
+                    let deadline = std::time::Instant::now() + REAP_WORKER_TIMEOUT;
+                    let mut reaped = false;
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => {
+                                reaped = true;
+                                break;
+                            }
+                            Ok(None) => {
+                                if std::time::Instant::now() >= deadline {
+                                    break; // Move to stuck list.
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            Err(_) => {
+                                reaped = true; // Likely ECHILD (already reaped).
+                                break;
+                            }
+                        }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(_) => {
-                    consecutive_errors += 1;
-                    if consecutive_errors >= 10 {
-                        // Persistent error — likely ECHILD (already reaped
-                        // by something else).  Stop retrying.
-                        break;
+                    if !reaped {
+                        match stuck.lock() {
+                            Ok(mut list) => list.push(child),
+                            Err(_) => Self::reap_to_completion(&mut child),
+                        }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
+                Err(_) => break, // Channel disconnected — exit.
             }
         }
     }
 
-    /// Queue a child for killing and reaping.  Does not panic and does not
-    /// create a new thread.
+    /// Stuck reaper thread.  Periodically revisits children that didn't
+    /// exit within the worker timeout.  Children are never dropped until
+    /// `try_wait` confirms exit.
+    fn stuck_loop(stuck: std::sync::Arc<std::sync::Mutex<Vec<tokio::process::Child>>>) {
+        loop {
+            std::thread::sleep(STUCK_REAPER_INTERVAL);
+            let mut list = match stuck.lock() {
+                Ok(list) => list,
+                Err(_) => break,
+            };
+            let mut still_stuck = Vec::with_capacity(list.len());
+            while let Some(mut child) = list.pop() {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => {}
+                    Ok(None) => still_stuck.push(child),
+                }
+            }
+            *list = still_stuck;
+        }
+    }
+
+    /// Queue a child for killing and reaping.  If the queue is full or
+    /// disconnected, reaps the child in a fallback thread (or inline if
+    /// thread creation fails).  No path drops the child handle without
+    /// reaping.
     fn reap(&self, mut child: tokio::process::Child) {
         let _ = child.start_kill();
-        let _ = self.sender.send(child);
+        match self.sender.try_send(child) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(child))
+            | Err(std::sync::mpsc::TrySendError::Disconnected(child)) => {
+                reap_with_fallback(child);
+            }
+        }
+    }
+
+    /// Kill and reap a child, never giving up.  Loops with `try_wait`
+    /// until the child exits or `try_wait` returns an error (ECHILD).
+    /// For truly stuck (D-state) processes, this loops indefinitely —
+    /// the handle is never dropped, so no zombie is left.
+    fn reap_to_completion(child: &mut tokio::process::Child) {
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl ChildReaper {
+    /// Create a ChildReaper whose receiver is already disconnected.
+    /// Used to test the `SendError` recovery path.
+    fn new_disconnected() -> ChildReaper {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+        ChildReaper {
+            sender,
+            stuck: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Create a ChildReaper with a bounded queue and no worker threads.
+    /// The queue can be filled to test the `Full` fallback path.
+    fn new_no_workers(capacity: usize) -> ChildReaper {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(capacity);
+        ChildReaper {
+            sender,
+            stuck: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
     }
 }
 
@@ -256,13 +374,13 @@ impl ChildReaper {
 /// `Drop` — it cannot `await`, so the child is not reaped (reaped via Tokio's
 /// best-effort SIGCHLD orphan queue, which requires the signal driver and is
 /// not guaranteed).  This guard closes that gap by delegating to a
-/// **centralized [`ChildReaper`]** — a single dedicated OS thread that
-/// polls `try_wait()` (synchronous `waitpid` with `WNOHANG`) until the child
+/// **centralized [`ChildReaper`]** — a pool of dedicated OS threads that
+/// poll `try_wait()` (synchronous `waitpid` with `WNOHANG`) until the child
 /// exits, ensuring the zombie is reaped regardless of Tokio runtime state.
 ///
-/// Using a centralized reaper (instead of spawning one thread per child)
-/// avoids unbounded thread creation and prevents panics in `Drop` when
-/// thread creation fails.  The reaper thread is independent of the Tokio
+/// Using a centralized reaper pool (instead of spawning one thread per
+/// child) avoids unbounded thread creation and prevents panics in `Drop`
+/// when thread creation fails.  The reaper threads are independent of the Tokio
 /// runtime lifecycle: it survives runtime shutdown and works when no
 /// runtime exists at all.
 ///
@@ -321,22 +439,40 @@ impl Drop for ReapGuard {
             return;
         }
         if let Some(child) = self.child.take() {
-            // Delegate to the centralized reaper.  This does not create a
-            // new thread and cannot panic — the child is queued for the
-            // single dedicated reaper thread, which kills and reaps it via
-            // `try_wait()` polling.
-            //
-            // If the reaper thread is unavailable (creation failed on first
-            // use due to extreme resource exhaustion), the child is
-            // SIGKILL'd here and will be reaped by init (PID 1) when the
-            // parent process exits.  This is degraded but safe.
+            // Delegate to the centralized reaper.  If the reaper is
+            // unavailable (thread creation failed on first use), spawn a
+            // fallback thread to reap — or reap inline as a last resort.
+            // No path drops the child handle without reaping.
             if let Some(reaper) = ChildReaper::global() {
                 reaper.reap(child);
             } else {
-                let mut child = child;
-                let _ = child.start_kill();
+                reap_with_fallback(child);
             }
         }
+    }
+}
+
+/// Reap a child in a fallback thread, or inline if thread creation fails.
+///
+/// Uses a shared `Arc<Mutex<Option>>` so the child handle is conditionally
+/// moved into the thread only when `spawn` succeeds.  If `spawn` fails, the
+/// handle is recovered and reaped inline (blocking the caller).  No path
+/// drops the handle without reaping.
+fn reap_with_fallback(mut child: tokio::process::Child) {
+    let _ = child.start_kill();
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let thread_shared = shared.clone();
+    if std::thread::Builder::new()
+        .name("child-reap-fallback".to_string())
+        .spawn(move || {
+            if let Some(mut c) = thread_shared.lock().unwrap().take() {
+                ChildReaper::reap_to_completion(&mut c);
+            }
+        })
+        .is_err()
+        && let Some(mut c) = shared.lock().unwrap().take()
+    {
+        ChildReaper::reap_to_completion(&mut c);
     }
 }
 
@@ -485,7 +621,7 @@ pub async fn drain_child_output_guarded(
 
 #[cfg(all(test, unix))]
 mod reap_tests {
-    use super::ReapGuard;
+    use super::{ChildReaper, ReapGuard, reap_with_fallback};
     use std::time::Duration;
 
     /// Check whether a process has been fully reaped (gone from /proc).
@@ -654,5 +790,139 @@ mod reap_tests {
         });
 
         drop(rt);
+    }
+
+    /// Spawn a child process inside a temporary Tokio runtime (required by
+    /// `tokio::process::Command::spawn`).  The runtime is dropped after
+    /// spawning — the child handle remains valid for `start_kill` and
+    /// `try_wait`, which are synchronous and don't need a runtime.
+    fn spawn_child(cmd: &str, arg: &str) -> tokio::process::Child {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            tokio::process::Command::new(cmd)
+                .arg(arg)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+    }
+
+    /// P1/P0: reap() with a disconnected receiver must still reap the child.
+    ///
+    /// The old code ignored `SendError<Child>`, dropping the handle without
+    /// `wait()`.  The PID remained in /proc as a zombie.  The fix recovers
+    /// the child from `SendError` and reaps it via a fallback thread.
+    #[test]
+    fn reap_recovers_child_on_disconnected_receiver() {
+        let reaper = ChildReaper::new_disconnected();
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        reaper.reap(child);
+
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped after reap() with disconnected receiver"
+        );
+    }
+
+    /// P1/P0: reap() with a full queue must still reap the child.
+    ///
+    /// When the bounded queue is saturated, `try_send` returns `Full`.  The
+    /// child must be recovered and reaped via the fallback path, not dropped.
+    #[test]
+    fn reap_recovers_child_on_full_queue() {
+        let reaper = ChildReaper::new_no_workers(1);
+
+        // Fill the queue with a killed child.
+        let filler = spawn_child("sleep", "30");
+        let filler_pid = filler.id().expect("filler must have a PID");
+        reaper.reap(filler);
+
+        // Now reap a second child — try_send will fail with Full.
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+        reaper.reap(child);
+
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped after reap() with full queue"
+        );
+
+        // The filler was killed by reap() and will be reaped by the OS
+        // since no workers are draining the queue.
+        assert!(
+            wait_for_reap(filler_pid, Duration::from_secs(5)),
+            "filler PID {filler_pid} must be gone"
+        );
+    }
+
+    /// P1/P0: A stuck child must not block reaping of other children.
+    ///
+    /// With multiple worker threads, one slow-to-exit child does not
+    /// prevent other children from being reaped promptly.
+    #[test]
+    fn stuck_child_does_not_block_healthy_children() {
+        let reaper = ChildReaper::global().expect("global reaper must be available");
+
+        let slow_child = spawn_child("sleep", "30");
+        let slow_pid = slow_child.id().expect("slow child must have a PID");
+        reaper.reap(slow_child);
+
+        // Submit multiple healthy children that exit quickly.
+        let mut pids = Vec::new();
+        for _ in 0..4 {
+            let child = spawn_child("true", "");
+            let pid = child.id().expect("child must have a PID");
+            pids.push(pid);
+            reaper.reap(child);
+        }
+
+        for &pid in &pids {
+            assert!(
+                wait_for_reap(pid, Duration::from_secs(3)),
+                "healthy child PID {pid} must be reaped promptly despite a slow sibling"
+            );
+        }
+
+        assert!(
+            wait_for_reap(slow_pid, Duration::from_secs(10)),
+            "slow child PID {slow_pid} must eventually be reaped"
+        );
+    }
+
+    /// P1/P0: reap_to_completion never gives up — it loops until the child
+    /// exits.  No path drops the handle without confirming exit status.
+    #[test]
+    fn reap_to_completion_reaps_killed_child() {
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        let mut child = child;
+        let _ = child.start_kill();
+        ChildReaper::reap_to_completion(&mut child);
+
+        assert!(
+            process_is_gone(pid),
+            "child PID {pid} must be gone after reap_to_completion"
+        );
+    }
+
+    /// P1/P0: reap_with_fallback reaps the child via a fallback thread.
+    #[test]
+    fn reap_with_fallback_reaps_child() {
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        reap_with_fallback(child);
+
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped after reap_with_fallback"
+        );
     }
 }

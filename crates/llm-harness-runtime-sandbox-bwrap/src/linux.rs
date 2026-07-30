@@ -84,6 +84,8 @@ fn modified_to_datetime(meta: &cap_std::fs::Metadata) -> DateTime<Utc> {
 /// - `ShuttingDown`: shutdown has begun; new work is rejected, active
 ///   commands are cancelled and killed.
 /// - `Stopped`: shutdown is complete; no further operations are possible.
+/// - `Tainted`: reset cleanup failed or panicked mid-mutation; the sandbox
+///   is unusable and must be shut down and recreated.  New work is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum LifecycleState {
@@ -91,6 +93,7 @@ enum LifecycleState {
     Resetting = 1,
     ShuttingDown = 2,
     Stopped = 3,
+    Tainted = 4,
 }
 
 impl LifecycleState {
@@ -99,11 +102,11 @@ impl LifecycleState {
             0 => LifecycleState::Running,
             1 => LifecycleState::Resetting,
             2 => LifecycleState::ShuttingDown,
-            _ => LifecycleState::Stopped,
+            3 => LifecycleState::Stopped,
+            _ => LifecycleState::Tainted,
         }
     }
 }
-
 /// Maximum time `shutdown()` waits for an active shell command to terminate
 /// after sending kill before proceeding with workspace deletion.
 const SHUTDOWN_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -124,6 +127,11 @@ const SHUTDOWN_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(
 /// the state (`Resetting` → `ShuttingDown`) while reset was in progress,
 /// `finish_reset` returns `false` and the guard does nothing — shutdown
 /// handles cleanup.
+///
+/// Once mutation starts (inside the blocking cleanup task), the guard must
+/// be **handed off** via [`ResetLifecycleGuard::handoff`] so that dropping
+/// the caller future does not roll back to `Running` while cleanup is still
+/// running.  The blocking task then owns the lifecycle transition.
 struct ResetLifecycleGuard {
     env: Arc<BwrapEnv>,
     completed: bool,
@@ -145,10 +153,12 @@ impl ResetLifecycleGuard {
         }
     }
 
-    /// Mark the reset as complete and transition back to `Running`.
-    /// Consumes the guard so `Drop` does not double-transition.
-    fn complete(mut self) {
-        self.env.finish_reset();
+    /// Transfer lifecycle ownership to the blocking cleanup task.
+    /// After this call, dropping the caller future does **not** roll back
+    /// to `Running` — the blocking task is responsible for the final
+    /// lifecycle transition (`finish_reset` on success, `taint` on error).
+    /// Consumes the guard so `Drop` is a no-op.
+    fn handoff(mut self) {
         self.completed = true;
     }
 }
@@ -161,6 +171,27 @@ impl Drop for ResetLifecycleGuard {
             // and we do nothing — shutdown handles cleanup.
             self.env.finish_reset();
         }
+    }
+}
+
+// ── TaintOnDrop ────────────────────────────────────────────────────────────
+
+/// RAII guard used inside the blocking cleanup task to ensure the sandbox
+/// transitions to `Tainted` if cleanup panics or returns an error.
+///
+/// On success, [`BwrapEnv::finish_reset`] transitions `Resetting → Running`
+/// before this guard drops, so the `taint` CAS fails (state is no longer
+/// `Resetting`) and the drop is a no-op.  On error,
+/// [`BwrapEnv::taint`] transitions `Resetting → Tainted` before drop, so
+/// the drop CAS also fails.  Only on **panic** (where neither method was
+/// called) does the drop perform the `Resetting → Tainted` transition.
+struct TaintOnDrop {
+    env: Arc<BwrapEnv>,
+}
+
+impl Drop for TaintOnDrop {
+    fn drop(&mut self) {
+        self.env.taint();
     }
 }
 
@@ -212,7 +243,15 @@ pub struct BwrapEnv {
     /// Mutex ensuring `reset()` / `shutdown()` are mutually exclusive with
     /// file operations and shell execution, so a running agent cannot
     /// recreate content during cleanup.
-    reset_lock: tokio::sync::Mutex<()>,
+    /// Wrapped in `Arc` so `reset()` can obtain an `OwnedMutexGuard` via
+    /// `lock_owned()` and move it into a `spawn_blocking` task, keeping the
+    /// lock held even if the caller future is dropped.
+    reset_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Test-only synchronization hook for `clear_work_dir_contents`.
+    /// When set, the cleanup task signals `started`, waits on `gate`, and
+    /// may simulate failure or panic based on `mode`.
+    #[cfg(test)]
+    cleanup_hook: std::sync::OnceLock<std::sync::Arc<CleanupHook>>,
 }
 
 impl BwrapEnv {
@@ -293,7 +332,9 @@ impl BwrapEnv {
             owned,
             lifecycle: std::sync::atomic::AtomicU8::new(LifecycleState::Running as u8),
             shutdown_token: std::sync::Mutex::new(CancellationToken::new()),
-            reset_lock: tokio::sync::Mutex::new(()),
+            reset_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            cleanup_hook: std::sync::OnceLock::new(),
         })
     }
 
@@ -307,6 +348,13 @@ impl BwrapEnv {
     /// can be `reset()` or deleted by `shutdown()`.
     pub(crate) fn owned(&self) -> bool {
         self.owned
+    }
+
+    /// Install a test-only cleanup hook for phase-controlled cancellation
+    /// tests.  Must be called before `reset()`.
+    #[cfg(test)]
+    fn set_cleanup_hook(&self, hook: CleanupHook) {
+        let _ = self.cleanup_hook.set(std::sync::Arc::new(hook));
     }
 
     /// Returns the current lifecycle state.
@@ -323,6 +371,19 @@ impl BwrapEnv {
             .lifecycle
             .compare_exchange(
                 LifecycleState::Running as u8,
+                LifecycleState::ShuttingDown as u8,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+        // Try Tainted -> ShuttingDown (shutdown of a tainted sandbox).
+        if self
+            .lifecycle
+            .compare_exchange(
+                LifecycleState::Tainted as u8,
                 LifecycleState::ShuttingDown as u8,
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
@@ -365,6 +426,22 @@ impl BwrapEnv {
             .compare_exchange(
                 LifecycleState::Resetting as u8,
                 LifecycleState::Running as u8,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Transition `Resetting -> Tainted`.  Called when reset cleanup fails
+    /// or panics — the workspace may be partially mutated and cannot be
+    /// trusted, so the sandbox becomes permanently unusable.  Returns
+    /// `true` if this call performed the transition.  No-op if the state
+    /// has already moved away from `Resetting` (e.g. shutdown stole it).
+    fn taint(&self) -> bool {
+        self.lifecycle
+            .compare_exchange(
+                LifecycleState::Resetting as u8,
+                LifecycleState::Tainted as u8,
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
             )
@@ -458,6 +535,23 @@ impl BwrapEnv {
     /// Symlinks are removed with `remove_file` (never followed), preventing
     /// accidental deletion of targets outside the sandbox.
     fn clear_work_dir_contents(&self) -> std::io::Result<()> {
+        // Test hook: signal that cleanup has started, then wait for the
+        // test to allow proceed.  This lets phase-controlled tests pause
+        // cleanup at entry, drop the reset future, and verify that
+        // admission is NOT reopened while the blocking task is still
+        // running.
+        #[cfg(test)]
+        if let Some(hook) = self.cleanup_hook.get() {
+            let _ = hook.started.send(());
+            let _ = hook.gate.lock().unwrap().recv();
+            match hook.mode {
+                CleanupMode::Normal => {}
+                CleanupMode::Fail => {
+                    return Err(std::io::Error::other("injected cleanup failure"));
+                }
+                CleanupMode::Panic => panic!("injected cleanup panic"),
+            }
+        }
         let work_cap = &self.caps[0].dir;
         for entry in work_cap.entries()? {
             let entry = entry?;
@@ -1128,10 +1222,12 @@ impl Sandbox for BwrapSandbox {
             // Atomically close admission: Running → Resetting.
             //
             // The RAII guard ensures we roll back to Running if the future
-            // is cancelled (dropped) or any error occurs below — including
-            // lock timeout, spawn_blocking errors, and I/O errors.  Without
-            // this guard, a cancelled reset would leave the lifecycle
-            // permanently stuck in Resetting, making the sandbox unusable.
+            // is cancelled (dropped) or errors out **before mutation
+            // starts** — i.e. during token swap or lock acquisition.  Once
+            // the blocking cleanup task is spawned, lifecycle ownership is
+            // handed off to that task (see guard.handoff() below), so
+            // dropping the caller future does NOT roll back to Running
+            // while cleanup is still in progress.
             let guard = match ResetLifecycleGuard::begin(self.env.clone()) {
                 Some(g) => g,
                 None => anyhow::bail!("sandbox is not running; cannot reset"),
@@ -1159,39 +1255,77 @@ impl Sandbox for BwrapSandbox {
             let old_token = self.env.swap_shutdown_token(CancellationToken::new());
             old_token.cancel();
 
-            // Acquire the lock with a timeout.  Active commands should exit
-            // promptly (killed by the token cancellation above), but the
-            // timeout guarantees boundedness if a file operation is in
-            // progress (file ops don't observe the token mid-execution).
-            // On timeout, the guard rolls back to Running via Drop.
-            let lock_guard = tokio::time::timeout(
+            // Acquire an owned lock guard with a timeout.  Active commands
+            // should exit promptly (killed by the token cancellation
+            // above), but the timeout guarantees boundedness if a file
+            // operation is in progress (file ops don't observe the token
+            // mid-execution).  On timeout, the guard rolls back to Running
+            // via Drop — safe because no mutation has started.
+            //
+            // OwnedMutexGuard is static and can be moved into the
+            // spawn_blocking closure, keeping the lock held for the entire
+            // duration of cleanup even if the caller future is dropped.
+            let owned_guard = tokio::time::timeout(
                 SHUTDOWN_KILL_GRACE,
-                self.env.reset_lock.lock(),
+                self.env.reset_lock.clone().lock_owned(),
             )
             .await
            .map_err(|_| anyhow::anyhow!("reset timed out waiting for lock"))?;
+            // (guard rolls back to Running via Drop on timeout error)
+
+            // Transfer lifecycle ownership to the blocking task.  After
+            // this call, dropping the caller future does NOT roll back to
+            // Running — the blocking task is responsible for the final
+            // transition (finish_reset on success, taint on error or
+            // panic).  This closes the P0 race where cancellation reopens
+            // admission while cleanup is still deleting files.
+            guard.handoff();
 
             let env = self.env.clone();
-            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                env.clear_work_dir_contents()?;
-                Ok(())
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))?
-            .map_err(|e| anyhow::anyhow!("reset failed: {e}"))?;
-            // Hold the lock guard until spawn_blocking completes so no new
-            // command can race into a partially-cleared workspace.
-            // (lock_guard is a tokio::sync::MutexGuard tied to &self, so it
-            // cannot be moved into spawn_blocking which requires 'static.)
-            drop(lock_guard);
+            let handle = tokio::task::spawn_blocking(
+                move || -> std::io::Result<()> {
+                    // TaintOnDrop ensures Resetting->Tainted if cleanup
+                    // panics (neither finish_reset nor taint was called).
+                    // On success, finish_reset() runs first so state is
+                    // Running and this drop's taint() CAS fails (no-op).
+                    // On error, taint() runs first so state is Tainted and
+                    // this drop's CAS also fails (no-op).
+                    let _taint = TaintOnDrop { env: env.clone() };
+                    // Hold the owned lock guard for the entire cleanup so
+                    // no new command can race into a partially-cleared
+                    // workspace.  Released when the closure returns or
+                    // panics (local variable drop).
+                    let _lock = owned_guard;
+                    let result = env.clear_work_dir_contents();
+                    match &result {
+                        Ok(()) => {
+                            env.finish_reset();
+                        }
+                        Err(_) => {
+                            env.taint();
+                        }
+                    }
+                    result
+                },
+            );
 
-            // Transition back to Running, reopening admission with the
-            // fresh token installed by swap_shutdown_token above.
-            // If shutdown stole the state (Resetting → ShuttingDown) while
-            // we were in progress, complete() calls finish_reset() which
-            // returns false — we return Ok and let shutdown handle cleanup.
-            guard.complete();
-            Ok(())
+            // Await the blocking task.  If the caller drops this future,
+            // the JoinHandle is dropped but the task continues — it still
+            // holds the owned lock and the TaintOnDrop guard, so cleanup
+            // completes and the lifecycle transitions correctly.
+            match handle.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(anyhow::anyhow!("reset failed: {e}")),
+                Err(join_err) => {
+                    // Task panicked or was cancelled (runtime shutdown).
+                    // TaintOnDrop may have already run (panic path) or
+                    // not (cancellation path).  Ensure Tainted in either
+                    // case — taint() is a CAS from Resetting, so it is a
+                    // no-op if already transitioned.
+                    self.env.taint();
+                    Err(anyhow::anyhow!("reset task failed: {join_err}"))
+                }
+            }
         }
         .boxed()
     }
@@ -1256,6 +1390,29 @@ impl Sandbox for BwrapSandbox {
     fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
+}
+
+// ── Test hooks ─────────────────────────────────────────────────────────────
+
+/// Synchronization hook for phase-controlled reset cancellation tests.
+///
+/// When installed on a `BwrapEnv`, `clear_work_dir_contents` signals
+/// `started`, blocks on `gate`, then either proceeds normally, returns an
+/// error, or panics, depending on `mode`.
+#[cfg(test)]
+#[derive(Debug)]
+struct CleanupHook {
+    started: std::sync::mpsc::Sender<()>,
+    gate: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    mode: CleanupMode,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum CleanupMode {
+    Normal,
+    Fail,
+    Panic,
 }
 
 #[cfg(test)]

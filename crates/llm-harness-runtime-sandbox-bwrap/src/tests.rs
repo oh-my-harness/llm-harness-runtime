@@ -1699,3 +1699,233 @@ async fn reset_future_drop_rolls_back_to_running() {
     // Clean up the auto-generated workspace.
     Box::new(sandbox).shutdown().await.unwrap();
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase-controlled reset cancellation tests (#97 P0)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Helper: create a BwrapSandbox with a cleanup hook installed.
+fn sandbox_with_hook(
+    mode: super::CleanupMode,
+) -> (
+    BwrapSandbox,
+    std::sync::Arc<super::BwrapEnv>,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    let env = sandbox.env.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+    env.set_cleanup_hook(super::CleanupHook {
+        started: started_tx,
+        gate: std::sync::Mutex::new(gate_rx),
+        mode,
+    });
+    (sandbox, env, started_rx, gate_tx)
+}
+
+/// P0: Dropping the reset future **after mutation has started** must NOT
+/// reopen admission.  The blocking cleanup task continues holding the lock
+/// and lifecycle ownership; new operations are rejected until cleanup
+/// completes.
+///
+/// This is the core race fixed by moving `OwnedMutexGuard` and lifecycle
+/// transition into the `spawn_blocking` task.  Before the fix, dropping the
+/// future released the borrowed `MutexGuard` and rolled back to `Running`,
+/// allowing new writes that the detached cleanup would then delete.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn reset_cancelled_during_mutation_rejects_new_work() {
+    require_bwrap();
+    let (sandbox, env, started_rx, gate_tx) = sandbox_with_hook(super::CleanupMode::Normal);
+    sandbox.start().await.unwrap();
+    let work_dir = env.working_dir().to_path_buf();
+
+    // Write a file before reset so cleanup has something to delete.
+    env.write_file(
+        std::path::Path::new("before.txt"),
+        b"data",
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    // Start reset.  The cleanup task will signal `started`, then block on
+    // `gate`.  We use select! to cancel the reset future once cleanup has
+    // started — this drops the future while spawn_blocking is still running.
+    let reset_fut = sandbox.reset();
+    let started_fut = tokio::task::spawn_blocking(move || {
+        started_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+    });
+
+    tokio::select! {
+        _ = started_fut => {
+            // Cleanup started — reset_fut will be dropped by select!.
+        }
+        result = reset_fut => {
+            panic!("reset must not complete before gate signal; got: {:?}", result);
+        }
+    }
+    // reset_fut is dropped here.  The spawn_blocking task continues,
+    // holding the OwnedMutexGuard and TaintOnDrop guard.
+
+    // Lifecycle must NOT be Running — cleanup is still in progress.
+    assert_ne!(
+        env.lifecycle(),
+        super::LifecycleState::Running,
+        "lifecycle must not be Running while cleanup is still running"
+    );
+
+    // New write operations must be rejected (lifecycle is Resetting,
+    // lock is held by the blocking task).
+    let write_result = env
+        .write_file(
+            std::path::Path::new("admitted-after-cancel.txt"),
+            b"should-not-succeed",
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        write_result.is_err(),
+        "write must be rejected while cleanup is in progress"
+    );
+
+    // Let cleanup proceed.
+    gate_tx.send(()).unwrap();
+
+    // Wait for cleanup to finish and lifecycle to transition to Running.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if env.lifecycle() == super::LifecycleState::Running {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("timeout waiting for lifecycle to return to Running");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The file we tried to write during cleanup must not exist — the write
+    // was rejected, so the detached cleanup could not have deleted it.
+    assert!(
+        !work_dir.join("admitted-after-cancel.txt").exists(),
+        "file written during cleanup must not exist (write was rejected)"
+    );
+
+    // The pre-existing file must have been deleted by cleanup.
+    assert!(
+        !work_dir.join("before.txt").exists(),
+        "pre-existing file must be deleted by cleanup"
+    );
+
+    Box::new(sandbox).shutdown().await.unwrap();
+}
+
+/// P0: If cleanup returns an I/O error after partial deletion, the sandbox
+/// must transition to `Tainted` — not roll back to `Running`.  A partially
+/// mutated workspace cannot be trusted.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn reset_cleanup_error_transitions_to_tainted() {
+    require_bwrap();
+    let (sandbox, env, _started_rx, gate_tx) = sandbox_with_hook(super::CleanupMode::Fail);
+    sandbox.start().await.unwrap();
+
+    env.write_file(
+        std::path::Path::new("file.txt"),
+        b"data",
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    // Pre-send gate so the hook doesn't block.
+    gate_tx.send(()).unwrap();
+
+    let result = sandbox.reset().await;
+    assert!(
+        result.is_err(),
+        "reset must return error on cleanup failure"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("injected cleanup failure"),
+        "error must mention injected failure; got: {err_msg}"
+    );
+
+    // Lifecycle must be Tainted, not Running.
+    assert_eq!(
+        env.lifecycle(),
+        super::LifecycleState::Tainted,
+        "lifecycle must be Tainted after cleanup error"
+    );
+
+    // New operations must be rejected.
+    let write_result = env
+        .write_file(
+            std::path::Path::new("post.txt"),
+            b"x",
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        write_result.is_err(),
+        "write must be rejected in Tainted state"
+    );
+
+    // Further reset attempts must also fail.
+    let reset_result = sandbox.reset().await;
+    assert!(
+        reset_result.is_err(),
+        "reset must fail on a Tainted sandbox"
+    );
+
+    Box::new(sandbox).shutdown().await.unwrap();
+}
+
+/// P0: If the cleanup task panics, the sandbox must transition to `Tainted`.
+/// The `TaintOnDrop` guard ensures the transition even when neither
+/// `finish_reset` nor `taint` was explicitly called.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn reset_cleanup_panic_transitions_to_tainted() {
+    require_bwrap();
+    let (sandbox, env, _started_rx, gate_tx) = sandbox_with_hook(super::CleanupMode::Panic);
+    sandbox.start().await.unwrap();
+
+    env.write_file(
+        std::path::Path::new("file.txt"),
+        b"data",
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    gate_tx.send(()).unwrap();
+
+    let result = sandbox.reset().await;
+    assert!(result.is_err(), "reset must return error on cleanup panic");
+
+    // Lifecycle must be Tainted — the TaintOnDrop guard transitioned it.
+    assert_eq!(
+        env.lifecycle(),
+        super::LifecycleState::Tainted,
+        "lifecycle must be Tainted after cleanup panic"
+    );
+
+    // New operations must be rejected.
+    let write_result = env
+        .write_file(
+            std::path::Path::new("post.txt"),
+            b"x",
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        write_result.is_err(),
+        "write must be rejected in Tainted state"
+    );
+
+    Box::new(sandbox).shutdown().await.unwrap();
+}
