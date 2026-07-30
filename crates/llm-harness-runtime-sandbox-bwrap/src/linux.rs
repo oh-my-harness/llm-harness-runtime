@@ -73,6 +73,84 @@ fn modified_to_datetime(meta: &cap_std::fs::Metadata) -> DateTime<Utc> {
     DateTime::from_timestamp(secs, nsecs).unwrap_or_default()
 }
 
+/// Well-known system directories that must never be used as disposable roots.
+const SYSTEM_DIRECTORIES: &[&str] = &[
+    "/",
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/home",
+    "/lib",
+    "/lib64",
+    "/opt",
+    "/proc",
+    "/root",
+    "/run",
+    "/sbin",
+    "/srv",
+    "/sys",
+    "/tmp",
+    "/usr",
+    "/var",
+    "/var/lib",
+    "/var/log",
+    "/var/spool",
+    "/var/tmp",
+];
+
+/// Returns true if `path` (canonicalized) is a well-known system directory.
+fn is_system_directory(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    for dir in SYSTEM_DIRECTORIES {
+        if path_str == *dir {
+            return true;
+        }
+    }
+    false
+}
+
+/// Basic safety check for a disposable root path (without sentinel).
+///
+/// Used by [`BwrapEnv::new`] to decide whether to place a sentinel.
+/// [`BwrapSandbox::is_safe_disposable_root`] adds the sentinel requirement
+/// on top of this check.
+fn is_potentially_disposable(path: &Path) -> bool {
+    let canon = match std::fs::canonicalize(path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // Reject root.
+    if canon == Path::new("/") || canon.parent().is_none() {
+        return false;
+    }
+
+    // Reject well-known system directories (e.g. /var/lib, /tmp, /etc).
+    if is_system_directory(&canon) {
+        return false;
+    }
+
+    // Reject shallow paths (e.g. /tmp, /home, /var).
+    // Require at least 2 path components below root.
+    let component_count = canon
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::RootDir))
+        .count();
+    if component_count < 2 {
+        return false;
+    }
+
+    // Reject the process's current working directory or any ancestor of it.
+    if let Ok(cwd) = std::env::current_dir()
+        && (canon == cwd || (cwd.starts_with(&canon) && cwd != canon))
+    {
+        return false;
+    }
+
+    true
+}
+
 // ── AllowedRoot ────────────────────────────────────────────────────────────
 
 /// A capability root: a directory opened as an ambient authority, plus its
@@ -96,7 +174,10 @@ struct AllowedRoot {
 /// mount/net/pid namespace per invocation.
 #[derive(Debug)]
 pub struct BwrapEnv {
+    /// The configured working directory path (returned by `working_dir()`).
     work_dir: PathBuf,
+    /// The canonicalized working directory (used for cap-std and bwrap).
+    work_dir_canon: PathBuf,
     caps: Vec<AllowedRoot>,
     config: SandboxConfig,
 }
@@ -107,13 +188,19 @@ impl BwrapEnv {
     /// This is `pub(crate)` so external callers must go through
     /// [`BwrapSandbox::new`], which calls `validate_config` first.
     pub(crate) fn new(config: SandboxConfig) -> Result<Self> {
-        let work_dir = config
-            .work_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("/tmp/sandbox-bwrap"));
+        let work_dir = match &config.work_dir {
+            Some(p) => p.clone(),
+            None => {
+                // Generate a unique directory to prevent cross-agent sharing
+                // when work_dir is not explicitly configured.
+                let id = uuid::Uuid::new_v4();
+                PathBuf::from(format!("/tmp/sandbox-bwrap-{id}"))
+            }
+        };
         std::fs::create_dir_all(&work_dir)?;
 
-        let work_dir_canon = std::fs::canonicalize(&work_dir).unwrap_or_else(|_| work_dir.clone());
+        let work_dir_canon = std::fs::canonicalize(&work_dir)
+            .map_err(|e| anyhow::anyhow!("failed to canonicalize work_dir: {e}"))?;
 
         let mut caps = Vec::new();
 
@@ -142,16 +229,62 @@ impl BwrapEnv {
             });
         }
 
-        Ok(Self {
-            work_dir: work_dir_canon,
+        let env = Self {
+            work_dir,
+            work_dir_canon,
             caps,
             config,
-        })
+        };
+
+        // Place sentinel if the work_dir is a potentially disposable root.
+        // This marks the directory as sandbox-owned so reset() can verify
+        // ownership before clearing.
+        if is_potentially_disposable(&env.work_dir_canon) {
+            env.place_sentinel()
+                .map_err(|e| anyhow::anyhow!("failed to place sentinel: {e}"))?;
+        }
+
+        Ok(env)
     }
 
     /// Working directory path (canonicalized).
     fn working_dir_path(&self) -> &Path {
         &self.work_dir
+    }
+
+    /// Name of the sentinel file placed in the work_dir to prove sandbox
+    /// ownership. `reset()` refuses to clear any directory that does not
+    /// contain this file.
+    const SENTINEL_NAME: &'static str = ".bwrap-disposable";
+
+    /// Write the sentinel file into the work_dir via the cap-std `Dir` handle.
+    fn place_sentinel(&self) -> std::io::Result<()> {
+        self.caps[0]
+            .dir
+            .write(Self::SENTINEL_NAME, b"sandbox-owned")
+    }
+
+    /// Clear all contents of the work_dir using the cap-std `Dir` handle.
+    ///
+    /// Unlike `remove_dir_all` + `create_dir_all`, this keeps the `Dir`
+    /// capability handle valid (the directory inode is not destroyed), so
+    /// subsequent file operations continue to work after `reset()`.
+    ///
+    /// Symlinks are removed with `remove_file` (never followed), preventing
+    /// accidental deletion of targets outside the sandbox.
+    fn clear_work_dir_contents(&self) -> std::io::Result<()> {
+        let work_cap = &self.caps[0].dir;
+        for entry in work_cap.entries()? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let meta = work_cap.symlink_metadata(&name)?;
+            if meta.is_dir() {
+                work_cap.remove_dir_all(&name)?;
+            } else {
+                work_cap.remove_file(&name)?;
+            }
+        }
+        Ok(())
     }
 
     /// Resolve `path` to a `(Dir, relative_path, full_path)` triple.
@@ -167,7 +300,7 @@ impl BwrapEnv {
         let resolved = if path.is_absolute() {
             path.to_path_buf()
         } else {
-            self.work_dir.join(path)
+            self.work_dir_canon.join(path)
         };
         let normalized = lexical_normalize(&resolved);
 
@@ -229,7 +362,7 @@ impl BwrapEnv {
         args.push("/tmp".to_string());
 
         // Bind the working directory (read-write).
-        let work_dir = self.work_dir.to_string_lossy().to_string();
+        let work_dir = self.work_dir_canon.to_string_lossy().to_string();
         args.push("--bind".to_string());
         args.push(work_dir.clone());
         args.push(work_dir.clone());
@@ -556,7 +689,7 @@ impl ExecutionEnv for BwrapEnv {
 
     fn create_temp_dir<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<PathBuf, EnvError>> {
         let dir_result = self.caps[0].dir.try_clone();
-        let work_dir = self.work_dir.clone();
+        let work_dir = self.work_dir_canon.clone();
         Box::pin(async move {
             let dir = dir_result.map_err(EnvError::Io)?;
             let prefix = prefix.to_string();
@@ -590,7 +723,10 @@ impl ExecutionEnv for BwrapEnv {
                 });
             }
 
-            let cwd = opts.cwd.unwrap_or(&self.work_dir).to_path_buf();
+            let cwd = opts
+                .cwd
+                .map(|c| c.to_path_buf())
+                .unwrap_or_else(|| self.work_dir_canon.clone());
             let bwrap_args = self.build_bwrap_args(&cwd);
 
             let mut shell_cmd = tokio::process::Command::new("bwrap");
@@ -757,41 +893,17 @@ impl BwrapSandbox {
     /// Returns true if `path` is safe to use as a disposable root for `reset()`.
     ///
     /// Checks:
-    /// 1. Canonicalize the path (resolves `.`, `..`, symlinks).
-    /// 2. Reject root `/` or paths with no parent.
-    /// 3. Reject paths with fewer than 2 components (e.g. `/tmp`, `/home`).
-    /// 4. Reject the process's current working directory.
-    /// 5. Reject ancestors of the current working directory.
+    /// 1. [`is_potentially_disposable`] passes (canonicalizable, not root,
+    ///    not a system directory, ≥2 components, not cwd/ancestor).
+    /// 2. The directory contains the sentinel file `.bwrap-disposable`,
+    ///    proving it was created/owned by the sandbox.
     fn is_safe_disposable_root(path: &Path) -> bool {
-        // Canonicalize to resolve `.`, `..`, and symlinks.
-        let canon = match std::fs::canonicalize(path) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-
-        // Reject root.
-        if canon == Path::new("/") || canon.parent().is_none() {
+        if !is_potentially_disposable(path) {
             return false;
         }
-
-        // Reject shallow paths (e.g. `/tmp`, `/home`, `/var`).
-        // Require at least 2 path components below root.
-        let component_count = canon
-            .components()
-            .filter(|c| !matches!(c, std::path::Component::RootDir))
-            .count();
-        if component_count < 2 {
-            return false;
-        }
-
-        // Reject the process's current working directory or any ancestor of it.
-        if let Ok(cwd) = std::env::current_dir()
-            && (canon == cwd || (cwd.starts_with(&canon) && cwd != canon))
-        {
-            return false;
-        }
-
-        true
+        // Require sentinel — proves the sandbox owns this directory.
+        let canon = std::fs::canonicalize(path).unwrap();
+        canon.join(BwrapEnv::SENTINEL_NAME).exists()
     }
 }
 
@@ -815,15 +927,25 @@ impl Sandbox for BwrapSandbox {
             if !Self::is_safe_disposable_root(work_dir) {
                 anyhow::bail!(
                     "refusing to reset work_dir {:?}: not a safe disposable root \
-                     (must be canonicalizable, have ≥2 path components, and not be \
-                     root/cwd/ancestor-of-cwd)",
+                     (must be canonicalizable, have ≥2 path components, not be a \
+                     system directory, not be root/cwd/ancestor-of-cwd, and contain \
+                     the sandbox sentinel file)",
                     work_dir
                 );
             }
-            if work_dir.exists() {
-                tokio::fs::remove_dir_all(work_dir).await?;
-                tokio::fs::create_dir_all(work_dir).await?;
-            }
+            // Clear contents via the cap-std Dir handle.  Unlike
+            // remove_dir_all + create_dir_all, this keeps the Dir capability
+            // handle valid (the directory inode is not destroyed), so
+            // subsequent file operations continue to work.
+            let env = self.env.clone();
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                env.clear_work_dir_contents()?;
+                env.place_sentinel()?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))?
+            .map_err(|e| anyhow::anyhow!("reset failed: {e}"))?;
             Ok(())
         }
         .boxed()

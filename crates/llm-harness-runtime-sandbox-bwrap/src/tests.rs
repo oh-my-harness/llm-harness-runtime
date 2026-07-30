@@ -370,8 +370,22 @@ async fn reset_only_affects_work_dir() {
     let sandbox = BwrapSandbox::new(default_config(work_dir.clone())).unwrap();
     sandbox.reset().await.unwrap();
 
-    let entries: Vec<_> = std::fs::read_dir(&work_dir).unwrap().collect();
-    assert!(entries.is_empty(), "work dir must be empty after reset");
+    // After reset, the work_dir must contain only the sentinel file.
+    let entries: Vec<String> = std::fs::read_dir(&work_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        entries.iter().all(|n| n == BwrapEnv::SENTINEL_NAME),
+        "work dir must only contain sentinel after reset; got: {:?}",
+        entries
+    );
+
+    // The pre-reset file must be gone.
+    assert!(
+        !work_dir.join("inside.txt").exists(),
+        "inside.txt must be deleted by reset"
+    );
 
     let content = tokio::fs::read_to_string(&outside_file).await.unwrap();
     assert_eq!(content, "should_survive");
@@ -812,5 +826,104 @@ async fn config_timeout_enforced_as_upper_bound() {
     assert!(
         elapsed2 < Duration::from_secs(3),
         "capped timeout must fire quickly; took {elapsed2:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Reset ownership & capability lifecycle — no bwrap required
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// P0: After reset(), file operations still work (Dir handle not invalidated).
+///
+/// reset() clears directory contents via the cap-std Dir handle rather than
+/// removing and recreating the directory, so the capability handle remains
+/// valid.
+#[tokio::test]
+async fn reset_preserves_file_api_usability() {
+    let dir = tempfile::tempdir().unwrap();
+    let work_dir = dir.path().join("workspace");
+    tokio::fs::create_dir_all(&work_dir).await.unwrap();
+
+    let sandbox = BwrapSandbox::new(default_config(work_dir.clone())).unwrap();
+    let env = sandbox.env();
+
+    env.write_file(Path::new("before.txt"), b"before", CancellationToken::new())
+        .await
+        .unwrap();
+
+    sandbox.reset().await.unwrap();
+
+    // This should succeed but fails if Dir handle is stale.
+    let result = env
+        .write_file(Path::new("after.txt"), b"after", CancellationToken::new())
+        .await;
+    assert!(
+        result.is_ok(),
+        "write_file after reset must succeed; got: {:?}",
+        result
+    );
+}
+
+/// P0: is_safe_disposable_root rejects well-known system directories
+/// like /var/lib that have sufficient path components but must never be
+/// used as disposable roots.
+#[tokio::test]
+async fn is_safe_disposable_root_rejects_system_directories() {
+    // /var/lib has 2 path components and is not cwd.
+    let result = BwrapSandbox::is_safe_disposable_root(Path::new("/var/lib"));
+    assert!(
+        !result,
+        "/var/lib must NOT be considered a safe disposable root"
+    );
+}
+
+/// P0: work_dir=None generates a unique directory per sandbox to prevent
+/// cross-agent file leakage and mutual reset.
+#[tokio::test]
+async fn work_dir_none_generates_unique_directory() {
+    let config_none = SandboxConfig {
+        fs_allowlist: vec![],
+        fs_denylist: vec![],
+        net_allowlist: vec![],
+        resource_limits: ResourceLimits {
+            max_cpus: None,
+            max_memory_mb: None,
+            max_disk_mb: None,
+            timeout: None,
+        },
+        work_dir: None,
+    };
+
+    let sandbox1 = BwrapSandbox::new(config_none.clone()).unwrap();
+    let sandbox2 = BwrapSandbox::new(config_none).unwrap();
+
+    let dir1 = sandbox1.env().working_dir().to_path_buf();
+    let dir2 = sandbox2.env().working_dir().to_path_buf();
+
+    // Clean up.
+    let _ = std::fs::remove_dir_all(&dir1);
+    let _ = std::fs::remove_dir_all(&dir2);
+
+    assert_ne!(dir1, dir2, "work_dir=None must generate unique directories");
+}
+
+/// P0: working_dir() returns the configured path, not the canonicalized
+/// path. A symlink work_dir must be preserved so callers can compare the
+/// returned path against what they configured.
+#[tokio::test]
+async fn working_dir_returns_configured_path_not_canonical() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("real_workspace");
+    tokio::fs::create_dir_all(&target).await.unwrap();
+    let link = dir.path().join("symlink_workspace");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let sandbox = BwrapSandbox::new(default_config(link.clone())).unwrap();
+    let env = sandbox.env();
+
+    assert_eq!(
+        env.working_dir(),
+        &link,
+        "working_dir() must return configured path, not canonicalized"
     );
 }
