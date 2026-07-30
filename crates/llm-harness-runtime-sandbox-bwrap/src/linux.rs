@@ -546,8 +546,12 @@ impl BwrapEnv {
             let _ = hook.gate.lock().unwrap().recv();
             match hook.mode {
                 CleanupMode::Normal => {}
-                CleanupMode::Fail => {
-                    return Err(std::io::Error::other("injected cleanup failure"));
+                CleanupMode::Fail | CleanupMode::FailPartial => {
+                    // FailPartial proceeds past this point and fails after
+                    // the first deletion (handled inside the loop below).
+                    if matches!(hook.mode, CleanupMode::Fail) {
+                        return Err(std::io::Error::other("injected cleanup failure"));
+                    }
                 }
                 CleanupMode::Panic => panic!("injected cleanup panic"),
             }
@@ -561,6 +565,12 @@ impl BwrapEnv {
                 work_cap.remove_dir_all(&name)?;
             } else {
                 work_cap.remove_file(&name)?;
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.cleanup_hook.get()
+                && matches!(hook.mode, CleanupMode::FailPartial)
+            {
+                return Err(std::io::Error::other("injected partial cleanup failure"));
             }
         }
         Ok(())
@@ -1046,11 +1056,25 @@ impl ExecutionEnv for BwrapEnv {
                 return Err(EnvError::Other("sandbox is shutting down".into()));
             }
 
+            // Acquire an admission permit BEFORE spawning.  This bounds the
+            // total number of in-flight (unreaped) children to
+            // REAPER_QUEUE_CAPACITY, preventing unbounded reaper resource
+            // growth.  If the reaper is unavailable or at capacity, refuse
+            // to spawn (fail-closed).
+            let reaper = llm_harness_runtime_sandbox_os::ChildReaper::global()
+                .ok_or_else(|| EnvError::Other("child reaper unavailable".into()))?;
+            if !reaper.try_admit() {
+                return Err(EnvError::Other(
+                    "sandbox at capacity: too many in-flight processes".into(),
+                ));
+            }
+
             let child = shell_cmd
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
                 .map_err(|e| {
+                    reaper.release();
                     if e.kind() == std::io::ErrorKind::NotFound {
                         EnvError::Other("bwrap not available — install bubblewrap".into())
                     } else {
@@ -1065,7 +1089,7 @@ impl ExecutionEnv for BwrapEnv {
             // If the token was cancelled between the check above and this
             // call, the shutdown branch fires immediately and the
             // just-spawned child is killed+reaped.
-            drain_child_output_guarded(child, opts, shutdown_token).await
+            drain_child_output_guarded(child, opts, shutdown_token, true).await
         }
         .boxed()
     }
@@ -1207,8 +1231,22 @@ impl Sandbox for BwrapSandbox {
     fn start(&self) -> BoxFuture<'_, Result<()>> {
         async move {
             Self::check_bwrap_available().await?;
-            self.running.store(true, Ordering::SeqCst);
-            Ok(())
+            // Reject start if the sandbox is not in a startable state.
+            // Tainted sandboxes (reset cleanup failed) cannot be restarted —
+            // they must be shut down and recreated.  Stopped/ShuttingDown
+            // sandboxes are likewise not restartable.
+            match self.env.lifecycle() {
+                LifecycleState::Running => {
+                    self.running.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+                LifecycleState::Tainted => Err(anyhow::anyhow!(
+                    "cannot start: sandbox is tainted (reset cleanup failed)"
+                )),
+                other => Err(anyhow::anyhow!(
+                    "cannot start: sandbox is in {other:?} state"
+                )),
+            }
         }
         .boxed()
     }
@@ -1388,7 +1426,10 @@ impl Sandbox for BwrapSandbox {
     }
 
     fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        // Unify the dual state sources: the sandbox is "running" only when
+        // start() has been called AND the lifecycle is Running.  A Tainted
+        // sandbox (or one that is shutting down / stopped) reports false.
+        self.running.load(Ordering::SeqCst) && self.env.lifecycle() == LifecycleState::Running
     }
 }
 
@@ -1413,6 +1454,9 @@ enum CleanupMode {
     Normal,
     Fail,
     Panic,
+    /// Fail after the first successful deletion, simulating a partial
+    /// cleanup error (some files deleted, some remaining).
+    FailPartial,
 }
 
 #[cfg(test)]

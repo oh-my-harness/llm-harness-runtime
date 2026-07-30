@@ -1881,6 +1881,18 @@ async fn reset_cleanup_error_transitions_to_tainted() {
         "reset must fail on a Tainted sandbox"
     );
 
+    // P1: Public lifecycle must reflect Tainted — is_running() returns
+    // false and start() refuses to restart a tainted sandbox.
+    assert!(
+        !sandbox.is_running(),
+        "is_running() must return false when sandbox is Tainted"
+    );
+    let start_result = sandbox.start().await;
+    assert!(
+        start_result.is_err(),
+        "start() must fail on a Tainted sandbox"
+    );
+
     Box::new(sandbox).shutdown().await.unwrap();
 }
 
@@ -1925,6 +1937,80 @@ async fn reset_cleanup_panic_transitions_to_tainted() {
     assert!(
         write_result.is_err(),
         "write must be rejected in Tainted state"
+    );
+
+    // P1: is_running() must return false for a Tainted sandbox.
+    assert!(
+        !sandbox.is_running(),
+        "is_running() must return false when sandbox is Tainted (panic path)"
+    );
+
+    Box::new(sandbox).shutdown().await.unwrap();
+}
+
+/// P0: If cleanup fails AFTER partial deletion (some files deleted, some
+/// remaining), the sandbox must still transition to `Tainted`.  This
+/// covers the case where the workspace is partially mutated.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn reset_partial_cleanup_error_transitions_to_tainted() {
+    require_bwrap();
+    let (sandbox, env, _started_rx, gate_tx) = sandbox_with_hook(super::CleanupMode::FailPartial);
+    sandbox.start().await.unwrap();
+    let work_dir = env.working_dir().to_path_buf();
+
+    // Write multiple files so cleanup has something to partially delete.
+    env.write_file(
+        std::path::Path::new("file_a.txt"),
+        b"data_a",
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    env.write_file(
+        std::path::Path::new("file_b.txt"),
+        b"data_b",
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    // Pre-send gate so the hook doesn't block.
+    gate_tx.send(()).unwrap();
+
+    let result = sandbox.reset().await;
+    assert!(
+        result.is_err(),
+        "reset must return error on partial cleanup failure"
+    );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("partial cleanup failure"),
+        "error must mention partial failure; got: {err_msg}"
+    );
+
+    // Lifecycle must be Tainted — partial mutation makes the workspace
+    // untrustworthy.
+    assert_eq!(
+        env.lifecycle(),
+        super::LifecycleState::Tainted,
+        "lifecycle must be Tainted after partial cleanup error"
+    );
+
+    // At least one file must have been deleted (proving partial cleanup
+    // actually happened).  The order of directory iteration is not
+    // guaranteed, so we check that not all files remain.
+    let a_exists = work_dir.join("file_a.txt").exists();
+    let b_exists = work_dir.join("file_b.txt").exists();
+    assert!(
+        !(a_exists && b_exists),
+        "at least one file must have been deleted before the failure"
+    );
+
+    // is_running() must return false for a Tainted sandbox.
+    assert!(
+        !sandbox.is_running(),
+        "is_running() must return false when sandbox is Tainted (partial cleanup)"
     );
 
     Box::new(sandbox).shutdown().await.unwrap();
