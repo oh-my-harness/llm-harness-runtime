@@ -1063,24 +1063,25 @@ impl ExecutionEnv for BwrapEnv {
             // to spawn (fail-closed).
             let reaper = llm_harness_runtime_sandbox_os::ChildReaper::global()
                 .ok_or_else(|| EnvError::Other("child reaper unavailable".into()))?;
-            if !reaper.try_admit() {
-                return Err(EnvError::Other(
-                    "sandbox at capacity: too many in-flight processes".into(),
-                ));
-            }
+            let permit = reaper
+                .try_admit()
+                .ok_or_else(|| EnvError::Other("sandbox at capacity or reaper unhealthy".into()))?;
 
-            let child = shell_cmd
+            let child = match shell_cmd
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .map_err(|e| {
-                    reaper.release();
-                    if e.kind() == std::io::ErrorKind::NotFound {
+            {
+                Ok(child) => child,
+                Err(e) => {
+                    // permit is dropped here (released) when we return Err.
+                    return Err(if e.kind() == std::io::ErrorKind::NotFound {
                         EnvError::Other("bwrap not available — install bubblewrap".into())
                     } else {
                         EnvError::Io(e)
-                    }
-                })?;
+                    });
+                }
+            };
 
             // drain_child_output_guarded handles all cancellation paths
             // (abort, timeout, shutdown) with kill+wait, and wraps the child
@@ -1088,8 +1089,10 @@ impl ExecutionEnv for BwrapEnv {
             // dropped before completion (via a background tokio::spawn task).
             // If the token was cancelled between the check above and this
             // call, the shutdown branch fires immediately and the
-            // just-spawned child is killed+reaped.
-            drain_child_output_guarded(child, opts, shutdown_token, true).await
+            // just-spawned child is killed+reaped.  The permit moves into
+            // the ReapGuard and is released when the child is confirmed
+            // exited.
+            drain_child_output_guarded(child, opts, shutdown_token, Some(permit)).await
         }
         .boxed()
     }
