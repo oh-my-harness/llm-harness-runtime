@@ -24,7 +24,7 @@ use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_runtime::platform::sandbox::{Sandbox, SandboxConfig};
-use llm_harness_runtime_sandbox_os::drain_child_output;
+use llm_harness_runtime_sandbox_os::drain_child_output_guarded;
 use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
 
@@ -306,6 +306,12 @@ impl BwrapEnv {
 
     /// Acquire `reset_lock` with cancellation and lifecycle awareness.
     ///
+    /// Returns both the lock guard and the shutdown token that was current
+    /// at the time of acquisition.  The caller must use **this same token**
+    /// for the duration of the operation (not re-clone from the field) so
+    /// that a `reset()` token-swap racing between lock acquisition and
+    /// token clone does not let the operation escape cancellation.
+    ///
     /// - Rejects immediately if the sandbox is shutting down or stopped.
     /// - Races the lock acquisition against the caller's `abort` token and
     ///   the sandbox's `shutdown_token`, so a queued operation does not
@@ -315,7 +321,7 @@ impl BwrapEnv {
     async fn acquire_op_lock(
         &self,
         abort: &CancellationToken,
-    ) -> Result<tokio::sync::MutexGuard<'_, ()>, EnvError> {
+    ) -> Result<(tokio::sync::MutexGuard<'_, ()>, CancellationToken), EnvError> {
         if self.lifecycle() != LifecycleState::Running {
             return Err(EnvError::Other("sandbox is shutting down".into()));
         }
@@ -335,7 +341,7 @@ impl BwrapEnv {
         if self.lifecycle() != LifecycleState::Running {
             return Err(EnvError::Other("sandbox is shutting down".into()));
         }
-        Ok(guard)
+        Ok((guard, shutdown_token))
     }
 
     /// Clear all contents of the work_dir using the cap-std `Dir` handle.
@@ -473,7 +479,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.acquire_op_lock(&abort).await?;
+            let (_guard, _token) = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             tokio::task::spawn_blocking(move || {
@@ -496,7 +502,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.acquire_op_lock(&abort).await?;
+            let (_guard, _token) = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             let text = tokio::task::spawn_blocking(move || {
@@ -523,7 +529,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.acquire_op_lock(&abort).await?;
+            let (_guard, _token) = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             tokio::task::spawn_blocking(move || {
@@ -551,7 +557,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.acquire_op_lock(&abort).await?;
+            let (_guard, _token) = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             let content = content.to_vec();
@@ -583,7 +589,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.acquire_op_lock(&abort).await?;
+            let (_guard, _token) = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             let content = content.to_vec();
@@ -610,7 +616,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.acquire_op_lock(&abort).await?;
+            let (_guard, _token) = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             tokio::task::spawn_blocking(move || {
@@ -644,7 +650,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.acquire_op_lock(&abort).await?;
+            let (_guard, _token) = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             tokio::task::spawn_blocking(move || {
@@ -688,7 +694,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.acquire_op_lock(&abort).await?;
+            let (_guard, _token) = self.acquire_op_lock(&abort).await?;
             let (dir, rel, _full) = resolved?;
             tokio::task::spawn_blocking(move || Ok(dir.exists(&rel)))
                 .await
@@ -708,7 +714,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.acquire_op_lock(&abort).await?;
+            let (_guard, _token) = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             tokio::task::spawn_blocking(move || {
@@ -739,7 +745,7 @@ impl ExecutionEnv for BwrapEnv {
             if abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.acquire_op_lock(&abort).await?;
+            let (_guard, _token) = self.acquire_op_lock(&abort).await?;
             let (dir, rel, full) = resolved?;
             let full = full.clone();
             tokio::task::spawn_blocking(move || {
@@ -776,7 +782,7 @@ impl ExecutionEnv for BwrapEnv {
         let work_dir = self.work_dir_canon.clone();
         Box::pin(async move {
             let abort = CancellationToken::new();
-            let _guard = self.acquire_op_lock(&abort).await?;
+            let (_guard, _token) = self.acquire_op_lock(&abort).await?;
             let dir = dir_result.map_err(EnvError::Io)?;
             let prefix = prefix.to_string();
             tokio::task::spawn_blocking(move || {
@@ -798,7 +804,14 @@ impl ExecutionEnv for BwrapEnv {
             if opts.abort.is_cancelled() {
                 return Err(EnvError::Aborted);
             }
-            let _guard = self.acquire_op_lock(&opts.abort).await?;
+            // acquire_op_lock returns the shutdown token that was current at
+            // the time of lock acquisition.  We use THIS token (not a fresh
+            // clone) for the entire operation, which linearizes the epoch:
+            // if reset() swaps the token after we acquire the lock, our token
+            // is the *old* one that reset() cancels, so we still observe the
+            // cancellation.  A second clone from the field would race with
+            // the swap and could pick up the new (uncancelled) token.
+            let (_guard, shutdown_token) = self.acquire_op_lock(&opts.abort).await?;
 
             // Enforce config-level timeout as an upper bound. If both the
             // caller-specified timeout and the config timeout are set, use
@@ -828,21 +841,8 @@ impl ExecutionEnv for BwrapEnv {
             }
             shell_cmd.args(["sh", "-c", cmd]);
 
-            // kill_on_drop(true) ensures that if this future is dropped
-            // before completion (e.g. the caller abandons the task), the
-            // child is SIGKILL'd immediately rather than becoming an
-            // orphan that continues writing to the workspace.
-            shell_cmd.kill_on_drop(true);
-
-            // Clone the shutdown token *after* acquiring the op-lock so we
-            // observe any cancellation that fired while queued.  drain_child_output
-            // receives this token and handles kill+wait internally when it
-            // fires — there is no separate select! here, which eliminates the
-            // race where the cancel branch drops drain without killing the child.
-            let shutdown_token = self.shutdown_token_clone();
-
-            // Re-check lifecycle after cloning the token: shutdown may have
-            // begun between acquire_op_lock and here.  If so, refuse to spawn.
+            // Re-check lifecycle: shutdown may have begun between
+            // acquire_op_lock and here.  If so, refuse to spawn.
             if self.lifecycle() != LifecycleState::Running || shutdown_token.is_cancelled() {
                 return Err(EnvError::Other("sandbox is shutting down".into()));
             }
@@ -859,12 +859,14 @@ impl ExecutionEnv for BwrapEnv {
                     }
                 })?;
 
-            // drain_child_output handles all cancellation paths (abort,
-            // timeout, shutdown) with kill+wait, so no outer select! is
-            // needed.  If the token was cancelled between the check above
-            // and this call, the shutdown branch fires immediately and the
+            // drain_child_output_guarded handles all cancellation paths
+            // (abort, timeout, shutdown) with kill+wait, and wraps the child
+            // in a ReapGuard that guarantees reap even if this future is
+            // dropped before completion (via a background tokio::spawn task).
+            // If the token was cancelled between the check above and this
+            // call, the shutdown branch fires immediately and the
             // just-spawned child is killed+reaped.
-            drain_child_output(child, opts, Some(shutdown_token)).await
+            drain_child_output_guarded(child, opts, shutdown_token).await
         }
         .boxed()
     }

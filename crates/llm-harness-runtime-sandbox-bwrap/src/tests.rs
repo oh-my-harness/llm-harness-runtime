@@ -1405,9 +1405,11 @@ async fn reset_interrupts_running_command() {
 
 /// P0: No orphan bwrap processes remain after shutdown kills a running command.
 ///
-/// Verifies the full kill+wait path: shutdown cancels the token,
-/// drain_child_output kills and reaps the child, and no zombie or orphan
-/// survives.
+/// Instead of counting global bwrap processes (which is unreliable on shared
+/// hosts with parallel tests), this test uses a sentinel file: the command
+/// creates a marker file after a delay.  If shutdown kills the child properly,
+/// the sentinel never appears.  If the child survives (orphan), the sentinel
+/// appears.
 #[tokio::test]
 #[ignore = "requires bwrap; run with --include-ignored"]
 async fn no_orphan_after_shutdown() {
@@ -1415,8 +1417,10 @@ async fn no_orphan_after_shutdown() {
     let sandbox = BwrapSandbox::new(owned_config()).unwrap();
     sandbox.start().await.unwrap();
     let env = sandbox.env();
+    let work_dir = env.working_dir().to_path_buf();
 
-    // Start a long-running command.
+    // Start a command that sleeps then creates a sentinel file.  If the child
+    // is killed within the sleep, the sentinel never appears.
     let env_clone = env.clone();
     let cmd_handle = tokio::spawn(async move {
         let opts = ShellOptions {
@@ -1427,40 +1431,152 @@ async fn no_orphan_after_shutdown() {
             on_stdout: None,
             on_stderr: None,
         };
-        let _ = env_clone.execute_shell("sleep 30", opts).await;
+        let _ = env_clone
+            .execute_shell("sleep 3 && touch sentinel_survivor.txt", opts)
+            .await;
     });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Count bwrap processes before shutdown.
-    let before = count_bwrap_processes();
-
+    // Shutdown must complete in bounded time.
+    let start = std::time::Instant::now();
     Box::new(sandbox).shutdown().await.unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "shutdown must be bounded; took {elapsed:?}"
+    );
 
     // Command task must finish.
     let _ = tokio::time::timeout(Duration::from_secs(5), cmd_handle).await;
 
-    // Give the OS a moment to reap any remaining zombies.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait long enough that the sleep would have completed if the child
+    // were still alive (3s sleep + margin).
+    tokio::time::sleep(Duration::from_secs(4)).await;
 
-    let after = count_bwrap_processes();
     assert!(
-        after <= before,
-        "no new bwrap processes should remain after shutdown; before={before}, after={after}"
+        !work_dir.join("sentinel_survivor.txt").exists(),
+        "child must have been killed by shutdown — sentinel must not exist"
     );
 }
+// ═══════════════════════════════════════════════════════════════════════════
+// Round 8 fixes — epoch linearization + guaranteed reap on drop
+// ═══════════════════════════════════════════════════════════════════════════
 
-/// Helper: count bwrap processes on the system.
-fn count_bwrap_processes() -> usize {
-    std::process::Command::new("pgrep")
-        .arg("-c")
-        .arg("bwrap")
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .trim()
-                .parse::<usize>()
-                .unwrap_or(0)
-        })
-        .unwrap_or(0)
+/// P1: reset() token swap must linearize with commands that have already
+/// acquired the op-lock.
+///
+/// A command that passed acquire_op_lock() holds a *snapshot* of the shutdown
+/// token at lock-acquisition time.  If reset() swaps the token afterwards,
+/// the command's snapshot is the OLD token — the one reset() cancels — so the
+/// command still observes the cancellation and is interrupted.
+///
+/// This test verifies that reset completes in bounded time even when a
+/// command is actively running (holding the lock via drain_child_output).
+/// If the epoch were not linearized, the command would hold the new
+/// (uncancelled) token and never exit, causing reset to time out.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn reset_linearizes_with_running_command() {
+    require_bwrap();
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    sandbox.start().await.unwrap();
+    let env = sandbox.env();
+
+    // Start a long-running command (no timeout, no abort).
+    let env_clone = env.clone();
+    let cmd_handle = tokio::spawn(async move {
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+        let _ = env_clone.execute_shell("sleep 60", opts).await;
+    });
+
+    // Give the command time to acquire the lock and start the child.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // reset() must complete in bounded time.  It swaps the token and cancels
+    // the old one.  The running command's drain_child_output_guarded observes
+    // the old token's cancellation, kills+waits the child, and releases the
+    // lock so reset can proceed.
+    let start = std::time::Instant::now();
+    sandbox.reset().await.expect("reset must succeed");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "reset must complete in bounded time; took {elapsed:?}"
+    );
+
+    // The command must have been interrupted.
+    let cmd_result = tokio::time::timeout(Duration::from_secs(5), cmd_handle).await;
+    assert!(cmd_result.is_ok(), "command task must complete after reset");
+
+    // Sandbox should still be usable (fresh token installed by reset).
+    let result = env.execute_shell("echo alive", shell_opts()).await;
+    assert!(result.is_ok(), "sandbox should still be usable after reset");
+
+    Box::new(sandbox).shutdown().await.unwrap();
+}
+
+/// P1: Dropping an execute_shell future must guarantee the child is killed,
+/// not just left as an orphan.
+///
+/// When the future is dropped, the ReapGuard's Drop spawns a background
+/// tokio::spawn task that calls start_kill() + wait(), ensuring the child
+/// is killed and reaped.  This test verifies the child does not survive
+/// long enough to create a sentinel file.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn dropped_future_guarantees_reap() {
+    require_bwrap();
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    sandbox.start().await.unwrap();
+    let env = sandbox.env();
+    let work_dir = env.working_dir().to_path_buf();
+
+    // Start a command that sleeps then creates a sentinel file.
+    let env_clone = env.clone();
+    let handle = tokio::spawn(async move {
+        let opts = ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        };
+        let _ = env_clone
+            .execute_shell("sleep 3 && touch sentinel_dropped.txt", opts)
+            .await;
+    });
+
+    // Give the command time to start.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Abort the task — this drops the execute_shell future, which drops the
+    // drain_child_output_guarded future, which drops the ReapGuard.
+    handle.abort();
+
+    // Wait long enough that the sleep would have completed if the child
+    // were still alive (3s sleep + margin).
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    assert!(
+        !work_dir.join("sentinel_dropped.txt").exists(),
+        "child must have been killed when future was dropped — sentinel must not exist"
+    );
+
+    // Sandbox should still be usable.
+    let result = env.execute_shell("echo alive", shell_opts()).await;
+    assert!(
+        result.is_ok(),
+        "sandbox should still be usable after dropped future"
+    );
+
+    Box::new(sandbox).shutdown().await.unwrap();
 }
