@@ -162,7 +162,7 @@ async fn file_api_rejects_absolute_path_outside_workspace() {
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let sandbox = BwrapSandbox::new(default_config(work_dir)).unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
 
     let result = env
         .read_text_file(Path::new("/etc/passwd"), CancellationToken::new())
@@ -185,7 +185,7 @@ async fn file_api_rejects_dotdot_traversal() {
         .unwrap();
 
     let sandbox = BwrapSandbox::new(default_config(work_dir)).unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
 
     let result = env
         .read_text_file(Path::new("../outside.txt"), CancellationToken::new())
@@ -201,7 +201,7 @@ async fn file_api_allows_paths_inside_workspace() {
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let sandbox = BwrapSandbox::new(default_config(work_dir)).unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
 
     env.write_file(
         Path::new("inside.txt"),
@@ -243,7 +243,7 @@ async fn file_api_allows_fs_allowlist_paths() {
         work_dir: Some(work_dir),
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
 
     let text = env
         .read_text_file(&shared_dir.join("shared.txt"), CancellationToken::new())
@@ -274,7 +274,7 @@ async fn file_api_rejects_symlink_escape() {
     std::os::unix::fs::symlink(&secret, &link).unwrap();
 
     let sandbox = BwrapSandbox::new(default_config(work_dir.clone())).unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
 
     // Reading via the symlink must fail — cap-std blocks the escape.
     let result = env
@@ -315,7 +315,7 @@ async fn file_api_allows_internal_symlinks() {
     std::os::unix::fs::symlink("target.txt", work_dir.join("good_link")).unwrap();
 
     let sandbox = BwrapSandbox::new(default_config(work_dir)).unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
 
     let text = env
         .read_text_file(Path::new("good_link"), CancellationToken::new())
@@ -336,7 +336,7 @@ async fn create_temp_dir_is_inside_workspace() {
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let sandbox = BwrapSandbox::new(default_config(work_dir)).unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
 
     let temp = env.create_temp_dir("probe").await.unwrap();
 
@@ -381,7 +381,7 @@ async fn reset_clears_owned_work_dir() {
         .unwrap();
 
     let sandbox = BwrapSandbox::new(owned_config()).unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let work_dir = env.working_dir().to_path_buf();
 
     env.write_file(
@@ -531,7 +531,7 @@ async fn reset_refuses_dot_path() {
 #[tokio::test]
 async fn reset_preserves_file_api_usability() {
     let sandbox = BwrapSandbox::new(owned_config()).unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let work_dir = env.working_dir().to_path_buf();
 
     env.write_file(Path::new("before.txt"), b"before", CancellationToken::new())
@@ -583,7 +583,7 @@ async fn auto_generated_dir_has_0700_permissions() {
 #[tokio::test]
 async fn agent_cannot_break_reset() {
     let sandbox = BwrapSandbox::new(owned_config()).unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let work_dir = env.working_dir().to_path_buf();
 
     // Agent writes and deletes files in the workspace.
@@ -697,7 +697,7 @@ async fn shell_cannot_read_host_file_outside_allowlist() {
     let sandbox = BwrapSandbox::new(default_config(work_dir.clone())).unwrap();
     sandbox.start().await.unwrap();
 
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let cmd = format!(
         "cat {} 2>/dev/null && echo LEAKED || echo BLOCKED",
         secret_path.to_string_lossy()
@@ -729,7 +729,7 @@ async fn shell_cannot_read_etc_passwd() {
     let sandbox = BwrapSandbox::new(default_config(work_dir)).unwrap();
     sandbox.start().await.unwrap();
 
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let cmd = "cat /etc/passwd 2>/dev/null && echo LEAKED || echo BLOCKED";
     let opts = ShellOptions {
         cwd: None,
@@ -761,7 +761,7 @@ async fn workspace_files_are_accessible_from_sandbox() {
     let sandbox = BwrapSandbox::new(default_config(work_dir.clone())).unwrap();
     sandbox.start().await.unwrap();
 
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let result = env
         .execute_shell("cat readable.txt", shell_opts())
         .await
@@ -780,7 +780,7 @@ async fn empty_net_allowlist_blocks_network() {
     let sandbox = BwrapSandbox::new(default_config(work_dir)).unwrap();
     sandbox.start().await.unwrap();
 
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let cmd = "timeout 3 bash -c 'echo test > /dev/tcp/8.8.8.8/53' 2>&1 && echo NETWORK_ALLOWED || echo NETWORK_BLOCKED";
     let opts = ShellOptions {
         cwd: None,
@@ -809,7 +809,7 @@ async fn host_credentials_not_inherited() {
     let sandbox = BwrapSandbox::new(default_config(work_dir)).unwrap();
     sandbox.start().await.unwrap();
 
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let opts = ShellOptions {
         cwd: None,
         env: vec![("SANDBOX_INJECTED", "injected_value")],
@@ -848,7 +848,7 @@ async fn injected_env_vars_are_visible_in_sandbox() {
     let sandbox = BwrapSandbox::new(default_config(work_dir)).unwrap();
     sandbox.start().await.unwrap();
 
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let opts = ShellOptions {
         cwd: None,
         env: vec![("MY_CUSTOM_VAR", "custom_value_42")],
@@ -879,7 +879,7 @@ async fn timeout_terminates_entire_process_tree() {
     let sandbox = BwrapSandbox::new(default_config(work_dir.clone())).unwrap();
     sandbox.start().await.unwrap();
 
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let cmd = "(sleep 3 && echo SURVIVED > sentinel.txt) & sleep 30";
     let opts = ShellOptions {
         cwd: None,
@@ -917,7 +917,7 @@ async fn abort_cancels_running_command() {
     let sandbox = BwrapSandbox::new(default_config(work_dir)).unwrap();
     sandbox.start().await.unwrap();
 
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let abort = CancellationToken::new();
     let abort_clone = abort.clone();
 
@@ -970,7 +970,7 @@ async fn config_timeout_enforced_as_upper_bound() {
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     sandbox.start().await.unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
 
     // No per-call timeout; config timeout (1s) should apply.
     let opts = ShellOptions {
@@ -1051,7 +1051,7 @@ async fn working_dir_returns_configured_path_not_canonical() {
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
     let sandbox = BwrapSandbox::new(default_config(link.clone())).unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
 
     assert_eq!(
         env.working_dir(),
@@ -1075,7 +1075,7 @@ async fn shutdown_completes_with_unbounded_command() {
     require_bwrap();
     let sandbox = BwrapSandbox::new(owned_config()).unwrap();
     sandbox.start().await.unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let work_dir = env.working_dir().to_path_buf();
 
     // Start a long-running command with NO timeout and NO abort.
@@ -1133,7 +1133,7 @@ async fn cancellation_observed_while_queued() {
     require_bwrap();
     let sandbox = BwrapSandbox::new(owned_config()).unwrap();
     sandbox.start().await.unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
 
     // Start a long-running shell command (holds the lock via
     // execute_shell -> acquire_op_lock -> drain_child_output).
@@ -1253,7 +1253,7 @@ async fn shutdown_race_with_command_start() {
     require_bwrap();
     let sandbox = BwrapSandbox::new(owned_config()).unwrap();
     sandbox.start().await.unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let work_dir = env.working_dir().to_path_buf();
 
     // Start a long-running command with NO timeout and NO abort.
@@ -1309,7 +1309,7 @@ async fn dropped_future_kills_child() {
     require_bwrap();
     let sandbox = BwrapSandbox::new(owned_config()).unwrap();
     sandbox.start().await.unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let work_dir = env.working_dir().to_path_buf();
 
     // Start a command that sleeps then creates a sentinel.
@@ -1364,7 +1364,7 @@ async fn reset_interrupts_running_command() {
     require_bwrap();
     let sandbox = BwrapSandbox::new(owned_config()).unwrap();
     sandbox.start().await.unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
 
     // Start a long-running command with NO timeout and NO abort.
     let env_clone = env.clone();
@@ -1416,7 +1416,7 @@ async fn no_orphan_after_shutdown() {
     require_bwrap();
     let sandbox = BwrapSandbox::new(owned_config()).unwrap();
     sandbox.start().await.unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let work_dir = env.working_dir().to_path_buf();
 
     // Start a command that sleeps then creates a sentinel file.  If the child
@@ -1481,7 +1481,7 @@ async fn reset_linearizes_with_running_command() {
     require_bwrap();
     let sandbox = BwrapSandbox::new(owned_config()).unwrap();
     sandbox.start().await.unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
 
     // Start a long-running command (no timeout, no abort).
     let env_clone = env.clone();
@@ -1536,7 +1536,7 @@ async fn dropped_future_guarantees_reap() {
     require_bwrap();
     let sandbox = BwrapSandbox::new(owned_config()).unwrap();
     sandbox.start().await.unwrap();
-    let env = sandbox.env();
+    let env = sandbox.env.clone();
     let work_dir = env.working_dir().to_path_buf();
 
     // Start a command that sleeps then creates a sentinel file.
@@ -1579,4 +1579,68 @@ async fn dropped_future_guarantees_reap() {
     );
 
     Box::new(sandbox).shutdown().await.unwrap();
+}
+
+/// P1: reset() must close admission atomically before token swap.
+///
+/// Without the Resetting state, a new operation can see Running, snapshot
+/// the fresh token, acquire the lock, and start a long command — causing
+/// reset to time out.  With Resetting, new operations are rejected during
+/// the entire reset window.
+///
+/// This test holds the reset_lock manually so reset blocks in the lock-
+/// acquisition phase.  While reset is blocked (state is Resetting), a new
+/// command is attempted and must be rejected.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn reset_closes_admission_atomically() {
+    require_bwrap();
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    sandbox.start().await.unwrap();
+    let env = sandbox.env.clone();
+
+    // Hold the reset_lock so reset() blocks in the lock-acquisition phase.
+    // This gives us a deterministic window where the lifecycle is Resetting.
+    let lock_guard = env.reset_lock.lock().await;
+
+    // Start reset() — it will:
+    // 1. begin_reset() -> state = Resetting
+    // 2. swap token, cancel old
+    // 3. try to acquire reset_lock -> blocks (we hold it)
+    //
+    // We spawn reset in a task so it doesn't borrow `sandbox` directly.
+    // The task owns the sandbox via Box.
+    let reset_handle = tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        sandbox.reset().await.expect("reset must succeed");
+        start.elapsed()
+    });
+
+    // Give reset time to call begin_reset() and reach the lock acquisition.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // State is now Resetting.  A new command must be rejected immediately
+    // by acquire_op_lock (lifecycle != Running), without trying to acquire
+    // the lock.
+    let new_cmd_result = env
+        .execute_shell("echo should_be_rejected", shell_opts())
+        .await;
+    assert!(
+        new_cmd_result.is_err(),
+        "new command during reset must be rejected (lifecycle is Resetting); got: Ok"
+    );
+
+    // Release the lock so reset can proceed.
+    drop(lock_guard);
+
+    // Reset must complete successfully.
+    let reset_elapsed = reset_handle.await.expect("reset task must not panic");
+    assert!(
+        reset_elapsed < Duration::from_secs(5),
+        "reset must complete quickly after lock release; took {reset_elapsed:?}"
+    );
+
+    // Sandbox should be usable after reset (state is Running again).
+    let result = env.execute_shell("echo alive", shell_opts()).await;
+    assert!(result.is_ok(), "sandbox should be usable after reset");
 }

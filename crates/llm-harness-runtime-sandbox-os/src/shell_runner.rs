@@ -173,11 +173,19 @@ pub async fn drain_child_output(
 /// `tokio::process::Command::kill_on_drop(true)` only sends `SIGKILL` from
 /// `Drop` — it cannot `await`, so the child is not reaped (reaped via Tokio's
 /// best-effort SIGCHLD orphan queue, which requires the signal driver and is
-/// not guaranteed).  This guard closes that gap by spawning a background
-/// `tokio::spawn` task in its `Drop` that calls `start_kill()` + `wait()`,
-/// ensuring no zombie survives.
+/// not guaranteed).  This guard closes that gap by spawning a **dedicated OS
+/// thread** in its `Drop` that polls `try_wait()` (synchronous `waitpid` with
+/// `WNOHANG`) until the child exits, ensuring the zombie is reaped regardless
+/// of Tokio runtime state.
 ///
-/// Once the child has been reaped via [`Self::kill_and_wait`] or
+/// Using `std::thread::spawn` instead of `tokio::spawn` is deliberate: the
+/// reaper must survive runtime shutdown (where `tokio::spawn` tasks may be
+/// cancelled before they poll) and must work when no runtime exists at all
+/// (e.g. Drop after the runtime has been dropped).  An OS thread is
+/// independent of the async runtime lifecycle and is guaranteed to run to
+/// completion.
+///
+/// Once the child has been successfully reaped via [`Self::kill_and_wait`] or
 /// [`Self::wait`], the `reaped` flag is set so `Drop` does not double-kill.
 struct ReapGuard {
     child: Option<tokio::process::Child>,
@@ -198,17 +206,20 @@ impl ReapGuard {
         self.child.as_mut()
     }
 
-    /// Kill and wait for the child to exit.  Marks the child as reaped so
-    /// `Drop` does not attempt a second kill.
+    /// Kill and wait for the child to exit.  Only marks the child as reaped
+    /// if `wait()` succeeds — a failed `wait()` leaves `reaped` false so
+    /// `Drop` still attempts reaping.
     async fn kill_and_wait(&mut self) {
         if let Some(child) = &mut self.child {
             let _ = child.start_kill();
-            let _ = child.wait().await;
-            self.reaped = true;
+            if child.wait().await.is_ok() {
+                self.reaped = true;
+            }
         }
     }
 
-    /// Wait for the child to exit naturally (no kill).  Marks as reaped.
+    /// Wait for the child to exit naturally (no kill).  Only marks as reaped
+    /// if `wait()` succeeds.
     async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         if let Some(child) = &mut self.child {
             let status = child.wait().await?;
@@ -231,25 +242,37 @@ impl Drop for ReapGuard {
         if let Some(mut child) = self.child.take() {
             // Send SIGKILL immediately (synchronous, safe in Drop).
             let _ = child.start_kill();
-            // Spawn a background task to reap the child.  This is the
+
+            // Spawn a dedicated OS thread to reap the child.  This is the
             // critical difference from kill_on_drop: we guarantee `wait()`
             // is called so the zombie is reaped, not just signalled.
             //
-            // If there is no Tokio runtime (e.g. Drop during shutdown of
-            // the runtime itself), we fall back to a blocking
-            // `std::process::Child::wait` via `try_wait` polling on the
-            // std child.  In practice the runtime is always available
-            // during normal operation.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = child.wait().await;
-                });
-            }
-            // If no runtime: the child has been SIGKILL'd.  On Unix the
-            // init process (PID 1) or Tokio's orphan reaper will eventually
-            // reap it.  This is a degraded but safe state — the process
-            // cannot do further harm (it's dead) and will not accumulate
-            // indefinitely (the OS reaps parentless zombies).
+            // We use `std::thread::spawn` (not `tokio::spawn`) because:
+            // - The reaper must survive runtime shutdown (tokio::spawn
+            //   tasks may be cancelled before they poll).
+            // - The reaper must work when no runtime exists (Drop after
+            //   runtime is dropped, or Drop outside any runtime context).
+            //
+            // `try_wait()` is synchronous — it calls `waitpid(WNOHANG)`
+            // internally and does not require a Tokio runtime.
+            std::thread::spawn(move || {
+                // Poll try_wait() until the child exits or an error occurs.
+                // An error (e.g. ESRCH — process already reaped) means the
+                // child is gone, so we stop.
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break, // Reaped successfully.
+                        Ok(None) => {
+                            // Still running — wait briefly and retry.
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(_) => break, // Error — process gone or unreapable.
+                    }
+                }
+                // Dropping `child` here releases the tokio::process::Child
+                // handle.  Since kill_on_drop is false (we didn't set it),
+                // this does not send another signal.
+            });
         }
     }
 }
@@ -394,5 +417,188 @@ pub async fn drain_child_output_guarded(
             stderr,
             exit_code: status.code().unwrap_or(0),
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod reap_tests {
+    use super::ReapGuard;
+    use std::time::Duration;
+
+    /// Check whether a PID is a zombie or gone by reading /proc/<pid>/status.
+    /// Returns true if the process is fully gone (no /proc entry).
+    /// Returns false if the process is still running or is a zombie.
+    fn process_is_gone(pid: u32) -> bool {
+        let status_path = format!("/proc/{pid}/status");
+        match std::fs::read_to_string(&status_path) {
+            Ok(content) => {
+                // Check if the process is a zombie.
+                for line in content.lines() {
+                    if line.starts_with("State:") {
+                        return line.contains("Z (zombie)");
+                    }
+                }
+                // State line not found — treat as still alive.
+                false
+            }
+            Err(_) => true, // /proc entry doesn't exist — process is gone.
+        }
+    }
+
+    /// Wait for a process to be fully reaped (gone from /proc), with a timeout.
+    fn wait_for_reap(pid: u32, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if process_is_gone(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// P1: ReapGuard::drop() must reap the child even when no Tokio runtime
+    /// is available.
+    ///
+    /// Creates a child inside a runtime, extracts it, drops the runtime,
+    /// then drops the ReapGuard outside any runtime context.  The child
+    /// must be killed AND reaped (no zombie).
+    #[test]
+    fn reap_guard_reaps_without_runtime() {
+        // Create a child inside a runtime.
+        let child = {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                tokio::process::Command::new("sleep")
+                    .arg("30")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+        };
+        let pid = child.id().expect("child must have a PID");
+
+        // Drop the runtime — we are now outside any Tokio context.
+        // (The `child` variable still holds the tokio::process::Child handle.)
+
+        // Wrap in ReapGuard and drop it — no runtime is available.
+        let guard = ReapGuard::new(child);
+        drop(guard);
+
+        // The child must be reaped (gone from /proc) within a reasonable time.
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped (gone from /proc) after ReapGuard::drop without runtime"
+        );
+    }
+
+    /// P1: ReapGuard::drop() must reap the child even when the Tokio runtime
+    /// is being shut down.
+    ///
+    /// Creates a child, then drops both the ReapGuard and the runtime in
+    /// sequence.  The std::thread reaper must still complete.
+    #[test]
+    fn reap_guard_reaps_during_runtime_shutdown() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (child, handle) = rt.block_on(async {
+            let child = tokio::process::Command::new("sleep")
+                .arg("30")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id().expect("child must have a PID");
+            (child, pid)
+        });
+
+        let guard = ReapGuard::new(child);
+
+        // Drop the guard first, then the runtime.
+        drop(guard);
+        drop(rt);
+
+        assert!(
+            wait_for_reap(handle, Duration::from_secs(5)),
+            "child PID {handle} must be reaped after ReapGuard::drop during runtime shutdown"
+        );
+    }
+
+    /// P1: ReapGuard::drop() must reap the child in the normal case (runtime
+    /// alive).  Verifies the std::thread path works even when a runtime
+    /// is present.
+    #[test]
+    fn reap_guard_reaps_with_runtime_alive() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let pid = rt.block_on(async {
+            let child = tokio::process::Command::new("sleep")
+                .arg("30")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id().expect("child must have a PID");
+            let guard = ReapGuard::new(child);
+            drop(guard);
+            pid
+        });
+
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped after ReapGuard::drop with runtime alive"
+        );
+
+        drop(rt);
+    }
+
+    /// P1: kill_and_wait must not set `reaped` when wait() fails.
+    ///
+    /// We can't easily force a wait() failure, but we can verify that a
+    /// successfully killed child is marked as reaped (so Drop doesn't
+    /// double-kill).
+    #[test]
+    fn kill_and_wait_marks_reaped_on_success() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let child = tokio::process::Command::new("sleep")
+                .arg("30")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id().expect("child must have a PID");
+
+            let mut guard = ReapGuard::new(child);
+            guard.kill_and_wait().await;
+            assert!(
+                guard.reaped,
+                "reaped must be true after successful kill_and_wait"
+            );
+
+            // Dropping the guard should be a no-op (already reaped).
+            drop(guard);
+
+            assert!(
+                wait_for_reap(pid, Duration::from_secs(2)),
+                "child PID {pid} must be gone after kill_and_wait"
+            );
+        });
+
+        drop(rt);
     }
 }

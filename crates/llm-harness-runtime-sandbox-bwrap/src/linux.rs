@@ -78,6 +78,9 @@ fn modified_to_datetime(meta: &cap_std::fs::Metadata) -> DateTime<Utc> {
 /// Sandbox lifecycle state, tracked atomically to coordinate shutdown.
 ///
 /// - `Running`: normal operation; new work is admitted.
+/// - `Resetting`: reset is in progress; new work is rejected so reset can
+///   acquire the lock without racing against a newly-admitted command.
+///   After cleanup, the state transitions back to `Running`.
 /// - `ShuttingDown`: shutdown has begun; new work is rejected, active
 ///   commands are cancelled and killed.
 /// - `Stopped`: shutdown is complete; no further operations are possible.
@@ -85,15 +88,17 @@ fn modified_to_datetime(meta: &cap_std::fs::Metadata) -> DateTime<Utc> {
 #[repr(u8)]
 enum LifecycleState {
     Running = 0,
-    ShuttingDown = 1,
-    Stopped = 2,
+    Resetting = 1,
+    ShuttingDown = 2,
+    Stopped = 3,
 }
 
 impl LifecycleState {
     fn from_atomic(v: u8) -> Self {
         match v {
             0 => LifecycleState::Running,
-            1 => LifecycleState::ShuttingDown,
+            1 => LifecycleState::Resetting,
+            2 => LifecycleState::ShuttingDown,
             _ => LifecycleState::Stopped,
         }
     }
@@ -254,12 +259,56 @@ impl BwrapEnv {
     }
 
     /// Transition to `ShuttingDown`. Returns `true` if this call performed
-    /// the transition (i.e. the previous state was `Running`).
+    /// the transition.  Accepts both `Running` and `Resetting` as valid
+    /// starting states so shutdown can interrupt an in-progress reset.
     fn begin_shutdown(&self) -> bool {
-        self.lifecycle
+        // Try Running -> ShuttingDown first (common case).
+        if self
+            .lifecycle
             .compare_exchange(
                 LifecycleState::Running as u8,
                 LifecycleState::ShuttingDown as u8,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+        // Try Resetting -> ShuttingDown (shutdown during reset).
+        self.lifecycle
+            .compare_exchange(
+                LifecycleState::Resetting as u8,
+                LifecycleState::ShuttingDown as u8,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Transition `Running -> Resetting`. Returns `true` if this call
+    /// performed the transition.  Fails if the sandbox is already
+    /// resetting, shutting down, or stopped.
+    fn begin_reset(&self) -> bool {
+        self.lifecycle
+            .compare_exchange(
+                LifecycleState::Running as u8,
+                LifecycleState::Resetting as u8,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Transition `Resetting -> Running`. Returns `true` on success.
+    /// Fails if shutdown stole the state (Resetting -> ShuttingDown) while
+    /// reset was in progress — in that case, reset returns Ok and lets
+    /// shutdown handle cleanup.
+    fn finish_reset(&self) -> bool {
+        self.lifecycle
+            .compare_exchange(
+                LifecycleState::Resetting as u8,
+                LifecycleState::Running as u8,
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
             )
@@ -1020,7 +1069,12 @@ impl Sandbox for BwrapSandbox {
 
     fn reset(&self) -> BoxFuture<'_, Result<()>> {
         async move {
-            if self.env.lifecycle() != LifecycleState::Running {
+            // Atomically close admission: transition Running -> Resetting.
+            // This prevents new operations from acquiring the lock between
+            // the token swap and lock acquisition — closing the race where
+            // a new command slips in with the fresh (uncancelled) token and
+            // blocks reset until timeout.
+            if !self.env.begin_reset() {
                 anyhow::bail!("sandbox is not running; cannot reset");
             }
             // Only auto-generated directories (work_dir=None) can be reset.
@@ -1028,19 +1082,21 @@ impl Sandbox for BwrapSandbox {
             // does not own them and must not claim ownership by writing
             // sentinel files or deleting their contents.
             if !self.env.owned() {
+                // Roll back to Running since we can't reset.
+                self.env.finish_reset();
                 anyhow::bail!(
                     "refusing to reset work_dir {:?}: sandbox does not own this directory (work_dir was explicitly provided; only auto-generated directories with work_dir=None can be reset)",
                     self.env.working_dir_path()
                 );
             }
             // Interrupt active shell commands by swapping in a fresh token
-            // and cancelling the old one.  drain_child_output observes the
-            // old token's cancellation, kills+waits the child, and returns
-            // Err — which releases the op-lock so reset can proceed.
+            // and cancelling the old one.  drain_child_output_guarded
+            // observes the old token's cancellation, kills+waits the child
+            // via ReapGuard, and returns Err — which releases the op-lock
+            // so reset can proceed.
             //
-            // Unlike shutdown(), reset() does NOT change the lifecycle
-            // state (it stays Running) and installs a fresh token so the
-            // sandbox remains usable afterwards.
+            // The lifecycle is Resetting (not Running), so new operations
+            // are rejected by acquire_op_lock() during this window.
             let old_token = self.env.swap_shutdown_token(CancellationToken::new());
             old_token.cancel();
 
@@ -1053,7 +1109,12 @@ impl Sandbox for BwrapSandbox {
                 self.env.reset_lock.lock(),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("reset timed out waiting for lock"))?;
+            .map_err(|_| {
+                // Roll back to Running on timeout — the sandbox is still
+                // usable, just not reset.
+                self.env.finish_reset();
+                anyhow::anyhow!("reset timed out waiting for lock")
+            })?;
 
             let _guard = guard;
             let env = self.env.clone();
@@ -1064,9 +1125,12 @@ impl Sandbox for BwrapSandbox {
             .await
             .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))?
             .map_err(|e| anyhow::anyhow!("reset failed: {e}"))?;
-            // The fresh token installed by swap_shutdown_token above is
-            // still active (not cancelled), so new commands can run after
-            // reset.  The sandbox lifecycle is still Running.
+            // Transition back to Running, reopening admission with the
+            // fresh token installed by swap_shutdown_token above.
+            // If shutdown stole the state (Resetting -> ShuttingDown) while
+            // we were in progress, finish_reset returns false — we return
+            // Ok and let shutdown handle the rest.
+            self.env.finish_reset();
             Ok(())
         }
         .boxed()
