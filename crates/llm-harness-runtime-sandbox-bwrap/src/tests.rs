@@ -1609,11 +1609,13 @@ async fn reset_closes_admission_atomically() {
     // 3. try to acquire reset_lock -> blocks (we hold it)
     //
     // We spawn reset in a task so it doesn't borrow `sandbox` directly.
-    // The task owns the sandbox via Box.
+    // The task owns the sandbox and returns it so we can shut it down
+    // after the test — otherwise the auto-generated /tmp/sandbox-bwrap-*
+    // workspace would leak.
     let reset_handle = tokio::spawn(async move {
         let start = std::time::Instant::now();
         sandbox.reset().await.expect("reset must succeed");
-        start.elapsed()
+        (sandbox, start.elapsed())
     });
 
     // Give reset time to call begin_reset() and reach the lock acquisition.
@@ -1634,13 +1636,66 @@ async fn reset_closes_admission_atomically() {
     drop(lock_guard);
 
     // Reset must complete successfully.
-    let reset_elapsed = reset_handle.await.expect("reset task must not panic");
+    let (sandbox, reset_elapsed) = reset_handle.await.expect("reset task must not panic");
     assert!(
         reset_elapsed < Duration::from_secs(5),
         "reset must complete quickly after lock release; took {reset_elapsed:?}"
     );
 
     // Sandbox should be usable after reset (state is Running again).
-    let result = env.execute_shell("echo alive", shell_opts()).await;
+    let result = sandbox.env.execute_shell("echo alive", shell_opts()).await;
     assert!(result.is_ok(), "sandbox should be usable after reset");
+
+    // Clean up the auto-generated workspace.
+    Box::new(sandbox).shutdown().await.unwrap();
+}
+
+/// P0: Dropping the reset() future must roll back the lifecycle to Running.
+///
+/// Without the RAII ResetLifecycleGuard, a dropped reset future leaves the
+/// lifecycle permanently stuck in Resetting — all subsequent operations fail.
+/// This test holds the reset_lock, polls reset briefly (it enters Resetting
+/// and blocks on the lock), then drops the future.  The lifecycle must
+/// return to Running so subsequent commands succeed.
+#[tokio::test]
+#[ignore = "requires bwrap; run with --include-ignored"]
+async fn reset_future_drop_rolls_back_to_running() {
+    require_bwrap();
+    let sandbox = BwrapSandbox::new(owned_config()).unwrap();
+    sandbox.start().await.unwrap();
+    let env = sandbox.env.clone();
+
+    // Hold the lock so reset() blocks during lock acquisition.
+    let lock_guard = env.reset_lock.lock().await;
+
+    // Start reset — poll it briefly so it enters Resetting and blocks on
+    // the lock.  Then drop the future (simulating cancellation).
+    {
+        let reset_future = sandbox.reset();
+        tokio::pin!(reset_future);
+        let _ = tokio::time::timeout(Duration::from_millis(200), &mut reset_future).await;
+        // reset_future is dropped here — the RAII guard must roll back
+        // to Running.
+    }
+
+    // Release the lock — no longer needed.
+    drop(lock_guard);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Lifecycle must be back to Running — the sandbox is usable.
+    assert_eq!(
+        env.lifecycle(),
+        super::LifecycleState::Running,
+        "lifecycle must roll back to Running after reset future is dropped"
+    );
+
+    // Verify the sandbox is actually usable.
+    let result = env.execute_shell("echo alive", shell_opts()).await;
+    assert!(
+        result.is_ok(),
+        "sandbox must be usable after reset future drop"
+    );
+
+    // Clean up the auto-generated workspace.
+    Box::new(sandbox).shutdown().await.unwrap();
 }

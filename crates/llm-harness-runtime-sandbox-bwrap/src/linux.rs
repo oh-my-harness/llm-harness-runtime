@@ -108,6 +108,62 @@ impl LifecycleState {
 /// after sending kill before proceeding with workspace deletion.
 const SHUTDOWN_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+// ── ResetLifecycleGuard ────────────────────────────────────────────────────
+
+/// RAII guard that ensures the lifecycle state is rolled back from
+/// `Resetting` to `Running` when dropped, unless explicitly completed.
+///
+/// This prevents the sandbox from being permanently stuck in `Resetting` if
+/// `reset()` is cancelled (the future is dropped) or errors out at any
+/// await point — including token swap, lock acquisition timeout,
+/// `spawn_blocking` errors, and workspace clearing I/O errors.
+///
+/// The guard is created by [`BwrapEnv::begin_reset`] (transitioning
+/// `Running` → `Resetting`).  On `Drop`, if not completed, it calls
+/// [`BwrapEnv::finish_reset`] to roll back to `Running`.  If shutdown stole
+/// the state (`Resetting` → `ShuttingDown`) while reset was in progress,
+/// `finish_reset` returns `false` and the guard does nothing — shutdown
+/// handles cleanup.
+struct ResetLifecycleGuard {
+    env: Arc<BwrapEnv>,
+    completed: bool,
+}
+
+impl ResetLifecycleGuard {
+    /// Attempt to enter the `Resetting` state.
+    ///
+    /// Returns `None` if the sandbox is not in `Running` state (already
+    /// resetting, shutting down, or stopped).
+    fn begin(env: Arc<BwrapEnv>) -> Option<Self> {
+        if env.begin_reset() {
+            Some(Self {
+                env,
+                completed: false,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Mark the reset as complete and transition back to `Running`.
+    /// Consumes the guard so `Drop` does not double-transition.
+    fn complete(mut self) {
+        self.env.finish_reset();
+        self.completed = true;
+    }
+}
+
+impl Drop for ResetLifecycleGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Roll back to Running.  If shutdown stole the state
+            // (Resetting -> ShuttingDown), finish_reset() returns false
+            // and we do nothing — shutdown handles cleanup.
+            self.env.finish_reset();
+        }
+    }
+}
+
 // ── AllowedRoot ────────────────────────────────────────────────────────────
 
 /// A capability root: a directory opened as an ambient authority, plus its
@@ -1069,26 +1125,29 @@ impl Sandbox for BwrapSandbox {
 
     fn reset(&self) -> BoxFuture<'_, Result<()>> {
         async move {
-            // Atomically close admission: transition Running -> Resetting.
-            // This prevents new operations from acquiring the lock between
-            // the token swap and lock acquisition — closing the race where
-            // a new command slips in with the fresh (uncancelled) token and
-            // blocks reset until timeout.
-            if !self.env.begin_reset() {
-                anyhow::bail!("sandbox is not running; cannot reset");
-            }
+            // Atomically close admission: Running → Resetting.
+            //
+            // The RAII guard ensures we roll back to Running if the future
+            // is cancelled (dropped) or any error occurs below — including
+            // lock timeout, spawn_blocking errors, and I/O errors.  Without
+            // this guard, a cancelled reset would leave the lifecycle
+            // permanently stuck in Resetting, making the sandbox unusable.
+            let guard = match ResetLifecycleGuard::begin(self.env.clone()) {
+                Some(g) => g,
+                None => anyhow::bail!("sandbox is not running; cannot reset"),
+            };
+
             // Only auto-generated directories (work_dir=None) can be reset.
-            // Caller-provided directories are never touched -- the sandbox
-            // does not own them and must not claim ownership by writing
-            // sentinel files or deleting their contents.
+            // Caller-provided directories are never touched — the sandbox
+            // does not own them and must not claim ownership by deleting
+            // their contents.  The guard rolls back to Running on drop.
             if !self.env.owned() {
-                // Roll back to Running since we can't reset.
-                self.env.finish_reset();
                 anyhow::bail!(
                     "refusing to reset work_dir {:?}: sandbox does not own this directory (work_dir was explicitly provided; only auto-generated directories with work_dir=None can be reset)",
                     self.env.working_dir_path()
                 );
             }
+
             // Interrupt active shell commands by swapping in a fresh token
             // and cancelling the old one.  drain_child_output_guarded
             // observes the old token's cancellation, kills+waits the child
@@ -1104,19 +1163,14 @@ impl Sandbox for BwrapSandbox {
             // promptly (killed by the token cancellation above), but the
             // timeout guarantees boundedness if a file operation is in
             // progress (file ops don't observe the token mid-execution).
-            let guard = tokio::time::timeout(
+            // On timeout, the guard rolls back to Running via Drop.
+            let lock_guard = tokio::time::timeout(
                 SHUTDOWN_KILL_GRACE,
                 self.env.reset_lock.lock(),
             )
             .await
-            .map_err(|_| {
-                // Roll back to Running on timeout — the sandbox is still
-                // usable, just not reset.
-                self.env.finish_reset();
-                anyhow::anyhow!("reset timed out waiting for lock")
-            })?;
+           .map_err(|_| anyhow::anyhow!("reset timed out waiting for lock"))?;
 
-            let _guard = guard;
             let env = self.env.clone();
             tokio::task::spawn_blocking(move || -> std::io::Result<()> {
                 env.clear_work_dir_contents()?;
@@ -1125,12 +1179,18 @@ impl Sandbox for BwrapSandbox {
             .await
             .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))?
             .map_err(|e| anyhow::anyhow!("reset failed: {e}"))?;
+            // Hold the lock guard until spawn_blocking completes so no new
+            // command can race into a partially-cleared workspace.
+            // (lock_guard is a tokio::sync::MutexGuard tied to &self, so it
+            // cannot be moved into spawn_blocking which requires 'static.)
+            drop(lock_guard);
+
             // Transition back to Running, reopening admission with the
             // fresh token installed by swap_shutdown_token above.
-            // If shutdown stole the state (Resetting -> ShuttingDown) while
-            // we were in progress, finish_reset returns false — we return
-            // Ok and let shutdown handle the rest.
-            self.env.finish_reset();
+            // If shutdown stole the state (Resetting → ShuttingDown) while
+            // we were in progress, complete() calls finish_reset() which
+            // returns false — we return Ok and let shutdown handle cleanup.
+            guard.complete();
             Ok(())
         }
         .boxed()
