@@ -254,104 +254,271 @@ fn classify_wait(result: std::io::Result<Option<std::process::ExitStatus>>) -> W
     }
 }
 
-/// A non-copyable, non-cloneable admission permit.
-///
-/// The only way to obtain a `ReapPermit` is [`ChildReaper::try_admit`],
-/// which atomically increments the `in_flight` counter.  Dropping a
-/// `ReapPermit` atomically decrements the counter, releasing the slot.
-///
-/// Because `ReapPermit` does not implement `Clone` or `Copy`, it cannot
-/// be forged, duplicated, or double-released.  It moves linearly:
-/// `try_admit()` → `ReapGuard` → `ReapRequest` → dropped when the child
-/// is confirmed exited.
-pub struct ReapPermit {
-    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+/// Atomically decrement the in-flight counter, saturating at zero.
+fn decrement_in_flight(in_flight: &std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::Ordering;
+    let _ = in_flight.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+        if v > 0 { Some(v - 1) } else { None }
+    });
 }
 
-impl Drop for ReapPermit {
+/// Supervisor lifecycle state for the reaper thread pool.
+///
+/// `Healthy` is the only state that accepts new admissions.  Any required
+/// thread exiting (panic, mutex poison, channel disconnect) transitions to
+/// `Degraded`, which closes admission (fail-closed).  `Failed` is set
+/// during initialisation if a thread cannot be spawned.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SupervisorState {
+    Healthy = 0,
+    Degraded = 1,
+    Failed = 2,
+}
+
+impl SupervisorState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Healthy,
+            1 => Self::Degraded,
+            _ => Self::Failed,
+        }
+    }
+}
+
+/// Pre-spawn admission token obtained from [`ChildReaper::try_admit`].
+///
+/// Dropping it releases the in-flight slot — correct when spawn fails or
+/// is never attempted.  To couple the admission with a spawned child, call
+/// [`SpawnAdmission::into_lease`], which transfers ownership to a
+/// [`ChildLease`] that **cannot** release the slot independently of the
+/// child.
+///
+/// This two-phase design (admission → lease) replaces the old `ReapPermit`
+/// which could be dropped independently of the child handle, leaking the
+/// admission slot while the child kept running.
+pub struct SpawnAdmission {
+    in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl SpawnAdmission {
+    /// Couple this admission with a spawned child.  Consumes `self`.
+    ///
+    /// The returned [`ChildLease`] owns both the child handle and the
+    /// admission count — they cannot be separated.  The count is released
+    /// only after the child is confirmed exited (via `confirm_exit` or via
+    /// the reaper when the lease is dropped without confirmation).
+    pub fn into_lease(mut self, child: tokio::process::Child) -> ChildLease {
+        let in_flight = self.in_flight.take();
+        ChildLease {
+            child: Some(child),
+            in_flight,
+            confirmed: false,
+        }
+    }
+}
+
+impl Drop for SpawnAdmission {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        let _ = self
-            .in_flight
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                if v > 0 { Some(v - 1) } else { None }
-            });
+        if let Some(in_flight) = &self.in_flight {
+            decrement_in_flight(in_flight);
+        }
+    }
+}
+
+/// Post-spawn lease coupling a child handle with its admission count.
+///
+/// Created via [`SpawnAdmission::into_lease`].  The admission slot is
+/// released **only** after the child is confirmed exited — either by
+/// [`Self::confirm_exit`] (called after a successful `wait()`) or by the
+/// reaper when this lease is dropped without confirmation.
+///
+/// Unlike the old `ReapPermit`, the `in_flight` Arc is **not** decremented
+/// by `Drop` directly.  Instead, `Drop` delegates the child + `in_flight`
+/// clone to the reaper, which decrements only after confirmed exit.  This
+/// guarantees the admission slot is held for the entire lifetime of the
+/// child.
+pub struct ChildLease {
+    child: Option<tokio::process::Child>,
+    in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    confirmed: bool,
+}
+
+impl ChildLease {
+    /// Create a lease without admission (for tests that don't use the
+    /// global reaper's admission counter).
+    pub fn new(child: tokio::process::Child) -> Self {
+        Self {
+            child: Some(child),
+            in_flight: None,
+            confirmed: false,
+        }
+    }
+
+    /// Borrow the inner child mutably (for `start_kill`, `wait`, taking
+    /// stdout/stderr handles, etc.).
+    pub fn child_mut(&mut self) -> Option<&mut tokio::process::Child> {
+        self.child.as_mut()
+    }
+
+    /// Confirm the child has exited and release the admission slot.
+    /// Idempotent — safe to call multiple times.
+    pub fn confirm_exit(&mut self) {
+        if !self.confirmed {
+            self.confirmed = true;
+            if let Some(in_flight) = &self.in_flight {
+                decrement_in_flight(in_flight);
+            }
+        }
+    }
+
+    /// Kill and wait for the child to exit.  Marks the lease as confirmed
+    /// only if `wait()` succeeds — a failed `wait()` leaves `confirmed`
+    /// false so `Drop` still delegates to the reaper.
+    async fn kill_and_wait(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.start_kill();
+            if child.wait().await.is_ok() {
+                self.confirm_exit();
+            }
+        }
+    }
+
+    /// Wait for the child to exit naturally (no kill).  Marks as confirmed
+    /// on success.
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        if let Some(child) = &mut self.child {
+            let status = child.wait().await?;
+            self.confirm_exit();
+            Ok(status)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "child already taken",
+            ))
+        }
+    }
+}
+
+impl Drop for ChildLease {
+    fn drop(&mut self) {
+        if self.confirmed {
+            return;
+        }
+        // Child exit NOT confirmed.  Delegate to the reaper — the child
+        // handle and an in_flight clone move into a ReapRequest.  The
+        // reaper will kill+wait the child, then drop the ReapRequest
+        // (releasing in_flight).  The lease's own Arc is dropped here
+        // (refcount decreases), but the atomic is NOT decremented — only
+        // the reaper does that after confirmed exit.
+        if let Some(child) = self.child.take() {
+            let in_flight = self.in_flight.clone();
+            if let Some(reaper) = ChildReaper::global()
+                && reaper.is_healthy()
+            {
+                reaper.reap(child, in_flight);
+            } else {
+                push_orphaned(child, in_flight);
+            }
+        }
     }
 }
 
 /// A kill+reap request queued to the [`ChildReaper`].
 ///
-/// The `permit` field holds the linear admission token (if acquired before
-/// spawn).  When the `ReapRequest` is dropped after confirmed child exit,
-/// the `ReapPermit`'s `Drop` releases the slot automatically.  If the
-/// request is leaked (catastrophic failure), the permit is also leaked —
-/// fail-closed (admission eventually blocks).
+/// Owns the child handle and the `in_flight` Arc.  `Drop` decrements
+/// `in_flight` — which only fires after the child is confirmed exited
+/// (worker/stuck-loop drops the request) or during catastrophic teardown.
 struct ReapRequest {
     child: tokio::process::Child,
-    #[allow(dead_code)]
-    permit: Option<ReapPermit>,
+    in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl Drop for ReapRequest {
+    fn drop(&mut self) {
+        if let Some(in_flight) = &self.in_flight {
+            decrement_in_flight(in_flight);
+        }
+    }
+}
+
+/// Snapshot of reaper state for observability.
+#[derive(Debug)]
+pub struct ReaperMetrics {
+    /// Current in-flight (admitted but not yet released) count.
+    pub in_flight: usize,
+    /// Total admissions since startup.
+    pub admitted: usize,
+    /// Total children confirmed reaped.
+    pub completed: usize,
+    /// Total thread (worker/stuck/orphan) failures.
+    pub worker_failures: usize,
+    /// Current stuck-list length.
+    pub stuck: usize,
+    /// Current orphaned-list length.
+    pub orphaned: usize,
+    /// Whether the supervisor is healthy (accepting admissions).
+    pub healthy: bool,
 }
 
 /// A centralized, multi-worker child process reaper with **bounded
-/// admission** and **worker health monitoring**.
-///
-/// The reaper enforces a global admission bound (`in_flight` counter,
-/// capacity = [`REAPER_QUEUE_CAPACITY`]) acquired **before** process
-/// creation via a non-copyable [`ReapPermit`] token.  This guarantees the
-/// total number of unreaped children never exceeds the bound.
+/// admission**, **supervisor health monitoring**, and **all-thread
+/// liveness guards**.
 ///
 /// Architecture:
-/// - `try_admit()` returns `Option<ReapPermit>`; the permit's `Drop`
-///   releases the slot atomically.  The token is non-copyable — it cannot
-///   be forged, duplicated, or double-released.
-/// - `is_healthy()` returns `false` if any worker thread has exited
-///   (panic, mutex poison, channel disconnect).  `try_admit()` checks
-///   health and returns `None` when unhealthy (fail-closed admission).
+/// - `try_admit()` returns `Option<SpawnAdmission>`; the admission's `Drop`
+///   releases the slot atomically.  `into_lease(child)` couples the
+///   admission with the child — the slot is released only after confirmed
+///   exit.
+/// - `is_healthy()` returns `false` if **any** thread (worker, stuck, or
+///   orphan) has exited.  `try_admit()` checks health and returns `None`
+///   when unhealthy (fail-closed admission).
+/// - All threads (workers, stuck reaper, orphan reaper) are registered with
+///   a [`LivenessGuard`] that transitions the supervisor to `Degraded` on
+///   drop.
+/// - Initialisation is transactional: if any thread fails to spawn, the
+///   state is set to `Failed` and `global()` returns `None`.
 /// - Workers process kill+reap requests from a bounded channel.  Children
-///   that don't exit within [`REAP_WORKER_TIMEOUT`] are moved to a stuck
-///   list and revisited by a dedicated thread.
+///   that don't exit within [`REAP_WORKER_TIMEOUT`] (including persistent
+///   EINTR) are moved to a stuck list.
 /// - On queue `Full`/`Disconnected`, children are pushed to the stuck list
 ///   — **no fallback thread is spawned**.
 /// - `try_wait` errors are classified via [`classify_wait`]: only `Exited`
 ///   and `AlreadyReaped` authorize dropping the handle; `Unknown` errors
 ///   retain it in the stuck list.
-/// - Handles that cannot be queued (reaper unhealthy, stuck mutex
-///   poisoned) are pushed to a static [`ORPHANED`] list, never dropped
-///   without confirmed exit.
-///
-/// If thread creation fails, `global()` returns `None` and callers must
-/// refuse to spawn (fail-closed).
 pub struct ChildReaper {
     sender: std::sync::mpsc::SyncSender<ReapRequest>,
     /// Global in-flight counter; bounds total unreaped children.
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// Health flag — `false` if any worker has exited.
-    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Supervisor state — `Healthy` is the only state that admits.
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// Stuck list for children that didn't exit within the worker timeout.
-    /// Bounded by `in_flight` admission.
-    #[allow(dead_code)]
     stuck: std::sync::Arc<std::sync::Mutex<Vec<ReapRequest>>>,
+    /// Metrics counters.
+    admitted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    completed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// RAII guard that marks the reaper as unhealthy when a worker exits.
-struct WorkerGuard {
-    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+/// RAII guard that transitions the supervisor to `Degraded` when any
+/// required thread (worker, stuck, or orphan) exits.  All threads carry
+/// one — this replaces the old `WorkerGuard` which only covered workers.
+struct LivenessGuard {
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl Drop for WorkerGuard {
+impl Drop for LivenessGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-        self.alive.store(false, Ordering::SeqCst);
+        self.state
+            .store(SupervisorState::Degraded as u8, Ordering::SeqCst);
+        self.failures.fetch_add(1, Ordering::SeqCst);
     }
 }
 
 /// Static last-resort storage for child handles that cannot be queued to
 /// the normal stuck list (reaper unhealthy or stuck mutex poisoned).
-///
-/// Handles here are never dropped without confirmed exit.  A dedicated
-/// `orphan_reaper_loop` thread periodically reaps from this list.  The
-/// list is bounded by `in_flight` admission (handles here were admitted
-/// before the reaper died).
 static ORPHANED: std::sync::OnceLock<std::sync::Mutex<Vec<ReapRequest>>> =
     std::sync::OnceLock::new();
 
@@ -360,90 +527,135 @@ fn orphaned_list() -> &'static std::sync::Mutex<Vec<ReapRequest>> {
 }
 
 /// Push a child handle to the orphaned list — never drops the handle.
-///
-/// If even the orphaned mutex is poisoned (truly catastrophic), the
-/// `ReapRequest` is leaked via `mem::forget` to prevent handle drop.  The
-/// permit is also leaked (fail-closed — admission eventually blocks).
-fn push_orphaned(mut child: tokio::process::Child, permit: Option<ReapPermit>) {
+/// The `in_flight` Arc (if held) moves into the `ReapRequest` and is
+/// decremented by `Drop` only after confirmed exit.
+fn push_orphaned(
+    mut child: tokio::process::Child,
+    in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+) {
     let _ = child.start_kill();
-    let req = ReapRequest { child, permit };
-    // Recover from poison — we must not drop the handle.
+    let req = ReapRequest { child, in_flight };
     let mut guard = orphaned_list().lock().unwrap_or_else(|e| e.into_inner());
     guard.push(req);
 }
 
 impl ChildReaper {
-    /// Returns the global reaper instance, or `None` if the reaper threads
-    /// could not be created.  When `None`, callers must refuse to spawn
-    /// (fail-closed) — there is no inline fallback.
+    /// Returns the global reaper instance, or `None` if any thread could
+    /// not be created (fail-closed).  Initialisation is transactional: if
+    /// any of the worker/stuck/orphan threads fail to spawn, the state is
+    /// set to `Failed` and `None` is returned permanently.
     pub fn global() -> Option<&'static ChildReaper> {
         static REAPER: std::sync::OnceLock<Option<ChildReaper>> = std::sync::OnceLock::new();
         REAPER
             .get_or_init(|| {
+                use std::sync::atomic::AtomicU8;
+
                 let (sender, receiver) =
                     std::sync::mpsc::sync_channel::<ReapRequest>(REAPER_QUEUE_CAPACITY);
                 let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
                 let stuck = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
                 let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let state = std::sync::Arc::new(AtomicU8::new(SupervisorState::Healthy as u8));
+                let admitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+                // Spawn worker threads — each carries a LivenessGuard.
                 for i in 0..REAPER_WORKERS {
                     let rx = receiver.clone();
                     let stuck = stuck.clone();
-                    let alive = alive.clone();
+                    let state_clone = state.clone();
+                    let failures = failures.clone();
+                    let completed = completed.clone();
                     if std::thread::Builder::new()
                         .name(format!("child-reaper-{i}"))
                         .spawn(move || {
-                            let _guard = WorkerGuard { alive };
-                            Self::worker_loop(rx, stuck)
+                            let _guard = LivenessGuard {
+                                state: state_clone,
+                                failures,
+                            };
+                            Self::worker_loop(rx, stuck, completed)
                         })
                         .is_err()
                     {
+                        state.store(
+                            SupervisorState::Failed as u8,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
                         return None;
                     }
                 }
 
+                // Spawn stuck reaper thread.
                 let stuck_clone = stuck.clone();
+                let completed_clone = completed.clone();
+                let state_clone = state.clone();
+                let failures_clone = failures.clone();
                 if std::thread::Builder::new()
                     .name("child-reaper-stuck".to_string())
-                    .spawn(move || Self::stuck_loop(stuck_clone))
+                    .spawn(move || {
+                        let _guard = LivenessGuard {
+                            state: state_clone,
+                            failures: failures_clone,
+                        };
+                        Self::stuck_loop(stuck_clone, completed_clone)
+                    })
                     .is_err()
                 {
+                    state.store(
+                        SupervisorState::Failed as u8,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
                     return None;
                 }
 
+                // Spawn orphan reaper thread.
+                let completed_clone2 = completed.clone();
+                let state_clone2 = state.clone();
+                let failures_clone2 = failures.clone();
                 if std::thread::Builder::new()
                     .name("child-reaper-orphan".to_string())
-                    .spawn(Self::orphan_reaper_loop)
+                    .spawn(move || {
+                        let _guard = LivenessGuard {
+                            state: state_clone2,
+                            failures: failures_clone2,
+                        };
+                        Self::orphan_reaper_loop(completed_clone2)
+                    })
                     .is_err()
                 {
+                    state.store(
+                        SupervisorState::Failed as u8,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
                     return None;
                 }
 
                 Some(ChildReaper {
                     sender,
                     in_flight,
-                    alive,
+                    state,
                     stuck,
+                    admitted,
+                    completed,
+                    failures,
                 })
             })
             .as_ref()
     }
 
-    /// Returns `true` if all worker threads are alive and the reaper is
-    /// accepting new admissions.  When `false`, `try_admit` returns
-    /// `None` (fail-closed).
+    /// Returns `true` only when the supervisor is `Healthy` — all required
+    /// threads alive.  Any thread exit transitions to `Degraded`, closing
+    /// admission.
     pub fn is_healthy(&self) -> bool {
         use std::sync::atomic::Ordering;
-        self.alive.load(Ordering::SeqCst)
+        SupervisorState::from_u8(self.state.load(Ordering::SeqCst)) == SupervisorState::Healthy
     }
 
-    /// Try to acquire an admission permit before spawning a child.
-    /// Returns `Some(permit)` if a slot was acquired (caller may spawn),
-    /// `None` if the reaper is unhealthy or at capacity (caller must
-    /// refuse to spawn — fail-closed).  The permit is released by `Drop`
-    /// when the child is confirmed exited.
-    pub fn try_admit(&self) -> Option<ReapPermit> {
+    /// Try to acquire a pre-spawn admission.  Returns `Some(admission)` if
+    /// a slot was acquired, `None` if the reaper is unhealthy or at
+    /// capacity (fail-closed).
+    pub fn try_admit(&self) -> Option<SpawnAdmission> {
         use std::sync::atomic::Ordering;
         if !self.is_healthy() {
             return None;
@@ -457,56 +669,79 @@ impl ChildReaper {
                 }
             })
             .ok()
-            .map(|_| ReapPermit {
-                in_flight: self.in_flight.clone(),
+            .map(|_| {
+                self.admitted.fetch_add(1, Ordering::SeqCst);
+                SpawnAdmission {
+                    in_flight: Some(self.in_flight.clone()),
+                }
             })
     }
 
-    /// Worker thread main loop.  Receives [`ReapRequest`]s from the shared
-    /// receiver, kills+reaps each child with a bounded timeout, and
-    /// classifies `try_wait` errors via [`classify_wait`].
+    /// Snapshot of reaper metrics for observability.
+    pub fn metrics(&self) -> ReaperMetrics {
+        use std::sync::atomic::Ordering;
+        ReaperMetrics {
+            in_flight: self.in_flight.load(Ordering::SeqCst),
+            admitted: self.admitted.load(Ordering::SeqCst),
+            completed: self.completed.load(Ordering::SeqCst),
+            worker_failures: self.failures.load(Ordering::SeqCst),
+            stuck: self.stuck.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            orphaned: orphaned_list()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            healthy: self.is_healthy(),
+        }
+    }
+
+    /// Queue a child for killing and reaping.  If the queue is full or
+    /// disconnected, the child is pushed to the stuck list — **no fallback
+    /// thread is spawned**.  The `in_flight` Arc (if held) is decremented
+    /// by `ReapRequest::drop` only after confirmed exit.
+    fn reap(
+        &self,
+        mut child: tokio::process::Child,
+        in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) {
+        let _ = child.start_kill();
+        let req = ReapRequest { child, in_flight };
+        match self.sender.try_send(req) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(req))
+            | Err(std::sync::mpsc::TrySendError::Disconnected(req)) => {
+                let mut list = self.stuck.lock().unwrap_or_else(|e| e.into_inner());
+                list.push(req);
+            }
+        }
+    }
+
+    /// Worker thread main loop.  Receives [`ReapRequest`]s, kills+reaps
+    /// each child with a bounded timeout via [`reap_with_deadline`], and
+    /// classifies `try_wait` errors.
     ///
-    /// Only `Exited` and `AlreadyReaped` drop the `ReapRequest` (releasing
-    /// the permit via `ReapPermit::drop`).  `Unknown` errors and timeouts
-    /// move the child to the stuck list — the handle and permit are
-    /// retained.
+    /// Only `Exited` and `AlreadyReaped` drop the `ReapRequest`.  Timeouts
+    /// (including persistent EINTR) and `Unknown` errors move the child to
+    /// the stuck list.
     fn worker_loop(
         receiver: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<ReapRequest>>>,
         stuck: std::sync::Arc<std::sync::Mutex<Vec<ReapRequest>>>,
+        completed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
+        use std::sync::atomic::Ordering;
         loop {
-            // Recover from poison — a panicked peer shouldn't kill us.
             let req = match receiver.lock() {
                 Ok(rx) => rx.recv(),
-                Err(e) => {
-                    // Mutex poisoned — recover the receiver.
-                    e.into_inner().recv()
-                }
+                Err(e) => e.into_inner().recv(),
             };
             match req {
                 Ok(mut req) => {
                     let _ = req.child.start_kill();
                     let deadline = std::time::Instant::now() + REAP_WORKER_TIMEOUT;
-                    let done = loop {
-                        match classify_wait(req.child.try_wait()) {
-                            WaitOutcome::Exited | WaitOutcome::AlreadyReaped => break true,
-                            WaitOutcome::Interrupted => {
-                                std::thread::sleep(EINTR_BACKOFF);
-                                continue;
-                            }
-                            WaitOutcome::Pending => {
-                                if std::time::Instant::now() >= deadline {
-                                    break false; // Move to stuck list.
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                            WaitOutcome::Unknown(_) => break false, // Stuck list.
-                        }
-                    };
+                    let done = reap_with_deadline(|| req.child.try_wait(), deadline);
                     if done {
-                        // req drops — ReapPermit::drop releases the slot.
+                        completed.fetch_add(1, Ordering::SeqCst);
+                        // req drops — ReapRequest::drop releases in_flight.
                     } else {
-                        // Recover from poison — push to stuck list.
                         let mut list = stuck.lock().unwrap_or_else(|e| e.into_inner());
                         list.push(req);
                     }
@@ -519,18 +754,20 @@ impl ChildReaper {
     /// Stuck reaper thread.  Periodically revisits children that didn't
     /// exit within the worker timeout.  Handles are never dropped until
     /// `classify_wait` returns `Exited` or `AlreadyReaped`.
-    fn stuck_loop(stuck: std::sync::Arc<std::sync::Mutex<Vec<ReapRequest>>>) {
+    fn stuck_loop(
+        stuck: std::sync::Arc<std::sync::Mutex<Vec<ReapRequest>>>,
+        completed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::Ordering;
         loop {
             std::thread::sleep(STUCK_REAPER_INTERVAL);
-            // Recover from poison.
             let mut list = stuck.lock().unwrap_or_else(|e| e.into_inner());
             let mut still_stuck = Vec::with_capacity(list.len());
             while let Some(mut req) = list.pop() {
                 match classify_wait(req.child.try_wait()) {
                     WaitOutcome::Exited | WaitOutcome::AlreadyReaped => {
-                        // req drops — ReapPermit::drop releases the slot.
+                        completed.fetch_add(1, Ordering::SeqCst);
                     }
-                    // Pending, Interrupted, Unknown — retain handle.
                     WaitOutcome::Pending | WaitOutcome::Interrupted | WaitOutcome::Unknown(_) => {
                         still_stuck.push(req)
                     }
@@ -541,18 +778,17 @@ impl ChildReaper {
     }
 
     /// Orphan reaper thread.  Periodically reaps handles in the
-    /// [`ORPHANED`] list that couldn't be queued to the normal stuck list.
-    /// Handles are never dropped without confirmed exit.
-    fn orphan_reaper_loop() {
+    /// [`ORPHANED`] list.
+    fn orphan_reaper_loop(completed: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
         loop {
             std::thread::sleep(STUCK_REAPER_INTERVAL);
-            // Recover from poison.
             let mut list = orphaned_list().lock().unwrap_or_else(|e| e.into_inner());
             let mut still_orphaned = Vec::with_capacity(list.len());
             while let Some(mut req) = list.pop() {
                 match classify_wait(req.child.try_wait()) {
                     WaitOutcome::Exited | WaitOutcome::AlreadyReaped => {
-                        // req drops — ReapPermit::drop releases the slot.
+                        completed.fetch_add(1, Ordering::SeqCst);
                     }
                     WaitOutcome::Pending | WaitOutcome::Interrupted | WaitOutcome::Unknown(_) => {
                         still_orphaned.push(req)
@@ -562,165 +798,110 @@ impl ChildReaper {
             *list = still_orphaned;
         }
     }
-
-    /// Queue a child for killing and reaping.  If the queue is full or
-    /// disconnected, the child is pushed to the stuck list — **no fallback
-    /// thread is spawned**.  The permit (if held) is released by
-    /// `ReapPermit::drop` when the child is confirmed exited.
-    fn reap(&self, mut child: tokio::process::Child, permit: Option<ReapPermit>) {
-        let _ = child.start_kill();
-        let req = ReapRequest { child, permit };
-        match self.sender.try_send(req) {
-            Ok(()) => {}
-            Err(std::sync::mpsc::TrySendError::Full(req))
-            | Err(std::sync::mpsc::TrySendError::Disconnected(req)) => {
-                // Push to stuck list instead of spawning a fallback thread.
-                // Recover from poison.
-                let mut list = self.stuck.lock().unwrap_or_else(|e| e.into_inner());
-                list.push(req);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 impl ChildReaper {
     /// Create a ChildReaper whose receiver is already disconnected.
-    /// Used to test the `SendError` recovery path.
     fn new_disconnected() -> ChildReaper {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<ReapRequest>(1);
         drop(receiver);
         ChildReaper {
             sender,
-            alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                SupervisorState::Healthy as u8,
+            )),
             stuck: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            admitted: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            completed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            failures: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
     /// Create a ChildReaper with a bounded queue, no worker threads, and
-    /// the receiver **kept alive** (returned to the caller).  This lets
-    /// tests fill the queue to capacity and then verify that a subsequent
-    /// `reap()` hits `Full` (not `Disconnected`).
+    /// the receiver kept alive (returned to caller).
     fn new_no_workers(capacity: usize) -> (ChildReaper, std::sync::mpsc::Receiver<ReapRequest>) {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<ReapRequest>(capacity);
         (
             ChildReaper {
                 sender,
-                alive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                    SupervisorState::Healthy as u8,
+                )),
                 stuck: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                admitted: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                completed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                failures: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
             receiver,
         )
     }
-}
 
-/// Guard that owns a [`tokio::process::Child`] and guarantees the child is
-/// killed **and reaped** even if the drain future is dropped without being
-/// polled to completion.
-///
-/// `tokio::process::Command::kill_on_drop(true)` only sends `SIGKILL` from
-/// `Drop` — it cannot `await`, so the child is not reaped (reaped via Tokio's
-/// best-effort SIGCHLD orphan queue, which requires the signal driver and is
-/// not guaranteed).  This guard closes that gap by delegating to a
-/// **centralized [`ChildReaper`]** — a pool of dedicated OS threads that
-/// poll `try_wait()` (synchronous `waitpid` with `WNOHANG`) until the child
-/// exits, ensuring the zombie is reaped regardless of Tokio runtime state.
-///
-/// `permit` holds the linear [`ReapPermit`] token (if acquired before
-/// spawn).  The permit is released by `ReapPermit::drop` when the child is
-/// confirmed exited — either by `kill_and_wait`/`wait` (drain future reaps,
-/// permit taken from `Option`) or by the reaper worker/stuck-loop (guard
-/// delegates on drop, permit moves into `ReapRequest`).  Test-created guards
-/// pass `None` so they don't interact with the admission counter.
-///
-/// Once the child has been successfully reaped via [`Self::kill_and_wait`] or
-/// [`Self::wait`], the `reaped` flag is set so `Drop` does not double-kill.
-struct ReapGuard {
-    child: Option<tokio::process::Child>,
-    reaped: bool,
-    permit: Option<ReapPermit>,
-}
-
-impl ReapGuard {
-    fn new(child: tokio::process::Child, permit: Option<ReapPermit>) -> Self {
-        Self {
-            child: Some(child),
-            reaped: false,
-            permit,
+    /// Create a ChildReaper in `Failed` state — for testing fail-closed
+    /// admission after a supervisor failure.
+    fn new_failed() -> ChildReaper {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel::<ReapRequest>(1);
+        ChildReaper {
+            sender,
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                SupervisorState::Failed as u8,
+            )),
+            stuck: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            admitted: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            completed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            failures: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
-    /// Borrow the inner child mutably (for `start_kill`, `wait`, taking
-    /// stdout/stderr handles, etc.).
-    fn child_mut(&mut self) -> Option<&mut tokio::process::Child> {
-        self.child.as_mut()
+    /// Directly create a ReapRequest for testing the stuck list.
+    fn reap_direct(
+        &self,
+        child: tokio::process::Child,
+        in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) {
+        self.reap(child, in_flight);
     }
 
-    /// Take and drop the admission permit, releasing the in-flight slot.
-    /// Idempotent — `take()` on `None` is a no-op.
-    fn release_permit(&mut self) {
-        self.permit.take();
+    /// Get a clone of the stuck list Arc (for testing poison recovery).
+    fn stuck_arc(&self) -> std::sync::Arc<std::sync::Mutex<Vec<ReapRequest>>> {
+        self.stuck.clone()
     }
-
-    /// Kill and wait for the child to exit.  Only marks the child as reaped
-    /// if `wait()` succeeds — a failed `wait()` leaves `reaped` false so
-    /// `Drop` still attempts reaping.
-    async fn kill_and_wait(&mut self) {
-        if let Some(child) = &mut self.child {
-            let _ = child.start_kill();
-            if child.wait().await.is_ok() {
-                self.reaped = true;
-                self.release_permit();
+}
+/// Reap a child with a deadline, using the provided `try_wait` closure.
+///
+/// Returns `true` if the child was confirmed exited (handle can be
+/// dropped), `false` if it should be moved to the stuck list.
+///
+/// The `try_wait` closure is injected for testability — tests can
+/// simulate persistent EINTR, unknown errors, etc. without spawning real
+/// processes.
+///
+/// **Every** retry branch (Interrupted and Pending) checks the deadline.
+/// Persistent EINTR no longer occupies a worker indefinitely — after the
+/// deadline, the child moves to the stuck list.
+fn reap_with_deadline(
+    mut try_wait: impl FnMut() -> std::io::Result<Option<std::process::ExitStatus>>,
+    deadline: std::time::Instant,
+) -> bool {
+    loop {
+        match classify_wait(try_wait()) {
+            WaitOutcome::Exited | WaitOutcome::AlreadyReaped => return true,
+            WaitOutcome::Interrupted => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(EINTR_BACKOFF);
             }
-        }
-    }
-
-    /// Wait for the child to exit naturally (no kill).  Only marks as reaped
-    /// if `wait()` succeeds.
-    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        if let Some(child) = &mut self.child {
-            let status = child.wait().await?;
-            self.reaped = true;
-            self.release_permit();
-            Ok(status)
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "child already taken",
-            ))
-        }
-    }
-}
-
-impl Drop for ReapGuard {
-    fn drop(&mut self) {
-        if self.reaped {
-            // Child was reaped by kill_and_wait/wait.  Permit already
-            // released (or never held).  Defensive: take any remaining.
-            self.release_permit();
-            return;
-        }
-        let permit = self.permit.take();
-        if let Some(child) = self.child.take() {
-            if let Some(reaper) = ChildReaper::global()
-                && reaper.is_healthy()
-            {
-                // Delegate to the reaper.  The permit moves into the
-                // ReapRequest — it's released by ReapPermit::drop when
-                // the child is confirmed exited.  No fallback thread.
-                reaper.reap(child, permit);
-            } else {
-                // Reaper unavailable or unhealthy.  Push to the orphaned
-                // list — the handle is never dropped without confirmed
-                // exit.  The permit is retained (leaked if the orphan
-                // reaper also dies — fail-closed).
-                push_orphaned(child, permit);
+            WaitOutcome::Pending => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-        } else {
-            // No child — just release the permit.
-            drop(permit);
+            WaitOutcome::Unknown(_) => return false,
         }
     }
 }
@@ -730,28 +911,26 @@ impl Drop for ReapGuard {
 ///
 /// This is the production-grade variant of [`drain_child_output`] used by
 /// sandbox backends that have an internal shutdown signal (e.g.
-/// `BwrapEnv`).  It adds two guarantees beyond the base function:
+/// `BwrapEnv`).
 ///
-/// 1. **Shutdown cancellation**: when `shutdown` fires, the child is killed
-///    and reaped immediately (not just abandoned).
-/// 2. **Drop-safe reap**: if the returned future is dropped before
-///    completion (e.g. the caller aborts the task), the [`ReapGuard`]
-///    spawns a background task to kill and wait the child, so no zombie or
-///    orphan survives.  This is stronger than `kill_on_drop(true)`, which
-///    only sends `SIGKILL` without reaping.
+/// **Drop-safe reap**: the [`ChildLease`] is created **synchronously**
+/// before the future is returned, so dropping the future without polling
+/// it still triggers `ChildLease::drop`, which delegates to the reaper.
+/// This closes the "unpolled future" gap — the child is never orphaned
+/// even if the caller creates the future and drops it before the first
+/// poll.
 ///
 /// `OsEnv` continues to use the simpler [`drain_child_output`] (no shutdown
-/// token, no guard overhead) because it has no internal shutdown signal.
-pub async fn drain_child_output_guarded(
-    child: tokio::process::Child,
+/// token, no lease overhead) because it has no internal shutdown signal.
+pub fn drain_child_output_guarded(
+    mut lease: ChildLease,
     opts: ShellOptions<'_>,
     shutdown: CancellationToken,
-    permit: Option<ReapPermit>,
-) -> Result<ShellOutput, EnvError> {
-    let mut guard = ReapGuard::new(child, permit);
-
-    let mut stdout_handle = guard.child_mut().and_then(|c| c.stdout.take());
-    let mut stderr_handle = guard.child_mut().and_then(|c| c.stderr.take());
+) -> impl std::future::Future<Output = Result<ShellOutput, EnvError>> + use<'_> {
+    // Take stdout/stderr handles synchronously — the lease retains the
+    // child handle for kill/wait.
+    let mut stdout_handle = lease.child_mut().and_then(|c| c.stdout.take());
+    let mut stderr_handle = lease.child_mut().and_then(|c| c.stderr.take());
 
     macro_rules! drain_pipe {
         ($handle:expr, $cb:expr) => {
@@ -787,100 +966,103 @@ pub async fn drain_child_output_guarded(
         };
     }
 
-    let mut on_stdout = opts.on_stdout;
-    let mut on_stderr = opts.on_stderr;
-    let drain = async {
-        let stdout_task = drain_pipe!(stdout_handle, on_stdout);
-        let stderr_task = drain_pipe!(stderr_handle, on_stderr);
-        let (stdout_res, stderr_res) = tokio::join!(stdout_task, stderr_task);
-        let stdout = stdout_res?;
-        let stderr = stderr_res?;
-        let status = guard.wait().await.map_err(EnvError::Io)?;
-        Ok::<_, EnvError>((stdout, stderr, status))
-    };
+    async move {
+        let mut on_stdout = opts.on_stdout;
+        let mut on_stderr = opts.on_stderr;
+        let drain = async {
+            let stdout_task = drain_pipe!(stdout_handle, on_stdout);
+            let stderr_task = drain_pipe!(stderr_handle, on_stderr);
+            let (stdout_res, stderr_res) = tokio::join!(stdout_task, stderr_task);
+            let stdout = stdout_res?;
+            let stderr = stderr_res?;
+            let status = lease.wait().await.map_err(EnvError::Io)?;
+            Ok::<_, EnvError>((stdout, stderr, status))
+        };
 
-    let (stdout, stderr, status) = if let Some(timeout) = opts.timeout {
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => {
-                guard.kill_and_wait().await;
-                return Err(EnvError::Other("sandbox is shutting down".into()));
-            }
-            _ = opts.abort.cancelled() => {
-                guard.kill_and_wait().await;
-                return Err(EnvError::Aborted);
-            }
-            res = tokio::time::timeout(timeout, drain) => match res {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
-                    guard.kill_and_wait().await;
-                    return Err(e);
+        let (stdout, stderr, status) = if let Some(timeout) = opts.timeout {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    lease.kill_and_wait().await;
+                    return Err(EnvError::Other("sandbox is shutting down".into()));
                 }
-                Err(_) => {
-                    guard.kill_and_wait().await;
-                    return Err(EnvError::ShellFailed {
-                        exit_code: -1,
-                        stdout: String::new(),
-                        stderr: "timeout".into(),
-                    });
+                _ = opts.abort.cancelled() => {
+                    lease.kill_and_wait().await;
+                    return Err(EnvError::Aborted);
                 }
-            },
+                res = tokio::time::timeout(timeout, drain) => match res {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        lease.kill_and_wait().await;
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        lease.kill_and_wait().await;
+                        return Err(EnvError::ShellFailed {
+                            exit_code: -1,
+                            stdout: String::new(),
+                            stderr: "timeout".into(),
+                        });
+                    }
+                },
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {
+                    lease.kill_and_wait().await;
+                    return Err(EnvError::Other("sandbox is shutting down".into()));
+                }
+                _ = opts.abort.cancelled() => {
+                    lease.kill_and_wait().await;
+                    return Err(EnvError::Aborted);
+                }
+                res = drain => match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        lease.kill_and_wait().await;
+                        return Err(e);
+                    }
+                },
+            }
+        };
+
+        // Child was reaped via wait() in the drain future.
+        lease.confirm_exit();
+
+        #[cfg(target_os = "windows")]
+        let (stdout, stderr) = (stdout.replace("\r\n", "\n"), stderr.replace("\r\n", "\n"));
+
+        if !status.success() {
+            Err(EnvError::ShellFailed {
+                exit_code: status.code().unwrap_or(-1),
+                stdout,
+                stderr,
+            })
+        } else {
+            Ok(ShellOutput {
+                stdout,
+                stderr,
+                exit_code: status.code().unwrap_or(0),
+            })
         }
-    } else {
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => {
-                guard.kill_and_wait().await;
-                return Err(EnvError::Other("sandbox is shutting down".into()));
-            }
-            _ = opts.abort.cancelled() => {
-                guard.kill_and_wait().await;
-                return Err(EnvError::Aborted);
-            }
-            res = drain => match res {
-                Ok(v) => v,
-                Err(e) => {
-                    guard.kill_and_wait().await;
-                    return Err(e);
-                }
-            },
-        }
-    };
-
-    // Guard has been reaped via wait() in the drain future.  Mark it so
-    // Drop does not attempt a second kill.
-    guard.reaped = true;
-
-    #[cfg(target_os = "windows")]
-    let (stdout, stderr) = (stdout.replace("\r\n", "\n"), stderr.replace("\r\n", "\n"));
-
-    if !status.success() {
-        Err(EnvError::ShellFailed {
-            exit_code: status.code().unwrap_or(-1),
-            stdout,
-            stderr,
-        })
-    } else {
-        Ok(ShellOutput {
-            stdout,
-            stderr,
-            exit_code: status.code().unwrap_or(0),
-        })
     }
 }
 
 #[cfg(all(test, unix))]
 mod reap_tests {
-    use super::{ChildReaper, ReapGuard, WaitOutcome, classify_wait};
+    use super::{
+        ChildLease, ChildReaper, LivenessGuard, REAPER_QUEUE_CAPACITY, SupervisorState,
+        WaitOutcome, classify_wait, drain_child_output_guarded, reap_with_deadline,
+    };
+    use llm_harness_types::ShellOptions;
     use std::os::unix::process::ExitStatusExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
 
     /// Check whether a process has been fully reaped (gone from /proc).
-    ///
-    /// Returns `true` only when `/proc/<pid>/status` cannot be read — the
-    /// process is fully gone from the process table.  A zombie still has a
-    /// `/proc` entry (it occupies a PID until reaped), so it returns
-    /// `false`.
     fn process_is_gone(pid: u32) -> bool {
         let status_path = format!("/proc/{pid}/status");
         std::fs::read_to_string(&status_path).is_err()
@@ -898,10 +1080,7 @@ mod reap_tests {
         false
     }
 
-    /// Spawn a child process inside a temporary Tokio runtime (required by
-    /// `tokio::process::Command::spawn`).  The runtime is dropped after
-    /// spawning — the child handle remains valid for `start_kill` and
-    /// `try_wait`, which are synchronous and don't need a runtime.
+    /// Spawn a child process inside a temporary Tokio runtime.
     fn spawn_child(cmd: &str, arg: &str) -> tokio::process::Child {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -915,6 +1094,18 @@ mod reap_tests {
                 .spawn()
                 .unwrap()
         })
+    }
+
+    /// Minimal ShellOptions for testing drain_child_output_guarded.
+    fn test_opts() -> ShellOptions<'static> {
+        ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout: None,
+            abort: CancellationToken::new(),
+            on_stdout: None,
+            on_stderr: None,
+        }
     }
 
     // ── classify_wait unit tests (no process needed) ──────────────────────
@@ -941,7 +1132,6 @@ mod reap_tests {
 
     #[test]
     fn classify_wait_already_reaped() {
-        // ECHILD (errno 10 on Linux/macOS) — child was reaped elsewhere.
         let err = std::io::Error::from_raw_os_error(super::ECHILD);
         assert!(matches!(
             classify_wait(Err(err)),
@@ -951,77 +1141,111 @@ mod reap_tests {
 
     #[test]
     fn classify_wait_unknown_error_retains_handle() {
-        // An unexpected error must NOT be treated as AlreadyReaped — the
-        // handle must be retained (WaitOutcome::Unknown).
-        let err = std::io::Error::from_raw_os_error(999); // bogus errno
+        let err = std::io::Error::from_raw_os_error(999);
         assert!(matches!(classify_wait(Err(err)), WaitOutcome::Unknown(_)));
     }
 
-    // ── ReapGuard integration tests ───────────────────────────────────────
+    // ── reap_with_deadline injectable tests ───────────────────────────────
 
-    /// P1: ReapGuard::drop() must reap the child even when no Tokio runtime
-    /// is available.
+    /// P0: Persistent EINTR must exceed the deadline and move to stuck,
+    /// not spin forever occupying a worker.
     #[test]
-    fn reap_guard_reaps_without_runtime() {
-        let child = {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                tokio::process::Command::new("sleep")
-                    .arg("30")
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .unwrap()
-            })
-        };
-        let pid = child.id().expect("child must have a PID");
-
-        let guard = ReapGuard::new(child, None);
-        drop(guard);
-
+    fn persistent_eintr_exceeds_deadline() {
+        let deadline = std::time::Instant::now() + Duration::from_millis(50);
+        let result = reap_with_deadline(
+            || Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+            deadline,
+        );
         assert!(
-            wait_for_reap(pid, Duration::from_secs(5)),
-            "child PID {pid} must be reaped after ReapGuard::drop without runtime"
+            !result,
+            "persistent EINTR should move to stuck after deadline"
+        );
+        assert!(
+            std::time::Instant::now() >= deadline,
+            "should have waited until deadline, not return early"
         );
     }
 
-    /// P1: ReapGuard::drop() must reap the child even when the Tokio runtime
-    /// is being shut down.
+    /// P0: Persistent unknown wait error must retain ownership (return
+    /// false) immediately, not treat it as AlreadyReaped.
     #[test]
-    fn reap_guard_reaps_during_runtime_shutdown() {
+    fn persistent_unknown_error_retains_ownership() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let result = reap_with_deadline(|| Err(std::io::Error::from_raw_os_error(999)), deadline);
+        assert!(
+            !result,
+            "unknown error must retain ownership (move to stuck)"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "should return immediately for unknown error"
+        );
+    }
+
+    /// Exited child should return true (handle can be dropped).
+    #[test]
+    fn reap_with_deadline_exited() {
+        let result = reap_with_deadline(
+            || Ok(Some(std::process::ExitStatus::from_raw(0))),
+            std::time::Instant::now() + Duration::from_secs(5),
+        );
+        assert!(result, "exited child should return true");
+    }
+
+    // ── ChildLease integration tests ──────────────────────────────────────
+
+    /// P0: ChildLease::drop() must reap the child even when no Tokio
+    /// runtime is available.
+    #[test]
+    fn lease_reaps_without_runtime() {
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        let lease = ChildLease::new(child);
+        drop(lease);
+
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped after ChildLease::drop without runtime"
+        );
+    }
+
+    /// P0: ChildLease::drop() must reap the child even when the Tokio
+    /// runtime is being shut down.
+    #[test]
+    fn lease_reaps_during_runtime_shutdown() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
-        let (child, handle) = rt.block_on(async {
+        let pid = rt.block_on(async {
             let child = tokio::process::Command::new("sleep")
                 .arg("30")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .unwrap();
-            let pid = child.id().expect("child must have a PID");
-            (child, pid)
+            child.id().expect("child must have a PID")
         });
 
-        let guard = ReapGuard::new(child, None);
-        drop(guard);
+        let child = spawn_child("sleep", "30");
+        let pid2 = child.id().expect("child must have a PID");
+        let lease = ChildLease::new(child);
+        drop(lease);
         drop(rt);
 
         assert!(
-            wait_for_reap(handle, Duration::from_secs(5)),
-            "child PID {handle} must be reaped after ReapGuard::drop during runtime shutdown"
+            wait_for_reap(pid2, Duration::from_secs(5)),
+            "child PID {pid2} must be reaped after ChildLease::drop during runtime shutdown"
         );
+        let _ = pid; // suppress unused warning
     }
 
-    /// P1: ReapGuard::drop() must reap the child in the normal case (runtime
-    /// alive).
+    /// P0: ChildLease::drop() must reap the child in the normal case
+    /// (runtime alive).
     #[test]
-    fn reap_guard_reaps_with_runtime_alive() {
+    fn lease_reaps_with_runtime_alive() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1035,22 +1259,22 @@ mod reap_tests {
                 .spawn()
                 .unwrap();
             let pid = child.id().expect("child must have a PID");
-            let guard = ReapGuard::new(child, None);
-            drop(guard);
+            let lease = ChildLease::new(child);
+            drop(lease);
             pid
         });
 
         assert!(
             wait_for_reap(pid, Duration::from_secs(5)),
-            "child PID {pid} must be reaped after ReapGuard::drop with runtime alive"
+            "child PID {pid} must be reaped after ChildLease::drop with runtime alive"
         );
 
         drop(rt);
     }
 
-    /// P1: kill_and_wait must mark the child as reaped on success.
+    /// P0: kill_and_wait must confirm exit on success.
     #[test]
-    fn kill_and_wait_marks_reaped_on_success() {
+    fn kill_and_wait_marks_confirmed_on_success() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1065,18 +1289,8 @@ mod reap_tests {
                 .unwrap();
             let pid = child.id().expect("child must have a PID");
 
-            let mut guard = ReapGuard::new(child, None);
-            guard.kill_and_wait().await;
-            assert!(
-                guard.reaped,
-                "reaped must be true after successful kill_and_wait"
-            );
-            assert!(
-                guard.permit.is_none(),
-                "permit must be released after kill_and_wait"
-            );
-
-            drop(guard);
+            let mut lease = ChildLease::new(child);
+            lease.kill_and_wait().await;
 
             assert!(
                 wait_for_reap(pid, Duration::from_secs(2)),
@@ -1087,24 +1301,200 @@ mod reap_tests {
         drop(rt);
     }
 
+    // ── P0: Unpolled future still reaps child ─────────────────────────────
+
+    /// P0: Creating the drain future but dropping it WITHOUT polling must
+    /// still kill+reap the child.  This is the core "unpolled future" fix
+    /// — the ChildLease is created synchronously before the future is
+    /// returned, so Drop fires even without a single poll.
+    #[test]
+    fn unpolled_future_still_reaps_child() {
+        let sentinel = std::env::temp_dir().join(format!(
+            "reaper_unpolled_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sentinel_str = sentinel.to_str().unwrap().to_string();
+
+        let (child, pid) = {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = rt.block_on(async {
+                let child = tokio::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("sleep 1; touch {sentinel_str}"))
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let pid = child.id().expect("child must have a PID");
+                (child, pid)
+            });
+            drop(rt);
+            result
+        };
+
+        // Create the future but DON'T poll it.
+        let lease = ChildLease::new(child);
+        let opts = test_opts();
+        let token = CancellationToken::new();
+        let fut = drain_child_output_guarded(lease, opts, token);
+
+        // Drop the future without polling — must still kill+reap the child.
+        drop(fut);
+
+        // Wait long enough for the sentinel to appear IF the child survived.
+        std::thread::sleep(Duration::from_millis(1500));
+
+        assert!(
+            !sentinel.exists(),
+            "sentinel must not exist — unpolled future must have killed the child"
+        );
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped after dropping unpolled future"
+        );
+
+        let _ = std::fs::remove_file(&sentinel);
+    }
+
+    // ── Supervisor health tests ───────────────────────────────────────────
+
+    /// P0: LivenessGuard must transition the supervisor to Degraded on
+    /// drop, incrementing the failure counter.
+    #[test]
+    fn liveness_guard_closes_admission() {
+        let state = Arc::new(AtomicU8::new(SupervisorState::Healthy as u8));
+        let failures = Arc::new(AtomicUsize::new(0));
+
+        {
+            let _guard = LivenessGuard {
+                state: state.clone(),
+                failures: failures.clone(),
+            };
+            assert_eq!(
+                SupervisorState::from_u8(state.load(Ordering::SeqCst)),
+                SupervisorState::Healthy,
+                "state should be Healthy while guard is alive"
+            );
+        }
+
+        assert_eq!(
+            SupervisorState::from_u8(state.load(Ordering::SeqCst)),
+            SupervisorState::Degraded,
+            "state should be Degraded after guard drops"
+        );
+        assert_eq!(
+            failures.load(Ordering::SeqCst),
+            1,
+            "failure counter should be 1"
+        );
+    }
+
+    /// P0: A reaper in Failed state must reject all admissions
+    /// (fail-closed).  This simulates a thread startup failure.
+    #[test]
+    fn supervisor_failure_closes_admission() {
+        let reaper = ChildReaper::new_failed();
+        assert!(!reaper.is_healthy(), "Failed reaper must not be healthy");
+        assert!(
+            reaper.try_admit().is_none(),
+            "Failed reaper must reject admission"
+        );
+        let metrics = reaper.metrics();
+        assert!(!metrics.healthy, "metrics must report unhealthy");
+    }
+
+    // ── Admission bound tests ─────────────────────────────────────────────
+
+    /// P0: Admission at capacity must reject spawn; full recovery after
+    /// all reaped, and the counter recovers exactly once.
+    #[test]
+    fn admission_at_capacity_rejects_then_recovers() {
+        let reaper = ChildReaper::new_disconnected();
+
+        // Fill to capacity.
+        let mut admissions: Vec<_> = Vec::with_capacity(REAPER_QUEUE_CAPACITY);
+        for _ in 0..REAPER_QUEUE_CAPACITY {
+            admissions.push(reaper.try_admit().expect("should admit below capacity"));
+        }
+        assert_eq!(
+            reaper.metrics().in_flight,
+            REAPER_QUEUE_CAPACITY,
+            "in_flight should be at capacity"
+        );
+
+        // Next admit must fail.
+        assert!(reaper.try_admit().is_none(), "should reject at capacity");
+
+        // Drop all admissions — releases all slots.
+        drop(admissions);
+
+        assert_eq!(
+            reaper.metrics().in_flight,
+            0,
+            "in_flight should be 0 after all admissions dropped"
+        );
+
+        // Should recover and admit again.
+        let admission = reaper.try_admit().expect("should admit after recovery");
+        assert_eq!(
+            reaper.metrics().in_flight,
+            1,
+            "in_flight should be 1 after one new admission"
+        );
+        drop(admission);
+        assert_eq!(
+            reaper.metrics().in_flight,
+            0,
+            "in_flight should be 0 after dropping the admission"
+        );
+    }
+
+    /// P0: Spawn failure (dropping SpawnAdmission without into_lease) must
+    /// release only the pre-spawn admission.
+    #[test]
+    fn spawn_failure_releases_pre_spawn_admission() {
+        let reaper = ChildReaper::new_disconnected();
+
+        let admission = reaper.try_admit().expect("should admit");
+        assert_eq!(
+            reaper.metrics().in_flight,
+            1,
+            "in_flight should be 1 after admit"
+        );
+
+        // Simulate spawn failure — drop the admission without calling
+        // into_lease.  The slot must be released.
+        drop(admission);
+
+        assert_eq!(
+            reaper.metrics().in_flight,
+            0,
+            "in_flight should be 0 after spawn failure (admission dropped)"
+        );
+    }
+
     // ── ChildReaper queue-overflow tests ──────────────────────────────────
 
     /// P1/P0: reap() with a disconnected receiver must retain the child
-    /// handle in the stuck list — NOT drop it, NOT spawn a fallback thread.
-    ///
-    /// The test reaper has no workers/stuck_loop, so the child stays in the
-    /// stuck list.  We verify the handle is retained (stuck list non-empty)
-    /// and the child was killed (SIGKILL sent).  Full reaping is the
-    /// stuck_loop's job, covered by the global-reaper test below.
+    /// handle in the stuck list.
     #[test]
     fn reap_recovers_child_on_disconnected_receiver() {
         let reaper = ChildReaper::new_disconnected();
         let child = spawn_child("sleep", "30");
 
-        reaper.reap(child, None);
+        reaper.reap_direct(child, None);
 
-        // The child handle must be in the stuck list — not dropped.
-        let stuck_len = reaper.stuck.lock().unwrap().len();
+        let stuck_len = reaper
+            .stuck_arc()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
         assert_eq!(
             stuck_len, 1,
             "child must be retained in stuck list after disconnected receiver"
@@ -1112,28 +1502,22 @@ mod reap_tests {
     }
 
     /// P1/P0: reap() with a full queue must retain the child handle in the
-    /// stuck list — NOT drop it, NOT spawn a fallback thread.
-    ///
-    /// The receiver is kept alive (not dropped) so `try_send` returns `Full`
-    /// when the queue is saturated, exercising the actual Full path (not
-    /// Disconnected).  The overflow child must end up in the stuck list.
+    /// stuck list.
     #[test]
     fn reap_recovers_child_on_full_queue() {
-        // new_no_workers returns (reaper, receiver).  The receiver is kept
-        // alive (_receiver) so try_send returns Full when the queue is full.
         let (reaper, _receiver) = ChildReaper::new_no_workers(1);
 
-        // Fill the queue to capacity (1 slot) with a killed child.
         let filler = spawn_child("sleep", "30");
-        reaper.reap(filler, None);
+        reaper.reap_direct(filler, None);
 
-        // The filler went into the queue (try_send succeeded).
-        // Now reap a second child — try_send will fail with Full.
         let child = spawn_child("sleep", "30");
-        reaper.reap(child, None);
+        reaper.reap_direct(child, None);
 
-        // The overflow child must be in the stuck list — not dropped.
-        let stuck_len = reaper.stuck.lock().unwrap().len();
+        let stuck_len = reaper
+            .stuck_arc()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
         assert_eq!(
             stuck_len, 1,
             "overflow child must be retained in stuck list after full queue"
@@ -1141,22 +1525,19 @@ mod reap_tests {
     }
 
     /// P1/P0: A child that takes time to die must not block reaping of
-    /// other children.  Multiple worker threads ensure concurrency.
-    ///
-    /// Note: SIGKILL cannot be caught, so all children exit quickly.  This
-    /// test verifies that multiple children are reaped concurrently by the
-    /// worker pool, not that a truly stuck (D-state) child is handled
-    /// (that path is covered by classify_wait unit tests).
+    /// other children.
     #[test]
     fn concurrent_reaps_do_not_block_each_other() {
-        let reaper = ChildReaper::global().expect("global reaper must be available");
+        // Ensure the global reaper is initialized.
+        ChildReaper::global().expect("global reaper must be available");
 
         let mut pids = Vec::new();
         for _ in 0..8 {
             let child = spawn_child("sleep", "30");
             let pid = child.id().expect("child must have a PID");
             pids.push(pid);
-            reaper.reap(child, None);
+            let lease = ChildLease::new(child);
+            drop(lease);
         }
 
         for &pid in &pids {
@@ -1164,6 +1545,86 @@ mod reap_tests {
                 wait_for_reap(pid, Duration::from_secs(5)),
                 "child PID {pid} must be reaped promptly"
             );
+        }
+    }
+
+    // ── Mutex poison recovery test ────────────────────────────────────────
+
+    /// P0: After the stuck mutex is poisoned (a panicked peer), reap_direct
+    /// must still recover and push the child to the stuck list via
+    /// `unwrap_or_else(|e| e.into_inner())`.
+    #[test]
+    fn mutex_poison_still_reaps() {
+        let reaper = ChildReaper::new_disconnected();
+
+        // Poison the stuck mutex in a separate thread.
+        let stuck = reaper.stuck_arc();
+        let handle = std::thread::spawn(move || {
+            let _guard = stuck.lock().unwrap();
+            panic!("intentional poison");
+        });
+        let _ = handle.join();
+
+        // Now the mutex is poisoned.  reap_direct should recover.
+        let child = spawn_child("sleep", "30");
+        reaper.reap_direct(child, None);
+
+        let stuck_len = reaper
+            .stuck_arc()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert_eq!(
+            stuck_len, 1,
+            "child should be in stuck list after poison recovery"
+        );
+    }
+
+    // ── Cancellation storm bounded test ───────────────────────────────────
+
+    /// P0: Under a cancellation storm (many children admitted and
+    /// immediately dropped), in_flight must stay bounded and return to 0
+    /// after all are reaped.
+    #[test]
+    fn cancellation_storm_stays_bounded() {
+        let reaper = ChildReaper::global().expect("global reaper must be available");
+
+        let mut pids = Vec::new();
+        for _ in 0..32 {
+            let admission = reaper.try_admit().expect("should admit below capacity");
+            let child = spawn_child("sleep", "30");
+            let pid = child.id().expect("child must have a PID");
+            pids.push(pid);
+            let lease = admission.into_lease(child);
+            drop(lease);
+        }
+
+        // in_flight must not exceed the number we admitted.
+        let metrics = reaper.metrics();
+        assert!(
+            metrics.in_flight <= 32,
+            "in_flight ({}) must stay bounded (<= 32)",
+            metrics.in_flight
+        );
+
+        // All PIDs must be reaped.
+        for &pid in &pids {
+            assert!(
+                wait_for_reap(pid, Duration::from_secs(10)),
+                "child PID {pid} must be reaped"
+            );
+        }
+
+        // in_flight must return to 0 after all reaped.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if reaper.metrics().in_flight == 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("in_flight did not return to 0: {:?}", reaper.metrics());
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 }

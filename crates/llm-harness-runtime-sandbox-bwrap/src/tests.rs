@@ -1526,7 +1526,7 @@ async fn reset_linearizes_with_running_command() {
 /// P1: Dropping an execute_shell future must guarantee the child is killed,
 /// not just left as an orphan.
 ///
-/// When the future is dropped, the ReapGuard's Drop spawns a background
+/// When the future is dropped, the ChildLease's Drop delegates to the
 /// tokio::spawn task that calls start_kill() + wait(), ensuring the child
 /// is killed and reaped.  This test verifies the child does not survive
 /// long enough to create a sentinel file.
@@ -1559,7 +1559,7 @@ async fn dropped_future_guarantees_reap() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Abort the task — this drops the execute_shell future, which drops the
-    // drain_child_output_guarded future, which drops the ReapGuard.
+    // drain_child_output_guarded future, which drops the ChildLease.
     handle.abort();
 
     // Wait long enough that the sleep would have completed if the child

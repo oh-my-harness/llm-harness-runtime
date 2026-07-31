@@ -1056,14 +1056,14 @@ impl ExecutionEnv for BwrapEnv {
                 return Err(EnvError::Other("sandbox is shutting down".into()));
             }
 
-            // Acquire an admission permit BEFORE spawning.  This bounds the
+            // Acquire a pre-spawn admission BEFORE spawning.  This bounds the
             // total number of in-flight (unreaped) children to
             // REAPER_QUEUE_CAPACITY, preventing unbounded reaper resource
             // growth.  If the reaper is unavailable or at capacity, refuse
             // to spawn (fail-closed).
             let reaper = llm_harness_runtime_sandbox_os::ChildReaper::global()
                 .ok_or_else(|| EnvError::Other("child reaper unavailable".into()))?;
-            let permit = reaper
+            let admission = reaper
                 .try_admit()
                 .ok_or_else(|| EnvError::Other("sandbox at capacity or reaper unhealthy".into()))?;
 
@@ -1074,7 +1074,7 @@ impl ExecutionEnv for BwrapEnv {
             {
                 Ok(child) => child,
                 Err(e) => {
-                    // permit is dropped here (released) when we return Err.
+                    // admission is dropped here (released) when we return Err.
                     return Err(if e.kind() == std::io::ErrorKind::NotFound {
                         EnvError::Other("bwrap not available — install bubblewrap".into())
                     } else {
@@ -1083,16 +1083,16 @@ impl ExecutionEnv for BwrapEnv {
                 }
             };
 
-            // drain_child_output_guarded handles all cancellation paths
-            // (abort, timeout, shutdown) with kill+wait, and wraps the child
-            // in a ReapGuard that guarantees reap even if this future is
-            // dropped before completion (via a background tokio::spawn task).
-            // If the token was cancelled between the check above and this
-            // call, the shutdown branch fires immediately and the
-            // just-spawned child is killed+reaped.  The permit moves into
-            // the ReapGuard and is released when the child is confirmed
+            // Couple the admission with the spawned child via into_lease.
+            // The ChildLease owns both the child handle and the admission
+            // count — they cannot be separated.  drain_child_output_guarded
+            // creates the lease synchronously before returning the future,
+            // so dropping the future without polling still triggers
+            // ChildLease::drop, which delegates to the reaper.  The
+            // admission slot is released only after the child is confirmed
             // exited.
-            drain_child_output_guarded(child, opts, shutdown_token, Some(permit)).await
+            let lease = admission.into_lease(child);
+            drain_child_output_guarded(lease, opts, shutdown_token).await
         }
         .boxed()
     }
@@ -1288,7 +1288,7 @@ impl Sandbox for BwrapSandbox {
             // Interrupt active shell commands by swapping in a fresh token
             // and cancelling the old one.  drain_child_output_guarded
             // observes the old token's cancellation, kills+waits the child
-            // via ReapGuard, and returns Err — which releases the op-lock
+            // via ChildLease, and returns Err — which releases the op-lock
             // so reset can proceed.
             //
             // The lifecycle is Resetting (not Running), so new operations
