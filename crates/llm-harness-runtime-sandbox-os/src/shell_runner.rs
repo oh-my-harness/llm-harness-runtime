@@ -395,6 +395,9 @@ struct RegistryEntry {
     /// Reaper threads skip active entries (they must not kill a child
     /// being actively drained).  `fatal_cleanup` ignores this flag.
     active: bool,
+    /// Number of times `blocking_reap` panicked on this child.
+    /// Used for backoff and observability.
+    panic_count: u32,
     #[allow(dead_code)]
     queued_at: std::time::Instant,
 }
@@ -624,6 +627,7 @@ impl SupervisorCore {
             reapable: Some(reapable),
             has_admission: true,
             active,
+            panic_count: 0,
             queued_at: std::time::Instant::now(),
         };
 
@@ -838,7 +842,7 @@ impl SupervisorCore {
             in_flight: inner.in_flight,
             admitted: inner.admitted,
             completed: inner.completed,
-            worker_failures: inner.failures,
+            component_failures: inner.failures,
             registry_len: inner.registry.len(),
             healthy: inner.state == SupState::Healthy,
             workers_alive: inner.liveness.workers_alive,
@@ -922,6 +926,16 @@ impl SupervisorCore {
     fn all_ids(&self) -> Vec<ChildId> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.registry.keys().copied().collect()
+    }
+
+    /// Record a panic during blocking reap for a child.  Increments
+    /// the per-child panic counter for observability and backoff.
+    fn record_panic(&self, id: ChildId) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = inner.registry.get_mut(&id) {
+            entry.panic_count += 1;
+        }
+        inner.failures += 1;
     }
 }
 
@@ -1142,7 +1156,7 @@ pub struct ReaperMetrics {
     pub in_flight: usize,
     pub admitted: usize,
     pub completed: usize,
-    pub worker_failures: usize,
+    pub component_failures: usize,
     pub registry_len: usize,
     pub healthy: bool,
     pub workers_alive: usize,
@@ -1511,44 +1525,68 @@ impl ChildReaper {
                 break;
             }
 
-            // Only act when in Failed state (all other reapers dead).
-            if core.is_healthy() {
+            // Emergency takeover: only act when all normal reapers
+            // (workers, stuck, orphan) are dead.  In Degraded state
+            // with some reapers alive, the stuck/orphan loops handle
+            // pending children.
+            if core.any_reaper_alive() {
                 continue;
             }
 
             // Scan and reap via CheckoutGuard (outside lock).
             let ids = core.pending_ids();
             let pass_deadline = std::time::Instant::now() + FATAL_CLEANUP_TOTAL_BUDGET;
-            let timeout = core.fatal_reap_timeout();
+            let per_child_timeout = core.fatal_reap_timeout();
 
             for id in ids {
-                if std::time::Instant::now() >= pass_deadline {
+                let now = std::time::Instant::now();
+                if now >= pass_deadline {
                     break; // Total budget exceeded — retry next pass.
                 }
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
+                // Use min(per_child_timeout, remaining_pass_budget) so
+                // a single child cannot exceed the pass deadline.
+                let remaining = pass_deadline.saturating_duration_since(now);
+                let timeout = std::cmp::min(per_child_timeout, remaining);
+
                 // Check out the child for fatal reap.  checkout_for_fatal
                 // takes the handle out of the registry under the lock,
                 // then we reap outside the lock.
-                if let Some(mut guard) = core.checkout_for_fatal(id)
-                    && let Some(r) = guard.reapable_mut()
-                {
-                    match blocking_reap(r, timeout) {
-                        BlockingReapResult::Exited(status) => {
-                            guard.consume(ReapStatus::Exited(status));
+                if let Some(guard) = core.checkout_for_fatal(id) {
+                    // Isolate panic: wrap blocking_reap in catch_unwind
+                    // so a panicking try_wait does not kill the emergency
+                    // thread.  CheckoutGuard::drop restores the handle
+                    // during unwind.  On panic, we back off and continue
+                    // to the next child.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut guard = guard;
+                        if let Some(r) = guard.reapable_mut() {
+                            match blocking_reap(r, timeout) {
+                                BlockingReapResult::Exited(status) => {
+                                    guard.consume(ReapStatus::Exited(status));
+                                }
+                                BlockingReapResult::AlreadyReaped => {
+                                    guard.consume(ReapStatus::AlreadyReaped);
+                                }
+                                BlockingReapResult::Timeout | BlockingReapResult::Unknown => {
+                                    guard.restore();
+                                }
+                            }
+                        } else {
+                            guard.consumed = true;
                         }
-                        BlockingReapResult::AlreadyReaped => {
-                            guard.consume(ReapStatus::AlreadyReaped);
-                        }
-                        BlockingReapResult::Timeout | BlockingReapResult::Unknown => {
-                            // Restore handle — will be retried next pass.
-                            guard.restore();
-                        }
+                    }));
+                    if result.is_err() {
+                        // Panic was caught — handle restored by
+                        // CheckoutGuard::drop during unwind.
+                        // Back off to avoid tight-spinning on a
+                        // persistent-panic child.
+                        core.record_panic(id);
+                        std::thread::sleep(EINTR_BACKOFF);
                     }
                 }
-                // If checkout_for_fatal returned None, the entry was
-                // already removed or checked out — skip.
             }
         }
     }
@@ -1562,9 +1600,9 @@ impl Drop for ChildReaper {
         for h in handles.drain(..) {
             let _ = h.join();
         }
-        // After join, all LivenessGuards have dropped.  The emergency
-        // thread is the last to die, ensuring any remaining children
-        // were reaped during shutdown.
+        // After join, all LivenessGuards have dropped.  Remaining
+        // children in the registry are not guaranteed to have been
+        // reaped — the emergency thread stops when the stop flag is set.
     }
 }
 
@@ -2992,5 +3030,239 @@ mod reap_tests {
             0,
             "admission released after Failed-state reap"
         );
+    }
+
+    // ── Round-19 failing probes (emergency panic isolation) ───────────────
+
+    #[test]
+    fn emergency_thread_survives_panic_and_reaps() {
+        let reaper = init_reaper(&default_spawner).expect("init must succeed");
+        reaper
+            .core
+            .set_fatal_reap_timeout(Duration::from_millis(500));
+
+        let epoch = reaper.core.try_admit().expect("must admit while healthy");
+        reaper.core.force_all_reapers_dead();
+        assert_eq!(reaper.core.state(), SupState::Failed);
+
+        // MockReapable: first try_wait panics, second returns Exited(0).
+        // The emergency thread must catch the panic and retry.
+        let mock = MockReapable::new(vec![MockOutcome::Panic, MockOutcome::Exited(0)]);
+        let _id = reaper.core.commit_child(Box::new(mock), epoch);
+        assert_eq!(reaper.core.in_flight_count(), 1);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if reaper.core.completed_count() >= 1 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "emergency thread did not reap child after panic within 10s \
+                     (completed={}, registry={})",
+                    reaper.core.completed_count(),
+                    reaper.core.registry_len()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert_eq!(reaper.core.completed_count(), 1);
+        assert_eq!(reaper.core.in_flight_count(), 0);
+        assert_eq!(reaper.core.registry_len(), 0);
+    }
+
+    #[test]
+    fn emergency_persistent_panic_does_not_block_other_children() {
+        let reaper = init_reaper(&default_spawner).expect("init must succeed");
+        reaper
+            .core
+            .set_fatal_reap_timeout(Duration::from_millis(100));
+
+        let epoch1 = reaper.core.try_admit().expect("must admit while healthy");
+        let epoch2 = reaper.core.try_admit().expect("must admit while healthy");
+        reaper.core.force_all_reapers_dead();
+        assert_eq!(reaper.core.state(), SupState::Failed);
+
+        // Child 1: always panics (3 panic outcomes, then Pending).
+        let mock_panic = MockReapable::new(vec![
+            MockOutcome::Panic,
+            MockOutcome::Panic,
+            MockOutcome::Panic,
+        ]);
+        let _id1 = reaper.core.commit_child(Box::new(mock_panic), epoch1);
+
+        // Child 2: exits normally on first try_wait.
+        let mock_exit = MockReapable::new(vec![MockOutcome::Exited(0)]);
+        let _id2 = reaper.core.commit_child(Box::new(mock_exit), epoch2);
+
+        // Wait for child 2 to be reaped despite child 1 panicking.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if reaper.core.completed_count() >= 1 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "child 2 was not reaped due to child 1 blocking \
+                     (completed={}, registry={})",
+                    reaper.core.completed_count(),
+                    reaper.core.registry_len()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Child 2 must be reaped.
+        assert_eq!(
+            reaper.core.completed_count(),
+            1,
+            "only child 2 should be reaped"
+        );
+        // Child 1 should still be in registry with its handle.
+        assert_eq!(
+            reaper.core.registry_len(),
+            1,
+            "persistent-panic child retained in registry"
+        );
+        assert_eq!(
+            reaper.core.in_flight_count(),
+            1,
+            "admission retained for persistent-panic child"
+        );
+    }
+
+    // ── Round-19: real thread fault and emergency rollback tests ──────────
+
+    #[test]
+    fn init_reaper_rollback_at_emergency_failure() {
+        // Fail at the 7th thread (emergency — last one).
+        // Workers=4 (idx 0-3), stuck=4, orphan=5, emergency=6.
+        let spawner = make_failing_spawner(6);
+        let result = init_reaper(&spawner);
+        assert!(
+            result.is_err(),
+            "init must fail when emergency thread spawn fails"
+        );
+        // No residual threads: the rollback joins all started threads.
+        // We can't directly count threads, but the rollback stop+join
+        // ensures they exit.  If init fails, no ChildReaper is created.
+    }
+
+    #[test]
+    fn real_worker_panic_degrades_and_child_eventually_reaped() {
+        // Use a real init_reaper with all threads.  A MockReapable that
+        // panics on first try_wait is committed with a stale epoch
+        // (non-active).  It is sent to the worker channel.  The worker
+        // that processes it calls try_reap → try_wait → panic.  The
+        // LivenessGuard fires, transitioning to Degraded.  The stuck/
+        // orphan loop then reaps the child (second outcome: Exited).
+        let reaper = init_reaper(&default_spawner).expect("init must succeed");
+        reaper
+            .core
+            .set_fatal_reap_timeout(Duration::from_millis(500));
+
+        let epoch = reaper.core.try_admit().expect("must admit while healthy");
+        reaper.core.force_worker_exit(); // Degraded, epoch changes
+
+        // Mock: panics on first try_wait (kills worker), then Exited(0).
+        let mock = MockReapable::new(vec![MockOutcome::Panic, MockOutcome::Exited(0)]);
+        let _id = reaper.core.commit_child(Box::new(mock), epoch);
+
+        // Wait for a worker to panic (component_failures > 0).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if reaper.metrics().component_failures > 0 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("worker did not panic within 5s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // After worker panic: Degraded (not Failed).
+        assert_eq!(
+            reaper.core.state(),
+            SupState::Degraded,
+            "must be Degraded after one worker panic"
+        );
+        let metrics = reaper.metrics();
+        assert!(
+            metrics.workers_alive >= 2,
+            "at least 2 workers still alive, got {}",
+            metrics.workers_alive
+        );
+        assert!(
+            metrics.stuck_alive && metrics.orphan_alive,
+            "stuck and orphan must still be alive"
+        );
+        assert!(
+            reaper.try_admit().is_none(),
+            "admission must be closed after Degraded"
+        );
+
+        // Wait for stuck/orphan to reap the child.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if reaper.core.completed_count() >= 1 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("child was not reaped after worker panic within 5s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(reaper.core.completed_count(), 1);
+        assert_eq!(reaper.core.in_flight_count(), 0);
+        assert_eq!(reaper.core.registry_len(), 0);
+    }
+
+    #[test]
+    fn epoch_fencing_end_to_end_with_real_threads() {
+        // End-to-end: acquire admission while Healthy, transition to
+        // Degraded (epoch changes), commit child — it must be killed
+        // immediately and non-active.  Then force all dead and verify
+        // emergency thread reaps it.
+        let reaper = init_reaper(&default_spawner).expect("init must succeed");
+        reaper
+            .core
+            .set_fatal_reap_timeout(Duration::from_millis(500));
+
+        let epoch = reaper.core.try_admit().expect("must admit while healthy");
+        assert_eq!(reaper.core.epoch(), epoch);
+
+        // Degrade: epoch increments.
+        reaper.core.force_worker_exit();
+        assert_eq!(reaper.core.state(), SupState::Degraded);
+        assert_ne!(reaper.core.epoch(), epoch, "epoch must change");
+
+        // Commit with stale epoch — child is non-active, killed immediately.
+        let mock = MockReapable::new(vec![MockOutcome::Exited(0)]);
+        let id = reaper.core.commit_child(Box::new(mock), epoch);
+        {
+            let inner = reaper.core.inner.lock().unwrap();
+            let entry = inner.registry.get(&id).unwrap();
+            assert!(!entry.active, "stale-epoch child must be non-active");
+        }
+
+        // Force all reapers dead — emergency thread takes over.
+        reaper.core.force_all_reapers_dead();
+        assert_eq!(reaper.core.state(), SupState::Failed);
+
+        // Wait for emergency thread to reap the non-active child.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if reaper.core.completed_count() >= 1 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("emergency thread did not reap stale-epoch child within 5s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(reaper.core.completed_count(), 1);
+        assert_eq!(reaper.core.in_flight_count(), 0);
+        assert_eq!(reaper.core.registry_len(), 0);
     }
 }

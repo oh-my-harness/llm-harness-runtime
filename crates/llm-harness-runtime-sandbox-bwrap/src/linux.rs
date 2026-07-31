@@ -1084,13 +1084,14 @@ impl ExecutionEnv for BwrapEnv {
             };
 
             // Couple the admission with the spawned child via into_lease.
-            // The ChildLease owns both the child handle and the admission
-            // count — they cannot be separated.  drain_child_output_guarded
-            // creates the lease synchronously before returning the future,
-            // so dropping the future without polling still triggers
-            // ChildLease::drop, which delegates to the reaper.  The
-            // admission slot is released only after the child is confirmed
-            // exited.
+            // The child handle is immediately committed to the authoritative
+            // registry (not held by the lease).  The ChildLease holds only
+            // the ChildId, stdout/stderr handles, and a confirmation flag.
+            // drain_child_output_guarded creates the lease synchronously
+            // before returning the future, so dropping the future without
+            // polling still triggers ChildLease::drop → cancel_child, which
+            // kills the child and routes it for reaping.  The admission slot
+            // is released only after the child is confirmed exited.
             let lease = admission.into_lease(child);
             drain_child_output_guarded(lease, opts, shutdown_token).await
         }

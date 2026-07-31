@@ -1,99 +1,310 @@
 //! API boundary verification for `ChildLease` opacity.
 //!
-//! Uses a **real compile-fail gate**: the test writes a small Rust program
-//! that attempts to call `ChildLease`'s private methods, then invokes
-//! `cargo build` on it.  If any method is public, the build succeeds and
-//! the test fails.  If all methods are private (correct), the build fails
-//! (E0624) and the test passes.
+//! Uses a **trusted compile-fail gate** with positive and negative controls:
 //!
-//! This does NOT depend on compiler diagnostic text — only on the exit
-//! code of `cargo build`.  It works on every Rust version and platform.
+//! 1. **Positive control**: a temp crate that uses only the public API
+//!    (`SpawnAdmission::into_lease`, `ChildReaper::global`, etc.) must
+//!    compile successfully with `--offline`.  This verifies the dependency
+//!    is healthy and the environment is clean.
+//!
+//! 2. **Negative controls**: separate temp binaries that each attempt to
+//!    access ONE private method, field, or trait.  Each must fail to
+//!    compile, and the stderr must contain a privacy-related diagnostic
+//!    (E0624, E0616, E0451, or "private").  If any target is made public,
+//!    the corresponding binary compiles, no privacy error appears, and the
+//!    test fails.
+//!
+//! All builds use `--offline` to prevent network access during tests.
 
 use std::process::Command;
 
-/// Rust source that attempts to call private methods on `ChildLease`.
-/// This code MUST fail to compile if the methods are private.
-const ATTEMPT_FORGE: &str = r#"
-use llm_harness_runtime_sandbox_os::ChildLease;
-
-fn _forge_confirm(lease: &mut ChildLease) {
-    lease.confirm_exit();
+/// Set up a temp crate with multiple binaries, each testing one API boundary.
+/// Returns the temp dir path and the crate dir path.
+struct ForgeCrate {
+    _tmp: tempfile::TempDir,
+    dir: std::path::PathBuf,
+    target_dir: std::path::PathBuf,
 }
 
-fn _forge_wait(lease: &mut ChildLease) {
-    let _ = lease.wait();
-}
+impl ForgeCrate {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let dir = tmp.path().join("forge_test");
+        let target_dir = tmp.path().join("target");
+        std::fs::create_dir_all(&dir).expect("create crate dir");
+        std::fs::create_dir_all(dir.join("src").join("bin")).expect("create bin dir");
 
-fn _forge_kill_and_wait(lease: &mut ChildLease) {
-    lease.kill_and_wait();
-}
+        let crate_path =
+            std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("canonicalize crate path");
 
-fn _forge_take_stdout(lease: &mut ChildLease) {
-    lease.take_stdout();
-}
-
-fn main() {}
-"#;
-
-/// Verify that the private methods on `ChildLease` cannot be called
-/// from external code.  This is a real compile-fail gate: we attempt
-/// to compile code that calls them, and expect compilation to fail.
-#[test]
-fn child_lease_private_methods_compile_fail() {
-    // Write the attempt to a temp crate and try to build it.
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let src_dir = temp_dir.path().join("forge_test");
-    std::fs::create_dir_all(&src_dir).expect("create src dir");
-
-    // Cargo.toml — depend on the sandbox-os crate via path.
-    let cargo_toml = format!(
-        r#"[package]
+        let cargo_toml = format!(
+            r#"[package]
 name = "forge_test"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-llm_harness_runtime_sandbox_os = {{ path = "{}" }}
+llm-harness-runtime-sandbox-os = {{ path = "{}" }}
 "#,
-        std::fs::canonicalize(".")
-            .or_else(|_| std::fs::canonicalize(
-                std::env::current_dir()
-                    .unwrap()
-                    .join("crates/llm-harness-runtime-sandbox-os")
-            ))
-            .unwrap()
-            .to_str()
-            .unwrap()
-    );
-    std::fs::write(src_dir.join("Cargo.toml"), cargo_toml).expect("write Cargo.toml");
-    std::fs::create_dir_all(src_dir.join("src")).expect("create src");
-    std::fs::write(src_dir.join("src/main.rs"), ATTEMPT_FORGE).expect("write main.rs");
-
-    // Attempt to build.  We expect failure (exit code != 0).
-    let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-        .arg("build")
-        .current_dir(&src_dir)
-        .env(
-            "PYO3_PYTHON",
-            std::env::var("PYO3_PYTHON").unwrap_or_default(),
-        )
-        .output()
-        .expect("cargo build");
-
-    if output.status.success() {
-        panic!(
-            "ChildLease private methods are accessible from external code! \
-             The build succeeded, meaning confirm_exit/wait/kill_and_wait/\
-             take_stdout are public.  They must be private.\n\
-             stdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+            crate_path.to_str().unwrap()
         );
+        std::fs::write(dir.join("Cargo.toml"), cargo_toml).expect("write Cargo.toml");
+
+        Self {
+            _tmp: tmp,
+            dir,
+            target_dir,
+        }
     }
-    // Build failed — methods are private (correct).
+
+    /// Write a binary source file.
+    fn write_bin(&self, name: &str, src: &str) {
+        std::fs::write(
+            self.dir.join("src").join("bin").join(format!("{name}.rs")),
+            src,
+        )
+        .unwrap_or_else(|e| panic!("write {name}.rs: {e}"));
+    }
+
+    /// Build a specific binary with `--offline`.  Returns (success, stderr).
+    fn build_bin(&self, name: &str) -> (bool, String) {
+        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(["build", "--offline", "--bin", name])
+            .current_dir(&self.dir)
+            .env("CARGO_TARGET_DIR", &self.target_dir)
+            .env(
+                "PYO3_PYTHON",
+                std::env::var("PYO3_PYTHON").unwrap_or_default(),
+            )
+            .output()
+            .unwrap_or_else(|e| panic!("cargo build --bin {name}: {e}"));
+
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        (output.status.success(), stderr)
+    }
 }
 
-/// Verify the positive public API surface exists.
+/// Check that stderr contains a privacy-related diagnostic.
+fn stderr_has_privacy_error(stderr: &str) -> bool {
+    stderr.contains("private")
+        || stderr.contains("E0624")
+        || stderr.contains("E0616")
+        || stderr.contains("E0451")
+        || stderr.contains("E0423")
+        || stderr.contains("method not found")
+}
+
+/// Positive control: uses only the public API.  Must compile successfully.
+#[test]
+fn positive_control_compiles() {
+    let crate_ = ForgeCrate::new();
+    crate_.write_bin(
+        "positive",
+        r#"
+// Uses ONLY the public API surface.
+use llm_harness_runtime_sandbox_os::{
+    ChildLease, ChildReaper, SpawnAdmission, drain_child_output_guarded,
+};
+fn _check_types(_lease: ChildLease, _admission: SpawnAdmission) {}
+fn _check_fns() {
+    let _ = ChildReaper::global;
+    let _ = ChildReaper::try_admit;
+    let _ = ChildReaper::is_healthy;
+    let _ = ChildReaper::metrics;
+    let _ = SpawnAdmission::into_lease;
+    let _ = drain_child_output_guarded;
+}
+fn main() {}
+"#,
+    );
+
+    let (ok, stderr) = crate_.build_bin("positive");
+    assert!(
+        ok,
+        "positive control must compile — if this fails, the dependency \
+         or environment is broken, not the API boundary.\nstderr: {stderr}"
+    );
+}
+
+/// Negative control: `confirm_exit` must be private.
+#[test]
+fn neg_confirm_exit_is_private() {
+    let crate_ = ForgeCrate::new();
+    crate_.write_bin(
+        "neg_confirm_exit",
+        r#"
+use llm_harness_runtime_sandbox_os::ChildLease;
+fn _forge(lease: &mut ChildLease) { lease.confirm_exit(); }
+fn main() {}
+"#,
+    );
+    let (ok, stderr) = crate_.build_bin("neg_confirm_exit");
+    assert!(!ok, "confirm_exit must be private — build succeeded");
+    assert!(
+        stderr_has_privacy_error(&stderr),
+        "failure must be from privacy, not unrelated error\nstderr: {stderr}"
+    );
+}
+
+/// Negative control: `wait` must be private.
+#[test]
+fn neg_wait_is_private() {
+    let crate_ = ForgeCrate::new();
+    crate_.write_bin(
+        "neg_wait",
+        r#"
+use llm_harness_runtime_sandbox_os::ChildLease;
+fn _forge(lease: &mut ChildLease) { let _ = lease.wait(); }
+fn main() {}
+"#,
+    );
+    let (ok, stderr) = crate_.build_bin("neg_wait");
+    assert!(!ok, "wait must be private — build succeeded");
+    assert!(
+        stderr_has_privacy_error(&stderr),
+        "failure must be from privacy\nstderr: {stderr}"
+    );
+}
+
+/// Negative control: `kill_and_wait` must be private.
+#[test]
+fn neg_kill_and_wait_is_private() {
+    let crate_ = ForgeCrate::new();
+    crate_.write_bin(
+        "neg_kill_and_wait",
+        r#"
+use llm_harness_runtime_sandbox_os::ChildLease;
+fn _forge(lease: &mut ChildLease) { lease.kill_and_wait(); }
+fn main() {}
+"#,
+    );
+    let (ok, stderr) = crate_.build_bin("neg_kill_and_wait");
+    assert!(!ok, "kill_and_wait must be private — build succeeded");
+    assert!(
+        stderr_has_privacy_error(&stderr),
+        "failure must be from privacy\nstderr: {stderr}"
+    );
+}
+
+/// Negative control: `take_stdout` must be private.
+#[test]
+fn neg_take_stdout_is_private() {
+    let crate_ = ForgeCrate::new();
+    crate_.write_bin(
+        "neg_take_stdout",
+        r#"
+use llm_harness_runtime_sandbox_os::ChildLease;
+fn _forge(lease: &mut ChildLease) { lease.take_stdout(); }
+fn main() {}
+"#,
+    );
+    let (ok, stderr) = crate_.build_bin("neg_take_stdout");
+    assert!(!ok, "take_stdout must be private — build succeeded");
+    assert!(
+        stderr_has_privacy_error(&stderr),
+        "failure must be from privacy\nstderr: {stderr}"
+    );
+}
+
+/// Negative control: `take_stderr` must be private.
+#[test]
+fn neg_take_stderr_is_private() {
+    let crate_ = ForgeCrate::new();
+    crate_.write_bin(
+        "neg_take_stderr",
+        r#"
+use llm_harness_runtime_sandbox_os::ChildLease;
+fn _forge(lease: &mut ChildLease) { lease.take_stderr(); }
+fn main() {}
+"#,
+    );
+    let (ok, stderr) = crate_.build_bin("neg_take_stderr");
+    assert!(!ok, "take_stderr must be private — build succeeded");
+    assert!(
+        stderr_has_privacy_error(&stderr),
+        "failure must be from privacy\nstderr: {stderr}"
+    );
+}
+
+/// Negative control: struct fields must be private (cannot construct
+/// `ChildLease` directly).
+#[test]
+fn neg_field_construction_is_private() {
+    let crate_ = ForgeCrate::new();
+    crate_.write_bin(
+        "neg_fields",
+        r#"
+use llm_harness_runtime_sandbox_os::ChildLease;
+fn _forge() {
+    let _ = ChildLease {
+        id: 0,
+        core: None,
+        stdout: None,
+        stderr: None,
+        confirmed: false,
+    };
+}
+fn main() {}
+"#,
+    );
+    let (ok, stderr) = crate_.build_bin("neg_fields");
+    assert!(!ok, "ChildLease fields must be private — build succeeded");
+    assert!(
+        stderr_has_privacy_error(&stderr),
+        "failure must be from private fields\nstderr: {stderr}"
+    );
+}
+
+/// Negative control: `ChildLease` must not be `Clone`.
+/// Uses an explicit trait bound so the failure is about `Clone`, not
+/// about reference auto-clone (`&T: Clone` always holds).
+#[test]
+fn neg_child_lease_is_not_clone() {
+    let crate_ = ForgeCrate::new();
+    crate_.write_bin(
+        "neg_clone",
+        r#"
+use llm_harness_runtime_sandbox_os::ChildLease;
+fn _requires_clone<T: Clone>(_: &T) {}
+fn _forge(lease: &ChildLease) {
+    _requires_clone(lease);
+}
+fn main() {}
+"#,
+    );
+    let (ok, stderr) = crate_.build_bin("neg_clone");
+    assert!(!ok, "ChildLease must not be Clone — build succeeded");
+    assert!(
+        stderr.contains("trait") || stderr.contains("E0277") || stderr.contains("not satisfied"),
+        "failure must be from missing Clone trait bound\nstderr: {stderr}"
+    );
+}
+
+/// Negative control: `ChildLease` must not be `Copy`.
+#[test]
+fn neg_child_lease_is_not_copy() {
+    let crate_ = ForgeCrate::new();
+    crate_.write_bin(
+        "neg_copy",
+        r#"
+use llm_harness_runtime_sandbox_os::ChildLease;
+fn _requires_copy<T: Copy>(_: &T) {}
+fn _forge(lease: &ChildLease) {
+    _requires_copy(lease);
+}
+fn main() {}
+"#,
+    );
+    let (ok, stderr) = crate_.build_bin("neg_copy");
+    assert!(!ok, "ChildLease must not be Copy — build succeeded");
+    assert!(
+        stderr.contains("trait") || stderr.contains("E0277") || stderr.contains("not satisfied"),
+        "failure must be from missing Copy trait bound\nstderr: {stderr}"
+    );
+}
+
+/// Verify the positive public API surface exists (compile-time check
+/// in the test crate itself).
 #[test]
 fn public_api_surface() {
     use llm_harness_runtime_sandbox_os::{
