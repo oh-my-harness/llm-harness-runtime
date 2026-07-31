@@ -1,54 +1,38 @@
-//! API boundary verification for `ChildLease` opacity.
+//! Compile-time checks for the child-reaper public API boundary.
 //!
-//! Uses a **trusted compile-fail gate** with positive and negative controls:
-//!
-//! 1. **Positive control**: a temp crate that uses only the public API
-//!    (`SpawnAdmission::into_lease`, `ChildReaper::global`, etc.) must
-//!    compile successfully with `--offline`.  This verifies the dependency
-//!    is healthy and the environment is clean.
-//!
-//! 2. **Negative controls**: separate temp binaries that each attempt to
-//!    access ONE private method, field, or trait.  Each must fail to
-//!    compile, and the stderr must contain a privacy-related diagnostic
-//!    (E0624, E0616, E0451, or "private").  If any target is made public,
-//!    the corresponding binary compiles, no privacy error appears, and the
-//!    test fails.
-//!
-//! All builds use `--offline` to prevent network access during tests.
+//! One temporary crate and one target directory are reused for every probe.
+//! The positive control is checked first. Each negative binary then has to
+//! produce the expected rustc JSON diagnostic at that binary's primary span.
 
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
-/// Set up a temp crate with multiple binaries, each testing one API boundary.
-/// Returns the temp dir path and the crate dir path.
 struct ForgeCrate {
     _tmp: tempfile::TempDir,
-    dir: std::path::PathBuf,
-    target_dir: std::path::PathBuf,
+    dir: PathBuf,
+    target_dir: PathBuf,
 }
 
 impl ForgeCrate {
     fn new() -> Self {
-        let tmp = tempfile::tempdir().expect("temp dir");
+        let tmp = tempfile::tempdir().expect("create forge temp dir");
         let dir = tmp.path().join("forge_test");
         let target_dir = tmp.path().join("target");
-        std::fs::create_dir_all(&dir).expect("create crate dir");
-        std::fs::create_dir_all(dir.join("src").join("bin")).expect("create bin dir");
+        std::fs::create_dir_all(dir.join("src/bin")).expect("create forge source directory");
 
         let crate_path =
             std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("canonicalize crate path");
-
+        let serialized_path = serde_json::to_string(&crate_path.to_string_lossy())
+            .expect("serialize dependency path as a TOML-compatible basic string");
         let cargo_toml = format!(
-            r#"[package]
-name = "forge_test"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-llm-harness-runtime-sandbox-os = {{ path = "{}" }}
-"#,
-            crate_path.to_str().unwrap()
+            "[package]\n\
+             name = \"forge_test\"\n\
+             version = \"0.1.0\"\n\
+             edition = \"2021\"\n\n\
+             [dependencies]\n\
+             llm-harness-runtime-sandbox-os = {{ path = {serialized_path} }}\n"
         );
-        std::fs::write(dir.join("Cargo.toml"), cargo_toml).expect("write Cargo.toml");
+        std::fs::write(dir.join("Cargo.toml"), cargo_toml).expect("write forge Cargo.toml");
 
         Self {
             _tmp: tmp,
@@ -57,19 +41,18 @@ llm-harness-runtime-sandbox-os = {{ path = "{}" }}
         }
     }
 
-    /// Write a binary source file.
-    fn write_bin(&self, name: &str, src: &str) {
-        std::fs::write(
-            self.dir.join("src").join("bin").join(format!("{name}.rs")),
-            src,
-        )
-        .unwrap_or_else(|e| panic!("write {name}.rs: {e}"));
+    fn write_bin(&self, name: &str, source: &str) {
+        std::fs::write(self.bin_path(name), source)
+            .unwrap_or_else(|error| panic!("write {name}.rs: {error}"));
     }
 
-    /// Build a specific binary with `--offline`.  Returns (success, stderr).
-    fn build_bin(&self, name: &str) -> (bool, String) {
-        let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-            .args(["build", "--offline", "--bin", name])
+    fn bin_path(&self, name: &str) -> PathBuf {
+        self.dir.join("src/bin").join(format!("{name}.rs"))
+    }
+
+    fn check_bin(&self, name: &str) -> Output {
+        Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(["check", "--offline", "--message-format=json", "--bin", name])
             .current_dir(&self.dir)
             .env("CARGO_TARGET_DIR", &self.target_dir)
             .env(
@@ -77,36 +60,99 @@ llm-harness-runtime-sandbox-os = {{ path = "{}" }}
                 std::env::var("PYO3_PYTHON").unwrap_or_default(),
             )
             .output()
-            .unwrap_or_else(|e| panic!("cargo build --bin {name}: {e}"));
+            .unwrap_or_else(|error| panic!("cargo check --bin {name}: {error}"))
+    }
 
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        (output.status.success(), stderr)
+    fn assert_positive(&self, name: &str) {
+        let output = self.check_bin(name);
+        assert!(
+            output.status.success(),
+            "positive API control {name} must compile\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    fn assert_diagnostic(&self, probe: Probe) {
+        self.write_bin(probe.name, &probe.source);
+        let output = self.check_bin(probe.name);
+        assert!(
+            !output.status.success(),
+            "negative API probe {} unexpectedly compiled",
+            probe.name
+        );
+
+        let expected_file = self.bin_path(probe.name);
+        let matched = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|message| diagnostic_matches(&message, &expected_file, &probe));
+
+        assert!(
+            matched,
+            "probe {} did not emit {} for `{}` at its own primary span\nstdout:\n{}\nstderr:\n{}",
+            probe.name,
+            probe.code,
+            probe.symbol,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }
 
-/// Check that stderr contains a privacy-related diagnostic.
-fn stderr_has_privacy_error(stderr: &str) -> bool {
-    stderr.contains("private")
-        || stderr.contains("E0624")
-        || stderr.contains("E0616")
-        || stderr.contains("E0451")
-        || stderr.contains("E0423")
-        || stderr.contains("method not found")
+struct Probe {
+    name: &'static str,
+    source: String,
+    code: &'static str,
+    symbol: &'static str,
 }
 
-/// Positive control: uses only the public API.  Must compile successfully.
+fn diagnostic_matches(message: &serde_json::Value, expected_file: &Path, probe: &Probe) -> bool {
+    if message["reason"] != "compiler-message"
+        || message["target"]["name"] != probe.name
+        || message["message"]["code"]["code"] != probe.code
+    {
+        return false;
+    }
+
+    let diagnostic = &message["message"];
+    let mentions_symbol = diagnostic["message"]
+        .as_str()
+        .is_some_and(|text| text.contains(probe.symbol));
+    let has_expected_primary_span =
+        diagnostic["spans"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|span| {
+                span["is_primary"] == true
+                    && span["file_name"]
+                        .as_str()
+                        .is_some_and(|file| same_source_file(Path::new(file), expected_file))
+            });
+
+    mentions_symbol && has_expected_primary_span
+}
+
+fn same_source_file(reported: &Path, expected: &Path) -> bool {
+    std::fs::canonicalize(reported)
+        .ok()
+        .zip(std::fs::canonicalize(expected).ok())
+        .is_some_and(|(reported, expected)| reported == expected)
+        || reported.file_name() == expected.file_name()
+}
+
 #[test]
-fn positive_control_compiles() {
-    let crate_ = ForgeCrate::new();
-    crate_.write_bin(
+fn child_reaper_api_boundaries_are_enforced() {
+    let forge = ForgeCrate::new();
+    forge.write_bin(
         "positive",
         r#"
-// Uses ONLY the public API surface.
 use llm_harness_runtime_sandbox_os::{
     ChildLease, ChildReaper, SpawnAdmission, drain_child_output_guarded,
 };
-fn _check_types(_lease: ChildLease, _admission: SpawnAdmission) {}
-fn _check_fns() {
+fn check_types(_: Option<ChildLease>, _: Option<SpawnAdmission>) {}
+fn check_api() {
     let _ = ChildReaper::global;
     let _ = ChildReaper::try_admit;
     let _ = ChildReaper::is_healthy;
@@ -117,204 +163,114 @@ fn _check_fns() {
 fn main() {}
 "#,
     );
+    forge.assert_positive("positive");
 
-    let (ok, stderr) = crate_.build_bin("positive");
-    assert!(
-        ok,
-        "positive control must compile — if this fails, the dependency \
-         or environment is broken, not the API boundary.\nstderr: {stderr}"
-    );
+    for probe in probes() {
+        forge.assert_diagnostic(probe);
+    }
 }
 
-/// Negative control: `confirm_exit` must be private.
-#[test]
-fn neg_confirm_exit_is_private() {
-    let crate_ = ForgeCrate::new();
-    crate_.write_bin(
-        "neg_confirm_exit",
-        r#"
+fn probes() -> Vec<Probe> {
+    vec![
+        method_probe(
+            "child_lease_confirm_exit",
+            "confirm_exit",
+            "fn probe(value: &mut ChildLease) { value.confirm_exit(); }",
+        ),
+        method_probe(
+            "child_lease_wait",
+            "wait",
+            "fn probe(value: &mut ChildLease) { let _ = value.wait(); }",
+        ),
+        method_probe(
+            "child_lease_kill_and_wait",
+            "kill_and_wait",
+            "fn probe(value: &mut ChildLease) { let _ = value.kill_and_wait(); }",
+        ),
+        method_probe(
+            "child_lease_take_stdout",
+            "take_stdout",
+            "fn probe(value: &mut ChildLease) { let _ = value.take_stdout(); }",
+        ),
+        method_probe(
+            "child_lease_take_stderr",
+            "take_stderr",
+            "fn probe(value: &mut ChildLease) { let _ = value.take_stderr(); }",
+        ),
+        field_probe("child_lease_id", "ChildLease", "id"),
+        field_probe("child_lease_core", "ChildLease", "core"),
+        field_probe("child_lease_stdout", "ChildLease", "stdout"),
+        field_probe("child_lease_stderr", "ChildLease", "stderr"),
+        field_probe("child_lease_confirmed", "ChildLease", "confirmed"),
+        Probe {
+            name: "child_lease_construction",
+            source: r#"
 use llm_harness_runtime_sandbox_os::ChildLease;
-fn _forge(lease: &mut ChildLease) { lease.confirm_exit(); }
-fn main() {}
-"#,
-    );
-    let (ok, stderr) = crate_.build_bin("neg_confirm_exit");
-    assert!(!ok, "confirm_exit must be private — build succeeded");
-    assert!(
-        stderr_has_privacy_error(&stderr),
-        "failure must be from privacy, not unrelated error\nstderr: {stderr}"
-    );
-}
-
-/// Negative control: `wait` must be private.
-#[test]
-fn neg_wait_is_private() {
-    let crate_ = ForgeCrate::new();
-    crate_.write_bin(
-        "neg_wait",
-        r#"
-use llm_harness_runtime_sandbox_os::ChildLease;
-fn _forge(lease: &mut ChildLease) { let _ = lease.wait(); }
-fn main() {}
-"#,
-    );
-    let (ok, stderr) = crate_.build_bin("neg_wait");
-    assert!(!ok, "wait must be private — build succeeded");
-    assert!(
-        stderr_has_privacy_error(&stderr),
-        "failure must be from privacy\nstderr: {stderr}"
-    );
-}
-
-/// Negative control: `kill_and_wait` must be private.
-#[test]
-fn neg_kill_and_wait_is_private() {
-    let crate_ = ForgeCrate::new();
-    crate_.write_bin(
-        "neg_kill_and_wait",
-        r#"
-use llm_harness_runtime_sandbox_os::ChildLease;
-fn _forge(lease: &mut ChildLease) { lease.kill_and_wait(); }
-fn main() {}
-"#,
-    );
-    let (ok, stderr) = crate_.build_bin("neg_kill_and_wait");
-    assert!(!ok, "kill_and_wait must be private — build succeeded");
-    assert!(
-        stderr_has_privacy_error(&stderr),
-        "failure must be from privacy\nstderr: {stderr}"
-    );
-}
-
-/// Negative control: `take_stdout` must be private.
-#[test]
-fn neg_take_stdout_is_private() {
-    let crate_ = ForgeCrate::new();
-    crate_.write_bin(
-        "neg_take_stdout",
-        r#"
-use llm_harness_runtime_sandbox_os::ChildLease;
-fn _forge(lease: &mut ChildLease) { lease.take_stdout(); }
-fn main() {}
-"#,
-    );
-    let (ok, stderr) = crate_.build_bin("neg_take_stdout");
-    assert!(!ok, "take_stdout must be private — build succeeded");
-    assert!(
-        stderr_has_privacy_error(&stderr),
-        "failure must be from privacy\nstderr: {stderr}"
-    );
-}
-
-/// Negative control: `take_stderr` must be private.
-#[test]
-fn neg_take_stderr_is_private() {
-    let crate_ = ForgeCrate::new();
-    crate_.write_bin(
-        "neg_take_stderr",
-        r#"
-use llm_harness_runtime_sandbox_os::ChildLease;
-fn _forge(lease: &mut ChildLease) { lease.take_stderr(); }
-fn main() {}
-"#,
-    );
-    let (ok, stderr) = crate_.build_bin("neg_take_stderr");
-    assert!(!ok, "take_stderr must be private — build succeeded");
-    assert!(
-        stderr_has_privacy_error(&stderr),
-        "failure must be from privacy\nstderr: {stderr}"
-    );
-}
-
-/// Negative control: struct fields must be private (cannot construct
-/// `ChildLease` directly).
-#[test]
-fn neg_field_construction_is_private() {
-    let crate_ = ForgeCrate::new();
-    crate_.write_bin(
-        "neg_fields",
-        r#"
-use llm_harness_runtime_sandbox_os::ChildLease;
-fn _forge() {
-    let _ = ChildLease {
-        id: 0,
-        core: None,
-        stdout: None,
-        stderr: None,
-        confirmed: false,
-    };
+fn probe() {
+    let _ = ChildLease { id: 0, core: None, stdout: None, stderr: None, confirmed: false };
 }
 fn main() {}
-"#,
-    );
-    let (ok, stderr) = crate_.build_bin("neg_fields");
-    assert!(!ok, "ChildLease fields must be private — build succeeded");
-    assert!(
-        stderr_has_privacy_error(&stderr),
-        "failure must be from private fields\nstderr: {stderr}"
-    );
-}
-
-/// Negative control: `ChildLease` must not be `Clone`.
-/// Uses an explicit trait bound so the failure is about `Clone`, not
-/// about reference auto-clone (`&T: Clone` always holds).
-#[test]
-fn neg_child_lease_is_not_clone() {
-    let crate_ = ForgeCrate::new();
-    crate_.write_bin(
-        "neg_clone",
-        r#"
-use llm_harness_runtime_sandbox_os::ChildLease;
-fn _requires_clone<T: Clone>(_: &T) {}
-fn _forge(lease: &ChildLease) {
-    _requires_clone(lease);
-}
+"#
+            .to_string(),
+            code: "E0451",
+            symbol: "id",
+        },
+        trait_probe("child_lease_clone", "ChildLease", "Clone"),
+        trait_probe("child_lease_copy", "ChildLease", "Copy"),
+        field_probe("spawn_admission_core", "SpawnAdmission", "core"),
+        field_probe("spawn_admission_epoch", "SpawnAdmission", "epoch"),
+        Probe {
+            name: "spawn_admission_construction",
+            source: r#"
+use llm_harness_runtime_sandbox_os::SpawnAdmission;
+fn probe() { let _ = SpawnAdmission { core: None, epoch: 0 }; }
 fn main() {}
-"#,
-    );
-    let (ok, stderr) = crate_.build_bin("neg_clone");
-    assert!(!ok, "ChildLease must not be Clone — build succeeded");
-    assert!(
-        stderr.contains("trait") || stderr.contains("E0277") || stderr.contains("not satisfied"),
-        "failure must be from missing Clone trait bound\nstderr: {stderr}"
-    );
+"#
+            .to_string(),
+            code: "E0451",
+            symbol: "core",
+        },
+        trait_probe("spawn_admission_clone", "SpawnAdmission", "Clone"),
+        trait_probe("spawn_admission_copy", "SpawnAdmission", "Copy"),
+    ]
 }
 
-/// Negative control: `ChildLease` must not be `Copy`.
-#[test]
-fn neg_child_lease_is_not_copy() {
-    let crate_ = ForgeCrate::new();
-    crate_.write_bin(
-        "neg_copy",
-        r#"
-use llm_harness_runtime_sandbox_os::ChildLease;
-fn _requires_copy<T: Copy>(_: &T) {}
-fn _forge(lease: &ChildLease) {
-    _requires_copy(lease);
-}
-fn main() {}
-"#,
-    );
-    let (ok, stderr) = crate_.build_bin("neg_copy");
-    assert!(!ok, "ChildLease must not be Copy — build succeeded");
-    assert!(
-        stderr.contains("trait") || stderr.contains("E0277") || stderr.contains("not satisfied"),
-        "failure must be from missing Copy trait bound\nstderr: {stderr}"
-    );
+fn method_probe(name: &'static str, symbol: &'static str, body: &'static str) -> Probe {
+    let source =
+        format!("use llm_harness_runtime_sandbox_os::ChildLease;\n{body}\nfn main() {{}}\n");
+    Probe {
+        name,
+        source,
+        code: "E0624",
+        symbol,
+    }
 }
 
-/// Verify the positive public API surface exists (compile-time check
-/// in the test crate itself).
-#[test]
-fn public_api_surface() {
-    use llm_harness_runtime_sandbox_os::{
-        ChildLease, ChildReaper, SpawnAdmission, drain_child_output_guarded,
-    };
-    let _ = std::marker::PhantomData::<ChildLease>;
-    let _ = SpawnAdmission::into_lease;
-    let _ = ChildReaper::global;
-    let _ = ChildReaper::try_admit;
-    let _ = ChildReaper::is_healthy;
-    let _ = ChildReaper::metrics;
-    let _ = drain_child_output_guarded;
+fn field_probe(name: &'static str, type_name: &'static str, field: &'static str) -> Probe {
+    let source = format!(
+        "use llm_harness_runtime_sandbox_os::{type_name};\n\
+         fn probe(value: &{type_name}) {{ let _ = &value.{field}; }}\n\
+         fn main() {{}}\n"
+    );
+    Probe {
+        name,
+        source,
+        code: "E0616",
+        symbol: field,
+    }
+}
+
+fn trait_probe(name: &'static str, type_name: &'static str, trait_name: &'static str) -> Probe {
+    let source = format!(
+        "use llm_harness_runtime_sandbox_os::{type_name};\n\
+         fn require_trait<T: {trait_name}>() {{}}\n\
+         fn probe() {{ require_trait::<{type_name}>(); }}\n\
+         fn main() {{}}\n"
+    );
+    Probe {
+        name,
+        source,
+        code: "E0277",
+        symbol: trait_name,
+    }
 }
