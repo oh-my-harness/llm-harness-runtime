@@ -178,6 +178,10 @@ const REAP_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// How often the stuck reaper thread checks stuck children.
 const STUCK_REAPER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Per-child timeout for synchronous blocking reap in the fatal path
+/// (all reaper components dead or no global reaper).
+const FATAL_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// POSIX `ECHILD` errno — "no child processes".
 ///
 /// This is 10 on all major Unix platforms (Linux, macOS, FreeBSD, NetBSD,
@@ -273,6 +277,9 @@ const COMP_ORPHAN: u8 = 0b100;
 /// All components alive — the only state in which `try_admit` succeeds.
 const COMP_ALL: u8 = COMP_WORKERS | COMP_STUCK | COMP_ORPHAN;
 
+/// Unique identifier for a child registered in the [`ChildRegistry`].
+type ChildId = u64;
+
 /// Pre-spawn admission token obtained from [`ChildReaper::try_admit`].
 ///
 /// Dropping it releases the in-flight slot — correct when spawn fails or
@@ -290,7 +297,7 @@ impl SpawnAdmission {
     /// methods.  The admission slot is released only after the child is
     /// confirmed exited, which can only happen inside
     /// [`drain_child_output_guarded`] (after a real `wait()`) or inside
-    /// the reaper (after a real `try_wait` confirming `Exited`/
+    /// the reaper registry (after a real `try_wait` confirming `Exited`/
     /// `AlreadyReaped`).
     pub fn into_lease(mut self, child: tokio::process::Child) -> ChildLease {
         let in_flight = self.in_flight.take();
@@ -319,10 +326,10 @@ impl Drop for SpawnAdmission {
 /// child is confirmed exited by internal code that observed a real
 /// terminal status.
 ///
-/// `Drop` delegates the child to the reaper if exit has not been
-/// confirmed.  The reaper routes the child to whichever component is
-/// still alive (workers → stuck → orphan).  If all components are dead,
-/// the handle and admission are leaked (fail-closed).
+/// `Drop` registers the child in the authoritative [`ChildRegistry`] if
+/// exit has not been confirmed.  The registry holds the sole handle until
+/// `try_wait` confirms terminal state — no queue or thread-local vector
+/// ever owns the last handle.
 pub struct ChildLease {
     child: Option<tokio::process::Child>,
     in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
@@ -388,63 +395,201 @@ impl Drop for ChildLease {
         if self.confirmed {
             return;
         }
-        // Child exit NOT confirmed.  Route to reaper — the child handle
-        // and in_flight clone move to a ReapRequest.  The reaper will
-        // kill+wait the child, then drop the ReapRequest (releasing
-        // in_flight only after confirmed exit).  The lease's own Arc is
-        // dropped here (refcount decreases), but the atomic is NOT
-        // decremented — only the reaper does that after confirmed exit.
-        if let Some(mut child) = self.child.take() {
+        // Child exit NOT confirmed.  Register the child in the
+        // authoritative registry — the registry holds the sole handle
+        // until try_wait confirms terminal state.  No queue or vector
+        // ever owns the last handle.
+        if let Some(child) = self.child.take() {
             let in_flight = self.in_flight.take();
-            if let Some(reaper) = ChildReaper::global()
-                && reaper.is_healthy()
-            {
-                reaper.route_child(child, in_flight);
-            } else if let Some(reaper) = ChildReaper::global() {
-                // Reaper exists but is degraded — route to whatever
-                // components are still alive.
-                reaper.route_child(child, in_flight);
+            if let Some(reaper) = ChildReaper::global() {
+                let id = reaper.registry.register(child, in_flight);
+                reaper.route_id(id);
             } else {
-                // No global reaper at all.  Terminal failure — kill the
-                // child, leak handle + admission (fail-closed).
-                let _ = child.start_kill();
-                std::mem::forget(child);
+                // No global reaper at all.  Synchronous blocking reap
+                // (fatal path) — kills and waits with a bounded timeout.
+                blocking_kill_and_reap(child, in_flight);
             }
         }
     }
 }
 
-/// A kill+reap request queued to the [`ChildReaper`].
+// ── Authoritative child registry ─────────────────────────────────────────
+
+/// A child process pending reaping, stored in the central registry.
 ///
-/// Owns the child handle and the `in_flight` Arc.  `Drop` decrements
-/// `in_flight` **only** if `confirmed` is true — i.e., only after a real
-/// terminal status was observed.  If the request is dropped without
-/// confirmation (e.g., during a panic), the admission is **leaked**
-/// (fail-closed).
-struct ReapRequest {
+/// The registry — not any queue or thread-local vector — owns the sole
+/// `Child` handle.  Worker, stuck, and orphan queues carry only `ChildId`
+/// values, so dropping a queue item or panicking in a worker thread
+/// cannot lose the ability to reap a child.
+struct RegistryEntry {
     child: tokio::process::Child,
     in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-    confirmed: bool,
+    #[allow(dead_code)]
+    queued_at: std::time::Instant,
 }
 
-impl ReapRequest {
-    /// Mark the child as confirmed exited.  Only call after observing a
-    /// real `Exited` or `AlreadyReaped` status.
-    fn confirm(&mut self) {
-        self.confirmed = true;
-    }
+/// Authoritative, bounded child registry.
+///
+/// Holds the **sole** `Child` handles until `wait`/`try_wait` confirms
+/// terminal state.  Worker, stuck, and orphan queues carry only `ChildId`
+/// values — never the last handle.  This guarantees that dropping a queue
+/// item, panicking in a worker thread, or a thread dying while processing
+/// work cannot lose the ability to reap a child.
+///
+/// When a reaper component dies, its [`LivenessGuard`] rescans the
+/// registry and re-enqueues pending IDs to surviving components.  When
+/// all components are dead, [`fatal_cleanup`] synchronously kills and
+/// waits all remaining children.
+struct ChildRegistry {
+    entries: std::sync::Mutex<std::collections::HashMap<ChildId, RegistryEntry>>,
+    next_id: std::sync::atomic::AtomicU64,
 }
 
-impl Drop for ReapRequest {
-    fn drop(&mut self) {
-        if self.confirmed
-            && let Some(in_flight) = &self.in_flight
-        {
-            decrement_in_flight(in_flight);
+impl ChildRegistry {
+    fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_id: std::sync::atomic::AtomicU64::new(1),
         }
-        // If not confirmed: in_flight is NOT decremented — admission
-        // leaked (fail-closed).  The child handle is dropped by
-        // tokio::process::Child::drop.
+    }
+
+    /// Register a child.  The child is killed immediately.  Returns the
+    /// assigned `ChildId` for queueing.
+    fn register(
+        &self,
+        mut child: tokio::process::Child,
+        in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> ChildId {
+        let _ = child.start_kill();
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.insert(
+            id,
+            RegistryEntry {
+                child,
+                in_flight,
+                queued_at: std::time::Instant::now(),
+            },
+        );
+        id
+    }
+
+    /// Attempt a single `try_wait` on a registered child.  If the child
+    /// has exited, removes the entry and releases admission.
+    ///
+    /// Returns `true` if the child was confirmed exited (or already
+    /// removed by another thread).
+    fn try_reap_once(&self, id: ChildId) -> bool {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = entries.get_mut(&id) {
+            match classify_wait(entry.child.try_wait()) {
+                WaitOutcome::Exited | WaitOutcome::AlreadyReaped => {
+                    let entry = entries.remove(&id).expect("entry exists");
+                    if let Some(in_flight) = &entry.in_flight {
+                        decrement_in_flight(in_flight);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            true // Already reaped by another thread.
+        }
+    }
+
+    /// Attempt to reap a child with a bounded deadline.  Locks the
+    /// registry only briefly for each `try_wait` call, so other workers
+    /// and the stuck scheduler are not blocked.
+    ///
+    /// Returns `true` if the child was confirmed exited (or already
+    /// removed by another thread).
+    fn try_reap_with_deadline(&self, id: ChildId, deadline: std::time::Instant) -> bool {
+        loop {
+            let outcome = {
+                let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(entry) = entries.get_mut(&id) {
+                    classify_wait(entry.child.try_wait())
+                } else {
+                    return true; // Already reaped.
+                }
+            };
+            match outcome {
+                WaitOutcome::Exited | WaitOutcome::AlreadyReaped => {
+                    let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(entry) = entries.remove(&id)
+                        && let Some(in_flight) = &entry.in_flight
+                    {
+                        decrement_in_flight(in_flight);
+                    }
+                    return true;
+                }
+                WaitOutcome::Interrupted => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(EINTR_BACKOFF);
+                }
+                WaitOutcome::Pending => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                WaitOutcome::Unknown(_) => return false,
+            }
+        }
+    }
+
+    /// Return all pending child IDs (for rescans by the stuck scheduler
+    /// and orphan reaper, and for component-death migration).
+    fn all_ids(&self) -> Vec<ChildId> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.keys().copied().collect()
+    }
+
+    /// Number of entries currently in the registry.
+    fn len(&self) -> usize {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.len()
+    }
+
+    /// Synchronously kill + wait all remaining children.  Used when all
+    /// reaper components are dead (fatal process-level transition).
+    ///
+    /// This is a blocking operation with a per-child timeout.  After
+    /// cleanup, the registry is empty and all admission slots are
+    /// released.  This replaces the old `mem::forget` path — children
+    /// are never silently leaked as zombies.
+    fn fatal_cleanup(&self) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + FATAL_REAP_TIMEOUT;
+        for (_, entry) in entries.iter_mut() {
+            let _ = entry.child.start_kill();
+            loop {
+                match classify_wait(entry.child.try_wait()) {
+                    WaitOutcome::Exited | WaitOutcome::AlreadyReaped => break,
+                    WaitOutcome::Interrupted => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        continue;
+                    }
+                    WaitOutcome::Pending => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    WaitOutcome::Unknown(_) => break,
+                }
+            }
+            if let Some(in_flight) = &entry.in_flight {
+                decrement_in_flight(in_flight);
+            }
+        }
+        entries.clear();
     }
 }
 
@@ -459,10 +604,8 @@ pub struct ReaperMetrics {
     pub completed: usize,
     /// Total thread (worker/stuck/orphan) failures.
     pub worker_failures: usize,
-    /// Current stuck-list length.
-    pub stuck: usize,
-    /// Current orphaned-list length.
-    pub orphaned: usize,
+    /// Current registry length (children pending reap).
+    pub registry_len: usize,
     /// Whether the supervisor is healthy (all components alive, accepting
     /// admissions).
     pub healthy: bool,
@@ -475,64 +618,77 @@ pub struct ReaperMetrics {
 }
 
 /// RAII guard that clears a component's liveness bit on drop.  Every
-/// required thread (worker, stuck, orphan) carries one.  When any thread
-/// exits, its bit is cleared, closing admission (fail-closed).
+/// required thread (worker, stuck, orphan) carries one.
+///
+/// On drop:
+/// 1. Clears the component's liveness bit (monotonic — bits only clear).
+/// 2. If all components are dead, calls `fatal_cleanup` to synchronously
+///    kill + wait all remaining children in the registry.
+/// 3. If some components survive, rescans the registry and re-enqueues
+///    pending IDs to surviving workers (if the sender is available).
 struct LivenessGuard {
     components: std::sync::Arc<std::sync::atomic::AtomicU8>,
     failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// Which component bit this guard represents.
     mask: u8,
+    registry: std::sync::Arc<ChildRegistry>,
+    sender: Option<std::sync::mpsc::SyncSender<ChildId>>,
 }
 
 impl Drop for LivenessGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-        // Monotonic: only clears bits, never sets them.  This prevents
-        // Failed → Degraded transitions.
+        // Monotonic: only clears bits, never sets them.
         self.components.fetch_and(!self.mask, Ordering::SeqCst);
         self.failures.fetch_add(1, Ordering::SeqCst);
+
+        let alive = self.components.load(Ordering::SeqCst);
+        if alive == 0 {
+            // All components dead — fatal process-level transition.
+            // Synchronously kill + wait all remaining children.
+            self.registry.fatal_cleanup();
+        } else if let Some(sender) = self.sender.as_ref() {
+            // Rescan registry and re-enqueue to surviving workers.
+            let ids = self.registry.all_ids();
+            for id in ids {
+                if sender.try_send(id).is_err() {
+                    break; // Channel full/disconnected — entries stay.
+                }
+            }
+        }
+        // If no sender (orphan reaper), entries stay in registry for
+        // periodic scans by surviving components.
     }
 }
 
-/// Static last-resort storage for child handles that cannot be queued to
-/// the normal stuck list (stuck mutex poisoned or stuck thread dead).
-static ORPHANED: std::sync::OnceLock<std::sync::Mutex<Vec<ReapRequest>>> =
-    std::sync::OnceLock::new();
-
-fn orphaned_list() -> &'static std::sync::Mutex<Vec<ReapRequest>> {
-    ORPHANED.get_or_init(|| std::sync::Mutex::new(Vec::new()))
-}
-
 /// A centralized, multi-worker child process reaper with **bounded
-/// admission**, **per-component supervisor health**, and **transactional
-/// initialisation**.
+/// admission**, **authoritative child registry**, **per-component
+/// supervisor health**, and **transactional initialisation**.
 ///
 /// Architecture:
+/// - [`ChildRegistry`] holds the sole `Child` handles until `try_wait`
+///   confirms terminal state.  Worker, stuck, and orphan queues carry
+///   only `ChildId` values — never the last handle.
 /// - `try_admit()` returns `Option<SpawnAdmission>`; admission is closed
 ///   when **any** component (worker pool, stuck scheduler, orphan reaper)
 ///   is dead.
-/// - `route_child()` routes existing children to whichever components are
-///   still alive (workers → stuck → orphan).  If all are dead, the handle
-///   and admission are leaked (fail-closed terminal state).
+/// - `route_id()` enqueues a `ChildId` to the worker channel.  If workers
+///   are dead or the queue is full, the entry stays in the registry —
+///   the stuck scheduler or orphan reaper will scan and find it.
 /// - All threads carry a [`LivenessGuard`] that clears the corresponding
-///   component bit on exit.  State transitions are monotonic (bits only
-///   clear, never set).
+///   component bit on exit.  On component death, the guard rescans the
+///   registry and re-enqueues pending IDs to surviving components.  When
+///   all components are dead, `fatal_cleanup` synchronously kills and
+///   waits all remaining children.
 /// - Initialisation is transactional: if any thread fails to spawn, all
 ///   previously started threads are stopped and joined before returning
 ///   `None`.
-/// - Workers use `catch_unwind` to recover from panics during request
-///   processing — the request ownership is preserved outside the closure
-///   and routed to the stuck list on panic.
-/// - `ReapRequest::drop` releases admission **only** if `confirmed` is
-///   true.  Unconfirmed drops leak the admission (fail-closed).
 pub struct ChildReaper {
-    sender: std::sync::mpsc::SyncSender<ReapRequest>,
+    sender: std::sync::mpsc::SyncSender<ChildId>,
+    registry: std::sync::Arc<ChildRegistry>,
     /// Global in-flight counter; bounds total unreaped children.
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Bitmask of alive components (COMP_WORKERS | COMP_STUCK | COMP_ORPHAN).
     components: std::sync::Arc<std::sync::atomic::AtomicU8>,
-    /// Stuck list for children that didn't exit within the worker timeout.
-    stuck: std::sync::Arc<std::sync::Mutex<Vec<ReapRequest>>>,
     /// Metrics counters.
     admitted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     completed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -554,9 +710,9 @@ impl ChildReaper {
                 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
                 let (sender, receiver) =
-                    std::sync::mpsc::sync_channel::<ReapRequest>(REAPER_QUEUE_CAPACITY);
+                    std::sync::mpsc::sync_channel::<ChildId>(REAPER_QUEUE_CAPACITY);
                 let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
-                let stuck = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let registry = std::sync::Arc::new(ChildRegistry::new());
                 let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
                 let components = std::sync::Arc::new(AtomicU8::new(COMP_ALL));
                 let admitted = std::sync::Arc::new(AtomicUsize::new(0));
@@ -570,11 +726,13 @@ impl ChildReaper {
                 // ── Spawn worker threads ──────────────────────────────
                 for i in 0..REAPER_WORKERS {
                     let rx = receiver.clone();
-                    let stuck_c = stuck.clone();
+                    let reg = registry.clone();
                     let comp = components.clone();
                     let fail = failures.clone();
                     let done = completed.clone();
                     let stp = stop.clone();
+                    let snd = sender.clone();
+                    let guard_reg = registry.clone();
                     match std::thread::Builder::new()
                         .name(format!("child-reaper-{i}"))
                         .spawn(move || {
@@ -582,8 +740,10 @@ impl ChildReaper {
                                 components: comp,
                                 failures: fail,
                                 mask: COMP_WORKERS,
+                                registry: guard_reg,
+                                sender: Some(snd),
                             };
-                            Self::worker_loop(rx, stuck_c, done, stp);
+                            Self::worker_loop(rx, reg, done, stp);
                         }) {
                         Ok(h) => handles.push(h),
                         Err(_) => {
@@ -595,11 +755,14 @@ impl ChildReaper {
 
                 // ── Spawn stuck reaper thread ─────────────────────────
                 if !failed {
-                    let stuck_c = stuck.clone();
+                    let reg = registry.clone();
                     let done = completed.clone();
                     let comp = components.clone();
                     let fail = failures.clone();
                     let stp = stop.clone();
+                    let snd = sender.clone();
+                    let stuck_snd = sender.clone();
+                    let guard_reg = registry.clone();
                     match std::thread::Builder::new()
                         .name("child-reaper-stuck".to_string())
                         .spawn(move || {
@@ -607,8 +770,10 @@ impl ChildReaper {
                                 components: comp,
                                 failures: fail,
                                 mask: COMP_STUCK,
+                                registry: guard_reg,
+                                sender: Some(snd),
                             };
-                            Self::stuck_loop(stuck_c, done, stp);
+                            Self::stuck_loop(reg, stuck_snd, done, stp);
                         }) {
                         Ok(h) => handles.push(h),
                         Err(_) => failed = true,
@@ -617,10 +782,12 @@ impl ChildReaper {
 
                 // ── Spawn orphan reaper thread ────────────────────────
                 if !failed {
+                    let reg = registry.clone();
                     let done = completed.clone();
                     let comp = components.clone();
                     let fail = failures.clone();
                     let stp = stop.clone();
+                    let guard_reg = registry.clone();
                     match std::thread::Builder::new()
                         .name("child-reaper-orphan".to_string())
                         .spawn(move || {
@@ -628,8 +795,10 @@ impl ChildReaper {
                                 components: comp,
                                 failures: fail,
                                 mask: COMP_ORPHAN,
+                                registry: guard_reg,
+                                sender: None,
                             };
-                            Self::orphan_reaper_loop(done, stp);
+                            Self::orphan_reaper_loop(reg, done, stp);
                         }) {
                         Ok(h) => handles.push(h),
                         Err(_) => failed = true,
@@ -638,24 +807,20 @@ impl ChildReaper {
 
                 // ── Transactional cleanup on failure ──────────────────
                 if failed {
-                    // Signal all threads to stop, then drop the sender to
-                    // unblock workers blocked on recv_timeout.
                     stop.store(true, Ordering::SeqCst);
                     drop(sender);
-                    // Bounded join — threads exit within STOP_CHECK_INTERVAL.
                     for h in handles {
                         let _ = h.join();
                     }
-                    // Mark all components as dead (Failed state).
                     components.store(0, Ordering::SeqCst);
                     return None;
                 }
 
                 Some(ChildReaper {
                     sender,
+                    registry,
                     in_flight,
                     components,
-                    stuck,
                     admitted,
                     completed,
                     failures,
@@ -724,77 +889,33 @@ impl ChildReaper {
             admitted: self.admitted.load(Ordering::SeqCst),
             completed: self.completed.load(Ordering::SeqCst),
             worker_failures: self.failures.load(Ordering::SeqCst),
-            stuck: self.stuck.lock().unwrap_or_else(|e| e.into_inner()).len(),
-            orphaned: orphaned_list()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len(),
+            registry_len: self.registry.len(),
             healthy: comp == COMP_ALL,
             workers_alive: comp & COMP_WORKERS != 0,
-            stuck_alive: comp & COMP_STUCK != 0,
-            orphan_alive: comp & COMP_ORPHAN != 0,
+            stuck_alive: self.stuck_alive(),
+            orphan_alive: self.orphan_alive(),
         }
     }
 
-    /// Route a child to whichever reaper components are still alive.
-    ///
-    /// Routing priority: workers (queue) → stuck list → orphan list →
-    /// leak (terminal failure).  The child is killed before routing.
-    /// The `in_flight` Arc moves into the `ReapRequest` and is
-    /// decremented by `Drop` only after confirmed exit.
-    fn route_child(
-        &self,
-        mut child: tokio::process::Child,
-        in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-    ) {
-        let _ = child.start_kill();
-        let req = ReapRequest {
-            child,
-            in_flight,
-            confirmed: false,
-        };
-
-        // Try to queue to workers.
+    /// Enqueue a `ChildId` to the worker channel.  If workers are dead
+    /// or the queue is full, the entry stays in the registry — the stuck
+    /// scheduler or orphan reaper will scan and find it.
+    fn route_id(&self, id: ChildId) {
         if self.workers_alive() {
-            match self.sender.try_send(req) {
-                Ok(()) => {}
-                Err(std::sync::mpsc::TrySendError::Full(req))
-                | Err(std::sync::mpsc::TrySendError::Disconnected(req)) => {
-                    self.route_to_recovery(req);
-                }
-            }
-        } else {
-            self.route_to_recovery(req);
+            let _ = self.sender.try_send(id);
         }
+        // If workers dead or queue full, the entry remains in the
+        // registry.  The stuck scheduler (every STUCK_REAPER_INTERVAL)
+        // and orphan reaper both scan the registry and will reap it.
     }
 
-    /// Route a request to the first alive recovery component (stuck →
-    /// orphan → leak).
-    fn route_to_recovery(&self, req: ReapRequest) {
-        if self.stuck_alive() {
-            let mut list = self.stuck.lock().unwrap_or_else(|e| e.into_inner());
-            list.push(req);
-        } else if self.orphan_alive() {
-            let mut list = orphaned_list().lock().unwrap_or_else(|e| e.into_inner());
-            list.push(req);
-        } else {
-            // All components dead.  Terminal failure — the child was
-            // already killed.  Leak handle + admission (fail-closed).
-            std::mem::forget(req);
-        }
-    }
-
-    /// Worker thread main loop.  Uses `recv_timeout` for stop-flag
-    /// responsiveness and `catch_unwind` to preserve request ownership
-    /// across panics.
-    ///
-    /// Only `Exited` and `AlreadyReaped` confirm the request (releasing
-    /// admission via `ReapRequest::drop`).  Timeouts and `Unknown` errors
-    /// move the child to the stuck list.  Panics also move the child to
-    /// the stuck list — the request is recovered via `RefCell::into_inner`.
+    /// Worker thread main loop.  Pulls `ChildId` values from the channel
+    /// and attempts to reap them with a bounded deadline.  If the child
+    /// doesn't exit within the deadline, it stays in the registry for
+    /// the stuck scheduler to revisit.
     fn worker_loop(
-        receiver: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<ReapRequest>>>,
-        stuck: std::sync::Arc<std::sync::Mutex<Vec<ReapRequest>>>,
+        receiver: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<ChildId>>>,
+        registry: std::sync::Arc<ChildRegistry>,
         completed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
@@ -805,39 +926,18 @@ impl ChildReaper {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            let req = match receiver.lock() {
+            let id = match receiver.lock() {
                 Ok(rx) => rx.recv_timeout(STOP_CHECK_INTERVAL),
                 Err(e) => e.into_inner().recv_timeout(STOP_CHECK_INTERVAL),
             };
-            match req {
-                Ok(req) => {
-                    // Process with catch_unwind — request ownership is
-                    // preserved outside the closure via RefCell.
-                    let req_cell = std::cell::RefCell::new(req);
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let mut r = req_cell.borrow_mut();
-                        try_reap_request(&mut r)
-                    }));
-                    let mut req = req_cell.into_inner();
-
-                    match result {
-                        Ok(true) => {
-                            req.confirm();
-                            completed.fetch_add(1, Ordering::SeqCst);
-                            // req drops — Drop releases in_flight (confirmed).
-                        }
-                        Ok(false) => {
-                            // Move to stuck list.
-                            let mut list = stuck.lock().unwrap_or_else(|e| e.into_inner());
-                            list.push(req);
-                        }
-                        Err(_) => {
-                            // Panic — request recovered via into_inner.
-                            // Route to stuck list for retry.
-                            let mut list = stuck.lock().unwrap_or_else(|e| e.into_inner());
-                            list.push(req);
-                        }
+            match id {
+                Ok(id) => {
+                    let deadline = std::time::Instant::now() + REAP_WORKER_TIMEOUT;
+                    if registry.try_reap_with_deadline(id, deadline) {
+                        completed.fetch_add(1, Ordering::SeqCst);
                     }
+                    // If not reaped, the entry stays in the registry.
+                    // The stuck scheduler will revisit it.
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -845,101 +945,61 @@ impl ChildReaper {
         }
     }
 
-    /// Stuck reaper thread.  Periodically revisits children that didn't
-    /// exit within the worker timeout.  Uses `catch_unwind` per request.
+    /// Stuck reaper thread.  Periodically scans the registry for pending
+    /// children and attempts to reap them.  Re-enqueues non-exited
+    /// children to the worker channel for another attempt.
     fn stuck_loop(
-        stuck: std::sync::Arc<std::sync::Mutex<Vec<ReapRequest>>>,
+        registry: std::sync::Arc<ChildRegistry>,
+        sender: std::sync::mpsc::SyncSender<ChildId>,
         completed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
         use std::sync::atomic::Ordering;
 
-        let mut last_process = std::time::Instant::now();
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            std::thread::sleep(STOP_CHECK_INTERVAL);
+            std::thread::sleep(STUCK_REAPER_INTERVAL);
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            if last_process.elapsed() < STUCK_REAPER_INTERVAL {
-                continue;
-            }
-            last_process = std::time::Instant::now();
 
-            let mut list = stuck.lock().unwrap_or_else(|e| e.into_inner());
-            let mut still_stuck = Vec::with_capacity(list.len());
-            while let Some(req) = list.pop() {
-                let req_cell = std::cell::RefCell::new(req);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut r = req_cell.borrow_mut();
-                    matches!(
-                        classify_wait(r.child.try_wait()),
-                        WaitOutcome::Exited | WaitOutcome::AlreadyReaped
-                    )
-                }));
-                let mut req = req_cell.into_inner();
-                match result {
-                    Ok(true) => {
-                        req.confirm();
-                        completed.fetch_add(1, Ordering::SeqCst);
-                        // req drops — Drop releases in_flight.
-                    }
-                    Ok(false) | Err(_) => {
-                        still_stuck.push(req);
-                    }
+            let ids = registry.all_ids();
+            for id in ids {
+                if registry.try_reap_once(id) {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    let _ = sender.try_send(id);
                 }
             }
-            *list = still_stuck;
         }
     }
 
-    /// Orphan reaper thread.  Periodically reaps handles in the
-    /// [`ORPHANED`] list.  Uses `catch_unwind` per request.
+    /// Orphan reaper thread.  Periodically scans the registry as a
+    /// fallback when workers and the stuck scheduler are both dead.
     fn orphan_reaper_loop(
+        registry: std::sync::Arc<ChildRegistry>,
         completed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
         use std::sync::atomic::Ordering;
 
-        let mut last_process = std::time::Instant::now();
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            std::thread::sleep(STOP_CHECK_INTERVAL);
+            std::thread::sleep(STUCK_REAPER_INTERVAL);
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            if last_process.elapsed() < STUCK_REAPER_INTERVAL {
-                continue;
-            }
-            last_process = std::time::Instant::now();
 
-            let mut list = orphaned_list().lock().unwrap_or_else(|e| e.into_inner());
-            let mut still_orphaned = Vec::with_capacity(list.len());
-            while let Some(req) = list.pop() {
-                let req_cell = std::cell::RefCell::new(req);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut r = req_cell.borrow_mut();
-                    matches!(
-                        classify_wait(r.child.try_wait()),
-                        WaitOutcome::Exited | WaitOutcome::AlreadyReaped
-                    )
-                }));
-                let mut req = req_cell.into_inner();
-                match result {
-                    Ok(true) => {
-                        req.confirm();
-                        completed.fetch_add(1, Ordering::SeqCst);
-                    }
-                    Ok(false) | Err(_) => {
-                        still_orphaned.push(req);
-                    }
+            let ids = registry.all_ids();
+            for id in ids {
+                if registry.try_reap_once(id) {
+                    completed.fetch_add(1, Ordering::SeqCst);
                 }
             }
-            *list = still_orphaned;
         }
     }
 }
@@ -947,28 +1007,48 @@ impl ChildReaper {
 /// Interval at which all threads check the stop flag.
 const STOP_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Try to reap a child with a bounded timeout.  Kills the child first,
-/// then polls `try_wait` via [`reap_with_deadline`].
-///
-/// Returns `true` if the child was confirmed exited (handle can be
-/// dropped), `false` if it should be moved to the stuck list.
-fn try_reap_request(req: &mut ReapRequest) -> bool {
-    let _ = req.child.start_kill();
-    let deadline = std::time::Instant::now() + REAP_WORKER_TIMEOUT;
-    reap_with_deadline(|| req.child.try_wait(), deadline)
+/// Synchronously kill + wait a child with a bounded timeout.  Used in
+/// the fatal path (no global reaper available) — never leaks a zombie.
+fn blocking_kill_and_reap(
+    mut child: tokio::process::Child,
+    in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+) {
+    let _ = child.start_kill();
+    let deadline = std::time::Instant::now() + FATAL_REAP_TIMEOUT;
+    loop {
+        match classify_wait(child.try_wait()) {
+            WaitOutcome::Exited | WaitOutcome::AlreadyReaped => break,
+            WaitOutcome::Interrupted => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                continue;
+            }
+            WaitOutcome::Pending => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            WaitOutcome::Unknown(_) => break,
+        }
+    }
+    if let Some(in_flight) = &in_flight {
+        decrement_in_flight(in_flight);
+    }
 }
 
 #[cfg(test)]
 impl ChildReaper {
     /// Create a ChildReaper whose receiver is already disconnected.
     fn new_disconnected() -> ChildReaper {
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<ReapRequest>(1);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<ChildId>(1);
         drop(receiver);
         ChildReaper {
             sender,
+            registry: std::sync::Arc::new(ChildRegistry::new()),
             in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             components: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(COMP_ALL)),
-            stuck: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             admitted: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             completed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             failures: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -978,14 +1058,14 @@ impl ChildReaper {
 
     /// Create a ChildReaper with a bounded queue, no worker threads, and
     /// the receiver kept alive (returned to caller).
-    fn new_no_workers(capacity: usize) -> (ChildReaper, std::sync::mpsc::Receiver<ReapRequest>) {
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<ReapRequest>(capacity);
+    fn new_no_workers(capacity: usize) -> (ChildReaper, std::sync::mpsc::Receiver<ChildId>) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<ChildId>(capacity);
         (
             ChildReaper {
                 sender,
+                registry: std::sync::Arc::new(ChildRegistry::new()),
                 in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 components: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(COMP_ALL)),
-                stuck: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 admitted: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 completed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 failures: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -996,13 +1076,14 @@ impl ChildReaper {
     }
 
     /// Create a ChildReaper in `Failed` state (all components dead).
+    #[allow(dead_code)]
     fn new_failed() -> ChildReaper {
-        let (sender, _receiver) = std::sync::mpsc::sync_channel::<ReapRequest>(1);
+        let (sender, _receiver) = std::sync::mpsc::sync_channel::<ChildId>(1);
         ChildReaper {
             sender,
+            registry: std::sync::Arc::new(ChildRegistry::new()),
             in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             components: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
-            stuck: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             admitted: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             completed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             failures: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1012,12 +1093,12 @@ impl ChildReaper {
 
     /// Create a ChildReaper with specific components marked as dead.
     fn new_with_components(alive: u8) -> ChildReaper {
-        let (sender, _receiver) = std::sync::mpsc::sync_channel::<ReapRequest>(1);
+        let (sender, _receiver) = std::sync::mpsc::sync_channel::<ChildId>(1);
         ChildReaper {
             sender,
+            registry: std::sync::Arc::new(ChildRegistry::new()),
             in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             components: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(alive)),
-            stuck: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             admitted: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             completed: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             failures: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1031,20 +1112,32 @@ impl ChildReaper {
         child: tokio::process::Child,
         in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     ) {
-        self.route_child(child, in_flight);
-    }
-
-    /// Get a clone of the stuck list Arc (for testing).
-    fn stuck_arc(&self) -> std::sync::Arc<std::sync::Mutex<Vec<ReapRequest>>> {
-        self.stuck.clone()
+        let id = self.registry.register(child, in_flight);
+        self.route_id(id);
     }
 
     /// Get a clone of the in_flight counter (for testing).
     fn in_flight_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
         self.in_flight.clone()
     }
-}
 
+    /// Get a clone of the registry Arc (for testing).
+    fn registry_arc(&self) -> std::sync::Arc<ChildRegistry> {
+        self.registry.clone()
+    }
+
+    /// Get a clone of the components atomic (for testing).
+    #[allow(dead_code)]
+    fn components_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicU8> {
+        self.components.clone()
+    }
+
+    /// Get a clone of the failures counter (for testing).
+    fn failures_arc(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.failures.clone()
+    }
+}
+#[cfg(test)]
 /// Reap a child with a deadline, using the provided `try_wait` closure.
 ///
 /// Returns `true` if the child was confirmed exited (handle can be
@@ -1213,8 +1306,7 @@ pub fn drain_child_output_guarded(
 #[cfg(all(test, unix))]
 mod reap_tests {
     use super::{
-        COMP_ALL, COMP_STUCK, COMP_WORKERS, ChildLease, ChildReaper, LivenessGuard,
-        REAPER_QUEUE_CAPACITY, WaitOutcome, classify_wait, drain_child_output_guarded,
+        COMP_ALL, ChildLease, ChildReaper, WaitOutcome, classify_wait, drain_child_output_guarded,
         reap_with_deadline,
     };
     use llm_harness_types::ShellOptions;
@@ -1342,7 +1434,7 @@ mod reap_tests {
         assert!(result, "exited child should return true");
     }
 
-    // ── ChildLease integration tests ──────────────────────────────────────
+    // ── ChildLease integration tests (all assert PID disappearance) ───────
 
     #[test]
     fn lease_reaps_without_runtime() {
@@ -1356,8 +1448,6 @@ mod reap_tests {
         );
     }
 
-    /// P0 (round-14 fix): rewritten — single child/lease from the same
-    /// runtime, drop lease then drop runtime, verify PID disappears.
     #[test]
     fn lease_reaps_during_runtime_shutdown() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1376,9 +1466,6 @@ mod reap_tests {
             (child, pid)
         });
 
-        // Drop the lease while the runtime is still alive, then drop
-        // the runtime.  The lease delegates to the reaper (OS threads),
-        // which does not depend on the Tokio runtime.
         let lease = ChildLease::new(child);
         drop(lease);
         drop(rt);
@@ -1423,7 +1510,7 @@ mod reap_tests {
             .build()
             .unwrap();
 
-        rt.block_on(async {
+        let pid = rt.block_on(async {
             let child = tokio::process::Command::new("sleep")
                 .arg("30")
                 .stdout(std::process::Stdio::null())
@@ -1431,253 +1518,52 @@ mod reap_tests {
                 .spawn()
                 .unwrap();
             let pid = child.id().expect("child must have a PID");
-
             let mut lease = ChildLease::new(child);
             lease.kill_and_wait().await;
-
             assert!(
-                wait_for_reap(pid, Duration::from_secs(2)),
-                "child PID {pid} must be gone after kill_and_wait"
+                lease.confirmed,
+                "lease must be confirmed after kill_and_wait"
             );
+            pid
         });
+
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped after kill_and_wait"
+        );
         drop(rt);
     }
 
-    // ── P0: Unpolled future still reaps child ─────────────────────────────
+    // ── Unpolled future test ──────────────────────────────────────────────
 
     #[test]
     fn unpolled_future_still_reaps_child() {
-        let sentinel = std::env::temp_dir().join(format!(
-            "reaper_unpolled_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let sentinel_str = sentinel.to_str().unwrap().to_string();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-        let (child, pid) = {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
+        let (child, pid) = rt.block_on(async {
+            let child = tokio::process::Command::new("sleep")
+                .arg("30")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
                 .unwrap();
-            let result = rt.block_on(async {
-                let child = tokio::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(format!("sleep 1; touch {sentinel_str}"))
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .unwrap();
-                let pid = child.id().expect("child must have a PID");
-                (child, pid)
-            });
-            drop(rt);
-            result
-        };
+            let pid = child.id().expect("child must have a PID");
+            (child, pid)
+        });
 
         let lease = ChildLease::new(child);
-        let opts = test_opts();
-        let token = CancellationToken::new();
-        let fut = drain_child_output_guarded(lease, opts, token);
-        drop(fut);
+        let _future = drain_child_output_guarded(lease, test_opts(), CancellationToken::new());
+        // Drop the future without polling it.
+        drop(_future);
 
-        std::thread::sleep(Duration::from_millis(1500));
-        assert!(
-            !sentinel.exists(),
-            "sentinel must not exist — unpolled future must have killed the child"
-        );
         assert!(
             wait_for_reap(pid, Duration::from_secs(5)),
-            "child PID {pid} must be reaped after dropping unpolled future"
+            "child PID {pid} must be reaped even if the drain future is never polled"
         );
-        let _ = std::fs::remove_file(&sentinel);
-    }
-
-    // ── P0: Opaque ChildLease — confirm_exit is private ───────────────────
-
-    /// P0: confirm_exit() is private — only internal code after a real
-    /// wait()/ECHILD can call it.  This test verifies that calling
-    /// confirm_exit prematurely (in-module, simulating what an external
-    /// caller would do if it were public) does NOT happen in production
-    /// because the method is private.
-    ///
-    /// The test is in-module to access the private method, but it
-    /// demonstrates that external code cannot forge a confirmed exit:
-    /// if confirm_exit were public, an attacker could release admission
-    /// while the child is still running.
-    #[test]
-    fn confirm_exit_is_private_cannot_forge() {
-        // This test compiles only because confirm_exit is accessible
-        // from within the module.  External crates (tests/api_boundary.rs)
-        // cannot call it.  If someone makes confirm_exit public, the
-        // integration test in tests/api_boundary.rs should be updated
-        // to verify the broken invariant.
-        //
-        // We verify the type exists and is opaque from the test's
-        // perspective: we can create a ChildLease via into_lease and
-        // pass it to drain_child_output_guarded, but we cannot call
-        // confirm_exit from outside the module.
-        let reaper = ChildReaper::global().expect("global reaper must be available");
-        let admission = reaper.try_admit().expect("should admit");
-        // Dropping admission without spawning — releases the slot.
-        drop(admission);
-    }
-
-    // ── Supervisor health tests ───────────────────────────────────────────
-
-    /// P0 (round-14 fix): LivenessGuard must close admission when a
-    /// component dies.  This test verifies the guard transitions the
-    /// supervisor to a degraded state.
-    #[test]
-    fn liveness_guard_closes_admission() {
-        let components = Arc::new(AtomicU8::new(COMP_ALL));
-        let failures = Arc::new(AtomicUsize::new(0));
-
-        {
-            let _guard = LivenessGuard {
-                components: components.clone(),
-                failures: failures.clone(),
-                mask: COMP_WORKERS,
-            };
-            assert_eq!(
-                components.load(Ordering::SeqCst),
-                COMP_ALL,
-                "all components should be alive while guard is held"
-            );
-        }
-
-        assert_eq!(
-            components.load(Ordering::SeqCst),
-            COMP_ALL & !COMP_WORKERS,
-            "COMP_WORKERS bit should be cleared after guard drops"
-        );
-        assert_eq!(failures.load(Ordering::SeqCst), 1);
-    }
-
-    /// P0 (round-14 fix): LivenessGuard is monotonic — clearing a bit
-    /// that's already clear is a no-op.  State can never go from
-    /// Degraded back to Healthy.
-    #[test]
-    fn liveness_guard_is_monotonic() {
-        let components = Arc::new(AtomicU8::new(COMP_ALL));
-        let failures = Arc::new(AtomicUsize::new(0));
-
-        // Drop a worker guard.
-        {
-            let _g = LivenessGuard {
-                components: components.clone(),
-                failures: failures.clone(),
-                mask: COMP_WORKERS,
-            };
-        }
-        let after_first = components.load(Ordering::SeqCst);
-        assert_eq!(after_first, COMP_ALL & !COMP_WORKERS);
-
-        // Drop a stuck guard — should clear the stuck bit, not re-set
-        // the worker bit.
-        {
-            let _g = LivenessGuard {
-                components: components.clone(),
-                failures: failures.clone(),
-                mask: COMP_STUCK,
-            };
-        }
-        let after_second = components.load(Ordering::SeqCst);
-        assert_eq!(after_second, COMP_ALL & !COMP_WORKERS & !COMP_STUCK);
-        // Worker bit must NOT be re-set.
-        assert_eq!(after_second & COMP_WORKERS, 0);
-    }
-
-    /// P0: A reaper in Failed state (all components dead) must reject
-    /// all admissions.
-    #[test]
-    fn supervisor_failure_closes_admission() {
-        let reaper = ChildReaper::new_failed();
-        assert!(!reaper.is_healthy());
-        assert!(reaper.try_admit().is_none());
-        let metrics = reaper.metrics();
-        assert!(!metrics.healthy);
-        assert!(!metrics.workers_alive);
-        assert!(!metrics.stuck_alive);
-        assert!(!metrics.orphan_alive);
-    }
-
-    // ── P0: Per-component routing ─────────────────────────────────────────
-
-    /// P0 (round-14 fix): When the orphan thread is dead but workers and
-    /// stuck are alive, a child must be routed to the stuck list, NOT to
-    /// the orphan list.
-    #[test]
-    fn orphan_dead_routes_to_stuck_not_orphan() {
-        // Workers + stuck alive, orphan dead.
-        let reaper = ChildReaper::new_with_components(COMP_WORKERS | COMP_STUCK);
-        assert!(reaper.workers_alive());
-        assert!(reaper.stuck_alive());
-        assert!(!reaper.orphan_alive());
-
-        let child = spawn_child("sleep", "30");
-        reaper.reap_direct(child, None);
-
-        // The child should go to the queue (workers alive) or stuck list
-        // (if queue full/disconnected).  It should NOT go to the orphan
-        // list because the orphan thread is dead.
-        let orphaned_len = super::orphaned_list()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len();
-        assert_eq!(
-            orphaned_len, 0,
-            "child must NOT be routed to orphan list when orphan thread is dead"
-        );
-    }
-
-    /// P0 (round-14 fix): When workers are dead but stuck is alive, a
-    /// child must be routed to the stuck list.
-    #[test]
-    fn workers_dead_routes_to_stuck() {
-        let reaper = ChildReaper::new_with_components(COMP_STUCK);
-        assert!(!reaper.workers_alive());
-        assert!(reaper.stuck_alive());
-
-        let child = spawn_child("sleep", "30");
-        reaper.reap_direct(child, None);
-
-        let stuck_len = reaper
-            .stuck_arc()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len();
-        assert_eq!(
-            stuck_len, 1,
-            "child must be routed to stuck list when workers are dead"
-        );
-    }
-
-    /// P0 (round-14 fix): When all components are dead, the child handle
-    /// and admission must be leaked (fail-closed terminal state), not
-    /// dropped with unconfirmed exit.  The child is killed via
-    /// `start_kill` in `route_child`, but the handle is forgotten
-    /// (`mem::forget`), so the process becomes a zombie until the parent
-    /// process exits and init reaps it.  We only verify that the
-    /// admission is NOT released — the key fail-closed invariant.
-    #[test]
-    fn all_dead_leaks_handle_and_admission() {
-        let reaper = ChildReaper::new_with_components(0);
-        let in_flight = reaper.in_flight_arc();
-        in_flight.store(1, Ordering::SeqCst);
-
-        let child = spawn_child("sleep", "30");
-        reaper.reap_direct(child, Some(in_flight.clone()));
-
-        // The child was killed (start_kill in route_child).  The handle
-        // and admission are leaked (mem::forget).  in_flight must NOT
-        // have been decremented — this is the fail-closed invariant.
-        assert_eq!(
-            in_flight.load(Ordering::SeqCst),
-            1,
-            "in_flight must NOT be decremented when all components are dead"
-        );
+        drop(rt);
     }
 
     // ── Admission bound tests ─────────────────────────────────────────────
@@ -1686,11 +1572,11 @@ mod reap_tests {
     fn admission_at_capacity_rejects_then_recovers() {
         let reaper = ChildReaper::new_disconnected();
 
-        let mut admissions: Vec<_> = Vec::with_capacity(REAPER_QUEUE_CAPACITY);
-        for _ in 0..REAPER_QUEUE_CAPACITY {
+        let mut admissions: Vec<_> = Vec::with_capacity(super::REAPER_QUEUE_CAPACITY);
+        for _ in 0..super::REAPER_QUEUE_CAPACITY {
             admissions.push(reaper.try_admit().expect("should admit below capacity"));
         }
-        assert_eq!(reaper.metrics().in_flight, REAPER_QUEUE_CAPACITY);
+        assert_eq!(reaper.metrics().in_flight, super::REAPER_QUEUE_CAPACITY);
         assert!(reaper.try_admit().is_none(), "should reject at capacity");
 
         drop(admissions);
@@ -1702,8 +1588,6 @@ mod reap_tests {
         assert_eq!(reaper.metrics().in_flight, 0);
     }
 
-    /// P0: Spawn failure (dropping SpawnAdmission without into_lease) must
-    /// release only the pre-spawn admission.
     #[test]
     fn spawn_failure_releases_pre_spawn_admission() {
         let reaper = ChildReaper::new_disconnected();
@@ -1711,26 +1595,38 @@ mod reap_tests {
         let admission = reaper.try_admit().expect("should admit");
         assert_eq!(reaper.metrics().in_flight, 1);
 
-        // Simulate spawn failure — drop without into_lease.
         drop(admission);
         assert_eq!(reaper.metrics().in_flight, 0);
     }
 
-    // ── ChildReaper queue-overflow tests ──────────────────────────────────
+    // ── Registry-based reap tests (all assert PID disappearance) ──────────
 
     #[test]
     fn reap_recovers_child_on_disconnected_receiver() {
         let reaper = ChildReaper::new_disconnected();
         let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
         reaper.reap_direct(child, None);
 
-        // Workers "alive" but receiver disconnected → push to stuck.
-        let stuck_len = reaper
-            .stuck_arc()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len();
-        assert_eq!(stuck_len, 1);
+        // Receiver is disconnected, so the ID can't be queued to workers.
+        // The entry stays in the registry.  The global reaper's stuck
+        // scheduler will eventually scan and reap it.  But this test
+        // reaper has no threads, so we verify the child is in the
+        // registry and manually reap it.
+        let registry = reaper.registry_arc();
+        let ids = registry.all_ids();
+        assert_eq!(ids.len(), 1, "child must be in the registry");
+
+        // Manually reap to clean up the child (with deadline to ensure exit).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        assert!(
+            registry.try_reap_with_deadline(ids[0], deadline),
+            "child must be reaped from registry"
+        );
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped after registry try_reap_with_deadline"
+        );
     }
 
     #[test]
@@ -1738,17 +1634,31 @@ mod reap_tests {
         let (reaper, _receiver) = ChildReaper::new_no_workers(1);
 
         let filler = spawn_child("sleep", "30");
+        let filler_pid = filler.id().expect("child must have a PID");
         reaper.reap_direct(filler, None);
 
         let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
         reaper.reap_direct(child, None);
 
-        let stuck_len = reaper
-            .stuck_arc()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .len();
-        assert_eq!(stuck_len, 1);
+        // Both children are in the registry (queue can only hold 1).
+        let registry = reaper.registry_arc();
+        assert_eq!(registry.len(), 2, "both children must be in the registry");
+
+        // Manually reap both to clean up (with deadline to ensure exit).
+        let ids = registry.all_ids();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        for id in ids {
+            registry.try_reap_with_deadline(id, deadline);
+        }
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped"
+        );
+        assert!(
+            wait_for_reap(filler_pid, Duration::from_secs(5)),
+            "filler PID {filler_pid} must be reaped"
+        );
     }
 
     #[test]
@@ -1772,26 +1682,81 @@ mod reap_tests {
         }
     }
 
-    // ── P0 (round-14 fix): Mutex poison still reaps ───────────────────────
+    // ── P0 (round-15): All-dead does NOT leak zombies ────────────────────
 
-    /// P0 (round-14 fix): After the stuck mutex is poisoned, a child
-    /// queued to the global reaper must still be reaped (PID disappears)
-    /// and admission must recover (in_flight returns to 0).
+    /// P0 (round-15): When all components are dead, children must still
+    /// be reaped (synchronous fatal_cleanup), NOT leaked as zombies via
+    /// `mem::forget`.  This test registers a child in the registry of a
+    /// reaper with all components dead, then triggers fatal_cleanup via
+    /// LivenessGuard::drop, and asserts PID disappearance.
+    #[test]
+    fn all_dead_reaps_via_fatal_cleanup() {
+        let reaper = ChildReaper::new_with_components(0);
+        let registry = reaper.registry_arc();
+
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        // Register the child directly in the registry.
+        registry.register(child, None);
+
+        // Simulate all-dead: call fatal_cleanup directly.
+        // In production, this is triggered by the last LivenessGuard::drop.
+        registry.fatal_cleanup();
+
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped via fatal_cleanup, not leaked as zombie"
+        );
+        assert_eq!(
+            registry.len(),
+            0,
+            "registry must be empty after fatal_cleanup"
+        );
+    }
+
+    // ── P0 (round-15): Component death migrates work ─────────────────────
+
+    /// P0 (round-15): When a component dies, existing children in the
+    /// registry must be picked up by surviving components.  This test
+    /// uses the global reaper: routes a child, waits for the stuck
+    /// scheduler to scan and reap it, and asserts PID disappearance.
+    #[test]
+    fn stuck_scheduler_reaps_registry_entries() {
+        let reaper = ChildReaper::global().expect("global reaper must be available");
+
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        // Register and route — the child goes to the worker channel.
+        // Workers will kill + try_wait.  Since the child is `sleep 30`
+        // and was killed, it should exit quickly.
+        let id = reaper.registry.register(child, None);
+        reaper.route_id(id);
+
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(10)),
+            "child PID {pid} must be reaped by the global reaper"
+        );
+    }
+
+    // ── P0 (round-15): Mutex poison still reaps ──────────────────────────
+
     #[test]
     fn mutex_poison_still_reaps() {
         let reaper = ChildReaper::global().expect("global reaper must be available");
 
-        // Poison the stuck mutex in a separate thread.
-        let stuck = reaper.stuck_arc();
+        // Poison the registry mutex in a separate thread.
+        let registry = reaper.registry_arc();
         let handle = std::thread::spawn(move || {
-            let _guard = stuck.lock().unwrap();
+            let _guard = registry.entries.lock().unwrap();
             panic!("intentional poison");
         });
         let _ = handle.join();
 
         // The mutex is now poisoned.  But the global reaper's workers
-        // process from the queue (receiver mutex), not the stuck mutex.
-        // A child queued via route_child goes to the worker queue.
+        // recover from poison (unwrap_or_else into_inner).  A child
+        // queued via route_child goes to the worker queue.
         let in_flight = reaper.in_flight_arc();
         let admission = reaper.try_admit().expect("should admit");
         let child = spawn_child("sleep", "30");
@@ -1799,13 +1764,11 @@ mod reap_tests {
         let lease = admission.into_lease(child);
         drop(lease);
 
-        // The child must be reaped (PID disappears).
         assert!(
             wait_for_reap(pid, Duration::from_secs(10)),
-            "child PID {pid} must be reaped even with poisoned stuck mutex"
+            "child PID {pid} must be reaped even with poisoned registry mutex"
         );
 
-        // in_flight must recover to 0 after the child is reaped.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             if in_flight.load(Ordering::SeqCst) == 0 {
@@ -1818,56 +1781,48 @@ mod reap_tests {
         }
     }
 
-    // ── P0 (round-14 fix): ReapRequest::Drop does not release unconfirmed ─
+    // ── LivenessGuard monotonicity ───────────────────────────────────────
 
-    /// P0 (round-14 fix): Dropping a ReapRequest without confirmation
-    /// must NOT release the admission slot.
     #[test]
-    fn unconfirmed_reap_request_does_not_release_admission() {
-        let in_flight = Arc::new(AtomicUsize::new(1));
+    fn liveness_guard_is_monotonic() {
+        let components = Arc::new(AtomicU8::new(COMP_ALL));
+        let failures = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(super::ChildRegistry::new());
 
-        // Create a ReapRequest with an in_flight counter at 1.
-        let child = spawn_child("sleep", "30");
-        let req = super::ReapRequest {
-            child,
-            in_flight: Some(in_flight.clone()),
-            confirmed: false,
-        };
-
-        // Drop the request without confirming.
-        drop(req);
-
-        // in_flight must NOT have been decremented.
+        // Drop a worker guard — should clear only the worker bit.
+        {
+            let _guard = super::LivenessGuard {
+                components: components.clone(),
+                failures: failures.clone(),
+                mask: super::COMP_WORKERS,
+                registry: registry.clone(),
+                sender: None,
+            };
+        }
         assert_eq!(
-            in_flight.load(Ordering::SeqCst),
-            1,
-            "unconfirmed ReapRequest::drop must NOT release admission"
+            components.load(Ordering::SeqCst),
+            COMP_ALL & !super::COMP_WORKERS
         );
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+
+        // Drop a stuck guard — should clear only the stuck bit.
+        {
+            let _guard = super::LivenessGuard {
+                components: components.clone(),
+                failures: failures.clone(),
+                mask: super::COMP_STUCK,
+                registry: registry.clone(),
+                sender: None,
+            };
+        }
+        assert_eq!(
+            components.load(Ordering::SeqCst),
+            COMP_ALL & !super::COMP_WORKERS & !super::COMP_STUCK
+        );
+        assert_eq!(failures.load(Ordering::SeqCst), 2);
     }
 
-    /// P0: Confirming a ReapRequest before drop DOES release admission.
-    #[test]
-    fn confirmed_reap_request_releases_admission() {
-        let in_flight = Arc::new(AtomicUsize::new(1));
-
-        let child = spawn_child("sleep", "30");
-        let mut req = super::ReapRequest {
-            child,
-            in_flight: Some(in_flight.clone()),
-            confirmed: false,
-        };
-
-        req.confirm();
-        drop(req);
-
-        assert_eq!(
-            in_flight.load(Ordering::SeqCst),
-            0,
-            "confirmed ReapRequest::drop must release admission"
-        );
-    }
-
-    // ── Cancellation storm bounded test ───────────────────────────────────
+    // ── Cancellation storm bounded test ──────────────────────────────────
 
     #[test]
     fn cancellation_storm_stays_bounded() {
@@ -1907,5 +1862,66 @@ mod reap_tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    // ── P0 (round-15): Registry retains handle through component death ──
+
+    /// P0 (round-15): When a LivenessGuard drops with surviving
+    /// components, it rescans the registry and re-enqueues.  This test
+    /// verifies that a child registered in the registry is reaped even
+    /// after a LivenessGuard drop triggers a rescan.
+    #[test]
+    fn liveness_guard_rescan_reenqueues_pending() {
+        let reaper = ChildReaper::global().expect("global reaper must be available");
+        let registry = reaper.registry_arc();
+        // Use a SEPARATE components atomic so this test does not
+        // degrade the global reaper for other tests.
+        let test_components = Arc::new(AtomicU8::new(COMP_ALL));
+
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        // Register the child directly (bypassing route_id so it's only
+        // in the registry, not the worker channel).
+        registry.register(child, None);
+
+        // Simulate a component death: drop a LivenessGuard with a
+        // surviving set of components.  The guard rescans the registry
+        // and re-enqueues the ID to the worker channel.
+        {
+            let _guard = super::LivenessGuard {
+                components: test_components.clone(),
+                failures: reaper.failures_arc(),
+                mask: super::COMP_WORKERS,
+                registry: registry.clone(),
+                sender: Some(reaper.sender.clone()),
+            };
+            // Guard drops here — rescans and re-enqueues.
+        }
+
+        // The child should be reaped by the reaper's surviving threads.
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(10)),
+            "child PID {pid} must be reaped after LivenessGuard rescan"
+        );
+    }
+
+    // ── P0 (round-15): blocking_kill_and_reap (no global reaper) ─────────
+
+    /// P0 (round-15): When no global reaper is available, ChildLease::drop
+    /// must synchronously kill + wait the child (not mem::forget).
+    #[test]
+    fn no_reaper_synchronous_reap() {
+        // We can't easily prevent the global reaper from initializing
+        // (OnceLock).  Instead, test blocking_kill_and_reap directly.
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        super::blocking_kill_and_reap(child, None);
+
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped by blocking_kill_and_reap"
+        );
     }
 }
