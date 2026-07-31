@@ -1,6 +1,6 @@
 # Issue #97 Round-20 Progress
 
-Updated: 2026-08-01 01:18 +08:00
+Updated: 2026-08-01 01:20 +08:00
 Task: Repair the Round-19 production-gate defects without redesigning the child-reaper architecture.
 
 ## Plan
@@ -14,7 +14,7 @@ Task: Repair the Round-19 production-gate defects without redesigning the child-
   epoch, panic-count, and recovery-owner assertions.
 - [x] Add deterministic RAII active-thread verification for emergency-spawn
   rollback.
-- [~] Run the Windows acceptance baseline, repeat the Linux-qualified subset in
+- [x] Run the Windows acceptance baseline, repeat the Linux-qualified subset in
   WSL, update the Round-19 status claim and #97 comment, then commit and push.
 
 ## Constraints
@@ -61,3 +61,6 @@ Task: Repair the Round-19 production-gate defects without redesigning the child-
   `child_lease_confirmed`; deriving only `Clone` for `SpawnAdmission` failed at
   `spawn_admission_clone`. Both temporary mutations were restored before final
   validation.
+- 2026-08-01 01:20 +08:00 - Committed and pushed the validated implementation
+  to `main` as `0822af1`. #97, #98, and #99 remain open, and no multi-agent
+  dependency revision was changed.
