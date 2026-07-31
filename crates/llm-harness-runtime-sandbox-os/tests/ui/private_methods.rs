@@ -14,3 +14,5 @@ fn _forge_child_mut(lease: &mut ChildLease) {
 fn _forge_new(child: tokio::process::Child) {
     let _ = ChildLease::new(child);
 }
+
+fn main() {}

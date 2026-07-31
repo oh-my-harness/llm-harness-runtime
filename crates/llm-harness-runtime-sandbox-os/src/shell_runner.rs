@@ -266,6 +266,26 @@ fn decrement_in_flight(in_flight: &std::sync::Arc<std::sync::atomic::AtomicUsize
     });
 }
 
+/// Result of a single reap attempt on a registered child.
+///
+/// Replaces the old `bool` return: `true` used to cover both "this call
+/// confirmed exit" and "already removed by another thread", causing
+/// `completed` to be incremented multiple times for the same child.
+/// Only [`ReapResult::ConfirmedNow`] authorizes incrementing `completed`.
+#[derive(Debug)]
+enum ReapResult {
+    /// This call confirmed the child exited and removed the registry
+    /// entry.  Only this variant increments `completed`.
+    ConfirmedNow,
+    /// The entry was already removed by another thread.  Do NOT
+    /// increment `completed`.
+    AlreadyAbsent,
+    /// Child is still running.  Entry retained in registry.
+    Pending,
+    /// Unknown wait error.  Entry retained in registry.
+    Unknown,
+}
+
 // ── Component liveness bitmask ───────────────────────────────────────────
 
 /// Bit set in the `components` atomic when the worker pool is alive.
@@ -288,6 +308,14 @@ type ChildId = u64;
 /// [`ChildLease`].
 pub struct SpawnAdmission {
     in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// Bound to the reaper that issued this admission.  Carried into
+    /// the [`ChildLease`] so that `ChildLease::drop` can check whether
+    /// the issuing reaper's components are still alive before registering
+    /// a child to its registry.  If all components have died (and
+    /// `fatal_cleanup` has already run), the lease must NOT register to
+    /// the dead registry — it reaps synchronously via
+    /// [`blocking_kill_and_reap`] instead.
+    components: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
 }
 
 impl SpawnAdmission {
@@ -301,9 +329,11 @@ impl SpawnAdmission {
     /// `AlreadyReaped`).
     pub fn into_lease(mut self, child: tokio::process::Child) -> ChildLease {
         let in_flight = self.in_flight.take();
+        let components = self.components.take();
         ChildLease {
             child: Some(child),
             in_flight,
+            components,
             confirmed: false,
         }
     }
@@ -333,6 +363,9 @@ impl Drop for SpawnAdmission {
 pub struct ChildLease {
     child: Option<tokio::process::Child>,
     in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// Components liveness from the issuing reaper.  `None` for test-only
+    /// leases created via [`ChildLease::new`].
+    components: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
     confirmed: bool,
 }
 
@@ -344,6 +377,23 @@ impl ChildLease {
         Self {
             child: Some(child),
             in_flight: None,
+            components: None,
+            confirmed: false,
+        }
+    }
+
+    /// Create a lease with a components liveness reference (tests only).
+    /// Used to test late-registration behaviour when the issuing reaper's
+    /// components are all dead.
+    #[cfg(test)]
+    fn new_with_components(
+        child: tokio::process::Child,
+        components: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    ) -> Self {
+        Self {
+            child: Some(child),
+            in_flight: None,
+            components: Some(components),
             confirmed: false,
         }
     }
@@ -395,18 +445,43 @@ impl Drop for ChildLease {
         if self.confirmed {
             return;
         }
-        // Child exit NOT confirmed.  Register the child in the
-        // authoritative registry — the registry holds the sole handle
-        // until try_wait confirms terminal state.  No queue or vector
-        // ever owns the last handle.
+        // Child exit NOT confirmed.  We must not drop the handle without
+        // ensuring reap.  Two paths:
+        //
+        // 1. If the issuing reaper still has alive components, register
+        //    the child in the authoritative registry.  The registry holds
+        //    the sole handle until try_wait confirms terminal state.
+        //
+        // 2. If the issuing reaper's components are all dead (or there is
+        //    no reaper at all), the registry is dead — `fatal_cleanup`
+        //    has already run or will never run.  Registering to a dead
+        //    registry would strand the child forever.  Instead, reap
+        //    synchronously via `blocking_kill_and_reap`.
         if let Some(child) = self.child.take() {
             let in_flight = self.in_flight.take();
-            if let Some(reaper) = ChildReaper::global() {
+
+            // Check liveness: prefer the bound components reference
+            // (from the issuing reaper).  Fall back to checking the
+            // global reaper for test-only leases without components.
+            let bound_alive = match &self.components {
+                Some(c) => {
+                    use std::sync::atomic::Ordering;
+                    c.load(Ordering::SeqCst) != 0
+                }
+                None => true, // Test-only — check global reaper below.
+            };
+
+            let reaper = ChildReaper::global();
+            let can_register =
+                bound_alive && reaper.map(|r| r.any_components_alive()).unwrap_or(false);
+
+            if can_register {
+                // Safe to unwrap: can_register implies reaper is Some.
+                let reaper = reaper.unwrap();
                 let id = reaper.registry.register(child, in_flight);
                 reaper.route_id(id);
             } else {
-                // No global reaper at all.  Synchronous blocking reap
-                // (fatal path) — kills and waits with a bounded timeout.
+                // Reaper dead or unavailable — reap synchronously.
                 blocking_kill_and_reap(child, in_flight);
             }
         }
@@ -479,9 +554,10 @@ impl ChildRegistry {
     /// Attempt a single `try_wait` on a registered child.  If the child
     /// has exited, removes the entry and releases admission.
     ///
-    /// Returns `true` if the child was confirmed exited (or already
-    /// removed by another thread).
-    fn try_reap_once(&self, id: ChildId) -> bool {
+    /// Returns [`ReapResult::ConfirmedNow`] only when this call removed
+    /// the entry.  [`ReapResult::AlreadyAbsent`] means another thread
+    /// already removed it — do NOT increment `completed`.
+    fn try_reap_once(&self, id: ChildId) -> ReapResult {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = entries.get_mut(&id) {
             match classify_wait(entry.child.try_wait()) {
@@ -490,12 +566,13 @@ impl ChildRegistry {
                     if let Some(in_flight) = &entry.in_flight {
                         decrement_in_flight(in_flight);
                     }
-                    true
+                    ReapResult::ConfirmedNow
                 }
-                _ => false,
+                WaitOutcome::Pending | WaitOutcome::Interrupted => ReapResult::Pending,
+                WaitOutcome::Unknown(_) => ReapResult::Unknown,
             }
         } else {
-            true // Already reaped by another thread.
+            ReapResult::AlreadyAbsent
         }
     }
 
@@ -503,16 +580,17 @@ impl ChildRegistry {
     /// registry only briefly for each `try_wait` call, so other workers
     /// and the stuck scheduler are not blocked.
     ///
-    /// Returns `true` if the child was confirmed exited (or already
-    /// removed by another thread).
-    fn try_reap_with_deadline(&self, id: ChildId, deadline: std::time::Instant) -> bool {
+    /// Returns [`ReapResult::ConfirmedNow`] only when this call removed
+    /// the entry.  [`ReapResult::AlreadyAbsent`] means another thread
+    /// already removed it.
+    fn try_reap_with_deadline(&self, id: ChildId, deadline: std::time::Instant) -> ReapResult {
         loop {
             let outcome = {
                 let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(entry) = entries.get_mut(&id) {
                     classify_wait(entry.child.try_wait())
                 } else {
-                    return true; // Already reaped.
+                    return ReapResult::AlreadyAbsent;
                 }
             };
             match outcome {
@@ -523,21 +601,21 @@ impl ChildRegistry {
                     {
                         decrement_in_flight(in_flight);
                     }
-                    return true;
+                    return ReapResult::ConfirmedNow;
                 }
                 WaitOutcome::Interrupted => {
                     if std::time::Instant::now() >= deadline {
-                        return false;
+                        return ReapResult::Pending;
                     }
                     std::thread::sleep(EINTR_BACKOFF);
                 }
                 WaitOutcome::Pending => {
                     if std::time::Instant::now() >= deadline {
-                        return false;
+                        return ReapResult::Pending;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                WaitOutcome::Unknown(_) => return false,
+                WaitOutcome::Unknown(_) => return ReapResult::Unknown,
             }
         }
     }
@@ -558,38 +636,61 @@ impl ChildRegistry {
     /// Synchronously kill + wait all remaining children.  Used when all
     /// reaper components are dead (fatal process-level transition).
     ///
-    /// This is a blocking operation with a per-child timeout.  After
-    /// cleanup, the registry is empty and all admission slots are
-    /// released.  This replaces the old `mem::forget` path — children
-    /// are never silently leaked as zombies.
-    fn fatal_cleanup(&self) {
+    /// **Process-level fatal policy**: only children confirmed exited
+    /// (`Exited`/`AlreadyReaped`) are removed from the registry and have
+    /// their admission released.  Children that could not be reaped
+    /// within `FATAL_REAP_TIMEOUT` or returned `Unknown` are **retained**
+    /// — their handles stay in the registry and their admission slots are
+    /// NOT released (fail-closed).  Since all reaper components are dead,
+    /// no surviving owner can reap them; the handles live until process
+    /// exit when the OS reaps remaining children.
+    ///
+    /// Returns the number of unreaped children retained in the registry.
+    fn fatal_cleanup(&self) -> usize {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = std::time::Instant::now() + FATAL_REAP_TIMEOUT;
-        for (_, entry) in entries.iter_mut() {
-            let _ = entry.child.start_kill();
-            loop {
-                match classify_wait(entry.child.try_wait()) {
-                    WaitOutcome::Exited | WaitOutcome::AlreadyReaped => break,
-                    WaitOutcome::Interrupted => {
-                        if std::time::Instant::now() >= deadline {
+        let ids: Vec<ChildId> = entries.keys().copied().collect();
+        let mut unreaped = 0;
+        for id in ids {
+            let reaped = if let Some(entry) = entries.get_mut(&id) {
+                let _ = entry.child.start_kill();
+                let mut child_reaped = false;
+                loop {
+                    match classify_wait(entry.child.try_wait()) {
+                        WaitOutcome::Exited | WaitOutcome::AlreadyReaped => {
+                            child_reaped = true;
                             break;
                         }
-                        continue;
-                    }
-                    WaitOutcome::Pending => {
-                        if std::time::Instant::now() >= deadline {
-                            break;
+                        WaitOutcome::Interrupted => {
+                            if std::time::Instant::now() >= deadline {
+                                break;
+                            }
+                            continue;
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        WaitOutcome::Pending => {
+                            if std::time::Instant::now() >= deadline {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        WaitOutcome::Unknown(_) => break,
                     }
-                    WaitOutcome::Unknown(_) => break,
                 }
-            }
-            if let Some(in_flight) = &entry.in_flight {
-                decrement_in_flight(in_flight);
+                child_reaped
+            } else {
+                true // Already removed.
+            };
+            if reaped {
+                if let Some(entry) = entries.remove(&id)
+                    && let Some(in_flight) = &entry.in_flight
+                {
+                    decrement_in_flight(in_flight);
+                }
+            } else {
+                unreaped += 1;
             }
         }
-        entries.clear();
+        unreaped
     }
 }
 
@@ -644,8 +745,17 @@ impl Drop for LivenessGuard {
         let alive = self.components.load(Ordering::SeqCst);
         if alive == 0 {
             // All components dead — fatal process-level transition.
-            // Synchronously kill + wait all remaining children.
-            self.registry.fatal_cleanup();
+            // Synchronously kill + wait all remaining children.  Only
+            // confirmed-exited children are removed; unreaped handles
+            // are retained in the registry (fail-closed).
+            let unreaped = self.registry.fatal_cleanup();
+            if unreaped > 0 {
+                // Record the failure — unreaped children remain in the
+                // registry with their handles and admission slots
+                // retained.  The process-level fatal policy is:
+                // handles live until process exit (OS cleanup).
+                self.failures.fetch_add(unreaped, Ordering::SeqCst);
+            }
         } else if let Some(sender) = self.sender.as_ref() {
             // Rescan registry and re-enqueue to surviving workers.
             let ids = self.registry.all_ids();
@@ -837,6 +947,14 @@ impl ChildReaper {
         self.components.load(Ordering::SeqCst) == COMP_ALL
     }
 
+    /// Whether any reaper component (worker, stuck, or orphan) is alive.
+    /// When false, the registry is dead and new children must not be
+    /// registered to it.
+    fn any_components_alive(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.components.load(Ordering::SeqCst) != 0
+    }
+
     /// Whether the worker pool is alive.
     fn workers_alive(&self) -> bool {
         use std::sync::atomic::Ordering;
@@ -876,6 +994,7 @@ impl ChildReaper {
                 self.admitted.fetch_add(1, Ordering::SeqCst);
                 SpawnAdmission {
                     in_flight: Some(self.in_flight.clone()),
+                    components: Some(self.components.clone()),
                 }
             })
     }
@@ -933,7 +1052,8 @@ impl ChildReaper {
             match id {
                 Ok(id) => {
                     let deadline = std::time::Instant::now() + REAP_WORKER_TIMEOUT;
-                    if registry.try_reap_with_deadline(id, deadline) {
+                    if let ReapResult::ConfirmedNow = registry.try_reap_with_deadline(id, deadline)
+                    {
                         completed.fetch_add(1, Ordering::SeqCst);
                     }
                     // If not reaped, the entry stays in the registry.
@@ -967,10 +1087,14 @@ impl ChildReaper {
 
             let ids = registry.all_ids();
             for id in ids {
-                if registry.try_reap_once(id) {
-                    completed.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    let _ = sender.try_send(id);
+                match registry.try_reap_once(id) {
+                    ReapResult::ConfirmedNow => {
+                        completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ReapResult::Pending | ReapResult::Unknown => {
+                        let _ = sender.try_send(id);
+                    }
+                    ReapResult::AlreadyAbsent => {}
                 }
             }
         }
@@ -996,7 +1120,7 @@ impl ChildReaper {
 
             let ids = registry.all_ids();
             for id in ids {
-                if registry.try_reap_once(id) {
+                if let ReapResult::ConfirmedNow = registry.try_reap_once(id) {
                     completed.fetch_add(1, Ordering::SeqCst);
                 }
             }
@@ -1008,33 +1132,55 @@ impl ChildReaper {
 const STOP_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Synchronously kill + wait a child with a bounded timeout.  Used in
-/// the fatal path (no global reaper available) — never leaks a zombie.
+/// the fatal path (no global reaper available, or all components dead).
+///
+/// Returns `true` if the child was confirmed exited (`Exited`/
+/// `AlreadyReaped`) and admission was released.  Returns `false` if the
+/// child could not be reaped within `FATAL_REAP_TIMEOUT` or returned an
+/// unknown error — in this case the handle is **retained** in a static
+/// container (not dropped) and admission is **NOT released** (fail-closed).
+/// The handle lives until process exit when the OS reaps remaining children.
 fn blocking_kill_and_reap(
     mut child: tokio::process::Child,
     in_flight: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-) {
+) -> bool {
     let _ = child.start_kill();
     let deadline = std::time::Instant::now() + FATAL_REAP_TIMEOUT;
-    loop {
+    let reaped = loop {
         match classify_wait(child.try_wait()) {
-            WaitOutcome::Exited | WaitOutcome::AlreadyReaped => break,
+            WaitOutcome::Exited | WaitOutcome::AlreadyReaped => break true,
             WaitOutcome::Interrupted => {
                 if std::time::Instant::now() >= deadline {
-                    break;
+                    break false;
                 }
                 continue;
             }
             WaitOutcome::Pending => {
                 if std::time::Instant::now() >= deadline {
-                    break;
+                    break false;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            WaitOutcome::Unknown(_) => break,
+            WaitOutcome::Unknown(_) => break false,
         }
-    }
-    if let Some(in_flight) = &in_flight {
-        decrement_in_flight(in_flight);
+    };
+    if reaped {
+        if let Some(in_flight) = &in_flight {
+            decrement_in_flight(in_flight);
+        }
+        true
+    } else {
+        // Failed to reap.  Retain the handle so it is NOT dropped
+        // (dropping would lose wait ability and potentially leak a
+        // zombie).  Admission is NOT released (fail-closed).  The
+        // handle lives in this static container until process exit.
+        static UNREAPED: std::sync::OnceLock<std::sync::Mutex<Vec<tokio::process::Child>>> =
+            std::sync::OnceLock::new();
+        let store = UNREAPED.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+        if let Ok(mut guard) = store.lock() {
+            guard.push(child);
+        }
+        false
     }
 }
 
@@ -1620,7 +1766,10 @@ mod reap_tests {
         // Manually reap to clean up the child (with deadline to ensure exit).
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         assert!(
-            registry.try_reap_with_deadline(ids[0], deadline),
+            matches!(
+                registry.try_reap_with_deadline(ids[0], deadline),
+                super::ReapResult::ConfirmedNow
+            ),
             "child must be reaped from registry"
         );
         assert!(
@@ -1649,7 +1798,7 @@ mod reap_tests {
         let ids = registry.all_ids();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         for id in ids {
-            registry.try_reap_with_deadline(id, deadline);
+            let _ = registry.try_reap_with_deadline(id, deadline);
         }
         assert!(
             wait_for_reap(pid, Duration::from_secs(5)),
@@ -1702,7 +1851,8 @@ mod reap_tests {
 
         // Simulate all-dead: call fatal_cleanup directly.
         // In production, this is triggered by the last LivenessGuard::drop.
-        registry.fatal_cleanup();
+        let unreaped = registry.fatal_cleanup();
+        assert_eq!(unreaped, 0, "child should be reaped within timeout");
 
         assert!(
             wait_for_reap(pid, Duration::from_secs(5)),
@@ -1917,11 +2067,239 @@ mod reap_tests {
         let child = spawn_child("sleep", "30");
         let pid = child.id().expect("child must have a PID");
 
-        super::blocking_kill_and_reap(child, None);
+        let reaped = super::blocking_kill_and_reap(child, None);
+        assert!(reaped, "child should be reaped within timeout");
 
         assert!(
             wait_for_reap(pid, Duration::from_secs(5)),
             "child PID {pid} must be reaped by blocking_kill_and_reap"
         );
+    }
+
+    // ── P0 (round-16): fatal_cleanup does not release on timeout/Unknown ──
+
+    /// P0 (round-16): fatal_cleanup must only release admission and remove
+    /// entries for children confirmed exited.  This test verifies the
+    /// success path: a killed child exits within the deadline, so
+    /// admission is released and the registry is empty.
+    #[test]
+    fn fatal_cleanup_releases_admission_on_success() {
+        let registry = Arc::new(super::ChildRegistry::new());
+        let in_flight = Arc::new(AtomicUsize::new(1));
+
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        registry.register(child, Some(in_flight.clone()));
+        assert_eq!(in_flight.load(Ordering::SeqCst), 1);
+
+        let unreaped = registry.fatal_cleanup();
+        assert_eq!(unreaped, 0, "child should be reaped within timeout");
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "admission must be released after successful reap"
+        );
+        assert_eq!(registry.len(), 0, "registry must be empty");
+
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be gone"
+        );
+    }
+
+    /// P0 (round-16): fatal_cleanup retains entries for unreaped children.
+    /// We can't easily create a child that survives SIGKILL for 5 seconds
+    /// (D-state), but we can verify the return value and registry state
+    /// on the success path.  The key invariant is: if fatal_cleanup
+    /// returns 0, all entries were removed and admissions released.
+    #[test]
+    fn fatal_cleanup_returns_zero_when_all_reaped() {
+        let registry = Arc::new(super::ChildRegistry::new());
+
+        let child1 = spawn_child("sleep", "30");
+        let child2 = spawn_child("sleep", "30");
+        let pid1 = child1.id().expect("child must have a PID");
+        let pid2 = child2.id().expect("child must have a PID");
+
+        registry.register(child1, None);
+        registry.register(child2, None);
+        assert_eq!(registry.len(), 2);
+
+        let unreaped = registry.fatal_cleanup();
+        assert_eq!(unreaped, 0);
+        assert_eq!(registry.len(), 0);
+
+        assert!(wait_for_reap(pid1, Duration::from_secs(5)));
+        assert!(wait_for_reap(pid2, Duration::from_secs(5)));
+    }
+
+    // ── P0 (round-16): blocking_kill_and_reap releases only on success ──
+
+    /// P0 (round-16): blocking_kill_and_reap must release admission only
+    /// when the child is confirmed exited.  On the success path, the
+    /// in_flight counter returns to 0.
+    #[test]
+    fn blocking_kill_and_reap_releases_admission_on_success() {
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+        let in_flight = Arc::new(AtomicUsize::new(1));
+
+        let reaped = super::blocking_kill_and_reap(child, Some(in_flight.clone()));
+        assert!(reaped, "child should be reaped");
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "admission must be released after successful reap"
+        );
+
+        assert!(wait_for_reap(pid, Duration::from_secs(5)));
+    }
+
+    // ── P0 (round-16): Late registration with dead reaper ────────────────
+
+    /// P0 (round-16): When the issuing reaper's components are all dead,
+    /// ChildLease::drop must NOT register to the dead registry.  Instead,
+    /// it must reap synchronously via blocking_kill_and_reap.  This test
+    /// creates a lease with components=0 (all dead) and verifies the
+    /// child is reaped (PID disappears).
+    #[test]
+    fn late_registration_dead_reaper_uses_blocking_reap() {
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        // Simulate a dead reaper: components = 0 (all dead).
+        let dead_components = Arc::new(AtomicU8::new(0));
+        let lease = ChildLease::new_with_components(child, dead_components);
+        drop(lease);
+
+        // The child must be reaped via blocking_kill_and_reap, not
+        // stranded in a dead registry.
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(10)),
+            "child PID {pid} must be reaped via blocking_kill_and_reap when reaper is dead"
+        );
+    }
+
+    /// P0 (round-16): When the issuing reaper's components are alive,
+    /// ChildLease::drop registers to the registry and the global reaper
+    /// reaps the child.  This test creates a lease with components=COMP_ALL
+    /// and verifies the child is reaped.
+    #[test]
+    fn late_registration_alive_reaper_registers_to_registry() {
+        let _reaper = ChildReaper::global().expect("global reaper must be available");
+
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        let alive_components = Arc::new(AtomicU8::new(COMP_ALL));
+        let lease = ChildLease::new_with_components(child, alive_components);
+        drop(lease);
+
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(10)),
+            "child PID {pid} must be reaped via registry when reaper is alive"
+        );
+    }
+
+    // ── P1 (round-16): exactly-once completed metric ─────────────────────
+
+    /// P1 (round-16): try_reap_once must return ConfirmedNow only once
+    /// for a given ChildId.  Subsequent calls return AlreadyAbsent.
+    /// This prevents multiple scanners from incrementing `completed`
+    /// for the same child.
+    #[test]
+    fn exactly_once_completed_metric() {
+        let registry = Arc::new(super::ChildRegistry::new());
+
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        let id = registry.register(child, None);
+
+        // register() sent SIGKILL.  Poll try_reap_once until the child
+        // is confirmed exited (it becomes a zombie until try_wait
+        // reaps it).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let result = loop {
+            match registry.try_reap_once(id) {
+                r @ (super::ReapResult::ConfirmedNow | super::ReapResult::AlreadyAbsent) => {
+                    break r;
+                }
+                _ => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("child was not reaped within timeout");
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        assert!(
+            matches!(result, super::ReapResult::ConfirmedNow),
+            "first successful reap should be ConfirmedNow, not AlreadyAbsent"
+        );
+
+        // Subsequent calls should return AlreadyAbsent — NOT ConfirmedNow.
+        for i in 0..8 {
+            let result = registry.try_reap_once(id);
+            assert!(
+                matches!(result, super::ReapResult::AlreadyAbsent),
+                "call {} should be AlreadyAbsent, not ConfirmedNow",
+                i + 2
+            );
+        }
+
+        assert_eq!(registry.len(), 0, "entry must be removed after first reap");
+        assert!(wait_for_reap(pid, Duration::from_secs(5)));
+    }
+
+    /// P1 (round-16): try_reap_with_deadline also returns ConfirmedNow
+    /// only once.  Multiple deadline-based calls on the same ID must not
+    /// all report success.
+    #[test]
+    fn try_reap_with_deadline_exactly_once() {
+        let registry = Arc::new(super::ChildRegistry::new());
+
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        let id = registry.register(child, None);
+
+        // try_reap_with_deadline polls until the child exits or the
+        // deadline is reached.  register() sent SIGKILL, so the child
+        // should exit within the deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let result1 = registry.try_reap_with_deadline(id, deadline);
+        assert!(
+            matches!(result1, super::ReapResult::ConfirmedNow),
+            "first call should be ConfirmedNow, got {:?}",
+            result1
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let result2 = registry.try_reap_with_deadline(id, deadline);
+        assert!(
+            matches!(result2, super::ReapResult::AlreadyAbsent),
+            "second call should be AlreadyAbsent, got {:?}",
+            result2
+        );
+
+        assert!(wait_for_reap(pid, Duration::from_secs(5)));
+    }
+
+    // ── P1 (round-16): any_components_alive ──────────────────────────────
+
+    /// P1 (round-16): any_components_alive returns false when all
+    /// components are dead, true otherwise.
+    #[test]
+    fn any_components_alive_check() {
+        let reaper_alive = ChildReaper::new_with_components(COMP_ALL);
+        assert!(reaper_alive.any_components_alive());
+
+        let reaper_dead = ChildReaper::new_with_components(0);
+        assert!(!reaper_dead.any_components_alive());
+
+        let reaper_partial = ChildReaper::new_with_components(super::COMP_WORKERS);
+        assert!(reaper_partial.any_components_alive());
     }
 }
