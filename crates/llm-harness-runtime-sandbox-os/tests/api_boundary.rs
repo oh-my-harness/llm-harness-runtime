@@ -1,48 +1,109 @@
 //! API boundary verification for `ChildLease` opacity.
 //!
-//! The compile-fail gate is Rust's visibility system itself: `ChildLease`'s
-//! internal methods (`confirm_exit`, `wait`, `kill_and_wait`, `take_stdout`,
-//! `take_stderr`) are private.  External code cannot call them — the compiler
-//! rejects any such attempt at compile time.  No diagnostic-text snapshot is
-//! needed.
+//! Uses a **real compile-fail gate**: the test writes a small Rust program
+//! that attempts to call `ChildLease`'s private methods, then invokes
+//! `cargo build` on it.  If any method is public, the build succeeds and
+//! the test fails.  If all methods are private (correct), the build fails
+//! (E0624) and the test passes.
 //!
-//! This test verifies the *positive* public API surface: the types and
-//! functions that external code IS allowed to use.  If someone removes a
-//! public item, this test fails.  If someone makes a private method public,
-//! code review and the type system catch it — the method signature would
-//! change from `fn` to `pub fn`, which is a visible diff.
+//! This does NOT depend on compiler diagnostic text — only on the exit
+//! code of `cargo build`.  It works on every Rust version and platform.
 
-use llm_harness_runtime_sandbox_os::{
-    ChildLease, ChildReaper, SpawnAdmission, drain_child_output_guarded,
-};
+use std::process::Command;
 
-/// Verify that the public API surface compiles and the expected types exist.
+/// Rust source that attempts to call private methods on `ChildLease`.
+/// This code MUST fail to compile if the methods are private.
+const ATTEMPT_FORGE: &str = r#"
+use llm_harness_runtime_sandbox_os::ChildLease;
+
+fn _forge_confirm(lease: &mut ChildLease) {
+    lease.confirm_exit();
+}
+
+fn _forge_wait(lease: &mut ChildLease) {
+    let _ = lease.wait();
+}
+
+fn _forge_kill_and_wait(lease: &mut ChildLease) {
+    lease.kill_and_wait();
+}
+
+fn _forge_take_stdout(lease: &mut ChildLease) {
+    lease.take_stdout();
+}
+
+fn main() {}
+"#;
+
+/// Verify that the private methods on `ChildLease` cannot be called
+/// from external code.  This is a real compile-fail gate: we attempt
+/// to compile code that calls them, and expect compilation to fail.
+#[test]
+fn child_lease_private_methods_compile_fail() {
+    // Write the attempt to a temp crate and try to build it.
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let src_dir = temp_dir.path().join("forge_test");
+    std::fs::create_dir_all(&src_dir).expect("create src dir");
+
+    // Cargo.toml — depend on the sandbox-os crate via path.
+    let cargo_toml = format!(
+        r#"[package]
+name = "forge_test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+llm_harness_runtime_sandbox_os = {{ path = "{}" }}
+"#,
+        std::fs::canonicalize(".")
+            .or_else(|_| std::fs::canonicalize(
+                std::env::current_dir()
+                    .unwrap()
+                    .join("crates/llm-harness-runtime-sandbox-os")
+            ))
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    std::fs::write(src_dir.join("Cargo.toml"), cargo_toml).expect("write Cargo.toml");
+    std::fs::create_dir_all(src_dir.join("src")).expect("create src");
+    std::fs::write(src_dir.join("src/main.rs"), ATTEMPT_FORGE).expect("write main.rs");
+
+    // Attempt to build.  We expect failure (exit code != 0).
+    let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .arg("build")
+        .current_dir(&src_dir)
+        .env(
+            "PYO3_PYTHON",
+            std::env::var("PYO3_PYTHON").unwrap_or_default(),
+        )
+        .output()
+        .expect("cargo build");
+
+    if output.status.success() {
+        panic!(
+            "ChildLease private methods are accessible from external code! \
+             The build succeeded, meaning confirm_exit/wait/kill_and_wait/\
+             take_stdout are public.  They must be private.\n\
+             stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    // Build failed — methods are private (correct).
+}
+
+/// Verify the positive public API surface exists.
 #[test]
 fn public_api_surface() {
-    // ChildLease is a public type (opaque — no public methods).
+    use llm_harness_runtime_sandbox_os::{
+        ChildLease, ChildReaper, SpawnAdmission, drain_child_output_guarded,
+    };
     let _ = std::marker::PhantomData::<ChildLease>;
-
-    // SpawnAdmission has `into_lease` as its only public method.
     let _ = SpawnAdmission::into_lease;
-
-    // ChildReaper exposes global, try_admit, is_healthy, metrics.
     let _ = ChildReaper::global;
     let _ = ChildReaper::try_admit;
     let _ = ChildReaper::is_healthy;
     let _ = ChildReaper::metrics;
-
-    // drain_child_output_guarded is a public free function.
     let _ = drain_child_output_guarded;
-}
-
-/// Verify that ChildLease is not Clone, not Copy, and has no public
-/// constructor.  These are structural guarantees enforced by the type
-/// system.
-#[test]
-fn child_lease_is_not_clone_or_copy() {
-    // If someone derives Clone or Copy on ChildLease, these assertions
-    // would fail to compile (the negative impl is not needed — we just
-    // verify the type exists and is affine).
-    fn assert_not_clone<T: Sized>() {}
-    assert_not_clone::<ChildLease>();
 }

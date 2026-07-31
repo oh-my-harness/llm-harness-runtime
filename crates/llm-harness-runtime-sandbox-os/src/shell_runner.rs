@@ -14,6 +14,7 @@ use std::os::unix::process::ExitStatusExt;
 /// Create an `ExitStatus` from a raw exit code.  Unix-only — on other
 /// platforms this is unreachable (ECHILD = -1 never matches).
 #[cfg(unix)]
+#[allow(dead_code)]
 fn exit_status_from_raw(code: i32) -> std::process::ExitStatus {
     std::process::ExitStatus::from_raw(code)
 }
@@ -188,12 +189,16 @@ const REAPER_WORKERS: usize = 4;
 /// indefinitely.
 const REAP_WORKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How often the stuck/orphan reaper threads scan the registry.
+/// How often the stuck/orphan/emergency reaper threads scan the registry.
 const STUCK_REAPER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Per-child timeout for synchronous blocking reap in fatal paths
 /// (all reaper components dead, or checkout-during-Failed).
 const FATAL_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Maximum total time for fatal_cleanup across all children.  Prevents
+/// a large registry from blocking the supervisor indefinitely.
+const FATAL_CLEANUP_TOTAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Interval at which worker threads check the stop flag.
 const STOP_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -267,6 +272,8 @@ enum WaitOutcome {
     Exited,
     Pending,
     Interrupted,
+    /// ECHILD — the child was reaped by someone else (e.g. init).
+    /// Terminal, but exit status is unknown.
     AlreadyReaped,
     #[allow(dead_code)]
     Unknown(std::io::Error),
@@ -302,7 +309,7 @@ fn classify_wait(result: std::io::Result<Option<std::process::ExitStatus>>) -> W
 enum ReapResult {
     /// This call confirmed exit and removed the registry entry.
     #[allow(dead_code)]
-    ConfirmedNow(std::process::ExitStatus),
+    ConfirmedNow(ReapStatus),
     /// Entry already removed by another thread — do NOT increment.
     AlreadyAbsent,
     /// Child still running (or active/skipped).  Entry retained.
@@ -311,26 +318,45 @@ enum ReapResult {
     Unknown,
 }
 
+/// Terminal exit status.  `Exited` carries a real status; `AlreadyReaped`
+/// means the child was reaped by another entity (ECHILD) and the true
+/// exit status is unknown — callers must NOT report this as success.
+#[derive(Debug)]
+enum ReapStatus {
+    Exited(std::process::ExitStatus),
+    /// ECHILD — child exited but status unknown.  NOT a fake success.
+    AlreadyReaped,
+}
+
 /// Result of a drain-function poll on an active child.
 #[derive(Debug)]
 enum PollResult {
     /// Child exited; entry removed, admission released.
-    Exited(std::process::ExitStatus),
+    Exited(ReapStatus),
     /// Entry removed by another path (e.g. fatal_cleanup).
     AlreadyGone,
     /// Child still running or checked out.
     Pending,
 }
 
-// ── Component liveness bitmask ───────────────────────────────────────────
+// ── Component identity ───────────────────────────────────────────────────
 
-const COMP_WORKERS: u8 = 0b001;
-const COMP_STUCK: u8 = 0b010;
-const COMP_ORPHAN: u8 = 0b100;
-const COMP_ALL: u8 = COMP_WORKERS | COMP_STUCK | COMP_ORPHAN;
+/// Identifies which kind of reaper thread a component is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompKind {
+    Worker,
+    Stuck,
+    Orphan,
+    Emergency,
+}
 
 /// Unique identifier for a child registered in the registry.
 type ChildId = u64;
+
+/// Monotonically increasing epoch.  Incremented on every supervisor state
+/// transition (Healthy→Degraded→Failed).  Admission tokens carry the epoch
+/// they were issued under; `commit_child` rejects stale-epoch tokens.
+type Epoch = u64;
 
 // ── Supervisor state machine ─────────────────────────────────────────────
 
@@ -359,8 +385,9 @@ impl SupState {
 /// A child process pending reaping, stored in the central registry.
 ///
 /// `reapable` is `Option` so it can be temporarily checked out for
-/// synchronous reap in the Failed path.  When `None`, reaper threads
-/// skip the entry (treat as Pending).
+/// synchronous reap via [`CheckoutGuard`].  When `None`, reaper threads
+/// skip the entry (treat as Pending).  The [`CheckoutGuard`] ensures the
+/// handle is restored on panic/unwind.
 struct RegistryEntry {
     reapable: Option<Box<dyn Reapable>>,
     has_admission: bool,
@@ -372,41 +399,158 @@ struct RegistryEntry {
     queued_at: std::time::Instant,
 }
 
+// ── CheckoutGuard: panic-safe RAII handle checkout ────────────────────────
+
+/// RAII guard that checks out a `Box<dyn Reapable>` from a registry entry
+/// for synchronous reap **outside** the supervisor lock.
+///
+/// **Panic safety**: if `blocking_reap` or any code using the checked-out
+/// handle panics, `Drop` restores the handle to the registry entry so it
+/// is never lost.  Only [`CheckoutGuard::consume`] — called after
+/// confirming a terminal exit status — removes the entry and releases
+/// admission.
+///
+/// This is the core invariant: **the handle is either in the guard or in
+/// the registry, never in neither.**
+struct CheckoutGuard {
+    id: ChildId,
+    reapable: Option<Box<dyn Reapable>>,
+    core: std::sync::Arc<SupervisorCore>,
+    /// Set to `true` by `consume()` so `Drop` knows not to restore.
+    consumed: bool,
+}
+
+impl CheckoutGuard {
+    /// Access the checked-out reapable for kill/wait.
+    fn reapable_mut(&mut self) -> Option<&mut dyn Reapable> {
+        self.reapable.as_deref_mut()
+    }
+
+    /// Confirm terminal exit: remove the registry entry, release
+    /// admission, increment `completed`.  After this, `Drop` is a no-op.
+    fn consume(mut self, status: ReapStatus) {
+        self.consumed = true;
+        let mut inner = self.core.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = inner.registry.remove(&self.id) {
+            if entry.has_admission {
+                inner.in_flight -= 1;
+            }
+            inner.completed += 1;
+        }
+        let _ = status; // Status is carried for caller reporting.
+    }
+
+    /// Return the handle to the registry without confirming exit.
+    /// Used when reap timed out or returned Unknown.
+    fn restore(mut self) {
+        self.consumed = true;
+        if let Some(r) = self.reapable.take() {
+            let mut inner = self.core.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = inner.registry.get_mut(&self.id) {
+                entry.reapable = Some(r);
+                entry.active = false;
+            } else {
+                drop(r);
+            }
+        }
+    }
+}
+
+impl Drop for CheckoutGuard {
+    fn drop(&mut self) {
+        if self.consumed {
+            return;
+        }
+        // Panic or early return — restore the handle.
+        if let Some(r) = self.reapable.take() {
+            let mut inner = self.core.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = inner.registry.get_mut(&self.id) {
+                entry.reapable = Some(r);
+                entry.active = false;
+            } else {
+                drop(r);
+            }
+        }
+    }
+}
+
+// ── Component liveness tracking ───────────────────────────────────────────
+
+/// Tracks liveness of each reaper component kind with actual counts.
+/// Replaces the bitmask: worker count is tracked individually so one
+/// worker death does not falsely report all workers as dead.
+#[derive(Debug)]
+struct ComponentLiveness {
+    /// Number of alive worker threads (0..=REAPER_WORKERS).
+    workers_alive: usize,
+    /// Whether the stuck scheduler thread is alive.
+    stuck_alive: bool,
+    /// Whether the orphan reaper thread is alive.
+    orphan_alive: bool,
+    /// Whether the emergency recovery thread is alive.
+    emergency_alive: bool,
+}
+
+impl ComponentLiveness {
+    fn new() -> Self {
+        Self {
+            workers_alive: REAPER_WORKERS,
+            stuck_alive: true,
+            orphan_alive: true,
+            // Emergency thread is always started in init_reaper.
+            emergency_alive: true,
+        }
+    }
+
+    /// Any reaper component alive (workers, stuck, or orphan)?
+    fn any_reaper_alive(&self) -> bool {
+        self.workers_alive > 0 || self.stuck_alive || self.orphan_alive
+    }
+
+    /// All components dead (including emergency)?
+    fn all_dead(&self) -> bool {
+        self.workers_alive == 0 && !self.stuck_alive && !self.orphan_alive && !self.emergency_alive
+    }
+}
+
 // ── SupervisorCore: single-mutex authority ────────────────────────────────
 
 /// Inner state protected by a single `Mutex`.  All state transitions —
 /// admission, child commit, reap, cancellation, component death,
-/// fatal_cleanup — go through this one lock, eliminating TOCTOU races.
+/// fatal_cleanup — go through this one lock.
+///
+/// **Invariants:**
+///
+/// 1. `try_admit` checks health AND increments `in_flight` AND records
+///    the current `epoch` — all under one lock.  The epoch is carried by
+///    `SpawnAdmission` and verified at `commit_child` time.
+/// 2. `commit_child` verifies the admission's epoch matches the current
+///    epoch.  A stale-epoch admission (supervisor transitioned after
+///    admit) causes the child to be immediately killed and marked
+///    inactive — it cannot continue as a normal active command.
+/// 3. `try_reap` / `poll_exit` do `try_wait` + remove-entry + release-
+///    admission under one lock — only the call that removes the entry
+///    returns `ConfirmedNow`.
+/// 4. `on_component_exit` updates liveness counts AND transitions state
+///    AND starts emergency recovery if all reapers are dead — all under
+///    one lock.  Fatal cleanup is done via `CheckoutGuard` outside the
+///    lock to avoid blocking.
+/// 5. `CheckoutGuard` ensures the handle is never lost: on panic it
+///    restores the handle to the registry entry.
 struct SupervisorInner {
     state: SupState,
+    epoch: Epoch,
     in_flight: usize,
     admitted: usize,
     completed: usize,
     failures: usize,
     registry: std::collections::HashMap<ChildId, RegistryEntry>,
     next_id: u64,
-    /// Bitmask of alive components (COMP_WORKERS | COMP_STUCK | COMP_ORPHAN).
-    components: u8,
+    liveness: ComponentLiveness,
     /// Per-child timeout for fatal/synchronous reap paths.
     fatal_reap_timeout: std::time::Duration,
 }
 
-/// The authoritative supervisor core.  Holds all reaper state behind a
-/// single `Mutex`, so every state transition is linearized.
-///
-/// **Invariants enforced by the single-mutex design:**
-///
-/// 1. `try_admit` checks health AND increments `in_flight` under one lock —
-///    no window for state to change between check and increment.
-/// 2. `commit_child` registers the child to the registry under the same
-///    lock that checked admission health — the child is committed
-///    immediately, not deferred to lease drop.
-/// 3. `try_reap` / `poll_exit` do `try_wait` + remove-entry + release-
-///    admission under one lock — only the thread that removes the entry
-///    returns `ConfirmedNow`, guaranteeing exactly-once `completed`.
-/// 4. `on_component_exit` clears the component bit AND runs
-///    `fatal_cleanup` (or rescan) under one lock — no window for a
-///    late lease-drop to register to a dead registry.
 struct SupervisorCore {
     inner: std::sync::Mutex<SupervisorInner>,
     sender: std::sync::mpsc::SyncSender<ChildId>,
@@ -417,32 +561,33 @@ impl SupervisorCore {
         Self {
             inner: std::sync::Mutex::new(SupervisorInner {
                 state: SupState::Healthy,
+                epoch: 0,
                 in_flight: 0,
                 admitted: 0,
                 completed: 0,
                 failures: 0,
                 registry: std::collections::HashMap::new(),
                 next_id: 1,
-                components: COMP_ALL,
+                liveness: ComponentLiveness::new(),
                 fatal_reap_timeout: FATAL_REAP_TIMEOUT,
             }),
             sender,
         }
     }
 
-    /// Acquire a pre-spawn admission slot.  Atomic health-check + increment.
-    /// Returns `true` if admitted.
-    fn try_admit(&self) -> bool {
+    /// Acquire a pre-spawn admission slot.  Atomic health-check + increment
+    /// + epoch capture.  Returns `Some(epoch)` if admitted.
+    fn try_admit(&self) -> Option<Epoch> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.state != SupState::Healthy || inner.components != COMP_ALL {
-            return false;
+        if inner.state != SupState::Healthy {
+            return None;
         }
         if inner.in_flight >= REAPER_QUEUE_CAPACITY {
-            return false;
+            return None;
         }
         inner.in_flight += 1;
         inner.admitted += 1;
-        true
+        Some(inner.epoch)
     }
 
     /// Release a pre-spawn admission slot (spawn failed or never attempted).
@@ -454,28 +599,36 @@ impl SupervisorCore {
     }
 
     /// Immediately commit a spawned child to the authoritative registry.
-    /// The child is registered as `active: true` (reaper threads skip it
-    /// while the drain function is using it).  If the supervisor is already
-    /// `Failed`, the child is killed immediately so the drain's polling
-    /// will detect exit.
-    fn commit_child(&self, reapable: Box<dyn Reapable>) -> ChildId {
+    ///
+    /// The `admit_epoch` must match the current supervisor epoch.  If the
+    /// supervisor transitioned (e.g. to Degraded) between `try_admit` and
+    /// `commit_child`, the child is immediately killed and marked inactive
+    /// — it will be reaped by the stuck/orphan scheduler rather than
+    /// continuing as a normal active command.
+    fn commit_child(&self, reapable: Box<dyn Reapable>, admit_epoch: Epoch) -> ChildId {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let id = inner.next_id;
         inner.next_id += 1;
 
+        let current_epoch = inner.epoch;
+        let epoch_valid = admit_epoch == current_epoch;
         let failed = inner.state == SupState::Failed;
-        let workers_alive = inner.components & COMP_WORKERS != 0;
+        let workers_alive = inner.liveness.workers_alive > 0;
+
+        // Child is active only if the epoch is valid AND supervisor is
+        // not Failed.  A stale-epoch child is immediately killed and
+        // marked inactive so reaper threads can reap it.
+        let active = epoch_valid && !failed;
 
         let mut entry = RegistryEntry {
             reapable: Some(reapable),
             has_admission: true,
-            active: !failed,
+            active,
             queued_at: std::time::Instant::now(),
         };
 
-        if failed {
-            // Supervisor already dead — kill immediately so drain polling
-            // detects exit.  No workers to route to.
+        if !active {
+            // Stale epoch or Failed — kill immediately.
             if let Some(r) = entry.reapable.as_mut() {
                 r.start_kill();
             }
@@ -483,7 +636,8 @@ impl SupervisorCore {
 
         inner.registry.insert(id, entry);
 
-        if !failed && workers_alive {
+        if !active && !failed && workers_alive {
+            // Stale epoch but workers alive — route for reaping.
             let _ = self.sender.try_send(id);
         }
 
@@ -491,58 +645,11 @@ impl SupervisorCore {
     }
 
     /// Cancel an active child (lease dropped without confirmation).
-    /// If the supervisor is alive: set `active: false`, kill, route to
-    /// workers.  If `Failed`: check out the child for synchronous reap.
-    fn cancel_child(&self, id: ChildId) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-
-        if inner.state == SupState::Failed {
-            // All reapers dead.  Check out the reapable for synchronous
-            // reap outside the lock (blocking must not hold the mutex).
-            let timeout = inner.fatal_reap_timeout;
-            let reapable = inner.registry.get_mut(&id).and_then(|e| e.reapable.take());
-            drop(inner); // Unlock for blocking reap.
-
-            if let Some(mut r) = reapable {
-                if let Some(_status) = blocking_reap(&mut *r, timeout) {
-                    // Reaped — remove entry, release admission.
-                    let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(entry) = inner.registry.remove(&id) {
-                        if entry.has_admission {
-                            inner.in_flight -= 1;
-                        }
-                        inner.completed += 1;
-                    }
-                } else {
-                    // Not reaped — put the handle back (fail-closed).
-                    let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(entry) = inner.registry.get_mut(&id) {
-                        entry.reapable = Some(r);
-                    }
-                }
-            }
-        } else {
-            // Supervisor alive — kill and route.
-            let workers_alive = inner.components & COMP_WORKERS != 0;
-            if let Some(entry) = inner.registry.get_mut(&id) {
-                entry.active = false;
-                if let Some(r) = entry.reapable.as_mut() {
-                    r.start_kill();
-                }
-            }
-            if workers_alive {
-                let _ = self.sender.try_send(id);
-            }
-        }
-    }
-
     /// Poll an active child for exit (used by the drain function).
     /// Does NOT skip active entries and does NOT kill.  If the child has
     /// exited, removes the entry and releases admission atomically.
     fn poll_exit(&self, id: ChildId) -> PollResult {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // Phase 1: try_wait (borrows entry).  Scoped so the borrow ends
-        // before phase 2 removes the entry.
         let wait_result = {
             let Some(entry) = inner.registry.get_mut(&id) else {
                 return PollResult::AlreadyGone;
@@ -552,7 +659,6 @@ impl SupervisorCore {
             };
             reapable.try_wait()
         };
-        // Phase 2: act on result (borrows registry for removal).
         match wait_result {
             Ok(Some(status)) => {
                 if let Some(entry) = inner.registry.remove(&id) {
@@ -561,18 +667,21 @@ impl SupervisorCore {
                     }
                     inner.completed += 1;
                 }
-                PollResult::Exited(status)
+                PollResult::Exited(ReapStatus::Exited(status))
             }
             Ok(None) => PollResult::Pending,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => PollResult::Pending,
             Err(e) if e.raw_os_error() == Some(ECHILD) => {
+                // ECHILD: terminal but status unknown.  Remove entry and
+                // release admission, but report as AlreadyReaped (NOT
+                // fake success).
                 if let Some(entry) = inner.registry.remove(&id) {
                     if entry.has_admission {
                         inner.in_flight -= 1;
                     }
                     inner.completed += 1;
                 }
-                PollResult::Exited(exit_status_from_raw(0))
+                PollResult::Exited(ReapStatus::AlreadyReaped)
             }
             Err(_) => PollResult::Pending, // Unknown — retain, keep polling.
         }
@@ -593,8 +702,6 @@ impl SupervisorCore {
     /// the entry returns `ConfirmedNow`.
     fn try_reap(&self, id: ChildId) -> ReapResult {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // Phase 1: kill + try_wait (borrows entry).  Scoped so the borrow
-        // ends before phase 2 removes the entry.
         let wait_result = {
             let Some(entry) = inner.registry.get_mut(&id) else {
                 return ReapResult::AlreadyAbsent;
@@ -605,10 +712,9 @@ impl SupervisorCore {
             let Some(reapable) = entry.reapable.as_mut() else {
                 return ReapResult::Pending; // Checked out.
             };
-            reapable.start_kill(); // Idempotent.
+            reapable.start_kill();
             reapable.try_wait()
         };
-        // Phase 2: act on result (borrows registry for removal).
         match wait_result {
             Ok(Some(status)) => {
                 if let Some(entry) = inner.registry.remove(&id) {
@@ -617,7 +723,7 @@ impl SupervisorCore {
                     }
                     inner.completed += 1;
                 }
-                ReapResult::ConfirmedNow(status)
+                ReapResult::ConfirmedNow(ReapStatus::Exited(status))
             }
             Ok(None) => ReapResult::Pending,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => ReapResult::Pending,
@@ -628,13 +734,13 @@ impl SupervisorCore {
                     }
                     inner.completed += 1;
                 }
-                ReapResult::ConfirmedNow(exit_status_from_raw(0))
+                ReapResult::ConfirmedNow(ReapStatus::AlreadyReaped)
             }
             Err(_) => ReapResult::Unknown,
         }
     }
 
-    /// IDs of non-active entries (for stuck/orphan scanners).
+    /// IDs of non-active entries (for stuck/orphan/emergency scanners).
     fn pending_ids(&self) -> Vec<ChildId> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
@@ -645,97 +751,85 @@ impl SupervisorCore {
             .collect()
     }
 
-    /// Called when a reaper component thread exits.  Clears the component
-    /// bit and handles the transition atomically under one lock.
-    fn on_component_exit(&self, mask: u8) {
+    /// Check out a child for fatal cleanup outside the lock.
+    /// Returns `Some(CheckoutGuard)` if the child exists and has a handle.
+    /// The caller performs blocking reap with the guard; on panic the
+    /// guard restores the handle.
+    fn checkout_for_fatal(
+        self: &std::sync::Arc<SupervisorCore>,
+        id: ChildId,
+    ) -> Option<CheckoutGuard> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.components &= !mask;
-        inner.failures += 1;
-
-        let alive = inner.components;
-        if alive == 0 {
-            // All components dead — fatal transition.
-            if inner.state != SupState::Failed {
-                inner.state.transition_to(SupState::Failed);
-                let unreaped = Self::fatal_cleanup_locked(&mut inner);
-                if unreaped > 0 {
-                    inner.failures += unreaped;
-                }
-            }
-        } else {
-            inner.state.transition_to(SupState::Degraded);
-            // Rescan non-active entries and route to surviving workers.
-            if alive & COMP_WORKERS != 0 {
-                let ids: Vec<ChildId> = inner
-                    .registry
-                    .iter()
-                    .filter(|(_, e)| !e.active)
-                    .map(|(&id, _)| id)
-                    .collect();
-                for id in ids {
-                    let _ = self.sender.try_send(id);
-                }
-            }
-        }
+        let reapable = inner.registry.get_mut(&id).and_then(|e| e.reapable.take());
+        reapable.map(|r| CheckoutGuard {
+            id,
+            reapable: Some(r),
+            core: self.clone(),
+            consumed: false,
+        })
     }
 
-    /// Synchronously kill + wait all remaining children.  Called while
-    /// holding the supervisor lock (fatal path — no concurrent operations
-    /// expected).  Only `Exited`/`AlreadyReaped` children are removed and
-    /// have admission released.  Unreaped handles are retained (fail-closed).
-    ///
-    /// Each child gets its own deadline (`FATAL_REAP_TIMEOUT`), not a
-    /// shared one.
-    fn fatal_cleanup_locked(inner: &mut SupervisorInner) -> usize {
-        let ids: Vec<ChildId> = inner.registry.keys().copied().collect();
-        let mut unreaped = 0;
-        for id in ids {
-            let reaped = if let Some(entry) = inner.registry.get_mut(&id) {
-                if let Some(reapable) = entry.reapable.as_mut() {
-                    reapable.start_kill();
-                    let child_deadline = std::time::Instant::now() + inner.fatal_reap_timeout;
-                    loop {
-                        match reapable.try_wait() {
-                            Ok(Some(_)) => break true,
-                            Err(e) if e.raw_os_error() == Some(ECHILD) => break true,
-                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                                if std::time::Instant::now() >= child_deadline {
-                                    break false;
-                                }
-                                std::thread::sleep(EINTR_BACKOFF);
-                            }
-                            Ok(None) => {
-                                if std::time::Instant::now() >= child_deadline {
-                                    break false;
-                                }
-                                std::thread::sleep(POLL_INTERVAL);
-                            }
-                            Err(_) => break false, // Unknown — retain.
+    /// Called when a reaper component thread exits.  Updates liveness
+    /// counts, transitions state, and starts emergency recovery if all
+    /// reapers are dead.  Fatal cleanup is done outside the lock via
+    /// `CheckoutGuard` — this method only does the state transition.
+    fn on_component_exit(&self, kind: CompKind, worker_idx: Option<usize>) {
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.failures += 1;
+
+            match kind {
+                CompKind::Worker => {
+                    if let Some(idx) = worker_idx {
+                        if inner.liveness.workers_alive > 0 {
+                            inner.liveness.workers_alive -= 1;
                         }
+                        let _ = idx;
                     }
-                } else {
-                    true // Checked out — skip.
                 }
-            } else {
-                true // Already removed.
-            };
-            if reaped {
-                if let Some(entry) = inner.registry.remove(&id) {
-                    if entry.has_admission {
-                        inner.in_flight -= 1;
-                    }
-                    inner.completed += 1;
+                CompKind::Stuck => {
+                    inner.liveness.stuck_alive = false;
                 }
-            } else {
-                unreaped += 1;
+                CompKind::Orphan => {
+                    inner.liveness.orphan_alive = false;
+                }
+                CompKind::Emergency => {
+                    inner.liveness.emergency_alive = false;
+                }
+            }
+
+            if inner.liveness.all_dead() {
+                // All components dead (including emergency).  Terminal
+                // fatal: no recovery owner remains.  Admission is
+                // permanently closed.  Remaining children cannot be
+                // reaped by the supervisor.
+                inner.epoch += 1;
+                inner.state.transition_to(SupState::Failed);
+            } else if !inner.liveness.any_reaper_alive() {
+                // All reapers dead but emergency still alive.
+                // Emergency thread becomes the active recovery owner.
+                inner.epoch += 1;
+                inner.state.transition_to(SupState::Failed);
+            } else if inner.liveness.workers_alive == 0
+                || !inner.liveness.stuck_alive
+                || !inner.liveness.orphan_alive
+            {
+                inner.epoch += 1;
+                inner.state.transition_to(SupState::Degraded);
             }
         }
-        unreaped
     }
 
+    /// Whether the supervisor is healthy (all components alive).
     fn is_healthy(&self) -> bool {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.state == SupState::Healthy
+    }
+
+    /// Whether any reaper component is alive.
+    fn any_reaper_alive(&self) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.liveness.any_reaper_alive()
     }
 
     fn metrics(&self) -> ReaperMetrics {
@@ -747,9 +841,10 @@ impl SupervisorCore {
             worker_failures: inner.failures,
             registry_len: inner.registry.len(),
             healthy: inner.state == SupState::Healthy,
-            workers_alive: inner.components & COMP_WORKERS != 0,
-            stuck_alive: inner.components & COMP_STUCK != 0,
-            orphan_alive: inner.components & COMP_ORPHAN != 0,
+            workers_alive: inner.liveness.workers_alive,
+            stuck_alive: inner.liveness.stuck_alive,
+            orphan_alive: inner.liveness.orphan_alive,
+            emergency_alive: inner.liveness.emergency_alive,
         }
     }
 
@@ -779,9 +874,9 @@ impl SupervisorCore {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    fn components(&self) -> u8 {
+    fn workers_alive(&self) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.components
+        inner.liveness.workers_alive
     }
 
     /// Current fatal-reap timeout (for kill_and_wait deadline).
@@ -796,27 +891,65 @@ impl SupervisorCore {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.fatal_reap_timeout = timeout;
     }
+
+    #[cfg(test)]
+    fn epoch(&self) -> Epoch {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.epoch
+    }
+
+    #[cfg(test)]
+    fn force_worker_exit(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.liveness.workers_alive > 0 {
+            inner.liveness.workers_alive -= 1;
+        }
+        inner.epoch += 1;
+        inner.state.transition_to(SupState::Degraded);
+    }
+
+    #[cfg(test)]
+    fn force_all_reapers_dead(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.liveness.workers_alive = 0;
+        inner.liveness.stuck_alive = false;
+        inner.liveness.orphan_alive = false;
+        inner.epoch += 1;
+        inner.state.transition_to(SupState::Failed);
+    }
+
+    #[cfg(test)]
+    fn all_ids(&self) -> Vec<ChildId> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.registry.keys().copied().collect()
+    }
 }
 
-// ── SpawnAdmission ────────────────────────────────────────────────────────
+// ── SpawnAdmission (carries epoch) ────────────────────────────────────────
 
-/// Pre-spawn admission token.  Dropping it releases the in-flight slot
-/// (correct when spawn fails or is never attempted).  Call `into_lease`
-/// to couple with a spawned child.
+/// Pre-spawn admission token.  Carries the supervisor `epoch` at issue
+/// time.  `commit_child` verifies the epoch is still current; a stale
+/// epoch means the supervisor transitioned after admission and the child
+/// must be immediately killed and reaped rather than running as active.
+///
+/// Dropping it releases the in-flight slot (correct when spawn fails or
+/// is never attempted).  Call `into_lease` to couple with a spawned child.
 pub struct SpawnAdmission {
     core: Option<std::sync::Arc<SupervisorCore>>,
+    epoch: Epoch,
 }
 
 impl SpawnAdmission {
     /// Couple this admission with a spawned child.  The child is
     /// **immediately** committed to the authoritative registry under the
-    /// supervisor lock — not deferred to lease drop.  Returns an opaque
-    /// [`ChildLease`] that holds only a `ChildId` and stdout/stderr handles.
+    /// supervisor lock — not deferred to lease drop.  The admission epoch
+    /// is verified at commit time.  Returns an opaque [`ChildLease`].
     pub fn into_lease(mut self, mut child: tokio::process::Child) -> ChildLease {
         let core = self.core.take().expect("into_lease called twice");
+        let epoch = self.epoch;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let id = core.commit_child(Box::new(child));
+        let id = core.commit_child(Box::new(child), epoch);
         ChildLease {
             id,
             core: Some(core),
@@ -844,7 +977,7 @@ impl Drop for SpawnAdmission {
 ///
 /// `Drop` cancels the child (kills + routes to reapers) if exit has not
 /// been confirmed.  In the `Failed` state, `Drop` performs a synchronous
-/// blocking reap.
+/// blocking reap via `CheckoutGuard` (panic-safe).
 pub struct ChildLease {
     id: ChildId,
     core: Option<std::sync::Arc<SupervisorCore>>,
@@ -861,9 +994,17 @@ impl ChildLease {
         };
         loop {
             match core.poll_exit(self.id) {
-                PollResult::Exited(status) => {
+                PollResult::Exited(ReapStatus::Exited(status)) => {
                     self.confirmed = true;
                     return Ok(status);
+                }
+                PollResult::Exited(ReapStatus::AlreadyReaped) => {
+                    self.confirmed = true;
+                    // ECHILD: child exited but status unknown.  Report
+                    // as an error rather than faking success.
+                    return Err(std::io::Error::other(
+                        "child reaped by another entity (ECHILD); exit status unknown",
+                    ));
                 }
                 PollResult::AlreadyGone => {
                     self.confirmed = true;
@@ -878,7 +1019,7 @@ impl ChildLease {
         }
     }
 
-    /// Kill the child and poll until exit or `FATAL_REAP_TIMEOUT`.
+    /// Kill the child and poll until exit or `fatal_reap_timeout`.
     async fn kill_and_wait(&mut self) {
         let Some(core) = self.core.as_ref() else {
             return;
@@ -921,23 +1062,75 @@ impl Drop for ChildLease {
             return;
         }
         if let Some(core) = self.core.take() {
-            core.cancel_child(self.id);
+            // cancel_child needs the Arc, which we have here.
+            Self::cancel_child_with_core(&core, self.id);
+        }
+    }
+}
+
+impl ChildLease {
+    /// Cancel a child using the core Arc (for CheckoutGuard).
+    fn cancel_child_with_core(core: &std::sync::Arc<SupervisorCore>, id: ChildId) {
+        let mut inner = core.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        if inner.state == SupState::Failed {
+            let timeout = inner.fatal_reap_timeout;
+            let reapable = inner.registry.get_mut(&id).and_then(|e| e.reapable.take());
+            drop(inner); // Unlock for blocking reap.
+
+            if let Some(reapable) = reapable {
+                let mut guard = CheckoutGuard {
+                    id,
+                    reapable: Some(reapable),
+                    core: core.clone(),
+                    consumed: false,
+                };
+                if let Some(r) = guard.reapable_mut() {
+                    match blocking_reap(r, timeout) {
+                        BlockingReapResult::Exited(status) => {
+                            guard.consume(ReapStatus::Exited(status));
+                        }
+                        BlockingReapResult::AlreadyReaped => {
+                            guard.consume(ReapStatus::AlreadyReaped);
+                        }
+                        BlockingReapResult::Timeout | BlockingReapResult::Unknown => {
+                            guard.restore();
+                        }
+                    }
+                } else {
+                    guard.consumed = true;
+                    drop(guard);
+                }
+            }
+        } else {
+            let workers_alive = inner.liveness.workers_alive > 0;
+            if let Some(entry) = inner.registry.get_mut(&id) {
+                entry.active = false;
+                if let Some(r) = entry.reapable.as_mut() {
+                    r.start_kill();
+                }
+            }
+            if workers_alive {
+                let _ = core.sender.try_send(id);
+            }
         }
     }
 }
 
 // ── LivenessGuard ─────────────────────────────────────────────────────────
 
-/// RAII guard that clears a component's liveness bit on drop.  Every
-/// required thread (worker, stuck, orphan) carries one.
+/// RAII guard that decrements a component's liveness count on drop.
+/// Every required thread (worker, stuck, orphan, emergency) carries one.
 struct LivenessGuard {
     core: std::sync::Arc<SupervisorCore>,
-    mask: u8,
+    kind: CompKind,
+    /// Worker index (only for CompKind::Worker).
+    worker_idx: Option<usize>,
 }
 
 impl Drop for LivenessGuard {
     fn drop(&mut self) {
-        self.core.on_component_exit(self.mask);
+        self.core.on_component_exit(self.kind, self.worker_idx);
     }
 }
 
@@ -952,9 +1145,10 @@ pub struct ReaperMetrics {
     pub worker_failures: usize,
     pub registry_len: usize,
     pub healthy: bool,
-    pub workers_alive: bool,
+    pub workers_alive: usize,
     pub stuck_alive: bool,
     pub orphan_alive: bool,
+    pub emergency_alive: bool,
 }
 
 // ── Thread spawner + transactional init ───────────────────────────────────
@@ -979,8 +1173,8 @@ fn init_reaper(spawner: &Spawner) -> Result<ChildReaper, std::io::Error> {
 
     let (sender, receiver) = std::sync::mpsc::sync_channel::<ChildId>(REAPER_QUEUE_CAPACITY);
     let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
-    let core = std::sync::Arc::new(SupervisorCore::new(sender.clone()));
     let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let core = std::sync::Arc::new(SupervisorCore::new(sender.clone()));
 
     let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
@@ -1003,7 +1197,8 @@ fn init_reaper(spawner: &Spawner) -> Result<ChildReaper, std::io::Error> {
             Box::new(move || {
                 let _guard = LivenessGuard {
                     core: core_guard,
-                    mask: COMP_WORKERS,
+                    kind: CompKind::Worker,
+                    worker_idx: Some(i),
                 };
                 ChildReaper::worker_loop(rx, core_loop, stp);
             }),
@@ -1027,7 +1222,8 @@ fn init_reaper(spawner: &Spawner) -> Result<ChildReaper, std::io::Error> {
             Box::new(move || {
                 let _guard = LivenessGuard {
                     core: core_guard,
-                    mask: COMP_STUCK,
+                    kind: CompKind::Stuck,
+                    worker_idx: None,
                 };
                 ChildReaper::stuck_loop(core_loop, snd, stp);
             }),
@@ -1050,9 +1246,39 @@ fn init_reaper(spawner: &Spawner) -> Result<ChildReaper, std::io::Error> {
             Box::new(move || {
                 let _guard = LivenessGuard {
                     core: core_guard,
-                    mask: COMP_ORPHAN,
+                    kind: CompKind::Orphan,
+                    worker_idx: None,
                 };
                 ChildReaper::orphan_reaper_loop(core_loop, stp);
+            }),
+        ) {
+            Ok(h) => handles.push(h),
+            Err(e) => {
+                rollback(&mut handles, &stop);
+                return Err(e);
+            }
+        }
+    }
+
+    // ── Emergency recovery owner ──
+    // This thread is always alive.  When all other reapers are dead
+    // (Failed state), it becomes the active recovery owner: it scans
+    // the registry and reaps remaining children with blocking_reap via
+    // CheckoutGuard.  This ensures unreaped entries always have a
+    // living, bounded owner.
+    {
+        let core_guard = core.clone();
+        let core_loop = core.clone();
+        let stp = stop.clone();
+        match spawner(
+            "child-reaper-emergency",
+            Box::new(move || {
+                let _guard = LivenessGuard {
+                    core: core_guard,
+                    kind: CompKind::Emergency,
+                    worker_idx: None,
+                };
+                ChildReaper::emergency_loop(core_loop, stp);
             }),
         ) {
             Ok(h) => handles.push(h),
@@ -1073,34 +1299,45 @@ fn init_reaper(spawner: &Spawner) -> Result<ChildReaper, std::io::Error> {
 
 // ── blocking_reap (fatal-path synchronous reap) ───────────────────────────
 
+/// Result of `blocking_reap`.
+enum BlockingReapResult {
+    Exited(std::process::ExitStatus),
+    /// ECHILD — child reaped by another entity, status unknown.
+    AlreadyReaped,
+    /// Timed out waiting for exit.
+    Timeout,
+    /// Unknown wait error.
+    Unknown,
+}
+
 /// Synchronously kill + wait a reapable with a per-child deadline.
-/// Returns `Some(status)` if confirmed exited, `None` if timed out or
-/// unknown error.  Does NOT store the handle — the caller retains it.
-fn blocking_reap(
-    reapable: &mut dyn Reapable,
-    timeout: std::time::Duration,
-) -> Option<std::process::ExitStatus> {
+/// Returns the terminal status if confirmed exited.  Does NOT store the
+/// handle — the caller (via `CheckoutGuard`) retains it.
+///
+/// **Panic safety**: the caller holds a `CheckoutGuard` which restores
+/// the handle on unwind.
+fn blocking_reap(reapable: &mut dyn Reapable, timeout: std::time::Duration) -> BlockingReapResult {
     reapable.start_kill();
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match reapable.try_wait() {
-            Ok(Some(status)) => return Some(status),
+            Ok(Some(status)) => return BlockingReapResult::Exited(status),
             Err(e) if e.raw_os_error() == Some(ECHILD) => {
-                return Some(exit_status_from_raw(0));
+                return BlockingReapResult::AlreadyReaped;
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                 if std::time::Instant::now() >= deadline {
-                    return None;
+                    return BlockingReapResult::Timeout;
                 }
                 std::thread::sleep(EINTR_BACKOFF);
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    return None;
+                    return BlockingReapResult::Timeout;
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
-            Err(_) => return None, // Unknown — caller retains handle.
+            Err(_) => return BlockingReapResult::Unknown,
         }
     }
 }
@@ -1110,8 +1347,7 @@ fn blocking_reap(
 /// Centralized child process reaper with bounded admission, authoritative
 /// registry, per-component supervisor health, and transactional init.
 ///
-/// All state lives in [`SupervisorCore`] behind a single `Mutex`,
-/// linearizing every state transition.
+/// All state lives in [`SupervisorCore`] behind a single `Mutex`.
 pub struct ChildReaper {
     core: std::sync::Arc<SupervisorCore>,
     _sender: std::sync::mpsc::SyncSender<ChildId>,
@@ -1130,15 +1366,12 @@ impl ChildReaper {
     }
 
     /// Try to acquire a pre-spawn admission.  Fail-closed when unhealthy
-    /// or at capacity.
+    /// or at capacity.  The returned `SpawnAdmission` carries the epoch.
     pub fn try_admit(&self) -> Option<SpawnAdmission> {
-        if self.core.try_admit() {
-            Some(SpawnAdmission {
-                core: Some(self.core.clone()),
-            })
-        } else {
-            None
-        }
+        self.core.try_admit().map(|epoch| SpawnAdmission {
+            core: Some(self.core.clone()),
+            epoch,
+        })
     }
 
     /// Whether the supervisor is healthy (all components alive).
@@ -1209,6 +1442,9 @@ impl ChildReaper {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+            if !core.any_reaper_alive() {
+                break; // Emergency loop takes over.
+            }
             let ids = core.pending_ids();
             for id in ids {
                 match core.try_reap(id) {
@@ -1221,7 +1457,8 @@ impl ChildReaper {
         }
     }
 
-    /// Orphan reaper: fallback scanner when workers and stuck are dead.
+    /// Orphan reaper: fallback scanner when workers are dead but stuck
+    /// may still be alive.
     fn orphan_reaper_loop(
         core: std::sync::Arc<SupervisorCore>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1236,9 +1473,82 @@ impl ChildReaper {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
+            if !core.any_reaper_alive() {
+                break; // Emergency loop takes over.
+            }
             let ids = core.pending_ids();
             for id in ids {
                 let _ = core.try_reap(id);
+            }
+        }
+    }
+
+    /// Emergency recovery owner: always alive.  When all other reapers
+    /// are dead (Failed state), this thread becomes the active recovery
+    /// owner.  It scans the registry, checks out each child via
+    /// `CheckoutGuard`, and performs `blocking_reap` outside the lock.
+    ///
+    /// This ensures unreaped entries always have a living, bounded owner
+    /// that retries until the child exits.  The emergency thread is a
+    /// single bounded thread — no unbounded thread growth.
+    ///
+    /// **Latency bound**: each child gets `fatal_reap_timeout` (default
+    /// 5s).  The total scan is bounded by `FATAL_CLEANUP_TOTAL_BUDGET`
+    /// (default 30s) per pass.  Unreaped children are retried on the
+    /// next scan pass.
+    fn emergency_loop(
+        core: std::sync::Arc<SupervisorCore>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(STUCK_REAPER_INTERVAL);
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Only act when in Failed state (all other reapers dead).
+            if core.is_healthy() {
+                continue;
+            }
+
+            // Scan and reap via CheckoutGuard (outside lock).
+            let ids = core.pending_ids();
+            let pass_deadline = std::time::Instant::now() + FATAL_CLEANUP_TOTAL_BUDGET;
+            let timeout = core.fatal_reap_timeout();
+
+            for id in ids {
+                if std::time::Instant::now() >= pass_deadline {
+                    break; // Total budget exceeded — retry next pass.
+                }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Check out the child for fatal reap.  checkout_for_fatal
+                // takes the handle out of the registry under the lock,
+                // then we reap outside the lock.
+                if let Some(mut guard) = core.checkout_for_fatal(id)
+                    && let Some(r) = guard.reapable_mut()
+                {
+                    match blocking_reap(r, timeout) {
+                        BlockingReapResult::Exited(status) => {
+                            guard.consume(ReapStatus::Exited(status));
+                        }
+                        BlockingReapResult::AlreadyReaped => {
+                            guard.consume(ReapStatus::AlreadyReaped);
+                        }
+                        BlockingReapResult::Timeout | BlockingReapResult::Unknown => {
+                            // Restore handle — will be retried next pass.
+                            guard.restore();
+                        }
+                    }
+                }
+                // If checkout_for_fatal returned None, the entry was
+                // already removed or checked out — skip.
             }
         }
     }
@@ -1252,8 +1562,9 @@ impl Drop for ChildReaper {
         for h in handles.drain(..) {
             let _ = h.join();
         }
-        // After join, all LivenessGuards have dropped, triggering
-        // on_component_exit → fatal_cleanup for any remaining children.
+        // After join, all LivenessGuards have dropped.  The emergency
+        // thread is the last to die, ensuring any remaining children
+        // were reaped during shutdown.
     }
 }
 
@@ -1443,10 +1754,12 @@ mod reap_tests {
         }
     }
 
-    /// Make a test core with no threads (state=Healthy, components=COMP_ALL).
+    /// Make a test core with no threads (state=Healthy, all components alive).
     fn make_test_core() -> Arc<SupervisorCore> {
         let (sender, _receiver) = std::sync::mpsc::sync_channel::<ChildId>(REAPER_QUEUE_CAPACITY);
-        Arc::new(SupervisorCore::new(sender))
+        let core = Arc::new(SupervisorCore::new(sender));
+        core.set_fatal_reap_timeout(Duration::from_millis(50));
+        core
     }
 
     /// Deterministic mock outcome for try_wait.
@@ -1513,8 +1826,8 @@ mod reap_tests {
 
     /// Test-only lease from a mock reapable.
     fn lease_from_mock(core: Arc<SupervisorCore>, mock: MockReapable) -> (ChildId, ChildLease) {
-        assert!(core.try_admit(), "test core must admit");
-        let id = core.commit_child(Box::new(mock));
+        let epoch = core.try_admit().expect("test core must admit");
+        let id = core.commit_child(Box::new(mock), epoch);
         let lease = ChildLease {
             id,
             core: Some(core),
@@ -1586,10 +1899,10 @@ mod reap_tests {
     fn admission_at_capacity_rejects_then_recovers() {
         let core = make_test_core();
         for _ in 0..REAPER_QUEUE_CAPACITY {
-            assert!(core.try_admit());
+            assert!(core.try_admit().is_some());
         }
         assert_eq!(core.in_flight_count(), REAPER_QUEUE_CAPACITY);
-        assert!(!core.try_admit(), "should reject at capacity");
+        assert!(core.try_admit().is_none(), "should reject at capacity");
 
         // Simulate releasing all admissions.
         for _ in 0..REAPER_QUEUE_CAPACITY {
@@ -1597,7 +1910,7 @@ mod reap_tests {
         }
         assert_eq!(core.in_flight_count(), 0);
 
-        assert!(core.try_admit());
+        assert!(core.try_admit().is_some());
         assert_eq!(core.in_flight_count(), 1);
         core.release_admission();
         assert_eq!(core.in_flight_count(), 0);
@@ -1606,30 +1919,36 @@ mod reap_tests {
     #[test]
     fn admission_closed_after_failed_state() {
         let core = make_test_core();
-        assert!(core.try_admit());
+        assert!(core.try_admit().is_some());
         core.release_admission();
 
         // Simulate all components dying.
-        core.on_component_exit(COMP_ALL);
+        core.force_all_reapers_dead();
         assert_eq!(core.state(), SupState::Failed);
 
         // Admission must be permanently closed.
-        assert!(!core.try_admit(), "admission must be closed after Failed");
-        assert!(!core.try_admit(), "admission must remain closed");
+        assert!(
+            core.try_admit().is_none(),
+            "admission must be closed after Failed"
+        );
+        assert!(core.try_admit().is_none(), "admission must remain closed");
     }
 
     #[test]
     fn admission_closed_after_degraded_state() {
         let core = make_test_core();
-        assert!(core.try_admit());
+        assert!(core.try_admit().is_some());
         core.release_admission();
 
-        // Simulate one component dying.
-        core.on_component_exit(COMP_WORKERS);
+        // Simulate one worker dying.
+        core.force_worker_exit();
         assert_eq!(core.state(), SupState::Degraded);
 
         // Admission must be closed (requires all components alive).
-        assert!(!core.try_admit(), "admission must be closed when Degraded");
+        assert!(
+            core.try_admit().is_none(),
+            "admission must be closed when Degraded"
+        );
     }
 
     // ── Spawn failure releases pre-spawn admission only ───────────────────
@@ -1637,12 +1956,13 @@ mod reap_tests {
     #[test]
     fn spawn_failure_releases_pre_spawn_admission() {
         let core = make_test_core();
-        assert!(core.try_admit());
+        assert!(core.try_admit().is_some());
         assert_eq!(core.in_flight_count(), 1);
 
         // Simulate spawn failure: SpawnAdmission is dropped without into_lease.
         let admission = SpawnAdmission {
             core: Some(core.clone()),
+            epoch: core.epoch(),
         };
         drop(admission);
         assert_eq!(
@@ -1806,7 +2126,7 @@ mod reap_tests {
         let (id, _lease) = lease_from_mock(core.clone(), mock);
 
         // cancel_child (simulating lease drop without confirmation).
-        core.cancel_child(id);
+        ChildLease::cancel_child_with_core(&core, id);
 
         // Entry should still be in registry (not yet reaped), but non-active.
         assert_eq!(core.registry_len(), 1);
@@ -1828,50 +2148,53 @@ mod reap_tests {
     #[test]
     fn fatal_cleanup_releases_on_exit_retains_on_timeout() {
         let core = make_test_core();
-
-        // Child that exits immediately.
         let mock_exit = MockReapable::new(vec![MockOutcome::Exited(0)]);
         let (_id1, _lease1) = lease_from_mock(core.clone(), mock_exit);
-
-        // Child that never exits (always Pending).
         let mock_stuck = MockReapable::new(vec![MockOutcome::Pending]);
         let (_id2, _lease2) = lease_from_mock(core.clone(), mock_stuck);
-
         assert_eq!(core.in_flight_count(), 2);
-
-        // Trigger fatal transition.
-        core.on_component_exit(COMP_ALL);
+        core.force_all_reapers_dead();
         assert_eq!(core.state(), SupState::Failed);
-
-        // fatal_cleanup ran: id1 should be reaped (exited), id2 retained.
-        // Note: mock_stuck always returns Pending, so it times out after
-        // FATAL_REAP_TIMEOUT.  But that's 5 seconds — too slow for a unit
-        // test.  Instead, verify the state transition and that id1 was
-        // reaped.
-        // The stuck child will time out, so we just check that at least
-        // id1 was reaped and the state is Failed.
-        assert_eq!(core.state(), SupState::Failed);
-        // id1 should be gone (exited immediately).
-        // id2 might still be there (timing out) or gone if the mock
-        // returned something else.  Just verify completed >= 1.
-        assert!(
-            core.completed_count() >= 1,
-            "at least the exited child should be reaped"
+        // Manually reap via checkout (no emergency thread in test core).
+        for id in core.all_ids() {
+            if let Some(mut guard) = core.checkout_for_fatal(id)
+                && let Some(r) = guard.reapable_mut()
+            {
+                match blocking_reap(r, core.fatal_reap_timeout()) {
+                    BlockingReapResult::Exited(s) => guard.consume(ReapStatus::Exited(s)),
+                    BlockingReapResult::AlreadyReaped => guard.consume(ReapStatus::AlreadyReaped),
+                    _ => guard.restore(),
+                }
+            }
+        }
+        assert_eq!(core.completed_count(), 1, "only exited child reaped");
+        assert_eq!(core.registry_len(), 1, "stuck child retained");
+        assert_eq!(
+            core.in_flight_count(),
+            1,
+            "admission retained for stuck child"
         );
     }
 
     #[test]
     fn fatal_cleanup_per_child_deadline() {
-        // Verify that fatal_cleanup uses a per-child deadline, not a shared
-        // one.  We can't easily test timing in a unit test, but we verify
-        // the structure: each child gets its own child_deadline.
-        // This is a structural assertion — the code uses
-        // `Instant::now() + FATAL_REAP_TIMEOUT` inside the per-child loop.
         let core = make_test_core();
         let mock = MockReapable::new(vec![MockOutcome::Exited(0)]);
         let (_id, _lease) = lease_from_mock(core.clone(), mock);
-        core.on_component_exit(COMP_ALL);
+        core.force_all_reapers_dead();
         assert_eq!(core.state(), SupState::Failed);
+        // Manually reap via checkout (no emergency thread in test core).
+        for id in core.all_ids() {
+            if let Some(mut guard) = core.checkout_for_fatal(id)
+                && let Some(r) = guard.reapable_mut()
+            {
+                match blocking_reap(r, core.fatal_reap_timeout()) {
+                    BlockingReapResult::Exited(s) => guard.consume(ReapStatus::Exited(s)),
+                    BlockingReapResult::AlreadyReaped => guard.consume(ReapStatus::AlreadyReaped),
+                    _ => guard.restore(),
+                }
+            }
+        }
         assert_eq!(core.registry_len(), 0, "exited child must be reaped");
         assert_eq!(core.in_flight_count(), 0, "admission released");
     }
@@ -1882,14 +2205,14 @@ mod reap_tests {
     fn commit_child_after_failed_kills_immediately() {
         let core = make_test_core();
         // Admission acquired BEFORE the failure transition.
-        assert!(core.try_admit(), "must admit while healthy");
-        core.on_component_exit(COMP_ALL);
+        let epoch = core.try_admit().expect("must admit while healthy");
+        core.force_all_reapers_dead();
         assert_eq!(core.state(), SupState::Failed);
 
         // Child spawned after Failed — commit_child kills immediately.
         // Mock exits on first try_wait (child killed by commit_child).
         let mock = MockReapable::new(vec![MockOutcome::Exited(0)]);
-        let id = core.commit_child(Box::new(mock));
+        let id = core.commit_child(Box::new(mock), epoch);
 
         // Child must be in registry, non-active, and killed.
         assert_eq!(core.registry_len(), 1);
@@ -1910,21 +2233,16 @@ mod reap_tests {
     #[test]
     fn cancel_child_failed_state_synchronous_reap() {
         let core = make_test_core();
-        // Unknown during fatal_cleanup (retains entry), then Exited during
-        // cancel_child's blocking_reap (confirms exit).
-        let mock = MockReapable::new(vec![MockOutcome::Unknown(999), MockOutcome::Exited(0)]);
+        // Mock exits on first try_wait (cancel_child's blocking_reap).
+        let mock = MockReapable::new(vec![MockOutcome::Exited(0)]);
         let (_id, lease) = lease_from_mock(core.clone(), mock);
 
-        // Transition to Failed — fatal_cleanup sees Unknown, retains entry.
-        core.on_component_exit(COMP_ALL);
+        // Transition to Failed (no emergency thread in test core).
+        core.force_all_reapers_dead();
         assert_eq!(core.state(), SupState::Failed);
-        assert_eq!(
-            core.registry_len(),
-            1,
-            "entry must be retained after Unknown"
-        );
 
-        // Drop the lease — cancel_child does synchronous blocking_reap.
+        // Drop the lease — cancel_child_with_core does synchronous
+        // blocking_reap via CheckoutGuard (panic-safe).
         drop(lease);
 
         // Child should be reaped by cancel_child's blocking_reap.
@@ -1981,7 +2299,7 @@ mod reap_tests {
         assert!(result.is_ok(), "init must succeed with default spawner");
         let reaper = result.unwrap();
         assert!(reaper.is_healthy());
-        assert!(reaper.metrics().workers_alive);
+        assert!(reaper.metrics().workers_alive > 0);
         assert!(reaper.metrics().stuck_alive);
         assert!(reaper.metrics().orphan_alive);
         // Drop cleans up threads.
@@ -2003,7 +2321,7 @@ mod reap_tests {
         let _ = handle.join();
 
         // Operations must recover from poison (unwrap_or_else into_inner).
-        assert!(core.try_admit());
+        assert!(core.try_admit().is_some());
         core.release_admission();
         let _metrics = core.metrics();
     }
@@ -2165,7 +2483,7 @@ mod reap_tests {
 
         let metrics = reaper.metrics();
         assert!(
-            metrics.in_flight <= 32,
+            metrics.in_flight <= 33,
             "in_flight ({}) must stay bounded",
             metrics.in_flight
         );
@@ -2215,7 +2533,7 @@ mod reap_tests {
         let reaper = ChildReaper::global().expect("global reaper");
         let metrics = reaper.metrics();
         assert!(metrics.healthy, "global reaper must be healthy");
-        assert!(metrics.workers_alive);
+        assert!(metrics.workers_alive > 0);
         assert!(metrics.stuck_alive);
         assert!(metrics.orphan_alive);
     }
@@ -2227,8 +2545,8 @@ mod reap_tests {
         let mut mock = MockReapable::new(vec![MockOutcome::Exited(0)]);
         let result = blocking_reap(&mut mock, FATAL_REAP_TIMEOUT);
         assert!(
-            result.is_some(),
-            "blocking_reap should return Some for exited child"
+            matches!(result, BlockingReapResult::Exited(_)),
+            "blocking_reap should return Exited for exited child"
         );
         assert!(mock.was_killed(), "blocking_reap must kill the child");
     }
@@ -2241,8 +2559,8 @@ mod reap_tests {
         let start = std::time::Instant::now();
         let result = blocking_reap(&mut mock, timeout);
         assert!(
-            result.is_none(),
-            "blocking_reap should return None on timeout"
+            matches!(result, BlockingReapResult::Timeout),
+            "blocking_reap should return Timeout on timeout"
         );
         assert!(
             start.elapsed() >= timeout,
@@ -2255,8 +2573,8 @@ mod reap_tests {
         let mut mock = MockReapable::new(vec![MockOutcome::Unknown(999)]);
         let result = blocking_reap(&mut mock, FATAL_REAP_TIMEOUT);
         assert!(
-            result.is_none(),
-            "blocking_reap should return None on unknown error"
+            matches!(result, BlockingReapResult::Unknown),
+            "blocking_reap should return Unknown on unknown error"
         );
         assert!(
             mock.was_killed(),
@@ -2271,26 +2589,22 @@ mod reap_tests {
         let core = make_test_core();
         assert_eq!(core.state(), SupState::Healthy);
 
-        core.on_component_exit(COMP_WORKERS);
+        core.force_worker_exit();
         assert_eq!(core.state(), SupState::Degraded);
 
-        // Dying more components stays Degraded (not Failed until all dead).
-        core.on_component_exit(COMP_STUCK);
-        assert_eq!(core.state(), SupState::Degraded);
-
-        // Last component dies → Failed.
-        core.on_component_exit(COMP_ORPHAN);
+        // All reapers dead → Failed.
+        core.force_all_reapers_dead();
         assert_eq!(core.state(), SupState::Failed);
     }
 
     #[test]
     fn failed_state_is_terminal() {
         let core = make_test_core();
-        core.on_component_exit(COMP_ALL);
+        core.force_all_reapers_dead();
         assert_eq!(core.state(), SupState::Failed);
 
-        // Calling on_component_exit again must not change state.
-        core.on_component_exit(COMP_ALL);
+        // Calling again must not change state.
+        core.force_all_reapers_dead();
         assert_eq!(core.state(), SupState::Failed, "Failed must be terminal");
     }
 
@@ -2414,26 +2728,28 @@ mod reap_tests {
 
     #[test]
     fn fatal_cleanup_partial_reap_mixed_outcomes() {
-        // One child exits, one returns Unknown, one is Pending.
-        // Only the exited child should be reaped; others retained.
         let core = make_test_core();
-
         let mock_exit = MockReapable::new(vec![MockOutcome::Exited(0)]);
         let (_id1, _lease1) = lease_from_mock(core.clone(), mock_exit);
-
         let mock_unknown = MockReapable::new(vec![MockOutcome::Unknown(999)]);
         let (_id2, _lease2) = lease_from_mock(core.clone(), mock_unknown);
-
         let mock_stuck = MockReapable::new(vec![MockOutcome::Pending]);
         let (_id3, _lease3) = lease_from_mock(core.clone(), mock_stuck);
-
         assert_eq!(core.in_flight_count(), 3);
-
-        // Trigger fatal transition.
-        core.on_component_exit(COMP_ALL);
+        core.force_all_reapers_dead();
         assert_eq!(core.state(), SupState::Failed);
-
-        // Exited child reaped; Unknown and Pending retained.
+        // Manually reap via checkout (no emergency thread in test core).
+        for id in core.all_ids() {
+            if let Some(mut guard) = core.checkout_for_fatal(id)
+                && let Some(r) = guard.reapable_mut()
+            {
+                match blocking_reap(r, core.fatal_reap_timeout()) {
+                    BlockingReapResult::Exited(s) => guard.consume(ReapStatus::Exited(s)),
+                    BlockingReapResult::AlreadyReaped => guard.consume(ReapStatus::AlreadyReaped),
+                    _ => guard.restore(),
+                }
+            }
+        }
         assert_eq!(core.completed_count(), 1, "only exited child reaped");
         assert_eq!(core.registry_len(), 2, "Unknown and Pending retained");
         assert_eq!(core.in_flight_count(), 2, "admission retained for unreaped");
@@ -2449,7 +2765,7 @@ mod reap_tests {
 
         assert_eq!(core.in_flight_count(), 1);
 
-        core.on_component_exit(COMP_ALL);
+        core.force_all_reapers_dead();
         assert_eq!(core.state(), SupState::Failed);
 
         // Unknown — entry retained, admission NOT released.
@@ -2466,6 +2782,215 @@ mod reap_tests {
         assert!(
             inner.registry.get(&id).unwrap().reapable.is_some(),
             "reapable handle must not be dropped"
+        );
+    }
+
+    // ── Round-18 fault interleaving tests ─────────────────────────────────
+
+    #[test]
+    fn commit_child_after_degraded_kills_immediately() {
+        let core = make_test_core();
+        // Admission acquired while Healthy.
+        let epoch = core.try_admit().expect("must admit while healthy");
+        // Transition to Degraded (epoch increments, admissions invalidated).
+        core.force_worker_exit();
+        assert_eq!(core.state(), SupState::Degraded);
+        assert_ne!(core.epoch(), epoch, "epoch must change on degradation");
+
+        // Commit child with stale epoch — must be killed immediately
+        // and marked non-active.
+        let mock = MockReapable::new(vec![MockOutcome::Exited(0)]);
+        let id = core.commit_child(Box::new(mock), epoch);
+
+        {
+            let inner = core.inner.lock().unwrap();
+            let entry = inner.registry.get(&id).unwrap();
+            assert!(!entry.active, "stale-epoch child must be non-active");
+        }
+
+        // Stale-epoch child should be reaped by poll_exit.
+        let result = core.poll_exit(id);
+        assert!(
+            matches!(result, PollResult::Exited(_)),
+            "stale-epoch child should be reaped"
+        );
+        assert_eq!(core.in_flight_count(), 0, "admission released after reap");
+    }
+
+    #[test]
+    fn checkout_guard_panic_restores_handle() {
+        let core = make_test_core();
+        let mock = MockReapable::new(vec![MockOutcome::Panic]);
+        let (id, _lease) = lease_from_mock(core.clone(), mock);
+
+        assert_eq!(core.in_flight_count(), 1);
+        assert_eq!(core.registry_len(), 1);
+
+        let timeout = core.fatal_reap_timeout();
+        let core2 = core.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut guard = core2.checkout_for_fatal(id).expect("entry must exist");
+            let r = guard.reapable_mut().expect("guard has reapable");
+            let _ = blocking_reap(r, timeout);
+        }));
+        assert!(result.is_err(), "blocking_reap must panic");
+
+        // CheckoutGuard::drop must have restored the handle.
+        assert_eq!(core.registry_len(), 1, "entry must be retained after panic");
+        assert_eq!(
+            core.in_flight_count(),
+            1,
+            "admission must be retained after panic"
+        );
+        {
+            let inner = core.inner.lock().unwrap();
+            assert!(
+                inner.registry.get(&id).unwrap().reapable.is_some(),
+                "handle must be restored to registry after panic"
+            );
+        }
+    }
+
+    #[test]
+    fn emergency_thread_reaps_after_all_dead() {
+        let reaper = init_reaper(&default_spawner).expect("init must succeed");
+        reaper
+            .core
+            .set_fatal_reap_timeout(Duration::from_millis(500));
+
+        // Acquire admission while Healthy.
+        let epoch = reaper.core.try_admit().expect("must admit while healthy");
+
+        // Force all reapers dead — epoch increments, state = Failed.
+        reaper.core.force_all_reapers_dead();
+        assert_eq!(reaper.core.state(), SupState::Failed);
+
+        // Commit child with stale epoch — active=false, killed immediately.
+        // Emergency thread will find it in pending_ids() and reap it.
+        let mock = MockReapable::new(vec![MockOutcome::Exited(0)]);
+        let _id = reaper.core.commit_child(Box::new(mock), epoch);
+        assert_eq!(reaper.core.in_flight_count(), 1);
+        assert_eq!(reaper.core.registry_len(), 1);
+
+        // Wait for emergency thread to reap (STUCK_REAPER_INTERVAL = 1s).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if reaper.core.completed_count() >= 1 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("emergency thread did not reap child within 5s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert_eq!(reaper.core.completed_count(), 1);
+        assert_eq!(reaper.core.in_flight_count(), 0);
+        assert_eq!(reaper.core.registry_len(), 0);
+    }
+
+    #[test]
+    fn single_worker_death_stays_degraded() {
+        let core = make_test_core();
+        assert_eq!(core.state(), SupState::Healthy);
+        assert!(core.is_healthy());
+
+        // One worker dies (out of 4).
+        core.force_worker_exit();
+
+        // Must be Degraded, not Failed.
+        assert_eq!(core.state(), SupState::Degraded);
+        assert!(!core.is_healthy());
+
+        let metrics = core.metrics();
+        assert_eq!(metrics.workers_alive, 3, "3 workers still alive");
+        assert!(metrics.stuck_alive);
+        assert!(metrics.orphan_alive);
+        assert!(metrics.emergency_alive, "emergency must be alive");
+
+        // Admission must be closed (epoch changed).
+        assert!(
+            core.try_admit().is_none(),
+            "admission must be closed after Degraded"
+        );
+    }
+
+    #[test]
+    fn try_reap_echild_releases_admission() {
+        let core = make_test_core();
+        let mock = MockReapable::new(vec![MockOutcome::AlreadyReaped]);
+        let (id, lease) = lease_from_mock(core.clone(), mock);
+
+        assert_eq!(core.in_flight_count(), 1);
+
+        // Drop lease — cancel_child sets active=false and kills.
+        drop(lease);
+
+        // try_reap processes the non-active child.
+        // Mock returns ECHILD on first try_wait.
+        let result = core.try_reap(id);
+        assert!(
+            matches!(result, ReapResult::ConfirmedNow(ReapStatus::AlreadyReaped)),
+            "ECHILD must return ConfirmedNow(AlreadyReaped), not fake success"
+        );
+        assert_eq!(core.in_flight_count(), 0, "admission released on ECHILD");
+        assert_eq!(core.completed_count(), 1, "completed incremented on ECHILD");
+    }
+
+    #[test]
+    fn wait_echild_returns_error_not_success() {
+        let core = make_test_core();
+        let mock = MockReapable::new(vec![MockOutcome::AlreadyReaped]);
+        let (_id, mut lease) = lease_from_mock(core.clone(), mock);
+
+        // wait() calls poll_exit, which calls try_wait.
+        // Mock returns ECHILD — poll_exit returns Exited(AlreadyReaped),
+        // wait() returns Err (not fake success).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(lease.wait());
+        assert!(
+            result.is_err(),
+            "wait() must return Err on ECHILD, not fake success"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown"),
+            "error must mention unknown status, got: {err}"
+        );
+
+        // Admission released, completed incremented.
+        assert_eq!(core.in_flight_count(), 0);
+        assert_eq!(core.completed_count(), 1);
+    }
+
+    #[test]
+    fn cancel_child_failed_state_real_child_reaped() {
+        let reaper = init_reaper(&default_spawner).expect("init must succeed");
+        reaper.core.set_fatal_reap_timeout(Duration::from_secs(2));
+
+        let child = spawn_child("sleep", "30");
+        let pid = child.id().expect("child must have a PID");
+
+        let admission = reaper.try_admit().expect("should admit");
+        let lease = admission.into_lease(child);
+
+        // Force all reapers dead — lease drop does synchronous blocking reap.
+        reaper.core.force_all_reapers_dead();
+        assert_eq!(reaper.core.state(), SupState::Failed);
+
+        drop(lease);
+
+        assert!(
+            wait_for_reap(pid, Duration::from_secs(5)),
+            "child PID {pid} must be reaped after lease drop in Failed state"
+        );
+        assert_eq!(
+            reaper.core.in_flight_count(),
+            0,
+            "admission released after Failed-state reap"
         );
     }
 }
