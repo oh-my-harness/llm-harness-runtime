@@ -8,15 +8,21 @@
 use llm_harness_types::{EnvError, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 use std::os::unix::process::ExitStatusExt;
 
-/// Create an `ExitStatus` from a raw exit code.  Unix-only — on other
-/// platforms this is unreachable (ECHILD = -1 never matches).
-#[cfg(unix)]
-#[allow(dead_code)]
+#[cfg(all(test, windows))]
+use std::os::windows::process::ExitStatusExt;
+
+/// Create an `ExitStatus` from a raw exit code for deterministic mocks.
+#[cfg(all(test, unix))]
 fn exit_status_from_raw(code: i32) -> std::process::ExitStatus {
     std::process::ExitStatus::from_raw(code)
+}
+
+#[cfg(all(test, windows))]
+fn exit_status_from_raw(code: i32) -> std::process::ExitStatus {
+    std::process::ExitStatus::from_raw(code as u32)
 }
 
 /// Find the index of the last complete UTF-8 character boundary in `bytes`.
@@ -850,31 +856,31 @@ impl SupervisorCore {
         }
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn registry_len(&self) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.registry.len()
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn in_flight_count(&self) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.in_flight
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn completed_count(&self) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.completed
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn state(&self) -> SupState {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.state
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     #[allow(dead_code)]
     fn workers_alive(&self) -> usize {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -887,20 +893,20 @@ impl SupervisorCore {
         inner.fatal_reap_timeout
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     #[allow(dead_code)]
     fn set_fatal_reap_timeout(&self, timeout: std::time::Duration) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.fatal_reap_timeout = timeout;
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn epoch(&self) -> Epoch {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.epoch
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn force_worker_exit(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.liveness.workers_alive > 0 {
@@ -910,7 +916,7 @@ impl SupervisorCore {
         inner.state.transition_to(SupState::Degraded);
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn force_all_reapers_dead(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.liveness.workers_alive = 0;
@@ -920,7 +926,7 @@ impl SupervisorCore {
         inner.state.transition_to(SupState::Failed);
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     fn all_ids(&self) -> Vec<ChildId> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.registry.keys().copied().collect()
@@ -1145,12 +1151,24 @@ impl Drop for LivenessGuard {
 // ── Metrics ───────────────────────────────────────────────────────────────
 
 /// Snapshot of reaper state for observability.
+///
+/// # Compatibility
+///
+/// Adding a field to this public struct is source-incompatible for downstream
+/// exhaustive struct literals and patterns. The `reap_panics` field is an
+/// intentional pre-1.0 API change; consumers that need forward compatibility
+/// should read fields individually and use `..` in patterns.
 #[derive(Debug)]
 pub struct ReaperMetrics {
     pub in_flight: usize,
     pub admitted: usize,
     pub completed: usize,
+    /// Component-thread exits observed by their liveness guards.
     pub component_failures: usize,
+    /// Panics caught and contained by the emergency reap loop.
+    ///
+    /// This excludes panics that terminate worker, stuck, orphan, or emergency
+    /// components; those exits are reflected in `component_failures` instead.
     pub reap_panics: usize,
     pub registry_len: usize,
     pub healthy: bool,
@@ -1735,21 +1753,27 @@ pub fn drain_child_output_guarded(
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod reap_tests {
     use super::*;
+    #[cfg(unix)]
     use llm_harness_types::ShellOptions;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+    #[cfg(unix)]
     use tokio_util::sync::CancellationToken;
 
     // ── Test helpers ──────────────────────────────────────────────────────
 
+    const TEST_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[cfg(unix)]
     fn process_is_gone(pid: u32) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/status")).is_err()
     }
 
+    #[cfg(unix)]
     fn wait_for_reap(pid: u32, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         while std::time::Instant::now() < deadline {
@@ -1761,6 +1785,7 @@ mod reap_tests {
         false
     }
 
+    #[cfg(unix)]
     fn spawn_child(cmd: &str, arg: &str) -> tokio::process::Child {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1776,6 +1801,7 @@ mod reap_tests {
         })
     }
 
+    #[cfg(unix)]
     fn test_opts() -> ShellOptions<'static> {
         ShellOptions {
             cwd: None,
@@ -1883,11 +1909,14 @@ mod reap_tests {
 
     struct PanicOnceThenExit {
         trace: Arc<AttemptTrace>,
-        first_attempt: Option<Arc<std::sync::Barrier>>,
+        first_attempt: Option<std::sync::mpsc::Sender<()>>,
     }
 
     impl PanicOnceThenExit {
-        fn new(trace: Arc<AttemptTrace>, first_attempt: Option<Arc<std::sync::Barrier>>) -> Self {
+        fn new(
+            trace: Arc<AttemptTrace>,
+            first_attempt: Option<std::sync::mpsc::Sender<()>>,
+        ) -> Self {
             Self {
                 trace,
                 first_attempt,
@@ -1904,12 +1933,32 @@ mod reap_tests {
             let attempt = self.trace.record_attempt();
             if attempt == 0 {
                 self.trace.panics.fetch_add(1, Ordering::SeqCst);
-                if let Some(barrier) = &self.first_attempt {
-                    barrier.wait();
+                if let Some(sender) = &self.first_attempt {
+                    let _ = sender.send(());
                 }
                 panic!("injected first-attempt panic");
             }
             Ok(Some(exit_status_from_raw(0)))
+        }
+    }
+
+    struct PanicUntilExitAllowed {
+        trace: Arc<AttemptTrace>,
+        exit_allowed: Arc<AtomicBool>,
+    }
+
+    impl Reapable for PanicUntilExitAllowed {
+        fn start_kill(&mut self) {
+            self.trace.killed.store(true, Ordering::SeqCst);
+        }
+
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            self.trace.record_attempt();
+            if self.exit_allowed.load(Ordering::SeqCst) {
+                return Ok(Some(exit_status_from_raw(0)));
+            }
+            self.trace.panics.fetch_add(1, Ordering::SeqCst);
+            panic!("injected persistent panic");
         }
     }
 
@@ -1931,8 +1980,8 @@ mod reap_tests {
 
     struct ExitWhenReleased {
         trace: Arc<AttemptTrace>,
-        entered: Arc<std::sync::Barrier>,
-        release: Arc<std::sync::Barrier>,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
     }
 
     impl Reapable for ExitWhenReleased {
@@ -1942,9 +1991,36 @@ mod reap_tests {
 
         fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
             self.trace.record_attempt();
-            self.entered.wait();
-            self.release.wait();
+            self.entered
+                .send(())
+                .expect("test observer dropped before entry notification");
+            self.release
+                .recv_timeout(TEST_SYNC_TIMEOUT)
+                .expect("test release timed out or disconnected");
             Ok(Some(exit_status_from_raw(0)))
+        }
+    }
+
+    #[derive(Default)]
+    struct TimedGate {
+        open: std::sync::Mutex<bool>,
+        changed: std::sync::Condvar,
+    }
+
+    impl TimedGate {
+        fn wait(&self, timeout: Duration) -> bool {
+            let open = self.open.lock().unwrap_or_else(|error| error.into_inner());
+            let (open, _) = self
+                .changed
+                .wait_timeout_while(open, timeout, |open| !*open)
+                .unwrap_or_else(|error| error.into_inner());
+            *open
+        }
+
+        fn open(&self) {
+            let mut open = self.open.lock().unwrap_or_else(|error| error.into_inner());
+            *open = true;
+            self.changed.notify_all();
         }
     }
 
@@ -2010,41 +2086,38 @@ mod reap_tests {
         let count = Arc::new(AtomicUsize::new(0));
         let tracker = Arc::new(ThreadTracker::default());
         let spawner_tracker = tracker.clone();
-        let spawner = move |name: &str,
-                            f: SpawnFn|
-              -> Result<std::thread::JoinHandle<()>, std::io::Error> {
-            let n = count.fetch_add(1, Ordering::SeqCst);
-            if n == fail_at {
-                return Err(std::io::Error::other("injected spawn failure"));
-            }
+        let spawner =
+            move |name: &str, f: SpawnFn| -> Result<std::thread::JoinHandle<()>, std::io::Error> {
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                if n == fail_at {
+                    return Err(std::io::Error::other("injected spawn failure"));
+                }
 
-            let tracker = spawner_tracker.clone();
-            let entered = Arc::new(std::sync::Barrier::new(2));
-            let thread_entered = entered.clone();
-            let handle = std::thread::Builder::new()
-                .name(name.to_string())
-                .spawn(move || {
-                    let _active = ActiveThreadGuard::enter(tracker);
-                    thread_entered.wait();
-                    f();
-                })?;
-            entered.wait();
-            Ok(handle)
-        };
+                let tracker = spawner_tracker.clone();
+                std::thread::Builder::new()
+                    .name(name.to_string())
+                    .spawn(move || {
+                        let _active = ActiveThreadGuard::enter(tracker);
+                        f();
+                    })
+            };
         (Box::new(spawner), tracker)
     }
 
     fn make_scanner_gated_spawner(
-        release_scanners: Arc<AtomicBool>,
+        scanner_gate: Arc<TimedGate>,
     ) -> impl Fn(&str, SpawnFn) -> Result<std::thread::JoinHandle<()>, std::io::Error> + Sync {
         move |name: &str, f: SpawnFn| {
-            let gate = release_scanners.clone();
+            let gate = scanner_gate.clone();
             let is_scanner = name == "child-reaper-stuck" || name == "child-reaper-orphan";
             std::thread::Builder::new()
                 .name(name.to_string())
                 .spawn(move || {
-                    while is_scanner && !gate.load(Ordering::SeqCst) {
-                        std::thread::sleep(Duration::from_millis(1));
+                    if is_scanner {
+                        assert!(
+                            gate.wait(TEST_SYNC_TIMEOUT),
+                            "scanner gate was not opened before its deadline"
+                        );
                     }
                     f();
                 })
@@ -2064,9 +2137,11 @@ mod reap_tests {
         controller_epoch: Epoch,
     ) -> Arc<AttemptTrace> {
         let trace = Arc::new(AttemptTrace::default());
+        let exit_allowed = Arc::new(AtomicBool::new(false));
         let controller_id = reaper.core.commit_child(
-            Box::new(AlwaysPanic {
+            Box::new(PanicUntilExitAllowed {
                 trace: trace.clone(),
+                exit_allowed: exit_allowed.clone(),
             }),
             controller_epoch,
         );
@@ -2102,17 +2177,19 @@ mod reap_tests {
         assert!(names.iter().any(|name| name == "child-reaper-stuck"));
         assert!(names.iter().any(|name| name == "child-reaper-orphan"));
 
+        exit_allowed.store(true, Ordering::SeqCst);
         wait_until(
-            Duration::from_secs(5),
-            "could not check out takeover controller from emergency owner",
-            || {
-                if let Some(guard) = reaper.core.checkout_for_fatal(controller_id) {
-                    guard.consume(ReapStatus::Exited(exit_status_from_raw(0)));
-                    true
-                } else {
-                    false
-                }
-            },
+            Duration::from_secs(10),
+            "emergency owner did not naturally reap the released controller",
+            || reaper.core.completed_count() == 1,
+        );
+        assert_eq!(reaper.core.registry_len(), 0);
+        assert!(
+            trace
+                .thread_names()
+                .last()
+                .is_some_and(|name| name == "child-reaper-emergency"),
+            "released controller did not complete on the emergency thread"
         );
         trace
     }
@@ -2141,6 +2218,7 @@ mod reap_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn classify_wait_already_reaped() {
         assert!(matches!(
             classify_wait(Err(std::io::Error::from_raw_os_error(ECHILD))),
@@ -2592,6 +2670,7 @@ mod reap_tests {
     // ── Real child PID tests (integration) ────────────────────────────────
 
     #[test]
+    #[cfg(unix)]
     fn lease_reaps_without_runtime() {
         let child = spawn_child("sleep", "30");
         let pid = child.id().expect("child must have a PID");
@@ -2606,6 +2685,7 @@ mod reap_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unpolled_future_still_reaps_child() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2637,6 +2717,7 @@ mod reap_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn lease_reaps_during_runtime_shutdown() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2667,6 +2748,7 @@ mod reap_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn lease_reaps_with_runtime_alive() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2696,6 +2778,7 @@ mod reap_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn kill_and_wait_marks_confirmed() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2731,6 +2814,7 @@ mod reap_tests {
     // ── Cancellation storm: bounded resources ─────────────────────────────
 
     #[test]
+    #[cfg(unix)]
     fn cancellation_storm_stays_bounded() {
         let reaper = ChildReaper::global().expect("global reaper");
 
@@ -2773,6 +2857,7 @@ mod reap_tests {
     // ── Global reaper: stuck scheduler reaps ──────────────────────────────
 
     #[test]
+    #[cfg(unix)]
     fn global_reaper_reaps_registered_child() {
         let reaper = ChildReaper::global().expect("global reaper");
 
@@ -3179,6 +3264,7 @@ mod reap_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn try_reap_echild_releases_admission() {
         let core = make_test_core();
         let mock = MockReapable::new(vec![MockOutcome::AlreadyReaped]);
@@ -3201,6 +3287,7 @@ mod reap_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn wait_echild_returns_error_not_success() {
         let core = make_test_core();
         let mock = MockReapable::new(vec![MockOutcome::AlreadyReaped]);
@@ -3230,6 +3317,7 @@ mod reap_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn cancel_child_failed_state_real_child_reaped() {
         let reaper = init_reaper(&default_spawner).expect("init must succeed");
         reaper.core.set_fatal_reap_timeout(Duration::from_secs(2));
@@ -3320,22 +3408,26 @@ mod reap_tests {
         );
 
         let normal_trace = Arc::new(AttemptTrace::default());
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         reaper.core.commit_child(
             Box::new(ExitWhenReleased {
                 trace: normal_trace.clone(),
-                entered: entered.clone(),
-                release: release.clone(),
+                entered: entered_tx,
+                release: release_rx,
             }),
             normal_epoch,
         );
-        entered.wait();
+        entered_rx
+            .recv_timeout(TEST_SYNC_TIMEOUT)
+            .expect("normal child was not attempted before deadline");
         assert_eq!(
             normal_trace.thread_names(),
             vec!["child-reaper-emergency".to_string()]
         );
-        release.wait();
+        release_tx
+            .send(())
+            .expect("normal child release receiver dropped");
 
         wait_until(
             Duration::from_secs(10),
@@ -3384,26 +3476,28 @@ mod reap_tests {
 
     #[test]
     fn real_worker_panic_degrades_and_child_eventually_reaped() {
-        let release_scanners = Arc::new(AtomicBool::new(false));
-        let spawner = make_scanner_gated_spawner(release_scanners.clone());
+        let scanner_gate = Arc::new(TimedGate::default());
+        let spawner = make_scanner_gated_spawner(scanner_gate.clone());
         let reaper = init_reaper(&spawner).expect("init must succeed");
         reaper
             .core
             .set_fatal_reap_timeout(Duration::from_millis(500));
 
         let epoch = reaper.core.try_admit().expect("must admit while healthy");
-        let first_attempt = Arc::new(std::sync::Barrier::new(2));
+        let (first_attempt_tx, first_attempt_rx) = std::sync::mpsc::channel();
         let trace = Arc::new(AttemptTrace::default());
         let id = reaper.core.commit_child(
             Box::new(PanicOnceThenExit::new(
                 trace.clone(),
-                Some(first_attempt.clone()),
+                Some(first_attempt_tx),
             )),
             epoch,
         );
         ChildLease::cancel_child_with_core(&reaper.core, id);
-        first_attempt.wait();
-        release_scanners.store(true, Ordering::SeqCst);
+        first_attempt_rx
+            .recv_timeout(TEST_SYNC_TIMEOUT)
+            .expect("worker did not reach injected panic before deadline");
+        scanner_gate.open();
 
         wait_until(Duration::from_secs(5), "worker did not panic", || {
             reaper.metrics().component_failures == 1
@@ -3433,8 +3527,8 @@ mod reap_tests {
 
     #[test]
     fn epoch_fencing_rejects_stale_admission_after_real_worker_panic() {
-        let release_scanners = Arc::new(AtomicBool::new(false));
-        let spawner = make_scanner_gated_spawner(release_scanners.clone());
+        let scanner_gate = Arc::new(TimedGate::default());
+        let spawner = make_scanner_gated_spawner(scanner_gate.clone());
         let reaper = init_reaper(&spawner).expect("init must succeed");
         reaper
             .core
@@ -3442,18 +3536,20 @@ mod reap_tests {
 
         let stale_epoch = reaper.core.try_admit().expect("stale admission");
         let trigger_epoch = reaper.core.try_admit().expect("trigger admission");
-        let first_attempt = Arc::new(std::sync::Barrier::new(2));
+        let (first_attempt_tx, first_attempt_rx) = std::sync::mpsc::channel();
         let trigger_trace = Arc::new(AttemptTrace::default());
         let trigger_id = reaper.core.commit_child(
             Box::new(PanicOnceThenExit::new(
                 trigger_trace,
-                Some(first_attempt.clone()),
+                Some(first_attempt_tx),
             )),
             trigger_epoch,
         );
         ChildLease::cancel_child_with_core(&reaper.core, trigger_id);
-        first_attempt.wait();
-        release_scanners.store(true, Ordering::SeqCst);
+        first_attempt_rx
+            .recv_timeout(TEST_SYNC_TIMEOUT)
+            .expect("worker did not reach epoch-trigger panic before deadline");
+        scanner_gate.open();
         wait_until(
             Duration::from_secs(5),
             "worker fault did not advance epoch",
@@ -3463,20 +3559,24 @@ mod reap_tests {
         assert_eq!(reaper.core.epoch(), stale_epoch + 1);
 
         let target_trace = Arc::new(AttemptTrace::default());
-        let entered = Arc::new(std::sync::Barrier::new(2));
-        let release = Arc::new(std::sync::Barrier::new(2));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         reaper.core.commit_child(
             Box::new(ExitWhenReleased {
                 trace: target_trace.clone(),
-                entered: entered.clone(),
-                release: release.clone(),
+                entered: entered_tx,
+                release: release_rx,
             }),
             stale_epoch,
         );
-        entered.wait();
+        entered_rx
+            .recv_timeout(TEST_SYNC_TIMEOUT)
+            .expect("stale-epoch target was not attempted before deadline");
         assert!(target_trace.killed.load(Ordering::SeqCst));
         assert_ne!(target_trace.thread_names()[0], "child-reaper-emergency");
-        release.wait();
+        release_tx
+            .send(())
+            .expect("stale-epoch target release receiver dropped");
         wait_until(
             Duration::from_secs(5),
             "stale-epoch target was not reaped by a surviving normal component",
