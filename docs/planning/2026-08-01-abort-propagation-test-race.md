@@ -1,6 +1,6 @@
 # Abort Propagation Test Race Progress
 
-Updated: 2026-08-01 10:54 +08:00
+Updated: 2026-08-01 11:17 +08:00
 Task: Remove the test-only race between sub-agent slot reservation and actual BlockingTool entry.
 
 ## Plan
@@ -19,6 +19,16 @@ Task: Remove the test-only race between sub-agent slot reservation and actual Bl
 - Do not change reaper architecture or production abort lifecycle logic.
 - Do not use added sleeps or enlarged timeouts to hide ordering races.
 - Treat `in_flight` as capacity/accounting state, not proof of tool execution.
+
+## Review Follow-up
+
+- [x] Require all three main prompt tasks to join successfully within a fixed
+  deadline, distinguishing timeout, `JoinError`, and inner `HarnessError`.
+- [x] In the future-spawn test, prove the first main round consumed its terminal
+  response before aborting the still-running asynchronous sub-agent.
+- [x] Bound the second prompt and enforce exact main/sub-agent LLM call counts.
+- [~] Repeat focused and parallel workspace validation, then commit and push the
+  narrow test-only follow-up.
 
 ## Progress Log
 
@@ -43,3 +53,20 @@ Task: Remove the test-only race between sub-agent slot reservation and actual Bl
   3/3 runs in 59.11, 57.05, and 56.94 seconds.
 - 2026-08-01 10:54 +08:00 - Committed and pushed the isolated test fix to
   `main` as `4cf9fb2`. No production, reaper, or API boundary file changed.
+- 2026-08-01 11:10 +08:00 - Accepted follow-up review: tool entry proves the
+  first sub-agent response was consumed but not that the first main prompt
+  consumed its terminal text. Also confirmed all three tests discard their
+  main task's nested result and the second prompt has no deadline. Started a
+  narrow ordering and error-propagation fix; production code remains out of
+  scope.
+- 2026-08-01 11:12 +08:00 - Added bounded helpers that distinguish prompt
+  timeout, task `JoinError`, and inner `HarnessError`; all three main tasks must
+  now finish normally before abort. The future-spawn test proves the first main
+  round consumed exactly two responses and returned to Idle while one sub-agent
+  remains in flight, bounds the second prompt, then requires exactly four main
+  and two sub-agent LLM calls. The focused test binary passes.
+- 2026-08-01 11:17 +08:00 - Follow-up Windows validation passed: the target
+  future-spawn test passed 50/50 repetitions; the complete abort propagation
+  binary passed 20/20 default-parallel repetitions (60 test executions);
+  format and strict workspace Clippy passed; and the full default-parallel
+  workspace suite passed 3/3 runs in 67.11, 56.56, and 56.87 seconds.

@@ -7,6 +7,7 @@
 //! - 测试通过独立 entry signal 确认 sub-agent 已进入 BlockingTool，再触发
 //!   主 agent abort；sub-agent join 返回 `Err(Aborted)`，in_flight 因 abort 归零。
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,10 +19,11 @@ use llm_harness_runtime::spawn::message_bus::message_bus_pair;
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_runtime::spawn::tools::SpawnAgentTool;
 use llm_harness_runtime_sandbox_os::{OsEnv, OsEnvFactory};
-use llm_harness_types::{ExecutionEnv, HarnessPhase};
+use llm_harness_types::{ExecutionEnv, HarnessError, HarnessPhase};
 use tokio::sync::Notify;
 
 const TOOL_ENTRY_TIMEOUT: Duration = Duration::from_secs(2);
+const PROMPT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 一个长跑 tool：sleep 直到完成或被 abort。
 /// 用于让 sub-agent 在 tool 执行阶段阻塞，使 abort 可在 sub-agent in-flight 时触发。
@@ -96,6 +98,30 @@ async fn wait_for_blocking_tool_entry(entered: &Notify) {
         .await
         .expect("sub-agent did not enter BlockingTool before the deadline");
 }
+
+async fn expect_prompt_task_success(
+    task: tokio::task::JoinHandle<Result<(), HarnessError>>,
+    context: &str,
+) {
+    match tokio::time::timeout(PROMPT_COMPLETION_TIMEOUT, task).await {
+        Err(_) => panic!("{context} timed out"),
+        Ok(Err(error)) => panic!("{context} task failed to join: {error}"),
+        Ok(Ok(Err(error))) => panic!("{context} returned HarnessError: {error}"),
+        Ok(Ok(Ok(()))) => {}
+    }
+}
+
+async fn expect_prompt_success(
+    prompt: impl Future<Output = Result<(), HarnessError>>,
+    context: &str,
+) {
+    match tokio::time::timeout(PROMPT_COMPLETION_TIMEOUT, prompt).await {
+        Err(_) => panic!("{context} timed out"),
+        Ok(Err(error)) => panic!("{context} returned HarnessError: {error}"),
+        Ok(Ok(())) => {}
+    }
+}
+
 /// 场景：主 agent spawn 异步 sub-agent（sub-agent 在 BlockingTool 中阻塞），
 /// 主 agent abort → sub-agent 的 abort token 被 cancel → BlockingTool 返回 Aborted →
 /// sub-agent 终止。断言：abort 后 sub-agent 在短时间内终止（in_flight 归零），
@@ -172,10 +198,10 @@ async fn abort_cancels_inflight_subagent() {
         1,
         "sub-agent should be in-flight (blocked in tool)"
     );
+    expect_prompt_task_success(main_task, "main prompt before abort cascade").await;
 
     // abort 主 agent —— 应级联取消 sub-agent
     harness.abort();
-    let _ = main_task.await;
 
     // sub-agent 被 cancel 后 BlockingTool 返回 Aborted，sub-agent 终止，in_flight 归零。
     // 这必须在远短于 30s（BlockingTool 的 sleep）的时间内发生，证明是 cancel 而非完成。
@@ -196,8 +222,8 @@ async fn abort_cancels_inflight_subagent() {
     );
 }
 
-/// 场景：abort 级联取消当前 in-flight sub-agent 后，再次 prompt + spawn 应正常工作。
-/// 证明级联只杀"当前这批"，不影响 registry 后续使用。
+/// 场景：主轮次正常结束、异步 sub-agent 仍阻塞在 tool 中时执行 abort，随后再次
+/// prompt + spawn。证明级联只取消当前 in-flight sub-agent，不污染后续 spawn。
 #[tokio::test]
 async fn abort_does_not_affect_future_spawns() {
     let tool_entered = Arc::new(Notify::new());
@@ -283,10 +309,27 @@ async fn abort_does_not_affect_future_spawns() {
         1,
         "first sub-agent should be in-flight"
     );
+    expect_prompt_task_success(main_task, "first main prompt").await;
+    assert_eq!(
+        harness.state().phase,
+        HarnessPhase::Idle,
+        "first main round should finish before abort"
+    );
+    assert_eq!(
+        main_client
+            .call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "first main round should consume spawn plus terminal text"
+    );
+    assert_eq!(
+        registry.in_flight_count(),
+        1,
+        "first sub-agent should still be running after the main round ends"
+    );
 
-    // abort —— 取消第一个 sub-agent
+    // 主轮次已经结束，但第一个 sub-agent 仍在 tool 中；abort 只取消它。
     harness.abort();
-    let _ = main_task.await;
 
     // 等待第一个 sub-agent 终止
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -306,10 +349,18 @@ async fn abort_does_not_affect_future_spawns() {
     );
 
     // 第二轮：再次 prompt，spawn 第二个 sub-agent（快，直接返回文本）
-    harness
-        .prompt("please spawn another sub-agent")
-        .await
-        .unwrap();
+    expect_prompt_success(
+        harness.prompt("please spawn another sub-agent"),
+        "second main prompt",
+    )
+    .await;
+    assert_eq!(
+        main_client
+            .call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "second main round should consume the second spawn plus terminal text"
+    );
 
     // 第二个 sub-agent 应正常完成（in_flight 归零因完成而非取消）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -328,13 +379,13 @@ async fn abort_does_not_affect_future_spawns() {
         "second sub-agent should have completed normally"
     );
 
-    // 第二个 sub-agent 的 LLM 被调用了（call_count >= 2：第一个 block_forever + 第二个 text）
+    // 恰好两次：第一个 block_forever + 第二个 text。重复调用也应失败。
     let sub_calls = sub_client
         .call_count
         .load(std::sync::atomic::Ordering::SeqCst);
-    assert!(
-        sub_calls >= 2,
-        "second sub-agent should have run its LLM, but call_count={sub_calls}"
+    assert_eq!(
+        sub_calls, 2,
+        "sub-agents should consume exactly two responses"
     );
 }
 
@@ -432,11 +483,11 @@ async fn idle_watcher_abort() {
         HarnessPhase::Idle,
         "main agent should be idle before testing watcher cancellation"
     );
+    expect_prompt_task_success(main_task, "idle-watcher main prompt").await;
 
     // 此时主 agent 在 Idle（spawn tool 返回后 LLM 第二 turn 无响应 → Idle）
     // watcher 正在监听 completion channel。abort 应 cancel watcher + sub-agent。
     harness.abort();
-    let _ = main_task.await;
 
     // 等待 sub-agent 终止
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
