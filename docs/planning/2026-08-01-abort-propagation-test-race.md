@@ -1,6 +1,6 @@
 # Abort Propagation Test Race Progress
 
-Updated: 2026-08-01 11:38 +08:00
+Updated: 2026-08-01 11:39 +08:00
 Task: Remove the test-only race between sub-agent slot reservation and actual BlockingTool entry.
 
 ## Plan
@@ -80,7 +80,7 @@ Task: Remove the test-only race between sub-agent slot reservation and actual Bl
   signals in `abort_cancels_inflight_subagent` only.
 - [x] Prove `Turning` plus one in-flight sub-agent before abort, then use the
   bounded join helper and assert both paths settle with exact call counts.
-- [~] Repeat focused stress, strict Clippy, and Windows parallel workspace
+- [x] Repeat focused stress, strict Clippy, and Windows parallel workspace
   validation; commit and push the final test-only follow-up.
 
 ## Active-Run Progress Log
@@ -100,3 +100,5 @@ Task: Remove the test-only race between sub-agent slot reservation and actual Bl
   20/20 default-parallel repetitions (60 test executions); format and strict
   workspace Clippy passed; and the full default-parallel workspace suite passed
   3/3 runs in 58.24, 55.90, and 57.55 seconds.
+- 2026-08-01 11:39 +08:00 - Committed and pushed the active-run coverage fix to
+  `main` as `53a7116`. No production file changed.
