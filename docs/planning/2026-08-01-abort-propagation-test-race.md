@@ -1,6 +1,6 @@
 # Abort Propagation Test Race Progress
 
-Updated: 2026-08-01 11:17 +08:00
+Updated: 2026-08-01 11:18 +08:00
 Task: Remove the test-only race between sub-agent slot reservation and actual BlockingTool entry.
 
 ## Plan
@@ -27,7 +27,7 @@ Task: Remove the test-only race between sub-agent slot reservation and actual Bl
 - [x] In the future-spawn test, prove the first main round consumed its terminal
   response before aborting the still-running asynchronous sub-agent.
 - [x] Bound the second prompt and enforce exact main/sub-agent LLM call counts.
-- [~] Repeat focused and parallel workspace validation, then commit and push the
+- [x] Repeat focused and parallel workspace validation, then commit and push the
   narrow test-only follow-up.
 
 ## Progress Log
@@ -70,3 +70,6 @@ Task: Remove the test-only race between sub-agent slot reservation and actual Bl
   binary passed 20/20 default-parallel repetitions (60 test executions);
   format and strict workspace Clippy passed; and the full default-parallel
   workspace suite passed 3/3 runs in 67.11, 56.56, and 56.87 seconds.
+- 2026-08-01 11:18 +08:00 - Committed and pushed the ordering follow-up to
+  `main` as `47fd359`. The commit changes only the abort propagation test and
+  this progress record.
