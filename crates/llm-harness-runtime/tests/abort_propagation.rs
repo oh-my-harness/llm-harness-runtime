@@ -96,7 +96,7 @@ impl Plugin for BlockingToolPlugin {
 async fn wait_for_blocking_tool_entry(entered: &Notify) {
     tokio::time::timeout(TOOL_ENTRY_TIMEOUT, entered.notified())
         .await
-        .expect("sub-agent did not enter BlockingTool before the deadline");
+        .expect("BlockingTool was not entered before the deadline");
 }
 
 async fn expect_prompt_task_success(
@@ -122,18 +122,21 @@ async fn expect_prompt_success(
     }
 }
 
-/// 场景：主 agent spawn 异步 sub-agent（sub-agent 在 BlockingTool 中阻塞），
-/// 主 agent abort → sub-agent 的 abort token 被 cancel → BlockingTool 返回 Aborted →
-/// sub-agent 终止。断言：abort 后 sub-agent 在短时间内终止（in_flight 归零），
-/// 远短于 30s sleep，证明是 cancel 而非自然完成。
+/// 场景：主 agent spawn 异步 sub-agent 后，主、子 agent 分别阻塞在独立的
+/// BlockingTool 中。此时 abort 同时取消 active main run 和 in-flight sub-agent。
+/// 断言：两条执行路径都在远短于 30s sleep 的时间内终止。
 #[tokio::test]
 async fn abort_cancels_inflight_subagent() {
-    let tool_entered = Arc::new(Notify::new());
-    let main_client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
-        "call_1",
-        "spawn_agent",
-        r#"{"prompt":"compute","wait":false}"#,
-    )]));
+    let main_tool_entered = Arc::new(Notify::new());
+    let sub_tool_entered = Arc::new(Notify::new());
+    let main_client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::tool_use(
+            "call_1",
+            "spawn_agent",
+            r#"{"prompt":"compute","wait":false}"#,
+        ),
+        MockResponse::tool_use("call_2", "block_forever", "{}"),
+    ]));
 
     // sub-agent：第一条响应调用 block_forever tool（会阻塞直到被 cancel）
     let sub_client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
@@ -147,7 +150,7 @@ async fn abort_cancels_inflight_subagent() {
 
     let registry = message_bus_pair();
     let async_hook = async_spawn_pair(registry.clone());
-    let plugin_tool_entered = tool_entered.clone();
+    let plugin_tool_entered = sub_tool_entered.clone();
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
@@ -167,6 +170,9 @@ async fn abort_cancels_inflight_subagent() {
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
+        .tool(Arc::new(BlockingTool {
+            entered: main_tool_entered.clone(),
+        }))
         .after_turn_hook(async_hook.clone())
         .build(env.clone())
         .await
@@ -191,17 +197,23 @@ async fn abort_cancels_inflight_subagent() {
     let h_clone = harness.clone();
     let main_task = tokio::spawn(async move { h_clone.prompt("please spawn a sub-agent").await });
 
-    // in_flight 只证明槽位已预留；entry signal 才证明已进入 tool 阶段。
-    wait_for_blocking_tool_entry(&tool_entered).await;
+    // 两个独立 signal 证明主 run 与 sub-agent 都已进入各自的 tool 阶段。
+    wait_for_blocking_tool_entry(&sub_tool_entered).await;
+    wait_for_blocking_tool_entry(&main_tool_entered).await;
+    assert_eq!(
+        harness.state().phase,
+        HarnessPhase::Turning,
+        "main Harness should still have an active run"
+    );
     assert_eq!(
         registry.in_flight_count(),
         1,
         "sub-agent should be in-flight (blocked in tool)"
     );
-    expect_prompt_task_success(main_task, "main prompt before abort cascade").await;
 
-    // abort 主 agent —— 应级联取消 sub-agent
+    // abort 同时取消 active main run 与 in-flight sub-agent。
     harness.abort();
+    expect_prompt_task_success(main_task, "active main prompt after abort cascade").await;
 
     // sub-agent 被 cancel 后 BlockingTool 返回 Aborted，sub-agent 终止，in_flight 归零。
     // 这必须在远短于 30s（BlockingTool 的 sleep）的时间内发生，证明是 cancel 而非完成。
@@ -219,6 +231,25 @@ async fn abort_cancels_inflight_subagent() {
         registry.in_flight_count(),
         0,
         "sub-agent should have been cancelled (in_flight=0) well before the 30s sleep"
+    );
+    assert_eq!(
+        harness.state().phase,
+        HarnessPhase::Idle,
+        "main Harness should return to Idle after abort"
+    );
+    assert_eq!(
+        main_client
+            .call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "main client should issue spawn_agent and main block_forever exactly once"
+    );
+    assert_eq!(
+        sub_client
+            .call_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "sub-agent client should issue block_forever exactly once"
     );
 }
 

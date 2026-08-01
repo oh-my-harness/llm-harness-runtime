@@ -1,6 +1,6 @@
 # Abort Propagation Test Race Progress
 
-Updated: 2026-08-01 11:18 +08:00
+Updated: 2026-08-01 11:38 +08:00
 Task: Remove the test-only race between sub-agent slot reservation and actual BlockingTool entry.
 
 ## Plan
@@ -73,3 +73,30 @@ Task: Remove the test-only race between sub-agent slot reservation and actual Bl
 - 2026-08-01 11:18 +08:00 - Committed and pushed the ordering follow-up to
   `main` as `47fd359`. The commit changes only the abort propagation test and
   this progress record.
+
+## Active-Run Coverage Follow-up
+
+- [x] Give the main Harness and sub-agent independent BlockingTool entry
+  signals in `abort_cancels_inflight_subagent` only.
+- [x] Prove `Turning` plus one in-flight sub-agent before abort, then use the
+  bounded join helper and assert both paths settle with exact call counts.
+- [~] Repeat focused stress, strict Clippy, and Windows parallel workspace
+  validation; commit and push the final test-only follow-up.
+
+## Active-Run Progress Log
+
+- 2026-08-01 11:31 +08:00 - Accepted the coverage review. Waiting for all main
+  prompt tasks before abort made every integration case an Idle-main scenario,
+  leaving the simultaneous active-main-run plus active-sub-agent cascade path
+  uncovered. The fix is restricted to the first test; production code and the
+  two ordering tests remain unchanged.
+- 2026-08-01 11:33 +08:00 - The first test now registers independent main and
+  sub-agent BlockingTools. After both entry signals, it proves `Turning` and
+  exactly one in-flight sub-agent before abort, then uses the existing bounded
+  nested-result helper and verifies Idle, zero in-flight children, two main LLM
+  calls, and one sub-agent LLM call. The focused test and full abort binary pass.
+- 2026-08-01 11:38 +08:00 - Active-run validation passed on Windows: the first
+  test passed 50/50 repetitions; the complete abort propagation binary passed
+  20/20 default-parallel repetitions (60 test executions); format and strict
+  workspace Clippy passed; and the full default-parallel workspace suite passed
+  3/3 runs in 58.24, 55.90, and 57.55 seconds.
