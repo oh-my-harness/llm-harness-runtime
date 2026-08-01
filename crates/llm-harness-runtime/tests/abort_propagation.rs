@@ -4,10 +4,11 @@
 //! - `MessageBus` 在 `track_with_oneshot()` 时存入 sub-agent 的 abort token。
 //! - 主 agent `abort()` 经 `AbortCascadeHook::cancel_all_subagents()` 取消所有
 //!   in-flight sub-agent 的 abort token。
-//! - 因此：主 agent abort 后，sub-agent 的 LLM 不会被调用（或调用被中断），
-//!   sub-agent join 返回 `Err(Aborted)`，in_flight 因 abort 归零。
+//! - 测试通过独立 entry signal 确认 sub-agent 已进入 BlockingTool，再触发
+//!   主 agent abort；sub-agent join 返回 `Err(Aborted)`，in_flight 因 abort 归零。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use llm_harness_agent::Plugin;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
@@ -18,9 +19,15 @@ use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFa
 use llm_harness_runtime::spawn::tools::SpawnAgentTool;
 use llm_harness_runtime_sandbox_os::{OsEnv, OsEnvFactory};
 use llm_harness_types::{ExecutionEnv, HarnessPhase};
+use tokio::sync::Notify;
+
+const TOOL_ENTRY_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// 一个长跑 tool：sleep 直到完成或被 abort。
 /// 用于让 sub-agent 在 tool 执行阶段阻塞，使 abort 可在 sub-agent in-flight 时触发。
-struct BlockingTool;
+struct BlockingTool {
+    entered: Arc<Notify>,
+}
 
 impl llm_harness_types::Tool for BlockingTool {
     fn name(&self) -> &str {
@@ -51,8 +58,9 @@ impl llm_harness_types::Tool for BlockingTool {
         Result<llm_harness_types::ToolResult, llm_harness_types::ToolFailure>,
     > {
         Box::pin(async move {
+            self.entered.notify_one();
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
                     Ok(llm_harness_types::ToolResult::full(
                         vec![llm_harness_types::DataBlock::text("done")],
                         serde_json::Value::Null,
@@ -68,14 +76,25 @@ impl llm_harness_types::Tool for BlockingTool {
 }
 
 /// sub-agent plugin：注册 BlockingTool。
-struct BlockingToolPlugin;
+struct BlockingToolPlugin {
+    entered: Arc<Notify>,
+}
+
 impl Plugin for BlockingToolPlugin {
     fn name(&self) -> &str {
         "blocking-tool"
     }
     fn register_tools(&self, tools: &mut Vec<Arc<dyn llm_harness_types::Tool>>) {
-        tools.push(Arc::new(BlockingTool));
+        tools.push(Arc::new(BlockingTool {
+            entered: self.entered.clone(),
+        }));
     }
+}
+
+async fn wait_for_blocking_tool_entry(entered: &Notify) {
+    tokio::time::timeout(TOOL_ENTRY_TIMEOUT, entered.notified())
+        .await
+        .expect("sub-agent did not enter BlockingTool before the deadline");
 }
 /// 场景：主 agent spawn 异步 sub-agent（sub-agent 在 BlockingTool 中阻塞），
 /// 主 agent abort → sub-agent 的 abort token 被 cancel → BlockingTool 返回 Aborted →
@@ -83,6 +102,7 @@ impl Plugin for BlockingToolPlugin {
 /// 远短于 30s sleep，证明是 cancel 而非自然完成。
 #[tokio::test]
 async fn abort_cancels_inflight_subagent() {
+    let tool_entered = Arc::new(Notify::new());
     let main_client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
         "call_1",
         "spawn_agent",
@@ -97,19 +117,22 @@ async fn abort_cancels_inflight_subagent() {
     )]));
 
     let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new(std::env::current_dir().unwrap()));
-    let session_dir = std::env::temp_dir().join("abort-cascade-inflight-test");
-    let _ = std::fs::remove_dir_all(&session_dir);
-    std::fs::create_dir_all(&session_dir).unwrap();
+    let session_dir = tempfile::tempdir().expect("create isolated session directory");
 
     let registry = message_bus_pair();
     let async_hook = async_spawn_pair(registry.clone());
+    let plugin_tool_entered = tool_entered.clone();
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
             sub_client.clone(),
-            session_dir.join("sub-sessions"),
+            session_dir.path().join("sub-sessions"),
             registry.clone(),
-            |_cwd, _bus, _agent_id| Box::new(BlockingToolPlugin),
+            move |_cwd, _bus, _agent_id| {
+                Box::new(BlockingToolPlugin {
+                    entered: plugin_tool_entered.clone(),
+                })
+            },
         )
         .session_factory(Arc::new(JsonlSessionFactory))
         .env_factory(Arc::new(OsEnvFactory)),
@@ -142,17 +165,8 @@ async fn abort_cancels_inflight_subagent() {
     let h_clone = harness.clone();
     let main_task = tokio::spawn(async move { h_clone.prompt("please spawn a sub-agent").await });
 
-    // 等待 sub-agent 启动并进入 BlockingTool（in_flight=1）
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        if registry.in_flight_count() == 1 {
-            break;
-        }
-        if std::time::Instant::now() > deadline {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    // in_flight 只证明槽位已预留；entry signal 才证明已进入 tool 阶段。
+    wait_for_blocking_tool_entry(&tool_entered).await;
     assert_eq!(
         registry.in_flight_count(),
         1,
@@ -186,19 +200,23 @@ async fn abort_cancels_inflight_subagent() {
 /// 证明级联只杀"当前这批"，不影响 registry 后续使用。
 #[tokio::test]
 async fn abort_does_not_affect_future_spawns() {
+    let tool_entered = Arc::new(Notify::new());
     let main_client = Arc::new(MockLlmClient::new(vec![
-        // 第一轮：spawn 慢 sub-agent
+        // 第一轮：spawn 慢 sub-agent，然后显式结束本轮，避免测试调度
+        // 决定第二个 spawn 是由本轮 continuation 还是下一次 prompt 消费。
         MockResponse::tool_use(
             "call_1",
             "spawn_agent",
             r#"{"prompt":"compute","wait":false}"#,
         ),
+        MockResponse::text("first spawn dispatched"),
         // 第二轮：spawn 快 sub-agent
         MockResponse::tool_use(
             "call_2",
             "spawn_agent",
             r#"{"prompt":"compute again","wait":false}"#,
         ),
+        MockResponse::text("second spawn dispatched"),
     ]));
 
     // sub-agent client 共享：第一个 sub-agent 取走第一条响应（block_forever），
@@ -209,19 +227,22 @@ async fn abort_does_not_affect_future_spawns() {
     ]));
 
     let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new(std::env::current_dir().unwrap()));
-    let session_dir = std::env::temp_dir().join("abort-cascade-future-test");
-    let _ = std::fs::remove_dir_all(&session_dir);
-    std::fs::create_dir_all(&session_dir).unwrap();
+    let session_dir = tempfile::tempdir().expect("create isolated session directory");
 
     let registry = message_bus_pair();
     let async_hook = async_spawn_pair(registry.clone());
+    let plugin_tool_entered = tool_entered.clone();
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
             sub_client.clone(),
-            session_dir.join("sub-sessions"),
+            session_dir.path().join("sub-sessions"),
             registry.clone(),
-            |_cwd, _bus, _agent_id| Box::new(BlockingToolPlugin),
+            move |_cwd, _bus, _agent_id| {
+                Box::new(BlockingToolPlugin {
+                    entered: plugin_tool_entered.clone(),
+                })
+            },
         )
         .session_factory(Arc::new(JsonlSessionFactory))
         .env_factory(Arc::new(OsEnvFactory)),
@@ -255,17 +276,8 @@ async fn abort_does_not_affect_future_spawns() {
     let h_clone = harness.clone();
     let main_task = tokio::spawn(async move { h_clone.prompt("please spawn a sub-agent").await });
 
-    // 等待 sub-agent in-flight
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        if registry.in_flight_count() == 1 {
-            break;
-        }
-        if std::time::Instant::now() > deadline {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    // 必须等第一个 sub-agent 消费首个 mock 响应并进入 BlockingTool。
+    wait_for_blocking_tool_entry(&tool_entered).await;
     assert_eq!(
         registry.in_flight_count(),
         1,
@@ -329,9 +341,10 @@ async fn abort_does_not_affect_future_spawns() {
 /// 场景：主 agent spawn sub-agent 后进入 Idle（IdleWatcher 运行中），
 /// 此时 abort → watcher 被 cancel + sub-agent 被 cancel。
 /// 断言：abort 后主 agent 不被 aborted completion 重新唤醒
-/// （main_client 的 call_count 不超过 1，不会因 follow_up 续命）。
+/// （main_client 的 call_count 保持 2，不会因 follow_up 续命）。
 #[tokio::test]
 async fn idle_watcher_abort() {
+    let tool_entered = Arc::new(Notify::new());
     let main_client = Arc::new(MockLlmClient::new(vec![
         MockResponse::tool_use(
             "call_1",
@@ -349,19 +362,22 @@ async fn idle_watcher_abort() {
     )]));
 
     let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new(std::env::current_dir().unwrap()));
-    let session_dir = std::env::temp_dir().join("abort-cascade-idle-watcher-test");
-    let _ = std::fs::remove_dir_all(&session_dir);
-    std::fs::create_dir_all(&session_dir).unwrap();
+    let session_dir = tempfile::tempdir().expect("create isolated session directory");
 
     let registry = message_bus_pair();
     let async_hook = async_spawn_pair(registry.clone());
+    let plugin_tool_entered = tool_entered.clone();
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
             sub_client.clone(),
-            session_dir.join("sub-sessions"),
+            session_dir.path().join("sub-sessions"),
             registry.clone(),
-            |_cwd, _bus, _agent_id| Box::new(BlockingToolPlugin),
+            move |_cwd, _bus, _agent_id| {
+                Box::new(BlockingToolPlugin {
+                    entered: plugin_tool_entered.clone(),
+                })
+            },
         )
         .session_factory(Arc::new(JsonlSessionFactory))
         .env_factory(Arc::new(OsEnvFactory)),
@@ -394,10 +410,11 @@ async fn idle_watcher_abort() {
     let h_clone = harness.clone();
     let main_task = tokio::spawn(async move { h_clone.prompt("please spawn a sub-agent").await });
 
-    // 等待主 agent 进 Idle + sub-agent in-flight（watcher 应已启动）
+    // 先证明 sub-agent 已进入 tool 阶段，再等待主 agent 进入 Idle。
+    wait_for_blocking_tool_entry(&tool_entered).await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
-        if registry.in_flight_count() == 1 && harness.state().phase == HarnessPhase::Idle {
+        if harness.state().phase == HarnessPhase::Idle {
             break;
         }
         if std::time::Instant::now() > deadline {
