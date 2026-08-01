@@ -1,6 +1,6 @@
 # Issue #97 Round-20 Progress
 
-Updated: 2026-08-01 10:17 +08:00
+Updated: 2026-08-01 10:20 +08:00
 Task: Repair the Round-19 production-gate defects without redesigning the child-reaper architecture.
 
 ## Plan
@@ -37,7 +37,7 @@ Task: Repair the Round-19 production-gate defects without redesigning the child-
   a real terminal result only after all six normal components have exited.
 - [x] Document the pre-1.0 `ReaperMetrics` field-addition compatibility decision
   and the exact emergency-only meaning of `reap_panics`.
-- [~] Qualify Windows and WSL baselines, update the corrected #97 status comment,
+- [x] Qualify Windows and WSL baselines, update the corrected #97 status comment,
   commit, and push while keeping #97/#98/#99 and the multi-agent pin unchanged.
 
 ## Progress Log
@@ -108,3 +108,9 @@ Task: Repair the Round-19 production-gate defects without redesigning the child-
   real bwrap passed 49/49 with ignored integration tests included, and Linux
   format plus strict workspace Clippy passed. The known DrvFS workspace
   permission-semantics baseline was not altered or used to justify code changes.
+- 2026-08-01 10:20 +08:00 - Committed and pushed the follow-up to `main` as
+  `c867b78`. Updated the existing #97 Round-20 status comment to withdraw the
+  former Windows coverage claim and barrier wording, and to record the bounded
+  synchronization, natural emergency completion, qualified metrics semantics,
+  and current validation. #97, #98, and #99 remain open; the multi-agent pin
+  remains `1be6859`.
