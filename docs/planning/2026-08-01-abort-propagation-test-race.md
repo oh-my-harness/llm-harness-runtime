@@ -1,6 +1,6 @@
 # Abort Propagation Test Race Progress
 
-Updated: 2026-08-01 10:53 +08:00
+Updated: 2026-08-01 10:54 +08:00
 Task: Remove the test-only race between sub-agent slot reservation and actual BlockingTool entry.
 
 ## Plan
@@ -12,7 +12,7 @@ Task: Remove the test-only race between sub-agent slot reservation and actual Bl
   `tempfile::TempDir`.
 - [x] Run formatting, strict Clippy, focused high-repetition tests, and the
   Windows parallel workspace suite.
-- [~] Commit and push the isolated test reliability fix with a clean worktree.
+- [x] Commit and push the isolated test reliability fix with a clean worktree.
 
 ## Constraints
 
@@ -41,3 +41,5 @@ Task: Remove the test-only race between sub-agent slot reservation and actual Bl
   default-parallel repetitions (60 test executions); format and strict
   workspace Clippy passed; and the full default-parallel workspace suite passed
   3/3 runs in 59.11, 57.05, and 56.94 seconds.
+- 2026-08-01 10:54 +08:00 - Committed and pushed the isolated test fix to
+  `main` as `4cf9fb2`. No production, reaper, or API boundary file changed.
