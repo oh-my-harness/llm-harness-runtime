@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use llm_harness_types::{
     AfterProviderResponseCtx, AfterProviderResponseHook, CostAggregate, PricingProvider,
+    calculate_token_usage_cost, canonical_billing_usage_profile,
 };
 
 /// Accumulates token usage and cost from each provider response into a shared
@@ -54,28 +55,45 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
                 return;
             };
 
-            // Resolve pricing for this model (if configured). Provider is
-            // optional: when the adapter does not expose provider metadata
-            // (the common case — see `StreamingState`), pricing is looked up
-            // by model alone with an empty provider string.
+            let canonical_profile = canonical_billing_usage_profile();
+            let usage_is_valid = usage.validate_billing_profile().is_ok();
+            let profile_is_valid = {
+                let mut cost = self.cost.lock().unwrap();
+                let profile_is_valid = match &cost.billing_usage_profile {
+                    Some(profile) => profile == &canonical_profile,
+                    None => {
+                        cost.billing_usage_profile = Some(canonical_profile);
+                        true
+                    }
+                };
+                cost.total_input_tokens += u64::from(usage.input_tokens);
+                cost.total_output_tokens += u64::from(usage.output_tokens);
+                cost.total_cache_read_tokens += u64::from(usage.cache_read_tokens);
+                cost.total_cache_write_tokens += u64::from(usage.cache_creation_tokens);
+                cost.total_reasoning_tokens += u64::from(usage.reasoning_tokens);
+                if !usage_is_valid || !profile_is_valid {
+                    cost.billing_usage_violations += 1;
+                }
+                profile_is_valid
+            };
+
+            // Invalid usage never reaches the externally supplied pricing
+            // source. The violation makes trusted accounting fail closed.
+            if !usage_is_valid || !profile_is_valid {
+                return;
+            }
+
+            // Resolve pricing only after the usage contract has been checked.
             let price = self.pricing.as_ref().and_then(|p| {
                 info.model
                     .as_deref()
                     .and_then(|m| p.price_for(m, info.provider.as_deref().unwrap_or("")))
             });
 
-            let mut cost = self.cost.lock().unwrap();
-            cost.total_input_tokens += usage.input_tokens as u64;
-            cost.total_output_tokens += usage.output_tokens as u64;
-            cost.total_cache_read_tokens += usage.cache_read_tokens as u64;
-            cost.total_cache_write_tokens += usage.cache_creation_tokens as u64;
-            cost.total_reasoning_tokens += usage.reasoning_tokens as u64;
-
             if let Some(p) = price {
-                let call_cost = (usage.input_tokens as f64 / 1_000_000.0) * p.input_per_mtok
-                    + (usage.output_tokens as f64 / 1_000_000.0) * p.output_per_mtok
-                    + (usage.cache_read_tokens as f64 / 1_000_000.0) * p.cache_read_per_mtok
-                    + (usage.cache_creation_tokens as f64 / 1_000_000.0) * p.cache_write_per_mtok;
+                let call_cost = calculate_token_usage_cost(usage, &p)
+                    .expect("usage was validated before pricing lookup");
+                let mut cost = self.cost.lock().unwrap();
                 cost.total_cost += call_cost;
 
                 if let Some(m) = info.model.as_deref() {
@@ -86,11 +104,11 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
                         format!("{pr}/{m}")
                     };
                     let mc = cost.by_model.entry(key).or_default();
-                    mc.input_tokens += usage.input_tokens as u64;
-                    mc.output_tokens += usage.output_tokens as u64;
-                    mc.cache_read_tokens += usage.cache_read_tokens as u64;
-                    mc.cache_write_tokens += usage.cache_creation_tokens as u64;
-                    mc.reasoning_tokens += usage.reasoning_tokens as u64;
+                    mc.input_tokens += u64::from(usage.input_tokens);
+                    mc.output_tokens += u64::from(usage.output_tokens);
+                    mc.cache_read_tokens += u64::from(usage.cache_read_tokens);
+                    mc.cache_write_tokens += u64::from(usage.cache_creation_tokens);
+                    mc.reasoning_tokens += u64::from(usage.reasoning_tokens);
                     mc.cost += call_cost;
                     mc.call_count += 1;
                 }
@@ -102,10 +120,13 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::budget::{BudgetControlAdapter, BudgetExceededHook};
+    use futures::future::BoxFuture;
     use llm_harness_types::{
-        AfterProviderResponseCtx, ProviderResponseInfo, RunContext, RunRequest, TokenPrice,
-        TokenUsage,
+        AfterProviderResponseCtx, AssistantMessage, CostAggregate, ProviderResponseInfo,
+        RunContext, RunRequest, ShouldStopCtx, ShouldStopHook, StopReason, TokenPrice, TokenUsage,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct FixedPricing;
     impl PricingProvider for FixedPricing {
@@ -115,6 +136,45 @@ mod tests {
                 output_per_mtok: 15.0,
                 cache_read_per_mtok: 0.3,
                 cache_write_per_mtok: 3.75,
+            })
+        }
+    }
+
+    struct CachePricing;
+    impl PricingProvider for CachePricing {
+        fn price_for(&self, _model: &str, _provider: &str) -> Option<TokenPrice> {
+            Some(TokenPrice {
+                input_per_mtok: 1.0,
+                output_per_mtok: 2.0,
+                cache_read_per_mtok: 0.1,
+                cache_write_per_mtok: 0.5,
+            })
+        }
+    }
+
+    struct StopOnExceeded;
+    impl BudgetExceededHook for StopOnExceeded {
+        fn on_budget_exceeded<'a>(
+            &'a self,
+            _cost: &'a CostAggregate,
+            _budget_limit: f64,
+        ) -> BoxFuture<'a, bool> {
+            Box::pin(async { false })
+        }
+    }
+
+    struct CountingPricing {
+        calls: Arc<AtomicU64>,
+    }
+
+    impl PricingProvider for CountingPricing {
+        fn price_for(&self, _model: &str, _provider: &str) -> Option<TokenPrice> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Some(TokenPrice {
+                input_per_mtok: 1.0,
+                output_per_mtok: 1.0,
+                cache_read_per_mtok: 1.0,
+                cache_write_per_mtok: 1.0,
             })
         }
     }
@@ -151,6 +211,103 @@ mod tests {
             info,
         })
         .await;
+    }
+
+    fn assistant() -> AssistantMessage {
+        let mut message = llm_harness_loop::test_utils::test_assistant_message(vec![]);
+        message.stop_reason = Some(StopReason::EndTurn);
+        message
+    }
+
+    fn stop_context(assistant: &AssistantMessage) -> ShouldStopCtx<'_> {
+        static RUN: std::sync::OnceLock<RunContext> = std::sync::OnceLock::new();
+        ShouldStopCtx {
+            run: RUN.get_or_init(|| RunContext::new(RunRequest::default())),
+            last_assistant: assistant,
+            stop_reason: StopReason::EndTurn,
+            turn_index: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_categories_are_billed_once_at_exact_budget_boundaries() {
+        let cost = Arc::new(Mutex::new(CostAggregate::default()));
+        let hook = CostAccumulatorHook::new(cost.clone(), Some(Arc::new(CachePricing)));
+        let usage = TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cache_read_tokens: 400,
+            cache_creation_tokens: 0,
+            reasoning_tokens: 100,
+        };
+
+        record_response(&hook, &make_info(usage, "cached-model", "openai")).await;
+
+        let observed = hook.current_cost();
+        assert!((observed.total_cost - 0.00164).abs() < 1e-12);
+        assert_eq!(
+            observed.billing_usage_profile,
+            Some(canonical_billing_usage_profile())
+        );
+        assert_eq!(observed.billing_usage_violations, 0);
+        let message = assistant();
+        let exact =
+            BudgetControlAdapter::new(cost.clone(), 0.00164, Some(Arc::new(StopOnExceeded)));
+        assert!(!exact.should_stop(stop_context(&message)).await);
+        let below = BudgetControlAdapter::new(cost, 0.00163, Some(Arc::new(StopOnExceeded)));
+        assert!(below.should_stop(stop_context(&message)).await);
+    }
+
+    #[tokio::test]
+    async fn cache_read_and_write_categories_are_billed_once() {
+        let cost = Arc::new(Mutex::new(CostAggregate::default()));
+        let hook = CostAccumulatorHook::new(cost, Some(Arc::new(CachePricing)));
+        let usage = TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cache_read_tokens: 400,
+            cache_creation_tokens: 100,
+            reasoning_tokens: 100,
+        };
+
+        record_response(&hook, &make_info(usage, "cached-model", "anthropic")).await;
+
+        assert!((hook.current_cost().total_cost - 0.00159).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn invalid_cache_relationship_fails_closed_before_pricing_lookup() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let cost = Arc::new(Mutex::new(CostAggregate::default()));
+        let hook = CostAccumulatorHook::new(
+            cost.clone(),
+            Some(Arc::new(CountingPricing {
+                calls: calls.clone(),
+            })),
+        );
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 80,
+            cache_creation_tokens: 30,
+            reasoning_tokens: 5,
+        };
+
+        record_response(&hook, &make_info(usage, "cached-model", "openai")).await;
+
+        let observed = hook.current_cost();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(observed.total_input_tokens, 100);
+        assert_eq!(observed.total_cache_read_tokens, 80);
+        assert_eq!(observed.total_cache_write_tokens, 30);
+        assert_eq!(observed.total_cost, 0.0);
+        assert_eq!(observed.billing_usage_violations, 1);
+        assert!(observed.by_model.is_empty());
+        assert!(observed.validate_billing_profile().is_err());
+
+        let message = assistant();
+        let budget = BudgetControlAdapter::new(cost, f64::MAX, None);
+        assert!(budget.should_stop(stop_context(&message)).await);
     }
 
     #[tokio::test]
@@ -286,7 +443,7 @@ mod tests {
         let hook = CostAccumulatorHook::new(cost.clone(), Some(Arc::new(FixedPricing)));
 
         let usage = TokenUsage {
-            input_tokens: 100,
+            input_tokens: 400,
             output_tokens: 50,
             cache_read_tokens: 200,
             cache_creation_tokens: 100,
@@ -299,7 +456,7 @@ mod tests {
             .by_model
             .get("anthropic/claude-sonnet")
             .expect("by_model entry");
-        assert_eq!(mc.input_tokens, 100);
+        assert_eq!(mc.input_tokens, 400);
         assert_eq!(mc.output_tokens, 50);
         assert_eq!(
             mc.cache_read_tokens, 200,

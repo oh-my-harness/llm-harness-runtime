@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::{
+    BillingUsageProfile, BillingUsageProfileError, TokenUsage, canonical_billing_usage_profile,
+};
+
 /// Per-model token pricing.
 #[derive(Debug, Clone)]
 pub struct TokenPrice {
@@ -53,8 +57,107 @@ pub struct CostAggregate {
     pub total_reasoning_tokens: u64,
     /// Total estimated cost in USD.
     pub total_cost: f64,
+    /// Accounting profile used to interpret the token counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_usage_profile: Option<BillingUsageProfile>,
+    /// Number of provider payloads that violated the accounting profile.
+    #[serde(default)]
+    pub billing_usage_violations: u64,
     /// Per-model breakdown.
     pub by_model: HashMap<String, ModelCost>,
+}
+
+impl CostAggregate {
+    /// Prompt tokens billed at the normal, non-cache input rate.
+    pub fn billable_uncached_input_tokens(&self) -> Result<u64, BillingUsageProfileError> {
+        billable_uncached_input_tokens(
+            self.total_input_tokens,
+            self.total_cache_read_tokens,
+            self.total_cache_write_tokens,
+        )
+    }
+
+    /// Validates this aggregate against the canonical accounting profile.
+    pub fn validate_billing_profile(&self) -> Result<(), BillingUsageProfileError> {
+        if self.billing_usage_violations != 0 {
+            return Err(BillingUsageProfileError::new(format!(
+                "usage contains {} billing profile violation(s)",
+                self.billing_usage_violations
+            )));
+        }
+        if self.billing_usage_profile.as_ref() != Some(&canonical_billing_usage_profile()) {
+            return Err(BillingUsageProfileError::new(
+                "usage is not bound to the canonical billing profile",
+            ));
+        }
+        self.billable_uncached_input_tokens()?;
+        if self.total_reasoning_tokens > self.total_output_tokens {
+            return Err(BillingUsageProfileError::new(format!(
+                "reasoning tokens ({}) exceed gross output tokens ({})",
+                self.total_reasoning_tokens, self.total_output_tokens
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Calculates one provider call using mutually exclusive billing categories.
+pub fn calculate_token_usage_cost(
+    usage: &TokenUsage,
+    price: &TokenPrice,
+) -> Result<f64, BillingUsageProfileError> {
+    usage.validate_billing_profile()?;
+    calculate_cost(
+        u64::from(usage.input_tokens),
+        u64::from(usage.output_tokens),
+        u64::from(usage.cache_read_tokens),
+        u64::from(usage.cache_creation_tokens),
+        price,
+    )
+}
+
+/// Recalculates aggregate cost under the canonical accounting profile.
+pub fn calculate_aggregate_cost(
+    usage: &CostAggregate,
+    price: &TokenPrice,
+) -> Result<f64, BillingUsageProfileError> {
+    usage.validate_billing_profile()?;
+    calculate_cost(
+        usage.total_input_tokens,
+        usage.total_output_tokens,
+        usage.total_cache_read_tokens,
+        usage.total_cache_write_tokens,
+        price,
+    )
+}
+
+fn calculate_cost(
+    gross_input: u64,
+    gross_output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    price: &TokenPrice,
+) -> Result<f64, BillingUsageProfileError> {
+    let uncached_input = billable_uncached_input_tokens(gross_input, cache_read, cache_write)?;
+    Ok((uncached_input as f64 / 1_000_000.0) * price.input_per_mtok
+        + (gross_output as f64 / 1_000_000.0) * price.output_per_mtok
+        + (cache_read as f64 / 1_000_000.0) * price.cache_read_per_mtok
+        + (cache_write as f64 / 1_000_000.0) * price.cache_write_per_mtok)
+}
+
+fn billable_uncached_input_tokens(
+    gross_input: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> Result<u64, BillingUsageProfileError> {
+    let cached = cache_read
+        .checked_add(cache_write)
+        .ok_or_else(|| BillingUsageProfileError::new("cache input token categories overflow"))?;
+    gross_input.checked_sub(cached).ok_or_else(|| {
+        BillingUsageProfileError::new(format!(
+            "gross input tokens ({gross_input}) are smaller than cache read plus cache creation tokens ({cached})"
+        ))
+    })
 }
 #[cfg(test)]
 mod tests {

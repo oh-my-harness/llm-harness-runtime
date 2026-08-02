@@ -11,10 +11,43 @@ pub(super) fn aggregate_cost(history: &[StepRecord]) -> CostAggregate {
     let mut total = CostAggregate::default();
     for record in history {
         if let Some(r) = &record.result {
+            let total_has_usage = total.total_input_tokens != 0
+                || total.total_output_tokens != 0
+                || !total.by_model.is_empty();
+            let source_has_usage = r.cost.total_input_tokens != 0
+                || r.cost.total_output_tokens != 0
+                || !r.cost.by_model.is_empty();
+            match (
+                total.billing_usage_profile.as_ref(),
+                r.cost.billing_usage_profile.as_ref(),
+            ) {
+                (None, Some(profile))
+                    if !total_has_usage && total.billing_usage_violations == 0 =>
+                {
+                    total.billing_usage_profile = Some(*profile);
+                }
+                (None, Some(_)) if source_has_usage => {
+                    total.billing_usage_violations += 1;
+                }
+                (Some(current), Some(incoming)) if current != incoming => {
+                    total.billing_usage_profile = None;
+                    total.billing_usage_violations += 1;
+                }
+                (Some(_), None) if source_has_usage => {
+                    total.billing_usage_profile = None;
+                    total.billing_usage_violations += 1;
+                }
+                (None, None) if source_has_usage => {
+                    total.billing_usage_violations += 1;
+                }
+                _ => {}
+            }
+            total.billing_usage_violations += r.cost.billing_usage_violations;
             total.total_input_tokens += r.cost.total_input_tokens;
             total.total_output_tokens += r.cost.total_output_tokens;
             total.total_cache_read_tokens += r.cost.total_cache_read_tokens;
             total.total_cache_write_tokens += r.cost.total_cache_write_tokens;
+            total.total_reasoning_tokens += r.cost.total_reasoning_tokens;
             total.total_cost += r.cost.total_cost;
             for (k, v) in &r.cost.by_model {
                 let entry = total.by_model.entry(k.clone()).or_default();

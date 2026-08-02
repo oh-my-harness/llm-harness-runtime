@@ -2290,7 +2290,7 @@ async fn double_with_hooks_accumulates() {
 #[test]
 fn aggregate_cost_merges_per_model_cache_tokens() {
     use crate::workflow::model::{StepRecord, StepResult, Transition};
-    use llm_harness_types::{CostAggregate, ModelCost};
+    use llm_harness_types::{CostAggregate, ModelCost, canonical_billing_usage_profile};
 
     let now = chrono::Utc::now();
     let mk_record = |read: u64, write: u64| StepRecord {
@@ -2304,18 +2304,22 @@ fn aggregate_cost_merges_per_model_cache_tokens() {
             tool_calls_count: 0,
             session_id: String::new(),
             cost: CostAggregate {
+                total_input_tokens: read + write,
+                total_output_tokens: 10,
                 total_cache_read_tokens: read,
                 total_cache_write_tokens: write,
+                total_reasoning_tokens: 5,
+                billing_usage_profile: Some(canonical_billing_usage_profile()),
                 by_model: {
                     let mut m = std::collections::HashMap::new();
                     m.insert(
                         "anthropic/claude-sonnet".to_string(),
                         ModelCost {
-                            input_tokens: 0,
-                            output_tokens: 0,
+                            input_tokens: read + write,
+                            output_tokens: 10,
                             cache_read_tokens: read,
                             cache_write_tokens: write,
-                            reasoning_tokens: 0,
+                            reasoning_tokens: 5,
                             cost: 0.0,
                             call_count: 1,
                         },
@@ -2348,8 +2352,16 @@ fn aggregate_cost_merges_per_model_cache_tokens() {
     );
     assert_eq!(mc.call_count, 2);
     // Top-level totals must also reflect the merge.
+    assert_eq!(total.total_input_tokens, 650);
+    assert_eq!(total.total_output_tokens, 20);
     assert_eq!(total.total_cache_read_tokens, 500);
     assert_eq!(total.total_cache_write_tokens, 150);
+    assert_eq!(total.total_reasoning_tokens, 10);
+    assert_eq!(
+        total.billing_usage_profile,
+        Some(canonical_billing_usage_profile())
+    );
+    assert_eq!(total.billing_usage_violations, 0);
 }
 
 #[tokio::test]

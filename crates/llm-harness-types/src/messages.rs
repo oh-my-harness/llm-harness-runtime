@@ -3,30 +3,117 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ContentBlock, DataBlock, PersistedToolProjection, StopReason};
 
-/// 单次 LLM 调用的 token 用量。
+/// Stable identity for the canonical token-accounting semantics.
+pub const BILLING_USAGE_PROFILE_ID: &str = "llm-harness-billing-usage";
+/// Version of the canonical token-accounting semantics.
+pub const BILLING_USAGE_PROFILE_VERSION: &str = "1";
+/// Canonical, digest-bound definition of each usage category.
+pub const BILLING_USAGE_PROFILE_CONTRACT: &str = "input_tokens=gross_input;cache_read_tokens=input_subset;cache_creation_input_tokens=input_subset;cache_read_and_creation=disjoint;output_tokens=gross_output;reasoning_tokens=output_subset;uncached_input=input_tokens-cache_read_tokens-cache_creation_input_tokens";
+/// SHA-256 digest of [`BILLING_USAGE_PROFILE_CONTRACT`].
+pub const BILLING_USAGE_PROFILE_DIGEST: &str =
+    "sha256:6afb4df926d32f3917ab28fb7ea30af87b20d7b81391d800c076f637c7eb73fb";
+
+/// Compact runtime marker for the accounting semantics used by an aggregate.
+///
+/// The full ID, version, and digest are exposed by the accessors and are bound
+/// separately into persisted trusted-pricing admissions.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BillingUsageProfile {
+    /// Canonical gross-input, mutually exclusive cache-subset profile.
+    V1,
+}
+
+impl BillingUsageProfile {
+    /// Stable profile ID.
+    pub fn id(&self) -> &str {
+        BILLING_USAGE_PROFILE_ID
+    }
+
+    /// Stable profile version.
+    pub fn version(&self) -> &str {
+        BILLING_USAGE_PROFILE_VERSION
+    }
+
+    /// Digest of the canonical profile contract.
+    pub fn digest(&self) -> &str {
+        BILLING_USAGE_PROFILE_DIGEST
+    }
+
+    /// Returns whether this identity is the runtime's canonical profile.
+    pub fn is_canonical(&self) -> bool {
+        matches!(self, Self::V1)
+    }
+}
+
+/// Returns the verifier-owned canonical token-accounting profile.
+pub fn canonical_billing_usage_profile() -> BillingUsageProfile {
+    BillingUsageProfile::V1
+}
+
+/// A provider usage payload violates the canonical accounting profile.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[error("{message}")]
+pub struct BillingUsageProfileError {
+    message: String,
+}
+
+impl BillingUsageProfileError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Token usage for one LLM request/response pair.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TokenUsage {
-    /// Prompt token 数。
+    /// Gross prompt tokens, including cache reads and cache writes.
     pub input_tokens: u32,
-    /// Completion token 数。
+    /// Gross output/completion tokens, including reasoning tokens.
     pub output_tokens: u32,
-    /// Anthropic prompt cache 命中的 token 数。
+    /// Cache-read tokens; a subset of `input_tokens`.
     pub cache_read_tokens: u32,
-    /// Anthropic prompt cache 新写入的 token 数。
+    /// Cache-write tokens; a disjoint subset of `input_tokens`.
     pub cache_creation_tokens: u32,
-    /// Reasoning/thinking token 数（DeepSeek thinking、Anthropic extended
-    /// thinking、OpenAI o-series）。非推理模型为 0。
+    /// Reasoning/thinking tokens; a subset of `output_tokens`.
     pub reasoning_tokens: u32,
 }
 
 impl TokenUsage {
-    /// 所有 token 的合计。
+    /// Gross input plus gross output, without double-counting subsets.
     pub fn total_tokens(&self) -> u32 {
-        self.input_tokens
-            + self.output_tokens
-            + self.cache_read_tokens
-            + self.cache_creation_tokens
-            + self.reasoning_tokens
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    /// Prompt tokens billed at the normal, non-cache input rate.
+    pub fn billable_uncached_input_tokens(&self) -> Result<u32, BillingUsageProfileError> {
+        let cached = self
+            .cache_read_tokens
+            .checked_add(self.cache_creation_tokens)
+            .ok_or_else(|| {
+                BillingUsageProfileError::new("cache input token categories overflow")
+            })?;
+        self.input_tokens.checked_sub(cached).ok_or_else(|| {
+            BillingUsageProfileError::new(format!(
+                "gross input tokens ({}) are smaller than cache read plus cache creation tokens ({cached})",
+                self.input_tokens
+            ))
+        })
+    }
+
+    /// Validates the canonical gross-plus-exclusive-subsets profile.
+    pub fn validate_billing_profile(&self) -> Result<(), BillingUsageProfileError> {
+        self.billable_uncached_input_tokens()?;
+        if self.reasoning_tokens > self.output_tokens {
+            return Err(BillingUsageProfileError::new(format!(
+                "reasoning tokens ({}) exceed gross output tokens ({})",
+                self.reasoning_tokens, self.output_tokens
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -247,7 +334,31 @@ mod tests {
             cache_creation_tokens: 10,
             reasoning_tokens: 20,
         };
-        assert_eq!(u.total_tokens(), 200);
+        assert_eq!(u.total_tokens(), 150);
+        assert_eq!(u.billable_uncached_input_tokens().unwrap(), 70);
+        u.validate_billing_profile().unwrap();
+    }
+
+    #[test]
+    fn token_usage_rejects_invalid_billing_subsets() {
+        let cache_error = TokenUsage {
+            input_tokens: 100,
+            cache_read_tokens: 80,
+            cache_creation_tokens: 30,
+            ..Default::default()
+        }
+        .validate_billing_profile()
+        .unwrap_err();
+        assert!(cache_error.to_string().contains("smaller than cache read"));
+
+        let reasoning_error = TokenUsage {
+            output_tokens: 20,
+            reasoning_tokens: 21,
+            ..Default::default()
+        }
+        .validate_billing_profile()
+        .unwrap_err();
+        assert!(reasoning_error.to_string().contains("exceed gross output"));
     }
 
     #[test]

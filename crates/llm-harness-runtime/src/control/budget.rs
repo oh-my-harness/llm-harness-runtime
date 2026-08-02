@@ -5,6 +5,7 @@
 //! `total_cost` exceeds `budget_limit`, consults the optional
 //! `BudgetExceededHook` for a continue/stop decision. Cost accumulation itself
 //! lives in `CostAccumulatorHook` (`cost_hook.rs`).
+//! Accounting-profile violations always stop and cannot be overridden.
 
 use std::sync::{Arc, Mutex};
 
@@ -73,6 +74,9 @@ impl ShouldStopHook for BudgetControlAdapter {
         Box::pin(async move {
             // Snapshot cost under lock, release before awaiting the hook.
             let cost_snapshot = self.cost.lock().unwrap().clone();
+            if cost_snapshot.billing_usage_violations != 0 {
+                return true;
+            }
             if cost_snapshot.total_cost <= self.budget_limit {
                 return false;
             }
@@ -159,6 +163,18 @@ mod tests {
         let ctx = make_ctx(&assistant);
         let stop = adapter.should_stop(ctx).await;
         assert!(!stop, "surveillance mode (no hook) must not stop");
+    }
+
+    #[tokio::test]
+    async fn accounting_profile_violation_always_stops() {
+        let cost = Arc::new(Mutex::new(CostAggregate {
+            billing_usage_violations: 1,
+            ..Default::default()
+        }));
+        let adapter = BudgetControlAdapter::new(cost, f64::MAX, None);
+
+        let assistant = make_assistant();
+        assert!(adapter.should_stop(make_ctx(&assistant)).await);
     }
 
     #[tokio::test]

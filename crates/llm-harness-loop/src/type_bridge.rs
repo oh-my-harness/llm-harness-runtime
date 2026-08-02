@@ -138,14 +138,35 @@ mod tests {
             output_tokens: 5,
             cached_input_tokens: 3,
             cache_creation_input_tokens: 1,
-            reasoning_tokens: 99,
+            reasoning_tokens: 4,
         };
         let tu = convert_usage(u);
         assert_eq!(tu.input_tokens, 10);
         assert_eq!(tu.output_tokens, 5);
         assert_eq!(tu.cache_read_tokens, 3);
         assert_eq!(tu.cache_creation_tokens, 1);
-        assert_eq!(tu.reasoning_tokens, 99);
+        assert_eq!(tu.reasoning_tokens, 4);
+        tu.validate_billing_profile().unwrap();
+    }
+
+    #[test]
+    fn adapter_and_runtime_share_the_exact_billing_profile() {
+        assert_eq!(
+            llm_adapter::types::BILLING_USAGE_PROFILE_ID,
+            BILLING_USAGE_PROFILE_ID
+        );
+        assert_eq!(
+            llm_adapter::types::BILLING_USAGE_PROFILE_VERSION,
+            BILLING_USAGE_PROFILE_VERSION
+        );
+        assert_eq!(
+            llm_adapter::types::BILLING_USAGE_PROFILE_DIGEST,
+            BILLING_USAGE_PROFILE_DIGEST
+        );
+        assert_eq!(
+            llm_adapter::types::BILLING_USAGE_PROFILE_CONTRACT,
+            BILLING_USAGE_PROFILE_CONTRACT
+        );
     }
 
     #[test]
