@@ -157,7 +157,12 @@ pub struct MockResponse {
 }
 
 impl MockResponse {
-    /// Simple text response ending with `EndTurn`.
+    /// Simple text response ending with `EndTurn` and missing provider usage.
+    ///
+    /// This convenience path intentionally cannot serve as trusted pricing
+    /// evidence. Use [`MockResponse::text_with_reported_zero`] or
+    /// [`MockResponse::with_reported_usage`] when the mock provider is meant to
+    /// supply an authoritative usage payload.
     pub fn text(text: &str) -> Self {
         let t = text.to_owned();
         Self {
@@ -179,6 +184,43 @@ impl MockResponse {
                 }),
             ],
         }
+    }
+
+    /// Simple text response with an explicit, authoritative all-zero report.
+    pub fn text_with_reported_zero(text: &str) -> Self {
+        Self::text(text).with_reported_usage(Usage::default())
+    }
+
+    /// Alias that makes a deliberately missing report explicit at the call site.
+    pub fn text_with_missing_usage(text: &str) -> Self {
+        Self::text(text)
+    }
+
+    /// Replaces this response's terminal usage with authoritative provider
+    /// values. Canonical numeric violations become `ReportedInvalid`.
+    pub fn with_reported_usage(mut self, usage: Usage) -> Self {
+        self.replace_usage(usage.reported());
+        self
+    }
+
+    /// Replaces this response's terminal usage with a provider report known to
+    /// violate a provider-specific invariant.
+    pub fn with_reported_invalid_usage(mut self, usage: Usage) -> Self {
+        self.replace_usage(usage.reported_invalid());
+        self
+    }
+
+    fn replace_usage(&mut self, usage: Usage) {
+        for event in &mut self.events {
+            if let Ok(StreamEvent::MessageStop {
+                usage: terminal, ..
+            }) = event
+            {
+                *terminal = usage;
+                return;
+            }
+        }
+        panic!("mock response has no terminal MessageStop usage");
     }
 
     /// Tool-use response: the model calls one tool.
@@ -374,6 +416,35 @@ pub fn test_assistant_message(content: Vec<ContentBlock>) -> AssistantMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_usage(response: &MockResponse) -> &Usage {
+        response
+            .events
+            .iter()
+            .find_map(|event| match event {
+                Ok(StreamEvent::MessageStop { usage, .. }) => Some(usage),
+                _ => None,
+            })
+            .expect("mock response has terminal usage")
+    }
+
+    #[test]
+    fn mock_usage_requires_explicit_reported_provenance() {
+        let missing = MockResponse::text("missing");
+        assert_eq!(
+            terminal_usage(&missing).provenance,
+            llm_adapter::types::UsageProvenance::Missing
+        );
+
+        let reported_zero = MockResponse::text_with_reported_zero("reported");
+        let usage = terminal_usage(&reported_zero);
+        assert_eq!(
+            usage.provenance,
+            llm_adapter::types::UsageProvenance::ReportedValid
+        );
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+    }
 
     #[tokio::test]
     async fn mock_client_returns_text_response() {

@@ -1,8 +1,11 @@
 # Billing Usage Contract
 
-Status: review candidate
+Status: cache accounting accepted; usage provenance under review
 
-Tracking: [runtime issue #102](https://github.com/oh-my-harness/llm-harness-runtime/issues/102)
+Tracking:
+
+- [runtime issue #102](https://github.com/oh-my-harness/llm-harness-runtime/issues/102) (cache categories and formula, closed)
+- [runtime issue #103](https://github.com/oh-my-harness/llm-harness-runtime/issues/103) (provider usage provenance)
 
 ## Scope
 
@@ -46,12 +49,13 @@ The following invariants are mandatory:
 - `reasoning_tokens <= output_tokens`
 
 Overflow or a violated relationship is an accounting failure. Runtime records
-the gross counters for observability, does not query or apply pricing, records a
-profile violation, and budget control fails closed.
+the completed response and its unknown-cost status, does not add the untrusted
+payload to billable totals, does not query or apply pricing, records a profile
+violation, and budget control fails closed.
 
 ## Provider Mapping
 
-`llm-api-adapter` revision `b4366a8aac3884103ced4c3e9052c86e93965614`
+`llm-api-adapter` revision `10fb9a8791170d78d6a84815059207efd99ce631`
 normalizes provider-shaped usage as follows:
 
 | Provider | Gross input | Cache read subset | Cache write subset |
@@ -65,6 +69,41 @@ requires `hit + miss == prompt_tokens`. Provider-shaped fixtures cover all three
 mappings. The adapter and runtime compile-time tests require an exact match of
 profile ID, version, digest, and contract text.
 
+## Usage Report Provenance
+
+Token values do not prove that a provider supplied a usage payload. An explicit
+provider payload containing all zeros is different from a response for which
+usage is absent. This evidence uses an independent profile so that changes to
+payload completeness do not silently change the accepted cache-billing
+semantics.
+
+The canonical identity is:
+
+- ID: `llm-harness-usage-report`
+- version: `1`
+- digest: `sha256:f6a776c595f99114eb692faf4f72eb4eb0012a33fa3722244e65fad0d6f48073`
+
+The digest binds this exact contract:
+
+```text
+provenance=provider_payload;states=reported_valid,missing,reported_invalid;zero_tokens_do_not_imply_missing;reported_valid_requires_billing_invariants
+```
+
+Every completed provider response observed by runtime's after-response
+accounting boundary has exactly one status:
+
+- `ReportedValid`: the provider supplied usage and the billing invariants hold.
+- `Missing`: the response completed without an authoritative usage payload.
+- `ReportedInvalid`: the provider supplied usage, but the payload violates a
+  canonical or provider-specific invariant.
+
+This call count does not include transport attempts that fail before a
+completed provider response exists. Those attempts already fail the model run
+and are not represented as zero-cost completions. Ordinary, non-priced clients
+may inspect or ignore missing provenance for compatibility. Runtime budget
+control and trusted multi-agent pricing must fail closed on either `Missing` or
+`ReportedInvalid`.
+
 ## Runtime Evidence
 
 `CostAggregate.billing_usage_profile` identifies the interpretation used for
@@ -72,6 +111,14 @@ the counters. `billing_usage_violations` is zero only when every observed
 provider payload satisfied the profile. `calculate_token_usage_cost` and
 `calculate_aggregate_cost` are the shared formula implementations; upper layers
 must not reproduce the formula.
+
+`CostAggregate.usage_reports` separately records completed responses, valid
+reports, missing reports, and invalid reports under the canonical provenance
+profile. A response with explicit, valid zero usage increments both
+`provider_calls` and `reported_valid`; it can therefore produce trusted zero
+cost. A missing or invalid report increments `provider_calls` and
+`unknown_cost_calls()`, does not create priced per-model evidence, and forces
+budget control to stop even in surveillance mode.
 
 Legacy serialized aggregates remain decodable because both new fields have
 serde defaults. An aggregate without a canonical profile is not trusted
@@ -87,13 +134,16 @@ session creation:
 - all four token rates
 - price-table ID, version, and digest
 - billing profile ID, version, and digest
+- usage-report profile ID, version, and digest
 
 The same immutable admission must be applied to execution. Post-call validation
 requires the canonical runtime profile, zero profile violations, exact
-provider/model call evidence, and cost recomputation through the shared runtime
-function. A missing or different accounting profile fails before execution; an
-invalid provider usage relationship fails after the response while preserving
-gross usage evidence.
+provider/model call evidence, one valid usage report per completed response,
+and cost recomputation through the shared runtime function. A missing or
+different accounting or provenance profile fails before execution. Missing or
+invalid provider usage fails after the response while preserving that a call
+completed and that its cost is unknown; it must not be represented as trusted
+zero cost.
 
 The multi-agent provider identity is bound to configured client selection. It
 is not remote provider attestation. A future paired-controls manifest must
@@ -103,6 +153,8 @@ regenerating it from aggregate usage.
 ## Revision Policy
 
 Any semantic change to gross/subset relationships, overlap rules, or billable
-categories requires a new profile version and digest. Adapter, runtime, trusted
-admission, and experiment manifests must move together. Changing only the
-formula while retaining profile version `1` is invalid.
+categories requires a new billing profile version and digest. Any semantic
+change to provenance states, completeness, or validity requires a new usage
+report profile version and digest. Adapter, runtime, trusted admission, and
+experiment manifests must move together. Changing either contract while
+retaining its version `1` is invalid.

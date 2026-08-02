@@ -5,7 +5,8 @@
 //! `total_cost` exceeds `budget_limit`, consults the optional
 //! `BudgetExceededHook` for a continue/stop decision. Cost accumulation itself
 //! lives in `CostAccumulatorHook` (`cost_hook.rs`).
-//! Accounting-profile violations always stop and cannot be overridden.
+//! Accounting-profile violations and unknown-cost provider responses always
+//! stop and cannot be overridden.
 
 use std::sync::{Arc, Mutex};
 
@@ -75,6 +76,14 @@ impl ShouldStopHook for BudgetControlAdapter {
             // Snapshot cost under lock, release before awaiting the hook.
             let cost_snapshot = self.cost.lock().unwrap().clone();
             if cost_snapshot.billing_usage_violations != 0 {
+                return true;
+            }
+            if cost_snapshot.usage_reports.provider_calls != 0
+                && cost_snapshot
+                    .usage_reports
+                    .require_all_reported_valid()
+                    .is_err()
+            {
                 return true;
             }
             if cost_snapshot.total_cost <= self.budget_limit {

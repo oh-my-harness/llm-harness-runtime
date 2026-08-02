@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::{
-    BillingUsageProfile, BillingUsageProfileError, TokenUsage, canonical_billing_usage_profile,
+    BillingUsageProfile, BillingUsageProfileError, TokenUsage, UsageReportProfile,
+    UsageReportProfileError, UsageReportProvenance, canonical_billing_usage_profile,
+    canonical_usage_report_profile,
 };
 
 /// Per-model token pricing.
@@ -42,6 +44,110 @@ pub struct ModelCost {
     /// Number of LLM calls.
     pub call_count: u64,
 }
+
+/// Completeness and validity evidence for completed provider responses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageReportAggregate {
+    /// Versioned provenance contract used to interpret these counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<UsageReportProfile>,
+    /// Completed provider responses observed at the accounting boundary.
+    pub provider_calls: u64,
+    /// Responses carrying an authoritative, valid provider usage payload.
+    pub reported_valid: u64,
+    /// Responses that completed without a provider usage payload.
+    pub missing: u64,
+    /// Responses carrying a provider usage payload that failed validation.
+    pub reported_invalid: u64,
+}
+
+impl UsageReportAggregate {
+    /// Records exactly one completed provider response.
+    pub fn record(&mut self, provenance: UsageReportProvenance) {
+        if self.profile.is_none() {
+            self.profile = Some(canonical_usage_report_profile());
+        }
+        self.provider_calls += 1;
+        match provenance {
+            UsageReportProvenance::ReportedValid => self.reported_valid += 1,
+            UsageReportProvenance::Missing => self.missing += 1,
+            UsageReportProvenance::ReportedInvalid => self.reported_invalid += 1,
+        }
+    }
+
+    /// Merges independently accumulated response evidence without inventing a
+    /// profile when non-empty inputs disagree.
+    pub fn merge(&mut self, incoming: &Self) {
+        if incoming.provider_calls != 0 {
+            if self.provider_calls == 0 {
+                self.profile = incoming.profile;
+            } else if self.profile != incoming.profile {
+                self.profile = None;
+            }
+        }
+        self.provider_calls += incoming.provider_calls;
+        self.reported_valid += incoming.reported_valid;
+        self.missing += incoming.missing;
+        self.reported_invalid += incoming.reported_invalid;
+    }
+
+    /// Calls whose cost cannot be trusted because usage is absent or invalid.
+    pub fn unknown_cost_calls(&self) -> u64 {
+        self.missing.saturating_add(self.reported_invalid)
+    }
+
+    /// Validates only the profile and mutually exclusive status counters.
+    pub fn validate_accounting(&self) -> Result<(), UsageReportProfileError> {
+        let classified = self
+            .reported_valid
+            .checked_add(self.missing)
+            .and_then(|count| count.checked_add(self.reported_invalid))
+            .ok_or_else(|| UsageReportProfileError::new("usage report counters overflow"))?;
+        if classified != self.provider_calls {
+            return Err(UsageReportProfileError::new(format!(
+                "provider calls ({}) do not equal classified usage reports ({classified})",
+                self.provider_calls
+            )));
+        }
+        if self.provider_calls == 0 {
+            if self.profile.is_some() {
+                return Err(UsageReportProfileError::new(
+                    "usage report profile is present without a provider call",
+                ));
+            }
+            return Ok(());
+        }
+        if self.profile.as_ref() != Some(&canonical_usage_report_profile()) {
+            return Err(UsageReportProfileError::new(
+                "usage reports are not bound to the canonical provenance profile",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Requires at least one response and one valid report for every response.
+    pub fn require_all_reported_valid(&self) -> Result<(), UsageReportProfileError> {
+        self.validate_accounting()?;
+        if self.provider_calls == 0 {
+            return Err(UsageReportProfileError::new(
+                "no completed provider call was recorded",
+            ));
+        }
+        if self.missing != 0 || self.reported_invalid != 0 {
+            return Err(UsageReportProfileError::new(format!(
+                "usage reports are incomplete: {} missing, {} invalid, {} provider calls",
+                self.missing, self.reported_invalid, self.provider_calls
+            )));
+        }
+        if self.reported_valid != self.provider_calls {
+            return Err(UsageReportProfileError::new(
+                "not every provider call has one valid usage report",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Aggregated cost across all models in a session/task.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CostAggregate {
@@ -63,6 +169,9 @@ pub struct CostAggregate {
     /// Number of provider payloads that violated the accounting profile.
     #[serde(default)]
     pub billing_usage_violations: u64,
+    /// Provider usage-report completeness and validity evidence.
+    #[serde(default)]
+    pub usage_reports: UsageReportAggregate,
     /// Per-model breakdown.
     pub by_model: HashMap<String, ModelCost>,
 }
@@ -190,5 +299,63 @@ mod tests {
         assert!(json.contains("\"cache_read_tokens\":200"), "got {json}");
         assert!(json.contains("\"cache_write_tokens\":100"), "got {json}");
         assert!(json.contains("\"reasoning_tokens\":50"), "got {json}");
+    }
+
+    #[test]
+    fn usage_report_aggregate_distinguishes_valid_missing_and_invalid_calls() {
+        let mut reports = UsageReportAggregate::default();
+        reports.record(UsageReportProvenance::ReportedValid);
+        assert_eq!(reports.provider_calls, 1);
+        assert_eq!(reports.reported_valid, 1);
+        assert_eq!(reports.unknown_cost_calls(), 0);
+        reports
+            .require_all_reported_valid()
+            .expect("one valid report is complete evidence");
+
+        reports.record(UsageReportProvenance::Missing);
+        reports.record(UsageReportProvenance::ReportedInvalid);
+        assert_eq!(reports.provider_calls, 3);
+        assert_eq!(reports.reported_valid, 1);
+        assert_eq!(reports.missing, 1);
+        assert_eq!(reports.reported_invalid, 1);
+        assert_eq!(reports.unknown_cost_calls(), 2);
+        assert!(reports.require_all_reported_valid().is_err());
+    }
+
+    #[test]
+    fn usage_report_aggregate_rejects_missing_profile_and_counter_mismatch() {
+        let missing_profile = UsageReportAggregate {
+            provider_calls: 1,
+            reported_valid: 1,
+            ..Default::default()
+        };
+        assert!(missing_profile.validate_accounting().is_err());
+
+        let counter_mismatch = UsageReportAggregate {
+            profile: Some(canonical_usage_report_profile()),
+            provider_calls: 2,
+            reported_valid: 1,
+            ..Default::default()
+        };
+        assert!(counter_mismatch.validate_accounting().is_err());
+    }
+
+    #[test]
+    fn usage_report_aggregate_merge_preserves_exact_call_classification() {
+        let mut valid = UsageReportAggregate::default();
+        valid.record(UsageReportProvenance::ReportedValid);
+        let mut missing = UsageReportAggregate::default();
+        missing.record(UsageReportProvenance::Missing);
+
+        valid.merge(&missing);
+
+        assert_eq!(valid.provider_calls, 2);
+        assert_eq!(valid.reported_valid, 1);
+        assert_eq!(valid.missing, 1);
+        assert_eq!(valid.unknown_cost_calls(), 1);
+        valid
+            .validate_accounting()
+            .expect("matching canonical profiles merge without losing evidence");
+        assert!(valid.require_all_reported_valid().is_err());
     }
 }

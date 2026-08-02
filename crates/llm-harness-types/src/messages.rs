@@ -12,6 +12,15 @@ pub const BILLING_USAGE_PROFILE_CONTRACT: &str = "input_tokens=gross_input;cache
 /// SHA-256 digest of [`BILLING_USAGE_PROFILE_CONTRACT`].
 pub const BILLING_USAGE_PROFILE_DIGEST: &str =
     "sha256:6afb4df926d32f3917ab28fb7ea30af87b20d7b81391d800c076f637c7eb73fb";
+/// Stable identity for provider usage-report provenance semantics.
+pub const USAGE_REPORT_PROFILE_ID: &str = "llm-harness-usage-report";
+/// Version of the provider usage-report provenance semantics.
+pub const USAGE_REPORT_PROFILE_VERSION: &str = "1";
+/// Canonical, digest-bound definition of usage-report provenance.
+pub const USAGE_REPORT_PROFILE_CONTRACT: &str = "provenance=provider_payload;states=reported_valid,missing,reported_invalid;zero_tokens_do_not_imply_missing;reported_valid_requires_billing_invariants";
+/// SHA-256 digest of [`USAGE_REPORT_PROFILE_CONTRACT`].
+pub const USAGE_REPORT_PROFILE_DIGEST: &str =
+    "sha256:f6a776c595f99114eb692faf4f72eb4eb0012a33fa3722244e65fad0d6f48073";
 
 /// Compact runtime marker for the accounting semantics used by an aggregate.
 ///
@@ -52,6 +61,55 @@ pub fn canonical_billing_usage_profile() -> BillingUsageProfile {
     BillingUsageProfile::V1
 }
 
+/// Compact runtime marker for provider usage-report provenance semantics.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum UsageReportProfile {
+    /// Provider-payload provenance with explicit valid/missing/invalid states.
+    V1,
+}
+
+impl UsageReportProfile {
+    /// Stable profile ID.
+    pub fn id(&self) -> &str {
+        USAGE_REPORT_PROFILE_ID
+    }
+
+    /// Stable profile version.
+    pub fn version(&self) -> &str {
+        USAGE_REPORT_PROFILE_VERSION
+    }
+
+    /// Digest of the canonical provenance contract.
+    pub fn digest(&self) -> &str {
+        USAGE_REPORT_PROFILE_DIGEST
+    }
+
+    /// Returns whether this identity is runtime's canonical profile.
+    pub fn is_canonical(&self) -> bool {
+        matches!(self, Self::V1)
+    }
+}
+
+/// Returns the verifier-owned canonical usage-report profile.
+pub fn canonical_usage_report_profile() -> UsageReportProfile {
+    UsageReportProfile::V1
+}
+
+/// Provenance and validity of one provider usage report.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageReportProvenance {
+    /// The response completed without authoritative provider usage.
+    #[default]
+    Missing,
+    /// The provider supplied usage and canonical invariants hold.
+    ReportedValid,
+    /// The provider supplied usage but an invariant failed.
+    ReportedInvalid,
+}
+
 /// A provider usage payload violates the canonical accounting profile.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[error("{message}")]
@@ -80,6 +138,24 @@ pub struct TokenUsage {
     pub cache_creation_tokens: u32,
     /// Reasoning/thinking tokens; a subset of `output_tokens`.
     pub reasoning_tokens: u32,
+    /// Provider-report provenance. Token values never imply this state.
+    #[serde(default)]
+    pub provenance: UsageReportProvenance,
+}
+
+/// A provider usage-report aggregate violates the provenance contract.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[error("{message}")]
+pub struct UsageReportProfileError {
+    message: String,
+}
+
+impl UsageReportProfileError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 impl TokenUsage {
@@ -114,6 +190,19 @@ impl TokenUsage {
             )));
         }
         Ok(())
+    }
+
+    /// Requires an authoritative, numerically valid provider report.
+    pub fn validate_report(&self) -> Result<(), BillingUsageProfileError> {
+        match self.provenance {
+            UsageReportProvenance::ReportedValid => self.validate_billing_profile(),
+            UsageReportProvenance::Missing => Err(BillingUsageProfileError::new(
+                "provider usage report is missing",
+            )),
+            UsageReportProvenance::ReportedInvalid => Err(BillingUsageProfileError::new(
+                "provider usage report is invalid",
+            )),
+        }
     }
 }
 
@@ -254,6 +343,22 @@ pub enum AgentMessage {
 mod tests {
     use super::*;
     use crate::ContentBlock;
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn profile_digests_match_their_contract_text() {
+        let billing = format!(
+            "sha256:{:x}",
+            Sha256::digest(BILLING_USAGE_PROFILE_CONTRACT.as_bytes())
+        );
+        let provenance = format!(
+            "sha256:{:x}",
+            Sha256::digest(USAGE_REPORT_PROFILE_CONTRACT.as_bytes())
+        );
+
+        assert_eq!(billing, BILLING_USAGE_PROFILE_DIGEST);
+        assert_eq!(provenance, USAGE_REPORT_PROFILE_DIGEST);
+    }
 
     fn text_block(s: &str) -> ContentBlock {
         ContentBlock::Text { text: s.into() }
@@ -288,6 +393,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
                 reasoning_tokens: 0,
+                provenance: UsageReportProvenance::ReportedValid,
             }),
             error_message: None,
         });
@@ -333,6 +439,7 @@ mod tests {
             cache_read_tokens: 20,
             cache_creation_tokens: 10,
             reasoning_tokens: 20,
+            provenance: UsageReportProvenance::ReportedValid,
         };
         assert_eq!(u.total_tokens(), 150);
         assert_eq!(u.billable_uncached_input_tokens().unwrap(), 70);
@@ -359,6 +466,26 @@ mod tests {
         .validate_billing_profile()
         .unwrap_err();
         assert!(reasoning_error.to_string().contains("exceed gross output"));
+    }
+
+    #[test]
+    fn token_usage_report_provenance_is_independent_of_zero_values() {
+        let missing = TokenUsage::default();
+        assert!(missing.validate_report().is_err());
+
+        let reported_zero = TokenUsage {
+            provenance: UsageReportProvenance::ReportedValid,
+            ..Default::default()
+        };
+        reported_zero
+            .validate_report()
+            .expect("an explicit provider zero payload is valid evidence");
+
+        let reported_invalid = TokenUsage {
+            provenance: UsageReportProvenance::ReportedInvalid,
+            ..Default::default()
+        };
+        assert!(reported_invalid.validate_report().is_err());
     }
 
     #[test]

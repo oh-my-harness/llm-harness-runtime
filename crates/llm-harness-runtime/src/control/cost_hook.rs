@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use llm_harness_types::{
     AfterProviderResponseCtx, AfterProviderResponseHook, CostAggregate, PricingProvider,
-    calculate_token_usage_cost, canonical_billing_usage_profile,
+    UsageReportProvenance, calculate_token_usage_cost, canonical_billing_usage_profile,
 };
 
 /// Accumulates token usage and cost from each provider response into a shared
@@ -21,11 +21,14 @@ use llm_harness_types::{
 /// - **With a `PricingProvider`**: per-call USD cost is computed and added to
 ///   `CostAggregate.total_cost` and the `by_model` breakdown (tokens, cost,
 ///   call count per `provider/model` key).
-/// - **Without pricing**: only the session-wide token totals
+/// - **Without pricing**: authoritative, valid reports still contribute to the
+///   session-wide token totals
 ///   (`total_input_tokens`, `total_output_tokens`, `total_cache_read_tokens`,
 ///   `total_cache_write_tokens`) accumulate. `total_cost` stays `0.0` and
 ///   `by_model` stays empty — per-model token breakdown is only meaningful
 ///   when pricing is configured, since `ModelCost` carries a USD `cost` field.
+/// - Missing or invalid usage records a completed unknown-cost response without
+///   adding untrusted counters or querying pricing.
 pub(crate) struct CostAccumulatorHook {
     cost: Arc<Mutex<CostAggregate>>,
     pricing: Option<Arc<dyn PricingProvider>>,
@@ -51,12 +54,38 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
     fn after_response<'a>(&'a self, ctx: AfterProviderResponseCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let info = ctx.info;
-            let Some(usage) = &info.usage else {
-                return;
+            let (provenance, usage) = match &info.usage {
+                None => (UsageReportProvenance::Missing, None),
+                Some(usage) => {
+                    let provenance = match usage.provenance {
+                        UsageReportProvenance::ReportedValid
+                            if usage.validate_billing_profile().is_ok() =>
+                        {
+                            UsageReportProvenance::ReportedValid
+                        }
+                        UsageReportProvenance::Missing => UsageReportProvenance::Missing,
+                        UsageReportProvenance::ReportedValid
+                        | UsageReportProvenance::ReportedInvalid => {
+                            UsageReportProvenance::ReportedInvalid
+                        }
+                    };
+                    (provenance, Some(usage))
+                }
             };
 
+            let report_profile_is_valid = {
+                let mut cost = self.cost.lock().unwrap();
+                cost.usage_reports.record(provenance);
+                cost.usage_reports.validate_accounting().is_ok()
+            };
+            if provenance != UsageReportProvenance::ReportedValid || !report_profile_is_valid {
+                if provenance == UsageReportProvenance::ReportedInvalid {
+                    self.cost.lock().unwrap().billing_usage_violations += 1;
+                }
+                return;
+            }
+            let usage = usage.expect("reported-valid provenance carries token usage");
             let canonical_profile = canonical_billing_usage_profile();
-            let usage_is_valid = usage.validate_billing_profile().is_ok();
             let profile_is_valid = {
                 let mut cost = self.cost.lock().unwrap();
                 let profile_is_valid = match &cost.billing_usage_profile {
@@ -71,7 +100,7 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
                 cost.total_cache_read_tokens += u64::from(usage.cache_read_tokens);
                 cost.total_cache_write_tokens += u64::from(usage.cache_creation_tokens);
                 cost.total_reasoning_tokens += u64::from(usage.reasoning_tokens);
-                if !usage_is_valid || !profile_is_valid {
+                if !profile_is_valid {
                     cost.billing_usage_violations += 1;
                 }
                 profile_is_valid
@@ -79,7 +108,7 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
 
             // Invalid usage never reaches the externally supplied pricing
             // source. The violation makes trusted accounting fail closed.
-            if !usage_is_valid || !profile_is_valid {
+            if !profile_is_valid {
                 return;
             }
 
@@ -239,6 +268,7 @@ mod tests {
             cache_read_tokens: 400,
             cache_creation_tokens: 0,
             reasoning_tokens: 100,
+            provenance: UsageReportProvenance::ReportedValid,
         };
 
         record_response(&hook, &make_info(usage, "cached-model", "openai")).await;
@@ -250,6 +280,12 @@ mod tests {
             Some(canonical_billing_usage_profile())
         );
         assert_eq!(observed.billing_usage_violations, 0);
+        assert_eq!(observed.usage_reports.provider_calls, 1);
+        assert_eq!(observed.usage_reports.reported_valid, 1);
+        observed
+            .usage_reports
+            .require_all_reported_valid()
+            .expect("one provider call has one valid usage report");
         let message = assistant();
         let exact =
             BudgetControlAdapter::new(cost.clone(), 0.00164, Some(Arc::new(StopOnExceeded)));
@@ -268,6 +304,7 @@ mod tests {
             cache_read_tokens: 400,
             cache_creation_tokens: 100,
             reasoning_tokens: 100,
+            provenance: UsageReportProvenance::ReportedValid,
         };
 
         record_response(&hook, &make_info(usage, "cached-model", "anthropic")).await;
@@ -291,17 +328,21 @@ mod tests {
             cache_read_tokens: 80,
             cache_creation_tokens: 30,
             reasoning_tokens: 5,
+            provenance: UsageReportProvenance::ReportedValid,
         };
 
         record_response(&hook, &make_info(usage, "cached-model", "openai")).await;
 
         let observed = hook.current_cost();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(observed.total_input_tokens, 100);
-        assert_eq!(observed.total_cache_read_tokens, 80);
-        assert_eq!(observed.total_cache_write_tokens, 30);
+        assert_eq!(observed.total_input_tokens, 0);
+        assert_eq!(observed.total_cache_read_tokens, 0);
+        assert_eq!(observed.total_cache_write_tokens, 0);
         assert_eq!(observed.total_cost, 0.0);
         assert_eq!(observed.billing_usage_violations, 1);
+        assert_eq!(observed.usage_reports.provider_calls, 1);
+        assert_eq!(observed.usage_reports.reported_invalid, 1);
+        assert_eq!(observed.usage_reports.unknown_cost_calls(), 1);
         assert!(observed.by_model.is_empty());
         assert!(observed.validate_billing_profile().is_err());
 
@@ -321,6 +362,7 @@ mod tests {
             cache_read_tokens: 200,
             cache_creation_tokens: 100,
             reasoning_tokens: 300,
+            provenance: UsageReportProvenance::ReportedValid,
         };
         record_response(&hook, &make_info(usage, "claude-sonnet", "anthropic")).await;
 
@@ -345,6 +387,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             reasoning_tokens: 0,
+            provenance: UsageReportProvenance::ReportedValid,
         };
         record_response(&hook, &make_info(usage, "claude-sonnet", "anthropic")).await;
 
@@ -370,10 +413,12 @@ mod tests {
 
         let u1 = TokenUsage {
             input_tokens: 500_000,
+            provenance: UsageReportProvenance::ReportedValid,
             ..Default::default()
         };
         let u2 = TokenUsage {
             input_tokens: 500_000,
+            provenance: UsageReportProvenance::ReportedValid,
             ..Default::default()
         };
         record_response(&hook, &make_info(u1, "claude-sonnet", "anthropic")).await;
@@ -387,9 +432,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_usage_is_noop() {
+    async fn missing_usage_records_unknown_cost_and_stops_budget() {
+        let pricing_calls = Arc::new(AtomicU64::new(0));
         let cost = Arc::new(Mutex::new(CostAggregate::default()));
-        let hook = CostAccumulatorHook::new(cost.clone(), Some(Arc::new(FixedPricing)));
+        let hook = CostAccumulatorHook::new(
+            cost.clone(),
+            Some(Arc::new(CountingPricing {
+                calls: pricing_calls.clone(),
+            })),
+        );
 
         let info = ProviderResponseInfo {
             status_code: None,
@@ -404,6 +455,79 @@ mod tests {
         let c = hook.current_cost();
         assert_eq!(c.total_input_tokens, 0);
         assert_eq!(c.total_cost, 0.0);
+        assert_eq!(c.usage_reports.provider_calls, 1);
+        assert_eq!(c.usage_reports.missing, 1);
+        assert_eq!(c.usage_reports.unknown_cost_calls(), 1);
+        assert!(c.by_model.is_empty());
+        assert_eq!(pricing_calls.load(Ordering::SeqCst), 0);
+
+        let message = assistant();
+        let budget = BudgetControlAdapter::new(cost, f64::MAX, None);
+        assert!(budget.should_stop(stop_context(&message)).await);
+    }
+
+    #[tokio::test]
+    async fn reported_zero_usage_is_valid_priced_evidence() {
+        let cost = Arc::new(Mutex::new(CostAggregate::default()));
+        let hook = CostAccumulatorHook::new(cost.clone(), Some(Arc::new(FixedPricing)));
+        let usage = TokenUsage {
+            provenance: UsageReportProvenance::ReportedValid,
+            ..Default::default()
+        };
+
+        record_response(&hook, &make_info(usage, "claude-sonnet", "anthropic")).await;
+
+        let observed = hook.current_cost();
+        assert_eq!(observed.total_cost, 0.0);
+        assert_eq!(observed.usage_reports.provider_calls, 1);
+        assert_eq!(observed.usage_reports.reported_valid, 1);
+        observed
+            .usage_reports
+            .require_all_reported_valid()
+            .expect("an explicit zero payload remains authoritative");
+        let model = observed
+            .by_model
+            .get("anthropic/claude-sonnet")
+            .expect("a priced zero-token call remains observable");
+        assert_eq!(model.call_count, 1);
+        assert_eq!(model.cost, 0.0);
+
+        let message = assistant();
+        let budget = BudgetControlAdapter::new(cost, 0.0, None);
+        assert!(!budget.should_stop(stop_context(&message)).await);
+    }
+
+    #[tokio::test]
+    async fn provider_reported_invalid_usage_records_unknown_cost() {
+        let pricing_calls = Arc::new(AtomicU64::new(0));
+        let cost = Arc::new(Mutex::new(CostAggregate::default()));
+        let hook = CostAccumulatorHook::new(
+            cost.clone(),
+            Some(Arc::new(CountingPricing {
+                calls: pricing_calls.clone(),
+            })),
+        );
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            provenance: UsageReportProvenance::ReportedInvalid,
+            ..Default::default()
+        };
+
+        record_response(&hook, &make_info(usage, "model", "provider")).await;
+
+        let observed = hook.current_cost();
+        assert_eq!(observed.usage_reports.provider_calls, 1);
+        assert_eq!(observed.usage_reports.reported_invalid, 1);
+        assert_eq!(observed.usage_reports.unknown_cost_calls(), 1);
+        assert_eq!(observed.billing_usage_violations, 1);
+        assert_eq!(observed.total_cost, 0.0);
+        assert!(observed.by_model.is_empty());
+        assert_eq!(pricing_calls.load(Ordering::SeqCst), 0);
+
+        let message = assistant();
+        let budget = BudgetControlAdapter::new(cost, f64::MAX, None);
+        assert!(budget.should_stop(stop_context(&message)).await);
     }
     /// Regression: production path has `provider: None` (StreamingState does
     /// not expose provider metadata). Pricing must still be resolved by model
@@ -419,6 +543,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             reasoning_tokens: 0,
+            provenance: UsageReportProvenance::ReportedValid,
         };
         record_response(&hook, &make_info_no_provider(usage, "claude-sonnet")).await;
 
@@ -448,6 +573,7 @@ mod tests {
             cache_read_tokens: 200,
             cache_creation_tokens: 100,
             reasoning_tokens: 50,
+            provenance: UsageReportProvenance::ReportedValid,
         };
         record_response(&hook, &make_info(usage, "claude-sonnet", "anthropic")).await;
 

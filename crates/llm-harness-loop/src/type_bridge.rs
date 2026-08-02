@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use llm_adapter::types::{
     ImageSource as AdapterImageSource, RequestContent, ResponseContent, StopReason as AdapterStop,
-    ToolDef, ToolInvocation, Usage,
+    ToolDef, ToolInvocation, Usage, UsageProvenance as AdapterUsageProvenance,
 };
 use llm_harness_types::*;
 
@@ -24,6 +24,11 @@ pub(crate) fn convert_usage(u: Usage) -> TokenUsage {
         cache_read_tokens: u.cached_input_tokens,
         cache_creation_tokens: u.cache_creation_input_tokens,
         reasoning_tokens: u.reasoning_tokens,
+        provenance: match u.provenance {
+            AdapterUsageProvenance::Missing => UsageReportProvenance::Missing,
+            AdapterUsageProvenance::ReportedValid => UsageReportProvenance::ReportedValid,
+            AdapterUsageProvenance::ReportedInvalid => UsageReportProvenance::ReportedInvalid,
+        },
     }
 }
 
@@ -139,6 +144,7 @@ mod tests {
             cached_input_tokens: 3,
             cache_creation_input_tokens: 1,
             reasoning_tokens: 4,
+            provenance: AdapterUsageProvenance::ReportedValid,
         };
         let tu = convert_usage(u);
         assert_eq!(tu.input_tokens, 10);
@@ -146,6 +152,7 @@ mod tests {
         assert_eq!(tu.cache_read_tokens, 3);
         assert_eq!(tu.cache_creation_tokens, 1);
         assert_eq!(tu.reasoning_tokens, 4);
+        assert_eq!(tu.provenance, UsageReportProvenance::ReportedValid);
         tu.validate_billing_profile().unwrap();
     }
 
@@ -166,6 +173,22 @@ mod tests {
         assert_eq!(
             llm_adapter::types::BILLING_USAGE_PROFILE_CONTRACT,
             BILLING_USAGE_PROFILE_CONTRACT
+        );
+        assert_eq!(
+            llm_adapter::types::USAGE_REPORT_PROFILE_ID,
+            USAGE_REPORT_PROFILE_ID
+        );
+        assert_eq!(
+            llm_adapter::types::USAGE_REPORT_PROFILE_VERSION,
+            USAGE_REPORT_PROFILE_VERSION
+        );
+        assert_eq!(
+            llm_adapter::types::USAGE_REPORT_PROFILE_DIGEST,
+            USAGE_REPORT_PROFILE_DIGEST
+        );
+        assert_eq!(
+            llm_adapter::types::USAGE_REPORT_PROFILE_CONTRACT,
+            USAGE_REPORT_PROFILE_CONTRACT
         );
     }
 

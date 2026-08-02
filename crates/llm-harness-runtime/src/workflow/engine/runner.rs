@@ -43,6 +43,7 @@ pub(super) fn aggregate_cost(history: &[StepRecord]) -> CostAggregate {
                 _ => {}
             }
             total.billing_usage_violations += r.cost.billing_usage_violations;
+            total.usage_reports.merge(&r.cost.usage_reports);
             total.total_input_tokens += r.cost.total_input_tokens;
             total.total_output_tokens += r.cost.total_output_tokens;
             total.total_cache_read_tokens += r.cost.total_cache_read_tokens;

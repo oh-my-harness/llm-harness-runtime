@@ -2290,7 +2290,10 @@ async fn double_with_hooks_accumulates() {
 #[test]
 fn aggregate_cost_merges_per_model_cache_tokens() {
     use crate::workflow::model::{StepRecord, StepResult, Transition};
-    use llm_harness_types::{CostAggregate, ModelCost, canonical_billing_usage_profile};
+    use llm_harness_types::{
+        CostAggregate, ModelCost, UsageReportAggregate, canonical_billing_usage_profile,
+        canonical_usage_report_profile,
+    };
 
     let now = chrono::Utc::now();
     let mk_record = |read: u64, write: u64| StepRecord {
@@ -2310,6 +2313,12 @@ fn aggregate_cost_merges_per_model_cache_tokens() {
                 total_cache_write_tokens: write,
                 total_reasoning_tokens: 5,
                 billing_usage_profile: Some(canonical_billing_usage_profile()),
+                usage_reports: UsageReportAggregate {
+                    profile: Some(canonical_usage_report_profile()),
+                    provider_calls: 1,
+                    reported_valid: 1,
+                    ..Default::default()
+                },
                 by_model: {
                     let mut m = std::collections::HashMap::new();
                     m.insert(
@@ -2362,6 +2371,24 @@ fn aggregate_cost_merges_per_model_cache_tokens() {
         Some(canonical_billing_usage_profile())
     );
     assert_eq!(total.billing_usage_violations, 0);
+    assert_eq!(total.usage_reports.provider_calls, 2);
+    assert_eq!(total.usage_reports.reported_valid, 2);
+    total
+        .usage_reports
+        .require_all_reported_valid()
+        .expect("both workflow calls retain valid usage evidence");
+
+    let mut legacy = mk_record(1, 0);
+    let legacy_cost = &mut legacy.result.as_mut().expect("step result").cost;
+    legacy_cost.billing_usage_profile = None;
+    legacy_cost.usage_reports = UsageReportAggregate::default();
+    legacy_cost.by_model.clear();
+    let mixed = aggregate_cost(&[legacy, mk_record(200, 100)]);
+    assert!(
+        mixed.validate_billing_profile().is_err(),
+        "legacy numeric usage without provenance must not inherit a later profile"
+    );
+    assert!(mixed.billing_usage_violations > 0);
 }
 
 #[tokio::test]
