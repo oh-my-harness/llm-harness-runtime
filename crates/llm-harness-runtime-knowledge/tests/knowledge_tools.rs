@@ -294,6 +294,26 @@ fn reference_only_plugin() -> KnowledgePlugin {
     .unwrap()
 }
 
+fn mixed_projection_plugin() -> KnowledgePlugin {
+    let access_control = Arc::new(KnowledgeAccessControl::new(Arc::new(AllowAllAuthorizer)));
+    let registry = Arc::new(
+        KnowledgeRegistry::builder(access_control)
+            .source(Arc::new(FixtureSource))
+            .source(Arc::new(ReferenceOnlyFixtureSource))
+            .build()
+            .unwrap(),
+    );
+    let provider = EvidenceProviderId("knowledge.registry".into());
+    let authority = Arc::new(EvidenceAuthority::new(vec![9; 32], [provider.clone()]).unwrap());
+    KnowledgePlugin::new(
+        registry,
+        authority,
+        provider,
+        KnowledgePluginConfig::default(),
+    )
+    .unwrap()
+}
+
 #[tokio::test]
 async fn reference_only_search_does_not_persist_snippets() {
     let plugin = reference_only_plugin();
@@ -326,6 +346,86 @@ async fn reference_only_search_does_not_persist_snippets() {
     let serialized = serde_json::to_string(result).unwrap();
     assert!(!serialized.contains("PRIVATE HISTORY SNIPPET"));
     assert!(serialized.contains("turn-1"));
+}
+
+#[tokio::test]
+async fn unscoped_search_federates_visible_sources() {
+    let plugin = knowledge_plugin(KnowledgePluginConfig::default());
+    let mut tools: Vec<Arc<dyn Tool>> = vec![];
+    plugin.register_tools(&mut tools);
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::tool_use(
+            "search-1",
+            KNOWLEDGE_SEARCH_TOOL_NAME,
+            r#"{"query":"help"}"#,
+        ),
+        MockResponse::text("done"),
+    ]));
+    let mut options = AgentHarnessOptions::new("test-model");
+    options.tools = tools;
+    let harness = AgentHarness::new_in_memory(
+        client.clone() as Arc<dyn LlmClient>,
+        Arc::new(NoOpEnv),
+        options,
+    )
+    .await;
+    harness
+        .run(RunRequest::from_text("search all knowledge").with_extension(access()))
+        .await
+        .unwrap();
+
+    let requests = client.captured_requests.lock().unwrap();
+    let result_text = requests[1]
+        .messages()
+        .iter()
+        .filter_map(|message| match message {
+            Message::Tool { content, .. } => Some(
+                content
+                    .iter()
+                    .filter_map(|block| match block {
+                        RequestContent::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(result_text.contains("refund"));
+    assert!(result_text.contains("preference"));
+    assert!(result_text.contains("source_failures"));
+}
+
+#[tokio::test]
+async fn federated_search_uses_the_most_restrictive_session_projection() {
+    let plugin = mixed_projection_plugin();
+    let mut tools: Vec<Arc<dyn Tool>> = vec![];
+    plugin.register_tools(&mut tools);
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::tool_use("search-1", KNOWLEDGE_SEARCH_TOOL_NAME, r#"{"query":"old"}"#),
+        MockResponse::text("done"),
+    ]));
+    let mut options = AgentHarnessOptions::new("test-model");
+    options.tools = tools;
+    let harness =
+        AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, Arc::new(NoOpEnv), options).await;
+    harness
+        .run(RunRequest::from_text("search mixed knowledge").with_extension(access()))
+        .await
+        .unwrap();
+
+    let context = harness.build_context().await.unwrap();
+    let result = context.messages.iter().find_map(|message| match message {
+        AgentMessage::ToolResult(result) => Some(result),
+        _ => None,
+    });
+    let result = result.expect("federated search result must be projected");
+    assert_eq!(result.projection.kind, ToolProjectionKind::Ephemeral);
+    let serialized = serde_json::to_string(result).unwrap();
+    assert!(!serialized.contains("PRIVATE HISTORY SNIPPET"));
+    assert!(!serialized.contains("Thirty day refund window"));
+    assert!(serialized.contains("turn-1"));
+    assert!(serialized.contains("refund"));
 }
 
 #[tokio::test]
