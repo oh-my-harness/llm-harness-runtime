@@ -55,7 +55,7 @@ violation, and budget control fails closed.
 
 ## Provider Mapping
 
-`llm-api-adapter` revision `10fb9a8791170d78d6a84815059207efd99ce631`
+`llm-api-adapter` revision `193117cbb8398aadeca74a925cfd699617f8c861`
 normalizes provider-shaped usage as follows:
 
 | Provider | Gross input | Cache read subset | Cache write subset |
@@ -69,6 +69,10 @@ requires `hit + miss == prompt_tokens`. Provider-shaped fixtures cover all three
 mappings. The adapter and runtime compile-time tests require an exact match of
 profile ID, version, digest, and contract text.
 
+If a provider usage object was parsed but gross/subset normalization overflows,
+the response still produces one `ReportedInvalid` completed-call report. Its
+numeric totals are not trusted or added to runtime accounting.
+
 ## Usage Report Provenance
 
 Token values do not prove that a provider supplied a usage payload. An explicit
@@ -80,14 +84,18 @@ semantics.
 The canonical identity is:
 
 - ID: `llm-harness-usage-report`
-- version: `1`
-- digest: `sha256:f6a776c595f99114eb692faf4f72eb4eb0012a33fa3722244e65fad0d6f48073`
+- version: `2`
+- digest: `sha256:9d9e1d63b51fb44ef06383f1b7e92729404b7729357c25aef2d4d15bfdc288c5`
 
 The digest binds this exact contract:
 
 ```text
-provenance=provider_payload;states=reported_valid,missing,reported_invalid;zero_tokens_do_not_imply_missing;reported_valid_requires_billing_invariants
+provenance=provider_payload;states=reported_valid,missing,reported_invalid;zero_tokens_do_not_imply_missing;reported_valid_requires_billing_invariants;parsed_usage_normalization_failure=reported_invalid;terminal=first_message_stop
 ```
+
+The first `MessageStop` is the unique response terminal. Consumers stop polling
+the transport immediately, ignore any later terminal, and account the first
+terminal exactly once. A completed terminal cannot be delayed until SSE EOF.
 
 Every completed provider response observed by runtime's after-response
 accounting boundary has exactly one status:
@@ -119,6 +127,12 @@ profile. A response with explicit, valid zero usage increments both
 cost. A missing or invalid report increments `provider_calls` and
 `unknown_cost_calls()`, does not create priced per-model evidence, and forces
 budget control to stop even in surveillance mode.
+
+Callers that need evidence after timeout or cancellation retain a clone of the
+runtime `UsageLedger`. The built-in accumulator writes to that caller-owned
+ledger before general after-response hooks and before session persistence or
+output extraction. Dropping the execution future therefore cannot erase a
+provider call whose first terminal was already observed.
 
 Legacy serialized aggregates remain decodable because both new fields have
 serde defaults. An aggregate without a canonical profile is not trusted
@@ -157,4 +171,4 @@ categories requires a new billing profile version and digest. Any semantic
 change to provenance states, completeness, or validity requires a new usage
 report profile version and digest. Adapter, runtime, trusted admission, and
 experiment manifests must move together. Changing either contract while
-retaining its version `1` is invalid.
+retaining its prior version is invalid.

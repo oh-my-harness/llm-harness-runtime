@@ -364,6 +364,8 @@ fn run_loop(
             loop {
                 match handle.events().next().await {
                     Some(Ok(adapter_event)) => {
+                        let is_terminal =
+                            matches!(&adapter_event, llm_adapter::types::StreamEvent::MessageStop { .. });
                         for agent_event in state.process(adapter_event) {
                             if let AgentEvent::MessageEnd { ref message, .. } = agent_event {
                                 final_message = Some(message.clone());
@@ -374,6 +376,9 @@ fn run_loop(
                                 }
                             }
                             yield agent_event;
+                        }
+                        if is_terminal {
+                            break;
                         }
                     }
                     Some(Err(e)) => {
@@ -1145,6 +1150,65 @@ mod tests {
         assert_eq!(
             client.call_count.load(std::sync::atomic::Ordering::SeqCst),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn first_message_stop_is_the_only_accounted_terminal() {
+        use llm_adapter::types::{
+            StopReason as AdapterStopReason, StreamEvent as AdapterEvent, Usage as AdapterUsage,
+        };
+        use std::sync::Mutex;
+
+        struct CaptureUsage(Arc<Mutex<Vec<TokenUsage>>>);
+
+        impl AfterProviderResponseHook for CaptureUsage {
+            fn after_response<'a>(
+                &'a self,
+                ctx: AfterProviderResponseCtx<'a>,
+            ) -> BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    if let Some(usage) = &ctx.info.usage {
+                        self.0.lock().unwrap().push(usage.clone());
+                    }
+                })
+            }
+        }
+
+        let invalid = AdapterUsage {
+            input_tokens: 100,
+            cached_input_tokens: 101,
+            ..Default::default()
+        };
+        let valid = AdapterUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            ..Default::default()
+        }
+        .reported();
+        let mut response = MockResponse::text("answer").with_reported_invalid_usage(invalid);
+        response.events.push(Ok(AdapterEvent::MessageStop {
+            stop_reason: AdapterStopReason::EndTurn,
+            usage: valid,
+        }));
+        let (client, mut config) = make_config(vec![response]);
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        config.after_provider_response = Some(Arc::new(CaptureUsage(captured.clone())));
+        let context = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+
+        let _: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, context, config)
+                .collect()
+                .await;
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].provenance,
+            UsageReportProvenance::ReportedInvalid
         );
     }
 

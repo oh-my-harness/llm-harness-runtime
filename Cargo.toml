@@ -42,7 +42,7 @@ llm-harness-runtime-knowledge-local = { path = "crates/llm-harness-runtime-knowl
 llm-harness-runtime-memory = { path = "crates/llm-harness-runtime-memory" }
 
 # API adapter — separate repo
-llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "10fb9a8791170d78d6a84815059207efd99ce631" }
+llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "193117cbb8398aadeca74a925cfd699617f8c861" }
 
 # Infrastructure
 anyhow             = "1"

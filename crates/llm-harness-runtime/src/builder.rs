@@ -19,7 +19,7 @@
 //! ```
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use llm_harness_agent::{
     AgentHarness, AgentHarnessOptions, CompactionModelConfig, HarnessHooks, ModelInfo, Plugin,
@@ -27,12 +27,13 @@ use llm_harness_agent::{
 };
 use llm_harness_loop::{ConvertToLlmHook, FinalAnswerMode, LlmClient, RetryConfig};
 use llm_harness_types::{
-    AfterProviderResponseHook, AfterTurnHook, CostAggregate, ExecutionEnv, PricingProvider,
-    ShouldStopHook, StreamOptions, ThinkingLevel, Tool,
+    AfterProviderResponseHook, AfterTurnHook, ExecutionEnv, PricingProvider, ShouldStopHook,
+    StreamOptions, ThinkingLevel, Tool,
 };
 
 use crate::control::{
-    budget::BudgetControlAdapter, budget::BudgetExceededHook, cost_hook::CostAccumulatorHook,
+    budget::BudgetControlAdapter, budget::BudgetExceededHook, cost::UsageLedger,
+    cost_hook::CostAccumulatorHook,
 };
 use thiserror::Error;
 
@@ -122,6 +123,8 @@ pub struct HarnessBuilder {
     providers: Vec<ProviderMatcher>,
     /// 可选的 pricing provider，用于成本计算。
     pricing: Option<Arc<dyn PricingProvider>>,
+    /// Optional caller-owned completed-call accounting state.
+    usage_ledger: Option<UsageLedger>,
     /// 可选的预算上限 + 超限 hook。设置后，一个 `BudgetControlAdapter`
     /// 会被注入 `should_stop`，与 `CostAccumulatorHook` 共享同一 cost Arc。
     budget: Option<(f64, Option<Arc<dyn BudgetExceededHook>>)>,
@@ -181,6 +184,7 @@ impl HarnessBuilder {
             templates: vec![],
             providers: vec![],
             pricing: None,
+            usage_ledger: None,
             budget: None,
             max_tokens: None,
             compaction_model: None,
@@ -301,6 +305,15 @@ impl HarnessBuilder {
     /// 不设置则只累积 token 计数。
     pub fn pricing(mut self, pricing: Arc<dyn PricingProvider>) -> Self {
         self.pricing = Some(pricing);
+        self
+    }
+
+    /// Use caller-owned accounting state for this harness.
+    ///
+    /// Retaining a clone lets the caller recover completed provider-call
+    /// evidence even if the harness execution future is later cancelled.
+    pub fn usage_ledger(mut self, usage_ledger: UsageLedger) -> Self {
+        self.usage_ledger = Some(usage_ledger);
         self
     }
 
@@ -605,13 +618,14 @@ impl HarnessBuilder {
         // 创建共享 cost 状态。即使没有 pricing/budget，
         // 也注入 CostAccumulatorHook，使 token 计数始终能通过
         // AgentHarness::usage() 读取。
-        let cost = Arc::new(Mutex::new(CostAggregate::default()));
+        let usage_ledger = self.usage_ledger.clone().unwrap_or_default();
+        let cost = usage_ledger.shared_state();
         opts.cost = cost.clone();
 
         // 注入内置成本累积器（始终注入，使 usage() 可用）。
         let accumulator: Arc<dyn AfterProviderResponseHook> =
             Arc::new(CostAccumulatorHook::new(cost.clone(), self.pricing.clone()));
-        opts.hooks.after_provider_response.push(accumulator);
+        opts.hooks.after_provider_response.insert(0, accumulator);
 
         // 若配置了 budget，注入预算决策器。
         if let Some((limit, exceeded_hook)) = &self.budget {
@@ -1350,6 +1364,86 @@ mod tests {
         assert_eq!(opts.compaction_reserve_tokens, None);
         assert_eq!(opts.compaction_keep_recent_tokens, None);
         assert_eq!(opts.queue_capacity, 32); // DEFAULT_QUEUE_CAPACITY
+    }
+
+    #[test]
+    fn caller_owned_usage_ledger_shares_the_builder_accounting_state() {
+        use llm_harness_types::UsageReportProvenance;
+
+        let ledger = UsageLedger::default();
+        let opts = HarnessBuilder::new("m")
+            .usage_ledger(ledger.clone())
+            .build_options(None);
+        opts.cost
+            .lock()
+            .unwrap()
+            .usage_reports
+            .record(UsageReportProvenance::Missing);
+
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.usage_reports.provider_calls, 1);
+        assert_eq!(snapshot.usage_reports.missing, 1);
+    }
+
+    #[tokio::test]
+    async fn completed_usage_is_recorded_before_custom_response_hooks() {
+        use futures::future::BoxFuture;
+        use llm_harness_types::{
+            AfterProviderResponseCtx, ProviderResponseInfo, RunContext, RunRequest, TokenUsage,
+            UsageReportProvenance,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct ObserveLedger {
+            ledger: UsageLedger,
+            observed: Arc<AtomicBool>,
+        }
+
+        impl AfterProviderResponseHook for ObserveLedger {
+            fn after_response<'a>(&'a self, _: AfterProviderResponseCtx<'a>) -> BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    self.observed.store(
+                        self.ledger.snapshot().usage_reports.provider_calls == 1,
+                        Ordering::SeqCst,
+                    );
+                })
+            }
+        }
+
+        let ledger = UsageLedger::default();
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut hooks = HarnessHooks::none();
+        hooks.after_provider_response.push(Arc::new(ObserveLedger {
+            ledger: ledger.clone(),
+            observed: observed.clone(),
+        }));
+        let opts = HarnessBuilder::new("m")
+            .usage_ledger(ledger)
+            .hooks(hooks)
+            .build_options(None);
+        let run = RunContext::new(RunRequest::default());
+        let info = ProviderResponseInfo {
+            status_code: None,
+            response_headers: vec![],
+            usage: Some(TokenUsage {
+                provenance: UsageReportProvenance::ReportedValid,
+                ..Default::default()
+            }),
+            latency_ms: 0,
+            model: Some("m".into()),
+            provider: Some("provider".into()),
+        };
+
+        for hook in &opts.hooks.after_provider_response {
+            hook.after_response(AfterProviderResponseCtx {
+                run: &run,
+                turn_index: 0,
+                info: &info,
+            })
+            .await;
+        }
+
+        assert!(observed.load(Ordering::SeqCst));
     }
 
     #[test]

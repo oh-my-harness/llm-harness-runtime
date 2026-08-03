@@ -15,12 +15,12 @@ pub const BILLING_USAGE_PROFILE_DIGEST: &str =
 /// Stable identity for provider usage-report provenance semantics.
 pub const USAGE_REPORT_PROFILE_ID: &str = "llm-harness-usage-report";
 /// Version of the provider usage-report provenance semantics.
-pub const USAGE_REPORT_PROFILE_VERSION: &str = "1";
+pub const USAGE_REPORT_PROFILE_VERSION: &str = "2";
 /// Canonical, digest-bound definition of usage-report provenance.
-pub const USAGE_REPORT_PROFILE_CONTRACT: &str = "provenance=provider_payload;states=reported_valid,missing,reported_invalid;zero_tokens_do_not_imply_missing;reported_valid_requires_billing_invariants";
+pub const USAGE_REPORT_PROFILE_CONTRACT: &str = "provenance=provider_payload;states=reported_valid,missing,reported_invalid;zero_tokens_do_not_imply_missing;reported_valid_requires_billing_invariants;parsed_usage_normalization_failure=reported_invalid;terminal=first_message_stop";
 /// SHA-256 digest of [`USAGE_REPORT_PROFILE_CONTRACT`].
 pub const USAGE_REPORT_PROFILE_DIGEST: &str =
-    "sha256:f6a776c595f99114eb692faf4f72eb4eb0012a33fa3722244e65fad0d6f48073";
+    "sha256:9d9e1d63b51fb44ef06383f1b7e92729404b7729357c25aef2d4d15bfdc288c5";
 
 /// Compact runtime marker for the accounting semantics used by an aggregate.
 ///
@@ -66,8 +66,10 @@ pub fn canonical_billing_usage_profile() -> BillingUsageProfile {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum UsageReportProfile {
-    /// Provider-payload provenance with explicit valid/missing/invalid states.
+    /// Legacy provider-payload provenance contract.
     V1,
+    /// First-terminal provider-payload provenance contract.
+    V2,
 }
 
 impl UsageReportProfile {
@@ -78,23 +80,29 @@ impl UsageReportProfile {
 
     /// Stable profile version.
     pub fn version(&self) -> &str {
-        USAGE_REPORT_PROFILE_VERSION
+        match self {
+            Self::V1 => "1",
+            Self::V2 => USAGE_REPORT_PROFILE_VERSION,
+        }
     }
 
     /// Digest of the canonical provenance contract.
     pub fn digest(&self) -> &str {
-        USAGE_REPORT_PROFILE_DIGEST
+        match self {
+            Self::V1 => "sha256:f6a776c595f99114eb692faf4f72eb4eb0012a33fa3722244e65fad0d6f48073",
+            Self::V2 => USAGE_REPORT_PROFILE_DIGEST,
+        }
     }
 
     /// Returns whether this identity is runtime's canonical profile.
     pub fn is_canonical(&self) -> bool {
-        matches!(self, Self::V1)
+        matches!(self, Self::V2)
     }
 }
 
 /// Returns the verifier-owned canonical usage-report profile.
 pub fn canonical_usage_report_profile() -> UsageReportProfile {
-    UsageReportProfile::V1
+    UsageReportProfile::V2
 }
 
 /// Provenance and validity of one provider usage report.
