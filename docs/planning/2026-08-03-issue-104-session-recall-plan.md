@@ -361,8 +361,14 @@ retain existing behavior and cost.
   dependencies.
 - Added WAL crash recovery, schema versioning, atomic rebuild, durable deletion
   tombstones, multilingual search, and restart reconciliation tests.
-- Benchmark indexing latency, disk amplification, search latency, and startup
-  reconciliation on representative Session sets.
+- Added a reproducible, dependency-free benchmark for bulk indexing latency,
+  SQLite/WAL bytes, search p50/p95/p99, and reopen revision scanning. Deployment
+  owners should record baselines with representative Session sets and hardware.
+- Local Windows release-profile baseline (2026-08-03; 1,000 Sessions / 5,000
+  turns / 200 searches): 386 ms bulk indexing, 5,525,504 SQLite/WAL bytes,
+  18,429 us p50, 21,452 us p95, 24,362 us p99, and 3 ms to reopen plus scan
+  1,000 projected revisions. These measurements are informational, not CI
+  thresholds.
 
 ## Acceptance Test Matrix
 

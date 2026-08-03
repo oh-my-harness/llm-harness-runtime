@@ -30,3 +30,8 @@ llm-harness-loop = { workspace = true, features = ["test-utils"] }
 llm_adapter.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[bench]]
+name = "sqlite_recall"
+harness = false
+required-features = ["sqlite-bundled"]

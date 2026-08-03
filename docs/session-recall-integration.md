@@ -203,3 +203,15 @@ the structured target is still present in result metadata.
 Persistent-index performance benchmarks and deployment-specific retention
 policies remain application concerns. They do not change this integration or
 authority boundary.
+
+Run the reproducible local baseline with:
+
+```text
+cargo bench -p llm-harness-runtime-session-recall --bench sqlite_recall --features sqlite-bundled
+```
+
+The benchmark reports bulk indexing time, SQLite/WAL bytes, search p50/p95/p99,
+and reopen plus projected-revision scan time. Override its dataset with
+`SESSION_RECALL_BENCH_SESSIONS`, `SESSION_RECALL_BENCH_DOCS_PER_SESSION`, and
+`SESSION_RECALL_BENCH_SEARCHES`; record results on the target hardware rather
+than enforcing machine-specific latency thresholds in correctness tests.
