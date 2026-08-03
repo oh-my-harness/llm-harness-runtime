@@ -140,6 +140,12 @@ pub enum SessionError {
     Serialization(String),
     #[error("concurrent modification")]
     ConcurrentModification,
+    #[error("invalid session recall configuration: {0}")]
+    InvalidRecallConfiguration(String),
+    #[error("session recall revision exhausted")]
+    RecallRevisionExhausted,
+    #[error("session storage does not support recall metadata updates")]
+    RecallMetadataUnsupported,
 }
 
 // ── CompactionError ───────────────────────────────────────────────────────────

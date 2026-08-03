@@ -218,6 +218,14 @@ impl Session {
     pub async fn metadata(&self) -> Result<SessionMetadata, SessionError> {
         self.storage.metadata().await
     }
+
+    /// Atomically replace cross-session recall eligibility and authorization scope.
+    pub async fn update_recall_settings(
+        &self,
+        settings: SessionRecallSettings,
+    ) -> Result<(), SessionError> {
+        self.storage.update_recall_settings(settings).await
+    }
 }
 
 // ── build_context_from_entries ────────────────────────────────────────────────

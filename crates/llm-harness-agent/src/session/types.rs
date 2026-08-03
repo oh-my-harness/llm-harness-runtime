@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use llm_harness_types::*;
 use serde::{Deserialize, Serialize};
@@ -106,6 +108,107 @@ pub struct SessionEntry {
 
 // ── Session metadata ───────────────────────────────────────────────────────────
 
+/// Whether a Session is expected to survive the current process/runtime.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDurability {
+    /// In-memory, scratch, or otherwise non-authoritative Session.
+    Temporary,
+    /// Persisted Session that may participate in explicitly enabled recall.
+    #[default]
+    Durable,
+}
+
+/// User-visible lifecycle state relevant to projections such as recall.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLifecycle {
+    #[default]
+    Active,
+    Archived,
+}
+
+/// Explicit opt-in policy for cross-session recall.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRecallPolicy {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
+/// Trusted authorization partition attached to a recallable Session.
+///
+/// This is scope metadata, not a credential. Principal identities, delegation
+/// proofs, tokens, and other secrets must never be stored here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecallScope {
+    pub namespace: String,
+    pub tenant: Option<String>,
+    pub project: Option<String>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+}
+
+impl SessionRecallScope {
+    pub fn new(namespace: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            tenant: None,
+            project: None,
+            attributes: BTreeMap::new(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), SessionError> {
+        if self.namespace.trim().is_empty() {
+            return Err(SessionError::InvalidRecallConfiguration(
+                "recall scope namespace must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Complete atomic recall-related metadata update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecallSettings {
+    pub durability: SessionDurability,
+    pub lifecycle: SessionLifecycle,
+    pub policy: SessionRecallPolicy,
+    pub scope: Option<SessionRecallScope>,
+}
+
+impl SessionRecallSettings {
+    pub fn disabled(durability: SessionDurability) -> Self {
+        Self {
+            durability,
+            lifecycle: SessionLifecycle::Active,
+            policy: SessionRecallPolicy::Disabled,
+            scope: None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), SessionError> {
+        if self.policy == SessionRecallPolicy::Enabled {
+            if self.durability != SessionDurability::Durable {
+                return Err(SessionError::InvalidRecallConfiguration(
+                    "temporary sessions cannot enable recall".into(),
+                ));
+            }
+            self.scope.as_ref().ok_or_else(|| {
+                SessionError::InvalidRecallConfiguration(
+                    "recall-enabled sessions require an authorization scope".into(),
+                )
+            })?;
+        }
+        if let Some(scope) = &self.scope {
+            scope.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// Persistent metadata for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMetadata {
@@ -123,6 +226,76 @@ pub struct SessionMetadata {
     pub active_cursor: Option<EntryId>,
     /// Source session path for cross-session forks (reference mode, v1.x only).
     pub parent_session_path: Option<String>,
+    /// Persistence class. Legacy persisted metadata defaults to durable.
+    #[serde(default)]
+    pub durability: SessionDurability,
+    /// Current lifecycle state. Archived Sessions are not recallable.
+    #[serde(default)]
+    pub lifecycle: SessionLifecycle,
+    /// Explicit cross-session recall opt-in. Defaults to disabled.
+    #[serde(default)]
+    pub recall_policy: SessionRecallPolicy,
+    /// Trusted authorization partition for recall queries and exact reads.
+    #[serde(default)]
+    pub recall_scope: Option<SessionRecallScope>,
+    /// Monotonic generation for recall-visible metadata, branch, and content.
+    #[serde(default)]
+    pub recall_revision: u64,
+}
+
+impl SessionMetadata {
+    pub fn recall_settings(&self) -> SessionRecallSettings {
+        SessionRecallSettings {
+            durability: self.durability,
+            lifecycle: self.lifecycle,
+            policy: self.recall_policy,
+            scope: self.recall_scope.clone(),
+        }
+    }
+
+    /// Whether this metadata is currently eligible to enter a recall projection.
+    pub fn is_recallable(&self) -> bool {
+        self.durability == SessionDurability::Durable
+            && self.lifecycle == SessionLifecycle::Active
+            && self.recall_policy == SessionRecallPolicy::Enabled
+            && self
+                .recall_scope
+                .as_ref()
+                .is_some_and(|scope| scope.validate().is_ok())
+    }
+
+    pub(crate) fn apply_recall_settings(
+        &mut self,
+        settings: SessionRecallSettings,
+    ) -> Result<bool, SessionError> {
+        settings.validate()?;
+        if self.recall_settings() == settings {
+            return Ok(false);
+        }
+        self.durability = settings.durability;
+        self.lifecycle = settings.lifecycle;
+        self.recall_policy = settings.policy;
+        self.recall_scope = settings.scope;
+        self.advance_recall_revision()?;
+        self.updated_at = Utc::now();
+        Ok(true)
+    }
+
+    pub(crate) fn mark_recall_content_changed(&mut self) -> Result<bool, SessionError> {
+        if self.recall_policy != SessionRecallPolicy::Enabled {
+            return Ok(false);
+        }
+        self.advance_recall_revision()?;
+        Ok(true)
+    }
+
+    fn advance_recall_revision(&mut self) -> Result<(), SessionError> {
+        self.recall_revision = self
+            .recall_revision
+            .checked_add(1)
+            .ok_or(SessionError::RecallRevisionExhausted)?;
+        Ok(())
+    }
 }
 
 // ── Creation / list options ────────────────────────────────────────────────────
@@ -138,6 +311,29 @@ pub struct CreateSessionOptions {
     pub initial_thinking_level: Option<ThinkingLevel>,
     /// List of tool identifiers initially available in this session.
     pub initial_tools: Vec<String>,
+    /// Override repository-default durability. In-memory repos default to
+    /// temporary; persisted repos default to durable.
+    pub durability: Option<SessionDurability>,
+    /// Explicit recall opt-in. Defaults to disabled.
+    pub recall_policy: SessionRecallPolicy,
+    /// Trusted scope required when recall is enabled.
+    pub recall_scope: Option<SessionRecallScope>,
+}
+
+impl CreateSessionOptions {
+    pub(crate) fn recall_settings(
+        &self,
+        default_durability: SessionDurability,
+    ) -> Result<SessionRecallSettings, SessionError> {
+        let settings = SessionRecallSettings {
+            durability: self.durability.unwrap_or(default_durability),
+            lifecycle: SessionLifecycle::Active,
+            policy: self.recall_policy,
+            scope: self.recall_scope.clone(),
+        };
+        settings.validate()?;
+        Ok(settings)
+    }
 }
 
 /// Options for listing sessions.

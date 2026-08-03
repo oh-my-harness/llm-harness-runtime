@@ -198,7 +198,12 @@ impl SessionStorage for JsonlSessionStorage {
     fn set_active_cursor(&self, id: EntryId) -> BoxFuture<'_, Result<(), SessionError>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
+            if inner.metadata.active_cursor == Some(id) {
+                return Ok(());
+            }
             inner.metadata.active_cursor = Some(id);
+            inner.metadata.updated_at = chrono::Utc::now();
+            inner.metadata.mark_recall_content_changed()?;
             Self::persist_meta(&inner).await
         })
     }
@@ -263,7 +268,12 @@ impl SessionStorage for JsonlSessionStorage {
     ) -> BoxFuture<'_, Result<(), SessionError>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
+            if inner.metadata.name == name {
+                return Ok(());
+            }
             inner.metadata.name = name;
+            inner.metadata.updated_at = chrono::Utc::now();
+            inner.metadata.mark_recall_content_changed()?;
             Self::persist_meta(&inner).await
         })
     }
@@ -279,26 +289,40 @@ impl SessionStorage for JsonlSessionStorage {
         })
     }
 
+    fn update_recall_settings(
+        &self,
+        settings: SessionRecallSettings,
+    ) -> BoxFuture<'_, Result<(), SessionError>> {
+        Box::pin(async move {
+            let mut inner = self.inner.lock().await;
+            if inner.metadata.apply_recall_settings(settings)? {
+                Self::persist_meta(&inner).await?;
+            }
+            Ok(())
+        })
+    }
+
     fn delete_entries(&self, ids: Vec<EntryId>) -> BoxFuture<'_, Result<(), SessionError>> {
         Box::pin(async move {
             let ids_set: std::collections::HashSet<EntryId> = ids.into_iter().collect();
             let mut inner = self.inner.lock().await;
             Self::ensure_loaded(&mut inner).await?;
 
-            let mut cursor_reset = false;
+            let mut changed = false;
             for id in &ids_set {
-                if let Some(entry) = inner.entry_map.remove(id)
-                    && let Some(children) = inner.children_map.get_mut(&entry.parent_id)
-                {
-                    children.retain(|c| c != id);
+                if let Some(entry) = inner.entry_map.remove(id) {
+                    changed = true;
+                    if let Some(children) = inner.children_map.get_mut(&entry.parent_id) {
+                        children.retain(|c| c != id);
+                    }
                 }
-                inner.children_map.remove(&Some(*id));
+                changed |= inner.children_map.remove(&Some(*id)).is_some();
             }
             if let Some(cursor) = inner.metadata.active_cursor
                 && ids_set.contains(&cursor)
             {
                 inner.metadata.active_cursor = None;
-                cursor_reset = true;
+                changed = true;
             }
 
             // Rewrite JSONL file without the deleted entries (sorted for determinism).
@@ -313,7 +337,9 @@ impl SessionStorage for JsonlSessionStorage {
             }
             Self::atomic_write(&inner.entries_path, content.as_bytes()).await?;
 
-            if cursor_reset {
+            if changed {
+                inner.metadata.updated_at = chrono::Utc::now();
+                inner.metadata.mark_recall_content_changed()?;
                 Self::persist_meta(&inner).await?;
             }
             Ok(())
@@ -359,6 +385,7 @@ impl SessionRepo for JsonlSessionRepo {
         opts: CreateSessionOptions,
     ) -> BoxFuture<'_, Result<Arc<dyn SessionStorage>, SessionError>> {
         Box::pin(async move {
+            let recall = opts.recall_settings(SessionDurability::Durable)?;
             let id = uuid::Uuid::now_v7().to_string();
             let dir = self.session_dir(&id);
             tokio::fs::create_dir_all(&dir).await?;
@@ -371,6 +398,15 @@ impl SessionRepo for JsonlSessionRepo {
                 model: opts.initial_model,
                 active_cursor: None,
                 parent_session_path: None,
+                durability: recall.durability,
+                lifecycle: recall.lifecycle,
+                recall_policy: recall.policy,
+                recall_scope: recall.scope,
+                recall_revision: if recall.policy == SessionRecallPolicy::Enabled {
+                    1
+                } else {
+                    0
+                },
             };
             let storage: Arc<dyn SessionStorage> =
                 Arc::new(JsonlSessionStorage::open(&dir, meta).await?);
@@ -495,6 +531,11 @@ impl SessionRepo for JsonlSessionRepo {
                 } else {
                     None
                 },
+                durability: SessionDurability::Durable,
+                lifecycle: SessionLifecycle::Active,
+                recall_policy: SessionRecallPolicy::Disabled,
+                recall_scope: None,
+                recall_revision: 0,
             };
             let new_storage = Arc::new(JsonlSessionStorage::open(&new_dir, new_meta).await?);
 
@@ -552,6 +593,9 @@ mod tests {
         session.append_message(user_msg("world")).await.unwrap();
 
         let meta = session.metadata().await.unwrap();
+        assert_eq!(meta.durability, SessionDurability::Durable);
+        assert_eq!(meta.recall_policy, SessionRecallPolicy::Disabled);
+        assert_eq!(meta.recall_revision, 0);
         let id = meta.id.clone();
 
         // Drop the cached storage, reload from disk.
@@ -669,5 +713,96 @@ mod tests {
         let storage2 = repo.open(&id).await.unwrap();
         let entry = storage2.get_entry(id1).await.unwrap();
         assert!(entry.is_some(), "surviving entry should still be on disk");
+    }
+
+    #[tokio::test]
+    async fn jsonl_legacy_metadata_defaults_to_disabled_recall() {
+        let tmp = TempDir::new().unwrap();
+        let repo = JsonlSessionRepo::new(tmp.path());
+        let storage = repo.create(CreateSessionOptions::default()).await.unwrap();
+        let id = storage.metadata().await.unwrap().id;
+        repo.cache.lock().await.remove(&id);
+
+        let meta_path = tmp.path().join(&id).join("meta.json");
+        let bytes = tokio::fs::read(&meta_path).await.unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("durability");
+        object.remove("lifecycle");
+        object.remove("recall_policy");
+        object.remove("recall_scope");
+        object.remove("recall_revision");
+        tokio::fs::write(&meta_path, serde_json::to_vec_pretty(&legacy).unwrap())
+            .await
+            .unwrap();
+
+        let reopened = repo.open(&id).await.unwrap().metadata().await.unwrap();
+        assert_eq!(reopened.durability, SessionDurability::Durable);
+        assert_eq!(reopened.lifecycle, SessionLifecycle::Active);
+        assert_eq!(reopened.recall_policy, SessionRecallPolicy::Disabled);
+        assert!(reopened.recall_scope.is_none());
+        assert_eq!(reopened.recall_revision, 0);
+        assert!(!reopened.is_recallable());
+    }
+
+    #[tokio::test]
+    async fn jsonl_recall_settings_and_revision_survive_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let repo = JsonlSessionRepo::new(tmp.path());
+        let storage = repo
+            .create(CreateSessionOptions {
+                recall_policy: SessionRecallPolicy::Enabled,
+                recall_scope: Some(SessionRecallScope::new("team-a")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let session = Session::new(storage);
+        assert_eq!(session.metadata().await.unwrap().recall_revision, 1);
+
+        session
+            .append_message(user_msg("persist me"))
+            .await
+            .unwrap();
+        session
+            .storage()
+            .update_metadata_name(Some("indexed title".into()))
+            .await
+            .unwrap();
+        let before = session.metadata().await.unwrap();
+        assert_eq!(before.recall_revision, 3);
+        assert!(before.is_recallable());
+        let id = before.id;
+
+        drop(session);
+        repo.cache.lock().await.remove(&id);
+        let reopened = repo.open(&id).await.unwrap().metadata().await.unwrap();
+        assert_eq!(reopened.recall_revision, 3);
+        assert!(reopened.is_recallable());
+        assert_eq!(reopened.recall_scope.as_ref().unwrap().namespace, "team-a");
+    }
+
+    #[tokio::test]
+    async fn jsonl_rejects_invalid_recall_before_creating_session_directory() {
+        let tmp = TempDir::new().unwrap();
+        let repo = JsonlSessionRepo::new(tmp.path());
+        let result = repo
+            .create(CreateSessionOptions {
+                durability: Some(SessionDurability::Temporary),
+                recall_policy: SessionRecallPolicy::Enabled,
+                recall_scope: Some(SessionRecallScope::new("team-a")),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(SessionError::InvalidRecallConfiguration(_))
+        ));
+        assert!(
+            repo.list(ListSessionOptions::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }

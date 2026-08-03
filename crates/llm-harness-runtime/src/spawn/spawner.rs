@@ -506,6 +506,7 @@ impl SessionFactory for JsonlSessionFactory {
                     initial_model: Some(model),
                     initial_thinking_level: None,
                     initial_tools: vec![],
+                    ..Default::default()
                 })
                 .await
                 .map_err(|e| {
@@ -570,6 +571,7 @@ mod tests {
                         initial_model: Some(model),
                         initial_thinking_level: None,
                         initial_tools: vec![],
+                        ..Default::default()
                     })
                     .await
                     .map_err(|e| {
