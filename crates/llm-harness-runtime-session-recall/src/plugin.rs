@@ -3,8 +3,8 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use futures::future::BoxFuture;
 use llm_harness_agent::{HarnessHooks, Plugin};
 use llm_harness_runtime_knowledge::{
-    ContentSelector, KnowledgeAccessContext, KnowledgeReadRequest, KnowledgeRef,
-    KnowledgeRequestContext, KnowledgeSource, SourceSearchRequest,
+    ContentSelector, KnowledgeAccessContext, KnowledgeReadRequest, KnowledgeRequestContext,
+    KnowledgeSource, SourceSearchRequest,
 };
 use llm_harness_types::{
     AgentContext, AgentError, AgentMessage, ContentBlock, DataBlock, TransformContextCtx,
@@ -13,8 +13,9 @@ use llm_harness_types::{
 use tokio::sync::Mutex;
 
 use crate::{
-    HistoryRecallRequest, SessionRecallAccessContext, SessionRecallBudget, SessionRecallError,
-    SessionRecallKnowledgeSource,
+    HistoryRecallAcceptedReference, HistoryRecallObservation, HistoryRecallRequest,
+    SessionRecallAccessContext, SessionRecallBudget, SessionRecallError,
+    SessionRecallKnowledgeSource, from_knowledge_ref,
 };
 
 const HISTORY_RECALL_PREFIX: &str = "[[runtime:history-recall:v1]]";
@@ -106,7 +107,7 @@ struct HistoryRecallRunState {
 struct RecallResolution {
     resolved: bool,
     injection: Option<AgentMessage>,
-    _references: Vec<KnowledgeRef>,
+    references: Vec<HistoryRecallAcceptedReference>,
 }
 
 impl TransformContextHook for HistoryRecallHook {
@@ -119,6 +120,7 @@ impl TransformContextHook for HistoryRecallHook {
                 return Ok(ctx.context);
             };
             let Some(recall) = ctx.run.extension::<SessionRecallAccessContext>() else {
+                publish_observation(ctx.run, vec![]);
                 return self.handle_failure(ctx.context, SessionRecallError::InvalidConfiguration);
             };
             if recall.scope.namespace.trim().is_empty()
@@ -127,6 +129,7 @@ impl TransformContextHook for HistoryRecallHook {
                     .as_ref()
                     .is_some_and(|session_id| !session_id.trim().is_empty())
             {
+                publish_observation(ctx.run, vec![]);
                 return self.handle_failure(ctx.context, SessionRecallError::InvalidConfiguration);
             }
             let state = ctx
@@ -145,22 +148,25 @@ impl TransformContextHook for HistoryRecallHook {
                     Ok((injection, references)) => RecallResolution {
                         resolved: true,
                         injection,
-                        _references: references,
+                        references,
                     },
                     Err(error) => {
                         if self.config.failure_mode == HistoryRecallFailureMode::FailRun {
+                            publish_observation(ctx.run, vec![]);
                             return Err(map_plugin_error(error));
                         }
                         RecallResolution {
                             resolved: true,
                             injection: None,
-                            _references: vec![],
+                            references: vec![],
                         }
                     }
                 };
             }
             let injection = resolution.injection.clone();
+            let references = resolution.references.clone();
             drop(resolution);
+            publish_observation(ctx.run, references);
 
             let mut context = ctx.context;
             context
@@ -185,7 +191,8 @@ impl HistoryRecallHook {
         run: &llm_harness_types::RunContext,
         request: &HistoryRecallRequest,
         abort: tokio_util::sync::CancellationToken,
-    ) -> Result<(Option<AgentMessage>, Vec<KnowledgeRef>), SessionRecallError> {
+    ) -> Result<(Option<AgentMessage>, Vec<HistoryRecallAcceptedReference>), SessionRecallError>
+    {
         if abort.is_cancelled() {
             return Err(SessionRecallError::Aborted);
         }
@@ -284,7 +291,13 @@ impl HistoryRecallHook {
                 "provenance": provenance,
                 "content": text,
             }));
-            references.push(hit.reference);
+            let session_reference = from_knowledge_ref(&hit.reference)
+                .map_err(|_| SessionRecallError::ProjectionFailed)?;
+            references.push(HistoryRecallAcceptedReference {
+                reference: hit.reference,
+                navigation_target: session_reference.navigation_target(),
+                uri: hit.uri,
+            });
         }
         if recalled.is_empty() {
             tracing::debug!(run_id = %run.id(), hit_count = 0, "history recall resolved");
@@ -324,6 +337,15 @@ impl HistoryRecallHook {
             HistoryRecallFailureMode::Ignore => Ok(context),
             HistoryRecallFailureMode::FailRun => Err(map_plugin_error(error)),
         }
+    }
+}
+
+fn publish_observation(
+    run: &llm_harness_types::RunContext,
+    references: Vec<HistoryRecallAcceptedReference>,
+) {
+    if let Some(observation) = run.extension::<HistoryRecallObservation>() {
+        observation.publish(run.id(), references);
     }
 }
 

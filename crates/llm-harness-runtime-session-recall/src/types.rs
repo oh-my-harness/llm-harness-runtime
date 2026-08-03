@@ -1,7 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use llm_harness_agent::SessionRecallScope;
-use llm_harness_types::EntryId;
+use llm_harness_runtime_knowledge::KnowledgeRef;
+use llm_harness_types::{EntryId, RunId};
 use serde::{Deserialize, Serialize};
 
 pub const SESSION_RECALL_SOURCE_ID: &str = "session_recall";
@@ -200,6 +201,60 @@ impl HistoryRecallRequest {
 impl Default for HistoryRecallRequest {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One reference accepted by the automatic plugin after an authoritative read.
+///
+/// This observation contains navigation/provenance only, never recalled text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryRecallAcceptedReference {
+    pub reference: KnowledgeRef,
+    pub navigation_target: SessionRecallNavigationTarget,
+    pub uri: Option<String>,
+}
+
+/// Serializable snapshot published by an explicitly observed History Recall run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryRecallObservationSnapshot {
+    pub run_id: Option<RunId>,
+    pub accepted_references: Vec<HistoryRecallAcceptedReference>,
+}
+
+/// Optional per-run observation handle for automatic History Recall.
+///
+/// Attach a fresh clone to `RunRequest` as a typed extension and retain the
+/// original handle to inspect `snapshot()`. The handle itself is intentionally
+/// not serializable and is never copied into Session messages.
+#[derive(Clone, Default)]
+pub struct HistoryRecallObservation {
+    state: std::sync::Arc<std::sync::RwLock<HistoryRecallObservationSnapshot>>,
+}
+
+impl HistoryRecallObservation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn snapshot(&self) -> HistoryRecallObservationSnapshot {
+        self.state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn publish(
+        &self,
+        run_id: RunId,
+        accepted_references: Vec<HistoryRecallAcceptedReference>,
+    ) {
+        *self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = HistoryRecallObservationSnapshot {
+            run_id: Some(run_id),
+            accepted_references,
+        };
     }
 }
 

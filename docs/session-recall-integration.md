@@ -147,6 +147,31 @@ let request = RunRequest::from_text(user_prompt)
 harness.run(request).await?;
 ```
 
+Applications using the automatic plugin may explicitly observe the bounded
+references that passed exact read, for example to render source-jump links:
+
+```rust
+use llm_harness_runtime_session_recall::HistoryRecallObservation;
+
+let observation = HistoryRecallObservation::new();
+let request = RunRequest::from_text(user_prompt)
+    // Add the access, recall, and HistoryRecallRequest extensions shown above.
+    .with_extension(observation.clone());
+
+harness.run(request).await?;
+let snapshot = observation.snapshot();
+for accepted in snapshot.accepted_references {
+    open_history_target(accepted.navigation_target, accepted.uri);
+}
+```
+
+Create a fresh observation handle for each run. This extension is optional;
+without it the plugin allocates no public observation state. Snapshots contain
+only the run ID, opaque Knowledge reference, structured Session/entry target,
+and optional application URI—never recalled conversation text. They are not
+appended to the Session; an application must deliberately project them into a
+UI trace if desired.
+
 Without `HistoryRecallRequest`, the automatic plugin leaves provider context
 unchanged. Model-driven `knowledge_search` / `knowledge_read` can still use the
 Session source when the run has both access contexts; they do not require the

@@ -855,11 +855,13 @@ async fn history_plugin_is_explicit_ephemeral_bounded_and_current_session_safe()
     plugin.register_hooks(&mut hooks);
     let hook = hooks.transform_context.pop().unwrap();
 
+    let observation = HistoryRecallObservation::new();
     let run = RunContext::new(
         RunRequest::from_text("Who owns Aurora?")
             .with_extension(access("team-a", "allowed"))
             .with_extension(recall_access("team-a").with_current_session_id("current-session"))
-            .with_extension(HistoryRecallRequest::new()),
+            .with_extension(HistoryRecallRequest::new())
+            .with_extension(observation.clone()),
     );
     let transformed = hook
         .transform(TransformContextCtx {
@@ -889,6 +891,21 @@ async fn history_plugin_is_explicit_ephemeral_bounded_and_current_session_safe()
     assert!(injected.contains("owner is Mei"));
     assert!(injected.len() <= 700);
     assert_eq!(run.initial_messages().len(), 1);
+    let observed = observation.snapshot();
+    assert_eq!(observed.run_id, Some(run.id()));
+    assert_eq!(observed.accepted_references.len(), 1);
+    let accepted = &observed.accepted_references[0];
+    assert_eq!(accepted.navigation_target.session_id, historical_id);
+    assert_eq!(
+        from_knowledge_ref(&accepted.reference).unwrap().session_id,
+        historical_id
+    );
+    assert!(accepted.uri.is_none());
+    assert!(
+        !serde_json::to_string(&observed)
+            .unwrap()
+            .contains("owner is Mei")
+    );
 
     let transformed_again = hook
         .transform(TransformContextCtx {
@@ -1528,12 +1545,14 @@ async fn harness_uses_recall_context_without_persisting_it_to_current_session() 
         options,
     )
     .await;
+    let observation = HistoryRecallObservation::new();
     harness
         .run(
             RunRequest::from_text("Who owns the launch?")
                 .with_extension(access("team-a", "allowed"))
                 .with_extension(recall_access("team-a").with_current_session_id("current-session"))
-                .with_extension(HistoryRecallRequest::new()),
+                .with_extension(HistoryRecallRequest::new())
+                .with_extension(observation.clone()),
         )
         .await
         .unwrap();
@@ -1551,6 +1570,7 @@ async fn harness_uses_recall_context_without_persisting_it_to_current_session() 
             )
         }));
     }
+    assert_eq!(observation.snapshot().accepted_references.len(), 1);
     let persisted =
         serde_json::to_string(&harness.build_context().await.unwrap().messages).unwrap();
     assert!(!persisted.contains("Mei owns the launch"));
