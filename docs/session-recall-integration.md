@@ -1,0 +1,127 @@
+# Session Recall integration
+
+`llm-harness-runtime-session-recall` provides opt-in History Recall over durable
+runtime Sessions. `SessionRepo` remains the only authority for conversation
+bodies; the recall index is a disposable candidate projection.
+
+## Install the projection explicitly
+
+Keep the authoritative repository separate from its observer wrapper. The
+projector and recall service reopen the authoritative repository for every
+projection and exact read.
+
+```rust
+use std::sync::Arc;
+
+use llm_harness_agent::{ObservedSessionRepo, SessionMutationObserver, SessionRepo};
+use llm_harness_runtime_knowledge::KnowledgeAccessControl;
+use llm_harness_runtime_session_recall::{
+    HistoryRecallPlugin, HistoryRecallPluginConfig, InMemorySessionRecallIndex,
+    SessionRecallIndex, SessionRecallKnowledgeSource, SessionRecallProjector,
+    SessionRecallService,
+};
+
+// Supply the application's JsonlSessionRepo or other authoritative repo.
+let authority: Arc<dyn SessionRepo> = authoritative_repo;
+let index: Arc<dyn SessionRecallIndex> = Arc::new(InMemorySessionRecallIndex::new());
+let projector = Arc::new(SessionRecallProjector::new(
+    authority.clone(),
+    index.clone(),
+));
+let observer: Arc<dyn SessionMutationObserver> = projector.clone();
+let sessions: Arc<dyn SessionRepo> = Arc::new(ObservedSessionRepo::new(
+    authority.clone(),
+    observer,
+));
+
+let service = Arc::new(SessionRecallService::new(
+    authority,
+    index,
+    knowledge_access_control,
+));
+let source = Arc::new(SessionRecallKnowledgeSource::new(service));
+let history_recall = HistoryRecallPlugin::new(
+    source.clone(),
+    HistoryRecallPluginConfig::default(),
+)?;
+```
+
+Register `source` in the common Knowledge registry when model-driven
+`knowledge_search` / `knowledge_read` access is wanted. Register
+`history_recall` as a Harness plugin (or call `register_hooks` on the Harness
+hooks) for automatic context recall.
+
+The in-memory index must be rebuilt at process startup:
+
+```rust
+projector.rebuild(shutdown.child_token()).await?;
+```
+
+`reconcile` repairs missed observer notifications by comparing authoritative
+Session revisions with the projection. A later persistent FTS backend can use
+it at startup instead of rebuilding every process-local generation.
+
+## Mark only eligible Sessions recallable
+
+Recall remains disabled by default. A Session must be durable, active, enabled,
+and carry a trusted scope supplied by the application:
+
+```rust
+use llm_harness_agent::{SessionDurability, SessionRecallPolicy, SessionRecallScope};
+use llm_harness_agent::session::CreateSessionOptions;
+
+let storage = sessions
+    .create(CreateSessionOptions {
+        durability: Some(SessionDurability::Durable),
+        recall_policy: SessionRecallPolicy::Enabled,
+        recall_scope: Some(SessionRecallScope::new("folumi")),
+        ..Default::default()
+    })
+    .await?;
+```
+
+The scope's namespace, tenant, project, and attributes must exactly match the
+trusted `KnowledgeAccessContext`. Principal and delegated access decisions are
+still made by the configured `KnowledgeAuthorizer`; credentials are never
+stored in Session metadata.
+
+## Opt in for each run
+
+Installing the plugin is not enough to trigger recall. Each run must carry both
+the trusted access context and `HistoryRecallRequest`. The current Session ID is
+mandatory so it can be excluded from cross-Session results.
+
+```rust
+use llm_harness_runtime_session_recall::HistoryRecallRequest;
+use llm_harness_types::RunRequest;
+
+let request = RunRequest::from_text(user_prompt)
+    .with_extension(knowledge_access_context)
+    .with_extension(HistoryRecallRequest::new(current_session_id));
+
+harness.run(request).await?;
+```
+
+Without `HistoryRecallRequest`, no search or read occurs and the provider
+context is unchanged. Recalled bodies are inserted only into the transformed
+provider context: they are not appended to the current Session, copied into
+Saved Memory, or persisted by generic Knowledge tool projections.
+
+## Operational behavior
+
+- Only user text and the following final assistant text on the active branch
+  are indexed. Thinking, tool calls/results, binary blocks, and custom entries
+  are excluded.
+- Every hit is reopened through `SessionRepo` and rechecked for current scope,
+  authorization, lifecycle, branch, entries, and revision before it is emitted.
+- Default recall is bounded to three hits, 4 KiB per hit, and 8 KiB total, with
+  a 750 ms timeout. Applications can tighten these limits.
+- The default failure mode ignores unavailable recall and continues the run.
+  `HistoryRecallFailureMode::FailRun` is available for strict deployments.
+- Do not expose the unwrapped authority to product write paths. Mutations that
+  bypass `ObservedSessionRepo` remain safe at read time but require `reconcile`
+  or `rebuild` before newly added content becomes searchable.
+
+The persistent local FTS backend, crash recovery, and performance benchmarks
+are intentionally a separate follow-up. They do not change this integration or
+authority boundary.

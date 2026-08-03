@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use chrono::Utc;
@@ -9,7 +12,7 @@ use llm_adapter::types::{Message, RequestContent};
 use llm_harness_agent::{
     AgentHarness, AgentHarnessOptions, HarnessHooks, InMemorySessionRepo, ObservedSessionRepo,
     Plugin, Session, SessionDurability, SessionLifecycle, SessionRecallPolicy, SessionRecallScope,
-    SessionRecallSettings, SessionRepo,
+    SessionRecallSettings, SessionRepo, session::ForkOptions,
 };
 use llm_harness_loop::{
     LlmClient,
@@ -78,6 +81,23 @@ fn access(namespace: &str, subject: &str) -> KnowledgeAccessContext {
         KnowledgeScope::new(namespace),
         PrincipalRef::new(subject, "user"),
     )
+}
+
+fn partitioned_recall_scope() -> SessionRecallScope {
+    SessionRecallScope {
+        namespace: "history".into(),
+        tenant: Some("tenant-a".into()),
+        project: Some("project-a".into()),
+        attributes: BTreeMap::from([("region".into(), "apac".into())]),
+    }
+}
+
+fn partitioned_access(subject: &str) -> KnowledgeAccessContext {
+    let mut scope = KnowledgeScope::new("history");
+    scope.tenant = Some("tenant-a".into());
+    scope.project = Some("project-a".into());
+    scope.attributes = BTreeMap::from([("region".into(), "apac".into())]);
+    KnowledgeAccessContext::new(scope, PrincipalRef::new(subject, "user"))
 }
 
 fn user(text: &str) -> AgentMessage {
@@ -167,6 +187,31 @@ fn data_text(blocks: &[DataBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+async fn search_refs(
+    source: &SessionRecallKnowledgeSource,
+    access: &KnowledgeAccessContext,
+    query: &str,
+) -> Vec<SessionRecallRef> {
+    let run = RunContext::new(RunRequest::from_text(query));
+    source
+        .search(
+            KnowledgeRequestContext { run: &run, access },
+            SourceSearchRequest {
+                query: query.into(),
+                filters: vec![],
+                limit: 20,
+                cursor: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .hits
+        .iter()
+        .map(|hit| from_knowledge_ref(&hit.reference).unwrap())
+        .collect()
 }
 
 #[test]
@@ -824,6 +869,235 @@ async fn authorization_is_checked_again_between_search_and_read() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), KnowledgeErrorCode::Unauthorized);
+}
+
+#[tokio::test]
+async fn every_configured_scope_dimension_and_principal_isolated() {
+    let repo = Arc::new(InMemorySessionRepo::new());
+    let storage = repo
+        .create(llm_harness_agent::session::CreateSessionOptions {
+            durability: Some(SessionDurability::Durable),
+            recall_policy: SessionRecallPolicy::Enabled,
+            recall_scope: Some(partitioned_recall_scope()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let session = Session::new(storage);
+    session
+        .append_message(user("partitioned helios marker"))
+        .await
+        .unwrap();
+    session
+        .append_message(assistant("visible only in the exact partition"))
+        .await
+        .unwrap();
+    let (_, projector, source) = stack(repo);
+    projector.rebuild(CancellationToken::new()).await.unwrap();
+
+    assert_eq!(
+        search_refs(&source, &partitioned_access("allowed"), "helios")
+            .await
+            .len(),
+        1
+    );
+
+    let mut wrong_namespace = partitioned_access("allowed");
+    wrong_namespace.scope.namespace = "other-history".into();
+    let mut wrong_tenant = partitioned_access("allowed");
+    wrong_tenant.scope.tenant = Some("tenant-b".into());
+    let mut wrong_project = partitioned_access("allowed");
+    wrong_project.scope.project = Some("project-b".into());
+    let mut wrong_attributes = partitioned_access("allowed");
+    wrong_attributes
+        .scope
+        .attributes
+        .insert("region".into(), "emea".into());
+    for mismatched in [
+        wrong_namespace,
+        wrong_tenant,
+        wrong_project,
+        wrong_attributes,
+    ] {
+        assert!(search_refs(&source, &mismatched, "helios").await.is_empty());
+    }
+
+    let run = RunContext::new(RunRequest::from_text("helios"));
+    let denied = partitioned_access("another-user");
+    let error = source
+        .search(
+            KnowledgeRequestContext {
+                run: &run,
+                access: &denied,
+            },
+            SourceSearchRequest {
+                query: "helios".into(),
+                filters: vec![],
+                limit: 5,
+                cursor: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), KnowledgeErrorCode::Unauthorized);
+}
+
+#[tokio::test]
+async fn temporary_and_recall_disabled_sessions_never_enter_projection() {
+    let repo = Arc::new(InMemorySessionRepo::new());
+    let temporary_storage = repo
+        .create(llm_harness_agent::session::CreateSessionOptions::default())
+        .await
+        .unwrap();
+    let temporary = Session::new(temporary_storage);
+    temporary
+        .append_message(user("excluded orion temporary marker"))
+        .await
+        .unwrap();
+    temporary
+        .append_message(assistant("must not be recalled"))
+        .await
+        .unwrap();
+    assert!(
+        temporary
+            .update_recall_settings(SessionRecallSettings {
+                durability: SessionDurability::Temporary,
+                lifecycle: SessionLifecycle::Active,
+                policy: SessionRecallPolicy::Enabled,
+                scope: Some(recall_scope("team-a")),
+            })
+            .await
+            .is_err()
+    );
+
+    let disabled_storage = repo
+        .create(llm_harness_agent::session::CreateSessionOptions {
+            durability: Some(SessionDurability::Durable),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let disabled = Session::new(disabled_storage);
+    disabled
+        .append_message(user("excluded orion durable marker"))
+        .await
+        .unwrap();
+    disabled
+        .append_message(assistant("recall remains disabled"))
+        .await
+        .unwrap();
+
+    let (index, projector, source) = stack(repo);
+    projector.rebuild(CancellationToken::new()).await.unwrap();
+    assert!(index.projected_revisions().await.unwrap().is_empty());
+    assert!(
+        search_refs(&source, &access("team-a", "allowed"), "orion")
+            .await
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn rebuild_is_equivalent_and_reconcile_repairs_missed_notifications() {
+    let repo = Arc::new(InMemorySessionRepo::new());
+    let (_, first_session_id) =
+        create_history(&repo, "team-a", "rebuild atlas marker", "first answer").await;
+    let (index, projector, source) = stack(repo.clone());
+    let allowed = access("team-a", "allowed");
+
+    projector.rebuild(CancellationToken::new()).await.unwrap();
+    let before = search_refs(&source, &allowed, "atlas").await;
+    assert_eq!(before.len(), 1);
+    index.reset().await.unwrap();
+    assert!(search_refs(&source, &allowed, "atlas").await.is_empty());
+    projector.rebuild(CancellationToken::new()).await.unwrap();
+    assert_eq!(search_refs(&source, &allowed, "atlas").await, before);
+
+    let (_, missed_session_id) =
+        create_history(&repo, "team-a", "missed zephyr marker", "second answer").await;
+    assert!(search_refs(&source, &allowed, "zephyr").await.is_empty());
+    projector.reconcile(CancellationToken::new()).await.unwrap();
+    let repaired = search_refs(&source, &allowed, "zephyr").await;
+    assert_eq!(repaired.len(), 1);
+    assert_eq!(repaired[0].session_id, missed_session_id);
+
+    repo.delete(&first_session_id).await.unwrap();
+    projector.reconcile(CancellationToken::new()).await.unwrap();
+    assert!(
+        !index
+            .projected_revisions()
+            .await
+            .unwrap()
+            .contains_key(&first_session_id)
+    );
+}
+
+#[tokio::test]
+async fn observed_fork_and_entry_deletion_update_projection() {
+    let authority = Arc::new(InMemorySessionRepo::new());
+    let index = Arc::new(InMemorySessionRecallIndex::new());
+    let projector = Arc::new(SessionRecallProjector::new(
+        authority.clone(),
+        index.clone(),
+    ));
+    let observed = ObservedSessionRepo::new(authority.clone(), projector);
+    let original_storage = observed
+        .create(llm_harness_agent::session::CreateSessionOptions {
+            durability: Some(SessionDurability::Durable),
+            recall_policy: SessionRecallPolicy::Enabled,
+            recall_scope: Some(recall_scope("team-a")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let original = Session::new(original_storage.clone());
+    original
+        .append_message(user("forkable nova marker"))
+        .await
+        .unwrap();
+    let assistant_id = original
+        .append_message(assistant("copied authoritative answer"))
+        .await
+        .unwrap();
+    let original_id = original.metadata().await.unwrap().id;
+
+    let forked_storage = observed
+        .fork(&original_id, assistant_id, ForkOptions::default())
+        .await
+        .unwrap();
+    forked_storage
+        .update_recall_settings(SessionRecallSettings {
+            durability: SessionDurability::Durable,
+            lifecycle: SessionLifecycle::Active,
+            policy: SessionRecallPolicy::Enabled,
+            scope: Some(recall_scope("team-a")),
+        })
+        .await
+        .unwrap();
+    let forked_id = forked_storage.metadata().await.unwrap().id;
+
+    let control = Arc::new(KnowledgeAccessControl::new(Arc::new(SubjectAuthorizer)));
+    let service = Arc::new(SessionRecallService::new(authority, index, control));
+    let source = SessionRecallKnowledgeSource::new(service);
+    let allowed = access("team-a", "allowed");
+    let mut ids = search_refs(&source, &allowed, "nova")
+        .await
+        .into_iter()
+        .map(|reference| reference.session_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    let mut expected = vec![original_id.clone(), forked_id.clone()];
+    expected.sort();
+    assert_eq!(ids, expected);
+
+    original_storage
+        .delete_entries(vec![assistant_id])
+        .await
+        .unwrap();
+    let remaining = search_refs(&source, &allowed, "nova").await;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].session_id, forked_id);
 }
 
 #[tokio::test]

@@ -78,6 +78,13 @@ senza.viewer.serve("/path/to/sessions")  # blocks, opens browser
 - Config entries: model change, thinking level, active tools, compaction, labels, branch points
 - Image content inlined as base64
 
+## Session Recall
+
+Cross-Session History Recall is an optional, fail-closed runtime feature. See
+[the Session Recall integration guide](docs/session-recall-integration.md) for
+authority wiring, per-Session eligibility, per-run opt-in, and operational
+limits.
+
 ## Versioning
 
 Workspace version is in the root `Cargo.toml` (`[workspace.package]`). To release a new version, bump the version in `Cargo.toml`.

@@ -3,7 +3,7 @@
 Updated: 2026-08-03 +08:00
 Issue: [#104 — Add a runtime-owned cross-session recall projection for SessionRepo](https://github.com/oh-my-harness/llm-harness-runtime/issues/104)
 
-Implementation status: PR1–PR4 are implemented locally on
+Implementation status: PR1–PR4 are implemented and pushed on
 `codex/issue-104-session-recall-metadata`. The implementation includes recall
 authority metadata, reference-only mutation observation, typed turn refs, an
 atomic rebuildable lexical index, active-branch projection, per-hit current
@@ -186,7 +186,7 @@ pub struct SessionRecallRef {
     pub user_entry_id: EntryId,
     pub assistant_entry_id: Option<EntryId>,
     pub branch_leaf_id: EntryId,
-    pub revision: String,
+    pub revision: u64,
 }
 ```
 
