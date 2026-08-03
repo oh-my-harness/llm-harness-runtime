@@ -148,7 +148,7 @@ impl SessionRecallIndex for InMemorySessionRecallIndex {
             if state
                 .sessions
                 .get(&projection.session_id)
-                .is_some_and(|stored| stored.revision > projection.revision)
+                .is_some_and(|stored| stored.revision >= projection.revision)
             {
                 return Ok(false);
             }

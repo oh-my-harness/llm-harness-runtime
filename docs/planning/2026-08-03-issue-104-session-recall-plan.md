@@ -218,10 +218,11 @@ all named branches is a future explicit policy, not an implicit expansion.
 
 ### Search
 
-1. Require an authenticated `KnowledgeAccessContext` and an enabled runtime
-   History Recall policy.
-2. Convert the trusted access scope into an index partition/filter before the
-   query executes.
+1. Require an authenticated `KnowledgeAccessContext`, a trusted
+   `SessionRecallAccessContext`, and an enabled runtime History Recall policy.
+2. Use the dedicated trusted recall scope as the index partition/filter before
+   the query executes. It is intentionally independent of Knowledge routing
+   scope and attributes.
 3. Search for bounded candidates.
 4. For every candidate, reopen current Session metadata and verify existence,
    durability, lifecycle, recall policy, scope, authorization version, branch,

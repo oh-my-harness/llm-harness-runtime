@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -36,6 +36,69 @@ struct SubjectAuthorizer;
 
 struct RevocableAuthorizer {
     allowed: Arc<AtomicBool>,
+}
+
+struct CountingOpenRepo {
+    inner: Arc<InMemorySessionRepo>,
+    opens: AtomicUsize,
+}
+
+impl CountingOpenRepo {
+    fn new(inner: Arc<InMemorySessionRepo>) -> Self {
+        Self {
+            inner,
+            opens: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl SessionRepo for CountingOpenRepo {
+    fn create(
+        &self,
+        opts: llm_harness_agent::session::CreateSessionOptions,
+    ) -> BoxFuture<
+        '_,
+        Result<Arc<dyn llm_harness_agent::SessionStorage>, llm_harness_types::SessionError>,
+    > {
+        self.inner.create(opts)
+    }
+
+    fn open(
+        &self,
+        id: &str,
+    ) -> BoxFuture<
+        '_,
+        Result<Arc<dyn llm_harness_agent::SessionStorage>, llm_harness_types::SessionError>,
+    > {
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        self.inner.open(id)
+    }
+
+    fn list(
+        &self,
+        opts: llm_harness_agent::session::ListSessionOptions,
+    ) -> BoxFuture<
+        '_,
+        Result<Vec<llm_harness_agent::session::SessionMetadata>, llm_harness_types::SessionError>,
+    > {
+        self.inner.list(opts)
+    }
+
+    fn delete(&self, id: &str) -> BoxFuture<'_, Result<(), llm_harness_types::SessionError>> {
+        self.inner.delete(id)
+    }
+
+    fn fork(
+        &self,
+        source_id: &str,
+        from_entry: EntryId,
+        opts: ForkOptions,
+    ) -> BoxFuture<
+        '_,
+        Result<Arc<dyn llm_harness_agent::SessionStorage>, llm_harness_types::SessionError>,
+    > {
+        self.inner.fork(source_id, from_entry, opts)
+    }
 }
 
 impl KnowledgeAuthorizer for SubjectAuthorizer {
@@ -98,6 +161,18 @@ fn partitioned_access(subject: &str) -> KnowledgeAccessContext {
     scope.project = Some("project-a".into());
     scope.attributes = BTreeMap::from([("region".into(), "apac".into())]);
     KnowledgeAccessContext::new(scope, PrincipalRef::new(subject, "user"))
+}
+
+fn recall_access(namespace: &str) -> SessionRecallAccessContext {
+    SessionRecallAccessContext::new(recall_scope(namespace))
+}
+
+fn partitioned_recall_access() -> SessionRecallAccessContext {
+    SessionRecallAccessContext::new(partitioned_recall_scope())
+}
+
+fn run_with_recall(query: &str, recall: SessionRecallAccessContext) -> RunContext {
+    RunContext::new(RunRequest::from_text(query).with_extension(recall))
 }
 
 fn user(text: &str) -> AgentMessage {
@@ -192,9 +267,10 @@ fn data_text(blocks: &[DataBlock]) -> String {
 async fn search_refs(
     source: &SessionRecallKnowledgeSource,
     access: &KnowledgeAccessContext,
+    recall: SessionRecallAccessContext,
     query: &str,
 ) -> Vec<SessionRecallRef> {
-    let run = RunContext::new(RunRequest::from_text(query));
+    let run = run_with_recall(query, recall);
     source
         .search(
             KnowledgeRequestContext { run: &run, access },
@@ -229,6 +305,92 @@ fn typed_reference_round_trips_as_opaque_id() {
 
     let knowledge = to_knowledge_ref(&reference).unwrap();
     assert_eq!(from_knowledge_ref(&knowledge).unwrap(), reference);
+    assert_eq!(
+        reference.navigation_target(),
+        SessionRecallNavigationTarget {
+            session_id: "session-a".into(),
+            entry_id: reference.user_entry_id,
+        }
+    );
+}
+
+#[tokio::test]
+async fn source_requires_trusted_recall_context_and_maps_navigation_targets() {
+    let repo = Arc::new(InMemorySessionRepo::new());
+    let (_, session_id) =
+        create_history(&repo, "team-a", "navigation comet marker", "mapped answer").await;
+    let index = Arc::new(InMemorySessionRecallIndex::new());
+    let projector = SessionRecallProjector::new(repo.clone(), index.clone());
+    projector.rebuild(CancellationToken::new()).await.unwrap();
+    let control = Arc::new(KnowledgeAccessControl::new(Arc::new(SubjectAuthorizer)));
+    let service = Arc::new(SessionRecallService::new(repo, index, control));
+    let source = SessionRecallKnowledgeSource::new(service).with_uri_mapper(
+        |target: &SessionRecallNavigationTarget| {
+            Some(format!("chat:{}:{}", target.session_id, target.entry_id))
+        },
+    );
+    let allowed = access("unrelated-knowledge-route", "allowed");
+    let missing_recall = RunContext::new(RunRequest::from_text("comet"));
+    let request = SourceSearchRequest {
+        query: "comet".into(),
+        filters: vec![],
+        limit: 5,
+        cursor: None,
+    };
+
+    let error = source
+        .search(
+            KnowledgeRequestContext {
+                run: &missing_recall,
+                access: &allowed,
+            },
+            request.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), KnowledgeErrorCode::Unauthorized);
+
+    let run = run_with_recall("comet", recall_access("team-a"));
+    let page = source
+        .search(
+            KnowledgeRequestContext {
+                run: &run,
+                access: &allowed,
+            },
+            request,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let hit = page.hits.first().unwrap();
+    assert!(
+        hit.uri
+            .as_deref()
+            .unwrap()
+            .starts_with(&format!("chat:{session_id}:"))
+    );
+    assert_eq!(
+        hit.metadata["navigation"]["session_id"],
+        serde_json::Value::String(session_id)
+    );
+
+    let content = source
+        .read(
+            KnowledgeRequestContext {
+                run: &run,
+                access: &allowed,
+            },
+            KnowledgeReadRequest {
+                reference: hit.reference.clone(),
+                selector: ContentSelector::Document,
+                max_bytes: 4096,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(content.uri, hit.uri);
 }
 
 #[tokio::test]
@@ -248,7 +410,7 @@ async fn source_search_and_read_revalidate_authority_and_exclude_private_blocks(
         source.search_projection(),
         KnowledgeSearchProjection::ReferenceOnly
     );
-    let run = RunContext::new(RunRequest::from_text("Aurora deadline"));
+    let run = run_with_recall("Aurora deadline", recall_access("team-a"));
     let allowed = access("team-a", "allowed");
     let page = source
         .search(
@@ -322,12 +484,13 @@ async fn stale_index_cannot_leak_archived_deleted_or_cross_scope_sessions() {
         create_history(&repo, "team-a", "Aurora security review", "Review complete").await;
     let (_, projector, source) = stack(repo.clone());
     projector.rebuild(CancellationToken::new()).await.unwrap();
-    let run = RunContext::new(RunRequest::from_text("Aurora"));
+    let other_scope_run = run_with_recall("Aurora", recall_access("team-b"));
+    let allowed_run = run_with_recall("Aurora", recall_access("team-a"));
 
     let other_scope = source
         .search(
             KnowledgeRequestContext {
-                run: &run,
+                run: &other_scope_run,
                 access: &access("team-b", "allowed"),
             },
             SourceSearchRequest {
@@ -345,7 +508,7 @@ async fn stale_index_cannot_leak_archived_deleted_or_cross_scope_sessions() {
     let denied = source
         .search(
             KnowledgeRequestContext {
-                run: &run,
+                run: &allowed_run,
                 access: &access("team-a", "denied"),
             },
             SourceSearchRequest {
@@ -372,7 +535,7 @@ async fn stale_index_cannot_leak_archived_deleted_or_cross_scope_sessions() {
     let archived = source
         .search(
             KnowledgeRequestContext {
-                run: &run,
+                run: &allowed_run,
                 access: &access("team-a", "allowed"),
             },
             SourceSearchRequest {
@@ -391,7 +554,7 @@ async fn stale_index_cannot_leak_archived_deleted_or_cross_scope_sessions() {
     let deleted = source
         .search(
             KnowledgeRequestContext {
-                run: &run,
+                run: &allowed_run,
                 access: &access("team-a", "allowed"),
             },
             SourceSearchRequest {
@@ -438,6 +601,12 @@ async fn index_rejects_out_of_order_tasks_and_rebuild_abort_keeps_generation() {
             .await
             .unwrap()
     );
+    assert!(
+        !index
+            .replace_session(projection("s", 3, "duplicate"))
+            .await
+            .unwrap()
+    );
     assert!(index.remove_session("s".into(), 3, false).await.unwrap());
     assert!(
         !index
@@ -478,6 +647,32 @@ async fn index_rejects_out_of_order_tasks_and_rebuild_abort_keeps_generation() {
 }
 
 #[tokio::test]
+async fn reconcile_skips_authority_reads_for_current_projection_revision() {
+    let authority = Arc::new(InMemorySessionRepo::new());
+    let (session, _) =
+        create_history(&authority, "team-a", "idempotent marker", "first answer").await;
+    let repo = Arc::new(CountingOpenRepo::new(authority));
+    let index = Arc::new(InMemorySessionRecallIndex::new());
+    let projector = SessionRecallProjector::new(repo.clone(), index);
+
+    projector.rebuild(CancellationToken::new()).await.unwrap();
+    assert_eq!(repo.opens.load(Ordering::SeqCst), 1);
+    projector.reconcile(CancellationToken::new()).await.unwrap();
+    assert_eq!(repo.opens.load(Ordering::SeqCst), 1);
+
+    session
+        .append_message(user("idempotent marker changed"))
+        .await
+        .unwrap();
+    session
+        .append_message(assistant("second answer"))
+        .await
+        .unwrap();
+    projector.reconcile(CancellationToken::new()).await.unwrap();
+    assert_eq!(repo.opens.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn history_plugin_is_explicit_ephemeral_bounded_and_current_session_safe() {
     let repo = Arc::new(InMemorySessionRepo::new());
     let (_, historical_id) =
@@ -496,7 +691,8 @@ async fn history_plugin_is_explicit_ephemeral_bounded_and_current_session_safe()
     let run = RunContext::new(
         RunRequest::from_text("Who owns Aurora?")
             .with_extension(access("team-a", "allowed"))
-            .with_extension(HistoryRecallRequest::new("current-session")),
+            .with_extension(recall_access("team-a").with_current_session_id("current-session"))
+            .with_extension(HistoryRecallRequest::new()),
     );
     let transformed = hook
         .transform(TransformContextCtx {
@@ -541,7 +737,8 @@ async fn history_plugin_is_explicit_ephemeral_bounded_and_current_session_safe()
     let excluded_run = RunContext::new(
         RunRequest::from_text("Who owns Aurora?")
             .with_extension(access("team-a", "allowed"))
-            .with_extension(HistoryRecallRequest::new(historical_id)),
+            .with_extension(recall_access("team-a").with_current_session_id(historical_id))
+            .with_extension(HistoryRecallRequest::new()),
     );
     let excluded = hook
         .transform(TransformContextCtx {
@@ -558,7 +755,9 @@ async fn history_plugin_is_explicit_ephemeral_bounded_and_current_session_safe()
     assert_eq!(excluded.messages.len(), 1);
 
     let disabled_run = RunContext::new(
-        RunRequest::from_text("Who owns Aurora?").with_extension(access("team-a", "allowed")),
+        RunRequest::from_text("Who owns Aurora?")
+            .with_extension(access("team-a", "allowed"))
+            .with_extension(recall_access("team-a").with_current_session_id("current-session")),
     );
     let disabled = hook
         .transform(TransformContextCtx {
@@ -593,7 +792,8 @@ async fn history_plugin_observes_run_cancellation() {
     let run = RunContext::new(
         RunRequest::from_text("Aurora")
             .with_extension(access("team-a", "allowed"))
-            .with_extension(HistoryRecallRequest::new("current")),
+            .with_extension(recall_access("team-a").with_current_session_id("current"))
+            .with_extension(HistoryRecallRequest::new()),
     );
     let abort = CancellationToken::new();
     abort.cancel();
@@ -646,7 +846,7 @@ async fn observed_repo_updates_and_invalidates_projection_incrementally() {
 
     let service = Arc::new(SessionRecallService::new(authority, index, control));
     let source = SessionRecallKnowledgeSource::new(service);
-    let run = RunContext::new(RunRequest::from_text("comet"));
+    let run = run_with_recall("comet", recall_access("team-a"));
     let allowed = access("team-a", "allowed");
     let search = || async {
         source
@@ -692,7 +892,7 @@ async fn session_source_passes_common_knowledge_contract() {
     .await;
     let (_, projector, source) = stack(repo);
     projector.rebuild(CancellationToken::new()).await.unwrap();
-    let run = RunContext::new(RunRequest::from_text("nebula"));
+    let run = run_with_recall("nebula", recall_access("team-a"));
     let allowed = access("team-a", "allowed");
     let page = source
         .search(
@@ -833,7 +1033,7 @@ async fn authorization_is_checked_again_between_search_and_read() {
     })));
     let service = Arc::new(SessionRecallService::new(repo, index, control));
     let source = SessionRecallKnowledgeSource::new(service);
-    let run = RunContext::new(RunRequest::from_text("quasar"));
+    let run = run_with_recall("quasar", recall_access("team-a"));
     let access = access("team-a", "allowed");
     let page = source
         .search(
@@ -872,7 +1072,7 @@ async fn authorization_is_checked_again_between_search_and_read() {
 }
 
 #[tokio::test]
-async fn every_configured_scope_dimension_and_principal_isolated() {
+async fn recall_scope_isolated_from_knowledge_routing_and_principal() {
     let repo = Arc::new(InMemorySessionRepo::new());
     let storage = repo
         .create(llm_harness_agent::session::CreateSessionOptions {
@@ -895,20 +1095,30 @@ async fn every_configured_scope_dimension_and_principal_isolated() {
     let (_, projector, source) = stack(repo);
     projector.rebuild(CancellationToken::new()).await.unwrap();
 
+    let mut another_knowledge_route = partitioned_access("allowed");
+    another_knowledge_route
+        .scope
+        .attributes
+        .insert("knowledge_base_id".into(), "kb-b".into());
     assert_eq!(
-        search_refs(&source, &partitioned_access("allowed"), "helios")
-            .await
-            .len(),
+        search_refs(
+            &source,
+            &another_knowledge_route,
+            partitioned_recall_access(),
+            "helios",
+        )
+        .await
+        .len(),
         1
     );
 
-    let mut wrong_namespace = partitioned_access("allowed");
+    let mut wrong_namespace = partitioned_recall_access();
     wrong_namespace.scope.namespace = "other-history".into();
-    let mut wrong_tenant = partitioned_access("allowed");
+    let mut wrong_tenant = partitioned_recall_access();
     wrong_tenant.scope.tenant = Some("tenant-b".into());
-    let mut wrong_project = partitioned_access("allowed");
+    let mut wrong_project = partitioned_recall_access();
     wrong_project.scope.project = Some("project-b".into());
-    let mut wrong_attributes = partitioned_access("allowed");
+    let mut wrong_attributes = partitioned_recall_access();
     wrong_attributes
         .scope
         .attributes
@@ -919,10 +1129,19 @@ async fn every_configured_scope_dimension_and_principal_isolated() {
         wrong_project,
         wrong_attributes,
     ] {
-        assert!(search_refs(&source, &mismatched, "helios").await.is_empty());
+        assert!(
+            search_refs(
+                &source,
+                &partitioned_access("allowed"),
+                mismatched,
+                "helios",
+            )
+            .await
+            .is_empty()
+        );
     }
 
-    let run = RunContext::new(RunRequest::from_text("helios"));
+    let run = run_with_recall("helios", partitioned_recall_access());
     let denied = partitioned_access("another-user");
     let error = source
         .search(
@@ -992,9 +1211,14 @@ async fn temporary_and_recall_disabled_sessions_never_enter_projection() {
     projector.rebuild(CancellationToken::new()).await.unwrap();
     assert!(index.projected_revisions().await.unwrap().is_empty());
     assert!(
-        search_refs(&source, &access("team-a", "allowed"), "orion")
-            .await
-            .is_empty()
+        search_refs(
+            &source,
+            &access("team-a", "allowed"),
+            recall_access("team-a"),
+            "orion",
+        )
+        .await
+        .is_empty()
     );
 }
 
@@ -1007,18 +1231,29 @@ async fn rebuild_is_equivalent_and_reconcile_repairs_missed_notifications() {
     let allowed = access("team-a", "allowed");
 
     projector.rebuild(CancellationToken::new()).await.unwrap();
-    let before = search_refs(&source, &allowed, "atlas").await;
+    let before = search_refs(&source, &allowed, recall_access("team-a"), "atlas").await;
     assert_eq!(before.len(), 1);
     index.reset().await.unwrap();
-    assert!(search_refs(&source, &allowed, "atlas").await.is_empty());
+    assert!(
+        search_refs(&source, &allowed, recall_access("team-a"), "atlas")
+            .await
+            .is_empty()
+    );
     projector.rebuild(CancellationToken::new()).await.unwrap();
-    assert_eq!(search_refs(&source, &allowed, "atlas").await, before);
+    assert_eq!(
+        search_refs(&source, &allowed, recall_access("team-a"), "atlas").await,
+        before
+    );
 
     let (_, missed_session_id) =
         create_history(&repo, "team-a", "missed zephyr marker", "second answer").await;
-    assert!(search_refs(&source, &allowed, "zephyr").await.is_empty());
+    assert!(
+        search_refs(&source, &allowed, recall_access("team-a"), "zephyr")
+            .await
+            .is_empty()
+    );
     projector.reconcile(CancellationToken::new()).await.unwrap();
-    let repaired = search_refs(&source, &allowed, "zephyr").await;
+    let repaired = search_refs(&source, &allowed, recall_access("team-a"), "zephyr").await;
     assert_eq!(repaired.len(), 1);
     assert_eq!(repaired[0].session_id, missed_session_id);
 
@@ -1081,7 +1316,7 @@ async fn observed_fork_and_entry_deletion_update_projection() {
     let service = Arc::new(SessionRecallService::new(authority, index, control));
     let source = SessionRecallKnowledgeSource::new(service);
     let allowed = access("team-a", "allowed");
-    let mut ids = search_refs(&source, &allowed, "nova")
+    let mut ids = search_refs(&source, &allowed, recall_access("team-a"), "nova")
         .await
         .into_iter()
         .map(|reference| reference.session_id)
@@ -1095,7 +1330,7 @@ async fn observed_fork_and_entry_deletion_update_projection() {
         .delete_entries(vec![assistant_id])
         .await
         .unwrap();
-    let remaining = search_refs(&source, &allowed, "nova").await;
+    let remaining = search_refs(&source, &allowed, recall_access("team-a"), "nova").await;
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].session_id, forked_id);
 }
@@ -1130,7 +1365,8 @@ async fn harness_uses_recall_context_without_persisting_it_to_current_session() 
         .run(
             RunRequest::from_text("Who owns the launch?")
                 .with_extension(access("team-a", "allowed"))
-                .with_extension(HistoryRecallRequest::new("current-session")),
+                .with_extension(recall_access("team-a").with_current_session_id("current-session"))
+                .with_extension(HistoryRecallRequest::new()),
         )
         .await
         .unwrap();

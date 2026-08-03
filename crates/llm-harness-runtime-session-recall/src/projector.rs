@@ -111,6 +111,16 @@ impl SessionRecallProjector {
         abort: CancellationToken,
     ) -> Result<(), SessionRecallError> {
         check_abort(&abort)?;
+        if revision_hint > 0
+            && self
+                .index
+                .projected_revisions()
+                .await?
+                .get(session_id)
+                .is_some_and(|projected| *projected >= revision_hint)
+        {
+            return Ok(());
+        }
         let storage = match self.repo.open(session_id).await {
             Ok(storage) => storage,
             Err(SessionError::SessionNotFound(_)) => {

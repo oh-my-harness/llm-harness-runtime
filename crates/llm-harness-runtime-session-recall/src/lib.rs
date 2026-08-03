@@ -6,10 +6,11 @@
 //! Wiring is explicit: create an index and [`SessionRecallProjector`], wrap the
 //! authoritative repo with `ObservedSessionRepo`, register
 //! [`SessionRecallKnowledgeSource`] in the common Knowledge registry, and add
-//! [`HistoryRecallPlugin`] to the harness. A run opts in only by carrying both
-//! a trusted `KnowledgeAccessContext` and [`HistoryRecallRequest`]. Without the
-//! wrapper, source, plugin, and request extension, existing Session behavior is
-//! unchanged and no indexing or background work exists.
+//! [`HistoryRecallPlugin`] to the harness. Tool-driven reads require trusted
+//! `KnowledgeAccessContext` and [`SessionRecallAccessContext`] extensions; the
+//! automatic plugin additionally requires [`HistoryRecallRequest`]. Without
+//! the wrapper, source, and extensions, existing Session behavior is unchanged
+//! and no indexing or background work exists.
 
 mod index;
 mod plugin;

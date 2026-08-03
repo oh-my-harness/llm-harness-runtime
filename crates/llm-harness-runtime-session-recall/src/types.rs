@@ -28,6 +28,20 @@ impl SessionRecallRef {
             .map_err(|_| SessionRecallError::InvalidReference)?;
         serde_json::from_slice(&bytes).map_err(|_| SessionRecallError::InvalidReference)
     }
+
+    pub fn navigation_target(&self) -> SessionRecallNavigationTarget {
+        SessionRecallNavigationTarget {
+            session_id: self.session_id.clone(),
+            entry_id: self.user_entry_id,
+        }
+    }
+}
+
+/// Product-neutral target for opening the authoritative Session turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecallNavigationTarget {
+    pub session_id: String,
+    pub entry_id: EntryId,
 }
 
 /// One derived, searchable conversational turn.
@@ -95,8 +109,6 @@ pub struct SessionRecallCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecallSearchRequest {
     pub query: String,
-    pub scope: SessionRecallScope,
-    pub exclude_session_id: Option<String>,
     pub limit: usize,
     pub max_snippet_bytes: usize,
 }
@@ -138,24 +150,56 @@ impl SessionRecallBudget {
     }
 }
 
-/// Explicit per-run opt-in. Absence of this extension disables the plugin.
+/// Trusted, per-run authorization partition for Session Recall.
+///
+/// This type intentionally implements neither `Debug` nor serialization so it
+/// cannot be logged or persisted accidentally. It is independent of
+/// `KnowledgeAccessContext.scope`: products may use Knowledge attributes for
+/// document routing without partitioning conversation history by those values.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionRecallAccessContext {
+    pub scope: SessionRecallScope,
+    pub current_session_id: Option<String>,
+}
+
+impl SessionRecallAccessContext {
+    pub fn new(scope: SessionRecallScope) -> Self {
+        Self {
+            scope,
+            current_session_id: None,
+        }
+    }
+
+    pub fn with_current_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.current_session_id = Some(session_id.into());
+        self
+    }
+}
+
+/// Explicit per-run automatic-recall opt-in.
+///
+/// Tool-driven Session Recall needs `SessionRecallAccessContext` but does not
+/// need this extension. Absence of this extension disables the automatic
+/// History Recall plugin.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HistoryRecallRequest {
-    pub current_session_id: String,
     pub query: Option<String>,
 }
 
 impl HistoryRecallRequest {
-    pub fn new(current_session_id: impl Into<String>) -> Self {
-        Self {
-            current_session_id: current_session_id.into(),
-            query: None,
-        }
+    pub fn new() -> Self {
+        Self { query: None }
     }
 
     pub fn with_query(mut self, query: impl Into<String>) -> Self {
         self.query = Some(query.into());
         self
+    }
+}
+
+impl Default for HistoryRecallRequest {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

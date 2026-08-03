@@ -13,7 +13,8 @@ use llm_harness_types::{
 use tokio::sync::Mutex;
 
 use crate::{
-    HistoryRecallRequest, SessionRecallBudget, SessionRecallError, SessionRecallKnowledgeSource,
+    HistoryRecallRequest, SessionRecallAccessContext, SessionRecallBudget, SessionRecallError,
+    SessionRecallKnowledgeSource,
 };
 
 const HISTORY_RECALL_PREFIX: &str = "[[runtime:history-recall:v1]]";
@@ -117,7 +118,15 @@ impl TransformContextHook for HistoryRecallHook {
             let Some(request) = ctx.run.extension::<HistoryRecallRequest>() else {
                 return Ok(ctx.context);
             };
-            if request.current_session_id.trim().is_empty() {
+            let Some(recall) = ctx.run.extension::<SessionRecallAccessContext>() else {
+                return self.handle_failure(ctx.context, SessionRecallError::InvalidConfiguration);
+            };
+            if recall.scope.namespace.trim().is_empty()
+                || !recall
+                    .current_session_id
+                    .as_ref()
+                    .is_some_and(|session_id| !session_id.trim().is_empty())
+            {
                 return self.handle_failure(ctx.context, SessionRecallError::InvalidConfiguration);
             }
             let state = ctx

@@ -17,9 +17,9 @@ use llm_harness_types::{DataBlock, SessionError};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    HistoryRecallRequest, SESSION_RECALL_SOURCE_ID, SessionRecallCandidate, SessionRecallDocument,
-    SessionRecallError, SessionRecallIndex, SessionRecallIndexQuery, SessionRecallRef,
-    SessionRecallSearchRequest, truncate_utf8,
+    SESSION_RECALL_SOURCE_ID, SessionRecallAccessContext, SessionRecallCandidate,
+    SessionRecallDocument, SessionRecallError, SessionRecallIndex, SessionRecallIndexQuery,
+    SessionRecallNavigationTarget, SessionRecallRef, SessionRecallSearchRequest, truncate_utf8,
 };
 
 /// Search/read facade that revalidates every candidate against Session authority.
@@ -45,13 +45,12 @@ impl SessionRecallService {
     pub async fn search(
         &self,
         access: &KnowledgeAccessContext,
+        recall: &SessionRecallAccessContext,
         request: SessionRecallSearchRequest,
         abort: CancellationToken,
     ) -> Result<Vec<SessionRecallCandidate>, KnowledgeError> {
         check_abort(&abort)?;
-        if request.scope != scope_from_access(access) {
-            return Err(KnowledgeError::Unauthorized);
-        }
+        validate_recall_context(recall)?;
         self.authorize_source(access, KnowledgeAction::Search)
             .await?;
         if request.limit == 0 {
@@ -64,8 +63,8 @@ impl SessionRecallService {
             .search(
                 SessionRecallIndexQuery {
                     query: request.query,
-                    scope: request.scope,
-                    exclude_session_id: request.exclude_session_id,
+                    scope: recall.scope.clone(),
+                    exclude_session_id: recall.current_session_id.clone(),
                     limit: candidate_limit,
                     max_snippet_bytes: request.max_snippet_bytes,
                 },
@@ -77,7 +76,7 @@ impl SessionRecallService {
         for candidate in indexed {
             check_abort(&abort)?;
             match self
-                .authoritative_document(access, &candidate.reference, abort.clone())
+                .authoritative_document(access, &recall.scope, &candidate.reference, abort.clone())
                 .await
             {
                 Ok(document) => {
@@ -106,17 +105,20 @@ impl SessionRecallService {
     pub async fn read(
         &self,
         access: &KnowledgeAccessContext,
+        recall: &SessionRecallAccessContext,
         reference: &SessionRecallRef,
         max_bytes: usize,
         abort: CancellationToken,
     ) -> Result<(SessionRecallDocument, String, bool), KnowledgeError> {
+        check_abort(&abort)?;
+        validate_recall_context(recall)?;
         if max_bytes == 0 {
             return Err(KnowledgeError::InvalidFilter(
                 "max_bytes must be greater than zero".into(),
             ));
         }
         let document = self
-            .authoritative_document(access, reference, abort)
+            .authoritative_document(access, &recall.scope, reference, abort)
             .await?;
         let (content, truncated) = truncate_utf8(&document.formatted_content(), max_bytes);
         Ok((document, content, truncated))
@@ -125,6 +127,7 @@ impl SessionRecallService {
     async fn authoritative_document(
         &self,
         access: &KnowledgeAccessContext,
+        recall_scope: &SessionRecallScope,
         reference: &SessionRecallRef,
         abort: CancellationToken,
     ) -> Result<SessionRecallDocument, KnowledgeError> {
@@ -143,8 +146,7 @@ impl SessionRecallService {
             .await
             .map_err(map_authority_error)?;
         let before = storage.metadata().await.map_err(map_authority_error)?;
-        let expected_scope = scope_from_access(access);
-        if before.recall_scope.as_ref() != Some(&expected_scope) {
+        if before.recall_scope.as_ref() != Some(recall_scope) {
             return Err(KnowledgeError::Unauthorized);
         }
         if !before.is_recallable() {
@@ -196,10 +198,25 @@ impl SessionRecallService {
     }
 }
 
+/// Maps a product-neutral Session target to an optional application URI.
+pub trait SessionRecallUriMapper: Send + Sync {
+    fn uri(&self, target: &SessionRecallNavigationTarget) -> Option<String>;
+}
+
+impl<F> SessionRecallUriMapper for F
+where
+    F: Fn(&SessionRecallNavigationTarget) -> Option<String> + Send + Sync,
+{
+    fn uri(&self, target: &SessionRecallNavigationTarget) -> Option<String> {
+        self(target)
+    }
+}
+
 pub struct SessionRecallKnowledgeSource {
     service: Arc<SessionRecallService>,
     descriptor: KnowledgeSourceDescriptor,
     max_snippet_bytes: usize,
+    uri_mapper: Option<Arc<dyn SessionRecallUriMapper>>,
 }
 
 impl SessionRecallKnowledgeSource {
@@ -220,6 +237,7 @@ impl SessionRecallKnowledgeSource {
                 filter_fields: vec![],
             },
             max_snippet_bytes: 1024,
+            uri_mapper: None,
         }
     }
 
@@ -230,6 +248,17 @@ impl SessionRecallKnowledgeSource {
 
     pub fn service(&self) -> &Arc<SessionRecallService> {
         &self.service
+    }
+
+    pub fn with_uri_mapper(mut self, mapper: impl SessionRecallUriMapper + 'static) -> Self {
+        self.uri_mapper = Some(Arc::new(mapper));
+        self
+    }
+
+    fn navigation_uri(&self, reference: &SessionRecallRef) -> Option<String> {
+        self.uri_mapper
+            .as_ref()
+            .and_then(|mapper| mapper.uri(&reference.navigation_target()))
     }
 }
 
@@ -258,18 +287,17 @@ impl KnowledgeSource for SessionRecallKnowledgeSource {
                     "session recall does not expose model-controlled filters".into(),
                 ));
             }
-            let current_session_id = ctx
+            let recall = ctx
                 .run
-                .extension::<HistoryRecallRequest>()
-                .map(|request| request.current_session_id.clone());
+                .extension::<SessionRecallAccessContext>()
+                .ok_or(KnowledgeError::Unauthorized)?;
             let candidates = self
                 .service
                 .search(
                     ctx.access,
+                    recall,
                     SessionRecallSearchRequest {
                         query: request.query,
-                        scope: scope_from_access(ctx.access),
-                        exclude_session_id: current_session_id,
                         limit: request.limit,
                         max_snippet_bytes: self.max_snippet_bytes,
                     },
@@ -279,16 +307,19 @@ impl KnowledgeSource for SessionRecallKnowledgeSource {
             Ok(SourceSearchPage {
                 hits: candidates
                     .into_iter()
-                    .map(|candidate| KnowledgeHit {
-                        reference: to_knowledge_ref(&candidate.reference)
-                            .expect("typed recall references are serializable"),
-                        title: candidate.title,
-                        snippet: candidate.snippet,
-                        suggested_selectors: vec![ContentSelector::Document],
-                        uri: None,
-                        score: Some(candidate.score),
-                        updated_at: Some(candidate.updated_at),
-                        metadata: reference_metadata(&candidate.reference),
+                    .map(|candidate| {
+                        let uri = self.navigation_uri(&candidate.reference);
+                        KnowledgeHit {
+                            reference: to_knowledge_ref(&candidate.reference)
+                                .expect("typed recall references are serializable"),
+                            title: candidate.title,
+                            snippet: candidate.snippet,
+                            suggested_selectors: vec![ContentSelector::Document],
+                            uri,
+                            score: Some(candidate.score),
+                            updated_at: Some(candidate.updated_at),
+                            metadata: reference_metadata(&candidate.reference),
+                        }
                     })
                     .collect(),
                 next_cursor: None,
@@ -312,16 +343,21 @@ impl KnowledgeSource for SessionRecallKnowledgeSource {
                 ));
             }
             let reference = from_knowledge_ref(&request.reference)?;
+            let recall = ctx
+                .run
+                .extension::<SessionRecallAccessContext>()
+                .ok_or(KnowledgeError::Unauthorized)?;
             let (document, content, truncated) = self
                 .service
-                .read(ctx.access, &reference, request.max_bytes, abort)
+                .read(ctx.access, recall, &reference, request.max_bytes, abort)
                 .await?;
+            let uri = self.navigation_uri(&document.reference);
             Ok(KnowledgeContent {
                 reference: request.reference,
                 selector: ContentSelector::Document,
                 title: document.title,
                 blocks: vec![DataBlock::text(content)],
-                uri: None,
+                uri,
                 updated_at: Some(document.updated_at),
                 obtained_at: Utc::now(),
                 truncated,
@@ -351,15 +387,6 @@ pub fn from_knowledge_ref(reference: &KnowledgeRef) -> Result<SessionRecallRef, 
     Ok(decoded)
 }
 
-fn scope_from_access(access: &KnowledgeAccessContext) -> SessionRecallScope {
-    SessionRecallScope {
-        namespace: access.scope.namespace.clone(),
-        tenant: access.scope.tenant.clone(),
-        project: access.scope.project.clone(),
-        attributes: access.scope.attributes.clone(),
-    }
-}
-
 fn reference_metadata(reference: &SessionRecallRef) -> BTreeMap<String, serde_json::Value> {
     BTreeMap::from([
         ("session_id".into(), reference.session_id.clone().into()),
@@ -379,12 +406,30 @@ fn reference_metadata(reference: &SessionRecallRef) -> BTreeMap<String, serde_js
             reference.branch_leaf_id.to_string().into(),
         ),
         ("recall_revision".into(), reference.revision.into()),
+        (
+            "navigation".into(),
+            serde_json::to_value(reference.navigation_target())
+                .expect("typed recall navigation targets are serializable"),
+        ),
     ])
 }
 
 fn check_abort(abort: &CancellationToken) -> Result<(), KnowledgeError> {
     if abort.is_cancelled() {
         Err(KnowledgeError::Aborted)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_recall_context(recall: &SessionRecallAccessContext) -> Result<(), KnowledgeError> {
+    if recall.scope.namespace.trim().is_empty()
+        || recall
+            .current_session_id
+            .as_ref()
+            .is_some_and(|session_id| session_id.trim().is_empty())
+    {
+        Err(KnowledgeError::Unauthorized)
     } else {
         Ok(())
     }
