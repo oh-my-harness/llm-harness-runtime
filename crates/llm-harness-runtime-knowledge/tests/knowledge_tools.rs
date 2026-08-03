@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 struct FixtureSource;
 struct MemoryFixtureSource;
+struct ReferenceOnlyFixtureSource;
 
 impl KnowledgeSource for FixtureSource {
     fn descriptor(&self) -> &KnowledgeSourceDescriptor {
@@ -164,6 +165,70 @@ impl KnowledgeSource for MemoryFixtureSource {
     }
 }
 
+impl KnowledgeSource for ReferenceOnlyFixtureSource {
+    fn descriptor(&self) -> &KnowledgeSourceDescriptor {
+        static DESCRIPTOR: OnceLock<KnowledgeSourceDescriptor> = OnceLock::new();
+        DESCRIPTOR.get_or_init(|| KnowledgeSourceDescriptor {
+            id: "history-fixture".into(),
+            name: "History fixture".into(),
+            description: "Reference-only search projection fixture".into(),
+            domains: vec!["history".into()],
+            capabilities: BTreeSet::from([KnowledgeCapability::Search, KnowledgeCapability::Read]),
+            freshness: FreshnessClass::Live,
+            filter_fields: vec![],
+        })
+    }
+
+    fn search_projection(&self) -> KnowledgeSearchProjection {
+        KnowledgeSearchProjection::ReferenceOnly
+    }
+
+    fn search<'a>(
+        &'a self,
+        _ctx: KnowledgeRequestContext<'a>,
+        _request: SourceSearchRequest,
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<SourceSearchPage, KnowledgeError>> {
+        Box::pin(async move {
+            if abort.is_cancelled() {
+                return Err(KnowledgeError::Aborted);
+            }
+            Ok(SourceSearchPage {
+                hits: vec![KnowledgeHit {
+                    reference: KnowledgeRef {
+                        source_id: "history-fixture".into(),
+                        item_id: "turn-1".into(),
+                        revision: Some("1".into()),
+                    },
+                    title: Some("Old session".into()),
+                    snippet: "PRIVATE HISTORY SNIPPET".into(),
+                    suggested_selectors: vec![ContentSelector::Document],
+                    uri: None,
+                    score: Some(1.0),
+                    updated_at: None,
+                    metadata: BTreeMap::new(),
+                }],
+                next_cursor: None,
+            })
+        })
+    }
+
+    fn read<'a>(
+        &'a self,
+        _ctx: KnowledgeRequestContext<'a>,
+        _request: KnowledgeReadRequest,
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<KnowledgeContent, KnowledgeError>> {
+        Box::pin(async move {
+            if abort.is_cancelled() {
+                Err(KnowledgeError::Aborted)
+            } else {
+                Err(KnowledgeError::NotFound)
+            }
+        })
+    }
+}
+
 fn reference() -> KnowledgeRef {
     KnowledgeRef {
         source_id: "docs".into(),
@@ -208,6 +273,59 @@ fn knowledge_plugin(config: KnowledgePluginConfig) -> KnowledgePlugin {
     let authority = Arc::new(EvidenceAuthority::new(vec![5; 32], [provider.clone()]).unwrap());
     KnowledgePlugin::new(registry, authority, provider, config)
         .expect("knowledge plugin should build")
+}
+
+fn reference_only_plugin() -> KnowledgePlugin {
+    let access_control = Arc::new(KnowledgeAccessControl::new(Arc::new(AllowAllAuthorizer)));
+    let registry = Arc::new(
+        KnowledgeRegistry::builder(access_control)
+            .source(Arc::new(ReferenceOnlyFixtureSource))
+            .build()
+            .unwrap(),
+    );
+    let provider = EvidenceProviderId("knowledge.registry".into());
+    let authority = Arc::new(EvidenceAuthority::new(vec![7; 32], [provider.clone()]).unwrap());
+    KnowledgePlugin::new(
+        registry,
+        authority,
+        provider,
+        KnowledgePluginConfig::default(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn reference_only_search_does_not_persist_snippets() {
+    let plugin = reference_only_plugin();
+    let mut tools: Vec<Arc<dyn Tool>> = vec![];
+    plugin.register_tools(&mut tools);
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::tool_use(
+            "search-1",
+            KNOWLEDGE_SEARCH_TOOL_NAME,
+            r#"{"query":"old","source_id":"history-fixture"}"#,
+        ),
+        MockResponse::text("done"),
+    ]));
+    let mut options = AgentHarnessOptions::new("test-model");
+    options.tools = tools;
+    let harness =
+        AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, Arc::new(NoOpEnv), options).await;
+    harness
+        .run(RunRequest::from_text("search history").with_extension(access()))
+        .await
+        .unwrap();
+
+    let context = harness.build_context().await.unwrap();
+    let result = context.messages.iter().find_map(|message| match message {
+        AgentMessage::ToolResult(result) => Some(result),
+        _ => None,
+    });
+    let result = result.expect("search result must be projected");
+    assert_eq!(result.projection.kind, ToolProjectionKind::Ephemeral);
+    let serialized = serde_json::to_string(result).unwrap();
+    assert!(!serialized.contains("PRIVATE HISTORY SNIPPET"));
+    assert!(serialized.contains("turn-1"));
 }
 
 #[tokio::test]

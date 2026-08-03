@@ -34,6 +34,7 @@ crates/
 ├── llm-harness-runtime/    # runtime: workflow engine, executors, event stream, builder
 ├── llm-harness-runtime-knowledge/ # backend-neutral knowledge and access contracts
 ├── llm-harness-runtime-knowledge-local/ # root-confined Markdown/Text knowledge source
+├── llm-harness-runtime-session-recall/ # opt-in authoritative cross-Session history recall
 ├── llm-harness-runtime-memory/ # composable memory read/write contracts and service
 ├── llm-harness-runtime-sandbox-*/  # sandbox backends (bwrap, seatbelt, os)
 ├── llm-harness-runtime-mcp/        # MCP integration

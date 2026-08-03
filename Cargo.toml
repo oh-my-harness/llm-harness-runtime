@@ -12,6 +12,7 @@ members = [
     "crates/llm-harness-runtime-tools",
     "crates/llm-harness-runtime-knowledge",
     "crates/llm-harness-runtime-knowledge-local",
+    "crates/llm-harness-runtime-session-recall",
     "crates/llm-harness-runtime-memory",
     "crates/llm-harness-runtime-audit-jsonl",
     # pyo3 sdk
@@ -39,6 +40,7 @@ llm-harness-runtime = { path = "crates/llm-harness-runtime" }
 llm-harness-runtime-tools = { path = "crates/llm-harness-runtime-tools" }
 llm-harness-runtime-knowledge = { path = "crates/llm-harness-runtime-knowledge" }
 llm-harness-runtime-knowledge-local = { path = "crates/llm-harness-runtime-knowledge-local" }
+llm-harness-runtime-session-recall = { path = "crates/llm-harness-runtime-session-recall" }
 llm-harness-runtime-memory = { path = "crates/llm-harness-runtime-memory" }
 
 # API adapter — separate repo

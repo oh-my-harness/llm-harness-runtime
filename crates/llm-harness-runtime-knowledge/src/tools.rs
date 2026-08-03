@@ -9,7 +9,8 @@ use llm_harness_types::{
 use crate::{
     CitationRecord, ContentSelector, EvidenceAuthority, EvidenceProviderId, KnowledgeAccessContext,
     KnowledgeCitationPolicy, KnowledgeError, KnowledgeEvidenceSet, KnowledgeReadRequest,
-    KnowledgeRef, KnowledgeRegistry, KnowledgeRunState, KnowledgeSearchRequest,
+    KnowledgeRef, KnowledgeRegistry, KnowledgeRunState, KnowledgeSearchProjection,
+    KnowledgeSearchRequest,
 };
 
 pub const KNOWLEDGE_SEARCH_TOOL_NAME: &str = "knowledge_search";
@@ -150,12 +151,25 @@ impl Tool for KnowledgeSearchTool {
                     value: serde_json::json!({"hits": page.hits.iter().map(|hit| &hit.reference).collect::<Vec<_>>() }),
                 }],
             };
+            let session_projection = if page.search_projection
+                == KnowledgeSearchProjection::ReferenceOnly
+            {
+                ToolSessionProjection::Ephemeral {
+                    summary: format!("Knowledge search returned {} reference(s)", page.hits.len()),
+                    metadata,
+                }
+            } else {
+                ToolSessionProjection::Projected {
+                    content: content.clone(),
+                    metadata,
+                }
+            };
             Ok(ToolResult {
                 model_content: content.clone(),
                 details: serde_json::json!({"hits": public_hits}),
                 extensions: ToolResultExtensions::new(),
                 terminate: false,
-                session_projection: ToolSessionProjection::Projected { content, metadata },
+                session_projection,
             })
         })
     }

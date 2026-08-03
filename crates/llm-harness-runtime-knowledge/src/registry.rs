@@ -203,6 +203,7 @@ impl KnowledgeRegistry {
             hits: page.hits,
             next_cursor: None,
             source_failures: vec![],
+            search_projection: source.search_projection(),
         })
     }
 
