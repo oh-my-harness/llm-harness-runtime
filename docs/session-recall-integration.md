@@ -55,15 +55,44 @@ Register `source` in the common Knowledge registry when model-driven
 `history_recall` as a Harness plugin (or call `register_hooks` on the Harness
 hooks) for automatic context recall.
 
-The in-memory index must be rebuilt at process startup:
+The dependency-free in-memory index must be rebuilt at process startup:
 
 ```rust
 projector.rebuild(shutdown.child_token()).await?;
 ```
 
 `reconcile` repairs missed observer notifications by comparing authoritative
-Session revisions with the projection. A later persistent FTS backend can use
-it at startup instead of rebuilding every process-local generation.
+Session revisions with the projection.
+
+For a durable local projection, enable the portable bundled SQLite backend:
+
+```toml
+[dependencies]
+llm-harness-runtime-session-recall = { version = "0.3", features = ["sqlite-bundled"] }
+```
+
+Then open the derived FTS5 database and reconcile it at startup:
+
+```rust
+use llm_harness_runtime_session_recall::SqliteSessionRecallIndex;
+
+let index: Arc<dyn SessionRecallIndex> = Arc::new(
+    SqliteSessionRecallIndex::open(state_dir.join("session-recall.sqlite3"))?
+);
+let projector = Arc::new(SessionRecallProjector::new(
+    authority.clone(),
+    index.clone(),
+));
+projector.reconcile(shutdown.child_token()).await?;
+```
+
+Unchanged Session revisions are not reopened during that reconciliation. The
+database uses transactions, WAL recovery, durable deletion tombstones, and an
+atomically replaced rebuild generation. It remains disposable derived state:
+after stopping writers, it may be deleted and regenerated from `SessionRepo`.
+Use the `sqlite` feature instead when the target supplies a compatible SQLite
+build with FTS5. With neither feature enabled, `rusqlite` and SQLite are absent
+from the dependency graph and the existing in-memory behavior is unchanged.
 
 ## Mark only eligible Sessions recallable
 
@@ -146,6 +175,6 @@ the structured target is still present in result metadata.
   bypass `ObservedSessionRepo` remain safe at read time but require `reconcile`
   or `rebuild` before newly added content becomes searchable.
 
-The persistent local FTS backend, crash recovery, and performance benchmarks
-are intentionally a separate follow-up. They do not change this integration or
+Persistent-index performance benchmarks and deployment-specific retention
+policies remain application concerns. They do not change this integration or
 authority boundary.

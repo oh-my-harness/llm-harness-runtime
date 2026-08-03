@@ -83,7 +83,8 @@ senza.viewer.serve("/path/to/sessions")  # blocks, opens browser
 Cross-Session History Recall is an optional, fail-closed runtime feature. See
 [the Session Recall integration guide](docs/session-recall-integration.md) for
 authority wiring, per-Session eligibility, per-run opt-in, and operational
-limits.
+limits. The default index is dependency-free and in-memory; an opt-in
+SQLite/FTS5 backend persists the derived projection across restarts.
 
 ## Versioning
 

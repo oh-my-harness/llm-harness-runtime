@@ -238,7 +238,7 @@ impl SessionRecallIndex for InMemorySessionRecallIndex {
     }
 }
 
-fn terms(query: &str) -> BTreeSet<String> {
+pub(crate) fn terms(query: &str) -> BTreeSet<String> {
     query
         .split(|character: char| !character.is_alphanumeric())
         .map(str::trim)

@@ -10,9 +10,10 @@ atomic rebuildable lexical index, active-branch projection, per-hit current
 authorization, a reference-only Knowledge projection policy, and an explicit
 ephemeral History Recall context plugin.
 
-The first backend is dependency-free and in-memory. A persistent local FTS
-backend remains the documented follow-up; it does not change the authority,
-authorization, reference, or plugin contracts delivered here.
+The default backend is dependency-free and in-memory. An optional SQLite/FTS5
+backend now provides transactional persistence, restart reconciliation, schema
+versioning, durable tombstones, and atomic rebuilds without changing the
+authority, authorization, reference, or plugin contracts delivered here.
 
 ## Objective
 
@@ -356,9 +357,10 @@ retain existing behavior and cost.
 
 ### Follow-Up — Local Persistent FTS Backend
 
-- Select a local FTS implementation without adding it to core dependencies.
-- Add crash recovery, schema versioning, atomic rebuild, and cleanup tests on
-  Windows and Linux.
+- Implemented as an opt-in SQLite/FTS5 feature without adding it to default
+  dependencies.
+- Added WAL crash recovery, schema versioning, atomic rebuild, durable deletion
+  tombstones, multilingual search, and restart reconciliation tests.
 - Benchmark indexing latency, disk amplification, search latency, and startup
   reconciliation on representative Session sets.
 

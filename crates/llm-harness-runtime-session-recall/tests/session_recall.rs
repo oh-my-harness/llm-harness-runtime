@@ -592,6 +592,173 @@ fn projection(session_id: &str, revision: u64, text: &str) -> SessionRecallProje
     }
 }
 
+#[cfg(feature = "sqlite")]
+fn index_query(query: &str) -> SessionRecallIndexQuery {
+    SessionRecallIndexQuery {
+        query: query.into(),
+        scope: recall_scope("team-a"),
+        exclude_session_id: None,
+        limit: 10,
+        max_snippet_bytes: 512,
+    }
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_index_persists_multilingual_search_and_enforces_query_boundaries() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("recall.sqlite3");
+    {
+        let index = SqliteSessionRecallIndex::open(&path).unwrap();
+        index
+            .replace_session(projection(
+                "historical",
+                7,
+                "Aurora launch owner 是美玲，极光计划将在周五启动。",
+            ))
+            .await
+            .unwrap();
+        index
+            .replace_session(SessionRecallProjection {
+                scope: recall_scope("team-b"),
+                ..projection("other-scope", 1, "极光计划")
+            })
+            .await
+            .unwrap();
+    }
+
+    let index = SqliteSessionRecallIndex::open(&path).unwrap();
+    assert_eq!(
+        index.projected_revisions().await.unwrap().get("historical"),
+        Some(&7)
+    );
+    let hits = index
+        .search(index_query("极光计划"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].reference.session_id, "historical");
+
+    let mut excluded = index_query("Aurora owner");
+    excluded.exclude_session_id = Some("historical".into());
+    assert!(
+        index
+            .search(excluded, CancellationToken::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        index
+            .search(index_query("\" OR * NOT"), CancellationToken::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_tombstones_survive_reopen_and_rebuild_replaces_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("recall.sqlite3");
+    {
+        let index = SqliteSessionRecallIndex::open(&path).unwrap();
+        index
+            .replace_session(projection("versioned", 3, "new marker"))
+            .await
+            .unwrap();
+        index
+            .remove_session("versioned".into(), 3, false)
+            .await
+            .unwrap();
+        index
+            .replace_session(projection("deleted", 1, "never return"))
+            .await
+            .unwrap();
+        index
+            .remove_session("deleted".into(), 1, true)
+            .await
+            .unwrap();
+    }
+
+    let index = SqliteSessionRecallIndex::open(&path).unwrap();
+    assert!(
+        !index
+            .replace_session(projection("versioned", 2, "stale marker"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        index
+            .replace_session(projection("versioned", 4, "fresh marker"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !index
+            .replace_session(projection("deleted", 9, "resurrected"))
+            .await
+            .unwrap()
+    );
+    index
+        .replace_all(vec![projection("replacement", 1, "atomic generation")])
+        .await
+        .unwrap();
+    assert_eq!(
+        index.projected_revisions().await.unwrap(),
+        BTreeMap::from([("replacement".into(), 1)])
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_restart_reconcile_skips_unchanged_session_body_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("recall.sqlite3");
+    let authority = Arc::new(InMemorySessionRepo::new());
+    create_history(
+        &authority,
+        "team-a",
+        "persistent reconcile marker",
+        "first answer",
+    )
+    .await;
+    let repo = Arc::new(CountingOpenRepo::new(authority));
+    {
+        let index = Arc::new(SqliteSessionRecallIndex::open(&path).unwrap());
+        let projector = SessionRecallProjector::new(repo.clone(), index);
+        projector.rebuild(CancellationToken::new()).await.unwrap();
+    }
+    assert_eq!(repo.opens.load(Ordering::SeqCst), 1);
+
+    let reopened = Arc::new(SqliteSessionRecallIndex::open(&path).unwrap());
+    let projector = SessionRecallProjector::new(repo.clone(), reopened);
+    projector.reconcile(CancellationToken::new()).await.unwrap();
+    assert_eq!(repo.opens.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_schema_initialization_is_safe_when_opened_concurrently() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("recall.sqlite3");
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let threads = (0..4)
+        .map(|_| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                SqliteSessionRecallIndex::open(path).map(|_| ())
+            })
+        })
+        .collect::<Vec<_>>();
+    for thread in threads {
+        assert!(thread.join().unwrap().is_ok());
+    }
+}
+
 #[tokio::test]
 async fn index_rejects_out_of_order_tasks_and_rebuild_abort_keeps_generation() {
     let index = Arc::new(InMemorySessionRecallIndex::new());

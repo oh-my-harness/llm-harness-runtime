@@ -16,10 +16,14 @@ mod index;
 mod plugin;
 mod projector;
 mod source;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 mod types;
 
 pub use index::*;
 pub use plugin::*;
 pub use projector::*;
 pub use source::*;
+#[cfg(feature = "sqlite")]
+pub use sqlite::*;
 pub use types::*;
