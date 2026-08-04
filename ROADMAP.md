@@ -1,182 +1,154 @@
 # Roadmap
 
-> 基于 harness engineering & RSI 研究综述与 AutoHarness 论文，经逐项验证与讨论后确定的演进路线。
-> 详见 [docs/harness-engineering-and-rsi-implications.md](docs/harness-engineering-and-rsi-implications.md)。
+> 基于 [AI Agents in Depth 分层梳理](docs/ai-agent-book-layer-analysis.md) 28 个 view 的分析结果。
+> 三层模型：**机制层**（trait/hook/引擎基础设施）· **runtime 策略层**（默认 hook 实现/内置工具/模板）· **用户策略层**（应用层决定）。
 
-## 现状
+---
 
-runtime 已具备 harness engineering 的核心机制（15 项 ✅）：
+## 第一层：功能全景
 
-- **workflow design / loop engineering** — `WorkflowEngine`：staged workflow + back-edge + retry
-- **evaluation** — `StepTransitionJudge` trait + `StepResult.structured`
-- **permission controls** — `BeforeToolCallHook` + `WorkflowGateHook` + `RuleBasedApprovalHook`
-- **persistent state management** — `TaskStore` + `Checkpoint` + `WorkflowState`
-- **memory / context management** — `WorkflowContext` (blackboard) + `Session` + compaction
-- **tools** — `Tool` trait + `Plugin` 注册 + `McpToolAdapter`
-- **planning** — `PlanWorkflowTool` + LLM step
-- **action** — `StepExecutor` + `Sandbox`
-- **file system as persistent memory** — `Sandbox` cwd + `shell` executor
-- **sub-agent spawn + parallel** — `spawn_async` + `MessageBus`
-- **agent delegation tools** — `SpawnAgentTool` / `MessageSubagentTool` / `MessageMainTool` / `AwaitSubagentReplyTool` / `AwaitMainMessageTool` / `QuerySubagentTool` / `AbortSubagentTool`
-- **audit trail** — `AuditSink` + SHA-256 hash chain
-- **cost / budget control** — `CostAggregate` + `BudgetControlAdapter`
-- **crash recovery** — `WorkflowEngine::restore()` + `restore_from_step()` + `TaskStore`
-- **event-driven pause/resume** — `EventStream` + `WaitForExternalEventTool`（含超时）
-- **mechanism/policy separation** — trait 声明在 types，实现在 runtime/后端 crate，策略靠 trait 回调注入
+### 图例
 
-## P0：AutoHarness 模式
+| 标记 | 含义 |
+|------|------|
+| ✅ 已支持 | 机制层有基础设施 + 策略层有默认实现，端到端可用 |
+| ⚠️ 部分支持 | 机制层有 trait/hook 点，但策略层缺默认实现或机制层有缺口 |
+| ❌ 待实现 | 机制层和策略层均缺失 |
 
-> 论文：*AutoHarness: improving LLM agents by automatically synthesizing a code harness*（Google DeepMind, 2026）
+### 功能矩阵
 
-### 核心思想
+| 功能领域 | 机制层 | 策略层 | 整体 | 说明 |
+|---------|--------|--------|------|------|
+| **Loop 引擎** | ✅ | — | ✅ | sync loop + async tools，RetryConfig 指数退避 |
+| **Workflow 引擎** | ✅ | — | ✅ | staged workflow + back-edge + retry + crash recovery |
+| **Tool 系统** | ✅ | — | ✅ | Tool trait + Plugin 注册 + ToolSessionProjection (Full/Projected/Ephemeral) |
+| **并行工具执行** | ✅ | — | ✅ | join_all + ToolExecutionMode (Parallel/Sequential) |
+| **工具审批** | ✅ | ⚠️ | ⚠️ | BeforeToolCallHook + RuleChain + WorkflowGateHook 机制完整；缺默认危险命令黑名单、路径遍历防护规则 |
+| **文件编辑** | ✅ | — | ✅ | EditTool 行号+hashline 定位，WriteTool，ReadTool offset/limit+行号 |
+| **搜索工具** | ❌ | ❌ | ❌ | grep + glob 工具未实现（跨平台差异需独立工具） |
+| **BashTool 截断** | ⚠️ | ❌ | ⚠️ | ShellExecutor 有 TruncationStrategy 但 BashTool 未使用 |
+| **上下文压缩** | ⚠️ | ⚠️ | ⚠️ | compaction 基础设施完整，但 prompt 硬编码、无熔断器、无消息级不可压缩标记 |
+| **上下文注入** | ✅ | ⚠️ | ⚠️ | ContextMode (Append/Replace/Inject) + TransformContextHook 机制完整；缺结构化来源标注 (Inject(String)→Inject(Vec\<ContextBlock\>))、状态栏默认模板 |
+| **状态栏** | ✅ | ❌ | ⚠️ | TransformContextHook/PrepareNextTurnHook 可注入；缺默认 XML 格式模板和内容收集器 |
+| **TODO 工具** | ❌ | ❌ | ❌ | 无 TODO write 工具 |
+| **成本/预算** | ✅ | ✅ | ✅ | CostAccumulatorHook + BudgetControlAdapter + UsageLedger（策略层代码待迁移到 strategy crate） |
+| **审计日志** | ✅ | ⚠️ | ⚠️ | AuditSink + SHA-256 hash chain；缺默认结构化日志格式 |
+| **沙箱** | ✅ | — | ✅ | Sandbox trait + os/bwrap/seatbelt 后端 |
+| **子 Agent** | ⚠️ | ⚠️ | ⚠️ | spawn + MessageBus + 7 个委派工具完整；SpawnOptions 不继承 system_prompt/tools/thinking_level；QuerySubagentTool 不返回 role/description |
+| **MCP 集成** | ⚠️ | ⚠️ | ⚠️ | McpToolAdapter 基本可用；缺版本锁定、最小权限凭证管理、工具描述审查 |
+| **Skill 系统** | ✅ | ⚠️ | ⚠️ | SkillReadTool + format_skills_for_system_prompt 存在但无生产调用者；缺 BeforeRunHook 自动注入默认实现 |
+| **HITL** | ❌ | ❌ | ❌ | 无 request_human_approval/input 内置工具 |
+| **通知** | ❌ | ❌ | ❌ | 无 NotificationChannel trait，无 notify_user 工具 |
+| **事件驱动** | ✅ | ⚠️ | ⚠️ | EventStream trait + WaitForExternalEventTool（含超时）；缺默认事件过滤规则、Cron/Heartbeat 实现 |
+| **故障恢复** | ⚠️ | ⚠️ | ⚠️ | RetryConfig 退避完整；缺抖动、空闲看门狗、轨迹修复、连续失败计数器、死亡螺旋防护、全局 max_turns |
+| **Abort/取消** | ✅ | — | ✅ | CancellationToken (3 检查点) + AbortCascadeHook + phase_guard RAII + session 持久化 |
+| **提示工程** | ✅ | ⚠️ | ⚠️ | PromptTemplate + ResourceInjector 机制完整；缺注入短语黑名单、来源标签包裹默认策略 |
+| **提示注入防御** | ✅ | ⚠️ | ⚠️ | ContextMode 结构化标注机制待补；缺来源约束默认策略 |
+| **项目指令文件** | ✅ | ❌ | ⚠️ | BeforeRunHook 可注入；缺自动扫描 CLAUDE.md 等的默认实现 |
+| **持久终端会话** | ❌ | ❌ | ❌ | OsEnv::execute_shell 每次 `sh -c` 新进程，无 PTY |
+| **流式工具执行** | ❌ | ❌ | ❌ | loop_fn 消费完整 stream 后才 dispatch 工具 |
+| **写入后 lint** | ✅ | ❌ | ⚠️ | AfterToolCallHook::Replace 可支持；无默认实现 |
+| **主动工具发现** | ❌ | ❌ | ❌ | 无 discover_tools 元工具 |
 
-LLM agent 在结构化环境中频繁输出非法动作（如 78% 的国际象棋失败源于非法走棋）。AutoHarness 让模型自动生成代码校验框架（harness），通过环境反馈迭代优化代码，消除非法动作。
+### 旧 roadmap 中的功能（仍有效）
 
-### 三级梯度架构
+| 功能领域 | 机制层 | 策略层 | 整体 | 说明 |
+|---------|--------|--------|------|------|
+| **持久状态管理** | ✅ | — | ✅ | TaskStore + Checkpoint + WorkflowState |
+| **规划** | ✅ | — | ✅ | PlanWorkflowTool + LLM step |
+| **崩溃恢复** | ✅ | — | ✅ | WorkflowEngine::restore() + restore_from_step() + TaskStore |
 
-1. **Action Filter**：代码生成全部合法动作 → LLM 排序选最优
-2. **Action Verifier**（主方案）：LLM 提议 → 代码校验 → 非法则带报错重试
-3. **Action Policy**：纯代码策略，推理阶段不调 LLM
+---
 
-### 迭代搜索流程
+## 第二层：下一版本详细计划
 
-```
-Thompson 采样树搜索
-  ├── 选节点：从搜索树按 Thompson 采样选代码版本
-  ├── Rollout：并行 N 个环境运行当前 harness，收集失败样本
-  ├── Critic：汇总非法动作/错误/奖励
-  ├── Refiner：LLM 接收旧代码 + 错误日志 → 修复后新代码
-  └── 更新树：新代码作为子节点，更新启发值（合法动作率）
-```
+分三个阶段执行。阶段间有依赖：阶段一是前置条件（策略 crate 存在后才能放策略代码），阶段二和阶段三可部分并行。
 
-### runtime 已有机制映射
+### 阶段一：提取策略代码到 `llm-harness-strategy` crate
 
-| AutoHarness 组件 | runtime 对应 |
-|---|---|
-| 迭代循环（rollout → critic → refine） | `WorkflowEngine` back-edge + retry + LoopConfig |
-| 并行环境 rollout | `spawn_async` + `MessageBus` |
-| harness 代码执行 | `Sandbox`（bash/python executor） |
-| Critic 评估 | `StepTransitionJudge` trait |
-| Refiner（LLM 修代码） | `Step::Llm` |
-| 搜索树节点持久化 | `Checkpoint` + `TaskStore` |
+将混杂在机制层 crate 中的策略层代码迁移到独立 crate，只依赖机制层 public API。编译器强制边界。
 
-### 实现方案：混合（runtime 加机制 + 应用层实现）
+| # | 待迁移代码 | 当前位置 | 说明 |
+|---|-----------|---------|------|
+| 1 | `BudgetControlAdapter` | `runtime/src/control/budget.rs` | ShouldStopHook 实现 |
+| 2 | `CostAccumulatorHook` | `runtime/src/control/cost_hook.rs` | AfterProviderResponseHook 实现 |
+| 3 | `RuleBasedApprovalHook` + `RuleChain`/`Rule`/`Predicate`/内置 predicates | `runtime/src/rules/` | BeforeToolCallHook 实现 + 规则匹配框架 |
+| 4 | `ResourceInjector` | `runtime/src/platform/resource.rs` | 往 system_prompt 追加资源的默认策略 |
+| 5 | `format_skills_for_system_prompt` | `agent/src/skills.rs` | Skill 元数据格式化模板 |
+| 6 | `SUMMARIZATION_SYSTEM_PROMPT`/`SUMMARY_REQUEST` | `agent/src/compaction.rs` | 压缩 prompt 模板 |
 
-外层搜索循环（Thompson 采样 / 树节点管理 / rollout 协调）在**应用层**实现，基于 `WorkflowEngine` + `spawn_async` + `Sandbox`。
+**保留在机制层**：`UsageLedger`/`CostAggregate`（共享数据结构）、`WorkflowGateHook`（与 workflow 引擎紧耦合）。
 
-runtime 层需新增的机制待详细设计时确定，候选方向：
+**迁移后**：`HarnessBuilder` 的 `budget()`/`pricing()` 方法改为委托到 strategy crate 的工厂函数，或保留 builder 方法但 hook 实现来自 strategy crate。
 
-- 环境接口抽象（如 `EnvironmentRunner` trait：`step(action) → obs/reward/done`）
-- 搜索树分支元数据（`Checkpoint` 的 stage/parent 关系）
-- 环境交互内置 tool（让 LLM step 调用外部环境）
-- cost/tokens 持久化（搜索树节点记录代价）
+### 阶段二：补齐机制层缺失
 
-**设计原则约束**：runtime 只提供机制（环境抽象、持久化、执行），不提供策略（Thompson 采样、树搜索协调、代码修复 prompt）。搜索算法和 prompt 设计由应用层实现。
+需改 loop_fn/session/dispatch 内部逻辑，不能仅靠 hook 实现。
 
-## 近期
+| # | 缺失项 | 涉及 view | 改动位置 | 优先级 |
+|---|--------|---------|---------|--------|
+| 1 | 自定义压缩 prompt 通路 | view 9 | `compaction.rs` | 高 |
+| 2 | 压缩熔断器（连续失败计数+停止） | view 9, 26 | `compaction_ops.rs` | 高 |
+| 3 | 标记消息为不可压缩 | view 9 | `messages.rs`/`compaction.rs` | 中 |
+| 4 | ContextMode 结构化来源标注 | view 19 | `spawn_types.rs`：Inject(String)→Inject(Vec\<ContextBlock\>) | 高 |
+| 5 | SpawnOptions 配置继承 | view 3, 12 | `spawn_types.rs`/`spawner.rs` | 高 |
+| 6 | QuerySubagentTool 返回 role/description | view 12 | `spawn/tools.rs` | 中 |
+| 7 | NotificationChannel trait | view 13 | `types/` | 高 |
+| 8 | 退避抖动 (jitter) | view 26 | `config.rs` RetryConfig | 中 |
+| 9 | 流式空闲看门狗 | view 26 | `loop_fn.rs` | 中 |
+| 10 | 轨迹完整性自动修复 | view 26 | `loop_fn.rs` | 中 |
+| 11 | MCP 服务器版本锁定 | view 17 | `runtime-mcp/` | 低 |
+| 12 | MCP 最小权限凭证管理 | view 17 | `runtime-mcp/` | 低 |
+| 13 | 截断后完整输出保存到临时文件 | view 18 | `tool.rs` ToolSessionProjection | 中 |
 
-### P1：step_history 按需检索（Q1）
+### 阶段三：补齐 runtime 策略层缺失
 
-**问题**：`format_step_history_summary` 把所有历史 step 截断后等权注入 prompt（output 前 1000 字符 + structured 前 4000 字符 + 总预算 20000 字符裁剪）。LLM 拿到的是平铺文本，不能按 step_id / stage / 指标检索特定历史 step 的完整 `StepResult`。长 workflow 中信息丢失。
+在 `llm-harness-strategy` crate 中实现默认策略。只需注册 hook 或实现 trait。
 
-**方案**：提供内置 `query_history` tool，让 LLM step agent 可查询 `step_history` 中特定 step 的完整 `structured` 结果。
+| # | 缺失项 | 涉及 view | 实现方式 | 优先级 |
+|---|--------|---------|---------|--------|
+| 1 | 默认危险命令黑名单 | view 11 | BeforeToolCallHook + RuleChain | 高 |
+| 2 | 默认路径遍历防护 | view 11 | BeforeToolCallHook + canonicalize | 高 |
+| 3 | 状态栏 XML 模板 + 内容收集器 | view 5, 8 | TransformContextHook 默认实现 | 高 |
+| 4 | Skill 元数据注入 BeforeRunHook | view 7 | BeforeRunHook 默认实现 | 高 |
+| 5 | notify_user 内置工具 | view 13 | Tool trait + NotificationChannel | 高 |
+| 6 | HITL 工具 + 超时降级 | view 12, 20 | Tool trait + timeout→Deny | 高 |
+| 7 | 项目指令文件自动注入 | view 25 | BeforeRunHook 扫描 CLAUDE.md 等 | 高 |
+| 8 | 全局 max_turns 上限 | view 26 | ShouldStopHook + 轮数计数 | 高 |
+| 9 | BashTool 截断策略 | view 18 | BashTool 改用 TruncationStrategy | 高 |
+| 10 | grep + glob 工具 | view 15 | runtime-tools 新增 | 高 |
+| 11 | 默认审计日志格式 | view 11 | AfterToolCallHook + 结构化模板 | 中 |
+| 12 | TODO write 工具 | view 5 | Tool trait + TransformContextHook | 中 |
+| 13 | 自动包裹来源标签 | view 6 | AfterToolCallHook 默认实现 | 中 |
+| 14 | 状态栏内容来源约束 | view 6 | TransformContextHook 校验 | 中 |
+| 15 | 命令语义解析 | view 24 | BeforeToolCallHook + Shell 语义分析 | 中 |
+| 16 | 持久记忆跨会话防线 | view 24 | BeforeToolCallHook 写入审查 | 中 |
+| 17 | 重复调用指纹检测 | view 26 | ShouldStopHook + tool+params 指纹 | 中 |
+| 18 | 连续失败计数器 | view 26 | ShouldStopHook + per-path 计数 | 中 |
+| 19 | 输出触顶降级接续 | view 26 | BeforeProviderRequestHook + 续写 | 中 |
+| 20 | 死亡螺旋防护 + 递归深度计数器 | view 26 | AfterRunHook/ShouldStopHook | 中 |
+| 21 | 压缩 prompt 默认模板（上下文感知） | view 9 | 自定义压缩 prompt 的默认实现 | 中 |
+| 22 | 保留优先级默认规则 | view 9 | 不可压缩消息的策略层规则 | 中 |
+| 23 | 截断标注引导 Agent read 临时文件 | view 18 | 截断标注模板 | 中 |
+| 24 | discover_tools 元工具 | view 17, 23 | Tool trait 实现 | 中 |
+| 25 | 工具层次化组织 | view 17, 23 | 工具分类+分组策略 | 中 |
+| 26 | 注入短语黑名单模板 | view 6 | TransformContextHook 默认实现 | 低 |
+| 27 | 批量 steer 消息编号+汇总 | view 22 | TransformContextHook 默认实现 | 低 |
+| 28 | 工具描述审查机制 | view 17 | MCP adapter wrapper 审计 | 低 |
+| 29 | 事件过滤规则 + 载荷上下文模板 | view 14 | EventStream wrapper | 低 |
+| 30 | Cron/Heartbeat EventStream | view 14 | TimerStream/HeartbeatStream | 低 |
+| 31 | 工具结果投影默认策略 | view 9, 10 | ToolSessionProjection 默认阈值 | 低 |
 
-**边界**：runtime 提供检索机制。查询什么、怎么用检索结果，是策略层。
-
-### P1：Session 续接（Gap-1）
-
-**问题**：`run_llm_step` 每次 `Transition::Retry` 时创建全新 `Session::new(storage)`。LLM 只拿到 `step_history` 文本摘要 + `WorkflowContext` KV 前缀，看不到上一轮 retry 的对话内容。ACE 的 Reflector iterative refinement、ADAS 的 self-refine 等需要 step 内多轮改进的模式无法保持对话连续性。
-
-**方案**：在 `Step::Llm` 定义中增加 `session_mode: SessionMode` 字段：
-
-- `Fresh`（默认，当前行为）：每次创建新 session。
-- `Persistent`：retry 时复用上一轮 session，LLM 看到完整对话历史。
-
-**边界**：只提供机制（session 复用 or 不复用），是否复用由 workflow 定义者（策略层）决定。
-
-**影响范围**：`workflow/model.rs`（Step 枚举扩展）、`workflow/engine/runner.rs`（`run_llm_step` 按 session_mode 选择 session 构造方式）。
-
-## 中期
-
-### P2：WorkflowContext 大小限制（Q2）
-
-**问题**：`WorkflowContext` 是 `serde_json::Map<String, Value>` 纯 KV 黑板。`format_context_vars` 把所有 KV 全量格式化进 prompt，无截断、无大小限制。如果应用层往 context 塞大对象，prompt 会膨胀。
-
-**方案**：`format_context_vars` 增加总大小上限 + 单值截断。超过上限时保留按 key 排序的前 N 个，或标记截断。
-
-**边界**：runtime 提供大小控制机制。限制多少、截断策略，是配置参数。
-
-### P2：Tool 声明式权限级别（借鉴 BoxAgnts）
-
-**问题**：`Tool` trait 无 `permission_level()` 方法。`RuleBasedApprovalHook` 的 `RuleChain` 未命中时 fallback 默认 Deny（fail-secure），缺少中间地带——Read 类工具（如 `read`/`glob`）也需要显式写规则才放行，应用层负担重。
-
-**方案**：在 `Tool` trait 增加默认方法 `fn permission_level(&self) -> PermissionLevel { PermissionLevel::Read }`，新增 `PermissionLevel` 枚举（`Read`/`Write`/`Execute`/`Network`）。在 `runtime/src/rules/` 新增 `PermissionLevelHook`（实现 `BeforeToolCallHook`），作为 `RuleChain` 未命中时的默认策略：按 `tool.permission_level()` 派生决策（Read→Allow, Write/Execute/Network→Deny），保持 fail-secure。
-
-**边界**：runtime 只提供声明性元数据 + 默认派生机制。`PermissionMode` 降级（BypassPermissions/AcceptEdits/Plan）、`Ask` 交互决策、规则持久化（Session/Persistent scope）是应用层策略，通过组合现有 `BeforeToolCallHook` 实现。
-
-**影响范围**：`llm-harness-types/src/tool.rs`（trait + enum）、`runtime/src/rules/`（新 hook）、内置 tool（bash→Execute, write/edit→Write, read→Read）。
-
-**参考**：[BoxAgnts](https://github.com/guyoung/boxagnts) `workspace/src/permissions.rs` 的 `PermissionLevel` + `PermissionManager::evaluate`。
-
-## 远期
-
-### P3：compaction 分级压缩（借鉴 BoxAgnts）
-
-**问题**：当前 compaction 是单层触发——`try_auto_compact` 在 estimated_tokens 超过阈值时全量压缩到 `keep_recent_tokens`。在阈值边界附近会产生振荡：context 刚好低于阈值时不压缩、持续膨胀，超过阈值时一次性大压缩导致信息丢失。
-
-**方案**：`CompactionThresholdConfig` 增加双阈值：`micro_compact_threshold: Option<f64>`（如 0.75，轻量压缩最旧部分）+ `full_compact_threshold`（当前隐式阈值）。`try_auto_compact` 按双阈值选择压缩力度：micro 阈值触发只压缩最旧 N 条（保留更大 `keep_recent_tokens`），full 阈值触发当前完整压缩。具体压缩策略可通过 `BeforeCompactHook` 注入。
-
-**边界**：runtime 提供双阈值配置机制。压缩多少、怎么压缩是策略，留给 hook。
-
-**影响范围**：`llm-harness-agent/src/compaction.rs`（`CompactionThresholdConfig` 扩展）、`harness/compaction_ops.rs`（双阈值逻辑）。
-
-**参考**：[BoxAgnts](https://github.com/guyoung/boxagnts) `query/src/compact.rs` 的 `MicroCompactConfig` + `micro_compact_if_needed`。
-
-## 设计原则
-
-以下原则在 runtime 后续开发中坚持（源自 [harness engineering & RSI 综述](docs/harness-engineering-and-rsi-implications.md) §5）：
-
-1. **机制与策略分离**（最高优先级）— runtime 提供机制（workflow 遍历、hook 组合、spawn、persist、sandbox、audit），不提供策略（怎么路由、什么时候分支、怎么评估、怎么搜索）。策略通过 trait 回调注入。检验标准：runtime 一行不改即可服务不同 agent。
-2. **刻意简单和通用** — 不预判模型能力边界，不预判领域需求。检验标准：资深工程师会觉得这过于复杂吗？如果是，简化。
-3. **File system as first-class memory** — context 不是垃圾桶。全量状态存文件，context 只留当前需要的。`WorkflowContext` 应保持轻量，`Sandbox` 文件系统是主要持久记忆。
-4. **可序列化、可比较、可恢复** — harness 配置必须可被导出为文件、可被重新加载执行、可被外层系统比较。
-5. **安全层在 evolution loop 之外** — permission control、evaluator、human review 不在 harness 自我改进的循环内。editable surface 必须被显式界定。
-6. **OS 式封装** — harness 像 OS：trait 是系统调用，runtime 是内核，后端 crate 是驱动，应用层 agent 是用户程序。
+---
 
 ## 明确不做的事
 
-以下经讨论确认**不在 runtime 职责内**，由上层建筑实现或当前设计已够用：
-
-| 不做 | 理由 |
-|---|---|
-| Checkpoint 阶段元数据（Q3） | checkpoint 关系管理是应用层职责，runtime 不应预设树结构语义 |
-| sub-agent 结构化回传（Q4） | sub-agent 通过文件系统回传结构化数据（写文件，主 agent 读），不需要专用 tool |
-| workflow context compaction（Q5） | session 级 compaction 已够，workflow context 应保持轻量（文件系统存全量） |
-| AuditSink 查询接口（Q6） | 查询是应用层职责，runtime 只管写，读全量 JSONL 自行解析即可 |
-| 多维 budget（Q7） | cost + max_steps + max_retries 三者独立够用，应用层可自行组合 |
-| Sandbox 资源计费（Q8） | 资源计费是上层建筑职责，runtime 只管隔离不管计量 |
-| EventStream trait 超时（Q9） | tool 层已有超时机制（`WaitForExternalEventTool::with_timeout`），trait 层不需要改 |
-| Context provenance tracking（Gap-2） | 应用层可在 `StepResult.structured` 里手动标注来源 |
-| 完整 harness 配置序列化（Gap-3） | 完整配置序列化是上层建筑职责，runtime 只需保证 Workflow 可序列化 |
-| 并行 fan-out / fan-in（Gap-4） | `spawn_async` + `MessageBus` 已足够，并行编排是应用层职责 |
-| Editable surface 标记（Gap-5） | 上层建筑（harness 自我改进系统）的职责，runtime 不需要预设这层抽象 |
-| Context lifecycle 管理（Gap-6） | lifecycle 管理是应用层职责，runtime 只提供 KV 存储 |
-| 失败模式聚合（Gap-7） | 失败分析是策略层职责，runtime 只提供数据（step_history + AuditSink） |
-| `resume_agent` 工具 | sub-agent 完成后不需要恢复，新任务应 spawn 新 agent |
-| 子图嵌套（Issue #38） | 当前 stage + back-edge + LoopConfig 已够用，子图嵌套增加复杂度但收益不明 |
-| 时间旅行 / checkpoint history（Issue #39） | `restore_from_step` 的 rerun 能力已够，fork 分支是上层建筑职责 |
-| State reducer（Issue #40） | 依赖并行 fan-out（已决定不做），没有独立价值 |
-| 运行时动态 workflow 修改 | workflow 应在运行前定义好，动态修改与声明式设计哲学冲突 |
-| Meta-Harness / ADAS / AFlow 外层搜索循环 | 这是"优化 harness 的系统"，不是 harness 本身。runtime 是被优化的对象，不是优化器 |
-| Skill 数据库 + crossover agent | MCE 的 outer loop。runtime 提供 skill 注册/执行机制，不提供 skill 演化策略 |
-| Pareto frontier 选择 | 多目标评估策略。runtime 提供评估数据，选择算法是策略 |
-| 模型权重更新 | SIA 的 joint optimization。完全在 runtime 之外（训练系统） |
-| 领域评估逻辑 | QoR 指标计算等。runtime 提供 `StepExecutor` + `StepTransitionJudge` trait，具体评估由应用层实现 |
-| WASM 沙箱工具执行（BoxAgnts A） | `Sandbox` trait 已覆盖（os/bwrap/seatbelt），WASM 是新后端非新机制，引入 wasmtime 增编译体积 |
-| ManagedAgentConfig 声明式编排（BoxAgnts D） | 与 spawn+MessageBus 机制重复，manager-executor 是并行编排策略，属应用层 |
-| compaction 熔断器（BoxAgnts E-1） | 不采纳——provider 故障应由应用层 retry 策略处理，runtime 不预设故障处理模式 |
-| API round 分组 + topic_hint（BoxAgnts E-3） | 树结构 session + 现有切点逻辑（`find_valid_cut_boundary`）已等价 |
-| Session 分支/检查点快照（BoxAgnts F） | 树结构 session（`fork_branch`/`navigate_to`）已是扁平+快照方案的严格上位 |
-| Skill `list` 工具发现（BoxAgnts G） | 现有 `SkillReadTool` + `format_skills_for_system_prompt` 已是严格上位 |
-| feature_gates 环境变量 flag（BoxAgnts H） | 配置应显式可序列化（`AgentHarnessOptions`），环境变量 flag 与设计原则有张力 |
-| ToolSearchTool 工具发现（BoxAgnts C） | 当前工具数量少全量注入更简单，ROI 低；需要时应用层可自行实现 |
+| 不做 | 涉及 view | 理由 |
+|------|----------|------|
+| 流式工具执行 | view 27 | 实现复杂度高（需 stream 中增量解析 ToolUse） |
+| 持久化终端会话 | view 28 | 需要 PTY/长运行 shell 进程管理 |
+| 写入后自动 lint | view 28 | AfterToolCallHook::Replace 可支持，但无内置实现计划 |
+| 动态 schema 追加 + KV Cache 优化 | view 23 | 太复杂；当前全量注入 tools 参数对数十个工具足够 |
+| mid-turn steer | view 21 | 有意设计选择——sync loop 模型更简单，匹配 LLM 训练范式 |
+| 优先级队列 | view 20 | 太复杂 |
+| 多渠道通知 | view 13/20 | 太复杂，NotificationChannel trait 先做单通道 |
