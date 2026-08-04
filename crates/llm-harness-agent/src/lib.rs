@@ -40,8 +40,8 @@ pub use session::{
 };
 pub use skills::{
     PromptTemplate, Skill, SkillDiagnostic, SkillReadTool, SourcedSkill, format_skill_invocation,
-    invoke_template, load_prompt_templates, load_skills,
-    parse_command_args, parse_frontmatter, parse_skill_file, resolve_skill_resource,
+    invoke_template, load_prompt_templates, load_skills, parse_command_args, parse_frontmatter,
+    parse_skill_file, resolve_skill_resource,
 };
 
 /// Recommended imports for most `llm-harness` SDK users.

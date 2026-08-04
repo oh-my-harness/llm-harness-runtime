@@ -5,5 +5,4 @@
 //! `runtime-mcp`, ...) implements. The runtime itself stays backend-agnostic.
 
 pub mod prompt;
-pub mod resource;
 pub mod sandbox;

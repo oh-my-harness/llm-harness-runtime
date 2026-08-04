@@ -1,50 +1,6 @@
 //! Skill metadata formatting for system prompt injection.
 
-use llm_harness_types::Skill;
-
-/// Escape tags that could forge skill markup boundaries.
-///
-/// Handles both bare tags (`<skill>`) and attributed open tags
-/// (`<skill name="...">`) by matching the tag prefix.
-fn escape_skill_markup(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if s[i..].starts_with("</skill>") {
-            out.push_str("</skill\\>");
-            i += 8;
-        } else if s[i..].starts_with("</available-skills>") {
-            out.push_str("</available-skills\\>");
-            i += 19;
-        } else if s[i..].starts_with("<skill>") {
-            out.push_str("<skill\\>");
-            i += 7;
-        } else if s[i..].starts_with("<skill ") {
-            out.push_str("<skill\\ ");
-            i += 7;
-        } else if s[i..].starts_with("<available-skills>") {
-            out.push_str("<available-skills\\>");
-            i += 18;
-        } else if s[i..].starts_with("<available-skills ") {
-            out.push_str("<available-skills\\ ");
-            i += 18;
-        } else {
-            let ch = s[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    out
-}
-
-/// Escape a string for safe use inside an XML attribute value (`"..."`).
-fn escape_xml_attr(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
+use llm_harness_types::{Skill, escape_skill_markup, escape_xml_attr};
 
 /// Build the skills section injected into the system prompt.
 ///

@@ -356,53 +356,6 @@ pub async fn load_prompt_templates(
     (templates, diags)
 }
 
-/// Escape tags that could forge skill markup boundaries.
-///
-/// Handles both bare tags (`<skill>`) and attributed open tags
-/// (`<skill name="...">`) by matching the tag prefix.
-fn escape_skill_markup(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Closing tags: </skill> and </available-skills>
-        if s[i..].starts_with("</skill>") {
-            out.push_str("</skill\\>");
-            i += 8;
-        } else if s[i..].starts_with("</available-skills>") {
-            out.push_str("</available-skills\\>");
-            i += 19;
-        } else if s[i..].starts_with("<skill>") {
-            out.push_str("<skill\\>");
-            i += 7;
-        } else if s[i..].starts_with("<skill ") {
-            // Attributed open tag: <skill name="..."> — escape the opening.
-            out.push_str("<skill\\ ");
-            i += 7;
-        } else if s[i..].starts_with("<available-skills>") {
-            out.push_str("<available-skills\\>");
-            i += 18;
-        } else if s[i..].starts_with("<available-skills ") {
-            out.push_str("<available-skills\\ ");
-            i += 18;
-        } else {
-            // Safe: push one char (handles multi-byte UTF-8 correctly).
-            let ch = s[i..].chars().next().unwrap();
-            out.push(ch);
-            i += ch.len_utf8();
-        }
-    }
-    out
-}
-
-/// Escape a string for safe use inside an XML attribute value (`"..."`).
-fn escape_xml_attr(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 /// Wrap a skill's content for explicit invocation as a user message.
 ///
 /// Reads the SKILL.md file on demand via `ExecutionEnv::read_text_file`.
@@ -1217,6 +1170,23 @@ mod tests {
         };
         let result = resolve_skill_resource(&skill, Some("nonexistent.md"));
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn make_test_ctx(tmp: &Path) -> ToolContext {
+        ToolContext {
+            run: Arc::new(llm_harness_types::RunContext::new(
+                llm_harness_types::RunRequest::default(),
+            )),
+            env: Arc::new(OsEnv::new(tmp)),
+            abort: CancellationToken::new(),
+            tool_use_id: "test".into(),
+            turn_index: 0,
+            assistant_message: Arc::new(llm_harness_loop::test_utils::test_assistant_message(
+                vec![],
+            )),
+            update_tx: tokio::sync::mpsc::channel(1).0,
+        }
     }
 
     // ── SkillReadTool ───────────────────────────────────────────────────────

@@ -2,7 +2,7 @@
 //!
 //! This crate defines traits and core orchestration logic for:
 //! - Sandbox abstraction (`Sandbox` trait)
-//! - Resource injection (`ResourceProvider`, `ResourceInjector`)
+//! - Resource injection (`ResourceProvider` trait; `ResourceInjector` in `llm-harness-strategy`)
 //! - Prompt template integration (`PromptSource`, `PromptTemplateCompiler`)
 //! - Task lifecycle management (`WorkflowEngine`)
 //! - Tracing (`TraceExporter`)

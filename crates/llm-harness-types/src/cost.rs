@@ -1,3 +1,4 @@
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -268,21 +269,23 @@ fn billable_uncached_input_tokens(
         ))
     })
 }
-use futures::future::BoxFuture;
-
 /// Business-layer hook for budget override decisions.
 /// Called when the per-task budget limit is exceeded.
 pub trait BudgetExceededHook: Send + Sync {
     /// Called when budget is exceeded. Return `true` to continue, `false` to
     /// transition the task to `Failed`.
     ///
-    /// `cost` is the session-wide accumulated cost snapshot.
+    /// `cost` is the session-wide accumulated cost snapshot. The previous
+    /// `task_cost` parameter was always equal to `session_cost` in pre-WorkflowEngine
+    /// scenarios and has been removed; callers needing task-scoped cost should
+    /// track it separately.
     fn on_budget_exceeded<'a>(
         &'a self,
         cost: &'a CostAggregate,
         budget_limit: f64,
     ) -> BoxFuture<'a, bool>;
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

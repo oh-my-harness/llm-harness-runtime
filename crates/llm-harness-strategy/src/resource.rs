@@ -3,9 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use llm_harness_types::{
-    AgentContext, ResourceContent, ResourceProvider,
-};
+use llm_harness_types::{AgentContext, ResourceContent, ResourceProvider};
 
 /// Resource injector — appends resource content to the system prompt tail
 /// with cache-control-compatible markers.
@@ -80,7 +78,7 @@ impl Default for ResourceInjector {
 mod tests {
     use super::*;
     use futures::future::BoxFuture;
-    use llm_harness_types::{ResourceDescriptor, ResourceContent, ResourceProvider};
+    use llm_harness_types::{ResourceContent, ResourceDescriptor, ResourceProvider};
 
     struct StubProvider {
         resources: Vec<ResourceDescriptor>,
@@ -143,10 +141,11 @@ mod tests {
             .await
             .unwrap();
         assert!(ctx.system_prompt.is_some());
-        assert!(ctx
-            .system_prompt
-            .as_ref()
-            .unwrap()
-            .contains("<resource uri=\"test://doc\">"));
+        assert!(
+            ctx.system_prompt
+                .as_ref()
+                .unwrap()
+                .contains("<resource uri=\"test://doc\">")
+        );
     }
 }

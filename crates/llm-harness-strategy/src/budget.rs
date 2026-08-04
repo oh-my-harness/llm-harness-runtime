@@ -24,6 +24,9 @@ use llm_harness_types::{BudgetExceededHook, CostAggregate, ShouldStopCtx, Should
 ///   never stops on budget.
 /// - `exceeded_hook = Some(h)` → `h.on_budget_exceeded` decides: `true` =
 ///   continue, `false` = stop.
+///
+/// Cost accumulation is handled separately by `CostAccumulatorHook`; this
+/// adapter holds no pricing or model state.
 pub struct BudgetControlAdapter {
     cost: Arc<Mutex<CostAggregate>>,
     budget_limit: f64,
@@ -53,6 +56,7 @@ impl BudgetControlAdapter {
 impl ShouldStopHook for BudgetControlAdapter {
     fn should_stop<'a>(&'a self, _ctx: ShouldStopCtx<'a>) -> BoxFuture<'a, bool> {
         Box::pin(async move {
+            // Snapshot cost under lock, release before awaiting the hook.
             let cost_snapshot = self.cost.lock().unwrap().clone();
             if cost_snapshot.billing_usage_violations != 0 {
                 return true;
@@ -69,8 +73,10 @@ impl ShouldStopHook for BudgetControlAdapter {
                 return false;
             }
             match &self.exceeded_hook {
-                None => false,
+                None => false, // surveillance mode: track but don't stop
                 Some(hook) => {
+                    // on_budget_exceeded returns true = continue, false = stop.
+                    // should_stop returns true = stop. Invert.
                     !hook
                         .on_budget_exceeded(&cost_snapshot, self.budget_limit)
                         .await
