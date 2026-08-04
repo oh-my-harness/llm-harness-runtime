@@ -1190,7 +1190,7 @@ mod tests {
         bus.register(
             "sub-1",
             AgentEntry {
-                status: AgentStatus::Done(done_result()),
+                status: AgentStatus::Done(Box::new(done_result())),
                 harness: None,
                 is_main: false,
             },

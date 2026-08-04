@@ -6,7 +6,7 @@ use anyhow::Result;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_runtime::platform::sandbox::{Sandbox, SandboxConfig};
-use llm_harness_types::{EnvError, ExecutionEnv, UnsupportedEnv};
+use llm_harness_types::{ExecutionEnv, UnsupportedEnv};
 
 /// Sandbox backed by macOS `sandbox(7)` / seatbelt for OS-level isolation.
 ///

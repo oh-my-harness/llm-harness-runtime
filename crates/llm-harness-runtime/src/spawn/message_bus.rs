@@ -36,7 +36,7 @@ pub enum SubAgentEvent {
 #[derive(Debug, Clone)]
 pub enum AgentStatus {
     Running,
-    Done(SubAgentResult),
+    Done(Box<SubAgentResult>),
     Aborted,
 }
 
@@ -483,7 +483,7 @@ impl MessageBus {
         tokio::spawn(async move {
             let result = handle.join().await;
             let status = match &result {
-                Ok(r) => AgentStatus::Done(r.clone()),
+                Ok(r) => AgentStatus::Done(Box::new(r.clone())),
                 Err(AgentError::Aborted) => AgentStatus::Aborted,
                 Err(_) => AgentStatus::Aborted,
             };
@@ -575,7 +575,7 @@ impl MessageBus {
         tokio::spawn(async move {
             let result = handle.join().await;
             let status = match &result {
-                Ok(r) => AgentStatus::Done(r.clone()),
+                Ok(r) => AgentStatus::Done(Box::new(r.clone())),
                 Err(AgentError::Aborted) => AgentStatus::Aborted,
                 Err(_) => AgentStatus::Aborted,
             };
@@ -936,7 +936,7 @@ mod tests {
         bus.register(
             "sub-1",
             AgentEntry {
-                status: AgentStatus::Done(done_result),
+                status: AgentStatus::Done(Box::new(done_result)),
                 harness: None,
                 is_main: false,
             },

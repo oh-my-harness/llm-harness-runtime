@@ -124,10 +124,10 @@ impl TransformContextHook for HistoryRecallHook {
                 return self.handle_failure(ctx.context, SessionRecallError::InvalidConfiguration);
             };
             if recall.scope.namespace.trim().is_empty()
-                || !recall
+                || recall
                     .current_session_id
                     .as_ref()
-                    .is_some_and(|session_id| !session_id.trim().is_empty())
+                    .is_none_or(|session_id| session_id.trim().is_empty())
             {
                 publish_observation(ctx.run, vec![]);
                 return self.handle_failure(ctx.context, SessionRecallError::InvalidConfiguration);
