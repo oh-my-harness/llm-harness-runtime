@@ -10,6 +10,7 @@ members = [
     "crates/llm-harness-runtime-sandbox-seatbelt",
     "crates/llm-harness-runtime-mcp",
     "crates/llm-harness-runtime-tools",
+    "crates/llm-harness-strategy",
     "crates/llm-harness-runtime-knowledge",
     "crates/llm-harness-runtime-knowledge-local",
     "crates/llm-harness-runtime-session-recall",
@@ -38,6 +39,7 @@ llm-harness-agent  = { path = "crates/llm-harness-agent" }
 # Runtime (within this workspace)
 llm-harness-runtime = { path = "crates/llm-harness-runtime" }
 llm-harness-runtime-tools = { path = "crates/llm-harness-runtime-tools" }
+llm-harness-strategy = { path = "crates/llm-harness-strategy" }
 llm-harness-runtime-knowledge = { path = "crates/llm-harness-runtime-knowledge" }
 llm-harness-runtime-knowledge-local = { path = "crates/llm-harness-runtime-knowledge-local" }
 llm-harness-runtime-session-recall = { path = "crates/llm-harness-runtime-session-recall" }

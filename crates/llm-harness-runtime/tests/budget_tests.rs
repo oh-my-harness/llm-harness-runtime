@@ -7,7 +7,8 @@
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use llm_harness_runtime::control::budget::{BudgetControlAdapter, BudgetExceededHook};
+use llm_harness_strategy::budget::BudgetControlAdapter;
+use llm_harness_types::BudgetExceededHook;
 use llm_harness_runtime::control::cost::{CostAggregate, ModelCost, PricingProvider, TokenPrice};
 use llm_harness_types::{AssistantMessage, ShouldStopCtx, ShouldStopHook, StopReason};
 

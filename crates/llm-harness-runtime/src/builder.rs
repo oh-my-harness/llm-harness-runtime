@@ -31,10 +31,7 @@ use llm_harness_types::{
     StreamOptions, ThinkingLevel, Tool,
 };
 
-use crate::control::{
-    budget::BudgetControlAdapter, budget::BudgetExceededHook, cost::UsageLedger,
-    cost_hook::CostAccumulatorHook,
-};
+use crate::control::{cost::UsageLedger, cost_hook::CostAccumulatorHook};
 use thiserror::Error;
 
 // ── Provider matching ─────────────────────────────────────────────────────────
@@ -125,9 +122,6 @@ pub struct HarnessBuilder {
     pricing: Option<Arc<dyn PricingProvider>>,
     /// Optional caller-owned completed-call accounting state.
     usage_ledger: Option<UsageLedger>,
-    /// 可选的预算上限 + 超限 hook。设置后，一个 `BudgetControlAdapter`
-    /// 会被注入 `should_stop`，与 `CostAccumulatorHook` 共享同一 cost Arc。
-    budget: Option<(f64, Option<Arc<dyn BudgetExceededHook>>)>,
     /// Optional maximum output tokens per provider call.
     max_tokens: Option<u32>,
     /// Optional independent compaction model config (model ID + metadata).
@@ -185,7 +179,6 @@ impl HarnessBuilder {
             providers: vec![],
             pricing: None,
             usage_ledger: None,
-            budget: None,
             max_tokens: None,
             compaction_model: None,
             system_prompt: None,
@@ -314,24 +307,6 @@ impl HarnessBuilder {
     /// evidence even if the harness execution future is later cancelled.
     pub fn usage_ledger(mut self, usage_ledger: UsageLedger) -> Self {
         self.usage_ledger = Some(usage_ledger);
-        self
-    }
-
-    /// 配置预算上限和可选的超限 hook。
-    ///
-    /// - `limit` — 预算上限，单位 USD（如 `5.0` 表示 $5.00）。
-    /// - `exceeded_hook = None` → surveillance 模式：只统计成本，loop 永不
-    ///   因预算停止。
-    /// - `exceeded_hook = Some(h)` → 超限时由 `h` 决定继续/停止。
-    ///
-    /// builder 注入一个 `BudgetControlAdapter`（与 `CostAccumulatorHook`
-    /// 共享同一 cost Arc）到 `hooks.should_stop`。
-    pub fn budget(
-        mut self,
-        limit: f64,
-        exceeded_hook: Option<Arc<dyn BudgetExceededHook>>,
-    ) -> Self {
-        self.budget = Some((limit, exceeded_hook));
         self
     }
 
@@ -626,16 +601,6 @@ impl HarnessBuilder {
         let accumulator: Arc<dyn AfterProviderResponseHook> =
             Arc::new(CostAccumulatorHook::new(cost.clone(), self.pricing.clone()));
         opts.hooks.after_provider_response.insert(0, accumulator);
-
-        // 若配置了 budget，注入预算决策器。
-        if let Some((limit, exceeded_hook)) = &self.budget {
-            let budget_adapter: Arc<dyn ShouldStopHook> = Arc::new(BudgetControlAdapter::new(
-                cost.clone(),
-                *limit,
-                exceeded_hook.clone(),
-            ));
-            opts.hooks.should_stop.push(budget_adapter);
-        }
 
         // ── 由 setter 配置的可选字段 ──
         if let Some(ref prompt) = self.system_prompt {
@@ -1126,37 +1091,6 @@ mod tests {
     }
 
     #[test]
-    fn build_options_injects_accumulator_and_budget_hooks() {
-        use crate::control::cost::TokenPrice;
-
-        struct StubPricing;
-        impl crate::control::cost::PricingProvider for StubPricing {
-            fn price_for(&self, _model: &str, _provider: &str) -> Option<TokenPrice> {
-                None
-            }
-        }
-
-        let builder = HarnessBuilder::new("test-model")
-            .pricing(Arc::new(StubPricing) as Arc<dyn crate::control::cost::PricingProvider>)
-            .budget(5.0, None);
-
-        let opts = builder.build_options(None);
-        // 成本累积器始终注入。
-        assert!(
-            !opts.hooks.after_provider_response.is_empty(),
-            "CostAccumulatorHook must be injected"
-        );
-        // 仅在调用 budget() 时注入预算 adapter。
-        assert!(
-            !opts.hooks.should_stop.is_empty(),
-            "BudgetControlAdapter must be injected when budget() is called"
-        );
-        // 共享 cost Arc 是同一实例。
-        let cost_snapshot = opts.cost.lock().unwrap().clone();
-        assert_eq!(cost_snapshot.total_cost, 0.0);
-    }
-
-    #[test]
     fn build_options_injects_accumulator_without_pricing() {
         let builder = HarnessBuilder::new("test-model");
         let opts = builder.build_options(None);
@@ -1166,7 +1100,7 @@ mod tests {
         );
         assert!(
             opts.hooks.should_stop.is_empty(),
-            "no budget() call → no BudgetControlAdapter"
+            "no should_stop hooks injected by default"
         );
     }
 

@@ -8,7 +8,7 @@
 //! - Tracing (`TraceExporter`)
 //! - Cost aggregation (`PricingProvider`, `CostAggregate`)
 //! - Audit logging (`AuditSink`)
-//! - Budget control (`BudgetExceededHook`, `BudgetControlAdapter`)
+//! - Budget control (`BudgetExceededHook` trait; `BudgetControlAdapter` in `llm-harness-strategy`)
 //! - Harness construction (`HarnessBuilder`)
 //!
 //! # Tracing / diagnostic logging

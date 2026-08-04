@@ -24,9 +24,7 @@ use base64::Engine;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_runtime::platform::prompt::{ArgumentDef, PromptSource, PromptSourceTemplate};
-use llm_harness_runtime::platform::resource::{
-    ResourceContent, ResourceDescriptor, ResourceProvider,
-};
+use llm_harness_types::{ResourceContent, ResourceDescriptor, ResourceProvider};
 use llm_harness_types::{DataBlock, Tool, ToolContext, ToolFailure, ToolResult};
 use serde_json::Value;
 

@@ -59,21 +59,29 @@
 >
 > #### 阶段一：提取已有策略代码到策略 crate
 >
+> > ✅ 已完成：3 项迁移（BudgetControlAdapter、ResourceInjector、format_skills_for_system_prompt）
+>
 > 将混杂在机制层 crate 中的策略层代码迁移到 `llm-harness-strategy`，只依赖机制层 public API。
+>
+> **判断原则**：不机械地执行机制/策略分离。runtime 自身必然集成的策略留机制层，用户可选注入的策略才迁移到 strategy crate。
 >
 > | 待迁移代码 | 当前位置 | 迁移目标 | 说明 |
 > |-----------|---------|---------|------|
-> | `BudgetControlAdapter` | `runtime/src/control/budget.rs` | strategy | ShouldStopHook 实现，纯策略 |
-> | `CostAccumulatorHook` | `runtime/src/control/cost_hook.rs` | strategy | AfterProviderResponseHook 实现，纯策略 |
-> | `UsageLedger`/`CostAggregate` | `runtime/src/control/cost.rs` | 保留在 types 或 runtime | 共享数据结构，机制层 |
-> | `RuleBasedApprovalHook` | `runtime/src/rules/hook.rs` | strategy | BeforeToolCallHook 实现，纯策略 |
-> | `RuleChain`/`Rule`/`Predicate`/内置 predicates | `runtime/src/rules/` | strategy | 规则匹配框架，纯策略 |
-> | `ResourceInjector` | `runtime/src/platform/resource.rs` | strategy | 往 system_prompt 追加资源，是默认注入策略 |
-> | `format_skills_for_system_prompt` | `agent/src/skills.rs` | strategy | Skill 元数据格式化，策略层模板 |
-> | `SUMMARIZATION_SYSTEM_PROMPT`/`SUMMARY_REQUEST` | `agent/src/compaction.rs` | strategy | 压缩 prompt 模板，策略层内容 |
-> | `WorkflowGateHook` | `runtime/src/workflow/gate.rs` | 保留在 runtime | 与 workflow 引擎紧耦合，机制层 |
+> | `BudgetControlAdapter` + `BudgetExceededHook` | `runtime/src/control/budget.rs` | strategy | ShouldStopHook 实现，仅在用户调用 `builder.budget()` 时注入 |
+> | `RuleBasedApprovalHook` + `RuleChain`/`Rule`/`Predicate`/内置 predicates | `runtime/src/rules/` | strategy | 规则匹配框架 + BeforeToolCallHook 实现，用户可选注入 |
+> | `ResourceInjector` | `runtime/src/platform/resource.rs` | strategy | 往 system_prompt 追加资源，用户可选调用 |
+> | `format_skills_for_system_prompt` | `agent/src/skills.rs` | strategy | Skill 元数据格式化模板，无生产调用 |
 >
-> 迁移后 `HarnessBuilder` 的 `budget()`/`pricing()` 方法改为从 strategy crate 注入 hook，或保留 builder 方法但委托到 strategy crate 的工厂函数。
+> 以下代码原表列为迁移/保留，现修正为**留 runtime**（runtime 必然集成的策略）：
+>
+> | 代码 | 位置 | 留 runtime 理由 |
+> |-----|------|----------------|
+> | `CostAccumulatorHook` | `runtime/src/control/cost_hook.rs` | builder.rs:618 注释"即使没有 pricing/budget 也注入"，是 runtime 必然集成的默认策略 |
+> | `SUMMARIZATION_SYSTEM_PROMPT`/`SUMMARY_REQUEST` | `agent/src/compaction.rs` | `compact()` 硬编码使用，是 runtime 压缩流程的默认 prompt；阶段二第 1 项补可配置入口后再由 strategy crate 提供默认模板 |
+> | `UsageLedger`/`CostAggregate` | `runtime/src/control/cost.rs` | 共享数据结构，机制层 |
+> | `WorkflowGateHook` | `runtime/src/workflow/gate.rs` | 与 workflow 引擎紧耦合，机制层 |
+>
+> 迁移后 `HarnessBuilder` 的 `budget()` 方法改为从 strategy crate 注入 hook（或保留 builder 方法但委托到 strategy crate 的工厂函数）。`pricing()` 不动——`CostAccumulatorHook` 留 runtime。
 >
 > #### 阶段二：补齐机制层缺失
 >

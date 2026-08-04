@@ -149,7 +149,8 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::budget::{BudgetControlAdapter, BudgetExceededHook};
+    use llm_harness_strategy::budget::BudgetControlAdapter;
+    use llm_harness_types::BudgetExceededHook;
     use futures::future::BoxFuture;
     use llm_harness_types::{
         AfterProviderResponseCtx, AssistantMessage, CostAggregate, ProviderResponseInfo,
