@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Senza Runtime 产品路线图 — 从 1.0 到 2.0</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --green: #3fb950;
+    --green-bg: #0d2818;
+    --yellow: #d29922;
+    --yellow-bg: #2d2200;
+    --red: #f85149;
+    --red-bg: #2d0d0d;
+    --blue: #58a6ff;
+    --blue-bg: #0d1a2d;
+    --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 0;
+  }
+  .container { max-width: 1100px; margin: 0 auto; padding: 40px 24px 80px; }
+
+  /* Hero */
+  .hero {
+    text-align: center;
+    padding: 60px 24px 48px;
+    background: linear-gradient(180deg, #161b22 0%, #0d1117 100%);
+    border-bottom: 1px solid var(--border);
+  }
+  .hero h1 {
+    font-size: 2.4rem;
+    font-weight: 700;
+    margin-bottom: 12px;
+    background: linear-gradient(135deg, #58a6ff, #bc8cff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .hero .subtitle { font-size: 1.1rem; color: var(--text-dim); }
+  .hero .version-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 20px;
+    padding: 8px 20px;
+    background: var(--blue-bg);
+    border: 1px solid var(--blue);
+    border-radius: 999px;
+    font-size: 0.95rem;
+    color: var(--blue);
+  }
+
+  /* Sections */
+  section { margin-top: 56px; }
+  h2 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  h2 .icon { margin-right: 8px; }
+  h3 { font-size: 1.15rem; font-weight: 600; margin: 32px 0 12px; color: var(--text); }
+  .section-desc { color: var(--text-dim); font-size: 0.95rem; margin-bottom: 20px; }
+
+  /* Intro */
+  .intro-box {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 8px;
+  }
+  .intro-box p { margin-bottom: 12px; }
+  .intro-box p:last-child { margin-bottom: 0; }
+  .intro-box strong { color: var(--blue); }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 0.92rem;
+  }
+  th {
+    text-align: left;
+    padding: 10px 14px;
+    background: #21262d;
+    border-bottom: 2px solid var(--border);
+    font-weight: 600;
+    color: var(--text);
+    white-space: nowrap;
+  }
+  td {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  tr:hover td { background: #1c2128; }
+
+  /* Status badges */
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .badge-green { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
+  .badge-yellow { background: var(--yellow-bg); color: var(--yellow); border: 1px solid var(--yellow); }
+  .badge-red { background: var(--red-bg); color: var(--red); border: 1px solid var(--red); }
+  .badge-blue { background: var(--blue-bg); color: var(--blue); border: 1px solid var(--blue); }
+
+  /* Timeline */
+  .timeline {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 4px;
+    margin: 24px 0;
+  }
+  .timeline-week {
+    text-align: center;
+    padding: 12px 4px;
+    border-radius: 8px;
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .timeline-week .wk { display: block; color: var(--text-dim); font-size: 0.7rem; margin-bottom: 4px; }
+  .tl-migrate { background: #1a1530; color: var(--purple); border: 1px solid var(--purple); }
+  .tl-mechanism { background: var(--blue-bg); color: var(--blue); border: 1px solid var(--blue); }
+  .tl-strategy { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
+
+  /* Milestone cards */
+  .milestones {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 16px;
+    margin: 24px 0;
+  }
+  .milestone {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+  }
+  .milestone::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+  }
+  .milestone.m1::before { background: var(--purple); }
+  .milestone.m2::before { background: var(--blue); }
+  .milestone.m3::before { background: var(--green); }
+  .milestone .ver { font-size: 1.6rem; font-weight: 700; }
+  .milestone.m1 .ver { color: var(--purple); }
+  .milestone.m2 .ver { color: var(--blue); }
+  .milestone.m3 .ver { color: var(--green); }
+  .milestone .weeks { color: var(--text-dim); font-size: 0.85rem; margin: 4px 0 12px; }
+  .milestone .title { font-weight: 600; margin-bottom: 8px; }
+  .milestone ul { list-style: none; padding: 0; }
+  .milestone li { padding: 3px 0; font-size: 0.88rem; color: var(--text-dim); }
+  .milestone li::before { content: '→ '; color: var(--text-dim); }
+
+  /* Priority dots */
+  .prio { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+  .prio-h { background: var(--red); }
+  .prio-m { background: var(--yellow); }
+  .prio-l { background: var(--text-dim); }
+
+  /* Stats row */
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+    margin: 24px 0;
+  }
+  .stat {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+  }
+  .stat .num { font-size: 2rem; font-weight: 700; }
+  .stat .num.g { color: var(--green); }
+  .stat .num.y { color: var(--yellow); }
+  .stat .num.r { color: var(--red); }
+  .stat .num.b { color: var(--blue); }
+  .stat .label { color: var(--text-dim); font-size: 0.85rem; margin-top: 4px; }
+
+  /* Feature category */
+  .feat-section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin: 16px 0;
+  }
+  .feat-section h3 { margin-top: 0; }
+
+  /* Responsive */
+  @media (max-width: 768px) {
+    .timeline { grid-template-columns: repeat(4, 1fr); }
+    .milestones { grid-template-columns: 1fr; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    table { font-size: 0.82rem; }
+    th, td { padding: 8px; }
+  }
+
+  /* Misc */
+  .legend {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin: 16px 0;
+    font-size: 0.88rem;
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; color: var(--text-dim); }
+  .footer {
+    margin-top: 60px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+  }
+  .footer a { color: var(--blue); text-decoration: none; }
+</style>
+</head>
+<body>
+
+<!-- Hero -->
+<div class="hero">
+  <h1>Senza Runtime 产品路线图</h1>
+  <div class="subtitle">从 1.0 到 2.0 — 8 周计划</div>
+  <div class="version-badge">
+    <span>📦 当前 v1.0.4</span>
+    <span>→</span>
+    <span>🎯 目标 v2.0</span>
+  </div>
+</div>
+
+<div class="container">
+
+  <!-- Intro -->
+  <section>
+    <div class="intro-box">
+      <p><strong>Senza</strong> 是 oh-my-harness Rust runtime 的 Python SDK——一个 AI Agent 的"操作系统"。</p>
+      <p>大语言模型只会对话，不能执行命令、读写文件、调用外部 API。Senza 给模型装上手脚和眼睛，让它变成能完成实际任务的 Agent。你可以把它想象成一个工作台：<strong>模型</strong>是坐在工作台前思考的人，<strong>工具</strong>是工作台上的器械，<strong>运行时</strong>是工作台本身——管理工具怎么摆放、安全围栏怎么设、上下文怎么传递、多个 Agent 怎么协作。</p>
+      <p>运行时不包含任何特定领域的逻辑，只提供通用基础设施。具体怎么用，由上层应用决定。</p>
+    </div>
+
+    <div class="stats">
+      <div class="stat">
+        <div class="num g">18</div>
+        <div class="label">已可使用</div>
+      </div>
+      <div class="stat">
+        <div class="num y">13</div>
+        <div class="label">部分支持</div>
+      </div>
+      <div class="stat">
+        <div class="num r">7</div>
+        <div class="label">待实现</div>
+      </div>
+      <div class="stat">
+        <div class="num b">8</div>
+        <div class="label">周完成全部</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Timeline Overview -->
+  <section>
+    <h2><span class="icon">🗓️</span>时间线总览</h2>
+    <div class="section-desc">8 周分三个里程碑，从策略代码迁移到机制层补齐再到策略层补齐，最终发布 2.0。</div>
+
+    <div class="timeline">
+      <div class="timeline-week tl-migrate"><span class="wk">W1</span>v1.1 迁移</div>
+      <div class="timeline-week tl-mechanism"><span class="wk">W2</span>v1.2 机制</div>
+      <div class="timeline-week tl-mechanism"><span class="wk">W3</span>v1.2 机制</div>
+      <div class="timeline-week tl-mechanism"><span class="wk">W4</span>v1.2 机制</div>
+      <div class="timeline-week tl-strategy"><span class="wk">W5</span>v2.0 策略</div>
+      <div class="timeline-week tl-strategy"><span class="wk">W6</span>v2.0 策略</div>
+      <div class="timeline-week tl-strategy"><span class="wk">W7</span>v2.0 策略</div>
+      <div class="timeline-week tl-strategy"><span class="wk">W8</span>v2.0 发布</div>
+    </div>
+
+    <div class="milestones">
+      <div class="milestone m1">
+        <div class="ver">v1.1</div>
+        <div class="weeks">W1 · 1 周</div>
+        <div class="title">策略代码迁移</div>
+        <ul>
+          <li>创建独立策略 crate</li>
+          <li>迁移 6 项策略代码</li>
+          <li>编译器强制机制/策略边界</li>
+        </ul>
+      </div>
+      <div class="milestone m2">
+        <div class="ver">v1.2</div>
+        <div class="weeks">W2–W4 · 3 周</div>
+        <div class="title">机制层补齐</div>
+        <ul>
+          <li>补齐 13 项机制层缺失</li>
+          <li>压缩、上下文、子 Agent</li>
+          <li>故障恢复基础设施</li>
+        </ul>
+      </div>
+      <div class="milestone m3">
+        <div class="ver">v2.0</div>
+        <div class="weeks">W5–W8 · 4 周</div>
+        <div class="title">策略层补齐 → 2.0 发布</div>
+        <ul>
+          <li>补齐 31 项策略层缺失</li>
+          <li>安全规则、HITL、通知</li>
+          <li>搜索工具、状态栏模板</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Layer 1: Feature Matrix -->
+  <section>
+    <h2><span class="icon">📋</span>第一层：功能全景</h2>
+    <div class="section-desc">所有功能领域的当前状态一览。🟢 已可使用 · 🟡 部分支持 · 🔴 待实现</div>
+
+    <div class="legend">
+      <div class="legend-item"><span class="badge badge-green">✅ 已可使用</span> 基础设施完整 + 有默认实现，端到端可用</div>
+      <div class="legend-item"><span class="badge badge-yellow">⚠️ 部分支持</span> 有基础框架，但缺默认实现或有关键缺口</div>
+      <div class="legend-item"><span class="badge badge-red">❌ 待实现</span> 基础设施和默认实现均缺失</div>
+    </div>
+
+    <h3>🟢 已可使用</h3>
+    <table>
+      <thead>
+        <tr><th style="width:22%">功能</th><th>做什么</th><th style="width:12%">状态</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><strong>Agent 核心循环</strong></td><td>Agent 按"思考→调用工具→看结果→再思考"循环工作。支持失败自动重试（指数退避）、流式输出、随时中止/取消</td><td><span class="badge badge-green">✅</span></td></tr>
+        <tr><td><strong>工作流引擎</strong></td><td>复杂任务拆成多阶段工作流，支持条件跳转、循环重试、崩溃后从断点恢复</td><td><span class="badge badge-green">✅</span></td></tr>
+        <tr><td><strong>文件编辑</strong></td><td>Agent 可以读文件（按行范围+行号）、编辑文件（行号定位+防过时检测）、写入文件</td><td><span class="badge badge-green">✅</span></td></tr>
+        <tr><td><strong>工具系统</strong></td><td>注册自定义工具，Agent 自动发现并使用。支持并行执行、输出投影（大结果只给模型看摘要）</td><td><span class="badge badge-green">✅</span></td></tr>
+        <tr><td><strong>并行工具执行</strong></td><td>同一轮里多个独立工具调用并行执行，不串行等待</td><td><span class="badge badge-green">✅</span></td></tr>
+        <tr><td><strong>沙箱隔离</strong></td><td>Agent 执行命令时安全隔离，限制文件访问和系统调用。Linux 用 bubblewrap，macOS 用 seatbelt</td><td><span class="badge badge-green">✅</span></td></tr>
+        <tr><td><strong>成本与预算</strong></td><td>自动记录每次 API 调用的 token 消耗和 USD 成本，支持预算上限（超限自动停止），按模型分别统计</td><td><span class="badge badge-green">✅</span></td></tr>
+        <tr><td><strong>子 Agent 协作</strong></td><td>主 Agent 可以派生子 Agent 分配独立任务，互相通信、等待回复、查询状态、中止子任务</td><td><span class="badge badge-green">✅</span></td></tr>
+        <tr><td><strong>持久状态</strong></td><td>任务执行记录可保存到磁盘，关键节点存检查点，进程崩溃后可恢复</td><td><span class="badge badge-green">✅</span></td></tr>
+        <tr><td><strong>规划能力</strong></td><td>Agent 可以先生成结构化计划，再按计划分步执行，根据结果调整后续步骤</td><td><span class="badge badge-green">✅</span></td></tr>
+        <tr><td><strong>Abort/取消</strong></td><td>用户或程序可随时中止运行，中止信号传播到所有子任务。有 3 个检查点保证安全取消</td><td><span class="badge badge-green">✅</span></td></tr>
+      </tbody>
+    </table>
+
+    <h3>🟡 部分支持</h3>
+    <table>
+      <thead>
+        <tr><th style="width:22%">功能</th><th>已有</th><th>缺失</th><th style="width:10%">状态</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>工具审批</strong></td>
+          <td>审批框架完整，应用层可定义"什么工具什么参数需要批准"的规则</td>
+          <td>没有开箱即用的默认安全规则（如拦截 rm -rf、阻止路径遍历）</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><strong>上下文压缩</strong></td>
+          <td>自动检测上下文超限，触发压缩，保留最近对话+生成历史摘要</td>
+          <td>压缩提示词硬编码不可自定义 · 无熔断器（失败即终止）· 不能标记关键消息为不可压缩</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><strong>状态栏</strong></td>
+          <td>有注入机制，可以把状态信息附加到模型上下文</td>
+          <td>没有默认的状态栏格式和内容收集器，应用层要自己写</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><strong>审计日志</strong></td>
+          <td>审计框架完整，记录带 SHA-256 哈希链防篡改</td>
+          <td>没有默认的结构化日志格式</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><strong>子 Agent 配置</strong></td>
+          <td>派生、通信、查询、中止功能完整</td>
+          <td>子 Agent 不自动继承父 Agent 配置 · 查询状态不返回角色描述</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><strong>MCP 集成</strong></td>
+          <td>可通过 MCP 协议连接外部工具服务（GitHub、数据库等）</td>
+          <td>不锁定服务器版本 · 无最小权限凭证管理 · 不审查工具描述文本</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><strong>Skill 系统</strong></td>
+          <td>Skill 加载、解析、读取工具都实现了</td>
+          <td>没有自动把 Skill 列表注入到模型上下文的默认实现</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><strong>事件驱动</strong></td>
+          <td>事件流接口和等待工具都实现了，支持超时</td>
+          <td>没有默认事件过滤规则 · 没有内置定时器/心跳实现</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><strong>故障恢复</strong></td>
+          <td>API 级别的重试和退避完整</td>
+          <td>无抖动 · 无空闲看门狗 · 无轨迹修复 · 无连续失败计数 · 无死亡螺旋防护 · 无全局轮数上限</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><strong>提示注入防御</strong></td>
+          <td>有上下文注入接口</td>
+          <td>无结构化来源标注 · 无默认来源约束策略</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><strong>项目指令文件</strong></td>
+          <td>有启动前 Hook，可以注入内容到系统提示词</td>
+          <td>没有自动扫描 CLAUDE.md 等文件的默认实现</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><strong>写入后 lint</strong></td>
+          <td>有"工具调用后 Hook"，支持替换工具输出</td>
+          <td>没有内置的 lint 实现，应用层可自行接入</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+        <tr>
+          <td><strong>BashTool 截断</strong></td>
+          <td>ShellExecutor 有截断策略（Head/Tail/HeadTail）</td>
+          <td>BashTool 未使用截断策略，长输出会撑爆上下文</td>
+          <td><span class="badge badge-yellow">⚠️</span></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>🔴 待实现</h3>
+    <table>
+      <thead>
+        <tr><th style="width:22%">功能</th><th>做什么</th><th style="width:10%">状态</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><strong>搜索工具 (grep + glob)</strong></td><td>按内容搜索（"找到所有包含 TODO 的文件"）和按文件名模式搜索（"找到所有 .rs 文件"）。当前只能靠 bash 跑命令，有跨平台差异且无安全限制</td><td><span class="badge badge-red">❌</span></td></tr>
+        <tr><td><strong>TODO 工具</strong></td><td>Agent 维护待办列表——记录还剩什么没做、什么正在做、什么做完了。类似人类的 checklist。当前 Agent 只能把待办写在上下文里，压缩时容易丢失</td><td><span class="badge badge-red">❌</span></td></tr>
+        <tr><td><strong>HITL 人机协作</strong></td><td>有些操作需要人类确认（"可以删除这个文件吗？"），有些需要人类提供输入（"这个变量叫什么？"）。当前没有内置工具，应用层要基于审批 Hook 自己实现</td><td><span class="badge badge-red">❌</span></td></tr>
+        <tr><td><strong>通知</strong></td><td>Agent 主动告知用户重要事件："任务完成了"、"遇到错误"、"预算快用完了"。当前没有通知通道和 notify_user 工具</td><td><span class="badge badge-red">❌</span></td></tr>
+        <tr><td><strong>主动工具发现</strong></td><td>工具数量多时，Agent 先搜索可用工具，只加载相关的，减少上下文占用。当前全量注入所有工具描述</td><td><span class="badge badge-red">❌</span></td></tr>
+        <tr><td><strong>持久化终端会话</strong></td><td>维持 bash 会话状态（当前目录、环境变量跨命令保持）。当前每条命令是独立进程，cd 不生效。需要 PTY 管理，暂不实现</td><td><span class="badge badge-red">❌</span></td></tr>
+        <tr><td><strong>流式工具执行</strong></td><td>模型生成到工具调用时立即开始执行，不用等整条回复生成完。当前要等全部生成完才执行。实现复杂，暂不实现</td><td><span class="badge badge-red">❌</span></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- Layer 2: Detailed Plan -->
+  <section>
+    <h2><span class="icon">🔧</span>第二层：详细计划</h2>
+    <div class="section-desc">三个阶段的具体任务、涉及周次和优先级。<span class="prio prio-h"></span>高 <span class="prio prio-m"></span>中 <span class="prio prio-l"></span>低</div>
+
+    <!-- Phase 1 -->
+    <div class="feat-section">
+      <h3>📦 v1.1 (W1) — 阶段一：策略代码迁移</h3>
+      <p style="color:var(--text-dim);margin-bottom:12px;">将混杂在机制层中的策略层代码迁移到独立 crate，只依赖机制层公开 API。编译器强制边界——策略代码不能伸手到内部实现。</p>
+      <table>
+        <thead>
+          <tr><th style="width:5%">#</th><th style="width:28%">待迁移代码</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>BudgetControlAdapter</td><td>预算控制——决定何时因超预算而停止</td></tr>
+          <tr><td>2</td><td>CostAccumulatorHook</td><td>成本累计——每次 API 调用后记录 token 和 USD 成本</td></tr>
+          <tr><td>3</td><td>RuleBasedApprovalHook + RuleChain</td><td>工具审批——按规则链决定工具调用是否放行</td></tr>
+          <tr><td>4</td><td>ResourceInjector</td><td>资源注入——往系统提示词追加资源的默认策略</td></tr>
+          <tr><td>5</td><td>format_skills_for_system_prompt</td><td>Skill 元数据格式化模板</td></tr>
+          <tr><td>6</td><td>SUMMARIZATION_SYSTEM_PROMPT</td><td>压缩提示词模板</td></tr>
+        </tbody>
+      </table>
+      <p style="color:var(--text-dim);font-size:0.88rem;margin-top:8px;">保留在机制层：共享数据结构（UsageLedger/CostAggregate）、与工作流引擎紧耦合的 WorkflowGateHook。</p>
+    </div>
+
+    <!-- Phase 2 -->
+    <div class="feat-section">
+      <h3>⚙️ v1.2 (W2–W4) — 阶段二：机制层补齐</h3>
+      <p style="color:var(--text-dim);margin-bottom:12px;">需改核心循环/会话/调度内部逻辑，不能仅靠外部 hook 实现。共 13 项。</p>
+      <table>
+        <thead>
+          <tr><th style="width:5%">#</th><th style="width:30%">缺失项</th><th>说明</th><th style="width:8%">优先级</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>自定义压缩 prompt 通路</td><td>压缩提示词当前硬编码，需支持外部注入自定义策略</td><td><span class="prio prio-h"></span>高</td></tr>
+          <tr><td>2</td><td>压缩熔断器</td><td>连续失败计数+停止，而非失败即终止</td><td><span class="prio prio-h"></span>高</td></tr>
+          <tr><td>3</td><td>ContextMode 结构化来源标注</td><td>注入内容带来源标签，防提示注入</td><td><span class="prio prio-h"></span>高</td></tr>
+          <tr><td>4</td><td>SpawnOptions 配置继承</td><td>子 Agent 自动继承父 Agent 的系统提示词/工具/思考模式</td><td><span class="prio prio-h"></span>高</td></tr>
+          <tr><td>5</td><td>NotificationChannel trait</td><td>通知通道抽象接口，为通知工具提供机制基础</td><td><span class="prio prio-h"></span>高</td></tr>
+          <tr><td>6</td><td>标记消息为不可压缩</td><td>关键消息（决策、用户指令）不被压缩丢弃</td><td><span class="prio prio-m"></span>中</td></tr>
+          <tr><td>7</td><td>QuerySubagentTool 返回角色描述</td><td>查询子 Agent 状态时返回其角色和职责</td><td><span class="prio prio-m"></span>中</td></tr>
+          <tr><td>8</td><td>退避抖动 (jitter)</td><td>重试等待加随机抖动，防止多 Agent 并发重试"惊群"</td><td><span class="prio prio-m"></span>中</td></tr>
+          <tr><td>9</td><td>流式空闲看门狗</td><td>流式输出时检测模型卡住，超时自动中断</td><td><span class="prio prio-m"></span>中</td></tr>
+          <tr><td>10</td><td>轨迹完整性自动修复</td><td>工具调用缺结果时自动修补，防止上下文损坏</td><td><span class="prio prio-m"></span>中</td></tr>
+          <tr><td>11</td><td>截断后完整输出保存到临时文件</td><td>大输出截断后，完整内容持久化到文件供后续读取</td><td><span class="prio prio-m"></span>中</td></tr>
+          <tr><td>12</td><td>MCP 服务器版本锁定</td><td>拒绝 MCP 服务器静默版本更新</td><td><span class="prio prio-l"></span>低</td></tr>
+          <tr><td>13</td><td>MCP 最小权限凭证管理</td><td>API Key 作用域限制，最小权限原则</td><td><span class="prio prio-l"></span>低</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Phase 3 -->
+    <div class="feat-section">
+      <h3>🎯 v2.0 (W5–W8) — 阶段三：策略层补齐 → 2.0 发布</h3>
+      <p style="color:var(--text-dim);margin-bottom:12px;">在独立策略 crate 中实现默认策略。只需注册 hook 或实现工具接口，不需改核心循环。共 31 项。</p>
+
+      <h4 style="margin:16px 0 8px;color:var(--red);">高优先级 — 安全与可用性核心</h4>
+      <table>
+        <thead>
+          <tr><th style="width:5%">#</th><th style="width:30%">缺失项</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>默认危险命令黑名单</td><td>开箱即用的 bash 危险命令拦截（rm -rf、chmod 777 等）</td></tr>
+          <tr><td>2</td><td>默认路径遍历防护</td><td>阻止访问工作目录之外的文件</td></tr>
+          <tr><td>3</td><td>状态栏 XML 模板 + 内容收集器</td><td>开箱即用的状态栏格式（当前任务/成本/预算/待办）</td></tr>
+          <tr><td>4</td><td>Skill 元数据自动注入</td><td>启动时自动把可用 Skill 列表注入模型上下文</td></tr>
+          <tr><td>5</td><td>notify_user 内置工具</td><td>Agent 能主动通知用户重要事件</td></tr>
+          <tr><td>6</td><td>HITL 工具 + 超时降级</td><td>request_human_approval / request_human_input，超时自动安全降级</td></tr>
+          <tr><td>7</td><td>项目指令文件自动注入</td><td>自动扫描 CLAUDE.md 等文件注入系统提示词</td></tr>
+          <tr><td>8</td><td>全局 max_turns 上限</td><td>防止 Agent 无限循环烧钱的安全阀</td></tr>
+          <tr><td>9</td><td>BashTool 截断策略</td><td>bash 输出过长时自动截断，防止撑爆上下文</td></tr>
+          <tr><td>10</td><td>grep + glob 工具</td><td>跨平台专用搜索工具（按内容/按文件名模式）</td></tr>
+          <tr><td>11</td><td>压缩 prompt 默认模板</td><td>上下文感知的压缩策略默认实现</td></tr>
+          <tr><td>12</td><td>保留优先级默认规则</td><td>哪些消息不可压缩的默认规则</td></tr>
+        </tbody>
+      </table>
+
+      <h4 style="margin:20px 0 8px;color:var(--yellow);">中优先级 — 增强与完善</h4>
+      <table>
+        <thead>
+          <tr><th style="width:5%">#</th><th style="width:30%">缺失项</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>13</td><td>TODO write 工具</td><td>Agent 维护待办列表，跨压缩不丢失</td></tr>
+          <tr><td>14</td><td>默认审计日志格式</td><td>开箱即用的结构化日志模板</td></tr>
+          <tr><td>15</td><td>自动包裹来源标签</td><td>工具返回内容自动标注来源，防注入</td></tr>
+          <tr><td>16</td><td>状态栏内容来源约束</td><td>校验状态栏内容来源，防止恶意注入</td></tr>
+          <tr><td>17</td><td>命令语义解析</td><td>分析 bash 命令真实意图，更精准的安全判断</td></tr>
+          <tr><td>18</td><td>持久记忆跨会话防线</td><td>跨会话写入审查，防止恶意内容持久化</td></tr>
+          <tr><td>19</td><td>重复调用指纹检测</td><td>同一工具同一参数反复调用时提醒，发现循环</td></tr>
+          <tr><td>20</td><td>连续失败计数器</td><td>同一工具连续失败 N 次换策略</td></tr>
+          <tr><td>21</td><td>输出触顶降级接续</td><td>输出达到 token 上限时自动续写</td></tr>
+          <tr><td>22</td><td>死亡螺旋防护</td><td>错误循环时禁用副作用操作 + 递归深度计数器</td></tr>
+          <tr><td>23</td><td>截断标注引导</td><td>截断时告知 Agent 去读临时文件获取完整内容</td></tr>
+          <tr><td>24</td><td>discover_tools 元工具</td><td>工具多时按需搜索加载，减少上下文占用</td></tr>
+          <tr><td>25</td><td>工具层次化组织</td><td>工具分类+分组，大量工具时的组织管理</td></tr>
+        </tbody>
+      </table>
+
+      <h4 style="margin:20px 0 8px;color:var(--text-dim);">低优先级 — 扩展与优化</h4>
+      <table>
+        <thead>
+          <tr><th style="width:5%">#</th><th style="width:30%">缺失项</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>26</td><td>注入短语黑名单模板</td><td>默认拦截常见提示注入模式</td></tr>
+          <tr><td>27</td><td>批量消息编号+汇总</td><td>多条消息合并时加序号，防遗漏</td></tr>
+          <tr><td>28</td><td>工具描述审查机制</td><td>审查 MCP 工具描述文本，防注入</td></tr>
+          <tr><td>29</td><td>事件过滤规则 + 载荷模板</td><td>默认事件过滤规则和上下文模板</td></tr>
+          <tr><td>30</td><td>Cron/Heartbeat 事件流</td><td>内置定时器/心跳实现，定时触发 Agent</td></tr>
+          <tr><td>31</td><td>工具结果投影默认策略</td><td>大输出的默认截断阈值和投影策略</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Not doing -->
+  <section>
+    <h2><span class="icon">🚫</span>明确不做的事</h2>
+    <div class="section-desc">以下经讨论确认不在 runtime 职责内，或实现复杂度过高暂不实现。</div>
+    <table>
+      <thead>
+        <tr><th style="width:25%">不做</th><th>理由</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>流式工具执行</td><td>实现复杂度高（需在流中增量解析工具调用），当前"生成完再执行"的模式对大多数场景够用</td></tr>
+        <tr><td>持久化终端会话</td><td>需要 PTY 和长运行进程管理，复杂度高且安全风险大</td></tr>
+        <tr><td>写入后自动 lint</td><td>运行时提供机制（Hook），但不内置 linter。应用层可自行接入</td></tr>
+        <tr><td>动态工具描述 + KV Cache 优化</td><td>当前数十个工具全量注入足够，优化收益不明</td></tr>
+        <tr><td>中途转向 (mid-turn steer)</td><td>有意选择同步循环模型——简单且匹配模型的训练方式</td></tr>
+        <tr><td>优先级消息队列</td><td>太复杂，当前消息按序处理足够</td></tr>
+        <tr><td>多渠道通知</td><td>先做单通道通知，多渠道（邮件+短信+IM）是应用层的事</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- v2.0 Vision -->
+  <section>
+    <h2><span class="icon">🚀</span>v2.0 交付后意味着什么</h2>
+    <div class="section-desc">八个维度，逐一看 2.0 完成后的实际能力跃升。</div>
+
+    <table>
+      <thead>
+        <tr><th style="width:18%">维度</th><th>1.0 现状</th><th>2.0 目标</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>开箱即用</strong></td>
+          <td>框架完整但需大量配置：安全规则、状态栏、审计格式、压缩策略、Skill 注入都要应用层从零实现</td>
+          <td>零配置即可安全运行。默认安全规则、状态栏、审计日志、压缩策略、项目指令注入、Skill 列表全部开箱即用。用户装上 SDK、写三行代码就能跑一个安全的 Agent</td>
+        </tr>
+        <tr>
+          <td><strong>安全防护</strong></td>
+          <td>有审批框架但没有默认规则，bash 和文件操作依赖应用层自行防护</td>
+          <td>三层防线完整：命令语义分析（不只是字符串匹配）+ 危险命令黑名单 + 路径遍历防护。Agent 执行任何危险操作前自动拦截，不需要开发者写一行安全代码</td>
+        </tr>
+        <tr>
+          <td><strong>人机协作</strong></td>
+          <td>无内置工具，应用层要基于审批框架自己实现确认和输入流程</td>
+          <td>request_human_approval 和 request_human_input 两个内置工具，支持超时自动降级（没人响应时按安全策略处理）。Agent 能自主判断何时需要人类介入，并优雅处理无人响应的场景</td>
+        </tr>
+        <tr>
+          <td><strong>故障韧性</strong></td>
+          <td>API 重试完整，但工具级故障（连续失败、循环调用、上下文损坏）无防护</td>
+          <td>六层故障防护：退避抖动防惊群、空闲看门狗防卡死、轨迹修复防上下文损坏、连续失败计数防重试浪费、死亡螺旋防护防错误扩大、全局 max_turns 防无限循环。Agent 在各种异常场景下都能安全降级而非崩溃</td>
+        </tr>
+        <tr>
+          <td><strong>上下文管理</strong></td>
+          <td>压缩基础设施完整但 prompt 硬编码、无熔断、关键消息可能被丢弃</td>
+          <td>压缩全链路可控：自定义压缩策略、连续失败熔断（API 偶尔故障不终止 Agent）、关键消息不可压缩标记、上下文来源标注防注入。长任务不会因压缩丢失关键信息，也不会因压缩失败而中断</td>
+        </tr>
+        <tr>
+          <td><strong>工具生态</strong></td>
+          <td>有 bash/read/write/edit 四个工具，搜索靠 bash 命令，无通知/HITL/发现机制</td>
+          <td>工具体系完整：跨平台 grep+glob 搜索工具、notify_user 通知工具、HITL 工具、discover_tools 按需加载、工具层次化组织。Agent 的"工具箱"从 4 件扩展到 10+ 件，覆盖搜索、通知、确认、发现全链路</td>
+        </tr>
+        <tr>
+          <td><strong>子 Agent 协作</strong></td>
+          <td>派生/通信/中止完整，但子 Agent 不继承配置，查询不返回角色</td>
+          <td>子 Agent 自动继承父 Agent 的系统提示词、工具列表和思考模式，减少配置遗漏。查询时返回角色描述，主 Agent 清楚每个子 Agent 的职责。多 Agent 协作从"能用"提升到"好用"</td>
+        </tr>
+        <tr>
+          <td><strong>架构清晰度</strong></td>
+          <td>策略代码混在机制层 crate 中，边界靠开发者纪律维护</td>
+          <td>策略代码全部在独立 crate 中，编译器强制边界——策略代码只能用公开 API，不能伸手到内部实现。"机制层能做的不放机制层"从设计原则变成编译器保证。代码更易维护、更易测试、更易贡献</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="feat-section" style="margin-top:24px;">
+      <h3 style="margin-top:0;">一句话总结</h3>
+      <p style="font-size:1.05rem;line-height:1.8;">1.0 是一个<strong style="color:var(--blue);">框架完整但需大量配置</strong>的运行时——所有机制都在，但安全规则、状态栏、审计格式、压缩策略都要应用层自己写。</p>
+      <p style="font-size:1.05rem;line-height:1.8;">2.0 是一个<strong style="color:var(--green);">零配置安全可用</strong>的运行时——装上就能跑，默认安全规则、故障防护、人机协作、通知、搜索工具全部内置。开发者只需关注业务逻辑，不再需要重复造安全围栏和运维基础设施的轮子。</p>
+    </div>
+  </section>
+  <div class="footer">
+    <p>Senza Runtime · oh-my-harness · <a href="https://github.com/oh-my-harness">github.com/oh-my-harness</a></p>
+  </div>
+
+</div>
+</body>
+</html>
