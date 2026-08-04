@@ -68,14 +68,14 @@
 > | 待迁移代码 | 当前位置 | 迁移目标 | 说明 |
 > |-----------|---------|---------|------|
 > | `BudgetControlAdapter` + `BudgetExceededHook` | `runtime/src/control/budget.rs` | strategy | ShouldStopHook 实现，仅在用户调用 `builder.budget()` 时注入 |
-> | `RuleBasedApprovalHook` + `RuleChain`/`Rule`/`Predicate`/内置 predicates | `runtime/src/rules/` | strategy | 规则匹配框架 + BeforeToolCallHook 实现，用户可选注入 |
 > | `ResourceInjector` | `runtime/src/platform/resource.rs` | strategy | 往 system_prompt 追加资源，用户可选调用 |
 > | `format_skills_for_system_prompt` | `agent/src/skills.rs` | strategy | Skill 元数据格式化模板，无生产调用 |
 >
-> 以下代码原表列为迁移/保留，现修正为**留 runtime**（runtime 必然集成的策略）：
+> 以下代码原表列为迁移/保留，现修正为**留 runtime**（runtime 自身必然集成的策略或紧耦合机制）：
 >
 > | 代码 | 位置 | 留 runtime 理由 |
 > |-----|------|----------------|
+> | `RuleBasedApprovalHook` + `RuleChain`/`Rule`/`Predicate`/内置 predicates | `runtime/src/rules/` | 规则匹配框架是 runtime 基础设施，workflow gate 等机制层直接依赖；决定不迁移 |
 > | `CostAccumulatorHook` | `runtime/src/control/cost_hook.rs` | builder.rs:618 注释"即使没有 pricing/budget 也注入"，是 runtime 必然集成的默认策略 |
 > | `SUMMARIZATION_SYSTEM_PROMPT`/`SUMMARY_REQUEST` | `agent/src/compaction.rs` | `compact()` 硬编码使用，是 runtime 压缩流程的默认 prompt；阶段二第 1 项补可配置入口后再由 strategy crate 提供默认模板 |
 > | `UsageLedger`/`CostAggregate` | `runtime/src/control/cost.rs` | 共享数据结构，机制层 |
