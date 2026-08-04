@@ -322,6 +322,7 @@ impl TransformContextHook for CompositeTransformContextHook {
                     .transform(TransformContextCtx {
                         run: ctx.run,
                         turn_index: ctx.turn_index,
+                        abort: ctx.abort.clone(),
                         context,
                     })
                     .await?;

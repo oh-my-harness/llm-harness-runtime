@@ -1,6 +1,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use futures::future::BoxFuture;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     AgentContext, AgentError, AgentHarnessResources, AgentMessage, AssistantMessage,
@@ -62,6 +63,8 @@ pub struct TransformContextCtx<'a> {
     pub run: &'a RunContext,
     /// 当前 turn 编号（从 0 开始）。
     pub turn_index: u32,
+    /// Cancellation for the current run; long-running transforms must observe it.
+    pub abort: CancellationToken,
     /// 待转换的结构化 Agent 上下文。
     pub context: AgentContext,
 }

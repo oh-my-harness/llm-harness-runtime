@@ -7,7 +7,8 @@ use llm_harness_types::{EntryId, SessionError};
 
 use super::storage::{InMemorySessionStorage, SessionStorage};
 use super::types::{
-    CreateSessionOptions, ForkOptions, ListOrder, ListSessionOptions, SessionMetadata,
+    CreateSessionOptions, ForkOptions, ListOrder, ListSessionOptions, SessionDurability,
+    SessionLifecycle, SessionMetadata, SessionRecallPolicy,
 };
 
 // ── SessionRepo trait ──────────────────────────────────────────────────────────
@@ -79,6 +80,7 @@ impl SessionRepo for InMemorySessionRepo {
         opts: CreateSessionOptions,
     ) -> BoxFuture<'_, Result<Arc<dyn SessionStorage>, SessionError>> {
         Box::pin(async move {
+            let recall = opts.recall_settings(SessionDurability::Temporary)?;
             let id = Self::new_id();
             let now = Utc::now();
             let meta = SessionMetadata {
@@ -89,6 +91,15 @@ impl SessionRepo for InMemorySessionRepo {
                 model: opts.initial_model,
                 active_cursor: None,
                 parent_session_path: None,
+                durability: recall.durability,
+                lifecycle: recall.lifecycle,
+                recall_policy: recall.policy,
+                recall_scope: recall.scope,
+                recall_revision: if recall.policy == SessionRecallPolicy::Enabled {
+                    1
+                } else {
+                    0
+                },
             };
             let storage: Arc<dyn SessionStorage> = Arc::new(InMemorySessionStorage::new(meta));
             self.inner
@@ -208,6 +219,11 @@ impl SessionRepo for InMemorySessionRepo {
                 } else {
                     None
                 },
+                durability: SessionDurability::Temporary,
+                lifecycle: SessionLifecycle::Active,
+                recall_policy: SessionRecallPolicy::Disabled,
+                recall_scope: None,
+                recall_revision: 0,
             };
             let new_storage: Arc<dyn SessionStorage> =
                 Arc::new(InMemorySessionStorage::new(new_meta));
@@ -248,6 +264,9 @@ impl SessionRepo for InMemorySessionRepo {
 mod tests {
     use super::*;
     use crate::session::session::Session;
+    use crate::session::{
+        SessionEntry, SessionEntryPayload, SessionRecallScope, SessionRecallSettings,
+    };
     use llm_harness_types::*;
 
     fn user_msg(text: &str) -> AgentMessage {
@@ -262,6 +281,11 @@ mod tests {
         let repo = InMemorySessionRepo::new();
         let storage = repo.create(CreateSessionOptions::default()).await.unwrap();
         let meta = storage.metadata().await.unwrap();
+        assert_eq!(meta.durability, SessionDurability::Temporary);
+        assert_eq!(meta.lifecycle, SessionLifecycle::Active);
+        assert_eq!(meta.recall_policy, SessionRecallPolicy::Disabled);
+        assert_eq!(meta.recall_revision, 0);
+        assert!(!meta.is_recallable());
         let id = meta.id.clone();
 
         repo.open(&id).await.unwrap();
@@ -315,7 +339,125 @@ mod tests {
             .await
             .unwrap();
         let forked_session = Session::new(forked);
+        let forked_meta = forked_session.metadata().await.unwrap();
+        assert_eq!(forked_meta.recall_policy, SessionRecallPolicy::Disabled);
+        assert_eq!(forked_meta.recall_revision, 0);
         let ctx = forked_session.build_context().await.unwrap();
         assert_eq!(ctx.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn in_memory_recall_is_explicit_and_revisioned() {
+        let repo = InMemorySessionRepo::new();
+        let storage = repo.create(CreateSessionOptions::default()).await.unwrap();
+        let session = Session::new(storage);
+
+        let invalid = SessionRecallSettings {
+            durability: SessionDurability::Temporary,
+            lifecycle: SessionLifecycle::Active,
+            policy: SessionRecallPolicy::Enabled,
+            scope: Some(SessionRecallScope::new("team-a")),
+        };
+        assert!(matches!(
+            session.update_recall_settings(invalid).await,
+            Err(SessionError::InvalidRecallConfiguration(_))
+        ));
+        assert_eq!(session.metadata().await.unwrap().recall_revision, 0);
+
+        session
+            .update_recall_settings(SessionRecallSettings {
+                durability: SessionDurability::Durable,
+                lifecycle: SessionLifecycle::Active,
+                policy: SessionRecallPolicy::Enabled,
+                scope: Some(SessionRecallScope::new("team-a")),
+            })
+            .await
+            .unwrap();
+        let enabled = session.metadata().await.unwrap();
+        assert!(enabled.is_recallable());
+        assert_eq!(enabled.recall_revision, 1);
+
+        session.append_message(user_msg("recall me")).await.unwrap();
+        assert_eq!(session.metadata().await.unwrap().recall_revision, 2);
+
+        session
+            .update_recall_settings(SessionRecallSettings {
+                durability: SessionDurability::Durable,
+                lifecycle: SessionLifecycle::Archived,
+                policy: SessionRecallPolicy::Enabled,
+                scope: Some(SessionRecallScope::new("team-a")),
+            })
+            .await
+            .unwrap();
+        let archived = session.metadata().await.unwrap();
+        assert!(!archived.is_recallable());
+        assert_eq!(archived.recall_revision, 3);
+    }
+
+    #[tokio::test]
+    async fn in_memory_create_rejects_enabled_temporary_session() {
+        let repo = InMemorySessionRepo::new();
+        let result = repo
+            .create(CreateSessionOptions {
+                recall_policy: SessionRecallPolicy::Enabled,
+                recall_scope: Some(SessionRecallScope::new("team-a")),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(SessionError::InvalidRecallConfiguration(_))
+        ));
+        assert!(
+            repo.list(ListSessionOptions::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_revision_tracks_visibility_not_detached_append() {
+        let repo = InMemorySessionRepo::new();
+        let storage = repo
+            .create(CreateSessionOptions {
+                durability: Some(SessionDurability::Durable),
+                recall_policy: SessionRecallPolicy::Enabled,
+                recall_scope: Some(SessionRecallScope::new("team-a")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let entry_id = storage.create_entry_id();
+        storage
+            .append_entry(SessionEntry {
+                id: entry_id,
+                parent_id: None,
+                timestamp: chrono::Utc::now(),
+                payload: SessionEntryPayload::Unknown,
+            })
+            .await
+            .unwrap();
+        assert_eq!(storage.metadata().await.unwrap().recall_revision, 1);
+
+        storage.set_active_cursor(entry_id).await.unwrap();
+        assert_eq!(storage.metadata().await.unwrap().recall_revision, 2);
+    }
+
+    #[tokio::test]
+    async fn in_memory_create_rejects_empty_scope_namespace() {
+        let repo = InMemorySessionRepo::new();
+        let result = repo
+            .create(CreateSessionOptions {
+                durability: Some(SessionDurability::Durable),
+                recall_policy: SessionRecallPolicy::Enabled,
+                recall_scope: Some(SessionRecallScope::new("  ")),
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(SessionError::InvalidRecallConfiguration(_))
+        ));
     }
 }

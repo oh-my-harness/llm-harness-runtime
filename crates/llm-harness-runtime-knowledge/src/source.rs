@@ -34,6 +34,16 @@ pub enum FreshnessClass {
     Live,
 }
 
+/// How generic knowledge tools may persist search results into a Session.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum KnowledgeSearchProjection {
+    /// Persist bounded snippets plus reference metadata.
+    #[default]
+    Projected,
+    /// Persist references/accounting only; snippets remain current-run data.
+    ReferenceOnly,
+}
+
 /// Value shape accepted by a declared source filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -170,6 +180,9 @@ pub struct FederatedKnowledgePage {
     pub hits: Vec<KnowledgeHit>,
     pub next_cursor: Option<String>,
     pub source_failures: Vec<SourceFailure>,
+    /// Runtime-only Session persistence policy of the selected source.
+    #[serde(skip)]
+    pub search_projection: KnowledgeSearchProjection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,6 +346,11 @@ impl<'a> KnowledgeRequestContext<'a> {
 /// Read-only, backend-neutral knowledge source contract.
 pub trait KnowledgeSource: Send + Sync {
     fn descriptor(&self) -> &KnowledgeSourceDescriptor;
+
+    /// Session persistence policy for generic search tool results.
+    fn search_projection(&self) -> KnowledgeSearchProjection {
+        KnowledgeSearchProjection::Projected
+    }
 
     fn search<'a>(
         &'a self,

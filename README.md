@@ -34,6 +34,7 @@ crates/
 ├── llm-harness-runtime/    # runtime: workflow engine, executors, event stream, builder
 ├── llm-harness-runtime-knowledge/ # backend-neutral knowledge and access contracts
 ├── llm-harness-runtime-knowledge-local/ # root-confined Markdown/Text knowledge source
+├── llm-harness-runtime-session-recall/ # opt-in authoritative cross-Session history recall
 ├── llm-harness-runtime-memory/ # composable memory read/write contracts and service
 ├── llm-harness-runtime-sandbox-*/  # sandbox backends (bwrap, seatbelt, os)
 ├── llm-harness-runtime-mcp/        # MCP integration
@@ -76,6 +77,14 @@ senza.viewer.serve("/path/to/sessions")  # blocks, opens browser
 - Token usage stats (input / output / reasoning / cache)
 - Config entries: model change, thinking level, active tools, compaction, labels, branch points
 - Image content inlined as base64
+
+## Session Recall
+
+Cross-Session History Recall is an optional, fail-closed runtime feature. See
+[the Session Recall integration guide](docs/session-recall-integration.md) for
+authority wiring, per-Session eligibility, per-run opt-in, and operational
+limits. The default index is dependency-free and in-memory; an opt-in
+SQLite/FTS5 backend persists the derived projection across restarts.
 
 ## Versioning
 

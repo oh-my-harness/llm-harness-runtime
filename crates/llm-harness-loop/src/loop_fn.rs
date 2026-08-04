@@ -221,6 +221,7 @@ fn run_loop(
                     .transform(TransformContextCtx {
                         run: &config.run,
                         turn_index,
+                        abort: config.abort.clone(),
                         context: ctx,
                     })
                     .await

@@ -9,7 +9,8 @@ use llm_harness_types::{
 use crate::{
     CitationRecord, ContentSelector, EvidenceAuthority, EvidenceProviderId, KnowledgeAccessContext,
     KnowledgeCitationPolicy, KnowledgeError, KnowledgeEvidenceSet, KnowledgeReadRequest,
-    KnowledgeRef, KnowledgeRegistry, KnowledgeRunState, KnowledgeSearchRequest,
+    KnowledgeRef, KnowledgeRegistry, KnowledgeRunState, KnowledgeSearchProjection,
+    KnowledgeSearchRequest,
 };
 
 pub const KNOWLEDGE_SEARCH_TOOL_NAME: &str = "knowledge_search";
@@ -51,7 +52,7 @@ impl Tool for KnowledgeSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search an authorized knowledge source. Returns lightweight references; use knowledge_read to inspect evidence."
+        "Search authorized knowledge sources. Optionally select one source; otherwise results are safely federated. Returns lightweight references; use knowledge_read to inspect evidence."
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -140,8 +141,12 @@ impl Tool for KnowledgeSearchTool {
                     })
                 })
                 .collect::<Vec<_>>();
-            let text = serde_json::to_string_pretty(&serde_json::json!({"hits": public_hits}))
-                .expect("knowledge hits are serializable");
+            let public_result = serde_json::json!({
+                "hits": public_hits,
+                "source_failures": page.source_failures,
+            });
+            let text = serde_json::to_string_pretty(&public_result)
+                .expect("knowledge hits and source failures are serializable");
             let content = vec![DataBlock::text(text)];
             let metadata = ProjectionMetadata {
                 envelopes: vec![PersistedEnvelope {
@@ -150,12 +155,25 @@ impl Tool for KnowledgeSearchTool {
                     value: serde_json::json!({"hits": page.hits.iter().map(|hit| &hit.reference).collect::<Vec<_>>() }),
                 }],
             };
+            let session_projection = if page.search_projection
+                == KnowledgeSearchProjection::ReferenceOnly
+            {
+                ToolSessionProjection::Ephemeral {
+                    summary: format!("Knowledge search returned {} reference(s)", page.hits.len()),
+                    metadata,
+                }
+            } else {
+                ToolSessionProjection::Projected {
+                    content: content.clone(),
+                    metadata,
+                }
+            };
             Ok(ToolResult {
                 model_content: content.clone(),
-                details: serde_json::json!({"hits": public_hits}),
+                details: public_result,
                 extensions: ToolResultExtensions::new(),
                 terminate: false,
-                session_projection: ToolSessionProjection::Projected { content, metadata },
+                session_projection,
             })
         })
     }

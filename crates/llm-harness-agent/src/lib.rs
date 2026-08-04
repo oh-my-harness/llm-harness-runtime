@@ -33,7 +33,10 @@ pub use llm_harness_loop::{
 };
 pub use plugin::Plugin;
 pub use session::{
-    BuiltContext, InMemorySessionRepo, JsonlSessionRepo, Session, SessionRepo, SessionStorage,
+    BuiltContext, InMemorySessionRepo, JsonlSessionRepo, ObservedSessionRepo, Session,
+    SessionDurability, SessionLifecycle, SessionMutation, SessionMutationKind,
+    SessionMutationObserver, SessionRecallPolicy, SessionRecallScope, SessionRecallSettings,
+    SessionRepo, SessionStorage,
 };
 pub use skills::{
     PromptTemplate, Skill, SkillDiagnostic, SkillReadTool, SourcedSkill, format_skill_invocation,
@@ -53,8 +56,10 @@ pub mod prelude {
         AgentState, BuiltContext, CompactionPreparation, CompactionStats, CompactionSummaryConfig,
         CompactionThresholdConfig, DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior,
         FinalAnswerMode, FinalAnswerToolConfig, FollowUpHandle, InMemorySessionRepo,
-        JsonlSessionRepo, ModelInfo, Plugin, PromptTemplate, Session, SessionRepo, SessionStorage,
-        Skill, SkillDiagnostic, SourcedSkill,
+        JsonlSessionRepo, ModelInfo, ObservedSessionRepo, Plugin, PromptTemplate, Session,
+        SessionDurability, SessionLifecycle, SessionMutation, SessionMutationKind,
+        SessionMutationObserver, SessionRecallPolicy, SessionRecallScope, SessionRecallSettings,
+        SessionRepo, SessionStorage, Skill, SkillDiagnostic, SourcedSkill,
     };
     pub use llm_harness_types::{
         AgentError, AgentEvent, AgentMessage, AssistantMessage, BinarySource, BranchSummaryMessage,

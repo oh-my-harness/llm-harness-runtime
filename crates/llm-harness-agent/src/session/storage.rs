@@ -5,7 +5,7 @@ use futures::future::BoxFuture;
 use llm_harness_types::{EntryId, SessionError};
 
 use super::tree_ops;
-use super::types::{SessionEntry, SessionEntryKind, SessionMetadata};
+use super::types::{SessionEntry, SessionEntryKind, SessionMetadata, SessionRecallSettings};
 
 // ── SessionStorage trait ───────────────────────────────────────────────────────
 
@@ -27,6 +27,8 @@ pub trait SessionStorage: Send + Sync {
 
     /// Append a pre-built entry. Does NOT advance `active_cursor`; the caller
     /// is responsible for calling `set_active_cursor` afterwards if needed.
+    /// Active-branch recall revision therefore advances on the cursor change,
+    /// not while an entry is still detached from the visible branch.
     fn append_entry(&self, entry: SessionEntry) -> BoxFuture<'_, Result<(), SessionError>>;
 
     /// Get an entry by ID.
@@ -85,6 +87,18 @@ pub trait SessionStorage: Send + Sync {
         &self,
         model: Option<String>,
     ) -> BoxFuture<'_, Result<(), SessionError>>;
+
+    /// Atomically replace recall-related authority metadata.
+    ///
+    /// The default fails closed so third-party storage implementations remain
+    /// source-compatible without silently accepting an update they cannot
+    /// persist.
+    fn update_recall_settings(
+        &self,
+        _settings: SessionRecallSettings,
+    ) -> BoxFuture<'_, Result<(), SessionError>> {
+        Box::pin(async { Err(SessionError::RecallMetadataUnsupported) })
+    }
 
     /// Delete the given entries and remove them from the children index.
     ///
@@ -170,8 +184,12 @@ impl SessionStorage for InMemorySessionStorage {
     fn set_active_cursor(&self, id: EntryId) -> BoxFuture<'_, Result<(), SessionError>> {
         Box::pin(async move {
             let mut st = self.inner.lock().unwrap();
+            if st.metadata.active_cursor == Some(id) {
+                return Ok(());
+            }
             st.metadata.active_cursor = Some(id);
             st.metadata.updated_at = chrono::Utc::now();
+            st.metadata.mark_recall_content_changed()?;
             Ok(())
         })
     }
@@ -226,7 +244,13 @@ impl SessionStorage for InMemorySessionStorage {
         name: Option<String>,
     ) -> BoxFuture<'_, Result<(), SessionError>> {
         Box::pin(async move {
-            self.inner.lock().unwrap().metadata.name = name;
+            let mut st = self.inner.lock().unwrap();
+            if st.metadata.name == name {
+                return Ok(());
+            }
+            st.metadata.name = name;
+            st.metadata.updated_at = chrono::Utc::now();
+            st.metadata.mark_recall_content_changed()?;
             Ok(())
         })
     }
@@ -241,22 +265,43 @@ impl SessionStorage for InMemorySessionStorage {
         })
     }
 
+    fn update_recall_settings(
+        &self,
+        settings: SessionRecallSettings,
+    ) -> BoxFuture<'_, Result<(), SessionError>> {
+        Box::pin(async move {
+            self.inner
+                .lock()
+                .unwrap()
+                .metadata
+                .apply_recall_settings(settings)?;
+            Ok(())
+        })
+    }
+
     fn delete_entries(&self, ids: Vec<EntryId>) -> BoxFuture<'_, Result<(), SessionError>> {
         Box::pin(async move {
             let ids_set: std::collections::HashSet<EntryId> = ids.into_iter().collect();
             let mut st = self.inner.lock().unwrap();
+            let mut changed = false;
             for id in &ids_set {
-                if let Some(entry) = st.entries.remove(id)
-                    && let Some(children) = st.children.get_mut(&entry.parent_id)
-                {
-                    children.retain(|c| c != id);
+                if let Some(entry) = st.entries.remove(id) {
+                    changed = true;
+                    if let Some(children) = st.children.get_mut(&entry.parent_id) {
+                        children.retain(|c| c != id);
+                    }
                 }
-                st.children.remove(&Some(*id));
+                changed |= st.children.remove(&Some(*id)).is_some();
             }
             if let Some(cursor) = st.metadata.active_cursor
                 && ids_set.contains(&cursor)
             {
                 st.metadata.active_cursor = None;
+                changed = true;
+            }
+            if changed {
+                st.metadata.updated_at = chrono::Utc::now();
+                st.metadata.mark_recall_content_changed()?;
             }
             Ok(())
         })

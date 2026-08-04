@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    sync::Arc,
+};
 
 use llm_harness_types::RunContext;
 use tokio_util::sync::CancellationToken;
@@ -6,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     FederatedKnowledgePage, KnowledgeAccessContext, KnowledgeAccessControl, KnowledgeAction,
     KnowledgeError, KnowledgeReadRequest, KnowledgeRequestContext, KnowledgeResourceRef,
-    KnowledgeSearchRequest, KnowledgeSource, KnowledgeSourceDescriptor, SourceSearchRequest,
+    KnowledgeSearchProjection, KnowledgeSearchRequest, KnowledgeSource, KnowledgeSourceDescriptor,
+    SourceSearchRequest,
 };
 
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
@@ -111,36 +115,42 @@ impl KnowledgeRegistry {
         if request.cursor.is_some() {
             return Err(KnowledgeError::InvalidCursor);
         }
-        if request.source_ids.len() > 1 {
-            return Err(KnowledgeError::UnsupportedCapability(
-                "a search request may select at most one source".into(),
+        let explicit_source_ids = request.source_ids.iter().cloned().collect::<BTreeSet<_>>();
+        if explicit_source_ids.len() != request.source_ids.len() {
+            return Err(KnowledgeError::InvalidFilter(
+                "source selection contains duplicate IDs".into(),
             ));
         }
-        let candidates = if let Some(source_id) = request.source_ids.first() {
-            let source = self
-                .sources
-                .get(source_id)
-                .ok_or(KnowledgeError::NotFound)?;
-            let descriptor = source.descriptor();
-            self.access_control
-                .authorize(
-                    access,
-                    KnowledgeAction::Discover,
-                    KnowledgeResourceRef::Source {
-                        source_id: &descriptor.id,
-                        domains: &descriptor.domains,
-                    },
-                )
-                .await?;
-            if !request.domains.is_empty()
-                && !descriptor
-                    .domains
-                    .iter()
-                    .any(|domain| request.domains.contains(domain))
-            {
-                return Err(KnowledgeError::NotFound);
+        let strict_single_source = request.source_ids.len() == 1;
+        let candidates = if !explicit_source_ids.is_empty() {
+            let mut selected = Vec::with_capacity(explicit_source_ids.len());
+            for source_id in explicit_source_ids {
+                let source = self
+                    .sources
+                    .get(&source_id)
+                    .ok_or(KnowledgeError::NotFound)?;
+                let descriptor = source.descriptor();
+                self.access_control
+                    .authorize(
+                        access,
+                        KnowledgeAction::Discover,
+                        KnowledgeResourceRef::Source {
+                            source_id: &descriptor.id,
+                            domains: &descriptor.domains,
+                        },
+                    )
+                    .await?;
+                if !request.domains.is_empty()
+                    && !descriptor
+                        .domains
+                        .iter()
+                        .any(|domain| request.domains.contains(domain))
+                {
+                    return Err(KnowledgeError::NotFound);
+                }
+                selected.push(descriptor.clone());
             }
-            vec![descriptor.clone()]
+            selected
         } else {
             self.visible_sources(access)
                 .await?
@@ -154,55 +164,104 @@ impl KnowledgeRegistry {
                 })
                 .collect::<Vec<_>>()
         };
-        if candidates.len() != 1 {
-            return Err(KnowledgeError::UnsupportedCapability(
-                "search request must resolve to exactly one visible source".into(),
+        let candidate_ids = candidates
+            .iter()
+            .map(|descriptor| descriptor.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if request
+            .filters
+            .iter()
+            .any(|filter| !candidate_ids.contains(filter.source_id.as_str()))
+        {
+            return Err(KnowledgeError::InvalidFilter(
+                "filter source does not match a selected source".into(),
             ));
         }
-        let descriptor = &candidates[0];
-        let source = self
-            .sources
-            .get(&descriptor.id)
-            .ok_or(KnowledgeError::NotFound)?;
-        self.access_control
-            .authorize(
-                access,
-                KnowledgeAction::Search,
-                KnowledgeResourceRef::Source {
-                    source_id: &descriptor.id,
-                    domains: &descriptor.domains,
-                },
-            )
-            .await?;
-        let filters = request
-            .filters
-            .into_iter()
-            .map(|filter| {
-                if filter.source_id != descriptor.id {
-                    Err(KnowledgeError::InvalidFilter(
-                        "filter source does not match selected source".into(),
-                    ))
-                } else {
-                    Ok(filter.expression)
+
+        let mut source_pages = Vec::new();
+        let mut source_failures = Vec::new();
+        let mut search_projection = KnowledgeSearchProjection::Projected;
+        for descriptor in candidates {
+            if abort.is_cancelled() {
+                return Err(KnowledgeError::Aborted);
+            }
+            let source = self
+                .sources
+                .get(&descriptor.id)
+                .ok_or(KnowledgeError::NotFound)?;
+            if source.search_projection() == KnowledgeSearchProjection::ReferenceOnly {
+                search_projection = KnowledgeSearchProjection::ReferenceOnly;
+            }
+            if let Err(error) = self
+                .access_control
+                .authorize(
+                    access,
+                    KnowledgeAction::Search,
+                    KnowledgeResourceRef::Source {
+                        source_id: &descriptor.id,
+                        domains: &descriptor.domains,
+                    },
+                )
+                .await
+            {
+                if strict_single_source || error == KnowledgeError::Aborted {
+                    return Err(error);
                 }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let page = source
-            .search(
-                KnowledgeRequestContext { run, access },
-                SourceSearchRequest {
-                    query: request.query,
-                    filters,
-                    limit: request.limit,
-                    cursor: None,
-                },
-                abort,
-            )
-            .await?;
+                if error != KnowledgeError::Unauthorized {
+                    source_failures.push(error.source_failure(descriptor.id));
+                }
+                continue;
+            }
+            let filters = request
+                .filters
+                .iter()
+                .filter(|filter| filter.source_id == descriptor.id)
+                .map(|filter| filter.expression.clone())
+                .collect();
+            let result = source
+                .search(
+                    KnowledgeRequestContext { run, access },
+                    SourceSearchRequest {
+                        query: request.query.clone(),
+                        filters,
+                        limit: request.limit,
+                        cursor: None,
+                    },
+                    abort.clone(),
+                )
+                .await;
+            match result {
+                Ok(page)
+                    if page
+                        .hits
+                        .iter()
+                        .all(|hit| hit.reference.source_id == descriptor.id) =>
+                {
+                    source_pages.push(VecDeque::from(page.hits));
+                }
+                Ok(_) => {
+                    let error = KnowledgeError::Backend(
+                        "knowledge source returned a reference in another source namespace".into(),
+                    );
+                    if strict_single_source {
+                        return Err(error);
+                    }
+                    source_failures.push(error.source_failure(descriptor.id));
+                }
+                Err(error) if strict_single_source || error == KnowledgeError::Aborted => {
+                    return Err(error);
+                }
+                Err(KnowledgeError::Unauthorized) => {}
+                Err(error) => source_failures.push(error.source_failure(descriptor.id)),
+            }
+        }
+
+        let hits = merge_federated_hits(source_pages, request.limit);
         Ok(FederatedKnowledgePage {
-            hits: page.hits,
+            hits,
             next_cursor: None,
-            source_failures: vec![],
+            source_failures,
+            search_projection,
         })
     }
 
@@ -237,6 +296,33 @@ impl KnowledgeRegistry {
     }
 }
 
+fn merge_federated_hits(
+    mut source_pages: Vec<VecDeque<crate::KnowledgeHit>>,
+    limit: usize,
+) -> Vec<crate::KnowledgeHit> {
+    let mut hits = Vec::with_capacity(limit);
+    let mut seen = BTreeSet::new();
+    while hits.len() < limit {
+        let mut progressed = false;
+        for page in &mut source_pages {
+            let Some(hit) = page.pop_front() else {
+                continue;
+            };
+            progressed = true;
+            if seen.insert(hit.reference.clone()) {
+                hits.push(hit);
+                if hits.len() == limit {
+                    break;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -262,6 +348,7 @@ mod tests {
     }
 
     struct ForeignReferenceSource;
+    struct FailingSource;
 
     impl GuardedSource {
         fn new() -> Self {
@@ -370,6 +457,39 @@ mod tests {
         }
     }
 
+    impl KnowledgeSource for FailingSource {
+        fn descriptor(&self) -> &KnowledgeSourceDescriptor {
+            static DESCRIPTOR: OnceLock<KnowledgeSourceDescriptor> = OnceLock::new();
+            DESCRIPTOR.get_or_init(|| KnowledgeSourceDescriptor {
+                id: "broken".into(),
+                name: "Broken".into(),
+                description: "Broken".into(),
+                domains: vec![],
+                capabilities: BTreeSet::from([KnowledgeCapability::Search]),
+                freshness: FreshnessClass::Live,
+                filter_fields: vec![],
+            })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _ctx: KnowledgeRequestContext<'a>,
+            _request: SourceSearchRequest,
+            _abort: CancellationToken,
+        ) -> BoxFuture<'a, Result<SourceSearchPage, KnowledgeError>> {
+            Box::pin(async { Err(KnowledgeError::Backend("private backend detail".into())) })
+        }
+
+        fn read<'a>(
+            &'a self,
+            _ctx: KnowledgeRequestContext<'a>,
+            _request: KnowledgeReadRequest,
+            _abort: CancellationToken,
+        ) -> BoxFuture<'a, Result<KnowledgeContent, KnowledgeError>> {
+            Box::pin(async { Err(KnowledgeError::NotFound) })
+        }
+    }
+
     fn access() -> KnowledgeAccessContext {
         KnowledgeAccessContext::new(
             KnowledgeScope::new("test"),
@@ -420,6 +540,62 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, KnowledgeError::Unauthorized);
         assert!(!source.called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn federated_search_sanitizes_partial_failures_but_explicit_search_stays_strict() {
+        let registry = KnowledgeRegistry::builder(Arc::new(KnowledgeAccessControl::new(Arc::new(
+            AllowAllAuthorizer,
+        ))))
+        .source(Arc::new(GuardedSource::new()))
+        .source(Arc::new(FailingSource))
+        .build()
+        .unwrap();
+        let run = RunContext::new(RunRequest::from_text("question"));
+        let page = registry
+            .search(
+                &run,
+                &access(),
+                KnowledgeSearchRequest {
+                    query: "policy".into(),
+                    domains: vec![],
+                    source_ids: vec![],
+                    filters: vec![],
+                    limit: 5,
+                    cursor: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(page.hits.is_empty());
+        assert_eq!(
+            page.source_failures,
+            vec![crate::SourceFailure {
+                source_id: "broken".into(),
+                code: crate::KnowledgeErrorCode::Backend,
+                retryable: true,
+            }]
+        );
+
+        let error = registry
+            .search(
+                &run,
+                &access(),
+                KnowledgeSearchRequest {
+                    query: "policy".into(),
+                    domains: vec![],
+                    source_ids: vec!["broken".into()],
+                    filters: vec![],
+                    limit: 5,
+                    cursor: None,
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), crate::KnowledgeErrorCode::Backend);
+        assert_eq!(error.diagnostic(), Some("private backend detail"));
     }
 
     #[tokio::test]
