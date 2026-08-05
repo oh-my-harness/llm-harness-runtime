@@ -16,6 +16,7 @@ tokio-stream.workspace      = true
 tokio-util.workspace        = true
 uuid.workspace              = true
 chrono.workspace            = true
+fastrand.workspace            = true
 
 [features]
 test-utils = []

@@ -87,14 +87,14 @@
 
 | # | 缺失项 | 涉及 view | 改动位置 | 优先级 |
 |---|--------|---------|---------|--------|
-| 1 | 自定义压缩 prompt 通路 | view 9 | `compaction.rs` | 高 |
-| 2 | 压缩熔断器（连续失败计数+停止） | view 9, 26 | `compaction_ops.rs` | 高 |
-| 3 | 标记消息为不可压缩 | view 9 | `messages.rs`/`compaction.rs` | 中 |
+| 1 | ~~自定义压缩 prompt 通路~~ ✅ 已实现 | view 9 | `compaction.rs`：CompactionPromptSpec + placeholder validation | ~~高~~ |
+| 2 | ~~压缩熔断器~~ ✅ 已实现 | view 9, 26 | `compaction_ops.rs`：连续失败 N 次 block + reset_circuit_breaker() | ~~高~~ |
+| 3 | ~~标记消息为不可压缩~~ ✅ 已实现 | view 9 | `messages.rs`/`compaction.rs`：CompactionPolicy::Keep + `<no-compact>` tag | ~~中~~ |
 | 4 | ~~ContextMode 结构化来源标注~~ ✅ 已实现 | view 19 | `spawn_types.rs`：Inject(String)→Inject(Vec\<ContextBlock\>) | ~~高~~ |
 | 5 | ~~SpawnOptions 配置继承~~ ✅ 已实现 | view 3, 12 | `spawn_types.rs`/`spawner.rs` | ~~高~~ |
 | 6 | ~~QuerySubagentTool 返回 role/description~~ ✅ 已实现 | view 12 | `spawn/tools.rs` | ~~中~~ |
-| 7 | NotificationChannel trait | view 13 | `types/` | 高 |
-| 8 | 退避抖动 (jitter) | view 26 | `config.rs` RetryConfig | 中 |
+| ~~7~~ | ~~NotificationChannel trait~~ → 移至阶段三第 10 项（策略层） | view 13 | 无机制层消费者，trait + notify_user 工具均放 `llm-harness-strategy` | ~~高~~ |
+| 8 | ~~退避抖动 (jitter)~~ ✅ 已实现 | view 26 | `config.rs`：delay_for full jitter `random(0, base*2^attempt]`，retry_after 优先 | ~~中~~ |
 | 9 | 流式空闲看门狗 | view 26 | `loop_fn.rs` | 中 |
 | 10 | 轨迹完整性自动修复 | view 26 | `loop_fn.rs` | 中 |
 | 11 | MCP 服务器版本锁定 | view 17 | `runtime-mcp/` | 低 |

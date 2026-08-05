@@ -39,7 +39,10 @@ impl RetryConfig {
             _ => None,
         };
         hint.unwrap_or_else(|| {
-            Duration::from_millis(self.base_delay_ms.saturating_mul(1u64 << attempt.min(10)))
+            // Full jitter: delay = random(0, base * 2^attempt]
+            let exp = self.base_delay_ms.saturating_mul(1u64 << attempt.min(10));
+            let jittered = fastrand::u64(0..=exp);
+            Duration::from_millis(jittered)
         })
     }
 }
@@ -214,5 +217,80 @@ mod tests {
             cfg.response_format.as_ref().unwrap(),
             &ResponseFormat::JsonObject
         );
+    }
+
+    #[test]
+    fn delay_for_jitter_within_range() {
+        use crate::config::RetryConfig;
+        use llm_adapter::LlmError;
+
+        let cfg = RetryConfig::new(3, 1000);
+        // attempt=0 → exp = 1000 * 2^0 = 1000; jittered must be in [0, 1000]
+        for _ in 0..100 {
+            let d = cfg.delay_for(0, &LlmError::Timeout);
+            assert!(
+                d.as_millis() <= 1000,
+                "delay {d:?} exceeded base for attempt 0"
+            );
+        }
+        // attempt=2 → exp = 1000 * 2^2 = 4000; jittered must be in [0, 4000]
+        for _ in 0..100 {
+            let d = cfg.delay_for(2, &LlmError::Timeout);
+            assert!(
+                d.as_millis() <= 4000,
+                "delay {d:?} exceeded 4x base for attempt 2"
+            );
+        }
+    }
+
+    #[test]
+    fn delay_for_retry_after_no_jitter() {
+        use crate::config::RetryConfig;
+        use llm_adapter::LlmError;
+        use std::time::Duration;
+
+        let cfg = RetryConfig::new(3, 1000);
+        let err = LlmError::RateLimit {
+            retry_after: Some(Duration::from_millis(5000)),
+        };
+        // With retry_after hint, delay must be exactly the hint — no jitter
+        for _ in 0..20 {
+            let d = cfg.delay_for(0, &err);
+            assert_eq!(
+                d,
+                Duration::from_millis(5000),
+                "retry_after should not be jittered"
+            );
+        }
+    }
+
+    #[test]
+    fn delay_for_jitter_is_seeded_deterministic() {
+        use crate::config::RetryConfig;
+        use llm_adapter::LlmError;
+
+        let cfg = RetryConfig::new(3, 1000);
+        fastrand::seed(42);
+        let d1 = cfg.delay_for(0, &LlmError::Timeout);
+        fastrand::seed(42);
+        let d2 = cfg.delay_for(0, &LlmError::Timeout);
+        assert_eq!(d1, d2, "same seed must produce same delay");
+    }
+
+    #[test]
+    fn delay_for_zero_base_returns_zero() {
+        use crate::config::RetryConfig;
+        use llm_adapter::LlmError;
+
+        let cfg = RetryConfig::new(3, 0);
+        // exp = 0 * 2^attempt = 0; fastrand::u64(0..=0) = 0
+        for _ in 0..20 {
+            let d = cfg.delay_for(0, &LlmError::Timeout);
+            assert_eq!(
+                d,
+                std::time::Duration::from_millis(0),
+                "zero base must yield zero delay"
+            );
+        }
     }
 }

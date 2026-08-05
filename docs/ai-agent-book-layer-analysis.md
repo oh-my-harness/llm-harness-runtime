@@ -89,13 +89,13 @@
 >
 > | # | 缺失项 | 涉及 view | 改动位置 | 说明 |
 > |---|--------|---------|---------|------|
-> | 1 | 自定义压缩 prompt 通路 | view 9 | `compaction.rs` | SUMMARIZATION_SYSTEM_PROMPT 硬编码 → 可配置入口 |
-> | 2 | 压缩熔断器（连续失败计数+停止） | view 9, view 26 | `compaction_ops.rs` | 失败即终止 → 连续失败 N 次才终止 |
-> | 3 | 标记消息为不可压缩 | view 9 | `messages.rs`/`compaction.rs` | 消息级 NoCompact 标记，压缩时跳过 |
-> | 4 | ContextMode 结构化来源标注 | view 19 | `spawn_types.rs` | Inject(String) → Inject(Vec&lt;ContextBlock&gt;) 带 source 标签 |
-> | 5 | SpawnOptions 配置继承 | view 3, view 12 | `spawn_types.rs`/`spawner.rs` | 继承 system_prompt/tools/thinking_level |
-> | 6 | QuerySubagentTool 返回 role/description | view 12 | `spawn/tools.rs` | AgentStatus 增加职责描述字段 |
-> | 7 | 退避抖动（jitter） | view 26 | `config.rs` RetryConfig | delay_for 增加随机抖动 |
+> | 1 | ~~自定义压缩 prompt 通路~~ ✅ 已完成 | view 9 | `compaction.rs` | CompactionPromptSpec + placeholder validation |
+> | 2 | ~~压缩熔断器（连续失败计数+停止）~~ ✅ 已完成 | view 9, view 26 | `compaction_ops.rs` | 连续失败 N 次 block + reset_circuit_breaker() |
+> | 3 | ~~标记消息为不可压缩~~ ✅ 已完成 | view 9 | `messages.rs`/`compaction.rs` | CompactionPolicy::Keep + `<no-compact>` tag |
+> | 4 | ~~ContextMode 结构化来源标注~~ ✅ 已完成 | view 19 | `spawn_types.rs` | Inject(String) → Inject(Vec&lt;ContextBlock&gt;) 带 source 标签 |
+> | 5 | ~~SpawnOptions 配置继承~~ ✅ 已完成 | view 3, view 12 | `spawn_types.rs`/`spawner.rs` | 继承 system_prompt/tools/thinking_level + per-spawn overrides |
+> | 6 | ~~QuerySubagentTool 返回 role/description~~ ✅ 已完成 | view 12 | `spawn/tools.rs` | AgentStatus 增加 role/description 字段 |
+> | 7 | ~~退避抖动（jitter）~~ ✅ 已完成 | view 26 | `config.rs` RetryConfig | delay_for 增加 full jitter（`random(0, base*2^attempt]`），retry_after 优先不抖动 |
 > | 8 | 流式空闲看门狗 | view 26 | `loop_fn.rs` | stream 事件间超时检测 |
 > | 9 | 轨迹完整性自动修复 | view 26 | `loop_fn.rs` | ToolUse 缺 ToolResult 时自动修补 |
 > | 10 | MCP 服务器版本锁定 | view 17 | `runtime-mcp/` | 拒绝静默版本更新 |
