@@ -437,19 +437,31 @@ fn run_loop(
 
             let stop_reason = assistant_msg.stop_reason.unwrap_or(StopReason::EndTurn);
 
-            if stop_reason == StopReason::ToolUse {
-                // Collect tool-use blocks from the assistant message
-                let tool_calls: Vec<(String, String, serde_json::Value)> = assistant_msg
-                    .content
-                    .iter()
-                    .filter_map(|cb| {
-                        if let ContentBlock::ToolUse { id, name, input } = cb {
-                            Some((id.clone(), name.clone(), input.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
+            // Unconditionally extract tool-use blocks — providers may emit ToolUse
+            // blocks with a non-ToolUse stop_reason (e.g. Anthropic structured output
+            // returns tool_use + EndTurn). Leaving them orphaned causes a provider 400
+            // on the next turn.
+            let tool_calls: Vec<(String, String, serde_json::Value)> = assistant_msg
+                .content
+                .iter()
+                .filter_map(|cb| {
+                    if let ContentBlock::ToolUse { id, name, input } = cb {
+                        Some((id.clone(), name.clone(), input.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if !tool_calls.is_empty() {
+                if stop_reason != StopReason::ToolUse {
+                    tracing::warn!(
+                        tool_use_ids = ?tool_calls.iter().map(|(id, _, _)| id).collect::<Vec<_>>(),
+                        stop_reason = ?stop_reason,
+                        "assistant message contains ToolUse blocks but stop_reason is not ToolUse; \
+                         proceeding with tool execution to preserve trajectory integrity"
+                    );
+                }
 
                 // Match tool calls to registered tools.
                 let tools_by_name: std::collections::HashMap<&str, Arc<dyn Tool>> = current_tools
@@ -563,6 +575,27 @@ fn run_loop(
                         Err(ToolFailure::new(
                             "unknown_tool",
                             format!("Unknown tool: {name}"),
+                        )),
+                    ));
+                }
+                // Trajectory integrity — every ToolUse id must have a paired
+                // result. If execute_tool_batch dropped any (abort/timeout/panic
+                // recovery), fill synthetic errors so the next provider request
+                // doesn't 400.
+                let result_ids: Vec<&str> =
+                    results.iter().map(|(id, _)| id.as_str()).collect();
+                let missing: Vec<String> = tool_calls
+                    .iter()
+                    .filter(|(id, _, _)| !result_ids.contains(&id.as_str()))
+                    .map(|(id, _, _)| id.clone())
+                    .collect();
+                for id in missing {
+                    results.push((
+                        id,
+                        Err(ToolFailure::new(
+                            "missing_result",
+                            "Tool execution produced no result for this tool_use_id; \
+                             a synthetic error was injected to preserve trajectory integrity.",
                         )),
                     ));
                 }
@@ -690,77 +723,89 @@ fn run_loop(
 
                 turn_index += 1;
                 continue 'main;
-            }
-
-            if let FinalAnswerMode::Tool(cfg) = &config.final_answer_mode
-                && cfg.missing_behavior == FinalAnswerMissingBehavior::Error
-            {
-                yield AgentEvent::Error(AgentError::Internal(format!(
-                    "final-answer tool '{}' was required but the model stopped without calling it",
-                    FINAL_ANSWER_TOOL_NAME
-                )));
-                break 'main;
-            }
-
-            // Non-tool stop
-            yield AgentEvent::TurnEnd {
-                index: turn_index,
-                message: assistant_msg.clone(),
-                tool_results: vec![],
-            };
-
-            let should_stop = if let Some(h) = &config.should_stop {
-                h.should_stop(ShouldStopCtx {
-                    run: &config.run,
-                    last_assistant: &assistant_msg,
-                    stop_reason,
-                    turn_index,
-                })
-                .await
             } else {
-                true // default: stop
-            };
-
-            if should_stop {
-                // Check follow_up channel
-                if let Some(ref mut rx) = config.follow_up_rx
-                    && let Ok(follow_up_msg) = rx.try_recv()
-                {
-                    ctx.messages.push(follow_up_msg.clone());
-                    new_messages.push(follow_up_msg);
-                    turn_index += 1;
-                    continue 'main;
+                // Non-tool turn. Covers two cases:
+                //   1. Normal: stop_reason != ToolUse and no ToolUse blocks.
+                //   2. Defensive: stop_reason == ToolUse but no ToolUse blocks found
+                //      (model claimed tool use but emitted no blocks). Nothing to
+                //      repair — log a warning and proceed as non-tool turn.
+                if stop_reason == StopReason::ToolUse {
+                    tracing::warn!(
+                        "stop_reason is ToolUse but no ToolUse blocks found in assistant message; \
+                         proceeding as non-tool turn"
+                    );
                 }
-                break 'main;
-            }
 
-            // should_stop = false → call PrepareNextTurnHook and continue
-            if let Some(h) = &config.prepare_next_turn {
-                match h.prepare(PrepareNextTurnCtx {
-                    run: &config.run,
-                    turn_index,
-                    last_message: &assistant_msg,
-                    last_tool_results: &[],
-                }).await {
-                    Ok(directive) => {
-                        if let Err(e) = apply_next_turn_directive(
-                            &mut ctx,
-                            &mut config,
-                            &mut active_tools,
-                            directive,
-                        ) {
+                if let FinalAnswerMode::Tool(cfg) = &config.final_answer_mode
+                    && cfg.missing_behavior == FinalAnswerMissingBehavior::Error
+                {
+                    yield AgentEvent::Error(AgentError::Internal(format!(
+                        "final-answer tool '{}' was required but the model stopped without calling it",
+                        FINAL_ANSWER_TOOL_NAME
+                    )));
+                    break 'main;
+                }
+
+                // Non-tool stop
+                yield AgentEvent::TurnEnd {
+                    index: turn_index,
+                    message: assistant_msg.clone(),
+                    tool_results: vec![],
+                };
+
+                let should_stop = if let Some(h) = &config.should_stop {
+                    h.should_stop(ShouldStopCtx {
+                        run: &config.run,
+                        last_assistant: &assistant_msg,
+                        stop_reason,
+                        turn_index,
+                    })
+                    .await
+                } else {
+                    true // default: stop
+                };
+
+                if should_stop {
+                    // Check follow_up channel
+                    if let Some(ref mut rx) = config.follow_up_rx
+                        && let Ok(follow_up_msg) = rx.try_recv()
+                    {
+                        ctx.messages.push(follow_up_msg.clone());
+                        new_messages.push(follow_up_msg);
+                        turn_index += 1;
+                        continue 'main;
+                    }
+                    break 'main;
+                }
+
+                // should_stop = false → call PrepareNextTurnHook and continue
+                if let Some(h) = &config.prepare_next_turn {
+                    match h.prepare(PrepareNextTurnCtx {
+                        run: &config.run,
+                        turn_index,
+                        last_message: &assistant_msg,
+                        last_tool_results: &[],
+                    }).await {
+                        Ok(directive) => {
+                            if let Err(e) = apply_next_turn_directive(
+                                &mut ctx,
+                                &mut config,
+                                &mut active_tools,
+                                directive,
+                            ) {
+                                yield AgentEvent::Error(e);
+                                break 'main;
+                            }
+                        }
+                        Err(e) => {
                             yield AgentEvent::Error(e);
                             break 'main;
                         }
                     }
-                    Err(e) => {
-                        yield AgentEvent::Error(e);
-                        break 'main;
-                    }
                 }
-            }
 
-            turn_index += 1;
+                turn_index += 1;
+            }
         }
 
         yield AgentEvent::AgentEnd { new_messages };
@@ -1954,6 +1999,205 @@ mod tests {
             captured[0].response_format(),
             Some(&crate::ResponseFormat::JsonObject),
             "response_format must be threaded to the ChatRequest sent to the provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_use_block_with_end_turn_stop_reason_gets_synthetic_result() {
+        // Model emits a ToolUse block for an unregistered tool but with stop_reason=EndTurn.
+        // Without repair, this ToolUse would be orphaned → 400 on next turn.
+        let (client_raw, cfg) = make_config(vec![
+            MockResponse::tool_use_end_turn("tu_01", "nonexistent_tool", r#"{}"#),
+            MockResponse::text("Recovered."),
+        ]);
+        let client: Arc<dyn Provider> = Arc::clone(&client_raw) as Arc<dyn Provider>;
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+
+        let events: Vec<AgentEvent> = agent_loop(client, ctx, cfg).collect().await;
+
+        // The orphan ToolUse must have produced a synthetic ToolExecutionEnd.
+        let tool_exec_ends: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+            .collect();
+        assert_eq!(
+            tool_exec_ends.len(),
+            1,
+            "orphan ToolUse must produce a synthetic ToolExecutionEnd"
+        );
+
+        // The synthetic result must be an error (unknown_tool or missing_result).
+        if let AgentEvent::ToolExecutionEnd { result, .. } = &tool_exec_ends[0] {
+            assert!(result.is_err(), "synthetic result for orphan ToolUse must be Err");
+        }
+
+        // Loop must have continued to the second turn (no 400, no crash).
+        assert_eq!(
+            client_raw
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "loop must continue to second turn after repair"
+        );
+
+        // Trajectory invariant: every ToolUse id in the second request's history
+        // must have a paired ToolResult. This directly verifies the core goal
+        // of the design — no orphan ToolUse reaches the provider.
+        let captured = client_raw.captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 2, "two provider calls expected");
+        use llm_adapter::types::{Message, ResponseContent};
+        let second_request_msgs = captured[1].messages();
+        let mut tool_use_ids: Vec<&str> = vec![];
+        let mut tool_result_ids: Vec<&str> = vec![];
+        for msg in second_request_msgs {
+            match msg {
+                Message::Assistant(content) => {
+                    for block in content {
+                        if let ResponseContent::ToolInvocation(ti) = block {
+                            tool_use_ids.push(ti.id.as_str());
+                        }
+                    }
+                }
+                Message::Tool { invocation_id, .. } => {
+                    tool_result_ids.push(invocation_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        for id in &tool_use_ids {
+            assert!(
+                tool_result_ids.contains(id),
+                "ToolUse id '{id}' has no paired ToolResult in the second request — trajectory integrity violated"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_tool_with_end_turn_stop_reason_still_executes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct EchoTool {
+            called: Arc<AtomicBool>,
+        }
+        impl Tool for EchoTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> &serde_json::Value {
+                static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+                S.get_or_init(|| serde_json::json!({}))
+            }
+            fn execute<'a>(
+                &'a self,
+                _: serde_json::Value,
+                _: &'a ToolContext,
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                self.called.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
+            }
+        }
+
+        let tool_called = Arc::new(AtomicBool::new(false));
+        let tool: Arc<dyn Tool> = Arc::new(EchoTool {
+            called: tool_called.clone(),
+        });
+
+        let (client_raw, mut cfg) = make_config(vec![
+            MockResponse::tool_use_end_turn("tu_01", "echo", r#"{"x":1}"#),
+            MockResponse::text("Done."),
+        ]);
+        cfg.tools = vec![tool];
+        let client: Arc<dyn Provider> = Arc::clone(&client_raw) as Arc<dyn Provider>;
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+
+        let events: Vec<AgentEvent> = agent_loop(client, ctx, cfg).collect().await;
+
+        assert!(
+            tool_called.load(Ordering::SeqCst),
+            "registered tool must execute even with EndTurn stop_reason"
+        );
+        assert_eq!(
+            client_raw
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "loop must continue after tool execution"
+        );
+
+        // Verify the tool produced a ToolExecutionEnd event.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. })),
+            "registered tool must emit ToolExecutionEnd"
+        );
+
+        // Trajectory invariant: the ToolUse id must have a paired ToolResult
+        // in the second request's history — no orphan ToolUse reaches the provider.
+        let captured = client_raw.captured_requests.lock().unwrap();
+        assert_eq!(captured.len(), 2, "two provider calls expected");
+        use llm_adapter::types::{Message, ResponseContent};
+        let second_request_msgs = captured[1].messages();
+        let mut tool_use_ids: Vec<&str> = vec![];
+        let mut tool_result_ids: Vec<&str> = vec![];
+        for msg in second_request_msgs {
+            match msg {
+                Message::Assistant(content) => {
+                    for block in content {
+                        if let ResponseContent::ToolInvocation(ti) = block {
+                            tool_use_ids.push(ti.id.as_str());
+                        }
+                    }
+                }
+                Message::Tool { invocation_id, .. } => {
+                    tool_result_ids.push(invocation_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        for id in &tool_use_ids {
+            assert!(
+                tool_result_ids.contains(id),
+                "ToolUse id '{id}' has no paired ToolResult in the second request — trajectory integrity violated"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_use_stop_reason_without_blocks_proceeds_as_non_tool_turn() {
+        // Model claims stop_reason=ToolUse but emits no ToolUse blocks.
+        // Defensive path: no orphan to repair, proceed as non-tool turn.
+        use llm_adapter::types::StopReason as AdapterStop;
+
+        let (client_raw, cfg) = make_config(vec![
+            MockResponse::text("Hello!").with_stop_reason(AdapterStop::ToolUse),
+            MockResponse::text("Done."),
+        ]);
+        let client: Arc<dyn Provider> = Arc::clone(&client_raw) as Arc<dyn Provider>;
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+
+        let events: Vec<AgentEvent> = agent_loop(client, ctx, cfg).collect().await;
+
+        // No ToolExecutionEnd should be emitted (no tool calls).
+        let tool_exec_ends = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
+            .count();
+        assert_eq!(
+            tool_exec_ends, 0,
+            "no ToolExecutionEnd for empty tool_calls"
         );
     }
 }

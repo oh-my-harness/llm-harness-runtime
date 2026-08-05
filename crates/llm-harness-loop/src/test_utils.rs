@@ -223,6 +223,22 @@ impl MockResponse {
         panic!("mock response has no terminal MessageStop usage");
     }
 
+    /// Replaces this response's terminal stop_reason. Used to simulate
+    /// providers that return ToolUse blocks with EndTurn, or vice versa.
+    pub fn with_stop_reason(mut self, stop_reason: StopReason) -> Self {
+        for event in &mut self.events {
+            if let Ok(StreamEvent::MessageStop {
+                stop_reason: terminal,
+                ..
+            }) = event
+            {
+                *terminal = stop_reason;
+                return self;
+            }
+        }
+        panic!("mock response has no terminal MessageStop event");
+    }
+
     /// Tool-use response: the model calls one tool.
     pub fn tool_use(tool_use_id: &str, tool_name: &str, args_json: &str) -> Self {
         let id = tool_use_id.to_owned();
@@ -460,6 +476,27 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Ok(StreamEvent::TextDelta { .. })))
         );
+    }
+
+    #[test]
+    fn with_stop_reason_replaces_terminal_stop_reason() {
+        use llm_adapter::types::StopReason as AdapterStop;
+
+        let resp = MockResponse::text("hello").with_stop_reason(AdapterStop::ToolUse);
+        let stop = resp.events.iter().rev().find_map(|e| match e {
+            Ok(StreamEvent::MessageStop { stop_reason, .. }) => Some(stop_reason),
+            _ => None,
+        });
+        assert!(matches!(stop, Some(AdapterStop::ToolUse)));
+    }
+
+    #[test]
+    #[should_panic(expected = "no terminal MessageStop event")]
+    fn with_stop_reason_panics_without_message_stop() {
+        use llm_adapter::types::StopReason as AdapterStop;
+
+        // rate_limit_error has no events — no MessageStop to mutate.
+        let _ = MockResponse::rate_limit_error().with_stop_reason(AdapterStop::ToolUse);
     }
 
     #[tokio::test]

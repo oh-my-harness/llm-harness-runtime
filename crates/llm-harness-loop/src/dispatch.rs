@@ -71,8 +71,39 @@ pub(crate) async fn execute_tool_batch(
             results[idx] = Some((id, r));
         }
     }
+    finalize_results(results, &calls)
+}
 
-    results.into_iter().map(|r| r.unwrap()).collect()
+/// Fill any `None` slots in `results` with a synthetic `missing_result` error.
+///
+/// In steady state `execute_tool_batch` fills every slot via `join_all`, but
+/// abort/panic recovery paths may leave gaps. This is the defensive backfill
+/// that prevents a process crash and lets the caller's trajectory-integrity
+/// check see a result for every call.
+fn finalize_results(
+    results: Vec<Option<(String, Result<ToolResult, ToolFailure>)>>,
+    calls: &[(String, serde_json::Value, Arc<dyn Tool>)],
+) -> Vec<(String, Result<ToolResult, ToolFailure>)> {
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(idx, r)| {
+            r.unwrap_or_else(|| {
+                tracing::warn!(
+                    idx,
+                    "execute_tool_batch: results[{idx}] was None; injecting synthetic missing_result"
+                );
+                let id = calls[idx].0.clone();
+                (
+                    id,
+                    Err(ToolFailure::new(
+                        "missing_result",
+                        "Tool execution did not produce a result.",
+                    )),
+                )
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -214,5 +245,38 @@ mod tests {
         let tools: Vec<Arc<dyn Tool>> = vec![parallel_tool("p1"), parallel_tool("p2")];
         let groups = group_by_sequential(&tools, ToolExecutionMode::Sequential);
         assert_eq!(groups, vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn finalize_results_backfills_none_slots_with_missing_result() {
+        // Simulate abort/panic recovery: results[1] is None.
+        let t1 = parallel_tool("t1");
+        let t2 = parallel_tool("t2");
+        let calls: Vec<(String, serde_json::Value, Arc<dyn Tool>)> = vec![
+            ("c1".to_string(), serde_json::json!({}), t1),
+            ("c2".to_string(), serde_json::json!({}), t2),
+        ];
+        let results: Vec<Option<(String, Result<ToolResult, ToolFailure>)>> = vec![
+            Some((
+                "c1".to_string(),
+                Ok(ToolResult::full(vec![], serde_json::Value::Null, false)),
+            )),
+            None, // gap — abort/panic left this slot unfilled
+        ];
+
+        let finalized = finalize_results(results, &calls);
+
+        assert_eq!(finalized.len(), 2);
+        assert!(finalized[0].1.is_ok(), "filled slot must keep its result");
+        assert!(
+            finalized[1].1.is_err(),
+            "None slot must be backfilled with an error"
+        );
+        assert_eq!(
+            finalized[1].0, "c2",
+            "backfilled result must carry the original tool_use_id"
+        );
+        let err = finalized[1].1.as_ref().unwrap_err();
+        assert_eq!(err.code, "missing_result");
     }
 }
