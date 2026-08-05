@@ -23,7 +23,9 @@ use llm_harness_types::{
 use crate::spawn::message_bus::{
     AgentStatus, MAIN_AGENT_ID, MessageBus, SendReceipt, SubAgentEvent,
 };
-use crate::spawn::spawn_types::{ContextMode, ProviderSelection, SpawnOptions};
+use crate::spawn::spawn_types::{
+    ContextBlock, ContextMode, ContextSource, ProviderSelection, SpawnOptions,
+};
 use crate::spawn::spawner::HarnessSubAgentSpawner;
 
 // ── default timeout ───────────────────────────────────────────────────────
@@ -36,6 +38,15 @@ fn parse_timeout(args: &serde_json::Value) -> Duration {
         .filter(|&v| v.is_finite() && v > 0.0)
         .map(Duration::from_secs_f64)
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_WAIT_TIMEOUT_SECS))
+}
+
+/// Sanitize LLM-provided metadata (role/description): truncate to max_len and
+/// strip newlines/carriage returns/control chars to prevent output injection.
+fn sanitize_metadata(s: &str, max_len: usize) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\t'))
+        .take(max_len)
+        .collect()
 }
 
 /// Format a [`SubAgentEvent`] as LLM-visible text.
@@ -79,8 +90,10 @@ impl SpawnAgentTool {
             "type": "object",
             "properties": {
                 "prompt": { "type": "string", "description": "给 sub-agent 的任务指令" },
-                "context": { "type": "string", "description": "附加上下文" },
-                "provider": { "type": "string", "description": provider_desc }
+                "context": { "type": "string", "description": "附加给 sub-agent 的上下文文本（如父对话摘要）" },
+                "provider": { "type": "string", "description": provider_desc },
+                "role": { "type": "string", "description": "角色标签（如 code-reviewer）" },
+                "description": { "type": "string", "description": "职责描述" }
             },
             "required": ["prompt"]
         });
@@ -122,23 +135,44 @@ impl Tool for SpawnAgentTool {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ToolFailure::invalid_arguments("missing prompt"))?
                 .to_string();
+
             let context = args
                 .get("context")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-                .map(|s| ContextMode::Inject(s.to_string()))
+                .map(|s| {
+                    ContextMode::Inject(vec![ContextBlock {
+                        source: ContextSource::ParentConversation,
+                        content: s.to_string(),
+                    }])
+                })
                 .unwrap_or(ContextMode::None);
+
             let provider = args
                 .get("provider")
                 .and_then(|v| v.as_str())
                 .map(|s| ProviderSelection::Alias(s.to_string()))
                 .unwrap_or(ProviderSelection::Inherit);
 
+            let role = args
+                .get("role")
+                .and_then(|v| v.as_str())
+                .map(|s| sanitize_metadata(s, 64))
+                .filter(|s| !s.is_empty());
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| sanitize_metadata(s, 256))
+                .filter(|s| !s.is_empty());
             let opts = SpawnOptions {
                 prompt,
                 provider,
                 cwd: None,
                 context,
+                system_prompt: None, // 不暴露给 LLM，由 builder_customize 控制
+                thinking_level: None,
+                role,
+                description,
             };
 
             let agent_id = self
@@ -429,17 +463,31 @@ impl Tool for QuerySubagentTool {
             } else {
                 snapshots
                     .iter()
-                    .map(|s| format!("{}: {}", s.agent_id, status_label(&s.status)))
+                    .map(|s| {
+                        let base = format!("{}: {}", s.agent_id, status_label(&s.status));
+                        match (&s.role, &s.description) {
+                            (Some(role), Some(desc)) => format!("{base} [{role}] — {desc}"),
+                            (Some(role), None) => format!("{base} [{role}]"),
+                            _ => base,
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             };
 
             let details = serde_json::json!({
                 "agents": snapshots.iter().map(|s| {
-                    serde_json::json!({
+                    let mut entry = serde_json::json!({
                         "agent_id": s.agent_id,
                         "status": status_label(&s.status),
-                    })
+                    });
+                    if let Some(role) = &s.role {
+                        entry["role"] = serde_json::Value::String(role.clone());
+                    }
+                    if let Some(desc) = &s.description {
+                        entry["description"] = serde_json::Value::String(desc.clone());
+                    }
+                    entry
                 }).collect::<Vec<_>>()
             });
 
@@ -739,6 +787,36 @@ mod tests {
     use llm_harness_types::{AgentError, CostAggregate, ExecutionEnv};
     use tokio_util::sync::CancellationToken;
 
+    // ── sanitize_metadata unit tests ─────────────────────────────────────
+
+    #[test]
+    fn sanitize_metadata_strips_control_chars() {
+        let input = "hello\nworld\r\tprefix\ttab";
+        let result = sanitize_metadata(input, 100);
+        // \n and \r removed, \t preserved
+        assert_eq!(result, "helloworld\tprefix\ttab");
+    }
+
+    #[test]
+    fn sanitize_metadata_truncates_to_max_len() {
+        let input = "abcdefghij";
+        let result = sanitize_metadata(input, 5);
+        assert_eq!(result, "abcde");
+    }
+
+    #[test]
+    fn sanitize_metadata_all_control_becomes_empty() {
+        let input = "\n\r\u{0001}\u{0002}";
+        let result = sanitize_metadata(input, 64);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn sanitize_metadata_preserves_normal_text() {
+        let input = "data-analyst";
+        let result = sanitize_metadata(input, 64);
+        assert_eq!(result, "data-analyst");
+    }
     // ── shared test fixtures ──────────────────────────────────────────────
 
     struct NoopPlugin;
@@ -818,6 +896,8 @@ mod tests {
                 status: AgentStatus::Running,
                 harness: None,
                 is_main: false,
+                role: None,
+                description: None,
             },
         );
     }
@@ -830,6 +910,8 @@ mod tests {
                 status: AgentStatus::Running,
                 harness: None,
                 is_main: true,
+                role: None,
+                description: None,
             },
         );
     }
@@ -1193,6 +1275,8 @@ mod tests {
                 status: AgentStatus::Done(Box::new(done_result())),
                 harness: None,
                 is_main: false,
+                role: None,
+                description: None,
             },
         );
 
@@ -1208,6 +1292,41 @@ mod tests {
             }
             _ => panic!("expected text"),
         }
+    }
+
+    #[tokio::test]
+    async fn query_subagent_includes_role_and_description() {
+        let bus = message_bus_pair();
+        bus.register(
+            "sub-1",
+            AgentEntry {
+                status: AgentStatus::Running,
+                harness: None,
+                is_main: false,
+                role: Some("code-reviewer".into()),
+                description: Some("Review src/auth.rs".into()),
+            },
+        );
+
+        let tool = QuerySubagentTool::new(bus);
+        let ctx = make_tool_context();
+        let result = tool
+            .execute(serde_json::json!({"agent_id": "sub-1"}), &ctx)
+            .await
+            .unwrap();
+
+        let text = match &result.model_content[0] {
+            DataBlock::Text { text, .. } => text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(
+            text.contains("code-reviewer"),
+            "text must contain role: {text}"
+        );
+        assert!(
+            text.contains("Review src/auth.rs"),
+            "text must contain description: {text}"
+        );
     }
 
     // ── Tool 5: MessageMainTool ───────────────────────────────────────────

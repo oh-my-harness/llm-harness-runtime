@@ -82,6 +82,8 @@ pub enum AgentError {
     Aborted,
     #[error("agent is not idle")]
     NotIdle,
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("internal: {0}")]
     Internal(String),
     #[error("resource limit exceeded: {0}")]

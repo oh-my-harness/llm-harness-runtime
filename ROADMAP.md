@@ -28,13 +28,13 @@
 | **搜索工具** | ❌ | ❌ | ❌ | grep + glob 工具未实现（跨平台差异需独立工具） |
 | **BashTool 截断** | ⚠️ | ❌ | ⚠️ | ShellExecutor 有 TruncationStrategy 但 BashTool 未使用 |
 | **上下文压缩** | ⚠️ | ⚠️ | ⚠️ | compaction 基础设施完整，但 prompt 硬编码、无熔断器、无消息级不可压缩标记 |
-| **上下文注入** | ✅ | ⚠️ | ⚠️ | ContextMode (Append/Replace/Inject) + TransformContextHook 机制完整；缺结构化来源标注 (Inject(String)→Inject(Vec\<ContextBlock\>))、状态栏默认模板 |
+| **上下文注入** | ✅ | ⚠️ | ⚠️ | ContextMode (Append/Replace/Inject) + TransformContextHook 机制完整；Inject 已改为 Vec\<ContextBlock\> 结构化来源标注；缺状态栏默认模板 |
 | **状态栏** | ✅ | ❌ | ⚠️ | TransformContextHook/PrepareNextTurnHook 可注入；缺默认 XML 格式模板和内容收集器 |
 | **TODO 工具** | ❌ | ❌ | ❌ | 无 TODO write 工具 |
 | **成本/预算** | ✅ | ✅ | ✅ | CostAccumulatorHook + BudgetControlAdapter + UsageLedger（策略层代码待迁移到 strategy crate） |
 | **审计日志** | ✅ | ⚠️ | ⚠️ | AuditSink + SHA-256 hash chain；缺默认结构化日志格式 |
 | **沙箱** | ✅ | — | ✅ | Sandbox trait + os/bwrap/seatbelt 后端 |
-| **子 Agent** | ⚠️ | ⚠️ | ⚠️ | spawn + MessageBus + 7 个委派工具完整；SpawnOptions 不继承 system_prompt/tools/thinking_level；QuerySubagentTool 不返回 role/description |
+| **子 Agent** | ✅ | ⚠️ | ⚠️ | spawn + MessageBus + 7 个委派工具完整；SpawnOptions 支持 per-spawn system_prompt/thinking_level/role/description 覆盖；QuerySubagentTool 返回 role/description；ContextMode 结构化来源标注已实现 |
 | **MCP 集成** | ⚠️ | ⚠️ | ⚠️ | McpToolAdapter 基本可用；缺版本锁定、最小权限凭证管理、工具描述审查 |
 | **Skill 系统** | ✅ | ⚠️ | ⚠️ | SkillReadTool + format_skills_for_system_prompt 存在但无生产调用者；缺 BeforeRunHook 自动注入默认实现 |
 | **HITL** | ❌ | ❌ | ❌ | 无 request_human_approval/input 内置工具 |
@@ -43,7 +43,7 @@
 | **故障恢复** | ⚠️ | ⚠️ | ⚠️ | RetryConfig 退避完整；缺抖动、空闲看门狗、轨迹修复、连续失败计数器、死亡螺旋防护、全局 max_turns |
 | **Abort/取消** | ✅ | — | ✅ | CancellationToken (3 检查点) + AbortCascadeHook + phase_guard RAII + session 持久化 |
 | **提示工程** | ✅ | ⚠️ | ⚠️ | PromptTemplate + ResourceInjector 机制完整；缺注入短语黑名单、来源标签包裹默认策略 |
-| **提示注入防御** | ✅ | ⚠️ | ⚠️ | ContextMode 结构化标注机制待补；缺来源约束默认策略 |
+| **提示注入防御** | ✅ | ⚠️ | ⚠️ | ContextMode 结构化来源标注已实现；缺来源约束默认策略 |
 | **项目指令文件** | ✅ | ❌ | ⚠️ | BeforeRunHook 可注入；缺自动扫描 CLAUDE.md 等的默认实现 |
 | **持久终端会话** | ❌ | ❌ | ❌ | OsEnv::execute_shell 每次 `sh -c` 新进程，无 PTY |
 | **流式工具执行** | ❌ | ❌ | ❌ | loop_fn 消费完整 stream 后才 dispatch 工具 |
@@ -90,9 +90,9 @@
 | 1 | 自定义压缩 prompt 通路 | view 9 | `compaction.rs` | 高 |
 | 2 | 压缩熔断器（连续失败计数+停止） | view 9, 26 | `compaction_ops.rs` | 高 |
 | 3 | 标记消息为不可压缩 | view 9 | `messages.rs`/`compaction.rs` | 中 |
-| 4 | ContextMode 结构化来源标注 | view 19 | `spawn_types.rs`：Inject(String)→Inject(Vec\<ContextBlock\>) | 高 |
-| 5 | SpawnOptions 配置继承 | view 3, 12 | `spawn_types.rs`/`spawner.rs` | 高 |
-| 6 | QuerySubagentTool 返回 role/description | view 12 | `spawn/tools.rs` | 中 |
+| 4 | ~~ContextMode 结构化来源标注~~ ✅ 已实现 | view 19 | `spawn_types.rs`：Inject(String)→Inject(Vec\<ContextBlock\>) | ~~高~~ |
+| 5 | ~~SpawnOptions 配置继承~~ ✅ 已实现 | view 3, 12 | `spawn_types.rs`/`spawner.rs` | ~~高~~ |
+| 6 | ~~QuerySubagentTool 返回 role/description~~ ✅ 已实现 | view 12 | `spawn/tools.rs` | ~~中~~ |
 | 7 | NotificationChannel trait | view 13 | `types/` | 高 |
 | 8 | 退避抖动 (jitter) | view 26 | `config.rs` RetryConfig | 中 |
 | 9 | 流式空闲看门狗 | view 26 | `loop_fn.rs` | 中 |

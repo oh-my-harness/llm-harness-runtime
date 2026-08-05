@@ -1241,6 +1241,10 @@ impl super::WorkflowEngine {
                     status: crate::spawn::message_bus::AgentStatus::Running,
                     harness: None,
                     is_main: true,
+                    // role/description 仅子 agent 支持。主 agent 是唯一的，
+                    // 无需 role 标签区分，QuerySubagentTool 输出中也不展示。
+                    role: None,
+                    description: None,
                 },
             );
             injected_tool_names.insert(SPAWN_AGENT_TOOL_NAME.to_string());

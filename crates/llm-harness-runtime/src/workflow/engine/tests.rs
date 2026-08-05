@@ -3516,7 +3516,7 @@ async fn executor_step_creates_no_session_dir() {
 #[tokio::test]
 async fn subagent_session_lands_in_subagents_subdir() {
     use crate::spawn::message_bus::message_bus_pair;
-    use crate::spawn::spawn_types::{ContextMode, ProviderSelection, SpawnOptions};
+    use crate::spawn::spawn_types::SpawnOptions;
     use crate::spawn::spawner::HarnessSubAgentSpawner;
 
     let dir = tempfile::TempDir::new().unwrap();
@@ -3540,9 +3540,7 @@ async fn subagent_session_lands_in_subagents_subdir() {
     let session_id = spawner
         .spawn_async(SpawnOptions {
             prompt: "do sub work".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         })
         .await
         .expect("spawn should succeed");

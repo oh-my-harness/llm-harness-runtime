@@ -45,6 +45,10 @@ pub enum AgentStatus {
 pub struct AgentStatusSnapshot {
     pub agent_id: String,
     pub status: AgentStatus,
+    /// 子 Agent 的角色标签（来自 SpawnOptions.role）。纯展示元数据。
+    pub role: Option<String>,
+    /// 子 Agent 的职责描述（来自 SpawnOptions.description）。纯展示元数据。
+    pub description: Option<String>,
 }
 
 /// Entry in the agent registry.
@@ -54,12 +58,26 @@ pub struct AgentEntry {
     /// Main agent is always None (harness held externally).
     pub harness: Option<Arc<AgentHarness>>,
     pub is_main: bool,
+    /// 子 Agent 的角色标签（来自 SpawnOptions.role）。纯展示元数据。
+    pub role: Option<String>,
+    /// 子 Agent 的职责描述（来自 SpawnOptions.description）。纯展示元数据。
+    pub description: Option<String>,
 }
 
 impl AgentEntry {
     /// Detach the harness reference (called when sub agent completes).
     pub fn detach(&mut self) {
         self.harness = None;
+    }
+
+    /// Build a status snapshot from this entry.
+    pub fn to_snapshot(&self, agent_id: &str) -> AgentStatusSnapshot {
+        AgentStatusSnapshot {
+            agent_id: agent_id.to_string(),
+            status: self.status.clone(),
+            role: self.role.clone(),
+            description: self.description.clone(),
+        }
     }
 }
 
@@ -168,20 +186,9 @@ impl MessageBus {
         match id {
             Some(id) => agents
                 .get(id)
-                .map(|e| {
-                    vec![AgentStatusSnapshot {
-                        agent_id: id.to_string(),
-                        status: e.status.clone(),
-                    }]
-                })
+                .map(|e| vec![e.to_snapshot(id)])
                 .unwrap_or_default(),
-            None => agents
-                .iter()
-                .map(|(id, e)| AgentStatusSnapshot {
-                    agent_id: id.clone(),
-                    status: e.status.clone(),
-                })
-                .collect(),
+            None => agents.iter().map(|(id, e)| e.to_snapshot(id)).collect(),
         }
     }
 
@@ -704,6 +711,8 @@ mod tests {
                 status: AgentStatus::Running,
                 harness: Some(harness),
                 is_main: false,
+                role: None,
+                description: None,
             },
         );
 
@@ -749,6 +758,8 @@ mod tests {
                 status: AgentStatus::Running,
                 harness: Some(harness.clone()),
                 is_main: false,
+                role: None,
+                description: None,
             },
         );
 
@@ -774,6 +785,8 @@ mod tests {
                 status: AgentStatus::Running,
                 harness: None,
                 is_main: true,
+                role: None,
+                description: None,
             },
         );
 
@@ -810,6 +823,8 @@ mod tests {
                 status: AgentStatus::Running,
                 harness: None,
                 is_main: true,
+                role: None,
+                description: None,
             },
         );
         bus.register(
@@ -818,6 +833,8 @@ mod tests {
                 status: AgentStatus::Running,
                 harness: None,
                 is_main: false,
+                role: None,
+                description: None,
             },
         );
 
@@ -836,6 +853,8 @@ mod tests {
                 status: AgentStatus::Running,
                 harness: None,
                 is_main: false,
+                role: None,
+                description: None,
             },
         );
 
@@ -864,6 +883,8 @@ mod tests {
                 status: AgentStatus::Running,
                 harness: None,
                 is_main: false,
+                role: None,
+                description: None,
             },
         );
         bus.register_subagent_abort("sub-1", token1.clone());
@@ -890,6 +911,8 @@ mod tests {
                 status: AgentStatus::Running,
                 harness: None,
                 is_main: false,
+                role: None,
+                description: None,
             },
         );
 
@@ -939,6 +962,8 @@ mod tests {
                 status: AgentStatus::Done(Box::new(done_result)),
                 harness: None,
                 is_main: false,
+                role: None,
+                description: None,
             },
         );
 

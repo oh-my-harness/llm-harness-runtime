@@ -95,14 +95,16 @@
 > | 4 | ContextMode 结构化来源标注 | view 19 | `spawn_types.rs` | Inject(String) → Inject(Vec&lt;ContextBlock&gt;) 带 source 标签 |
 > | 5 | SpawnOptions 配置继承 | view 3, view 12 | `spawn_types.rs`/`spawner.rs` | 继承 system_prompt/tools/thinking_level |
 > | 6 | QuerySubagentTool 返回 role/description | view 12 | `spawn/tools.rs` | AgentStatus 增加职责描述字段 |
-> | 7 | NotificationChannel trait | view 13 | `types/` | 新 trait，类似 ExecutionEnv |
-> | 8 | 退避抖动（jitter） | view 26 | `config.rs` RetryConfig | delay_for 增加随机抖动 |
-> | 9 | 流式空闲看门狗 | view 26 | `loop_fn.rs` | stream 事件间超时检测 |
-> | 10 | 轨迹完整性自动修复 | view 26 | `loop_fn.rs` | ToolUse 缺 ToolResult 时自动修补 |
-> | 11 | MCP 服务器版本锁定 | view 17 | `runtime-mcp/` | 拒绝静默版本更新 |
-> | 12 | MCP 最小权限凭证管理 | view 17 | `runtime-mcp/` | 凭证作用域 |
-> | 13 | 截断后完整输出保存到临时文件 | view 18 | `tool.rs` ToolSessionProjection | Projected 投影后原始内容持久化到文件 |
->
+> | 7 | 退避抖动（jitter） | view 26 | `config.rs` RetryConfig | delay_for 增加随机抖动 |
+> | 8 | 流式空闲看门狗 | view 26 | `loop_fn.rs` | stream 事件间超时检测 |
+> | 9 | 轨迹完整性自动修复 | view 26 | `loop_fn.rs` | ToolUse 缺 ToolResult 时自动修补 |
+> | 10 | MCP 服务器版本锁定 | view 17 | `runtime-mcp/` | 拒绝静默版本更新 |
+> | 11 | MCP 最小权限凭证管理 | view 17 | `runtime-mcp/` | 凭证作用域 |
+> | 12 | 截断后完整输出保存到临时文件 | view 18 | `tool.rs` ToolSessionProjection | Projected 投影后原始内容持久化到文件 |
+> | 13 | Sidecar 专用机制（与流式输出并行的轻量 LLM 门控） | view 11 | `loop_fn.rs`/dispatch | 在工具调用 emit 时即触发并行审查，非 LLM 输出完整后才调用；与流式工具执行（暂不做）相关但更轻量——`BeforeToolCallHook` 的输入隔离已天然满足，缺并行调度 |
+> | 14 | 幂等性机制（idempotency key + 预检-确认两段式） | view 11 | `types/tool.rs` | idempotency key 传递和去重基础设施 + initiate→事件通知完成两段式工具接口 |
+> | 15 | 前台/后台调用区分 | view 26 | `compaction_ops.rs`/`loop_fn.rs` | 后台调用（如 compaction summary）失败无独立放弃策略，需独立放弃逻辑不终止整个 run |
+> | 16 | 中间输出过滤 hook（待评估） | view 5 | `types/hooks.rs` | `FinalAnswerValidator` 只覆盖最终答案提交点，非最终回复的中间输出无拦截 hook（`AfterTurnHook` 是纯通知无返回值）；待确认是否需要新增输出过滤 hook |
 > #### 阶段三：补齐 runtime 策略层缺失
 >
 > 按 28 个 view 中标记为"runtime 策略层缺失"的项目，在 `llm-harness-strategy` crate 中实现默认策略。这些只需注册 hook 或实现 trait，不需改机制层内部逻辑。
@@ -118,8 +120,7 @@
 > | 7 | 自动包裹来源标签策略 | view 6 | AfterToolCallHook 默认实现 | 中 |
 > | 8 | 注入短语黑名单模板 | view 6 | TransformContextHook 默认实现 | 低 |
 > | 9 | 状态栏内容来源约束 | view 6 | TransformContextHook 校验逻辑 | 中 |
-> | 10 | notify_user 内置工具 | view 13 | Tool trait 实现 + NotificationChannel | 高 |
-> | 11 | HITL 内置工具（request_human_approval/input）+ 超时降级 | view 12, 20 | Tool trait 实现 + timeout 默认 Deny | 高 |
+> | 10 | notify_user 内置工具 + NotificationChannel trait | view 13 | Tool trait 实现 + NotificationChannel trait（均放 strategy crate，不进机制层 types/） | 高 |
 > | 12 | 命令语义解析 | view 24 | BeforeToolCallHook + Shell 命令语义分析 | 中 |
 > | 13 | 持久记忆跨会话防线 | view 24 | BeforeToolCallHook/AfterToolCallHook 写入审查 | 中 |
 > | 14 | 项目指令文件自动注入 BeforeRunHook | view 25 | BeforeRunHook 默认实现（扫描 CLAUDE.md 等） | 高 |
@@ -140,6 +141,17 @@
 > | 29 | BashTool 截断策略 | view 18 | BashTool 改用 TruncationStrategy | 高 |
 > | 30 | 截断标注引导 Agent read 临时文件 | view 18 | 截断标注模板 | 中 |
 > | 31 | grep + glob 工具补齐 | view 15 | llm-harness-runtime-tools 新增 | 高 |
+> | 32 | 内置工具 description 改写（补充"什么时候用"+边界+示例+移除实现细节） | view 16 | 工具实现改进 | 高 |
+> | 33 | 内置工具参数描述补充具体例子 | view 16 | 工具实现改进 | 中 |
+> | 34 | 内置工具附带 1-5 个调用示例 | view 16 | 工具实现改进 | 中 |
+> | 35 | edit 工具 trailing newline 行为修正 | view 16 | 工具实现改进 | 中 |
+> | 36 | 模型降级（主模型过载自动切备用模型） | view 26 | BeforeProviderRequestHook + fallback model | 中 |
+> | 37 | 连续失败超阈值→人工升级 | view 26 | ShouldStopHook + 人工升级通知 | 中 |
+> | 38 | ContextMode::Inject 注入格式加来源标签 | view 19 | 默认注入格式模板（[FROM_MAIN_AGENT]/[FROM_USER]/[TOOL_RESULT]） | 中 |
+> | 39 | 后台任务监控 EventStream 默认实现（ShellMonitorStream） | view 14 | 基于 BashTool 后台进程 + stdout 行流 | 低 |
+> | 40 | 外部通道 webhook 接收器默认实现 | view 14 | EventStream 默认实现 | 低 |
+> | 41 | 事件结构化模板（来源/渠道/内容/上下文四维度默认 JSON schema） | view 14 | Event details 默认模板 | 低 |
+> | 42 | 事件过滤机制（基于 Event.details 的 predicate 过滤） | view 14 | EventStream wrapper 过滤接口 | 低 |
 >
 > 暂不做的项目（明确标记）：
 > - 流式工具执行（view 27）— 实现复杂度高
@@ -628,7 +640,7 @@
 | 10 | 感知工具的输出信息量控制 | 不上升为统一策略层 | 各工具输出特征差异大，统一阈值要么太宽要么太窄；截断位置和格式依赖工具自身语义 | ✅ 讨论后达成一致。机制层不缺：ToolSessionProjection（Full/Projected/Ephemeral）+ AfterToolCallHook + 工具实现的 offset/limit。当前各工具各自实现截断（ReadTool DEFAULT_MAX_LINES=300、SkillReadTool 256KB），BashTool 无截断。输出控制留在具体工具实现，不上升为统一策略层。唯一通用原则"截断必须显式标注"是设计准则非 runtime 功能 |
 | 11 | 执行工具的安全约束 | 机制层+runtime 策略层 | 机制层大部分已具备，但有两个实质缺失 | ✅ 讨论后达成一致。逐条对照教程 9 项安全机制：机制层已具备 5 项（权限控制 SandboxConfig、事前审批 BeforeToolCallHook async+Allow/Deny/Modify、自动验证 AfterToolCallHook、沙盒隔离 Sandbox trait+bwrap/seatbelt、取消 CancellationToken）；机制层缺失 2 项：Sidecar 专用机制（与流式输出并行的轻量 LLM 门控——BeforeToolCallHook 上下文已天然满足输入隔离，但非"与流式输出并行"）、幂等性机制（idempotency key/预检-确认两段式）；策略层缺失 3 项：默认危险命令黑名单、默认路径遍历防护规则、默认审计日志格式 |
 | 12 | 协作工具 | 机制层基本完备+runtime 策略层缺失 | 7 个内置工具覆盖完整生命周期，但 HITL 和 Agent 发现有缺口 | ✅ 讨论后达成一致。机制层：7 个 BuiltIn 工具（spawn_agent/message_subagent/await_subagent_reply/query_subagent/abort_subagent/message_main/await_main_message）覆盖启动/取消/消息传递/发现/查询。机制层缺失 2 项：QuerySubagentTool 不返回职责描述（只有 agent_id+status）、子 Agent 配置继承（观点 3 已标记——SpawnOptions 不继承 system_prompt/tools/thinking_level）。runtime 策略层缺失 2 项：HITL 内置工具+超时默认行为（request_human_approval/request_human_input 无 BuiltIn 工具，机制层 BeforeToolCallHook async+steer/follow_up channel 可实现但无开箱即用工具）、HITL 超时降级默认策略 |
-| 13 | 用户沟通工具 | 机制层+runtime 策略层 | 需要内置工具+渠道抽象 trait | ✅ 讨论后达成一致。当前只有 final_answer（结束 run），缺"向用户发消息但不结束 run"的内置工具。机制层缺失：NotificationChannel trait（抽象通知渠道，类似 ExecutionEnv 抽象文件系统/shell）。runtime 策略层缺失：内置 notify_user 工具（BuiltIn，LLM 可调用，通过 NotificationChannel 发送）、未配置渠道时 fallback 到 final_answer/steer、多渠道选择策略（按紧急程度选渠道） |
+| 13 | 用户沟通工具 | runtime 策略层 | 需要内置工具+渠道抽象 trait | ✅ 讨论后达成一致，后修正分类。当前只有 final_answer（结束 run），缺"向用户发消息但不结束 run"的内置工具。**修正**：原记"机制层缺失 NotificationChannel trait"有误——NotificationChannel 无机制层消费者（loop_fn/dispatch/session 不发通知），notify_user 工具只需实现 Tool trait 不改 loop 内部逻辑，符合策略层判定标准（观点 6 起的设计原则：策略层能做的尽量不放在机制层）。NotificationChannel trait + notify_user 工具均放 `llm-harness-strategy` crate，不进机制层 `types/`。ExecutionEnv 类比不成立：ExecutionEnv 有多个机制层消费者（read/write/bash/SkillReadTool/compaction），NotificationChannel 零个。runtime 策略层缺失：NotificationChannel trait + 内置 notify_user 工具（LLM 可调用，通过 NotificationChannel 发送，不结束 run）、未配置渠道时 fallback 到 final_answer/steer、超时降级、多渠道选择策略（后者暂不做） |
 | 14 | 事件触发工具 | 机制层基本完备+runtime 策略层缺失 | EventStream trait+WaitForExternalEventTool+steer/follow_up/abort 覆盖完整链路 | ✅ 讨论后达成一致。机制层：EventStream trait（业务层实现）+WaitForExternalEventTool（BuiltIn，阻塞等待事件，事件到达后 tool 返回 loop 续跑）+TaskStore（崩溃恢复）+steer（运行中注入消息）+follow_up（should_stop 后注入）+abort（CancellationToken）。机制层基本不缺。runtime 策略层缺失：三类常见事件触发工具（定时器 set_timer/后台监控 monitor_shell/外部通道 connect_channel）无内置实现，都要求业务层自己实现 EventStream |
 | 15 | 通用性设计：grep、glob 与 code_interpreter | llm-harness-runtime-tools 补齐 | bash+Sandbox=code_interpreter，不需要单独内置；grep+glob 需补齐 | ✅ 讨论后达成一致。code_interpreter 不需要在 runtime-tools 中内置——bash 是更通用的执行器（python -c/script.py 即可），沙盒由 Sandbox trait+bwrap/seatbelt 解决，预装库是部署配置。grep 需要补齐——跨平台语法差异（BSD vs GNU）让 Agent 自由发挥容易出错。glob 需要补齐——跨平台 glob 行为差异（shell 展开 vs 程序内匹配），Agent 用 bash 的 find 命令会遇到平台差异问题。当前 runtime-tools 有 read/write/edit/bash 但缺 grep/glob。三者均为 llm-harness-runtime-tools 常用工具 |
 | 16 | 工具描述艺术+参数保真性+工具演进 | 工具实现改进点 | 对照教程三节检查所有工具实现 | ✅ 讨论后达成一致。工具描述：所有工具 description 只说"能做什么"不说"什么时候用"和"做不到什么"；参数描述无具体例子；无调用示例（教程说附带示例可使准确率从 72%→90%）；read/edit 暴露实现细节（hashline/snapshot store）。参数保真性：edit 静默添加 trailing newline——与原文件内容有系统性偏差。工具演进：示例驱动调用缺失（同工具描述）、动态工具发现留到主动工具发现一节、代码编排执行留到第五章 |
@@ -776,25 +788,34 @@
 
 - **工具归属层**：协作工具的 7 个内置工具 → runtime 内置（`ToolLevel::BuiltIn`）。HITL 工具（`request_human_approval` / `request_human_input`）→ 应为 runtime 策略层提供的内置工具。多渠道通知（`send_im_notification` / `send_email_notification` / `send_slack_message`）→ 用户自定义。
 
-#### 观点 13：用户沟通工具 → 机制层+runtime 策略层
+#### 观点 13：用户沟通工具 → runtime 策略层（修正分类）
 
 - **教程依据**：ch4 "用户沟通工具"（line 386-400）。reply_to_user、send_card_to_user、send_user_notification。当 Agent 与用户的沟通从单一 session 内的一问一答，扩展到多渠道的异步消息时，"说话"本身也需要成为显式的工具调用。教程还提到多渠道召回（IM/短信/邮件/电话/推送，按紧急程度/用户状态/内容性质选择渠道）和异步消息模式（用户不一定在线，已读/未读追踪）。
 
 - **核心问题**：当前 runtime 的 agent→用户通信只有一个出口：`final_answer`（BuiltIn，结束 run 并返回最终答案）。教程说的场景是异步通知——agent 在长时间运行中主动通知用户、用户召回、多渠道触达。`final_answer` 结束 run，不能用于中间通知。
 
-- **三层归属**：
+- **修正记录**：原记"机制层缺失：需要 `NotificationChannel` trait（类似 `ExecutionEnv` 抽象文件系统/shell）"。经讨论后修正为纯策略层缺失，理由如下：
 
-  **机制层**：❌ 缺失。需要 `NotificationChannel` trait（类似 `ExecutionEnv` 抽象文件系统/shell），用户实现具体渠道。当前没有——agent 只能通过 `final_answer`（结束 run）或 `steer()`（API 层注入，非 LLM 可调用）与用户通信。
+  1. **ExecutionEnv 类比不成立**。`ExecutionEnv` 之所以是机制层 trait，是因为机制层自身有大量消费者（read/write/bash/SkillReadTool/compaction 落盘）。`NotificationChannel` 的机制层消费者数量为零——`loop_fn`/`dispatch`/`session` 内部从不发通知。抽象一个机制层自身不依赖的 trait 违反 trait 放机制层的必要条件。
+  2. **违反"策略层能做的尽量不放在机制层"原则**（观点 6 起贯彻）。`notify_user` 工具只需实现 `Tool` trait 并注册到 builder——不改 `loop_fn`/`session`/`dispatch` 内部逻辑。符合架构决策的边界判定标准："如果实现只需注册 hook 或实现 trait → 策略层"。
+  3. **notify_user 不需要 BuiltIn 级别**。`final_answer` 是 `BuiltIn` 因为 loop 引擎对它有特殊处理（`loop_fn.rs:596-619` 检测 final_answer tool call 并当作终止信号）。`notify_user` 不需要任何 loop 特殊处理——它就是一个普通工具：发消息、返回 `ToolResult { terminate: false }`。没有理由进 `BUILTIN_TOOL_NAMES`。
+  4. **trait 放机制层的真实成本**。如果 `NotificationChannel` 放 `crates/llm-harness-types/src/`，所有下游 crate 多一个类型依赖（即使不用通知功能也要编译），trait 定义一旦发布就很难改（跨 crate ABI），与 YAGNI 相悖。
+  5. **教程依据再审视**。教程 ch4 line 386-400 说的是"说话需要成为显式工具调用"，强调的是工具化，不是"需要 runtime 提供通道抽象 trait"。教程的 `reply_to_user`/`send_card_to_user`/`send_user_notification` 都是具体工具，不是 trait。
 
-  **runtime 策略层**：❌ 缺失。
-  - 内置的 `notify_user` 工具（BuiltIn）——LLM 可调用，通过 `NotificationChannel` trait 发送消息，不结束 run。
+- **修正后三层归属**：
+
+  **机制层**：✅ 不缺失。`Tool` trait（策略层实现 notify_user 工具的接口）+ `ToolContext`（工具执行上下文，已含 `RunExtensions` typed slot 可传递通道实例）+ `BUILTIN_TOOL_NAMES` 保留名机制（notify_user 不需要进）。机制层无需新增任何类型或改任何内部逻辑。
+
+  **runtime 策略层**：❌ 缺失。以下均放 `llm-harness-strategy` crate：
+  - `NotificationChannel` trait——抽象通知渠道（`Send + Sync`，`send(&self, msg: NotificationMessage) -> BoxFuture<Result<(), NotificationError>>`），用户实现具体渠道。
+  - 内置的 `notify_user` 工具（`ToolLevel::User`，非 BuiltIn）——LLM 可调用，通过 `NotificationChannel` trait 发送消息，不结束 run（`terminate: false`）。
   - 默认行为：未配置渠道时 fallback 到 `final_answer` 或 `steer`。
   - 超时降级：通知发送超时后的保守策略。
-  - 多渠道选择策略：按紧急程度/用户状态/内容性质选择渠道的默认规则。
+  - 多渠道选择策略：按紧急程度/用户状态/内容性质选择渠道的默认规则（暂不做，太复杂）。
 
-  **用户策略层**：具体渠道实现（IM/邮件/Slack/推送）、推送内容措辞、用户偏好。
+  **用户策略层**：具体渠道实现（IM/邮件/Slack/推送，实现 `NotificationChannel` trait）、推送内容措辞、用户偏好。
 
-- **工具归属层**：`notify_user` → runtime 策略层提供的内置工具（通过 `NotificationChannel` trait 抽象渠道）。具体渠道实现（`send_im_notification`/`send_email_notification`/`send_slack_message`）→ 用户自定义（实现 `NotificationChannel` trait）。
+- **工具归属层**：`notify_user` + `NotificationChannel` trait → `llm-harness-strategy` crate（`ToolLevel::User`，非 BuiltIn）。具体渠道实现（`send_im_notification`/`send_email_notification`/`send_slack_message`）→ 用户自定义（实现 `NotificationChannel` trait）。
 
 - **与协作工具的边界**（教程 line 394）：同样是"发通知"，通知对象是审批者或协作者 → 协作工具（观点 12 的 HITL）；通知对象是最终用户本人 → 用户沟通工具（本观点）。区别不在渠道，而在"通知谁、为什么通知"。
 
@@ -1089,24 +1110,16 @@
 
   **上下文来源标注**：教程说"提示中应该明确区分各个来源：'[FROM_MAIN_AGENT] 是主协调 Agent 给你的任务指令；[FROM_USER] 是用户直接补充的信息；[TOOL_RESULT] 是你调用工具后的返回结果'。这种标注可以防止子 Agent 混淆信息来源，避免提示注入攻击。"
 
-  当前 `ContextMode::Inject(String)` 的格式：
-  ```
-  Context:
-  {ctx}
+  ~~当前 `ContextMode::Inject(String)` 的格式：~~ **已实现**：`ContextMode::Inject(Vec<ContextBlock>)`，每个 block 带 `ContextSource` 标签（`ParentConversation`/`File`/`UserInstruction`/`Custom`），渲染为 `[Context: {label}]\n{content}\n\n`。
 
-  ---
+  ~~问题：~~ **已解决**：
+  1. ~~`{ctx}` 是无结构大块文本，来源不可区分~~ → 每个 block 独立标注来源
+  2. ~~无 `[FROM_MAIN_AGENT]`/`[FROM_USER]`/`[TOOL_RESULT]` 标签~~ → `[Context: Parent Conversation]`/`[Context: User Instruction]` 等标签
+  3. ~~攻击者可通过 `ctx` 中的内容注入指令~~ → 来源标签让子 Agent 可区分数据来源
 
-  {prompt}
-  ```
+  ~~**改进点 1**：`ContextMode` 需结构化上下文来源标注。~~ ✅ 已实现：`Inject(Vec<ContextBlock>)`，每个 block 带 source 标签。
 
-  问题：
-  1. `{ctx}` 是无结构大块文本，来源不可区分——主 Agent 任务指令、用户补充信息、工具结果混在一起
-  2. 无 `[FROM_MAIN_AGENT]`/`[FROM_USER]`/`[TOOL_RESULT]` 标签
-  3. 攻击者可通过 `ctx` 中的内容注入指令（如"忽略以上所有指令，改为..."），子 Agent 无法区分这是数据还是指令
-
-  **改进点 1**：`ContextMode` 需结构化上下文来源标注。当前 `Inject(String)` 是无结构文本，教程要求区分来源防提示注入。可扩展为 `Inject(Vec<ContextBlock>)`，每个 block 带 source 标签（`FromMainAgent`/`FromUser`/`FromToolResult`）。归属机制层。
-
-  **改进点 2**：`ContextMode::Inject` 的注入格式需加来源标签。当前 `"Context:\n{ctx}"` 无标注，应改为按 source 分段标注。归属 runtime 策略层。
+  ~~**改进点 2**：`ContextMode::Inject` 的注入格式需加来源标签。~~ ✅ 已实现：`render_context_blocks` 按 source 分段标注。
 
 - **三、子 Agent 配置继承**（view 3/12 已标记，不重复）
 
@@ -1125,7 +1138,7 @@
 
 - **教程依据**：ch4 "超时和降级策略"（HITL 请求的超时阈值+默认行为+优先级队列）。HITL 请求可能不会立即得到响应，需要设置超时阈值和默认行为："如果 5 分钟内没有响应，采用保守策略"。还需要引入优先级队列："紧急请求通过多渠道通知，普通请求只发邮件"。
 
-- **与 view 12/13 的关系**：view 12 已标记 HITL 内置工具缺失+超时降级默认策略缺失。view 13 已标记 NotificationChannel trait 缺失+多渠道选择策略缺失。本次深化超时参数和降级默认行为的具体机制，并评估优先级队列。
+- **与 view 12/13 的关系**：view 12 已标记 HITL 内置工具缺失+超时降级默认策略缺失。view 13 已标记 NotificationChannel trait + notify_user 工具缺失（均归 runtime 策略层，不进机制层——见观点 13 修正记录）+多渠道选择策略缺失。本次深化超时参数和降级默认行为的具体机制，并评估优先级队列。
 
 - **一、超时阈值**
 
@@ -1156,7 +1169,7 @@
 
   runtime 现状：`BeforeToolCallHook` 和 `steer()`/`follow_up()` 都是无优先级的 FIFO 通道，无优先级队列概念。
 
-  **暂缓**：优先级队列+多渠道通知+选择策略复杂度高，暂不做。view 13 已标记 NotificationChannel trait 缺失和多渠道选择策略缺失，留待后续评估。
+  **暂缓**：优先级队列+多渠道通知+选择策略复杂度高，暂不做。view 13 已标记 NotificationChannel trait + notify_user 工具缺失（归 runtime 策略层）和多渠道选择策略缺失，留待后续评估。
 
 - **改进点汇总**：
 

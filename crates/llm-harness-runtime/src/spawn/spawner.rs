@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use crate::spawn::message_bus::{AgentEntry, AgentStatus, MessageBus};
 use crate::spawn::spawn_types::{
-    ContextMode, ProviderSelection, SpawnOptions, SubAgentHandle, SubAgentResult,
+    ContextBlock, ContextMode, ContextSource, ProviderSelection, SpawnOptions, SubAgentHandle,
+    SubAgentResult,
 };
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -200,6 +201,57 @@ impl HarnessSubAgentSpawner {
     }
 }
 
+/// 将 ContextBlock 列表渲染为带来源标签的文本。
+/// File 变体触发文件读取；绝对路径原样使用，相对路径相对 cwd 解析。
+/// 其他变体直接使用 content。File 读取上限 1 MiB，超出返回 Err。
+const FILE_CONTEXT_MAX_BYTES: u64 = 1024 * 1024;
+
+async fn render_context_blocks(
+    blocks: &[ContextBlock],
+    cwd: &Path,
+) -> Result<String, std::io::Error> {
+    if blocks.is_empty() {
+        return Ok(String::new());
+    }
+    let mut buf = String::new();
+    for block in blocks {
+        let (label, content, file_path) = match &block.source {
+            ContextSource::ParentConversation => {
+                ("Parent Conversation", block.content.clone(), None)
+            }
+            ContextSource::File(path) => {
+                let resolved = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    cwd.join(path)
+                };
+                let metadata = tokio::fs::metadata(&resolved).await?;
+                if metadata.len() > FILE_CONTEXT_MAX_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::FileTooLarge,
+                        format!(
+                            "context file too large: {} ({} bytes, max {})",
+                            resolved.display(),
+                            metadata.len(),
+                            FILE_CONTEXT_MAX_BYTES
+                        ),
+                    ));
+                }
+                let content = tokio::fs::read_to_string(&resolved).await?;
+                ("File", content, Some(path.clone()))
+            }
+            ContextSource::UserInstruction => ("User Instruction", block.content.clone(), None),
+            ContextSource::Custom(name) => (name.as_str(), block.content.clone(), None),
+        };
+        let path_suffix = match &file_path {
+            Some(p) => format!(": {}", p.display()),
+            None => String::new(),
+        };
+        buf.push_str(&format!("[Context: {label}{path_suffix}]\n{content}\n\n"));
+    }
+    buf.push_str("---\n\n");
+    Ok(buf)
+}
 impl HarnessSubAgentSpawner {
     /// 私有：构建 sub-agent harness + tokio task，返回 `SubAgentHandle` 和 session_id。
     ///
@@ -276,6 +328,15 @@ impl HarnessSubAgentSpawner {
             if let Some(customize) = &builder_customize {
                 builder = customize(builder);
             }
+            // per-spawn 覆盖：在全局闭包之上覆盖。
+            // 依赖 HarnessBuilder::system_prompt 的覆盖语义（赋值而非追加）。
+            // 若未来 system_prompt 改为追加语义，per-spawn 覆盖会静默失效。
+            if let Some(sp) = &opts.system_prompt {
+                builder = builder.system_prompt(Some(sp.clone()));
+            }
+            if let Some(tl) = opts.thinking_level {
+                builder = builder.thinking_level(tl);
+            }
             let harness = builder
                 .build_with_session(env, Session::new(storage))
                 .map_err(|e: HarnessBuildError| {
@@ -287,9 +348,22 @@ impl HarnessSubAgentSpawner {
 
             // 7. 构建 prompt（可选的 context 注入）。
             let prompt = match &opts.context {
-                ContextMode::None => opts.prompt,
-                ContextMode::Inject(ctx) => {
-                    format!("Context:\n{ctx}\n\n---\n\n{}", opts.prompt)
+                ContextMode::None => opts.prompt.clone(),
+                ContextMode::Inject(blocks) => {
+                    let ctx_text =
+                        render_context_blocks(blocks, &cwd)
+                            .await
+                            .map_err(|e| match e.kind() {
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::FileTooLarge => {
+                                    AgentError::InvalidInput(format!(
+                                        "context block render failed: {e}"
+                                    ))
+                                }
+                                _ => AgentError::Internal(format!(
+                                    "context block render failed: {e}"
+                                )),
+                            })?;
+                    format!("{ctx_text}{}", opts.prompt)
                 }
             };
 
@@ -303,6 +377,8 @@ impl HarnessSubAgentSpawner {
                     status: AgentStatus::Running,
                     harness: Some(harness.clone()),
                     is_main: false,
+                    role: opts.role.clone(),
+                    description: opts.description.clone(),
                 },
             );
 
@@ -747,8 +823,7 @@ mod tests {
             .spawn_inner(SpawnOptions {
                 prompt: "hello".into(),
                 provider: ProviderSelection::Alias("fast".into()),
-                cwd: None,
-                context: ContextMode::None,
+                ..Default::default()
             })
             .await
             .expect("spawn with known alias should succeed");
@@ -766,8 +841,7 @@ mod tests {
             .spawn_inner(SpawnOptions {
                 prompt: "hello".into(),
                 provider: ProviderSelection::Alias("does-not-exist".into()),
-                cwd: None,
-                context: ContextMode::None,
+                ..Default::default()
             })
             .await
             .expect_err("spawn with unknown alias should fail");
@@ -787,16 +861,14 @@ mod tests {
         let (_handle, _session_id) = spawner
             .spawn_inner(SpawnOptions {
                 prompt: "hello".into(),
-                provider: ProviderSelection::Inherit,
-                cwd: None,
-                context: ContextMode::None,
+                ..Default::default()
             })
             .await
             .expect("spawn with Inherit should succeed");
 
         assert_eq!(factory.model(), Some("default-model".into()));
     }
-    /// ContextMode::Inject(text) → prompt 前缀正确。
+    /// ContextMode::Inject(Vec<ContextBlock>) → prompt 前缀正确。
     #[tokio::test]
     async fn context_injection_prefixes_prompt() {
         let mock = MockResponse::text("response from sub-agent");
@@ -808,9 +880,11 @@ mod tests {
         let (handle, _session_id) = spawner
             .spawn_inner(SpawnOptions {
                 prompt: "my task".into(),
-                provider: ProviderSelection::Inherit,
-                cwd: None,
-                context: ContextMode::Inject("relevant context".into()),
+                context: ContextMode::Inject(vec![ContextBlock {
+                    source: ContextSource::ParentConversation,
+                    content: "relevant context".into(),
+                }]),
+                ..Default::default()
             })
             .await
             .expect("spawn with Inject should succeed");
@@ -846,7 +920,7 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(
-            user_text.contains("Context:\nrelevant context\n\n---\n\n"),
+            user_text.contains("[Context: Parent Conversation]\nrelevant context\n\n---\n\n"),
             "user message should contain context prefix, got: {user_text:?}"
         );
     }
@@ -866,9 +940,7 @@ mod tests {
         let (handle, _session_id) = spawner
             .spawn_inner(SpawnOptions {
                 prompt: "do the thing".into(),
-                provider: ProviderSelection::Inherit,
-                cwd: None,
-                context: ContextMode::None,
+                ..Default::default()
             })
             .await
             .expect("spawn should succeed");
@@ -890,9 +962,7 @@ mod tests {
         let (handle, _session_id) = spawner
             .spawn_inner(SpawnOptions {
                 prompt: "do the thing".into(),
-                provider: ProviderSelection::Inherit,
-                cwd: None,
-                context: ContextMode::None,
+                ..Default::default()
             })
             .await
             .expect("spawn should succeed");
@@ -927,9 +997,7 @@ mod tests {
 
         let opts = SpawnOptions {
             prompt: "say hi".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         };
         let agent_id = spawner
             .spawn_async(opts)
@@ -949,9 +1017,7 @@ mod tests {
         let spawner = make_async_test_spawner(bus.clone()).max_concurrent(Some(0));
         let opts = SpawnOptions {
             prompt: "say hi".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         };
         let err = spawner
             .spawn_async(opts)
@@ -981,9 +1047,7 @@ mod tests {
 
         let opts = SpawnOptions {
             prompt: "say hi".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         };
         let _err = spawner
             .spawn_async(opts)
@@ -996,9 +1060,7 @@ mod tests {
         let spawner2 = make_async_test_spawner(bus.clone()).max_concurrent(Some(3));
         let opts2 = SpawnOptions {
             prompt: "say hi".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         };
         let _id = spawner2
             .spawn_async(opts2)
@@ -1047,9 +1109,7 @@ mod tests {
         .max_concurrent(Some(1));
         let opts = SpawnOptions {
             prompt: "say hi".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         };
 
         let spawn_task = tokio::spawn(async move { spawner.spawn_async(opts).await });
@@ -1081,9 +1141,7 @@ mod tests {
         let spawner = make_async_test_spawner(bus.clone()).max_concurrent(Some(5));
         let opts = SpawnOptions {
             prompt: "say hi".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         };
         let _id = spawner.spawn_async(opts).await.expect("should succeed");
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1125,5 +1183,158 @@ mod tests {
         harness.steer("from-main");
 
         handle.await.expect("spawned task should complete");
+    }
+
+    #[tokio::test]
+    async fn render_context_blocks_various_sources() {
+        let dir = std::env::temp_dir();
+        let file_path = dir.join("test_render_ctx.txt");
+        std::fs::write(&file_path, "file content here").unwrap();
+
+        let blocks = vec![
+            ContextBlock {
+                source: ContextSource::ParentConversation,
+                content: "User asked to fix auth bug.".into(),
+            },
+            ContextBlock {
+                source: ContextSource::File(file_path.clone()),
+                content: String::new(),
+            },
+            ContextBlock {
+                source: ContextSource::Custom("constraints".into()),
+                content: "Must use async/await.".into(),
+            },
+        ];
+
+        let cwd = std::path::Path::new(".");
+        let rendered = render_context_blocks(&blocks, cwd).await.unwrap();
+
+        assert!(rendered.contains("[Context: Parent Conversation]"));
+        assert!(rendered.contains("User asked to fix auth bug."));
+        assert!(rendered.contains("[Context: File"));
+        assert!(rendered.contains("file content here"));
+        assert!(rendered.contains("[Context: constraints]"));
+        assert!(rendered.contains("Must use async/await."));
+        assert!(rendered.ends_with("---\n\n"));
+    }
+
+    #[tokio::test]
+    async fn render_context_blocks_empty_vec() {
+        let rendered = render_context_blocks(&[], std::path::Path::new("."))
+            .await
+            .unwrap();
+        assert_eq!(rendered, "");
+    }
+
+    #[tokio::test]
+    async fn render_context_blocks_file_not_found() {
+        let blocks = vec![ContextBlock {
+            source: ContextSource::File(std::path::PathBuf::from("/nonexistent/file.txt")),
+            content: String::new(),
+        }];
+        let result = render_context_blocks(&blocks, std::path::Path::new(".")).await;
+        assert!(
+            result.is_err(),
+            "File variant with nonexistent path should error"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_context_blocks_file_too_large() {
+        let dir = std::env::temp_dir();
+        let file_path = dir.join("test_render_ctx_large.txt");
+        // Write > 1 MiB to trigger FileTooLarge guard.
+        let big_content = "x".repeat((FILE_CONTEXT_MAX_BYTES + 1) as usize);
+        std::fs::write(&file_path, &big_content).unwrap();
+
+        let blocks = vec![ContextBlock {
+            source: ContextSource::File(file_path.clone()),
+            content: String::new(),
+        }];
+        let result = render_context_blocks(&blocks, std::path::Path::new(".")).await;
+        assert!(result.is_err(), "File exceeding size cap should error");
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        assert!(
+            err.to_string().contains("too large"),
+            "error message should mention 'too large': {err}"
+        );
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    /// Verifies role/description propagate through the real spawner path:
+    /// SpawnOptions → spawn_inner → AgentEntry registration → bus.query_status.
+    #[tokio::test]
+    async fn role_description_propagate_to_query() {
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
+        let bus = message_bus_pair();
+        let (spawner, _factory, _) = make_spawner(client, "default-model", bus.clone());
+
+        let (handle, _session_id) = spawner
+            .spawn_inner(SpawnOptions {
+                prompt: "do task".into(),
+                role: Some("data-analyst".into()),
+                description: Some("Analyze Q3 sales data".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("spawn should succeed");
+
+        // AgentEntry is registered before the tokio task starts, so we can
+        // query immediately without waiting for completion.
+        let snapshots = bus.query_status(None);
+        let our_agent = snapshots
+            .iter()
+            .find(|s| s.role.as_deref() == Some("data-analyst"))
+            .expect("agent with role must be registered");
+
+        assert_eq!(our_agent.role.as_deref(), Some("data-analyst"));
+        assert_eq!(
+            our_agent.description.as_deref(),
+            Some("Analyze Q3 sales data")
+        );
+
+        // Let the sub-agent finish to avoid dangling task.
+        let _ = handle.join().await;
+    }
+
+    /// Verifies per-spawn system_prompt overrides the global builder_customize
+    /// system_prompt. Global sets "global-prompt", per-spawn sets "override-prompt",
+    /// captured LLM request must contain "override-prompt" as system message.
+    #[tokio::test]
+    async fn per_spawn_system_prompt_overrides_global() {
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
+        let client_clone = client.clone();
+        let bus = message_bus_pair();
+        let (spawner, _factory, _) = make_spawner(client, "default-model", bus);
+        let spawner = spawner.builder_customize(Some(Arc::new(|b| {
+            b.system_prompt(Some("global-prompt".to_string()))
+        })));
+
+        let (handle, _session_id) = spawner
+            .spawn_inner(SpawnOptions {
+                prompt: "do task".into(),
+                system_prompt: Some("override-prompt".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("spawn should succeed");
+
+        let _ = handle.join().await;
+
+        let captured = client_clone.captured_requests.lock().unwrap();
+        let system_msg = captured
+            .first()
+            .expect("should have at least one request")
+            .messages()
+            .iter()
+            .find(|m| matches!(m, LlmMessage::System(_)))
+            .expect("should have a system message");
+        let system_text = match system_msg {
+            LlmMessage::System(s) => s,
+            _ => unreachable!(),
+        };
+        assert_eq!(system_text, "override-prompt");
     }
 }

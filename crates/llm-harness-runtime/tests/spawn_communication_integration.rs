@@ -24,7 +24,7 @@ use llm_harness_runtime::spawn::delivery::IdleWatcher;
 use llm_harness_runtime::spawn::message_bus::{
     AgentEntry, AgentStatus, MessageBus, SendReceipt, SubAgentEvent, message_bus_pair,
 };
-use llm_harness_runtime::spawn::spawn_types::{ContextMode, ProviderSelection, SpawnOptions};
+use llm_harness_runtime::spawn::spawn_types::SpawnOptions;
 use llm_harness_runtime::spawn::spawner::{
     EnvFactory, HarnessSubAgentSpawner, JsonlSessionFactory,
 };
@@ -92,6 +92,8 @@ fn register_sub(bus: &Arc<MessageBus>, id: &str) {
             status: AgentStatus::Running,
             harness: None,
             is_main: false,
+            role: None,
+            description: None,
         },
     );
 }
@@ -104,6 +106,8 @@ fn register_main(bus: &Arc<MessageBus>) {
             status: AgentStatus::Running,
             harness: None,
             is_main: true,
+            role: None,
+            description: None,
         },
     );
 }
@@ -132,9 +136,7 @@ async fn async_spawn_completion_test() {
     let agent_id = spawner
         .spawn_async(SpawnOptions {
             prompt: "say ok".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         })
         .await
         .expect("spawn_async should succeed");
@@ -195,6 +197,8 @@ async fn message_subagent_steer_test() {
             status: AgentStatus::Running,
             harness: Some(harness.clone()),
             is_main: false,
+            role: None,
+            description: None,
         },
     );
     register_main(&bus);
@@ -243,6 +247,8 @@ async fn custom_message_persistence_no_waiter_test() {
             status: AgentStatus::Running,
             harness: Some(sub_harness.clone()),
             is_main: false,
+            role: None,
+            description: None,
         },
     );
     register_main(&bus);
@@ -429,9 +435,7 @@ async fn idle_watcher_wake_test() {
     let _agent_id = spawner
         .spawn_async(SpawnOptions {
             prompt: "say ok".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         })
         .await
         .expect("spawn_async should succeed");
@@ -564,9 +568,7 @@ async fn abort_propagation_test() {
     let agent_id = spawner
         .spawn_async(SpawnOptions {
             prompt: "call the blocking tool".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         })
         .await
         .expect("spawn_async should succeed");
@@ -634,9 +636,7 @@ async fn done_event_matches_waiter_test() {
     let agent_id = spawner
         .spawn_async(SpawnOptions {
             prompt: "say completed".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         })
         .await
         .expect("spawn_async should succeed");
@@ -696,9 +696,7 @@ async fn query_status_after_completion_test() {
     let agent_id = spawner
         .spawn_async(SpawnOptions {
             prompt: "say finished".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         })
         .await
         .expect("spawn_async should succeed");
@@ -745,18 +743,14 @@ async fn cancel_all_aborts_inflight_subagents_test() {
     let _id1 = spawner
         .spawn_async(SpawnOptions {
             prompt: "block".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         })
         .await
         .expect("spawn 1");
     let _id2 = spawner
         .spawn_async(SpawnOptions {
             prompt: "block".into(),
-            provider: ProviderSelection::Inherit,
-            cwd: None,
-            context: ContextMode::None,
+            ..Default::default()
         })
         .await
         .expect("spawn 2");
