@@ -348,6 +348,14 @@ pub struct BeforeCompactCtx<'a> {
     pub reserve_tokens: usize,
     /// 压缩时保留的近期历史 token 数。
     pub keep_recent_tokens: usize,
+    /// 当前任务查询意图，由调用方通过 `AgentHarnessOptions.compaction_query` 提供。
+    /// None 表示不使用上下文感知压缩。
+    /// 机制层不做 fallback 提取——query 的语义判断是策略层职责。
+    ///
+    /// 此字段对 hook 是只读上下文，不可注入。hook 若需使用自定义 query
+    /// 生成摘要，应返回 `BeforeCompactDecision::Override` 并自行构造
+    /// `CompactionResult`——此时 hook 拥有完全控制权，包括 query 的使用方式。
+    pub current_query: Option<&'a str>,
 }
 
 /// `BeforeCompactHook::before_compact` 的返回决策。
@@ -400,6 +408,22 @@ mod tests {
         let d = BeforeCompactDecision::Compact;
         assert!(!matches!(d, BeforeCompactDecision::Proceed));
         assert!(!matches!(d, BeforeCompactDecision::Skip));
+    }
+
+    #[test]
+    fn before_compact_ctx_has_current_query() {
+        let msgs: Vec<AgentMessage> = vec![];
+        let ids: Vec<EntryId> = vec![];
+        let ctx = BeforeCompactCtx {
+            estimated_tokens: 100,
+            messages: &msgs,
+            entry_ids: &ids,
+            context_window: 200_000,
+            reserve_tokens: 16_384,
+            keep_recent_tokens: 20_000,
+            current_query: Some("find payment callback"),
+        };
+        assert_eq!(ctx.current_query, Some("find payment callback"));
     }
 
     #[test]

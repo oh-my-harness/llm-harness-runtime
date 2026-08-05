@@ -340,6 +340,7 @@ mod tests {
                 payload: SessionEntryPayload::SessionInfo {
                     name: "body-must-not-enter-event".into(),
                 },
+                compaction_policy: None,
             })
             .await
             .unwrap();
@@ -371,6 +372,7 @@ mod tests {
                 parent_id: None,
                 timestamp: Utc::now(),
                 payload: SessionEntryPayload::Unknown,
+                compaction_policy: None,
             })
             .await
             .unwrap();

@@ -4,11 +4,11 @@ use chrono::Utc;
 use llm_harness_loop::LlmMessage;
 use llm_harness_loop::{ChatRequest, LlmClient, RequestContent};
 use llm_harness_types::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::ModelInfo;
-use crate::session::types::{CompactionEntry, SessionEntry, SessionEntryPayload};
+use crate::session::types::{CompactionEntry, CompactionPolicy, SessionEntry, SessionEntryPayload};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -29,7 +29,13 @@ Be concise but complete. Preserve:\n\
 - What has been done and what remains\n\
 - Key decisions and their rationale\n\
 - Critical technical details (file paths, function names, error messages)\n\
-- The immediate next steps\n";
+- The immediate next steps\n\
+\n";
+
+/// Instruction appended to every compaction system prompt (both hardcoded
+/// and custom) so the LLM knows to preserve <no-compact> tagged content.
+const NO_COMPACT_INSTRUCTION: &str = "\
+Content wrapped in <no-compact> tags must be preserved verbatim in your summary — do not summarize, paraphrase, or omit it.\n";
 
 /// User-facing instructions appended to each compaction summary request.
 const SUMMARY_REQUEST: &str = "\
@@ -87,6 +93,168 @@ pub struct CompactionThresholdConfig {
     pub context_window: u32,
 }
 
+/// Custom compaction prompt configuration.
+///
+/// When set on [`CompactionSummaryConfig`], replaces the hardcoded
+/// `SUMMARIZATION_SYSTEM_PROMPT` / `SUMMARY_REQUEST` constants.
+///
+/// `user_template` supports these placeholders:
+/// - `{conversation}` — text-serialized entries to compress
+/// - `{previous_summary}` — prior compaction summary text (if any)
+/// - `{file_operations}` — formatted file operation list (if any)
+/// - `{query}` — current task query intent (if provided by caller/hook)
+///
+/// `{` and `}` are reserved for placeholder syntax — there is no escape
+/// sequence (e.g. `{{`). Templates must not contain literal braces outside
+/// of recognized placeholders; `new()` will reject unknown `{...}` patterns.
+/// If the prompt needs literal JSON or other braced text, put it in the
+/// `system_prompt` (which is not parsed for placeholders).
+#[derive(Debug, Clone, Serialize)]
+pub struct CompactionPromptSpec {
+    /// System prompt for the summary LLM.
+    pub(crate) system_prompt: String,
+    /// User message template with placeholder substitution.
+    pub(crate) user_template: String,
+}
+
+/// Known placeholders supported by `CompactionPromptSpec::user_template`.
+const KNOWN_PLACEHOLDERS: &[&str] = &[
+    "conversation",
+    "previous_summary",
+    "file_operations",
+    "query",
+];
+
+/// Find the closest known placeholder to `name` by edit distance.
+fn closest_placeholder(name: &str) -> String {
+    KNOWN_PLACEHOLDERS
+        .iter()
+        .map(|&candidate| (candidate, edit_distance(name, candidate)))
+        .min_by_key(|&(_, d)| d)
+        .map(|(candidate, _)| candidate.to_string())
+        .expect("KNOWN_PLACEHOLDERS is non-empty")
+}
+
+/// Simple Levenshtein edit distance.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+impl CompactionPromptSpec {
+    /// Create a new prompt spec, validating that `user_template` only
+    /// contains known placeholders and includes `{conversation}`.
+    ///
+    /// Returns `Err(UnknownPlaceholder)` if an unrecognized `{...}` pattern
+    /// is found, with a suggestion for the closest known placeholder.
+    ///
+    /// Returns `Err(MissingRequiredPlaceholder)` if `{conversation}` is
+    /// absent — without it the summary LLM receives no conversation content.
+    pub fn new(
+        system_prompt: impl Into<String>,
+        user_template: impl Into<String>,
+    ) -> Result<Self, llm_harness_types::TemplateError> {
+        let user_template = user_template.into();
+        let mut start = 0;
+        while let Some(open) = user_template[start..].find('{') {
+            let abs_open = start + open;
+            if let Some(close) = user_template[abs_open + 1..].find('}') {
+                let abs_close = abs_open + 1 + close;
+                let name = &user_template[abs_open + 1..abs_close];
+                if !name.is_empty() && !KNOWN_PLACEHOLDERS.contains(&name) {
+                    let suggestion = closest_placeholder(name);
+                    return Err(llm_harness_types::TemplateError::UnknownPlaceholder {
+                        found: name.to_string(),
+                        suggestion,
+                    });
+                }
+                start = abs_close + 1;
+            } else {
+                break;
+            }
+        }
+        if !user_template.contains("{conversation}") {
+            return Err(
+                llm_harness_types::TemplateError::MissingRequiredPlaceholder("conversation".into()),
+            );
+        }
+        Ok(Self {
+            system_prompt: system_prompt.into(),
+            user_template,
+        })
+    }
+}
+
+impl CompactionPromptSpec {
+    /// Returns the system prompt.
+    pub fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
+    /// Returns the user message template.
+    pub fn user_template(&self) -> &str {
+        &self.user_template
+    }
+}
+
+impl<'de> Deserialize<'de> for CompactionPromptSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            system_prompt: String,
+            user_template: String,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        CompactionPromptSpec::new(raw.system_prompt, raw.user_template).map_err(de::Error::custom)
+    }
+}
+
+/// Render a template by scanning it once and replacing `{placeholder}` patterns
+/// with the corresponding value. Inserted values are never re-scanned, preventing
+/// prompt injection via placeholder-like content in user/tool messages.
+fn render_template(template: &str, replacements: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        if let Some(close) = after.find('}') {
+            let name = &after[..close];
+            if let Some((_, value)) = replacements.iter().find(|(key, _)| *key == name) {
+                out.push_str(value);
+            } else {
+                // Unknown placeholder — pass through verbatim.
+                out.push('{');
+                out.push_str(name);
+                out.push('}');
+            }
+            rest = &after[close + 1..];
+        } else {
+            // No closing brace — pass through the rest verbatim.
+            out.push('{');
+            out.push_str(after);
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Summary LLM 调用配置。
 #[derive(Debug, Clone)]
 pub struct CompactionSummaryConfig {
@@ -94,6 +262,8 @@ pub struct CompactionSummaryConfig {
     pub summary_model: String,
     /// Summary 模型的元数据（上下文窗口、最大输出 token 数）。
     pub summary_model_info: ModelInfo,
+    /// Custom prompt spec. `None` → use hardcoded constants.
+    pub prompt: Option<CompactionPromptSpec>,
 }
 
 impl CompactionThresholdConfig {
@@ -345,6 +515,7 @@ pub async fn compact(
     client: &(dyn LlmClient + Send + Sync),
     preparation: CompactionPreparation,
     summary: &CompactionSummaryConfig,
+    query: Option<&str>,
     abort: &CancellationToken,
 ) -> Result<CompactionResult, CompactionError> {
     if preparation.entries_to_compress.is_empty() {
@@ -362,27 +533,73 @@ pub async fn compact(
         ));
     }
 
-    // Build user message.
-    let user_content = if let Some(prev) = &preparation.previous_summary {
-        format!(
-            "The messages below are NEW conversation messages to incorporate into \
-            the existing summary provided in <previous-summary> tags.\n\n\
-            <previous-summary>\n{prev}\n</previous-summary>\n\n\
-            New conversation:\n<conversation>\n{conversation_text}\n</conversation>\n\n\
-            Update the summary to incorporate the new information. Preserve existing \
-            completed items, update in-progress items, add new progress.\n\n{SUMMARY_REQUEST}"
-        )
-    } else {
-        format!(
-            "Here is the conversation to summarize:\n\n\
-            <conversation>\n{conversation_text}\n</conversation>\n\n\
-            {SUMMARY_REQUEST}"
-        )
+    // Build system + user prompt. When a custom prompt spec is configured,
+    // render the template with placeholder substitution; otherwise fall back
+    // to the hardcoded constants.
+    let (system_prompt_str, user_content) = match &summary.prompt {
+        None => {
+            // When a query is provided, prepend it as task context so the
+            // summary LLM can prioritize task-relevant information.
+            let query_prefix = match query {
+                Some(q) if !q.is_empty() => {
+                    format!("Task context: {q}\n\n")
+                }
+                _ => String::new(),
+            };
+            let uc = if let Some(prev) = &preparation.previous_summary {
+                format!(
+                    "{query_prefix}The messages below are NEW conversation messages to \
+                    incorporate into the existing summary provided in <previous-summary> \
+                    tags.\n\n\
+                    <previous-summary>\n{prev}\n</previous-summary>\n\n\
+                    New conversation:\n<conversation>\n{conversation_text}\n</conversation>\n\n\
+                    Update the summary to incorporate the new information. Preserve existing \
+                    completed items, update in-progress items, add new progress.\n\n{SUMMARY_REQUEST}"
+                )
+            } else {
+                format!(
+                    "{query_prefix}Here is the conversation to summarize:\n\n\
+                    <conversation>\n{conversation_text}\n</conversation>\n\n\
+                    {SUMMARY_REQUEST}"
+                )
+            };
+            (
+                format!("{SUMMARIZATION_SYSTEM_PROMPT}\n{NO_COMPACT_INSTRUCTION}"),
+                uc,
+            )
+        }
+        Some(spec) => {
+            let prev = preparation.previous_summary.as_deref().unwrap_or("");
+            let file_ops = if preparation.file_operations.is_empty() {
+                String::new()
+            } else {
+                preparation
+                    .file_operations
+                    .iter()
+                    .map(|op| format!("- {:?}: {}", op.kind, op.path.display()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let q = query.unwrap_or("");
+            let uc = render_template(
+                &spec.user_template,
+                &[
+                    ("conversation", &conversation_text),
+                    ("previous_summary", prev),
+                    ("file_operations", &file_ops),
+                    ("query", q),
+                ],
+            );
+            (
+                format!("{}\n{}", spec.system_prompt, NO_COMPACT_INSTRUCTION),
+                uc,
+            )
+        }
     };
 
     // Validate that the prompt fits within the summary model's context window.
-    let prompt_tokens = estimate_tokens_for_text(SUMMARIZATION_SYSTEM_PROMPT)
-        + estimate_tokens_for_text(&user_content);
+    let prompt_tokens =
+        estimate_tokens_for_text(&system_prompt_str) + estimate_tokens_for_text(&user_content);
     let max_input_tokens = (summary.summary_model_info.context_window as usize)
         .saturating_sub(summary.summary_model_info.max_tokens as usize);
     if prompt_tokens > max_input_tokens {
@@ -397,7 +614,7 @@ pub async fn compact(
         summary.summary_model_info.max_tokens,
     )
     .messages(vec![
-        LlmMessage::System(SUMMARIZATION_SYSTEM_PROMPT.to_string()),
+        LlmMessage::System(system_prompt_str),
         LlmMessage::User(vec![RequestContent::Text(user_content)]),
     ])
     .build();
@@ -431,6 +648,36 @@ pub async fn compact(
         format!(
             "{summary_text}\n\n## Files Touched\n{}",
             file_lines.join("\n")
+        )
+    };
+
+    // Structurally preserve Keep-marked entries: append their rendered text
+    // verbatim to the summary. This is a hard guarantee — even if the LLM
+    // ignores the <no-compact> instruction in the prompt, the content is
+    // still preserved in the summary message.
+    let kept_verbatim: Vec<String> = preparation
+        .entries_to_compress
+        .iter()
+        .filter(|e| e.compaction_policy == Some(CompactionPolicy::Keep))
+        .map(|e| {
+            let mut buf = String::new();
+            match &e.payload {
+                SessionEntryPayload::Message(msg) => append_message_text(&mut buf, msg),
+                SessionEntryPayload::ModelChange { to, .. } => {
+                    write!(buf, "[Config] Model changed to: {to}").unwrap();
+                }
+                _ => {}
+            }
+            buf
+        })
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    let full_summary = if kept_verbatim.is_empty() {
+        full_summary
+    } else {
+        format!(
+            "{full_summary}\n\n## Preserved Content (verbatim)\n{}",
+            kept_verbatim.join("\n\n")
         )
     };
 
@@ -475,6 +722,16 @@ pub(crate) fn format_entries_as_text(entries: &[SessionEntry]) -> String {
                 format!("[Config] Model changed to: {to}")
             }
             _ => continue,
+        };
+        let rendered = if entry.compaction_policy == Some(CompactionPolicy::Keep) {
+            // Escape no-compact tags in content to prevent premature
+            // termination or spurious nesting that would confuse the LLM.
+            let escaped = rendered
+                .replace("</no-compact>", "&lt;/no-compact&gt;")
+                .replace("<no-compact", "&lt;no-compact");
+            format!("<no-compact preserve=\"verbatim\">\n{escaped}\n</no-compact>")
+        } else {
+            rendered
         };
         if !out.is_empty() {
             out.push_str("\n\n");
@@ -630,6 +887,7 @@ mod tests {
                 content: vec![ContentBlock::Text { text: text.into() }],
                 timestamp: Utc::now(),
             })),
+            compaction_policy: None,
         }
     }
 
@@ -646,6 +904,7 @@ mod tests {
                 m.usage = tokens;
                 m
             })),
+            compaction_policy: None,
         }
     }
 
@@ -658,6 +917,7 @@ mod tests {
                 custom_type: "file_operations".into(),
                 data,
             },
+            compaction_policy: None,
         }
     }
 
@@ -671,6 +931,7 @@ mod tests {
                 provider: None,
                 model_id: None,
             },
+            compaction_policy: None,
         }
     }
 
@@ -689,6 +950,7 @@ mod tests {
                 from_hook: false,
                 details: None,
             }),
+            compaction_policy: None,
         }
     }
 
@@ -718,6 +980,7 @@ mod tests {
                 context_window: 2000,
                 max_tokens: 512,
             },
+            prompt: None,
         }
     }
 
@@ -886,6 +1149,59 @@ mod tests {
     }
 
     #[test]
+    fn format_entries_wraps_keep_entries_in_no_compact_tag() {
+        use crate::session::types::{SessionEntry, SessionEntryPayload};
+        use chrono::Utc;
+
+        let normal = SessionEntry {
+            id: EntryId::new(),
+            parent_id: None,
+            timestamp: Utc::now(),
+            payload: SessionEntryPayload::Message(AgentMessage::User(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "normal message".into(),
+                }],
+                timestamp: Utc::now(),
+            })),
+            compaction_policy: None,
+        };
+        let keep = SessionEntry {
+            id: EntryId::new(),
+            parent_id: None,
+            timestamp: Utc::now(),
+            payload: SessionEntryPayload::Message(AgentMessage::User(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "important decision".into(),
+                }],
+                timestamp: Utc::now(),
+            })),
+            compaction_policy: Some(CompactionPolicy::Keep),
+        };
+
+        let text = format_entries_as_text(&[normal, keep]);
+
+        assert!(text.contains("normal message"), "normal entry text present");
+        assert!(
+            text.contains("<no-compact"),
+            "keep entry must be wrapped in no-compact tag"
+        );
+        assert!(
+            text.contains("important decision"),
+            "keep entry text present"
+        );
+        assert!(
+            text.contains("</no-compact>"),
+            "no-compact tag must be closed"
+        );
+        // The normal entry should not itself be wrapped.
+        let normal_segment = text.split("<no-compact").next().unwrap();
+        assert!(
+            normal_segment.contains("normal message"),
+            "normal entry must not be wrapped in no-compact tag"
+        );
+    }
+
+    #[test]
     fn file_op_kind_serde_roundtrip() {
         let k = FileOpKind::Modify;
         let json = serde_json::to_string(&k).unwrap();
@@ -922,6 +1238,7 @@ mod tests {
                 file_operations: vec![],
             },
             &summary_config(),
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -1067,5 +1384,188 @@ mod tests {
         };
         let result = compute_cut_point(&path, None, &settings, None, None);
         assert!(result.is_some());
+    }
+    #[test]
+    fn prompt_spec_is_constructible() {
+        let spec = CompactionPromptSpec::new(
+            "You are a summarizer.",
+            "Query: {query}\nConv: {conversation}",
+        )
+        .unwrap();
+        assert!(spec.system_prompt().contains("summarizer"));
+        assert!(spec.user_template().contains("{query}"));
+    }
+
+    #[test]
+    fn prompt_spec_rejects_unknown_placeholder() {
+        let err = CompactionPromptSpec::new("sys", "Conv: {converstion}").unwrap_err();
+        match err {
+            llm_harness_types::TemplateError::UnknownPlaceholder { found, suggestion } => {
+                assert_eq!(found, "converstion");
+                assert_eq!(suggestion, "conversation");
+            }
+            other => panic!("expected UnknownPlaceholder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prompt_spec_rejects_missing_conversation_placeholder() {
+        let err = CompactionPromptSpec::new("sys", "Query: {query}").unwrap_err();
+        match err {
+            llm_harness_types::TemplateError::MissingRequiredPlaceholder(name) => {
+                assert_eq!(name, "conversation");
+            }
+            other => panic!("expected MissingRequiredPlaceholder, got {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn compact_with_custom_prompt_renders_placeholders() {
+        let client = MockLlmClient::new(vec![llm_harness_loop::test_utils::MockResponse::text(
+            "summary text",
+        )]);
+
+        // Build a minimal CompactionPreparation.
+        let msg = AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::Text {
+                text: "hello world".into(),
+            }],
+            timestamp: chrono::Utc::now(),
+        });
+        let entry = SessionEntry {
+            id: EntryId::new(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            payload: SessionEntryPayload::Message(msg.clone()),
+            compaction_policy: None,
+        };
+        let prep = CompactionPreparation {
+            entries_to_compress: vec![entry],
+            kept_entries: vec![],
+            compress_from_entry: EntryId::new(),
+            cut_point: EntryId::new(),
+            previous_summary: None,
+            estimated_tokens: 100,
+            file_operations: vec![],
+        };
+        let summary = CompactionSummaryConfig {
+            summary_model: "test-model".into(),
+            summary_model_info: crate::agent::ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            },
+            prompt: Some(
+                CompactionPromptSpec::new(
+                    "Custom summarizer.",
+                    "Query: {query}\nConv: {conversation}\nPrev: {previous_summary}",
+                )
+                .unwrap(),
+            ),
+        };
+
+        let result = compact(
+            &client,
+            prep,
+            &summary,
+            Some("find bugs"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let _ = result;
+        let captured = client.captured_requests.lock().unwrap();
+        let req = &captured[0];
+        // System prompt should be the custom one.
+        let sys = req.messages().first().expect("has system message");
+        assert!(format!("{sys:?}").contains("Custom summarizer."));
+        // User content should contain the query and conversation text.
+        let user_content = format!("{:?}", req.messages().get(1).expect("has user message"));
+        assert!(
+            user_content.contains("find bugs"),
+            "query must appear in rendered prompt"
+        );
+        assert!(
+            user_content.contains("hello world"),
+            "conversation text must appear in rendered prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_with_custom_prompt_renders_file_operations() {
+        let client = MockLlmClient::new(vec![llm_harness_loop::test_utils::MockResponse::text(
+            "summary text",
+        )]);
+
+        let msg = AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::Text {
+                text: "hello world".into(),
+            }],
+            timestamp: chrono::Utc::now(),
+        });
+        let entry = SessionEntry {
+            id: EntryId::new(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            payload: SessionEntryPayload::Message(msg.clone()),
+            compaction_policy: None,
+        };
+        let prep = CompactionPreparation {
+            entries_to_compress: vec![entry],
+            kept_entries: vec![],
+            compress_from_entry: EntryId::new(),
+            cut_point: EntryId::new(),
+            previous_summary: None,
+            estimated_tokens: 100,
+            file_operations: vec![
+                FileOperation {
+                    path: PathBuf::from("/src/main.rs"),
+                    kind: FileOpKind::Read,
+                    at_entry: EntryId::new(),
+                },
+                FileOperation {
+                    path: PathBuf::from("/src/lib.rs"),
+                    kind: FileOpKind::Modify,
+                    at_entry: EntryId::new(),
+                },
+            ],
+        };
+        let summary = CompactionSummaryConfig {
+            summary_model: "test-model".into(),
+            summary_model_info: crate::agent::ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            },
+            prompt: Some(
+                CompactionPromptSpec::new(
+                    "Custom summarizer.",
+                    "Conv: {conversation}\nFiles: {file_operations}",
+                )
+                .unwrap(),
+            ),
+        };
+
+        let _ = compact(&client, prep, &summary, None, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let captured = client.captured_requests.lock().unwrap();
+        let req = &captured[0];
+        let user_content = format!("{:?}", req.messages().get(1).expect("has user message"));
+        assert!(
+            user_content.contains("/src/main.rs"),
+            "file_operations must render file paths"
+        );
+        assert!(
+            user_content.contains("/src/lib.rs"),
+            "file_operations must render all file paths"
+        );
+        assert!(
+            user_content.contains("Read"),
+            "file_operations must render operation kind"
+        );
+        assert!(
+            user_content.contains("Modify"),
+            "file_operations must render Modify kind"
+        );
     }
 }

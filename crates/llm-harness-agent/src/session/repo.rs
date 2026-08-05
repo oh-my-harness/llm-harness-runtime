@@ -240,6 +240,7 @@ impl SessionRepo for InMemorySessionRepo {
                     parent_id: new_parent,
                     timestamp: entry.timestamp,
                     payload: entry.payload,
+                    compaction_policy: entry.compaction_policy,
                 };
                 new_storage.append_entry(new_entry).await?;
                 last_new_id = Some(new_entry_id);
@@ -435,6 +436,7 @@ mod tests {
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
                 payload: SessionEntryPayload::Unknown,
+                compaction_policy: None,
             })
             .await
             .unwrap();

@@ -4,7 +4,7 @@ use llm_harness_loop::{ConvertToLlmHook, FinalAnswerMode, RetryConfig};
 use llm_harness_types::*;
 
 use crate::agent::ModelInfo;
-use crate::compaction::CompactionModelConfig;
+use crate::compaction::{CompactionModelConfig, CompactionPromptSpec};
 use crate::skills::{PromptTemplate, Skill};
 
 use super::state::HarnessHooks;
@@ -65,6 +65,21 @@ pub struct AgentHarnessOptions {
     pub compaction_model: Option<CompactionModelConfig>,
     /// Enable automatic compaction at each turn start. Default: `false`.
     pub auto_compact: bool,
+    /// Max consecutive compaction failures before circuit breaker trips.
+    /// `None` → default 3.
+    pub compaction_max_failures: Option<u32>,
+    /// Custom compaction prompt spec. `None` → hardcoded constants.
+    pub compaction_prompt: Option<CompactionPromptSpec>,
+    /// Current task query intent for context-aware compaction.
+    /// `None` → non-task-aware compaction.
+    ///
+    /// # Trust boundary
+    ///
+    /// This value is inserted verbatim into the compaction prompt template.
+    /// It MUST come from a trusted source (e.g. system-generated task
+    /// summary, caller-defined intent) — never raw user input. Untrusted
+    /// content here is a prompt injection vector.
+    pub compaction_query: Option<String>,
 }
 
 impl AgentHarnessOptions {
@@ -93,6 +108,9 @@ impl AgentHarnessOptions {
             compaction_keep_recent_tokens: None,
             compaction_model: None,
             auto_compact: false,
+            compaction_max_failures: None,
+            compaction_prompt: None,
+            compaction_query: None,
         }
     }
 }

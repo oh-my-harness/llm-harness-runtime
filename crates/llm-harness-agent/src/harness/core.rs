@@ -149,6 +149,7 @@ impl AgentHarness {
                     CompactionSummaryConfig {
                         summary_model: c.model,
                         summary_model_info: c.model_info,
+                        prompt: opts.compaction_prompt.clone(),
                     },
                 )
             }),
@@ -157,6 +158,10 @@ impl AgentHarness {
             idle_watcher: None,
             async_spawn_hook: None,
             abort_cascade_hook: None,
+            compaction_query: opts.compaction_query,
+            compaction_max_failures: opts.compaction_max_failures.unwrap_or(3).max(1),
+            compaction_failure_count: 0,
+            compaction_prompt: opts.compaction_prompt,
         };
 
         let convert_to_llm: Arc<dyn ConvertToLlmHook> = opts

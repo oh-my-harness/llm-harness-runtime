@@ -64,7 +64,24 @@ impl Session {
     }
 
     /// Append any payload under the current active cursor and advance it.
+    ///
+    /// Equivalent to `append_with_policy(payload, None)`.
     pub async fn append(&self, payload: SessionEntryPayload) -> Result<EntryId, SessionError> {
+        self.append_with_policy(payload, None).await
+    }
+
+    /// Append any payload with a compaction policy under the current active
+    /// cursor and advance it.
+    ///
+    /// Pass `Some(CompactionPolicy::Keep)` to mark the entry for verbatim
+    /// preservation during compaction. Its content is appended to the
+    /// compaction summary (in a "Preserved Content" section) rather than
+    /// being summarized by the LLM.
+    pub async fn append_with_policy(
+        &self,
+        payload: SessionEntryPayload,
+        compaction_policy: Option<CompactionPolicy>,
+    ) -> Result<EntryId, SessionError> {
         let id = self.storage.create_entry_id();
         let parent_id = self.storage.active_cursor().await?;
 
@@ -78,6 +95,7 @@ impl Session {
             parent_id,
             timestamp: Utc::now(),
             payload,
+            compaction_policy,
         };
         self.storage.append_entry(entry).await?;
         self.storage.set_active_cursor(id).await?;
@@ -114,6 +132,7 @@ impl Session {
                 from: from_entry,
                 label,
             },
+            compaction_policy: None,
         };
         self.storage.append_entry(entry).await?;
         self.storage.set_active_cursor(bp_id).await?;

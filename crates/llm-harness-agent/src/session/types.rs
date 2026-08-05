@@ -93,6 +93,17 @@ pub struct BranchSummaryEntry {
 
 // ── SessionEntry ───────────────────────────────────────────────────────────────
 
+/// Per-entry compaction policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPolicy {
+    /// Normal compaction participant (default).
+    #[default]
+    Compact,
+    /// Do not compress — preserve verbatim in the summary.
+    Keep,
+}
+
 /// A single node in the session tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEntry {
@@ -104,6 +115,8 @@ pub struct SessionEntry {
     pub timestamp: DateTime<Utc>,
     /// Typed payload.
     pub payload: SessionEntryPayload,
+    /// Compaction policy for this entry. `None` is equivalent to `Compact`.
+    pub compaction_policy: Option<CompactionPolicy>,
 }
 
 // ── Session metadata ───────────────────────────────────────────────────────────
@@ -463,5 +476,27 @@ impl SessionEntry {
             SessionEntryPayload::BranchSummary(_) => SessionEntryKind::BranchSummary,
             SessionEntryPayload::Unknown => SessionEntryKind::Unknown,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compaction_policy_default_is_compact() {
+        assert_eq!(CompactionPolicy::default(), CompactionPolicy::Compact);
+    }
+
+    #[test]
+    fn session_entry_has_compaction_policy() {
+        let entry = SessionEntry {
+            id: EntryId::new(),
+            parent_id: None,
+            timestamp: Utc::now(),
+            payload: SessionEntryPayload::Unknown,
+            compaction_policy: Some(CompactionPolicy::Keep),
+        };
+        assert_eq!(entry.compaction_policy, Some(CompactionPolicy::Keep));
     }
 }

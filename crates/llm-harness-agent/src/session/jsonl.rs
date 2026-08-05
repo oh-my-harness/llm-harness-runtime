@@ -550,6 +550,7 @@ impl SessionRepo for JsonlSessionRepo {
                     parent_id: new_parent,
                     timestamp: entry.timestamp,
                     payload: entry.payload,
+                    compaction_policy: entry.compaction_policy,
                 };
                 new_storage.append_entry(new_entry).await?;
                 last_new_id = Some(new_entry_id);

@@ -170,6 +170,7 @@ mod tests {
             parent_id: parent,
             timestamp: chrono::Utc::now(),
             payload,
+            compaction_policy: None,
         }
     }
 

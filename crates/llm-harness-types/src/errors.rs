@@ -161,6 +161,8 @@ pub enum CompactionError {
     Skipped,
     #[error("summary model call failed: {0}")]
     SummaryFailed(String),
+    #[error("compaction circuit breaker open: {0} consecutive failures")]
+    CircuitOpen(u32),
     #[error("first_kept_entry {0} not found in compaction path")]
     InvalidFirstKeptEntry(crate::EntryId),
     #[error(transparent)]
@@ -180,6 +182,10 @@ pub enum TemplateError {
     MissingArg(usize),
     #[error("invalid argument syntax: {0}")]
     InvalidSyntax(String),
+    #[error("unknown placeholder {{{found}}} in template; did you mean {{{suggestion}}}?")]
+    UnknownPlaceholder { found: String, suggestion: String },
+    #[error("template is missing required placeholder {{{0}}}")]
+    MissingRequiredPlaceholder(String),
 }
 
 // ── HarnessError ──────────────────────────────────────────────────────────────
@@ -243,6 +249,12 @@ mod tests {
         let se = SessionError::EntryNotFound(EntryId::new());
         let ce: CompactionError = se.into();
         assert!(ce.to_string().contains("entry not found"));
+    }
+
+    #[test]
+    fn circuit_open_variant_constructible() {
+        let e = CompactionError::CircuitOpen(3);
+        assert!(e.to_string().contains("3 consecutive failures"));
     }
 
     #[test]

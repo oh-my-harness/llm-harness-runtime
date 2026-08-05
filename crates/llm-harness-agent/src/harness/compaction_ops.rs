@@ -63,8 +63,38 @@ impl AgentHarness {
     ///
     /// If `auto_compact` is enabled, this is called automatically at
     /// `prompt_with_messages` entry.
+    ///
+    /// Not subject to the circuit breaker — manual compaction always runs.
+    /// On success, resets the compaction failure count (and thus the circuit
+    /// breaker if it was tripped). On failure, the count is not incremented.
     pub async fn compact(&self) -> Result<CompactionStats, HarnessError> {
         self.compact_with_path(None).await
+    }
+
+    /// Reset the compaction circuit breaker.
+    ///
+    /// After the circuit breaker trips (`CircuitOpen`), auto-compact is
+    /// blocked until the failure count is reset. Manual `compact()` is
+    /// unaffected and can still run, but if it also fails the count is
+    /// not reset.
+    ///
+    /// Call this after fixing the underlying cause (e.g. switching to a
+    /// working summary model) to re-enable auto-compact.
+    pub fn reset_circuit_breaker(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.compaction_failure_count = 0;
+    }
+
+    /// Update the compaction query intent at runtime.
+    ///
+    /// Allows long-lived harness instances to switch task context between
+    /// different prompts. The value is used by the next auto-compact or
+    /// manual `compact()` invocation.
+    ///
+    /// See [`AgentHarnessOptions::compaction_query`] for trust boundary.
+    pub fn set_compaction_query(&self, query: Option<String>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.compaction_query = query;
     }
 
     /// Internal compaction entry point that accepts an optional pre-loaded
@@ -78,6 +108,10 @@ impl AgentHarness {
         let result = self.do_compact(preloaded_path, None).await;
         match result {
             Ok(stats) => {
+                {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.compaction_failure_count = 0;
+                }
                 self.emit(AgentHarnessEvent::CompactionEnd {
                     stats: Some(stats.clone()),
                     error: None,
@@ -93,6 +127,12 @@ impl AgentHarness {
                 Err(e)
             }
         }
+    }
+
+    /// Returns the current compaction query, if set.
+    fn current_query_for_compaction(&self) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner.compaction_query.clone()
     }
 
     /// Auto-compaction check called at `prompt_with_messages` entry (Idle phase).
@@ -118,6 +158,15 @@ impl AgentHarness {
     /// context window) do NOT emit `CompactionEnd` events — they are silently
     /// treated as "nothing to do". This avoids spurious error events when a
     /// hook forces `Compact` but no valid cut boundary exists.
+    ///
+    /// # Circuit breaker scope
+    ///
+    /// The circuit breaker only tracks `SummaryFailed` errors (LLM summary
+    /// generation failures). Other error types — `Session` (storage faults),
+    /// `InvalidFirstKeptEntry` (logic errors), `Agent` — propagate immediately
+    /// without incrementing the failure count. These are non-transient: retrying
+    /// won't help a full disk or a malformed session, so they should surface
+    /// right away rather than accumulate toward the circuit breaker threshold.
     pub(super) async fn try_auto_compact(&self) -> Result<(), HarnessError> {
         let (auto_compact, has_before_compact_hook) = {
             let inner = self.inner.lock().unwrap();
@@ -125,6 +174,16 @@ impl AgentHarness {
         };
         if !auto_compact {
             return Ok(());
+        }
+
+        // Circuit breaker: if consecutive failures have tripped the breaker,
+        // refuse to auto-compact.
+        {
+            let inner = self.inner.lock().unwrap();
+            let max = inner.compaction_max_failures;
+            if inner.compaction_failure_count >= max {
+                return Err(CompactionError::CircuitOpen(inner.compaction_failure_count).into());
+            }
         }
 
         // Lightweight pre-check: if tokens are under threshold, skip without
@@ -178,6 +237,11 @@ impl AgentHarness {
         let result = self.do_compact(Some(path), Some(pre)).await;
         match result {
             Ok(stats) => {
+                // Success: reset failure count.
+                {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.compaction_failure_count = 0;
+                }
                 self.emit(AgentHarnessEvent::CompactionEnd {
                     stats: Some(stats),
                     error: None,
@@ -193,6 +257,43 @@ impl AgentHarness {
                 self.handle_no_valid_boundary(saved_estimated_tokens, saved_context_window)
             }
             Err(HarnessError::Compaction(CompactionError::Skipped)) => Ok(()),
+            Err(e)
+                if matches!(
+                    &e,
+                    HarnessError::Compaction(CompactionError::SummaryFailed(_))
+                ) =>
+            {
+                let (count, max) = {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.compaction_failure_count += 1;
+                    (
+                        inner.compaction_failure_count,
+                        inner.compaction_max_failures,
+                    )
+                };
+                if count >= max {
+                    // Circuit just tripped — return CircuitOpen.
+                    self.emit(AgentHarnessEvent::CompactionEnd {
+                        stats: None,
+                        error: Some(CompactionError::CircuitOpen(count).to_string()),
+                    });
+                    return Err(CompactionError::CircuitOpen(count).into());
+                }
+                self.emit(AgentHarnessEvent::CompactionEnd {
+                    stats: None,
+                    error: Some(e.to_string()),
+                });
+                // Circuit not yet tripped. If the context still exceeds the
+                // model's window, we cannot proceed — the main request would
+                // be rejected by the provider. Propagate as NoValidBoundary.
+                if saved_estimated_tokens > saved_context_window {
+                    return Err(CompactionError::NoValidBoundary.into());
+                }
+                // Context fits within the window — swallow the error so the
+                // run proceeds. The circuit breaker will trip after `max`
+                // consecutive failures.
+                Ok(())
+            }
             Err(e) => {
                 self.emit(AgentHarnessEvent::CompactionEnd {
                     stats: None,
@@ -243,6 +344,10 @@ impl AgentHarness {
             inner.current_abort.clone().unwrap_or_default()
         };
 
+        // Capture query once to avoid redundant mutex lock+clone.
+        let query = self.current_query_for_compaction();
+        let query_ref = query.as_deref();
+
         // before_compact hook is called BEFORE prepare_compaction so that
         // BeforeCompactDecision::Override can bypass the token-threshold check entirely.
         if !self.hooks.before_compact.is_empty() {
@@ -259,6 +364,7 @@ impl AgentHarness {
                     context_window: pre.threshold_config.context_window,
                     reserve_tokens: pre.threshold_config.reserve_tokens,
                     keep_recent_tokens: pre.threshold_config.keep_recent_tokens,
+                    current_query: query_ref,
                 })
                 .await;
             match decision {
@@ -274,7 +380,9 @@ impl AgentHarness {
                         .await;
                 }
                 BeforeCompactDecision::Compact => {
-                    return self.execute_compaction(&path, &pre, &abort).await;
+                    return self
+                        .execute_compaction(&path, &pre, query_ref, &abort)
+                        .await;
                 }
                 BeforeCompactDecision::Proceed => {}
             }
@@ -284,13 +392,14 @@ impl AgentHarness {
             return Err(CompactionError::InsufficientTokens.into());
         }
 
-        self.execute_compaction(&path, &pre, &abort).await
+        self.execute_compaction(&path, &pre, query_ref, &abort)
+            .await
     }
-
     async fn execute_compaction(
         &self,
         path: &[SessionEntry],
         pre: &CompactionPrereqs,
+        query: Option<&str>,
         abort: &CancellationToken,
     ) -> Result<CompactionStats, HarnessError> {
         let prep = compute_cut_point(
@@ -309,6 +418,7 @@ impl AgentHarness {
             pre.summary_client.as_ref(),
             prep,
             &pre.summary_config,
+            query,
             abort,
         )
         .await?;
@@ -354,6 +464,7 @@ impl AgentHarness {
                     let sc = CompactionSummaryConfig {
                         summary_model: model,
                         summary_model_info: m_info,
+                        prompt: inner.compaction_prompt.clone(),
                     };
                     (tc, self.client.clone(), sc)
                 }

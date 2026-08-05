@@ -6,12 +6,11 @@ use llm_harness_types::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::{AbortCascadeHook, AsyncSpawnHookHandle, IdleWatcherHook};
 use crate::agent::ModelInfo;
-use crate::compaction::{CompactionSummaryConfig, CompactionThresholdConfig};
+use crate::compaction::{CompactionPromptSpec, CompactionSummaryConfig, CompactionThresholdConfig};
 use crate::session::types::*;
 use crate::skills::{PromptTemplate, Skill};
-
-use super::{AbortCascadeHook, AsyncSpawnHookHandle, IdleWatcherHook};
 
 // ── HarnessState ──────────────────────────────────────────────────────────────
 
@@ -144,6 +143,15 @@ pub(super) struct HarnessInner {
     /// (injected via `after_provider_response` by `HarnessBuilder`).
     /// Read by `AgentHarness::usage()`.
     pub(super) cost: Arc<Mutex<CostAggregate>>,
+    /// Max consecutive failures before auto-compact circuit breaker trips.
+    pub(super) compaction_max_failures: u32,
+    /// Consecutive compaction failure count for circuit breaker.
+    pub(super) compaction_failure_count: u32,
+    /// Custom compaction prompt spec, propagated to CompactionSummaryConfig.
+    pub(super) compaction_prompt: Option<CompactionPromptSpec>,
+    /// Current compaction query intent, set by caller via builder/options.
+    /// `None` → non-task-aware compaction.
+    pub(super) compaction_query: Option<String>,
 }
 
 impl HarnessInner {

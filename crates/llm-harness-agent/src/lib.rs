@@ -19,7 +19,7 @@ pub mod skills;
 
 pub use agent::{Agent, AgentOptions, AgentPhase, AgentState, ModelInfo};
 pub use compaction::{
-    CompactionModelConfig, CompactionPreparation, CompactionSummaryConfig,
+    CompactionModelConfig, CompactionPreparation, CompactionPromptSpec, CompactionSummaryConfig,
     CompactionThresholdConfig, compact,
 };
 pub use harness::{

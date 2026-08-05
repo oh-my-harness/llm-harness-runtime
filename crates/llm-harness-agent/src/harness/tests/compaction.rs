@@ -462,6 +462,7 @@ async fn auto_compact_failure_propagates_error() {
     });
     opts.compaction_reserve_tokens = Some(9);
     opts.compaction_keep_recent_tokens = Some(0);
+    opts.compaction_max_failures = Some(1);
     opts.auto_compact = true;
     opts.compaction_model = Some(CompactionModelConfig {
         client: compaction_client as Arc<dyn LlmClient>,
@@ -477,18 +478,19 @@ async fn auto_compact_failure_propagates_error() {
     h.prompt("second").await.unwrap();
 
     // Third prompt triggers auto-compaction at run entry (Idle phase).
-    // The compaction client returns RateLimit error → SummaryFailed.
-    // The error must propagate and abort the run (context is too large
-    // to continue without compaction).
+    // msg2's compaction returned NoValidBoundary (not counted as failure);
+    // msg3 is the first SummaryFailed. With compaction_max_failures=1,
+    // the first consecutive failure (count 0→1) trips the circuit
+    // breaker → CircuitOpen(1). The error must propagate and abort the
+    // run (context is too large to continue without compaction).
     let err = h.prompt("third").await.unwrap_err();
     assert!(
         matches!(
             err,
-            HarnessError::Compaction(CompactionError::SummaryFailed(_))
+            HarnessError::Compaction(CompactionError::CircuitOpen(1))
         ),
-        "expected SummaryFailed from compaction rate limit, got: {err:?}"
+        "expected CircuitOpen(1) after 1 consecutive failure, got: {err:?}"
     );
-
     // Main client should NOT have received a third request (run aborted).
     assert_eq!(
         main_client
@@ -981,5 +983,281 @@ async fn auto_compact_hook_proceed_under_threshold_no_compaction_end() {
     assert!(
         !had_compaction_end,
         "hook Proceed + under-threshold must not emit CompactionEnd"
+    );
+}
+
+#[tokio::test]
+async fn circuit_breaker_trips_after_max_failures() {
+    use futures::future::BoxFuture;
+    use llm_harness_types::{BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook};
+
+    struct CompactDecisionHook;
+    impl BeforeCompactHook for CompactDecisionHook {
+        fn before_compact<'a>(
+            &'a self,
+            _ctx: BeforeCompactCtx<'a>,
+        ) -> BoxFuture<'a, BeforeCompactDecision> {
+            Box::pin(async { BeforeCompactDecision::Compact })
+        }
+    }
+
+    // Use a compaction client that always fails.
+    let main_client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("reply1"),
+        MockResponse::text("reply2"),
+        MockResponse::text("reply3"),
+        MockResponse::text("reply4"),
+    ]));
+    // Compaction client that always returns an error.
+    let failing_client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::rate_limit_error(),
+        MockResponse::rate_limit_error(),
+        MockResponse::rate_limit_error(),
+    ]));
+
+    let env = Arc::new(NoOpEnv);
+    let mut opts = AgentHarnessOptions::new("test-model");
+    opts.model_info = Some(ModelInfo {
+        context_window: 100_000,
+        max_tokens: 50,
+    });
+    opts.compaction_reserve_tokens = Some(0);
+    opts.compaction_keep_recent_tokens = Some(0);
+    opts.compaction_max_failures = Some(3);
+    opts.auto_compact = true;
+    opts.compaction_model = Some(CompactionModelConfig {
+        client: failing_client as Arc<dyn LlmClient>,
+        model: "failing-model".into(),
+        model_info: ModelInfo {
+            context_window: 200_000,
+            max_tokens: 8192,
+        },
+    });
+    opts.hooks = HarnessHooks {
+        before_compact: vec![Arc::new(CompactDecisionHook)],
+        ..HarnessHooks::none()
+    };
+    let h = AgentHarness::new_in_memory(main_client as Arc<dyn LlmClient>, env, opts).await;
+
+    // msg1: empty path → no compaction attempt.
+    // msg2: path has 2 entries → NoValidBoundary (not a failure, not counted).
+    // msg3: path has 4 entries → SummaryFailed (count=1, swallowed).
+    // msg4: path has 6 entries → SummaryFailed (count=2, swallowed).
+    // msg5: path has 8 entries → SummaryFailed (count=3) → circuit trips.
+    h.prompt("msg1").await.unwrap();
+    h.prompt("msg2").await.unwrap();
+    h.prompt("msg3").await.unwrap();
+    h.prompt("msg4").await.unwrap();
+
+    let err = h.prompt("msg5").await;
+    assert!(
+        matches!(
+            &err,
+            Err(HarnessError::Compaction(CompactionError::CircuitOpen(3)))
+        ),
+        "expected CircuitOpen after 3 failures, got: {err:?}"
+    );
+}
+
+/// Integration test: setting `compaction_prompt` and `compaction_query` on
+/// `AgentHarnessOptions` must propagate through the full compaction pathway —
+/// the compaction LLM receives a request whose rendered user content contains
+/// both the query text and the conversation text, proving the custom prompt
+/// template (not the hardcoded constants) was used end-to-end.
+#[tokio::test]
+async fn custom_prompt_renders_query_and_conversation() {
+    use crate::compaction::CompactionPromptSpec;
+    use futures::future::BoxFuture;
+    use llm_harness_types::{BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook};
+
+    struct CompactDecisionHook;
+    impl BeforeCompactHook for CompactDecisionHook {
+        fn before_compact<'a>(
+            &'a self,
+            _ctx: BeforeCompactCtx<'a>,
+        ) -> BoxFuture<'a, BeforeCompactDecision> {
+            Box::pin(async { BeforeCompactDecision::Compact })
+        }
+    }
+
+    let main_client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("response1"),
+        MockResponse::text("response2"),
+    ]));
+    let compaction_client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
+        "summary with preserved content",
+    )]));
+
+    let env = Arc::new(NoOpEnv);
+    let mut opts = AgentHarnessOptions::new("test-model");
+    opts.model_info = Some(ModelInfo {
+        context_window: 1,
+        max_tokens: 50,
+    });
+    opts.compaction_reserve_tokens = Some(0);
+    opts.compaction_keep_recent_tokens = Some(0);
+    opts.compaction_model = Some(CompactionModelConfig {
+        client: compaction_client.clone() as Arc<dyn LlmClient>,
+        model: "compaction-model".into(),
+        model_info: ModelInfo {
+            context_window: 200_000,
+            max_tokens: 8192,
+        },
+    });
+    opts.compaction_prompt = Some(
+        CompactionPromptSpec::new(
+            "You are a summarizer.",
+            "Query: {query}\nConversation:\n{conversation}",
+        )
+        .unwrap(),
+    );
+    opts.compaction_query = Some("test query".into());
+    opts.hooks = HarnessHooks {
+        before_compact: vec![Arc::new(CompactDecisionHook)],
+        ..HarnessHooks::none()
+    };
+    let h = AgentHarness::new_in_memory(main_client as Arc<dyn LlmClient>, env, opts).await;
+
+    // Two prompts → 4 entries (user, assistant, user, assistant).
+    // A single prompt yields only 2 entries, for which `compute_cut_point`
+    // returns `None` (the only valid boundary is the first entry, which
+    // equals `prev_first_kept` → no compressible range). Two prompts give
+    // a valid cut boundary between the two turns.
+    h.prompt("hello").await.unwrap();
+    h.prompt("world").await.unwrap();
+
+    // Manually compact.
+    let stats = h.compact().await.unwrap();
+    assert!(stats.tokens_before > 0);
+
+    // Verify the compaction client received the custom prompt with query and conversation.
+    let captured = compaction_client.captured_requests.lock().unwrap();
+    assert!(!captured.is_empty(), "compaction LLM must have been called");
+    let req = &captured[0];
+    let user_content = format!("{:?}", req.messages().get(1).expect("has user message"));
+    assert!(
+        user_content.contains("test query"),
+        "custom prompt must contain query"
+    );
+    assert!(
+        user_content.contains("hello"),
+        "custom prompt must contain conversation text"
+    );
+}
+
+/// End-to-end test: a Keep-marked entry in the compressed region must have
+/// its content structurally preserved in the compaction summary — appended
+/// verbatim after the LLM-generated summary, independent of LLM compliance
+/// with `<no-compact>` instructions.
+#[tokio::test]
+async fn keep_entry_content_preserved_in_summary_end_to_end() {
+    use crate::session::CompactionPolicy;
+    use futures::future::BoxFuture;
+    use llm_harness_types::{BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook};
+
+    struct CompactDecisionHook;
+    impl BeforeCompactHook for CompactDecisionHook {
+        fn before_compact<'a>(
+            &'a self,
+            _ctx: BeforeCompactCtx<'a>,
+        ) -> BoxFuture<'a, BeforeCompactDecision> {
+            Box::pin(async { BeforeCompactDecision::Compact })
+        }
+    }
+
+    let main_client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("response1"),
+        MockResponse::text("response2"),
+    ]));
+    // The summary LLM returns a minimal summary — it does NOT include the
+    // Keep entry's content. The structural preservation must add it.
+    let compaction_client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
+        "LLM summary text",
+    )]));
+
+    let env = Arc::new(NoOpEnv);
+    let mut opts = AgentHarnessOptions::new("test-model");
+    opts.model_info = Some(ModelInfo {
+        context_window: 1,
+        max_tokens: 50,
+    });
+    opts.compaction_reserve_tokens = Some(0);
+    opts.compaction_keep_recent_tokens = Some(0);
+    opts.compaction_model = Some(CompactionModelConfig {
+        client: compaction_client.clone() as Arc<dyn LlmClient>,
+        model: "compaction-model".into(),
+        model_info: ModelInfo {
+            context_window: 200_000,
+            max_tokens: 8192,
+        },
+    });
+    opts.hooks = HarnessHooks {
+        before_compact: vec![Arc::new(CompactDecisionHook)],
+        ..HarnessHooks::none()
+    };
+    let h = AgentHarness::new_in_memory(main_client as Arc<dyn LlmClient>, env, opts).await;
+
+    // First prompt to establish a turn.
+    h.prompt("hello").await.unwrap();
+
+    // Insert a Keep-marked user message into the session.
+    h.session
+        .append_with_policy(
+            SessionEntryPayload::Message(AgentMessage::User(UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "CRITICAL: deploy to prod after compaction".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })),
+            Some(CompactionPolicy::Keep),
+        )
+        .await
+        .unwrap();
+
+    // Second prompt to create a valid cut boundary.
+    h.prompt("world").await.unwrap();
+
+    // Manually compact.
+    h.compact().await.unwrap();
+
+    // The compaction summary in the session must contain both the LLM
+    // summary AND the verbatim Keep entry content.
+    let path = h.session.read_active_path().await.unwrap();
+    let summary = path
+        .iter()
+        .find_map(|e| match &e.payload {
+            SessionEntryPayload::Compaction(c) => match &c.summary_message {
+                AgentMessage::CompactionSummary(cs) => Some(cs.summary.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("compaction summary must exist");
+
+    assert!(
+        summary.contains("LLM summary text"),
+        "summary must contain the LLM-generated text"
+    );
+    assert!(
+        summary.contains("CRITICAL: deploy to prod after compaction"),
+        "Keep entry content must be structurally preserved in summary"
+    );
+    assert!(
+        summary.contains("Preserved Content"),
+        "summary must have the preserved content section header"
+    );
+
+    // The LLM request must contain the <no-compact> tag wrapping the Keep
+    // entry's content in the {conversation} placeholder.
+    let captured = compaction_client.captured_requests.lock().unwrap();
+    let req = &captured[0];
+    let user_content = format!("{:?}", req.messages().get(1).expect("has user message"));
+    assert!(
+        user_content.contains("<no-compact"),
+        "LLM request must contain <no-compact> tag wrapping Keep entry"
+    );
+    assert!(
+        user_content.contains("CRITICAL: deploy to prod after compaction"),
+        "LLM request must contain Keep entry content in conversation"
     );
 }
