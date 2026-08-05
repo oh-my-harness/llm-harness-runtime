@@ -105,10 +105,14 @@ pub(super) fn step_progress_from(ev: &AgentEvent) -> Option<StepProgress> {
         AgentEvent::MessageEnd {
             message_id,
             message,
+            discarded: false,
         } => StepProgress::MessageEnd {
             message_id: message_id.clone(),
             kind: message.kind,
         },
+        AgentEvent::MessageEnd {
+            discarded: true, ..
+        } => return None,
         _ => return None,
     })
 }

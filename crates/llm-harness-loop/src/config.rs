@@ -64,6 +64,14 @@ pub(crate) fn is_retryable(e: &LlmError) -> bool {
     )
 }
 
+/// Cap a retry delay to `max_retry_delay_ms` if set.
+pub(crate) fn cap_delay(delay: Duration, max_retry_delay_ms: Option<u64>) -> Duration {
+    match max_retry_delay_ms {
+        Some(max_ms) => delay.min(Duration::from_millis(max_ms)),
+        None => delay,
+    }
+}
+
 /// Agent loop 的配置。`agent_loop` 会消费此结构（所有权转移）。
 pub struct LoopConfig {
     // === Run context ===

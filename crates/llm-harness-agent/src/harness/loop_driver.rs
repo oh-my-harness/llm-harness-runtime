@@ -360,11 +360,15 @@ impl AgentHarness {
                     self.inner.lock().unwrap().state.streaming_message = Some(partial.clone());
                     self.emit(AgentHarnessEvent::Agent(event));
                 }
-                AgentEvent::MessageEnd { message, .. } => {
+                AgentEvent::MessageEnd {
+                    message, discarded, ..
+                } => {
                     self.inner.lock().unwrap().state.streaming_message = None;
-                    let msg = AgentMessage::Assistant(message.clone());
-                    self.push_pending_write(SessionEntryPayload::Message(msg.clone()));
-                    turn_messages.push(msg);
+                    if !discarded {
+                        let msg = AgentMessage::Assistant(message.clone());
+                        self.push_pending_write(SessionEntryPayload::Message(msg.clone()));
+                        turn_messages.push(msg);
+                    }
                     self.emit(AgentHarnessEvent::Agent(event));
                 }
                 AgentEvent::ToolExecutionStart {

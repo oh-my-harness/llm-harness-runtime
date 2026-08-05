@@ -148,12 +148,15 @@ impl ExecutionEnv for NoOpEnv {
 
 /// Preset response for `MockLlmClient`.
 pub struct MockResponse {
-    /// Stream events to emit in order. Ignored when `stream_error` is set.
+    /// Stream events to emit in order. Ignored when `stream_error` is set or
+    /// when `stream_impl` is set.
     pub events: Vec<Result<StreamEvent, LlmError>>,
     /// Model name to set on the `StreamHandle`. Ignored when `stream_error` is set.
     pub model: String,
     /// If set, `chat_stream` returns this error instead of a `StreamHandle`.
     pub stream_error: Option<LlmError>,
+    /// Custom stream implementation; when set, takes precedence over `events`.
+    pub stream_impl: Option<BoxStream<'static, Result<StreamEvent, LlmError>>>,
 }
 
 impl MockResponse {
@@ -162,12 +165,12 @@ impl MockResponse {
     /// This convenience path intentionally cannot serve as trusted pricing
     /// evidence. Use [`MockResponse::text_with_reported_zero`] or
     /// [`MockResponse::with_reported_usage`] when the mock provider is meant to
-    /// supply an authoritative usage payload.
     pub fn text(text: &str) -> Self {
         let t = text.to_owned();
         Self {
             model: "mock-model".into(),
             stream_error: None,
+            stream_impl: None,
             events: vec![
                 Ok(StreamEvent::ContentStart {
                     index: 0,
@@ -247,6 +250,7 @@ impl MockResponse {
         Self {
             model: "mock-model".into(),
             stream_error: None,
+            stream_impl: None,
             events: vec![
                 Ok(StreamEvent::ContentStart {
                     index: 0,
@@ -279,6 +283,7 @@ impl MockResponse {
         Self {
             model: "mock-model".into(),
             stream_error: None,
+            stream_impl: None,
             events: vec![
                 Ok(StreamEvent::ContentStart {
                     index: 0,
@@ -306,6 +311,7 @@ impl MockResponse {
             events: vec![],
             model: String::new(),
             stream_error: Some(LlmError::RateLimit { retry_after: None }),
+            stream_impl: None,
         }
     }
     /// Preset that emits a couple of text deltas then terminates abnormally
@@ -319,6 +325,7 @@ impl MockResponse {
         Self {
             model: "mock-model".into(),
             stream_error: None,
+            stream_impl: None,
             events: vec![
                 Ok(StreamEvent::ContentStart {
                     index: 0,
@@ -330,6 +337,55 @@ impl MockResponse {
                     finish_reason: None,
                 }),
             ],
+        }
+    }
+
+    /// Emits `n` initial events from a default text response, then stalls
+    /// forever (channel sender stays open, receiver blocks). Used to test
+    /// the stream idle watchdog.
+    pub fn stall_after(n: usize) -> Self {
+        let template = MockResponse::text("stalled");
+        let initial: Vec<Result<StreamEvent, LlmError>> =
+            template.events.into_iter().take(n).collect();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, LlmError>>(32);
+        tokio::spawn(async move {
+            for ev in initial {
+                if tx.send(ev).await.is_err() {
+                    break;
+                }
+            }
+            // Do not close tx — receiver blocks forever, simulating stream stall.
+            std::future::pending::<()>().await;
+        });
+        let inner: BoxStream<'static, Result<StreamEvent, LlmError>> =
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+        Self {
+            events: vec![],
+            model: "mock-model".into(),
+            stream_error: None,
+            stream_impl: Some(inner),
+        }
+    }
+
+    /// Emits the given events one at a time, sleeping `interval_ms` between
+    /// each. Used to verify the idle timer resets on each event arrival.
+    pub fn slow_stream(events: Vec<Result<StreamEvent, LlmError>>, interval_ms: u64) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, LlmError>>(32);
+        tokio::spawn(async move {
+            for ev in events {
+                tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+                if tx.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let inner: BoxStream<'static, Result<StreamEvent, LlmError>> =
+            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+        Self {
+            events: vec![],
+            model: "mock-model".into(),
+            stream_error: None,
+            stream_impl: Some(inner),
         }
     }
 }
@@ -400,7 +456,11 @@ impl Provider for MockLlmClient {
             return Err(e);
         }
         let inner: BoxStream<'static, Result<StreamEvent, LlmError>> =
-            Box::pin(stream::iter(response.events));
+            if let Some(stream) = response.stream_impl {
+                stream
+            } else {
+                Box::pin(stream::iter(response.events))
+            };
         Ok(StreamHandle::from_raw_stream(response.model, inner))
     }
 }
@@ -511,5 +571,45 @@ mod tests {
     fn no_op_env_working_dir() {
         let env = NoOpEnv;
         assert_eq!(env.working_dir(), Path::new("/tmp"));
+    }
+}
+
+#[cfg(test)]
+mod stream_mock_tests {
+    use super::*;
+    use futures::StreamExt;
+
+    #[tokio::test]
+    async fn stall_after_emits_n_events_then_blocks() {
+        let resp = MockResponse::stall_after(2);
+        let client = MockLlmClient::with_single(resp);
+        let req = ChatRequest::builder("m", 1).build();
+        let mut handle = client.chat_stream(&req).await.unwrap();
+        // First two events arrive
+        let ev1 = handle.events().next().await;
+        let ev2 = handle.events().next().await;
+        assert!(ev1.is_some());
+        assert!(ev2.is_some());
+        // Third should block — wrap in timeout to verify
+        let ev3 =
+            tokio::time::timeout(std::time::Duration::from_millis(50), handle.events().next())
+                .await;
+        assert!(ev3.is_err(), "third event should block (stream stalled)");
+    }
+
+    #[tokio::test]
+    async fn slow_stream_emits_events_at_interval() {
+        let events = MockResponse::text("hi").events;
+        let resp = MockResponse::slow_stream(events, 5);
+        let client = MockLlmClient::with_single(resp);
+        let req = ChatRequest::builder("m", 1).build();
+        let mut handle = client.chat_stream(&req).await.unwrap();
+        // Collect all events — they arrive at 5ms intervals
+        let collected: Vec<_> = handle.events().collect().await;
+        assert!(!collected.is_empty(), "should receive all events");
+        assert!(
+            collected.iter().any(|r| r.is_ok()),
+            "should have at least one ok event"
+        );
     }
 }

@@ -48,6 +48,14 @@ pub struct StreamOptions {
     pub metadata: serde_json::Value,
     /// 厂商特定的缓存配置；需要 provider adapter 支持后才能透传。
     pub cache_config: Option<serde_json::Value>,
+    /// 流式事件间空闲超时（毫秒）。
+    ///
+    /// 两个 StreamEvent 之间无新数据超过此时长则判定为卡死，
+    /// drop StreamHandle 并触发重试。`None`（默认）表示禁用看门狗，
+    /// 保持既有行为：不会因流中途无数据而 mid-stream 重试。
+    /// 启用后，若卡死前已发出可见事件，重试前会为该 partial message
+    /// 补发一个 `MessageEnd`，避免消费者看到未闭合的消息。
+    pub stream_idle_timeout_ms: Option<u64>,
 }
 
 #[cfg(test)]
@@ -76,5 +84,6 @@ mod tests {
         assert!(opts.timeout_ms.is_none());
         assert!(opts.max_retries.is_none());
         assert!(opts.headers.is_empty());
+        assert!(opts.stream_idle_timeout_ms.is_none());
     }
 }

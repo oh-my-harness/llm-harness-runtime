@@ -7,6 +7,7 @@ use crate::{
 ///
 /// 消息级事件（`Message*`）与 token 级事件（`TextDelta` 等）并列，
 /// 支持消息列表 UI 和字符流 UI 两种模式。
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum AgentEvent {
     // === Agent 生命周期 ===
@@ -37,9 +38,15 @@ pub enum AgentEvent {
         partial: AssistantMessage,
     },
     /// Assistant message 完整生成完毕，含 stop_reason 和 usage。
+    ///
+    /// `discarded` 为 `true` 时表示此 MessageEnd 关闭的是一个中途被放弃的
+    /// partial message（例如 idle-timeout 重试）。持久化消息的消费者应跳过
+    /// discarded 消息；`as_final_answer()` / `as_progress()` 对 discarded
+    /// 消息返回 `None`。
     MessageEnd {
         message_id: String,
         message: AssistantMessage,
+        discarded: bool,
     },
 
     // === Token 级（字符流） ===
@@ -105,11 +112,12 @@ pub enum AgentEvent {
 
 impl AgentEvent {
     /// 若此事件是最终回答（`MessageEnd` 且 `message.kind == FinalAnswer`），
-    /// 返回 `(message_id, turn_id, text)`。
+    /// 返回 `(message_id, turn_id, text)`。对 `discarded` 消息返回 `None`。
     pub fn as_final_answer(&self) -> Option<(&str, &str, String)> {
         if let AgentEvent::MessageEnd {
             message_id,
             message,
+            discarded: false,
         } = self
             && message.kind == AssistantMessageKind::FinalAnswer
         {
@@ -119,11 +127,12 @@ impl AgentEvent {
     }
 
     /// 若此事件是进度消息（`MessageEnd` 且 `message.kind == Progress`），
-    /// 返回 `(message_id, turn_id, text)`。
+    /// 返回 `(message_id, turn_id, text)`。对 `discarded` 消息返回 `None`。
     pub fn as_progress(&self) -> Option<(&str, &str, String)> {
         if let AgentEvent::MessageEnd {
             message_id,
             message,
+            discarded: false,
         } = self
             && message.kind == AssistantMessageKind::Progress
         {
@@ -216,6 +225,7 @@ mod tests {
         let ev = AgentEvent::MessageEnd {
             message_id: "msg_1".into(),
             message: msg,
+            discarded: false,
         };
         let (id, turn, text) = ev.as_final_answer().unwrap();
         assert_eq!(id, "msg_1");
@@ -230,6 +240,7 @@ mod tests {
         let ev = AgentEvent::MessageEnd {
             message_id: "msg_1".into(),
             message: msg,
+            discarded: false,
         };
         assert!(ev.as_final_answer().is_none());
         assert!(ev.as_progress().is_some());
@@ -242,6 +253,7 @@ mod tests {
         let ev = AgentEvent::MessageEnd {
             message_id: "msg_1".into(),
             message: msg,
+            discarded: false,
         };
         let (id, turn, text) = ev.as_progress().unwrap();
         assert_eq!(id, "msg_1");
@@ -257,5 +269,18 @@ mod tests {
         };
         assert!(ev.as_final_answer().is_none());
         assert!(ev.as_progress().is_none());
+    }
+
+    #[test]
+    fn as_progress_returns_none_for_discarded_message() {
+        let mut msg = make_assistant();
+        msg.kind = crate::AssistantMessageKind::Progress;
+        let ev = AgentEvent::MessageEnd {
+            message_id: "msg_1".into(),
+            message: msg,
+            discarded: true,
+        };
+        assert!(ev.as_progress().is_none());
+        assert!(ev.as_final_answer().is_none());
     }
 }

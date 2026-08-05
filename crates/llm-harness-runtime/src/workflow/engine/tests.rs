@@ -1013,6 +1013,7 @@ fn step_progress_from_maps_coarse_events() {
     let ev = AgentEvent::MessageEnd {
         message_id: "m1".into(),
         message: test_msg(vec![ContentBlock::Text { text: "hi".into() }]),
+        discarded: false,
     };
     match step_progress_from(&ev) {
         Some(StepProgress::MessageEnd { message_id, kind }) => {
@@ -1059,6 +1060,17 @@ fn step_progress_from_returns_none_for_filtered_events() {
         message_id: "m1".into(),
     };
     assert!(step_progress_from(&ev).is_none());
+
+    // Discarded MessageEnd — filtered (boundary signal, not real progress)
+    let ev = AgentEvent::MessageEnd {
+        message_id: "m1".into(),
+        message: test_msg(vec![]),
+        discarded: true,
+    };
+    assert!(
+        step_progress_from(&ev).is_none(),
+        "discarded MessageEnd should not produce StepProgress"
+    );
 }
 
 /// Integration: a free-task LLM step that calls a registered tool should

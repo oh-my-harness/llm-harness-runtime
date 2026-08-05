@@ -184,15 +184,14 @@ fn main() {}
                 std::fs::write(&bin_path, &probe.source)
                     .unwrap_or_else(|error| panic!("write {name}.rs: {error}"));
                 let target_dir = target_dir.clone();
-                let output = Command::new(
-                    std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()),
-                )
-                .args(["check", "--offline", "--message-format=json", "--bin", name])
-                .current_dir(&forge_dir)
-                .env("CARGO_TARGET_DIR", &target_dir)
-                .env("PYO3_PYTHON", &pyo3_python)
-                .output()
-                .unwrap_or_else(|error| panic!("cargo check --bin {name}: {error}"));
+                let output =
+                    Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+                        .args(["check", "--offline", "--message-format=json", "--bin", name])
+                        .current_dir(&forge_dir)
+                        .env("CARGO_TARGET_DIR", &target_dir)
+                        .env("PYO3_PYTHON", &pyo3_python)
+                        .output()
+                        .unwrap_or_else(|error| panic!("cargo check --bin {name}: {error}"));
                 (probe, output)
             })
         })

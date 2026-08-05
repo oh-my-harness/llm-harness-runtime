@@ -174,6 +174,7 @@ impl StreamingState {
                 let events = vec![AgentEvent::MessageEnd {
                     message_id: mid,
                     message: message.clone(),
+                    discarded: false,
                 }];
                 events
             }
@@ -190,6 +191,26 @@ impl StreamingState {
             stop_reason: None,
             timestamp: Utc::now(),
             // The current adapter stream does not expose provider/api metadata.
+            provider: None,
+            api: None,
+            model: Some(self.model.clone()),
+            usage: None,
+            error_message: None,
+        }
+    }
+
+    /// Build a discarded `AssistantMessage` — a Progress-kind message with
+    /// empty content, used for the discard `MessageEnd` emitted before an
+    /// idle-timeout retry. Unlike `partial_message()`, this does NOT clone
+    /// accumulated content blocks (they would be immediately cleared anyway).
+    pub(crate) fn discarded_message(&self) -> AssistantMessage {
+        AssistantMessage {
+            kind: AssistantMessageKind::Progress,
+            message_id: self.message_id.clone(),
+            turn_id: self.turn_id.clone(),
+            content: Vec::new(),
+            stop_reason: None,
+            timestamp: Utc::now(),
             provider: None,
             api: None,
             model: Some(self.model.clone()),

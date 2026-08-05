@@ -88,6 +88,8 @@ pub enum AgentError {
     Internal(String),
     #[error("resource limit exceeded: {0}")]
     ResourceLimitExceeded(String),
+    #[error("stream idle timeout after {timeout_ms}ms")]
+    StreamIdle { timeout_ms: u64 },
 }
 
 // ── EnvError ──────────────────────────────────────────────────────────────────

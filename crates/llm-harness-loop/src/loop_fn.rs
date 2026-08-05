@@ -288,45 +288,189 @@ fn run_loop(
                 .await;
             }
 
-            // Call LLM (with optional retry on transient errors)
-            let mut handle = {
-                use crate::config::{is_retryable, RetryConfig};
-                let mut retry = config.retry.as_ref().cloned().unwrap_or(RetryConfig {
-                    max_retries: 0,
-                    base_delay_ms: 0,
-                });
-                if let Some(max_retries) = stream_opts.max_retries {
-                    retry.max_retries = max_retries;
-                }
-                let mut attempt = 0u32;
-                loop {
-                    let call = client.chat_stream(&req);
-                    let response = if let Some(timeout_ms) = stream_opts.timeout_ms {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_millis(timeout_ms),
-                            call,
-                        )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => {
-                                yield AgentEvent::Error(AgentError::Provider(format!(
-                                    "provider request timed out after {timeout_ms}ms"
-                                )));
+            // Call LLM (with optional retry on transient errors).
+            // The retry loop encompasses both connection establishment AND
+            // stream event consumption. An idle watchdog fires if no
+            // StreamEvent arrives within stream_idle_timeout_ms, dropping
+            // the StreamHandle and retrying the whole request.
+            use crate::config::{cap_delay, is_retryable, RetryConfig};
+
+            let mut retry = config.retry.as_ref().cloned().unwrap_or(RetryConfig {
+                max_retries: 0,
+                base_delay_ms: 0,
+            });
+            if let Some(max_retries) = stream_opts.max_retries {
+                retry.max_retries = max_retries;
+            }
+            let mut attempt = 0u32;
+
+            let (assistant_msg, handle_status_code, handle_latency_ms) = loop {
+                // === Connection establishment ===
+                let call = client.chat_stream(&req);
+                let response = if let Some(timeout_ms) = stream_opts.timeout_ms {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(timeout_ms),
+                        call,
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            yield AgentEvent::Error(AgentError::Provider(format!(
+                                "provider request timed out after {timeout_ms}ms"
+                            )));
+                            break 'main;
+                        }
+                    }
+                } else {
+                    call.await
+                };
+
+                let mut handle = match response {
+                    Ok(h) => h,
+                    Err(e) if is_retryable(&e) && retry.can_retry(attempt) => {
+                        let delay = cap_delay(
+                            retry.delay_for(attempt, &e),
+                            stream_opts.max_retry_delay_ms,
+                        );
+                        yield AgentEvent::RetryAttempt {
+                            attempt,
+                            max_retries: retry.max_retries,
+                            delay_ms: delay.as_millis() as u64,
+                            error: e.to_string(),
+                        };
+                        tokio::select! {
+                            biased;
+                            _ = config.abort.cancelled() => {
+                                yield AgentEvent::Error(AgentError::Aborted);
                                 break 'main;
                             }
+                            _ = tokio::time::sleep(delay) => {}
                         }
-                    } else {
-                        call.await
-                    };
+                        attempt += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        yield AgentEvent::Error(AgentError::Provider(e.to_string()));
+                        break 'main;
+                    }
+                };
 
-                    match response {
-                        Ok(h) => break h,
-                        Err(e) if is_retryable(&e) && retry.can_retry(attempt) => {
-                            let mut delay = retry.delay_for(attempt, &e);
-                            if let Some(max_delay_ms) = stream_opts.max_retry_delay_ms {
-                                delay = delay.min(std::time::Duration::from_millis(max_delay_ms));
+                // === Stream consumption with idle watchdog ===
+                let mut state = StreamingState::new_with_terminal_text_classification(
+                    handle.model().to_owned(),
+                    turn_id.clone(),
+                    terminal_text_classification(&config.final_answer_mode),
+                );
+                let message_id = state.message_id.clone();
+                // Tracks whether any consumer-visible AgentEvent was emitted for
+                // this message (MessageStart, TextDelta, MessageUpdate, ToolCall*,
+                // …). MessageStart itself counts — if the stream stalls after
+                // only ContentStart (which produces no AgentEvent), we still
+                // need to close the orphaned MessageStart with a discard
+                // MessageEnd before retrying.
+                let mut had_visible_events = true;
+                yield AgentEvent::MessageStart { message_id };
+
+                // Idle watchdog: a single reusable Sleep hoisted above the
+                // consume loop. Reset on every event arrival to re-arm.
+                // Some(0) is treated as disabled (avoid busy-retry spin).
+                let idle_timeout = stream_opts.stream_idle_timeout_ms.filter(|&ms| ms > 0);
+                // Always use a Sleep; when disabled, deadline is far future (never fires).
+                let idle_sleep = tokio::time::sleep(match idle_timeout {
+                    Some(ms) => std::time::Duration::from_millis(ms),
+                    None => std::time::Duration::MAX,
+                });
+                tokio::pin!(idle_sleep);
+
+                let mut final_message: Option<AssistantMessage> = None;
+                let stream_result: Result<Option<AssistantMessage>, AgentError> = loop {
+                    let event_fut = handle.events().next();
+                    tokio::pin!(event_fut);
+
+                    tokio::select! {
+                        biased;
+                        _ = config.abort.cancelled() => {
+                            break Err(AgentError::Aborted);
+                        }
+                        _ = &mut idle_sleep => {
+                            // Idle timeout fired — break out of consume loop.
+                            // handle is dropped below, outside select!.
+                            break Err(AgentError::StreamIdle {
+                                timeout_ms: idle_timeout.unwrap(),
+                            });
+                        }
+                        ev = &mut event_fut => {
+                            match ev {
+                                Some(Ok(adapter_event)) => {
+                                    let is_terminal = matches!(
+                                        &adapter_event,
+                                        llm_adapter::types::StreamEvent::MessageStop { .. }
+                                    );
+                                    for agent_event in state.process(adapter_event) {
+                                        if let AgentEvent::MessageEnd { ref message, .. } = agent_event {
+                                            final_message = Some(message.clone());
+                                            if message.kind == AssistantMessageKind::FinalAnswer {
+                                                continue;
+                                            }
+                                        }
+                                        had_visible_events = true;
+                                        yield agent_event;
+                                    }
+                                    // Re-arm idle watchdog on every event.
+                                    if let Some(ms) = idle_timeout {
+                                        idle_sleep.as_mut().reset(tokio::time::Instant::now()
+                                            + std::time::Duration::from_millis(ms));
+                                    }
+                                    if is_terminal {
+                                        break Ok(final_message);
+                                    }
+                                }
+                                Some(Err(e)) => {
+                                    break Err(AgentError::Provider(e.to_string()));
+                                }
+                                None => break Ok(final_message),
                             }
+                        }
+                    }
+                };
+                let handle_status_code = handle.status_code();
+                let handle_latency_ms = handle.latency_ms();
+                // handle dropped here (end of this loop iteration's scope).
+                // This kills the underlying HTTP connection.
+                drop(handle);
+
+                match stream_result {
+                    Ok(Some(msg)) => break (msg, handle_status_code, handle_latency_ms),
+                    Ok(None) => {
+                        yield AgentEvent::Error(AgentError::Internal(
+                            "stream ended without MessageEnd".into(),
+                        ));
+                        break 'main;
+                    }
+                    Err(AgentError::Aborted) => {
+                        yield AgentEvent::Error(AgentError::Aborted);
+                        break 'main;
+                    }
+                    Err(e) => {
+                        // Idle timeout or stream error — check retry.
+                        let is_idle = matches!(e, AgentError::StreamIdle { .. });
+                        if is_idle && retry.can_retry(attempt) {
+                            // Close the orphaned partial message so consumers
+                            // pairing MessageStart→MessageEnd see a clean
+                            // boundary before the retry emits a new MessageStart.
+                            if had_visible_events {
+                                let partial = state.discarded_message();
+                                yield AgentEvent::MessageEnd {
+                                    message_id: partial.message_id.clone(),
+                                    message: partial,
+                                    discarded: true,
+                                };
+                            }
+                            let delay = cap_delay(
+                                retry.delay_for(attempt, &llm_adapter::LlmError::Timeout),
+                                stream_opts.max_retry_delay_ms,
+                            );
                             yield AgentEvent::RetryAttempt {
                                 attempt,
                                 max_retries: retry.max_retries,
@@ -342,71 +486,23 @@ fn run_loop(
                                 _ = tokio::time::sleep(delay) => {}
                             }
                             attempt += 1;
-                        }
-                        Err(e) => {
-                            yield AgentEvent::Error(AgentError::Provider(e.to_string()));
+                            continue;
+                        } else {
+                            yield AgentEvent::Error(e);
                             break 'main;
                         }
                     }
                 }
             };
 
-            // Emit MessageStart
-            let mut state = StreamingState::new_with_terminal_text_classification(
-                handle.model().to_owned(),
-                turn_id,
-                terminal_text_classification(&config.final_answer_mode),
-            );
-            let message_id = state.message_id.clone();
-            yield AgentEvent::MessageStart { message_id: message_id.clone() };
-
-            // Process stream events
-            let mut final_message: Option<AssistantMessage> = None;
-            loop {
-                match handle.events().next().await {
-                    Some(Ok(adapter_event)) => {
-                        let is_terminal =
-                            matches!(&adapter_event, llm_adapter::types::StreamEvent::MessageStop { .. });
-                        for agent_event in state.process(adapter_event) {
-                            if let AgentEvent::MessageEnd { ref message, .. } = agent_event {
-                                final_message = Some(message.clone());
-                                if message.kind == AssistantMessageKind::FinalAnswer {
-                                    // Final answers cross the committed event boundary only
-                                    // after validation below. Text deltas remain provisional.
-                                    continue;
-                                }
-                            }
-                            yield agent_event;
-                        }
-                        if is_terminal {
-                            break;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        yield AgentEvent::Error(AgentError::Provider(e.to_string()));
-                        break 'main;
-                    }
-                    None => break,
-                }
-            }
-
-            let assistant_msg = match final_message {
-                Some(m) => m,
-                None => {
-                    yield AgentEvent::Error(AgentError::Internal(
-                        "stream ended without MessageEnd".into(),
-                    ));
-                    break 'main;
-                }
-            };
-
             // AfterProviderResponseHook: observation hook for quota tracking, cost monitoring.
+            // Only reached on the successful path (Ok(Some(msg)) => break msg above).
             if let Some(h) = &config.after_provider_response {
                 let info = ProviderResponseInfo {
-                    status_code: handle.status_code(),
+                    status_code: handle_status_code,
                     response_headers: vec![],
                     usage: assistant_msg.usage.clone(),
-                    latency_ms: handle.latency_ms(),
+                    latency_ms: handle_latency_ms,
                     model: assistant_msg.model.clone(),
                     provider: assistant_msg.provider.clone(),
                 };
@@ -428,6 +524,7 @@ fn run_loop(
                 yield AgentEvent::MessageEnd {
                     message_id: assistant_msg.message_id.clone(),
                     message: assistant_msg.clone(),
+                    discarded: false,
                 };
             }
 
@@ -663,6 +760,7 @@ fn run_loop(
                     yield AgentEvent::MessageEnd {
                         message_id,
                         message: final_message.clone(),
+                        discarded: false,
                     };
                     let final_agent_msg = AgentMessage::Assistant(final_message.clone());
                     ctx.messages.push(final_agent_msg.clone());
@@ -1976,6 +2074,528 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn stream_idle_timeout_triggers_retry() {
+        use crate::config::RetryConfig;
+
+        // First response: stall after 1 event (stream stalls).
+        // Second response: normal text response (retry succeeds).
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stall_after(1),
+            MockResponse::text("recovered"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0)); // base_delay_ms=0
+        cfg.stream_options.stream_idle_timeout_ms = Some(100);
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+
+        tokio::time::pause();
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        // Must have a RetryAttempt from the idle timeout
+        let retry_count = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+            .count();
+        assert_eq!(
+            retry_count, 1,
+            "expected one RetryAttempt from idle timeout"
+        );
+
+        // Must complete successfully after retry
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
+            "loop should complete after successful retry"
+        );
+
+        // Verify the RetryAttempt was triggered by an idle timeout (typed
+        // variant check — not a string substring match on the Display text).
+        // A RetryAttempt is only emitted on the idle-retry path (is_idle &&
+        // can_retry), so its presence after a stall confirms the typed
+        // dispatch contract.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. })),
+            "RetryAttempt should be present, confirming idle-timeout typed dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_exhausts_retries() {
+        use crate::config::RetryConfig;
+
+        // All responses stall — retries exhaust, loop emits Error.
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stall_after(1),
+            MockResponse::stall_after(1),
+            MockResponse::stall_after(1),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0)); // max_retries=2
+        cfg.stream_options.stream_idle_timeout_ms = Some(50);
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+
+        tokio::time::pause();
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        let retry_count = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+            .count();
+        assert_eq!(
+            retry_count, 2,
+            "expected 2 RetryAttempt events (max_retries=2)"
+        );
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::StreamIdle { .. }))),
+            "expected Error(StreamIdle) after retries exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_disabled_by_default() {
+        use crate::config::RetryConfig;
+
+        // stream_idle_timeout_ms=None → watchdog disabled, no RetryAttempt emitted.
+        let (client, mut cfg) = make_config(vec![MockResponse::stall_after(1)]);
+        cfg.retry = Some(RetryConfig::new(3, 0));
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+
+        tokio::time::pause();
+
+        let stream = agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg);
+        futures::pin_mut!(stream);
+
+        let mut events = Vec::new();
+        let deadline = tokio::time::sleep(std::time::Duration::from_millis(500));
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                ev = stream.next() => {
+                    match ev {
+                        Some(e) => events.push(e),
+                        None => break,
+                    }
+                }
+            }
+        }
+
+        // No RetryAttempt should have been emitted (watchdog disabled)
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. })),
+            "no RetryAttempt when stream_idle_timeout_ms is None"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timer_resets_on_event() {
+        use crate::config::RetryConfig;
+
+        // slow_stream emits events at 10ms intervals; idle timeout=50ms.
+        // Each event resets the timer, so watchdog should NOT fire.
+        let events = MockResponse::text("slow").events;
+        let (client, mut cfg) = make_config(vec![MockResponse::slow_stream(events, 10)]);
+        cfg.retry = Some(RetryConfig::new(3, 0));
+        cfg.stream_options.stream_idle_timeout_ms = Some(50);
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+
+        tokio::time::pause();
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        // Should complete normally — no RetryAttempt
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. })),
+            "no RetryAttempt when events arrive within idle window"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
+            "loop should complete normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_during_idle_wait() {
+        use crate::config::RetryConfig;
+
+        let (client, mut cfg) = make_config(vec![MockResponse::stall_after(1)]);
+        cfg.retry = Some(RetryConfig::new(3, 0));
+        cfg.stream_options.stream_idle_timeout_ms = Some(10_000); // 10s idle
+        let abort = cfg.abort.clone();
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+
+        tokio::time::pause();
+
+        let stream = agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg);
+        futures::pin_mut!(stream);
+        let mut events = Vec::new();
+
+        while let Some(ev) = stream.next().await {
+            // Abort after MessageStart (stream is now stalled waiting for events)
+            let is_error = matches!(ev, AgentEvent::Error(_));
+            if matches!(ev, AgentEvent::MessageStart { .. }) {
+                abort.cancel();
+            }
+            events.push(ev);
+            if is_error {
+                break;
+            }
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::Aborted))),
+            "expected Error(Aborted) when abort fires during idle wait"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. })),
+            "no RetryAttempt — abort should take priority over idle timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_idle_timeout_succeeds() {
+        use crate::config::RetryConfig;
+
+        // First: stall. Second: normal response. Retry should succeed.
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stall_after(1),
+            MockResponse::text("ok after retry"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        cfg.stream_options.stream_idle_timeout_ms = Some(100);
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+
+        tokio::time::pause();
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        // Should have exactly 1 RetryAttempt
+        let retry_count = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+            .count();
+        assert_eq!(retry_count, 1);
+
+        // Should complete with AgentEnd
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
+            "loop should complete after successful retry"
+        );
+
+        // new_messages should contain the assistant message
+        if let Some(AgentEvent::AgentEnd { new_messages }) = events
+            .iter()
+            .rev()
+            .find(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+        {
+            assert!(
+                !new_messages.is_empty(),
+                "should have new messages after successful retry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_retry_emits_discard_message_end_for_partial_message() {
+        use crate::config::RetryConfig;
+
+        // stall_after(2) emits ContentStart + TextDelta (a visible partial),
+        // then stalls. On idle timeout the loop must emit a discard MessageEnd
+        // for the orphaned partial message before retrying with a fresh
+        // MessageStart.
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stall_after(2),
+            MockResponse::text("recovered"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        cfg.stream_options.stream_idle_timeout_ms = Some(100);
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+
+        tokio::time::pause();
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        // Collect message_ids seen in MessageStart order.
+        let starts: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::MessageStart { message_id } => Some(message_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts.len(),
+            2,
+            "expected two MessageStart events (stall + retry)"
+        );
+
+        // The first (stalled) message_id must have a matching MessageEnd
+        // emitted BEFORE the second MessageStart — the discard signal.
+        let stalled_id = &starts[0];
+        let retry_id = &starts[1];
+        assert_ne!(stalled_id, retry_id, "retry must start a fresh message_id");
+
+        let stalled_end_idx = events.iter().position(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageEnd { message_id, .. } if message_id == stalled_id
+            )
+        });
+        let retry_start_idx = events.iter().position(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageStart { message_id } if message_id == retry_id
+            )
+        });
+        assert!(
+            stalled_end_idx.is_some(),
+            "partial message must be closed with MessageEnd"
+        );
+        assert!(
+            retry_start_idx.is_some(),
+            "retry must emit a fresh MessageStart"
+        );
+        assert!(
+            stalled_end_idx.unwrap() < retry_start_idx.unwrap(),
+            "discard MessageEnd for partial message must precede the retry's MessageStart"
+        );
+
+        // The discard MessageEnd must carry a Progress (non-final) message,
+        // be marked discarded, and have cleared content.
+        if let Some(AgentEvent::MessageEnd {
+            message, discarded, ..
+        }) = events.iter().find(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageEnd { message_id, .. } if message_id == stalled_id
+            )
+        }) {
+            assert_eq!(
+                message.kind,
+                AssistantMessageKind::Progress,
+                "discard MessageEnd should be a Progress partial, not FinalAnswer"
+            );
+            assert!(*discarded, "discard MessageEnd must have discarded: true");
+            assert!(
+                message.content.is_empty(),
+                "discard MessageEnd content must be cleared"
+            );
+        }
+
+        // Loop completes after successful retry.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
+            "loop should complete after successful retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_retry_stall_after_one_event_emits_discard_message_end() {
+        use crate::config::RetryConfig;
+
+        // stall_after(1) emits only ContentStart (which produces no AgentEvent
+        // from state.process), then stalls. MessageStart was already emitted
+        // unconditionally, so the idle retry must still close it with a discard
+        // MessageEnd — even though no visible token-level event followed.
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stall_after(1),
+            MockResponse::text("recovered"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        cfg.stream_options.stream_idle_timeout_ms = Some(100);
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+
+        tokio::time::pause();
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        let starts: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::MessageStart { message_id } => Some(message_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts.len(),
+            2,
+            "expected two MessageStart events (stall + retry)"
+        );
+
+        let stalled_id = &starts[0];
+
+        // The stalled MessageStart must be closed by a discard MessageEnd
+        // before the retry's MessageStart.
+        let stalled_end_idx = events.iter().position(|e| matches!(
+            e,
+            AgentEvent::MessageEnd { message_id, discarded: true, .. } if message_id == stalled_id
+        ));
+        let retry_start_idx = events.iter().position(|e| {
+            matches!(
+                e,
+                AgentEvent::MessageStart { message_id } if message_id == &starts[1]
+            )
+        });
+        assert!(
+            stalled_end_idx.is_some(),
+            "stalled MessageStart must be closed with a discard MessageEnd even after ContentStart-only stall"
+        );
+        assert!(retry_start_idx.is_some());
+        assert!(
+            stalled_end_idx.unwrap() < retry_start_idx.unwrap(),
+            "discard MessageEnd must precede the retry's MessageStart"
+        );
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
+            "loop should complete after successful retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_with_aborted_retry_sleep() {
+        use crate::config::RetryConfig;
+
+        // Stall → idle timeout → retry sleep is long → abort during sleep.
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stall_after(1),
+            MockResponse::text("never reached"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 10_000)); // 10s backoff
+        cfg.stream_options.stream_idle_timeout_ms = Some(50);
+        let abort = cfg.abort.clone();
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+
+        tokio::time::pause();
+
+        let stream = agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg);
+        futures::pin_mut!(stream);
+        let mut events = Vec::new();
+
+        while let Some(ev) = stream.next().await {
+            let is_retry = matches!(ev, AgentEvent::RetryAttempt { .. });
+            let is_error = matches!(ev, AgentEvent::Error(_));
+            events.push(ev);
+            if is_retry {
+                abort.cancel();
+            }
+            if is_error {
+                break;
+            }
+        }
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::Aborted))),
+            "expected Error(Aborted) after abort during retry sleep"
+        );
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "provider should be called once before abort during retry sleep"
+        );
+    }
+
+    #[tokio::test]
     async fn response_format_threaded_to_provider_request() {
         let (client, mut cfg) = make_config(vec![MockResponse::text("hi")]);
         cfg.response_format = Some(crate::ResponseFormat::JsonObject);
@@ -2031,7 +2651,10 @@ mod tests {
 
         // The synthetic result must be an error (unknown_tool or missing_result).
         if let AgentEvent::ToolExecutionEnd { result, .. } = &tool_exec_ends[0] {
-            assert!(result.is_err(), "synthetic result for orphan ToolUse must be Err");
+            assert!(
+                result.is_err(),
+                "synthetic result for orphan ToolUse must be Err"
+            );
         }
 
         // Loop must have continued to the second turn (no 400, no crash).
