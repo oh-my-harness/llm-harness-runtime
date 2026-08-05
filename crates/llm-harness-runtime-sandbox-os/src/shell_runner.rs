@@ -556,6 +556,8 @@ struct SupervisorInner {
     liveness: ComponentLiveness,
     /// Per-child timeout for fatal/synchronous reap paths.
     fatal_reap_timeout: std::time::Duration,
+    /// Sleep interval for stuck/orphan/emergency scanner threads.
+    scanner_interval: std::time::Duration,
 }
 
 struct SupervisorCore {
@@ -578,6 +580,7 @@ impl SupervisorCore {
                 next_id: 1,
                 liveness: ComponentLiveness::new(),
                 fatal_reap_timeout: FATAL_REAP_TIMEOUT,
+                scanner_interval: STUCK_REAPER_INTERVAL,
             }),
             sender,
         }
@@ -898,6 +901,19 @@ impl SupervisorCore {
     fn set_fatal_reap_timeout(&self, timeout: std::time::Duration) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.fatal_reap_timeout = timeout;
+    }
+
+    /// Current scanner sleep interval for stuck/orphan/emergency threads.
+    fn scanner_interval(&self) -> std::time::Duration {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.scanner_interval
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn set_scanner_interval(&self, interval: std::time::Duration) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.scanner_interval = interval;
     }
 
     #[cfg(test)]
@@ -1465,7 +1481,7 @@ impl ChildReaper {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            std::thread::sleep(STUCK_REAPER_INTERVAL);
+            std::thread::sleep(core.scanner_interval());
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -1496,7 +1512,7 @@ impl ChildReaper {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            std::thread::sleep(STUCK_REAPER_INTERVAL);
+            std::thread::sleep(core.scanner_interval());
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -1533,7 +1549,7 @@ impl ChildReaper {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            std::thread::sleep(STUCK_REAPER_INTERVAL);
+            std::thread::sleep(core.scanner_interval());
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -1818,6 +1834,7 @@ mod reap_tests {
         let (sender, _receiver) = std::sync::mpsc::sync_channel::<ChildId>(REAPER_QUEUE_CAPACITY);
         let core = Arc::new(SupervisorCore::new(sender));
         core.set_fatal_reap_timeout(Duration::from_millis(50));
+        core.set_scanner_interval(Duration::from_millis(10));
         core
     }
 
@@ -2639,6 +2656,7 @@ mod reap_tests {
         let result = init_reaper(&default_spawner);
         assert!(result.is_ok(), "init must succeed with default spawner");
         let reaper = result.unwrap();
+        reaper.core.set_scanner_interval(Duration::from_millis(10));
         assert!(reaper.is_healthy());
         assert!(reaper.metrics().workers_alive > 0);
         assert!(reaper.metrics().stuck_alive);
@@ -3205,6 +3223,7 @@ mod reap_tests {
         reaper
             .core
             .set_fatal_reap_timeout(Duration::from_millis(500));
+        reaper.core.set_scanner_interval(Duration::from_millis(10));
 
         // Acquire admission while Healthy.
         let epoch = reaper.core.try_admit().expect("must admit while healthy");
@@ -3321,6 +3340,7 @@ mod reap_tests {
     fn cancel_child_failed_state_real_child_reaped() {
         let reaper = init_reaper(&default_spawner).expect("init must succeed");
         reaper.core.set_fatal_reap_timeout(Duration::from_secs(2));
+        reaper.core.set_scanner_interval(Duration::from_millis(10));
 
         let child = spawn_child("sleep", "30");
         let pid = child.id().expect("child must have a PID");
@@ -3353,6 +3373,7 @@ mod reap_tests {
         reaper
             .core
             .set_fatal_reap_timeout(Duration::from_millis(500));
+        reaper.core.set_scanner_interval(Duration::from_millis(10));
 
         let controller_epoch = reaper.core.try_admit().expect("controller admission");
         let target_epoch = reaper.core.try_admit().expect("target admission");
@@ -3392,6 +3413,7 @@ mod reap_tests {
         reaper
             .core
             .set_fatal_reap_timeout(Duration::from_millis(100));
+        reaper.core.set_scanner_interval(Duration::from_millis(10));
 
         let controller_epoch = reaper.core.try_admit().expect("controller admission");
         let persistent_epoch = reaper.core.try_admit().expect("persistent admission");
@@ -3482,6 +3504,7 @@ mod reap_tests {
         reaper
             .core
             .set_fatal_reap_timeout(Duration::from_millis(500));
+        reaper.core.set_scanner_interval(Duration::from_millis(10));
 
         let epoch = reaper.core.try_admit().expect("must admit while healthy");
         let (first_attempt_tx, first_attempt_rx) = std::sync::mpsc::channel();
@@ -3533,6 +3556,7 @@ mod reap_tests {
         reaper
             .core
             .set_fatal_reap_timeout(Duration::from_millis(500));
+        reaper.core.set_scanner_interval(Duration::from_millis(10));
 
         let stale_epoch = reaper.core.try_admit().expect("stale admission");
         let trigger_epoch = reaper.core.try_admit().expect("trigger admission");

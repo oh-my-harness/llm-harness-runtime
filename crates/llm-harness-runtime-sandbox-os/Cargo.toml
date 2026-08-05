@@ -15,6 +15,12 @@ uuid       = { workspace = true }
 tokio      = { workspace = true, features = ["process", "fs", "io-util", "time"] }
 tokio-util.workspace          = true
 
+[features]
+# API boundary compile-probe tests are off by default — they spawn ~20
+# `cargo check` subprocesses and add ~17s to the test suite.  Enable with
+# `cargo test -p llm-harness-runtime-sandbox-os --features api-boundary-tests`.
+api-boundary-tests = []
+
 [dev-dependencies]
 tokio    = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"

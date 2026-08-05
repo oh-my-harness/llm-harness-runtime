@@ -1,3 +1,5 @@
+#![cfg(feature = "api-boundary-tests")]
+
 //! Compile-time checks for the child-reaper public API boundary.
 //!
 //! One temporary crate and one target directory are reused for every probe.
@@ -73,9 +75,7 @@ impl ForgeCrate {
         );
     }
 
-    fn assert_diagnostic(&self, probe: Probe) {
-        self.write_bin(probe.name, &probe.source);
-        let output = self.check_bin(probe.name);
+    fn assert_diagnostic(&self, probe: Probe, output: Output) {
         assert!(
             !output.status.success(),
             "negative API probe {} unexpectedly compiled",
@@ -165,8 +165,42 @@ fn main() {}
     );
     forge.assert_positive("positive");
 
-    for probe in probes() {
-        forge.assert_diagnostic(probe);
+    // Run all negative probes in parallel with per-probe target dirs so
+    // cargo doesn't serialize on the target-dir lock.
+    let probe_list = probes();
+    let forge_dir = forge.dir.clone();
+    let target_dir = forge.target_dir.clone();
+    let pyo3_python = std::env::var("PYO3_PYTHON").unwrap_or_default();
+
+    let handles: Vec<_> = probe_list
+        .into_iter()
+        .map(|probe| {
+            let forge_dir = forge_dir.clone();
+            let target_dir = target_dir.clone();
+            let pyo3_python = pyo3_python.clone();
+            std::thread::spawn(move || {
+                let name = probe.name;
+                let bin_path = forge_dir.join("src/bin").join(format!("{name}.rs"));
+                std::fs::write(&bin_path, &probe.source)
+                    .unwrap_or_else(|error| panic!("write {name}.rs: {error}"));
+                let target_dir = target_dir.clone();
+                let output = Command::new(
+                    std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()),
+                )
+                .args(["check", "--offline", "--message-format=json", "--bin", name])
+                .current_dir(&forge_dir)
+                .env("CARGO_TARGET_DIR", &target_dir)
+                .env("PYO3_PYTHON", &pyo3_python)
+                .output()
+                .unwrap_or_else(|error| panic!("cargo check --bin {name}: {error}"));
+                (probe, output)
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let (probe, output) = handle.join().expect("probe thread panicked");
+        forge.assert_diagnostic(probe, output);
     }
 }
 
