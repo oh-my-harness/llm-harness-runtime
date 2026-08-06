@@ -13,10 +13,14 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::McpServerConfig;
+use crate::config::{MismatchPolicy, ToolChangePolicy, VersionPolicy};
 use crate::session::{McpSession, McpSessionError, SessionResult};
 use crate::transport::{create_transport, resolve_timeout_ms};
 use crate::types::{McpToolCallResult, McpToolDefinition, notification_methods};
 use crate::utils::sanitize_name;
+use crate::version_lock::{
+    McpLockFile, ServerInfoSnapshot, ServerLockEntry, compute_tool_hashes, diff_tool_snapshots,
+};
 
 pub const STARTUP_TIMEOUT_MS: u64 = 250;
 const RECONNECT_WINDOW: Duration = Duration::from_secs(30);
@@ -56,6 +60,16 @@ pub enum McpManagerError {
     CircuitOpen(String),
     #[error("MCP tool cache error: {0}")]
     Cache(String),
+    #[error("MCP server '{server}' version mismatch: expected {expected}, got {actual}")]
+    VersionMismatch {
+        server: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("MCP server '{server}' credential reference '{reference}' could not be resolved")]
+    CredentialUnresolved { server: String, reference: String },
+    #[error("MCP server '{server}' tool definition changed: {summary}")]
+    ToolDefinitionChanged { server: String, summary: String },
 }
 
 pub type ManagerResult<T> = Result<T, McpManagerError>;
@@ -208,6 +222,10 @@ struct ManagerInner {
     reconnection_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     connector: SessionConnector,
     shutting_down: AtomicBool,
+    lock_file: RwLock<McpLockFile>,
+    lock_file_path: Option<PathBuf>,
+    credential_provider: Arc<dyn crate::credential::CredentialProvider>,
+    credential_scopes: RwLock<HashMap<String, HashMap<String, Vec<String>>>>,
 }
 
 pub struct McpManager {
@@ -216,14 +234,65 @@ pub struct McpManager {
 
 impl McpManager {
     pub fn new() -> Self {
-        Self::with_connector(None, Arc::new(default_connector))
+        Self::build_inner(
+            None,
+            Arc::new(default_connector),
+            Some(PathBuf::from(".mcp-lock.json")),
+            Arc::new(crate::credential::EnvCredentialProvider),
+        )
     }
 
     pub fn with_cache_path(cache_path: impl Into<PathBuf>) -> Self {
-        Self::with_connector(Some(cache_path.into()), Arc::new(default_connector))
+        Self::build_inner(
+            Some(cache_path.into()),
+            Arc::new(default_connector),
+            Some(PathBuf::from(".mcp-lock.json")),
+            Arc::new(crate::credential::EnvCredentialProvider),
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn with_connector(cache_path: Option<PathBuf>, connector: SessionConnector) -> Self {
+        Self::build_inner(
+            cache_path,
+            connector,
+            None,
+            Arc::new(crate::credential::EnvCredentialProvider),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_connector_and_lock(
+        cache_path: Option<PathBuf>,
+        connector: SessionConnector,
+        lock_file_path: PathBuf,
+    ) -> Self {
+        Self::build_inner(
+            cache_path,
+            connector,
+            Some(lock_file_path),
+            Arc::new(crate::credential::EnvCredentialProvider),
+        )
+    }
+
+    /// Construct an McpManager with a custom credential provider (e.g. for
+    /// `vault://` reference resolution). Use this when the default
+    /// `EnvCredentialProvider` is insufficient.
+    pub fn with_credential_provider(
+        cache_path: Option<PathBuf>,
+        connector: SessionConnector,
+        lock_file_path: Option<PathBuf>,
+        provider: Arc<dyn crate::credential::CredentialProvider>,
+    ) -> Self {
+        Self::build_inner(cache_path, connector, lock_file_path, provider)
+    }
+
+    fn build_inner(
+        cache_path: Option<PathBuf>,
+        connector: SessionConnector,
+        lock_file_path: Option<PathBuf>,
+        credential_provider: Arc<dyn crate::credential::CredentialProvider>,
+    ) -> Self {
         Self {
             inner: Arc::new(ManagerInner {
                 connections: RwLock::new(HashMap::new()),
@@ -237,6 +306,10 @@ impl McpManager {
                 reconnection_tasks: Mutex::new(HashMap::new()),
                 connector,
                 shutting_down: AtomicBool::new(false),
+                lock_file: RwLock::new(McpLockFile::default()),
+                lock_file_path,
+                credential_provider,
+                credential_scopes: RwLock::new(HashMap::new()),
             }),
         }
     }
@@ -248,6 +321,25 @@ impl McpManager {
         self.inner.shutting_down.store(false, Ordering::Release);
         if let Err(error) = self.inner.tool_cache.load_from_disk().await {
             tracing::warn!(%error, "failed to load MCP tool cache");
+        }
+        if let Some(lock_path) = &self.inner.lock_file_path {
+            match McpLockFile::load_from_disk(lock_path).await {
+                Ok(lock) => *self.inner.lock_file.write() = lock,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "failed to load MCP lock file; refusing to connect servers"
+                    );
+                    let msg = format!("lock file load failed: {error}");
+                    for name in configs.keys() {
+                        self.inner
+                            .failures
+                            .write()
+                            .insert(name.clone(), msg.clone());
+                    }
+                    return Ok(());
+                }
+            }
         }
         self.inner.server_configs.write().extend(configs.clone());
 
@@ -382,6 +474,36 @@ impl McpManager {
 
     pub fn get_tools(&self) -> Vec<ExposedTool> {
         self.inner.tools.read().clone()
+    }
+
+    /// Returns the set of credential keys authorized for the given tool
+    /// (raw `tool_def.name` before `sanitize_name`) on the given server.
+    pub fn authorized_credentials_for(&self, server_name: &str, tool_name: &str) -> Vec<String> {
+        let scopes = self.inner.credential_scopes.read();
+        let Some(server_scopes) = scopes.get(server_name) else {
+            return Vec::new();
+        };
+        server_scopes
+            .iter()
+            .filter_map(|(key, allowed_tools)| {
+                if allowed_tools.iter().any(|t| t == tool_name) {
+                    Some(key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Returns true if the given server has any scoped credential declarations.
+    pub fn has_scoped_credentials(&self, server_name: &str) -> bool {
+        let scopes = self.inner.credential_scopes.read();
+        scopes.get(server_name).is_some_and(|s| !s.is_empty())
+    }
+
+    /// Returns a snapshot of all credential scopes (server_name → credential_key → allowed_tools).
+    pub fn credential_scopes_snapshot(&self) -> HashMap<String, HashMap<String, Vec<String>>> {
+        self.inner.credential_scopes.read().clone()
     }
 
     pub fn errors(&self) -> HashMap<String, String> {
@@ -580,7 +702,7 @@ fn start_connection_inner(
     Ok(receiver)
 }
 
-fn default_connector(
+pub(crate) fn default_connector(
     config: McpServerConfig,
 ) -> BoxFuture<'static, SessionResult<Arc<McpSession>>> {
     Box::pin(async move {
@@ -589,16 +711,254 @@ fn default_connector(
     })
 }
 
+async fn verify_and_lock(
+    inner: &Arc<ManagerInner>,
+    server_name: &str,
+    session: &Arc<McpSession>,
+    tools: &[McpToolDefinition],
+    policy: &VersionPolicy,
+) -> ManagerResult<()> {
+    let server_info = session.server_info();
+    let protocol_version = session.protocol_version();
+    let current_snapshot = compute_tool_hashes(tools);
+
+    // All read-diff-upsert happens in a single write-lock scope to avoid
+    // TOCTOU. parking_lot guards are !Send, so we cannot hold them across
+    // await points — persist happens after the lock is released.
+    {
+        let mut lock = inner.lock_file.write();
+        let updated_entry = match lock.get_entry(server_name) {
+            None => {
+                tracing::info!(
+                    server = server_name,
+                    "first connection: locking server snapshot"
+                );
+                ServerLockEntry {
+                    server_info: ServerInfoSnapshot {
+                        name: server_info.name.clone(),
+                        version: server_info.version.clone(),
+                    },
+                    protocol_version: protocol_version.clone(),
+                    tools_snapshot: current_snapshot,
+                }
+            }
+            Some(entry) => {
+                if entry.server_info.version != server_info.version
+                    || entry.protocol_version != protocol_version
+                {
+                    match policy.on_mismatch {
+                        MismatchPolicy::FailClosed => {
+                            return Err(McpManagerError::VersionMismatch {
+                                server: server_name.to_owned(),
+                                expected: entry.server_info.version.clone(),
+                                actual: server_info.version.clone(),
+                            });
+                        }
+                        MismatchPolicy::AllowWithWarning => {
+                            tracing::warn!(
+                                server = server_name,
+                                expected = %entry.server_info.version,
+                                actual = %server_info.version,
+                                "MCP server version mismatch (allowed with warning)"
+                            );
+                        }
+                        MismatchPolicy::AllowAndUpdate => {
+                            tracing::info!(
+                                server = server_name,
+                                "updating lock file for version change"
+                            );
+                        }
+                    }
+                }
+
+                let diff = diff_tool_snapshots(&entry.tools_snapshot, &current_snapshot);
+                if !diff.is_empty() {
+                    let should_accept = match policy.on_tool_change {
+                        ToolChangePolicy::FailClosed => false,
+                        ToolChangePolicy::AllowAdded => {
+                            diff.removed.is_empty()
+                                && diff.modified_desc.is_empty()
+                                && diff.modified_schema.is_empty()
+                        }
+                        ToolChangePolicy::AllowAll => true,
+                    };
+
+                    if !should_accept {
+                        return Err(McpManagerError::ToolDefinitionChanged {
+                            server: server_name.to_owned(),
+                            summary: diff.summary(),
+                        });
+                    }
+
+                    tracing::warn!(
+                        server = server_name,
+                        summary = %diff.summary(),
+                        "MCP tool definition changed (accepted by policy)"
+                    );
+                }
+
+                ServerLockEntry {
+                    server_info: ServerInfoSnapshot {
+                        name: server_info.name.clone(),
+                        version: server_info.version.clone(),
+                    },
+                    protocol_version: protocol_version.clone(),
+                    tools_snapshot: current_snapshot,
+                }
+            }
+        };
+        lock.upsert_entry(server_name.to_owned(), updated_entry);
+    }
+
+    persist_lock_file(inner).await;
+    Ok(())
+}
+
+async fn persist_lock_file(inner: &Arc<ManagerInner>) {
+    if let Some(path) = &inner.lock_file_path {
+        let lock = inner.lock_file.read().clone();
+        if let Err(error) = lock.save_to_disk(path).await {
+            tracing::warn!(%error, "failed to persist MCP lock file");
+        }
+    }
+}
+
+/// Resolves all credential references (`${ENV:...}`, `vault://...`) in a
+/// server config's env/headers and scoped credentials before the transport
+/// is created. Returns a new config with concrete values; the original is
+/// untouched. Fail-closed: an unresolved reference yields
+/// `CredentialUnresolved`.
+async fn resolve_config_credentials(
+    inner: &Arc<ManagerInner>,
+    server_name: &str,
+    config: &McpServerConfig,
+) -> ManagerResult<McpServerConfig> {
+    use crate::credential::resolve_map;
+
+    let provider = inner.credential_provider.as_ref();
+    let mut resolved = config.clone();
+
+    match &mut resolved {
+        McpServerConfig::Stdio {
+            env, credentials, ..
+        } => {
+            *env = resolve_map(env, provider).await.map_err(|ref_str| {
+                McpManagerError::CredentialUnresolved {
+                    server: server_name.to_owned(),
+                    reference: ref_str,
+                }
+            })?;
+
+            if let Some(creds) = credentials {
+                let resolved_creds =
+                    resolve_scoped_credentials(creds, provider)
+                        .await
+                        .map_err(|ref_str| McpManagerError::CredentialUnresolved {
+                            server: server_name.to_owned(),
+                            reference: ref_str,
+                        })?;
+                // Merge resolved scoped_env values into env so the transport
+                // receives them. check_env_credential_mutex (config validate)
+                // guarantees no key overlap between env and scoped_env.
+                for (key, scoped) in &resolved_creds.scoped_env {
+                    env.insert(key.clone(), scoped.value.clone());
+                }
+                *credentials = Some(resolved_creds);
+            }
+        }
+        McpServerConfig::HttpOrSse {
+            headers,
+            credentials,
+            ..
+        } => {
+            *headers = resolve_map(headers, provider).await.map_err(|ref_str| {
+                McpManagerError::CredentialUnresolved {
+                    server: server_name.to_owned(),
+                    reference: ref_str,
+                }
+            })?;
+
+            if let Some(creds) = credentials {
+                let resolved_creds =
+                    resolve_scoped_credentials(creds, provider)
+                        .await
+                        .map_err(|ref_str| McpManagerError::CredentialUnresolved {
+                            server: server_name.to_owned(),
+                            reference: ref_str,
+                        })?;
+                for (key, scoped) in &resolved_creds.scoped_env {
+                    headers.insert(key.clone(), scoped.value.clone());
+                }
+                *credentials = Some(resolved_creds);
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Resolves the `value` field of each `ScopedCredential`, preserving
+/// `allowed_tools`. Returns `Err(reference)` on the first unresolved value.
+async fn resolve_scoped_credentials(
+    creds: &crate::credential::CredentialDeclarations,
+    provider: &dyn crate::credential::CredentialProvider,
+) -> Result<crate::credential::CredentialDeclarations, String> {
+    use crate::credential::{CredentialDeclarations, ScopedCredential, resolve_credential_value};
+    let mut resolved = CredentialDeclarations::default();
+    for (key, scoped) in &creds.scoped_env {
+        let value = resolve_credential_value(&scoped.value, provider)
+            .await
+            .ok_or_else(|| scoped.value.clone())?;
+        resolved.scoped_env.insert(
+            key.clone(),
+            ScopedCredential {
+                value,
+                allowed_tools: scoped.allowed_tools.clone(),
+            },
+        );
+    }
+    Ok(resolved)
+}
+
 async fn run_connection_attempt(
     inner: Arc<ManagerInner>,
     name: String,
     config: McpServerConfig,
     sender: watch::Sender<ConnectionAttempt>,
 ) {
+    let config = match resolve_config_credentials(&inner, &name, &config).await {
+        Ok(config) => config,
+        Err(error) => {
+            let error_msg = error.to_string();
+            inner
+                .failures
+                .write()
+                .insert(name.clone(), error_msg.clone());
+            let _ = sender.send(ConnectionAttempt::Failed(Arc::new(error_msg)));
+            inner.pending_connections.write().remove(&name);
+            return;
+        }
+    };
     let timeout_ms = resolve_timeout_ms(
         std::env::var("OMP_MCP_TIMEOUT_MS").ok().as_deref(),
         config.timeout_ms(),
     );
+    let policy = config.version_policy().clone();
+    let credential_scopes: Option<HashMap<String, Vec<String>>> = config
+        .credentials()
+        .map(|creds| {
+            creds
+                .scoped_env
+                .iter()
+                .filter_map(|(key, scoped)| {
+                    scoped
+                        .allowed_tools
+                        .as_ref()
+                        .map(|tools| (key.clone(), tools.clone()))
+                })
+                .collect::<HashMap<String, Vec<String>>>()
+        })
+        .filter(|scopes| !scopes.is_empty());
     // When the timeout cancels `connect`, the future is dropped.
     // Transport cleanup happens via transport Drop impls:
     // - StdioTransport::Drop calls start_kill on the child process
@@ -621,6 +981,26 @@ async fn run_connection_attempt(
 
     match result {
         Ok((session, tools)) => {
+            if let Err(error) = verify_and_lock(&inner, &name, &session, &tools, &policy).await {
+                let error_msg = error.to_string();
+                inner
+                    .failures
+                    .write()
+                    .insert(name.clone(), error_msg.clone());
+                if let Err(disconnect_error) = session.disconnect().await {
+                    tracing::debug!(server = name, %disconnect_error, "failed to disconnect rejected MCP server");
+                }
+                let _ = sender.send(ConnectionAttempt::Failed(Arc::new(error_msg)));
+                inner.pending_connections.write().remove(&name);
+                return;
+            }
+            // Register credential scopes
+            if let Some(scopes) = &credential_scopes {
+                inner
+                    .credential_scopes
+                    .write()
+                    .insert(name.clone(), scopes.clone());
+            }
             wire_session(&inner, &name, &session);
             inner
                 .connections
@@ -661,15 +1041,34 @@ fn wire_session(inner: &Arc<ManagerInner>, name: &str, session: &Arc<McpSession>
         let name = notification_name.clone();
         tokio::spawn(async move {
             let session = inner.connections.read().get(&name).cloned();
-            if let Some(session) = session {
-                match session.list_tools().await {
-                    Ok(tools) => {
-                        replace_server_tools(&inner, &name, tools.clone(), false);
-                        inner.tool_cache.set(&name, tools).await;
-                    }
-                    Err(error) => {
-                        tracing::warn!(server = name, %error, "failed to refresh MCP tools");
-                    }
+            let Some(session) = session else { return };
+
+            let tools = match session.list_tools().await {
+                Ok(tools) => tools,
+                Err(error) => {
+                    tracing::warn!(server = name, %error, "failed to refresh MCP tools");
+                    return;
+                }
+            };
+
+            let policy = inner
+                .server_configs
+                .read()
+                .get(&name)
+                .map(|c| c.version_policy().clone())
+                .unwrap_or_default();
+
+            match verify_and_lock(&inner, &name, &session, &tools, &policy).await {
+                Ok(()) => {
+                    replace_server_tools(&inner, &name, tools.clone(), false);
+                    inner.tool_cache.set(&name, tools).await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        server = name,
+                        %error,
+                        "rejected tools/list_changed update (policy: fail_closed)"
+                    );
                 }
             }
         });
@@ -860,6 +1259,31 @@ mod tests {
             transport.drop_tracker = Some(tracker);
             transport
         }
+
+        fn new_with_desc(tool_name: &str, desc: &str) -> Self {
+            Self {
+                connected: AtomicBool::new(true),
+                responses: Mutex::new(
+                    [
+                        json!({
+                            "protocolVersion": crate::session::PREFERRED_PROTOCOL_VERSION,
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "fixture", "version": "1"}
+                        }),
+                        json!({
+                            "tools": [{
+                                "name": tool_name,
+                                "description": desc,
+                                "inputSchema": {"type": "object"}
+                            }]
+                        }),
+                    ]
+                    .into(),
+                ),
+                request_handler: Mutex::new(None),
+                drop_tracker: None,
+            }
+        }
     }
 
     impl Drop for FixtureTransport {
@@ -911,6 +1335,8 @@ mod tests {
             env: HashMap::new(),
             cwd: None,
             timeout: Some(5_000),
+            version_policy: Default::default(),
+            credentials: None,
         }
     }
 
@@ -1148,13 +1574,14 @@ mod tests {
                 })
             }),
         );
-
         let config = McpServerConfig::Stdio {
             command: "sh".to_owned(),
             args: vec!["-c".to_owned(), "true".to_owned()],
             env: std::collections::HashMap::new(),
             cwd: None,
             timeout: Some(50),
+            version_policy: Default::default(),
+            credentials: None,
         };
 
         let _ = manager.start_connection("test".to_owned(), config).unwrap();
@@ -1265,5 +1692,312 @@ mod tests {
         assert_eq!(RECONNECT_WINDOW, Duration::from_secs(30));
         assert_eq!(RECONNECT_BACKOFF_MS.len(), 5);
         assert_eq!(RECONNECT_BACKOFF_MS[0], 0); // immediate first retry
+    }
+    #[tokio::test]
+    async fn first_connection_writes_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".mcp-lock.json");
+
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move {
+                let transport: Arc<dyn McpTransport> = Arc::new(FixtureTransport::new("tool_a"));
+                Ok(Arc::new(McpSession::connect(transport).await?))
+            })
+        });
+        let manager = McpManager::with_connector_and_lock(None, connector, lock_path.clone());
+
+        manager
+            .discover_and_connect(HashMap::from([("srv".to_owned(), stdio_config("srv"))]))
+            .await
+            .unwrap();
+
+        let lock = McpLockFile::load_from_disk(&lock_path).await.unwrap();
+        let entry = lock.get_entry("srv").unwrap();
+        assert_eq!(entry.server_info.name, "fixture");
+        assert_eq!(entry.server_info.version, "1");
+        assert_eq!(entry.tools_snapshot.len(), 1);
+        assert_eq!(entry.tools_snapshot[0].name, "tool_a");
+    }
+
+    #[tokio::test]
+    async fn version_mismatch_fail_closed_rejects_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".mcp-lock.json");
+
+        let mut lock = McpLockFile::default();
+        lock.upsert_entry(
+            "srv".to_owned(),
+            ServerLockEntry {
+                server_info: ServerInfoSnapshot {
+                    name: "fixture".to_owned(),
+                    version: "2.0.0".to_owned(),
+                },
+                protocol_version: crate::session::PREFERRED_PROTOCOL_VERSION.to_owned(),
+                tools_snapshot: compute_tool_hashes(&[McpToolDefinition {
+                    name: "tool_a".to_owned(),
+                    title: None,
+                    description: "fixture".to_owned(),
+                    input_schema: json!({"type": "object"}),
+                    output_schema: None,
+                    annotations: None,
+                    icons: Vec::new(),
+                    metadata: None,
+                }]),
+            },
+        );
+        lock.save_to_disk(&lock_path).await.unwrap();
+
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move {
+                let transport: Arc<dyn McpTransport> = Arc::new(FixtureTransport::new("tool_a"));
+                Ok(Arc::new(McpSession::connect(transport).await?))
+            })
+        });
+        let manager = McpManager::with_connector_and_lock(None, connector, lock_path);
+
+        manager
+            .discover_and_connect(HashMap::from([("srv".to_owned(), stdio_config("srv"))]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.get_connection_status("srv"),
+            ConnectionStatus::Disconnected
+        );
+        assert!(manager.errors().contains_key("srv"));
+        assert!(manager.errors()["srv"].contains("version mismatch"));
+    }
+
+    #[tokio::test]
+    async fn tool_change_fail_closed_rejects_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".mcp-lock.json");
+
+        let original_tool = McpToolDefinition {
+            name: "tool_a".to_owned(),
+            title: None,
+            description: "original".to_owned(),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            annotations: None,
+            icons: Vec::new(),
+            metadata: None,
+        };
+        let mut lock = McpLockFile::default();
+        lock.upsert_entry(
+            "srv".to_owned(),
+            ServerLockEntry {
+                server_info: ServerInfoSnapshot {
+                    name: "fixture".to_owned(),
+                    version: "1".to_owned(),
+                },
+                protocol_version: crate::session::PREFERRED_PROTOCOL_VERSION.to_owned(),
+                tools_snapshot: compute_tool_hashes(&[original_tool]),
+            },
+        );
+        lock.save_to_disk(&lock_path).await.unwrap();
+
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move {
+                let transport: Arc<dyn McpTransport> =
+                    Arc::new(FixtureTransport::new_with_desc("tool_a", "poisoned"));
+                Ok(Arc::new(McpSession::connect(transport).await?))
+            })
+        });
+        let manager = McpManager::with_connector_and_lock(None, connector, lock_path);
+
+        manager
+            .discover_and_connect(HashMap::from([("srv".to_owned(), stdio_config("srv"))]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.get_connection_status("srv"),
+            ConnectionStatus::Disconnected
+        );
+        assert!(manager.errors()["srv"].contains("tool definition changed"));
+    }
+
+    #[tokio::test]
+    async fn unresolved_credential_rejects_connection() {
+        unsafe { std::env::remove_var("TEST_MCP_UNRESOLVED_TOKEN") };
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".mcp-lock.json");
+
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move {
+                let transport: Arc<dyn McpTransport> = Arc::new(FixtureTransport::new("tool_a"));
+                Ok(Arc::new(McpSession::connect(transport).await?))
+            })
+        });
+        let manager = McpManager::with_connector_and_lock(None, connector, lock_path);
+
+        let mut config = stdio_config("srv");
+        if let McpServerConfig::Stdio { env, .. } = &mut config {
+            env.insert(
+                "TOKEN".to_owned(),
+                "${ENV:TEST_MCP_UNRESOLVED_TOKEN}".to_owned(),
+            );
+        }
+
+        manager
+            .discover_and_connect(HashMap::from([("srv".to_owned(), config)]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.get_connection_status("srv"),
+            ConnectionStatus::Disconnected
+        );
+        assert!(manager.errors()["srv"].contains("credential"));
+    }
+    #[tokio::test]
+    async fn authorized_credentials_populated_for_scoped_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".mcp-lock.json");
+
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move {
+                let transport: Arc<dyn McpTransport> =
+                    Arc::new(FixtureTransport::new("search_repos"));
+                Ok(Arc::new(McpSession::connect(transport).await?))
+            })
+        });
+        let manager = McpManager::with_connector_and_lock(None, connector, lock_path);
+
+        let mut config = stdio_config("srv");
+        let creds = crate::credential::CredentialDeclarations {
+            scoped_env: {
+                let mut map = HashMap::new();
+                map.insert(
+                    "TOKEN".to_owned(),
+                    crate::credential::ScopedCredential {
+                        value: "plain".to_owned(),
+                        allowed_tools: Some(vec!["search_repos".to_owned()]),
+                    },
+                );
+                map
+            },
+        };
+        if let McpServerConfig::Stdio { credentials, .. } = &mut config {
+            *credentials = Some(creds);
+        }
+
+        manager
+            .discover_and_connect(HashMap::from([("srv".to_owned(), config)]))
+            .await
+            .unwrap();
+
+        let source = crate::McpToolSource::new(Arc::new(manager));
+        let adapters = source.into_adapters().await.unwrap();
+        assert_eq!(adapters.len(), 1);
+        let lookup = source.build_credential_lookup();
+        use llm_harness_types::CredentialLookup;
+        match lookup("mcp__srv_search_repos") {
+            CredentialLookup::Authorized(creds) => {
+                assert_eq!(creds, vec!["TOKEN".to_owned()]);
+            }
+            other => panic!("expected Authorized, got {other:?}"),
+        }
+    }
+    #[tokio::test]
+    async fn scoped_env_credential_merged_into_env() {
+        let manager = McpManager::new();
+        let mut config = stdio_config("srv");
+        if let McpServerConfig::Stdio {
+            env, credentials, ..
+        } = &mut config
+        {
+            env.insert("PLAIN".to_owned(), "text".to_owned());
+            *credentials = Some(crate::credential::CredentialDeclarations {
+                scoped_env: {
+                    let mut map = HashMap::new();
+                    map.insert(
+                        "SCOPED_TOKEN".to_owned(),
+                        crate::credential::ScopedCredential {
+                            value: "secret123".to_owned(),
+                            allowed_tools: Some(vec!["tool_a".to_owned()]),
+                        },
+                    );
+                    map
+                },
+            });
+        }
+
+        let resolved = resolve_config_credentials(&manager.inner, "srv", &config)
+            .await
+            .unwrap();
+
+        if let McpServerConfig::Stdio { env, .. } = &resolved {
+            assert_eq!(env.get("SCOPED_TOKEN"), Some(&"secret123".to_owned()));
+            assert_eq!(env.get("PLAIN"), Some(&"text".to_owned()));
+        } else {
+            panic!("expected Stdio config");
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_env_credential_merged_into_http_headers() {
+        let manager = McpManager::new();
+        let config = McpServerConfig::HttpOrSse {
+            url: "https://example.com/mcp".to_owned(),
+            transport_type: None,
+            headers: HashMap::new(),
+            timeout: Some(5_000),
+            version_policy: Default::default(),
+            credentials: Some(crate::credential::CredentialDeclarations {
+                scoped_env: {
+                    let mut map = HashMap::new();
+                    map.insert(
+                        "Authorization".to_owned(),
+                        crate::credential::ScopedCredential {
+                            value: "Bearer token123".to_owned(),
+                            allowed_tools: Some(vec!["tool_a".to_owned()]),
+                        },
+                    );
+                    map
+                },
+            }),
+        };
+
+        let resolved = resolve_config_credentials(&manager.inner, "srv", &config)
+            .await
+            .unwrap();
+
+        if let McpServerConfig::HttpOrSse { headers, .. } = &resolved {
+            assert_eq!(
+                headers.get("Authorization"),
+                Some(&"Bearer token123".to_owned())
+            );
+        } else {
+            panic!("expected HttpOrSse config");
+        }
+    }
+    #[tokio::test]
+    async fn corrupted_lock_file_rejects_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(".mcp-lock.json");
+        tokio::fs::write(&lock_path, "{ invalid json }")
+            .await
+            .unwrap();
+
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move {
+                let transport: Arc<dyn McpTransport> = Arc::new(FixtureTransport::new("tool_a"));
+                Ok(Arc::new(McpSession::connect(transport).await?))
+            })
+        });
+        let manager = McpManager::with_connector_and_lock(None, connector, lock_path);
+
+        manager
+            .discover_and_connect(HashMap::from([("srv".to_owned(), stdio_config("srv"))]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.get_connection_status("srv"),
+            ConnectionStatus::Disconnected
+        );
+        assert!(manager.errors().contains_key("srv"));
     }
 }

@@ -679,6 +679,8 @@ mod tests {
             transport_type: None,
             headers: HashMap::new(),
             timeout: Some(5_000),
+            version_policy: Default::default(),
+            credentials: None,
         }
     }
 
@@ -749,6 +751,8 @@ mod tests {
             transport_type: None,
             headers: HashMap::from([("bad header".to_owned(), "value".to_owned())]),
             timeout: None,
+            version_policy: Default::default(),
+            credentials: None,
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let transport = runtime.block_on(HttpTransport::connect(&config)).unwrap();

@@ -1,11 +1,13 @@
 pub mod builder;
 pub mod config;
+pub mod credential;
 pub mod json_rpc;
 pub mod manager;
 pub mod session;
 pub mod transport;
 pub mod types;
 mod utils;
+pub mod version_lock;
 pub mod workflow;
 
 pub use builder::{
@@ -52,6 +54,33 @@ impl McpToolSource {
                 manager: Arc::clone(&self.manager),
             })
             .collect())
+    }
+
+    /// Build a credential lookup function for the credential guard hook.
+    /// Tools on servers with scoped_env declarations but not in any
+    /// allowed_tools list are marked as Unauthorized.
+    pub fn build_credential_lookup(&self) -> llm_harness_types::CredentialLookupFn {
+        let tools = self.manager.get_tools();
+        let scopes = self.manager.credential_scopes_snapshot();
+
+        let mut authorized: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut unauthorized: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for tool in &tools {
+            let creds = self
+                .manager
+                .authorized_credentials_for(&tool.server_name, &tool.tool_def.name);
+            if creds.is_empty() {
+                if scopes.get(&tool.server_name).is_some_and(|s| !s.is_empty()) {
+                    unauthorized.insert(tool.full_name.clone());
+                }
+            } else {
+                authorized.insert(tool.full_name.clone(), creds);
+            }
+        }
+
+        llm_harness_types::build_credential_lookup(authorized, unauthorized)
     }
 }
 

@@ -4,5 +4,6 @@
 //! 默认实现在此 crate。用户按需引入，runtime 不依赖此 crate。
 
 pub mod budget;
+pub mod credential_guard;
 pub mod resource;
 pub mod skills;

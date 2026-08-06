@@ -137,6 +137,7 @@ impl StdioTransport {
             env,
             cwd,
             timeout,
+            ..
         } = config
         else {
             return Err(McpTransportError::InvalidConfig(
@@ -376,6 +377,8 @@ mod tests {
                 env: HashMap::new(),
                 cwd: None,
                 timeout: Some(5_000),
+                version_policy: Default::default(),
+                credentials: None,
             }
         }
         #[cfg(not(windows))]
@@ -386,6 +389,8 @@ mod tests {
                 env: HashMap::new(),
                 cwd: None,
                 timeout: Some(5_000),
+                version_policy: Default::default(),
+                credentials: None,
             }
         }
     }

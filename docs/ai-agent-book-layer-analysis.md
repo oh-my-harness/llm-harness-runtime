@@ -101,10 +101,10 @@
 > | 10 | MCP 服务器版本锁定 | view 17 | `runtime-mcp/` | 拒绝静默版本更新 |
 > | 11 | MCP 最小权限凭证管理 | view 17 | `runtime-mcp/` | 凭证作用域 |
 > | 12 | ~~截断后完整输出保存到临时文件~~ ✅ 已完成 | view 18 | `runtime-tools/truncation.rs` + `bash.rs` | truncate_and_persist 辅助模块 + BashTool 集成；双阈值（200行/10000字节）触发，头尾各50行，完整输出持久化到 OS 临时文件 |
-> | 13 | Sidecar 专用机制（与流式输出并行的轻量 LLM 门控） | view 11 | `loop_fn.rs`/dispatch | 在工具调用 emit 时即触发并行审查，非 LLM 输出完整后才调用；与流式工具执行（暂不做）相关但更轻量——`BeforeToolCallHook` 的输入隔离已天然满足，缺并行调度 |
-> | 14 | 幂等性机制（idempotency key + 预检-确认两段式） | view 11 | `types/tool.rs` | idempotency key 传递和去重基础设施 + initiate→事件通知完成两段式工具接口 |
-> | 15 | 前台/后台调用区分 | view 26 | `compaction_ops.rs`/`loop_fn.rs` | 后台调用（如 compaction summary）失败无独立放弃策略，需独立放弃逻辑不终止整个 run |
-> | 16 | 中间输出过滤 hook（待评估） | view 5 | `types/hooks.rs` | `FinalAnswerValidator` 只覆盖最终答案提交点，非最终回复的中间输出无拦截 hook（`AfterTurnHook` 是纯通知无返回值）；待确认是否需要新增输出过滤 hook |
+> | ~~13~~ | ~~Sidecar 专用机制（与流式输出并行的轻量 LLM 门控）~~ | view 11 | ~~`loop_fn.rs`/dispatch~~ | **不做**——见下方"暂不做的项目" |
+> | ~~14~~ | ~~幂等性机制（idempotency key + 预检-确认两段式）~~ | view 11 | ~~`types/tool.rs`~~ | **不做**——见下方"暂不做的项目" |
+> | ~~15~~ | ~~前台/后台调用区分~~ | view 26 | ~~`compaction_ops.rs`/`loop_fn.rs`~~ | **已满足**——改进点 2（压缩熔断器）完成后已覆盖，详见 view 26 校验记录 |
+> | ~~16~~ | ~~中间输出过滤 hook（待评估）~~ | view 5 | ~~`types/hooks.rs`~~ | **不需要**——教程说的输出侧护栏检查点是"响应返回用户之前"，`FinalAnswerValidator` 已覆盖；中间 Progress 文本不直接返回用户，进入上下文后可由 `TransformContextHook` 清洗。见下方"暂不做的项目" |
 > #### 阶段三：补齐 runtime 策略层缺失
 >
 > 按 28 个 view 中标记为"runtime 策略层缺失"的项目，在 `llm-harness-strategy` crate 中实现默认策略。这些只需注册 hook 或实现 trait，不需改机制层内部逻辑。
@@ -113,7 +113,7 @@
 > |---|--------|---------|---------|--------|
 > | 1 | 默认危险命令黑名单 BeforeToolCallHook | view 11 | RuleBasedApprovalHook + 默认 RuleChain | 高 |
 > | 2 | 默认路径遍历防护规则 | view 11 | BeforeToolCallHook + canonicalize/boundary check | 高 |
-> | 3 | 默认审计日志格式 | view 11 | AfterToolCallHook + 结构化日志模板 | 中 |
+> | 3 | 默认审计日志格式 | view 11 | AfterToolCallHook + 结构化日志模板 | 中 | ⚠️ 部分完成：`AuditEntry`/`AuditSink` trait + `AuditEventType`/`AuditDecision`/`CostDelta` 结构化模板已有（`runtime/src/observability/audit.rs`），`JsonlAuditSink` 后端已有（`runtime-audit-jsonl` crate，含 SHA-256 hash chain）。缺默认 AfterToolCallHook 自动写入审计条目 |
 > | 4 | 状态栏 XML 格式模板 + 四种内容收集器 | view 5, 8 | TransformContextHook 默认实现 | 高 |
 > | 5 | TODO write 工具 + 状态栏更新策略 | view 5 | Tool trait 实现 + TransformContextHook | 中 |
 > | 6 | Skill 元数据注入（方式三）BeforeRunHook | view 7 | BeforeRunHook 默认实现 | 高 |
@@ -135,19 +135,19 @@
 > | 23 | 工具描述审查机制 | view 17 | MCP adapter wrapper 审计 description | 低 |
 > | 24 | 事件过滤规则 + 事件载荷上下文模板 | view 14 | EventStream wrapper + 默认模板 | 低 |
 > | 25 | Cron/Heartbeat 内置 EventStream 实现 | view 14 | TimerStream/HeartbeatStream | 低 |
-> | 26 | 压缩 prompt 默认模板（上下文感知） | view 9 | 自定义压缩 prompt 的策略层默认实现 | 中 |
-> | 27 | 保留优先级默认规则 | view 9 | 标记消息不可压缩的策略层规则 | 中 |
-> | 28 | 工具结果投影默认策略 | view 9, 10 | ToolSessionProjection 默认大小阈值 | 低 |
+> | 26 | 压缩 prompt 默认模板（上下文感知） | view 9 | 自定义压缩 prompt 的策略层默认实现 | 中 | ⚠️ 部分完成：`SUMMARIZATION_SYSTEM_PROMPT`/`SUMMARY_REQUEST` 硬编码在 `agent/src/compaction.rs`（机制层），`CompactionPromptSpec` 支持自定义替换。缺 strategy crate 的上下文感知默认模板 |
+> | 27 | ~~保留优先级默认规则~~ ✅ 已完成 | view 9 | `session/types.rs` + `agent/src/compaction.rs` | `CompactionPolicy::Keep` + `<no-compact>` tag（阶段二第 3 项）；Keep 条目 verbatim 保留到 summary，LLM 不合规时 also preserved |
+> | 28 | 工具结果投影默认策略 | view 9, 10 | ToolSessionProjection 默认大小阈值 | 低 | ⚠️ 部分完成：`ToolSessionProjection` enum (Full/Projected/Ephemeral) + `ToolProjectionKind` 已有（`types/tool.rs`），各工具自行选择投影策略。缺统一默认大小阈值 |
 > | 29 | ~~BashTool 截断策略~~ ✅ 已完成 | view 18 | `runtime-tools/truncation.rs` + `bash.rs` | truncate_and_persist 双阈值（200行/10000字节），按行截断头尾各50行 |
 > | 30 | ~~截断标注引导 Agent read 临时文件~~ ✅ 已完成 | view 18 | `runtime-tools/truncation.rs` | 中文标注含文件路径+read工具引导 |
 > | 31 | grep + glob 工具补齐 | view 15 | llm-harness-runtime-tools 新增 | 高 |
 > | 32 | 内置工具 description 改写（补充"什么时候用"+边界+示例+移除实现细节） | view 16 | 工具实现改进 | 高 |
 > | 33 | 内置工具参数描述补充具体例子 | view 16 | 工具实现改进 | 中 |
 > | 34 | 内置工具附带 1-5 个调用示例 | view 16 | 工具实现改进 | 中 |
-> | 35 | edit 工具 trailing newline 行为修正 | view 16 | 工具实现改进 | 中 |
+> | ~~35~~ | ~~edit 工具 trailing newline 行为修正~~ ✅ 已完成 | view 16 | `runtime-tools/edit.rs` | 文档明确 POSIX trailing newline 行为：always rewritten as joined lines + single `\n`；callers 需 byte-exact 用 `write` |
 > | 36 | 模型降级（主模型过载自动切备用模型） | view 26 | BeforeProviderRequestHook + fallback model | 中 |
 > | 37 | 连续失败超阈值→人工升级 | view 26 | ShouldStopHook + 人工升级通知 | 中 |
-> | 38 | ContextMode::Inject 注入格式加来源标签 | view 19 | 默认注入格式模板（[FROM_MAIN_AGENT]/[FROM_USER]/[TOOL_RESULT]） | 中 |
+> | ~~38~~ | ~~ContextMode::Inject 注入格式加来源标签~~ ✅ 已完成 | view 19 | `runtime/src/spawn/spawn_types.rs` + `spawner.rs` | `ContextBlock` + `ContextSource` enum (ParentConversation/File/UserInstruction/Custom) + `render_context_blocks` 输出 `[Context: <label>]` 格式。标签为 `Parent Conversation`/`File`/`User Instruction`/`Custom`，非教程建议的 `[FROM_MAIN_AGENT]`/`[FROM_USER]`/`[TOOL_RESULT]`，但功能等价 |
 > | 39 | 后台任务监控 EventStream 默认实现（ShellMonitorStream） | view 14 | 基于 BashTool 后台进程 + stdout 行流 | 低 |
 > | 40 | 外部通道 webhook 接收器默认实现 | view 14 | EventStream 默认实现 | 低 |
 > | 41 | 事件结构化模板（来源/渠道/内容/上下文四维度默认 JSON schema） | view 14 | Event details 默认模板 | 低 |
@@ -161,6 +161,9 @@
 > - mid-turn steer（view 21）— 明确不做
 > - 优先级队列（view 20）— 太复杂
 > - 多渠道通知（view 13/20）— 太复杂
+> - 幂等性机制（view 11 改进点 14）— 场景不成立：(1) 工具执行是本地同步函数调用且每个 tool_use_id 仅执行一次，无机械重试循环，idempotency key 去重无消费者；(2) 先查询后变更是工具设计模式，Tool trait 的 execute 已给工具完全控制权；(3) 预检-确认两段式已有等价构建块（ToolProgress channel + EventStream + spawn_agent），拆成两工具或异步工具即可表达，无需新 Tool trait 变体；(4) 崩溃恢复策略（view 26 轨迹完整性修复）注入 synthetic error 而非重执行，不触发重复执行
+> - 中间输出过滤 hook（view 5 改进点 16）— 不需要：教程输出侧护栏检查点是"响应返回用户之前"（ch1 line 425），只有 FinalAnswer 返回用户，FinalAnswerValidator 已覆盖；中间 Progress 文本不直接返回用户，进入上下文后可由 TransformContextHook 在下一轮清洗；新增 hook 的语义复杂度（拒绝 Progress 后做什么？）和性能开销不匹配收益
+> - Sidecar 并行门控机制（view 11 改进点 13）— 优先级不高：收益仅限于 `BeforeToolCallHook` 内部做 LLM 审查的场景（数百 ms 延迟与剩余流式输出重叠），而当前无内置 LLM 审查 hook（`RuleBasedApprovalHook` 纯规则、`CostAccumulatorHook` 记账，均微秒级无并行收益）；LLM 审批工具本身不是高优先级。若后续实现 LLM 审查 hook 时再回来设计。`BeforeToolCallHook` 的输入隔离（只看 tool_name + args）已天然满足，届时只需补并行调度
 
 ---
 ## 第一章：AI Agent 入门
@@ -190,7 +193,7 @@
 | 2 | 工具风险评级/特权等级（低/中/高） | runtime 策略层+用户策略层（拆分） | 策略层提供按分类自动标注的通用规则；具体规则和阈值由业务决定 | ✅ 讨论后达成一致。机制层不缺失：BeforeToolCallHook（async）+ Allow/Modify/Deny 三档已足够支撑人工审批实现（hook 内部 await oneshot channel 等待人工结果，loop 引擎无感知）。不需要增加"需人工确认"档位——它是过程不是终态。拆分为两层：通用策略（按分类/参数自动标注风险等级的默认规则模板）→ runtime 策略层，当前缺失；具体规则和阈值 → 用户策略层 |
 | 3 | 具体工具设计（通用 vs 专用、沙盒隔离、参数设计等） | 用户策略层 | 面向具体任务的设计决策 | ✅ 正确。教程 ch1 line 99-103 讨论的设计权衡是任务级决策，runtime 只提供 Tool trait 接口 |
 | 4 | 约束（Constrain） | 三层拆分 | 机制层提供拦截点；策略层提供默认策略原则；用户策略层提供具体规则 | ✅ 讨论后达成一致。机制层已具备（BeforeToolCallHook + WorkflowGateHook）；runtime 策略层当前缺失（故障安全默认值、权限分类模板）；用户策略层为具体约束规则 |
-| 5 | 验证（Verify） | 三层拆分 | 机制层提供拦截点；策略层提供通用验证原则；用户策略层提供具体验证逻辑 | ✅ 讨论后达成一致。机制层已具备（AfterToolCallHook + FinalAnswerValidator + StepTransitionJudge）；runtime 策略层当前缺失（输入隔离原则、通用验证规则模板）；用户策略层为具体验证内容。⚠️ 潜在缺口：FinalAnswerValidator 只覆盖最终答案提交点，非最终回复的中间输出无拦截 hook（AfterTurnHook 是纯通知无返回值），待第二/五章确认 |
+| 5 | 验证（Verify） | 三层拆分 | 机制层提供拦截点；策略层提供通用验证原则；用户策略层提供具体验证逻辑 | ✅ 讨论后达成一致。机制层已具备（AfterToolCallHook + FinalAnswerValidator + StepTransitionJudge）；runtime 策略层当前缺失（输入隔离原则、通用验证规则模板）；用户策略层为具体验证内容。~~潜在缺口~~：~~FinalAnswerValidator 只覆盖最终答案提交点，非最终回复的中间输出无拦截 hook~~ **已确认不需要**——教程输出侧护栏检查点是"响应返回用户之前"，FinalAnswerValidator 已覆盖；中间 Progress 文本不直接返回用户，进入上下文后可由 TransformContextHook 清洗 |
 | 6 | 纠正（Correct） | 三层拆分 | 机制层提供 retry/abort/should_stop；策略层提供通用纠正策略；用户策略层提供具体阈值和业务回滚 | ✅ 讨论后达成一致。机制层已具备（ToolFailure.terminate + run_step_with_policy + ShouldStopHook + CancellationToken）；runtime 策略层当前缺失（不暴露中间态原则、熔断器通用实现、回滚策略模板）；用户策略层为具体重试次数/超时阈值/工具级回滚 |
 
 ### 校验记录
@@ -284,7 +287,7 @@
 
 **观点 4 确认**：教程将输入侧护栏（相关性分类器、安全分类器、内容审核、基于规则的保护）列为约束的实现。runtime 对应机制：`TransformContextHook`（LLM 调用前转换上下文，可过滤输入）+ `BeforeProviderRequestHook`（provider 请求前拦截）。机制层已具备，具体分类器实现是用户策略层。无修正。
 
-**观点 5 确认 + 标记潜在缺口**：教程将输出侧护栏（PII 过滤器、输出验证）列为验证的实现。runtime 对应机制：`FinalAnswerValidator`（最终答案提交前校验）+ `AfterToolCallHook`（工具执行结果校验）。**潜在缺口**：`FinalAnswerValidator` 只覆盖"最终答案"提交点。如果 Agent 在非最终回复中输出内容（如流式输出中间文本），没有对应的输出过滤 hook——`AfterTurnHook` 是纯通知（无返回值），无法拦截。待第二章（提示注入防护）和第五章（代码执行安全）确认是否需要补充。
+**观点 5 确认**：教程将输出侧护栏（PII 过滤器、输出验证）列为验证的实现。runtime 对应机制：`FinalAnswerValidator`（最终答案提交前校验）+ `AfterToolCallHook`（工具执行结果校验）。~~潜在缺口~~ **已确认不需要**：教程说的输出侧护栏检查点是"在响应返回用户之前检查"（ch1 line 425），本 runtime 只有 `FinalAnswer` 返回用户，`FinalAnswerValidator` 已覆盖此检查点。中间 Progress 文本不直接返回用户，进入上下文后可通过已有的 `TransformContextHook` 在下一轮 LLM 调用前清洗。新增拦截 hook 引入的语义复杂度（拒绝后做什么？丢弃？重试？修改？）和性能开销不匹配收益 |
 
 **观点 6 确认**：教程人工干预部分明确两个触发条件——"超过失败阈值"对应 `ShouldStopHook` + retry 机制；"高风险操作"对应 `BeforeToolCallHook` 中人工审批（观点 2 已讨论）。无修正。
 
@@ -723,14 +726,14 @@
   - runtime 策略层：❌ 缺失。默认的审计日志格式（每次调用的时间、参数、结果、耗时）、性能指标（调用频率、成功率、平均耗时）、告警机制（频繁失败、超时通知）。
 
   **10. 幂等性与取消语义**（idempotency key / 先查询后变更 / 预检-确认两段式）
-  - 机制层：❌ 缺失。`CancellationToken` 支持取消，但无 idempotency key 机制（工具调用去重）、无"预检-确认"两段式工具接口（initiate → 事件通知完成）。
-  - runtime 策略层：无。哪些操作需要幂等性是业务决策，但机制层需要提供 idempotency key 传递和去重的基础设施。
+  - 机制层：~~❌ 缺失~~ **不做**。经讨论确认场景不成立：(1) 工具执行是本地同步函数调用，每个 tool_use_id 仅执行一次（`execute_tool_batch` 无重试循环），idempotency key 去重无消费者；(2) 工具失败返回 LLM 决策重试（新 tool call 新 ID），非机械重试；(3) 先查询后变更是工具设计模式，Tool trait 的 execute 已给工具完全控制权；(4) 预检-确认两段式已有等价构建块（ToolProgress channel + EventStream + spawn_agent），拆成两工具或异步工具即可表达；(5) 崩溃恢复（view 26 轨迹完整性修复）注入 synthetic error 而非重执行，不触发重复执行。
+  - runtime 策略层：无。
 
 - **缺失总结**：
 
   **机制层缺失（2 项）**：
   1. Sidecar 专用机制——与流式输出并行的轻量 LLM 门控。`BeforeToolCallHook` 的输入隔离已天然满足，但缺"在工具调用 emit 时即触发、与流式输出并行"的调度。
-  2. 幂等性机制——idempotency key 传递和去重 + 预检-确认两段式工具接口。
+  2. ~~幂等性机制~~——**不做**（场景不成立，详见上方第 10 条）。
 
   **runtime 策略层缺失（3 项）**：
   1. 默认的危险命令黑名单（`rm -rf /`、`dd`等）。
@@ -1511,7 +1514,7 @@
   | 教程要求 | runtime 实现 | 状态 |
   |---------|------------|------|
   | 静默重试+指数退避+抖动 | `RetryConfig`（指数退避）；`delay_for` 尊重 retry_after；无随机抖动 | ⚠️ 缺抖动 |
-  | 前台/后台区分 | 无——后台调用（如 compaction summary）失败直接终止，无独立放弃策略 | ⚠️ |
+  | 前台/后台区分 | ✅ 已满足——compaction 是唯一后台 LLM 调用：`compact()` 零次重试（无 RetryConfig 包装），失败时 context 在窗口内则 `Ok(())` 静默吞掉不终止 run，连续失败由熔断器（`compaction_failure_count`/`compaction_max_failures`）独立放弃。改进点 2 完成后即已满足，此条为遗留标记 | ✅ |
   | 降级与接续（输出触顶） | 无——输出截断后无自动提升 max_tokens 或追加续写指令 | ❌ 缺失 |
   | 模型降级 | 无——主模型过载不自动切备用模型 | ❌ 缺失 |
   | 工具错误变输入（不终止会话） | ✅ `ToolFailure` 作为 ToolResult 进入上下文 | ✅ |

@@ -91,6 +91,7 @@ pub struct McpHarnessBuilder {
     mcp_config_files: Vec<PathBuf>,
     mcp_manager: Option<Arc<McpManager>>,
     resource_policy: Option<McpResourceInjectionPolicy>,
+    lock_file: Option<PathBuf>,
 }
 
 pub trait HarnessBuilderMcpExt {
@@ -102,7 +103,6 @@ impl HarnessBuilderMcpExt for HarnessBuilder {
         McpHarnessBuilder::new(self)
     }
 }
-
 impl McpHarnessBuilder {
     pub fn new(inner: HarnessBuilder) -> Self {
         Self {
@@ -111,6 +111,7 @@ impl McpHarnessBuilder {
             mcp_config_files: Vec::new(),
             mcp_manager: None,
             resource_policy: None,
+            lock_file: None,
         }
     }
 
@@ -131,6 +132,34 @@ impl McpHarnessBuilder {
 
     pub fn resource_injection(mut self, policy: McpResourceInjectionPolicy) -> Self {
         self.resource_policy = Some(policy);
+        self
+    }
+
+    /// Set the MCP lock file path. When set, the builder constructs
+    /// McpManager with this path. When None, defaults to ".mcp-lock.json".
+    pub fn lock_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.lock_file = Some(path.into());
+        self
+    }
+
+    /// Set version_policy for a specific server. The server must already
+    /// have been added via mcp_server(). This updates the config in-place.
+    pub fn version_policy(mut self, server: &str, policy: crate::config::VersionPolicy) -> Self {
+        for (name, config) in &mut self.mcp_servers {
+            if name == server {
+                match config {
+                    McpServerConfig::Stdio {
+                        version_policy: vp, ..
+                    }
+                    | McpServerConfig::HttpOrSse {
+                        version_policy: vp, ..
+                    } => {
+                        *vp = policy;
+                    }
+                }
+                break;
+            }
+        }
         self
     }
 
@@ -183,6 +212,7 @@ impl McpHarnessBuilder {
             mcp_config_files,
             mcp_manager,
             resource_policy,
+            lock_file,
         } = self;
 
         let mut configs = HashMap::new();
@@ -202,10 +232,18 @@ impl McpHarnessBuilder {
                 );
             }
         }
-
+        let lock_path = lock_file.or(Some(PathBuf::from(".mcp-lock.json")));
         let (manager, ownership) = match mcp_manager {
             Some(manager) => (manager, McpManagerOwnership::Shared),
-            None => (Arc::new(McpManager::default()), McpManagerOwnership::Owned),
+            None => {
+                let manager = McpManager::with_credential_provider(
+                    None,
+                    Arc::new(crate::manager::default_connector),
+                    lock_path,
+                    Arc::new(crate::credential::EnvCredentialProvider),
+                );
+                (Arc::new(manager), McpManagerOwnership::Owned)
+            }
         };
         if !configs.is_empty() {
             manager.discover_and_connect(configs).await?;
@@ -658,6 +696,8 @@ mod tests {
                     env: HashMap::new(),
                     cwd: None,
                     timeout: Some(5_000),
+                    version_policy: Default::default(),
+                    credentials: None,
                 },
             )]))
             .await
