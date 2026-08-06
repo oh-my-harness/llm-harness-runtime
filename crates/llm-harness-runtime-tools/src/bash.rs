@@ -10,6 +10,7 @@ use llm_harness_types::{
 };
 
 use crate::resolve_path;
+use crate::truncation::{TruncationConfig, TruncationOutcome, truncate_and_persist};
 
 /// Default timeout (seconds) when `timeout` is not supplied.
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
@@ -190,7 +191,14 @@ impl Tool for BashTool {
                 text.push_str(&output.stderr);
             }
 
-            let details = serde_json::json!({ "exit_code": output.exit_code });
+            // Truncate + persist if output exceeds thresholds.
+            let outcome = truncate_and_persist(&text, ctx, &TruncationConfig::default())
+                .await
+                .unwrap_or_else(|_| TruncationOutcome {
+                    output: text.clone(),
+                    truncated: false,
+                });
+            let text = outcome.output;
 
             if output.exit_code == 0 {
                 let text = if text.is_empty() {
@@ -198,6 +206,10 @@ impl Tool for BashTool {
                 } else {
                     text
                 };
+                let details = serde_json::json!({
+                    "exit_code": output.exit_code,
+                    "truncated": outcome.truncated,
+                });
                 Ok(ToolResult::full(
                     vec![DataBlock::text(text)],
                     details,
@@ -205,11 +217,18 @@ impl Tool for BashTool {
                 ))
             } else {
                 // Non-zero exit: the command ran but failed. Surface the exit
-                // code both in the text and in `details`.
+                // code both in the text and in `details`. The exit-code line
+                // is appended *after* truncation — it is metadata, not command
+                // output, and must not be truncated.
+                let mut text = text;
                 if !text.is_empty() {
                     text.push('\n');
                 }
                 text.push_str(&format!("Command exited with code {}", output.exit_code));
+                let details = serde_json::json!({
+                    "exit_code": output.exit_code,
+                    "truncated": outcome.truncated,
+                });
                 Ok(ToolResult::full(
                     vec![DataBlock::text(text)],
                     details,
@@ -279,6 +298,20 @@ mod tests {
 
         assert_eq!(text_of(&res), "hello");
         assert_eq!(res.details["exit_code"], 0);
+    }
+    #[tokio::test]
+    async fn bash_short_output_not_truncated() {
+        let env = Arc::new(MockExecutionEnv::new());
+        let ctx = make_ctx(env);
+        let tool = BashTool::new();
+
+        let res = tool
+            .execute(serde_json::json!({ "command": "echo hello" }), &ctx)
+            .await
+            .expect("echo should succeed");
+
+        assert_eq!(text_of(&res), "hello");
+        assert_eq!(res.details["truncated"], false);
     }
 
     #[tokio::test]
@@ -427,5 +460,118 @@ mod tests {
             .expect_err("timeout must produce a ToolFailure");
         assert_eq!(err.code, "execution_failed");
         assert_eq!(err.model_message, "Tool execution failed.");
+    }
+
+    #[tokio::test]
+    async fn bash_nonzero_exit_truncated_field_present() {
+        let env = Arc::new(MockExecutionEnv::new());
+        let ctx = make_ctx(env);
+        let tool = BashTool::new();
+
+        let res = tool
+            .execute(serde_json::json!({ "command": "false" }), &ctx)
+            .await
+            .expect("false should return a result");
+
+        // `false` produces empty output → not truncated.
+        assert_eq!(res.details["truncated"], false);
+        assert_eq!(res.details["exit_code"], 1);
+        let text = text_of(&res);
+        assert!(text.contains("Command exited with code 1"));
+    }
+
+    #[tokio::test]
+    async fn bash_truncated_output_readable_via_read_tool() {
+        use crate::ReadTool;
+        use crate::truncation::{TruncationConfig, truncate_and_persist};
+
+        let env = Arc::new(MockExecutionEnv::new());
+        let ctx = make_ctx(env.clone());
+
+        // Generate 300 lines of output.
+        let input: String = (1..=300)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let outcome = truncate_and_persist(&input, &ctx, &TruncationConfig::default())
+            .await
+            .expect("should succeed");
+        assert!(outcome.truncated);
+
+        // Extract file path from marker text.
+        let path_start = outcome.output.find("已保存至 `").unwrap() + "已保存至 `".len();
+        let path_end = outcome.output[path_start..].find("`").unwrap() + path_start;
+        let file_path = &outcome.output[path_start..path_end];
+
+        // Read the file using ReadTool.
+        let read_tool = ReadTool::new(None);
+        let read_res = read_tool
+            .execute(serde_json::json!({ "path": file_path }), &ctx)
+            .await
+            .expect("read should succeed");
+
+        let read_text = match read_res.model_content.as_slice() {
+            [DataBlock::Text { text, .. }] => text.clone(),
+            _ => panic!("expected text block"),
+        };
+        assert!(read_text.contains("line 1"));
+        assert!(read_text.contains("line 300"));
+        assert!(read_text.contains("line 150"));
+    }
+
+    #[tokio::test]
+    async fn bash_long_output_truncated_end_to_end() {
+        // `__seq:300` makes MockExecutionEnv emit 300 numbered lines,
+        // exercising BashTool's truncation path end-to-end.
+        let env = Arc::new(MockExecutionEnv::new());
+        let ctx = make_ctx(env);
+        let tool = BashTool::new();
+
+        let res = tool
+            .execute(serde_json::json!({ "command": "__seq:300" }), &ctx)
+            .await
+            .expect("seq should succeed");
+
+        assert_eq!(
+            res.details["truncated"], true,
+            "300-line output must be truncated"
+        );
+        let text = text_of(&res);
+        assert!(
+            text.contains("省略 200 行"),
+            "missing marker with omitted count: {text}"
+        );
+        assert!(text.contains("line 1"), "missing head line 1: {text}");
+        assert!(text.contains("line 300"), "missing tail line 300: {text}");
+    }
+
+    #[tokio::test]
+    async fn bash_nonzero_exit_with_long_output_truncated() {
+        // `__seq_fail:300` generates 300 lines with exit_code=1.
+        // Verifies: truncation applies, exit-code line appears *after*
+        // the truncation marker (marker index < exit-code line index).
+        let env = Arc::new(MockExecutionEnv::new());
+        let ctx = make_ctx(env);
+        let tool = BashTool::new();
+
+        let res = tool
+            .execute(serde_json::json!({ "command": "__seq_fail:300" }), &ctx)
+            .await
+            .expect("seq_fail should return a result, not an error");
+
+        assert_eq!(res.details["truncated"], true);
+        assert_eq!(res.details["exit_code"], 1);
+        let text = text_of(&res);
+        let marker_idx = text.find("省略 200 行").expect("missing marker");
+        let exit_idx = text
+            .find("Command exited with code 1")
+            .expect("missing exit-code line");
+        assert!(
+            marker_idx < exit_idx,
+            "marker must appear before exit-code line"
+        );
+        assert!(text.contains("line 1"), "missing head: {text}");
+        assert!(text.contains("line 300"), "missing tail: {text}");
     }
 }

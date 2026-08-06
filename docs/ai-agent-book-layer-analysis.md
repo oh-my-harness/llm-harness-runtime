@@ -100,7 +100,7 @@
 > | 9 | ~~轨迹完整性自动修复~~ ✅ 已完成 | view 26 | `loop_fn.rs`/`dispatch.rs` | 未注册 ToolUse→synthetic error；执行缺结果→backfill；保证无 orphan ToolUse 到达 provider |
 > | 10 | MCP 服务器版本锁定 | view 17 | `runtime-mcp/` | 拒绝静默版本更新 |
 > | 11 | MCP 最小权限凭证管理 | view 17 | `runtime-mcp/` | 凭证作用域 |
-> | 12 | 截断后完整输出保存到临时文件 | view 18 | `tool.rs` ToolSessionProjection | Projected 投影后原始内容持久化到文件 |
+> | 12 | ~~截断后完整输出保存到临时文件~~ ✅ 已完成 | view 18 | `runtime-tools/truncation.rs` + `bash.rs` | truncate_and_persist 辅助模块 + BashTool 集成；双阈值（200行/10000字节）触发，头尾各50行，完整输出持久化到 OS 临时文件 |
 > | 13 | Sidecar 专用机制（与流式输出并行的轻量 LLM 门控） | view 11 | `loop_fn.rs`/dispatch | 在工具调用 emit 时即触发并行审查，非 LLM 输出完整后才调用；与流式工具执行（暂不做）相关但更轻量——`BeforeToolCallHook` 的输入隔离已天然满足，缺并行调度 |
 > | 14 | 幂等性机制（idempotency key + 预检-确认两段式） | view 11 | `types/tool.rs` | idempotency key 传递和去重基础设施 + initiate→事件通知完成两段式工具接口 |
 > | 15 | 前台/后台调用区分 | view 26 | `compaction_ops.rs`/`loop_fn.rs` | 后台调用（如 compaction summary）失败无独立放弃策略，需独立放弃逻辑不终止整个 run |
@@ -138,8 +138,8 @@
 > | 26 | 压缩 prompt 默认模板（上下文感知） | view 9 | 自定义压缩 prompt 的策略层默认实现 | 中 |
 > | 27 | 保留优先级默认规则 | view 9 | 标记消息不可压缩的策略层规则 | 中 |
 > | 28 | 工具结果投影默认策略 | view 9, 10 | ToolSessionProjection 默认大小阈值 | 低 |
-> | 29 | BashTool 截断策略 | view 18 | BashTool 改用 TruncationStrategy | 高 |
-> | 30 | 截断标注引导 Agent read 临时文件 | view 18 | 截断标注模板 | 中 |
+> | 29 | ~~BashTool 截断策略~~ ✅ 已完成 | view 18 | `runtime-tools/truncation.rs` + `bash.rs` | truncate_and_persist 双阈值（200行/10000字节），按行截断头尾各50行 |
+> | 30 | ~~截断标注引导 Agent read 临时文件~~ ✅ 已完成 | view 18 | `runtime-tools/truncation.rs` | 中文标注含文件路径+read工具引导 |
 > | 31 | grep + glob 工具补齐 | view 15 | llm-harness-runtime-tools 新增 | 高 |
 > | 32 | 内置工具 description 改写（补充"什么时候用"+边界+示例+移除实现细节） | view 16 | 工具实现改进 | 高 |
 > | 33 | 内置工具参数描述补充具体例子 | view 16 | 工具实现改进 | 中 |

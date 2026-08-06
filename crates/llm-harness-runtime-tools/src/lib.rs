@@ -11,6 +11,7 @@ pub mod read;
 pub mod snapshot;
 #[cfg(test)]
 pub mod test_env;
+pub mod truncation;
 pub mod write;
 
 pub use bash::BashTool;

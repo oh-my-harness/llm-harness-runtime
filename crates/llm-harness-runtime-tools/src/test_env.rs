@@ -27,6 +27,10 @@ struct Inner {
     dirs: Vec<PathBuf>,
     /// Last `ShellOptions` seen by `execute_shell` (for test assertions).
     last_shell_opts: Option<RecordedShellOpts>,
+    /// When set, `create_temp_dir` returns `EnvError::Other` (degradation test).
+    fail_temp_dir: bool,
+    /// When set, `write_file` returns `EnvError::Other` (degradation test).
+    fail_write: bool,
 }
 
 /// A snapshot of the `ShellOptions` passed to `execute_shell`, for tests that
@@ -60,8 +64,20 @@ impl MockExecutionEnv {
                 files: HashMap::new(),
                 dirs: Vec::new(),
                 last_shell_opts: None,
+                fail_temp_dir: false,
+                fail_write: false,
             }),
         }
+    }
+
+    /// Inject a failure into `create_temp_dir` (returns `EnvError::Other`).
+    pub fn set_fail_temp_dir(&self, fail: bool) {
+        self.inner.lock().fail_temp_dir = fail;
+    }
+
+    /// Inject a failure into `write_file` (returns `EnvError::Other`).
+    pub fn set_fail_write(&self, fail: bool) {
+        self.inner.lock().fail_write = fail;
     }
 
     /// Seed a file synchronously (test-setup helper).
@@ -195,7 +211,11 @@ impl ExecutionEnv for MockExecutionEnv {
         let normalized = self.normalize(path);
         let content = content.to_vec();
         Box::pin(async move {
-            self.inner.lock().files.insert(normalized, content);
+            let mut guard = self.inner.lock();
+            if guard.fail_write {
+                return Err(EnvError::Other("injected failure".into()));
+            }
+            guard.files.insert(normalized, content);
             Ok(())
         })
     }
@@ -332,6 +352,9 @@ impl ExecutionEnv for MockExecutionEnv {
             .join(format!("{}-{}", prefix, Uuid::new_v4()));
         Box::pin(async move {
             let mut guard = self.inner.lock();
+            if guard.fail_temp_dir {
+                return Err(EnvError::Other("injected failure".into()));
+            }
             if !guard.dirs.contains(&path) {
                 guard.dirs.push(path.clone());
             }
@@ -359,9 +382,33 @@ impl ExecutionEnv for MockExecutionEnv {
                 let mut guard = self.inner.lock();
                 guard.last_shell_opts = Some(recorded);
             }
-            // Fake shell: `echo <text>` echoes, `false` fails, else succeeds.
+            // Fake shell: `echo <text>` echoes, `false` fails, `__seq:N`
+            // generates N numbered lines (exit 0), `__seq_fail:N` generates
+            // N numbered lines with exit_code=1, else succeeds.
             let trimmed = cmd.trim();
-            if let Some(rest) = trimmed.strip_prefix("echo ") {
+            if let Some(rest) = trimmed.strip_prefix("__seq_fail:") {
+                let n: usize = rest.parse().unwrap_or(0);
+                let stdout = (1..=n)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(ShellOutput {
+                    stdout,
+                    stderr: String::new(),
+                    exit_code: 1,
+                })
+            } else if let Some(rest) = trimmed.strip_prefix("__seq:") {
+                let n: usize = rest.parse().unwrap_or(0);
+                let stdout = (1..=n)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(ShellOutput {
+                    stdout,
+                    stderr: String::new(),
+                    exit_code: 0,
+                })
+            } else if let Some(rest) = trimmed.strip_prefix("echo ") {
                 Ok(ShellOutput {
                     stdout: rest.to_string(),
                     stderr: String::new(),
