@@ -283,11 +283,12 @@ Plugin 的单次运行状态只能写入 `RunContext.local`，不能保存在可
 
 ## Git 规则
 
-- **每个阶段结束后自动提交并推送**。每完成一个独立的阶段或功能单元（如一个 Phase、一个 crate、一批测试），在 `cargo test` 和 `cargo clippy` 通过后：
+- 完成代码改动后，无需等用户明确要求即可执行：
   1. 自行 review 本次改动（diff 正确、无多余文件、无调试代码）
-  2. `git commit`
-  3. `git push`
-  无需等用户明确要求。不要累积多个阶段后一次性提交推送。
+  2. 运行 `cargo fmt`
+  3. `git commit`（或 `git commit --amend`）
+  不要累积多个阶段后一次性提交。每完成一个独立的阶段或功能单元即可提交。
+- `git push` 之前**必须等待用户确认**。
 - Commit message 格式：`<type>(<scope>): <description>`
   - type：`feat` / `fix` / `docs` / `test` / `refactor` / `chore`
   - scope：crate 名，如 `traits`、`budget`、`orchestration`

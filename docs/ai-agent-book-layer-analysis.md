@@ -96,8 +96,8 @@
 > | 5 | ~~SpawnOptions 配置继承~~ ✅ 已完成 | view 3, view 12 | `spawn_types.rs`/`spawner.rs` | 继承 system_prompt/tools/thinking_level + per-spawn overrides |
 > | 6 | ~~QuerySubagentTool 返回 role/description~~ ✅ 已完成 | view 12 | `spawn/tools.rs` | AgentStatus 增加 role/description 字段 |
 > | 7 | ~~退避抖动（jitter）~~ ✅ 已完成 | view 26 | `config.rs` RetryConfig | delay_for 增加 full jitter（`random(0, base*2^attempt]`），retry_after 优先不抖动 |
-> | 8 | 流式空闲看门狗 | view 26 | `loop_fn.rs` | stream 事件间超时检测 |
-> | 9 | 轨迹完整性自动修复 | view 26 | `loop_fn.rs` | ToolUse 缺 ToolResult 时自动修补 |
+> | 8 | ~~流式空闲看门狗~~ ✅ 已完成 | view 26 | `loop_fn.rs` | stream 事件间超时检测；idle watchdog hoisted Sleep + reset()，discarded MessageEnd 类型层强制 |
+> | 9 | ~~轨迹完整性自动修复~~ ✅ 已完成 | view 26 | `loop_fn.rs`/`dispatch.rs` | 未注册 ToolUse→synthetic error；执行缺结果→backfill；保证无 orphan ToolUse 到达 provider |
 > | 10 | MCP 服务器版本锁定 | view 17 | `runtime-mcp/` | 拒绝静默版本更新 |
 > | 11 | MCP 最小权限凭证管理 | view 17 | `runtime-mcp/` | 凭证作用域 |
 > | 12 | 截断后完整输出保存到临时文件 | view 18 | `tool.rs` ToolSessionProjection | Projected 投影后原始内容持久化到文件 |
