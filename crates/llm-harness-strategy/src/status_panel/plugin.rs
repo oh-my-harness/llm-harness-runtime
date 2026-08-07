@@ -169,8 +169,10 @@ mod tests {
 
     #[test]
     fn register_tools_skips_todo_when_disabled() {
-        let mut config = StatusPanelConfig::default();
-        config.enable_todo = false;
+        let config = StatusPanelConfig {
+            enable_todo: false,
+            ..Default::default()
+        };
         let plugin = StatusPanelPlugin::new(config);
         let mut tools: Vec<Arc<dyn Tool>> = vec![];
         plugin.register_tools(&mut tools);
@@ -188,8 +190,10 @@ mod tests {
 
     #[test]
     fn register_hooks_skips_counter_when_disabled() {
-        let mut config = StatusPanelConfig::default();
-        config.enable_tool_counter = false;
+        let config = StatusPanelConfig {
+            enable_tool_counter: false,
+            ..Default::default()
+        };
         let plugin = StatusPanelPlugin::new(config);
         let mut hooks = HarnessHooks::none();
         plugin.register_hooks(&mut hooks);

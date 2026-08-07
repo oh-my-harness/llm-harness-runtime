@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use llm_harness_agent::{HarnessHooks, Plugin};
 use llm_harness_loop::test_utils::NoOpEnv;
-use llm_harness_strategy::status_panel::{StatusPanelConfig, StatusPanelPlugin};
+use llm_harness_strategy::status_panel::StatusPanelPlugin;
 use llm_harness_types::{
     AgentContext, AgentMessage, AssistantMessage, AssistantMessageKind, ContentBlock, ExecutionEnv,
-    RunContext, RunRequest, Tool, ToolContext, ToolProgress, TransformContextCtx, UserMessage,
+    RunContext, RunRequest, Tool, ToolContext, ToolProgress, TransformContextCtx,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

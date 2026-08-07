@@ -236,11 +236,11 @@ mod tests {
         assert_eq!(status_count, 1);
 
         let last = result.messages.last().unwrap();
-        if let AgentMessage::User(u) = last {
-            if let ContentBlock::Text { text } = &u.content[0] {
-                assert!(text.contains("task A"));
-                assert!(!text.contains("<old/>"));
-            }
+        if let AgentMessage::User(u) = last
+            && let ContentBlock::Text { text } = &u.content[0]
+        {
+            assert!(text.contains("task A"));
+            assert!(!text.contains("<old/>"));
         }
     }
 

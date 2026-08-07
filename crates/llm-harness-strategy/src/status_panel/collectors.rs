@@ -414,10 +414,10 @@ mod tests {
         sc.prefix_messages(&mut messages);
         // 两条都应该被加前缀（window=3 >= 2）
         for msg in &messages {
-            if let AgentMessage::User(u) = msg {
-                if let ContentBlock::Text { text } = &u.content[0] {
-                    assert!(text.starts_with('['), "message not prefixed: {}", text);
-                }
+            if let AgentMessage::User(u) = msg
+                && let ContentBlock::Text { text } = &u.content[0]
+            {
+                assert!(text.starts_with('['), "message not prefixed: {}", text);
             }
         }
     }

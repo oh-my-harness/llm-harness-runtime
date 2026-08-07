@@ -75,11 +75,14 @@ impl AfterProviderResponseHook for CompositeAfterProviderResponseHook {
     }
 }
 
-/// Chains multiple `AfterToolCallHook` implementations (last-Patch-wins semantics).
+/// Chains multiple `AfterToolCallHook` implementations (chained semantics).
 ///
-/// All hooks execute in order, each seeing the original (unpatched) result.
-/// If multiple hooks return `Patch`, the last one wins; earlier patches are
-/// discarded. A `Passthrough` from any hook does not reset a prior `Patch`.
+/// Each hook sees the result from the previous hook's replacement (or the
+/// original result if no prior hook replaced). When a hook returns `Replace`,
+/// its output becomes the input to the next hook. `Passthrough` leaves the
+/// current result unchanged. This allows multiple hooks to compose their
+/// modifications — e.g. an injection filter and a source-tag wrapper can
+/// both apply to the same tool result.
 pub struct CompositeAfterToolCallHook {
     hooks: Vec<Arc<dyn AfterToolCallHook>>,
 }
@@ -97,28 +100,35 @@ impl AfterToolCallHook for CompositeAfterToolCallHook {
         ctx: AfterToolCallCtx<'a>,
     ) -> BoxFuture<'a, AfterToolCallDecision> {
         Box::pin(async move {
-            let mut final_decision = AfterToolCallDecision::Passthrough;
+            // Start from the original result. Each hook that returns Replace
+            // feeds its output into the next hook, so modifications compose.
+            let mut current_result = ctx.result.clone();
+            let mut replaced = false;
 
             for hook in &self.hooks {
-                // Each hook sees the original result; replacement is atomic.
                 let hook_ctx = AfterToolCallCtx {
                     run: ctx.run,
                     assistant_message: ctx.assistant_message,
                     tool_use_id: ctx.tool_use_id,
                     tool_name: ctx.tool_name,
                     args: ctx.args,
-                    result: ctx.result,
+                    result: &current_result,
                     turn_index: ctx.turn_index,
                 };
 
                 let decision = hook.on_complete(hook_ctx).await;
 
-                if let AfterToolCallDecision::Replace(_) = decision {
-                    final_decision = decision;
+                if let AfterToolCallDecision::Replace(new_result) = decision {
+                    current_result = new_result;
+                    replaced = true;
                 }
             }
 
-            final_decision
+            if replaced {
+                AfterToolCallDecision::Replace(current_result)
+            } else {
+                AfterToolCallDecision::Passthrough
+            }
         })
     }
 }
@@ -495,6 +505,81 @@ mod tests {
         fn _accept(_: &dyn AfterToolCallHook) {}
         let composite = CompositeAfterToolCallHook::new(vec![]);
         _accept(&composite);
+    }
+
+    #[tokio::test]
+    async fn composite_after_tool_call_chains_replacements() {
+        // Regression: two Replace hooks must both have their modifications
+        // survive. Previously the composite used last-Replace-wins, which
+        // silently discarded the first hook's output.
+        use llm_harness_types::{DataBlock, RunContext, RunRequest, ToolResult};
+
+        /// Prefixes text blocks with "A:".
+        struct PrefixHook(&'static str);
+        impl AfterToolCallHook for PrefixHook {
+            fn on_complete<'a>(
+                &'a self,
+                ctx: AfterToolCallCtx<'a>,
+            ) -> BoxFuture<'a, AfterToolCallDecision> {
+                let prefix = self.0;
+                Box::pin(async move {
+                    let Ok(result) = &ctx.result else {
+                        return AfterToolCallDecision::Passthrough;
+                    };
+                    let new_content: Vec<DataBlock> = result
+                        .model_content
+                        .iter()
+                        .map(|b| match b {
+                            DataBlock::Text { text, mime_type } => DataBlock::Text {
+                                text: format!("{prefix}: {text}"),
+                                mime_type: mime_type.clone(),
+                            },
+                            o => o.clone(),
+                        })
+                        .collect();
+                    AfterToolCallDecision::Replace(Ok(ToolResult {
+                        model_content: new_content,
+                        details: result.details.clone(),
+                        extensions: result.extensions.clone(),
+                        terminate: result.terminate,
+                        session_projection: result.session_projection.clone(),
+                    }))
+                })
+            }
+        }
+
+        let run = RunContext::new(RunRequest::from_text("test"));
+        let assistant = crate::test_utils::test_assistant_message(vec![]);
+        let result = Ok(ToolResult::full(
+            vec![DataBlock::text("content")],
+            serde_json::json!({}),
+            false,
+        ));
+        let ctx = AfterToolCallCtx {
+            run: &run,
+            assistant_message: &assistant,
+            tool_use_id: "tu-1",
+            tool_name: "web_search",
+            args: &serde_json::Value::Null,
+            result: &result,
+            turn_index: 0,
+        };
+
+        let composite = CompositeAfterToolCallHook::new(vec![
+            Arc::new(PrefixHook("A")),
+            Arc::new(PrefixHook("B")),
+        ]);
+        let decision = composite.on_complete(ctx).await;
+
+        let AfterToolCallDecision::Replace(Ok(replaced)) = decision else {
+            panic!("expected Replace");
+        };
+        let text = match &replaced.model_content[0] {
+            DataBlock::Text { text, .. } => text.as_str(),
+            _ => panic!("expected Text"),
+        };
+        // Both hooks applied: B saw A's output, so order is "B: A: content".
+        assert_eq!(text, "B: A: content");
     }
 
     #[test]

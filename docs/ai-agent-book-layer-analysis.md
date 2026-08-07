@@ -111,15 +111,15 @@
 >
 > | # | 缺失项 | 涉及 view | 实现方式 | 优先级 |
 > |---|--------|---------|---------|--------|
-> | 1 | 默认危险命令黑名单 BeforeToolCallHook | view 11 | RuleBasedApprovalHook + 默认 RuleChain | 高 |
-> | 2 | 默认路径遍历防护规则 | view 11 | BeforeToolCallHook + canonicalize/boundary check | 高 |
+> | 1 | ~~默认危险命令黑名单 BeforeToolCallHook~~ ✅ 已完成 | view 11 | RuleBasedApprovalHook + 默认 RuleChain | 高 | `SafetyDefaultsPlugin`（strategy crate）集成 `RuleBasedApprovalHook` + 内置危险命令黑名单 RuleChain（`rm -rf /`、`dd if=/dev/zero` 等）。一行 install 接入 |
+> | 2 | ~~默认路径遍历防护规则~~ ✅ 已完成 | view 11 | BeforeToolCallHook + canonicalize/boundary check | 高 | `SafetyDefaultsPlugin` 同时集成路径遍历防护规则，对文件工具参数做 canonicalize + boundary check |
 > | 3 | ~~默认审计日志格式~~ ✅ 已完成 | view 11 | AfterToolCallHook + 结构化日志模板 | 中 | `ToolCallAuditHook`（strategy crate）实现 BeforeToolCallHook + AfterToolCallHook 双 hook，自动记录工具调用的审计条目（时间、参数、结果、耗时、执行者、上下文）到 `AuditSink`。`AuditPlugin` 包装为 Plugin 一行 install 接入。审计类型从 runtime 迁移到 types crate，新增 `duration_ms` 字段 |
-> | 4 | 状态栏 XML 格式模板 + 四种内容收集器 | view 5, 8 | TransformContextHook 默认实现 | 高 |
-> | 5 | TODO write 工具 + 状态栏更新策略 | view 5 | Tool trait 实现 + TransformContextHook | 中 |
-> | 6 | Skill 元数据注入（方式三）BeforeRunHook | view 7 | BeforeRunHook 默认实现 | 高 |
-> | 7 | 自动包裹来源标签策略 | view 6 | AfterToolCallHook 默认实现 | 中 |
-> | 8 | 注入短语黑名单模板 | view 6 | TransformContextHook 默认实现 | 低 |
-> | 9 | 状态栏内容来源约束 | view 6 | TransformContextHook 校验逻辑 | 中 |
+> | 4 | ~~状态栏 XML 格式模板 + 四种内容收集器~~ ✅ 已完成 | view 5, 8 | TransformContextHook 默认实现 | 高 | `StatusPanelPlugin`（strategy crate）实现 `TransformContextHook`，注入 `<agent_status>` XML 到上下文末尾。四种内容收集器：TODO 列表、侧信道时间戳、工具调用计数器、环境状态。支持 Replace/Append 两种更新策略 |
+> | 5 | ~~TODO write 工具 + 状态栏更新策略~~ ✅ 已完成 | view 5 | Tool trait 实现 + TransformContextHook | 中 | `todo_write` 工具（strategy crate）实现 Tool trait，提供 `rewrite_todo_list` 和 `update_todo_status` 功能。`StatusPanelPlugin` 集成 TODO store，工具写入后下一轮状态栏自动更新 |
+> | 6 | ~~Skill 元数据注入（方式三）BeforeRunHook~~ ✅ 已完成 | view 7 | BeforeRunHook 默认实现 | 高 | `SkillMetadataInjectionHook`（strategy crate）实现 `BeforeRunHook`，在 run 开始时将 Skills 元数据（name + description）追加到上下文末尾（方式三），不注入 system prompt（方式一），保持 KV Cache 前缀稳定 |
+> | 7 | ~~自动包裹来源标签策略~~ ✅ 已完成 | view 6 | AfterToolCallHook 默认实现 | 中 | `SourceTagHook`（strategy crate）实现 `AfterToolCallHook`，在配置的外部内容工具返回 `DataBlock::Text` 时自动包裹 `<external_content source="...">` 标签。同时包裹 `model_content` 和 `session_projection`（Projected/Ephemeral），确保来源标记持久化。已有标签先 strip 再重新包裹（防伪造 source 属性）。Label 校验 `[A-Za-z0-9 _-]`。Image/Document 块透传 |
+> | 8 | ~~注入短语黑名单模板~~ ✅ 已完成 | view 6 | AfterToolCallHook + TransformContextHook 默认实现 | 低 | `InjectionFilterHook`（strategy crate）同时实现 `AfterToolCallHook`（在 session_message 拆分前过滤，防持久化绕过）和 `TransformContextHook`（过滤已累积上下文，纵深防御）。扫描工具结果文本块中的注入短语（默认覆盖中英文"忽略之前的指令"等），替换为 `[FILTERED]`。支持自定义 `InjectionPattern`（Replace/Remove 动作）。仅过滤工具结果，用户消息不过滤。过滤 model_content/Projected content/Ephemeral summary。文档标注"辅助手段"；CompactionSummary/BranchSummary/Custom 过滤 out of scope |
+> | 9 | ~~状态栏内容来源约束~~ ✅ 已完成 | view 6 | TransformContextHook 校验逻辑 | 中 | item 4（StatusPanelPlugin）已实现，状态栏内容由框架代码维护（TODO store、工具计数器、环境状态），不来自外部可污染数据源。`StatusPanelPlugin` 的内容收集器均从 `RunContext`/`ToolContext` 等可信来源读取数据 |
 > | 10 | notify_user 内置工具 + NotificationChannel trait | view 13 | Tool trait 实现 + NotificationChannel trait（均放 strategy crate，不进机制层 types/） | 高 |
 > | 12 | 命令语义解析 | view 24 | BeforeToolCallHook + Shell 命令语义分析 | 中 |
 > | 13 | 持久记忆跨会话防线 | view 24 | BeforeToolCallHook/AfterToolCallHook 写入审查 | 中 |
