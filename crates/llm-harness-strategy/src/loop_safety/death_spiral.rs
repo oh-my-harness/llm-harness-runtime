@@ -26,7 +26,9 @@ use super::state::LoopSafetyState;
 ///
 /// Implements `PrepareNextTurnHook` (increment if any tool failed this turn,
 /// reset on all-success) and `ShouldStopHook` (stop once
-/// `consecutive_error_turns >= max_error_turns`).
+/// `consecutive_error_turns >= max_error_turns`). `prepare` uses blocking
+/// `lock()` (await-free critical section); `should_stop` fails open on
+/// contention.
 pub struct DeathSpiralGuardHook {
     pub(crate) state: Arc<Mutex<LoopSafetyState>>,
     pub(crate) config: DeathSpiralGuardConfig,
@@ -122,7 +124,6 @@ mod tests {
             Err(ToolFailure::new("test_error", "something failed")),
         )
     }
-
 
     // 1. Turn with an error → consecutive_error_turns becomes 1.
     #[tokio::test]

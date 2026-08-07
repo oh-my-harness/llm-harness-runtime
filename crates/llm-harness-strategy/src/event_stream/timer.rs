@@ -21,8 +21,9 @@
 //! the stream:
 //! - `Once` + `fire_at` already passed → fires immediately
 //! - `Once` + `fire_at` in future → sleeps until `fire_at`
-//! - `Interval` → resumes interval schedule, adjusting `first_fire_at`
-//!   to `now + max(0, remaining)`
+//! - `Interval` + `first_fire_at` already passed → fires immediately,
+//!   then resumes every `interval` (no schedule adjustment)
+//! - `Interval` + `first_fire_at` in future → sleeps until `first_fire_at`
 
 use std::time::Duration;
 

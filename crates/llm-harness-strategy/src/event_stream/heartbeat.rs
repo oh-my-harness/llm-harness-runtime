@@ -13,7 +13,8 @@
 //!
 //! # Architecture
 //!
-//! Split into two objects sharing an `Arc<AtomicU64>`:
+//! Split into two objects sharing an `Arc<AtomicU64>` (last-activity
+//! timestamp) and an `Arc<tokio::sync::Notify>` (wake-up signal):
 //! - `HeartbeatHandle` — lightweight `Clone + Send + Sync` control handle
 //!   with `tick()` method. The business layer holds this.
 //! - `HeartbeatStream` — implements `EventStream`, held by
@@ -23,6 +24,10 @@
 //! `Arc<Mutex<Box<dyn EventStream>>>`, which type-erases the concrete type.
 //! The handle provides out-of-band control without needing access to the
 //! trait object.
+//!
+//! `tick()` updates the timestamp and notifies the stream via `Notify`,
+//! interrupting any in-progress sleep so the watchdog immediately
+//! recomputes the remaining wait.
 //!
 //! # Crash recovery
 //!
@@ -55,12 +60,17 @@ fn now_millis() -> u64 {
 #[derive(Clone)]
 pub struct HeartbeatHandle {
     last_activity: Arc<AtomicU64>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl HeartbeatHandle {
     /// Reset the watchdog — call on every meaningful activity.
+    ///
+    /// Updates the activity timestamp and wakes the stream's sleep so it
+    /// immediately recomputes the remaining wait.
     pub fn tick(&self) {
         self.last_activity.store(now_millis(), Ordering::Relaxed);
+        self.notify.notify_one();
     }
 }
 
@@ -70,6 +80,7 @@ impl HeartbeatHandle {
 /// Never returns `None` — stopping is via `abort` (CancellationToken).
 pub struct HeartbeatStream {
     last_activity: Arc<AtomicU64>,
+    notify: Arc<tokio::sync::Notify>,
     timeout: Duration,
     label: String,
 }
@@ -83,11 +94,14 @@ impl HeartbeatStream {
         label: impl Into<String>,
     ) -> (HeartbeatHandle, Box<dyn EventStream>) {
         let last_activity = Arc::new(AtomicU64::new(now_millis()));
+        let notify = Arc::new(tokio::sync::Notify::new());
         let handle = HeartbeatHandle {
             last_activity: last_activity.clone(),
+            notify: notify.clone(),
         };
         let stream = HeartbeatStream {
             last_activity,
+            notify,
             timeout,
             label: label.into(),
         };
@@ -109,11 +123,14 @@ impl HeartbeatStream {
             .map(|dt| dt.timestamp_millis() as u64)
             .unwrap_or_else(now_millis);
         let last_activity = Arc::new(AtomicU64::new(baseline));
+        let notify = Arc::new(tokio::sync::Notify::new());
         let handle = HeartbeatHandle {
             last_activity: last_activity.clone(),
+            notify: notify.clone(),
         };
         let stream = HeartbeatStream {
             last_activity,
+            notify,
             timeout,
             label: parsed.label,
         };
@@ -165,9 +182,12 @@ impl EventStream for HeartbeatStream {
                     return Some(self.make_event());
                 }
 
-                // Sleep for remaining time, then re-check.
+                // Sleep for remaining time, but wake early if tick() arrives.
                 let sleep_dur = Duration::from_millis(remaining_ms);
-                tokio::time::sleep(sleep_dur).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(sleep_dur) => {}
+                    _ = self.notify.notified() => {}
+                }
             }
         })
     }
@@ -221,6 +241,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tick_interrupts_sleep_and_delays_fire() {
+        // timeout = 300ms. Without tick, fires at ~300ms.
+        // tick() at ~50ms should interrupt the sleep and push fire to ~350ms.
+        let (handle, mut stream) = HeartbeatStream::new(Duration::from_millis(300), "watchdog");
+
+        // Start next() in a concurrent task so we can call tick() while it sleeps.
+        let task = tokio::spawn(async move { stream.next().await });
+
+        // Tick at 50ms — interrupts the 300ms sleep, pushes deadline to ~350ms.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.tick();
+
+        // At 200ms (well before the 350ms deadline) the task should still be pending.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "should not fire before tick-extended deadline"
+        );
+
+        // Wait for the fire (should happen around 350ms).
+        let e = tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("should fire within extended deadline")
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.details["channel"], "heartbeat.timeout");
+    }
+
+    #[tokio::test]
     async fn heartbeat_fires_repeatedly() {
         let (_handle, mut stream) = HeartbeatStream::new(Duration::from_millis(50), "loop");
 
@@ -252,6 +301,7 @@ mod tests {
         // returns `Box<dyn EventStream>`) so we can call `descriptor()`.
         let stream = HeartbeatStream {
             last_activity: Arc::new(AtomicU64::new(now_millis())),
+            notify: Arc::new(tokio::sync::Notify::new()),
             timeout: Duration::from_secs(30),
             label: "svc-health".to_string(),
         };

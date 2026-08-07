@@ -7,8 +7,12 @@
 //! zero. `should_stop` halts the loop once any tool's counter reaches the
 //! limit.
 //!
-//! All three hook entry points fail open: on `try_lock` contention they
-//! allow the call / pass through the result / decline to stop.
+//! Locking strategy: `AfterToolCallHook::on_complete` uses a blocking
+//! `lock()` — the critical section is await-free and nanosecond-level, so
+//! safe in async context; this prevents parallel-batch `try_lock` failures
+//! from skipping failure-count updates. `BeforeToolCallHook` and
+//! `ShouldStopHook` are read-only queries and fail open on contention
+//! (allow the call / decline to stop).
 
 use std::sync::Arc;
 
@@ -27,8 +31,8 @@ use super::state::LoopSafetyState;
 /// Implements `AfterToolCallHook` (increment on `Err`, reset on `Ok`),
 /// `BeforeToolCallHook` (deny once the counter reaches the limit), and
 /// `ShouldStopHook` (stop the loop once any tool's counter reaches the
-/// limit). All three fail open: on `try_lock` contention they allow the
-/// call / pass through the result / decline to stop.
+/// limit). `on_complete` uses blocking `lock()` (await-free critical section);
+/// `on_call` and `should_stop` fail open on contention.
 pub struct FailureCircuitBreakerHook {
     pub(crate) state: Arc<Mutex<LoopSafetyState>>,
     pub(crate) config: FailureCircuitBreakerConfig,
