@@ -56,14 +56,20 @@ impl AgentHarness {
         run: &RunContext,
         mut initial: Vec<AgentMessage>,
     ) -> Result<Vec<AgentMessage>, HarnessError> {
-        if self.hooks.before_run.is_empty() {
+        let (has_skill_readiness, skills, templates) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                inner.readable_skills.is_some(),
+                inner.skills.clone(),
+                inner.templates.clone(),
+            )
+        };
+        // `readable_skills` 为 Some 表示 skill readiness 已激活（Builder 注册
+        // 或运行时懒注册）。此条件下内联注入 skills 元数据，不依赖独立的
+        // BeforeRunHook 注册——`readable_skills` 的存在本身就是激活信号。
+        if !has_skill_readiness && self.hooks.before_run.is_empty() {
             return Ok(initial);
         }
-        let composite = Arc::new(CompositeBeforeRunHook::new(self.hooks.before_run.clone()));
-        let (skills, templates) = {
-            let inner = self.inner.lock().unwrap();
-            (inner.skills.clone(), inner.templates.clone())
-        };
         let resources = AgentHarnessResources { skills, templates };
         let prompt_text = initial
             .iter()
@@ -82,22 +88,37 @@ impl AgentHarness {
             })
             .unwrap_or_default();
 
-        let mut system_prompt = self.inner.lock().unwrap().state.system_prompt.clone();
-        let result = composite
-            .before_run(BeforeRunCtx {
-                run,
-                prompt_text: &prompt_text,
-                initial_messages: &mut initial,
-                system_prompt: &mut system_prompt,
-                resources: &resources,
-            })
-            .await
-            .map_err(HarnessError::from)?;
+        // 内联注入 skills 元数据（方式三第一层）。
+        if has_skill_readiness {
+            let metadata = crate::skills::format_skills_metadata(&resources.skills, true);
+            if !metadata.is_empty() {
+                initial.push(AgentMessage::User(UserMessage {
+                    content: vec![ContentBlock::Text { text: metadata }],
+                    timestamp: chrono::Utc::now(),
+                }));
+            }
+        }
 
-        // Apply hook results.
-        initial.extend(result.additional_messages);
-        if let Some(sp) = result.system_prompt.or(system_prompt) {
-            self.inner.lock().unwrap().state.system_prompt = Some(sp);
+        if !self.hooks.before_run.is_empty() {
+            let composite = Arc::new(CompositeBeforeRunHook::new(self.hooks.before_run.clone()));
+
+            let mut system_prompt = self.inner.lock().unwrap().state.system_prompt.clone();
+            let result = composite
+                .before_run(BeforeRunCtx {
+                    run,
+                    prompt_text: &prompt_text,
+                    initial_messages: &mut initial,
+                    system_prompt: &mut system_prompt,
+                    resources: &resources,
+                })
+                .await
+                .map_err(HarnessError::from)?;
+
+            // Apply hook results.
+            initial.extend(result.additional_messages);
+            if let Some(sp) = result.system_prompt.or(system_prompt) {
+                self.inner.lock().unwrap().state.system_prompt = Some(sp);
+            }
         }
         Ok(initial)
     }

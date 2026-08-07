@@ -1436,4 +1436,58 @@ mod tests {
             "skill_read should NOT be registered when opted out"
         );
     }
+
+    #[test]
+    fn build_sets_readable_skills_when_skills_present() {
+        use llm_harness_loop::test_utils::MockLlmClient;
+        use llm_harness_runtime_sandbox_os::OsEnv;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env: Arc<dyn llm_harness_types::ExecutionEnv> = Arc::new(OsEnv::new(tmp.path()));
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let plugin = MockPlugin::new("p1").with_skill("my-skill");
+        let builder = HarnessBuilder::new("m")
+            .provider("m", client)
+            .install(&plugin)
+            .inject_skill_read_tool(&env);
+        let (_client, opts) = builder.resolve_and_build().unwrap();
+        assert!(
+            opts.readable_skills.is_some(),
+            "readable_skills store should be set when skills are present"
+        );
+    }
+
+    #[test]
+    fn build_no_readable_skills_when_no_skills() {
+        use llm_harness_loop::test_utils::MockLlmClient;
+
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let builder = HarnessBuilder::new("m").provider("m", client);
+        let (_client, opts) = builder.resolve_and_build().unwrap();
+        assert!(
+            opts.readable_skills.is_none(),
+            "readable_skills should NOT be set when no skills"
+        );
+    }
+
+    #[test]
+    fn disable_skill_read_tool_leaves_readable_skills_none() {
+        use llm_harness_loop::test_utils::MockLlmClient;
+        use llm_harness_runtime_sandbox_os::OsEnv;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env: Arc<dyn llm_harness_types::ExecutionEnv> = Arc::new(OsEnv::new(tmp.path()));
+        let client = Arc::new(MockLlmClient::new(vec![]));
+        let plugin = MockPlugin::new("p1").with_skill("my-skill");
+        let builder = HarnessBuilder::new("m")
+            .provider("m", client)
+            .install(&plugin)
+            .disable_skill_read_tool()
+            .inject_skill_read_tool(&env);
+        let (_client, opts) = builder.resolve_and_build().unwrap();
+        assert!(
+            opts.readable_skills.is_none(),
+            "readable_skills should NOT be set when skill_read_tool is disabled"
+        );
+    }
 }

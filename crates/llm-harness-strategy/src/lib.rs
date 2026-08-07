@@ -9,5 +9,4 @@ pub mod budget;
 pub mod credential_guard;
 pub mod resource;
 pub mod safety;
-pub mod skills;
 pub mod status_panel;

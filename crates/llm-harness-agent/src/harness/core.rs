@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use llm_harness_loop::{
     ChatRequest, ConvertToLlmHook, DefaultConvertToLlm, FinalAnswerMode, LlmClient, LlmMessage,
@@ -26,7 +26,7 @@ use super::follow_up::FollowUpHandle;
 use super::hooks::{AbortCascadeHook, AsyncSpawnHookHandle, IdleWatcherHook};
 use super::options::AgentHarnessOptions;
 use super::state::{HarnessHooks, HarnessInner, HarnessState};
-use crate::skills::{dedup_skills, dedup_templates, filter_readable};
+use crate::skills::{SkillReadTool, dedup_skills, dedup_templates, filter_readable};
 
 const BROADCAST_CAPACITY: usize = 256;
 
@@ -300,6 +300,7 @@ impl AgentHarness {
             inner.skills = skills;
             inner.templates = templates;
         }
+        self.ensure_skill_readiness();
         self.emit(AgentHarnessEvent::ResourcesUpdate {
             skills: skill_count,
             templates: tmpl_count,
@@ -329,11 +330,37 @@ impl AgentHarness {
             }
             (inner.skills.len(), inner.templates.len())
         };
+        // 如果 harness 构建时没有 skills，SkillReadTool 和元数据注入 hook
+        // 未注册。此处检测到首次添加 readable skills 时懒注册。
+        self.ensure_skill_readiness();
         self.emit(AgentHarnessEvent::ResourcesUpdate {
             skills: skill_count,
             templates: template_count,
             diagnostics: vec![],
         });
+    }
+
+    /// 确保 `SkillReadTool` 已注册。
+    ///
+    /// 当 harness 构建时没有 skills（Builder 未注册工具），
+    /// 但运行时通过 `add_skills`/`reload_resources` 添加了 skills 时，
+    /// 此方法懒注册 `SkillReadTool` 并设置 `readable_skills` store。
+    /// 元数据注入由 `run_before_run_hook` 检测 `readable_skills` 后内联完成，
+    /// 不需要独立的 hook 注册。
+    fn ensure_skill_readiness(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.readable_skills.is_some() {
+            return; // Builder 时已注册
+        }
+        let readable: Vec<Skill> = filter_readable(&inner.skills);
+        if readable.is_empty() {
+            return;
+        }
+        // 创建共享 store 并注册 SkillReadTool。
+        let store = Arc::new(RwLock::new(readable));
+        let tool: Arc<dyn Tool> = Arc::new(SkillReadTool::new(store.clone(), self.env.clone()));
+        inner.state.tools.push(tool);
+        inner.readable_skills = Some(store);
     }
 
     /// Append prompt templates to the existing list without replacing it.

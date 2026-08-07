@@ -450,3 +450,54 @@ async fn set_tools_mid_run_rolled_back_on_storage_error() {
         "flag must be reset after storage-error rollback"
     );
 }
+
+#[tokio::test]
+async fn skill_metadata_injected_before_run() {
+    use std::path::PathBuf;
+
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
+    let env = Arc::new(NoOpEnv);
+    let mut opts = AgentHarnessOptions::new("test-model");
+    opts.skills = vec![Skill {
+        name: "test-skill".into(),
+        label: None,
+        description: "A test skill for E2E".into(),
+        source: PathBuf::from("/skills/test-skill/SKILL.md"),
+        base_dir: PathBuf::from("/skills/test-skill"),
+        disable_model_invocation: false,
+    }];
+    // Set readable_skills (simulating what HarnessBuilder::inject_skill_read_tool does).
+    // The inline injection in run_before_run_hook checks readable_skills.is_some().
+    let readable: Vec<Skill> = opts
+        .skills
+        .iter()
+        .filter(|s| !s.disable_model_invocation)
+        .cloned()
+        .collect();
+    opts.readable_skills = Some(Arc::new(std::sync::RwLock::new(readable)));
+
+    let harness = futures::executor::block_on(AgentHarness::new_in_memory(
+        client.clone() as Arc<dyn LlmClient>,
+        env,
+        opts,
+    ))
+    .unwrap();
+
+    let _ = harness.prompt("hello").await;
+
+    // Verify the LLM client received a message containing <available-skills>.
+    let captured = client.captured_requests.lock().unwrap();
+    assert!(!captured.is_empty(), "provider should have been called");
+    let messages = captured[0].messages();
+    let has_metadata = messages.iter().any(|m| match m {
+        llm_harness_loop::LlmMessage::User(content) => content.iter().any(|c| {
+            matches!(c, llm_harness_loop::RequestContent::Text(text)
+                if text.contains("<available-skills>"))
+        }),
+        _ => false,
+    });
+    assert!(
+        has_metadata,
+        "LLM should receive <available-skills> metadata in messages"
+    );
+}

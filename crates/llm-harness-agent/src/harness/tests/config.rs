@@ -129,6 +129,49 @@ fn add_skills_deduplicates_first_wins() {
 }
 
 #[test]
+fn add_skills_lazy_registers_skill_read_tool() {
+    let h = make_harness(vec![]);
+    // No skills at build time → no skill_read tool.
+    assert!(
+        !h.state().tools.iter().any(|t| t.name() == "skill_read"),
+        "skill_read should not be registered when no skills at build time"
+    );
+
+    h.add_skills(vec![make_skill("lazy-skill", "Lazy loaded")]);
+
+    // After add_skills, SkillReadTool should be registered.
+    assert!(
+        h.state().tools.iter().any(|t| t.name() == "skill_read"),
+        "skill_read should be lazy-registered after add_skills"
+    );
+}
+
+#[tokio::test]
+async fn add_skills_lazy_injects_metadata_on_next_prompt() {
+    use llm_harness_types::RunContext;
+    use llm_harness_types::RunRequest;
+
+    let h = make_harness(vec![MockResponse::text("ok")]);
+    h.add_skills(vec![make_skill("lazy-skill", "Lazy loaded")]);
+
+    // run_before_run_hook should inject <available-skills> via inline logic
+    // (readable_skills is Some after add_skills).
+    let run = RunContext::new(RunRequest::from_text("test"));
+    let result = h.run_before_run_hook(&run, vec![]).await.unwrap();
+    let has_metadata = result.iter().any(|m| match m {
+        llm_harness_types::AgentMessage::User(u) => u.content.iter().any(|c| {
+            matches!(c, llm_harness_types::ContentBlock::Text { text }
+                    if text.contains("<available-skills>"))
+        }),
+        _ => false,
+    });
+    assert!(
+        has_metadata,
+        "inline injection should produce <available-skills> metadata after add_skills"
+    );
+}
+
+#[test]
 fn add_templates_deduplicates_first_wins() {
     let h = make_harness(vec![]);
     let tmpl = |name: &str, desc: &str| PromptTemplate {
