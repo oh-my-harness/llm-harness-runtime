@@ -812,7 +812,7 @@
   **runtime 策略层**：❌ 缺失。以下均放 `llm-harness-strategy` crate：
   - `NotificationChannel` trait——抽象通知渠道（`Send + Sync`，`send(&self, msg: NotificationMessage) -> BoxFuture<Result<(), NotificationError>>`），用户实现具体渠道。
   - 内置的 `notify_user` 工具（`ToolLevel::User`，非 BuiltIn）——LLM 可调用，通过 `NotificationChannel` trait 发送消息，不结束 run（`terminate: false`）。
-  - 默认行为：未配置渠道时 fallback 到 `final_answer` 或 `steer`。
+  - 默认行为：未配置渠道时返回成功但标注未投递（`delivered: false`），不终止 run。~~fallback 到 final_answer 或 steer~~（修正：final_answer 的 terminate=true 与 notify_user 的 terminate=false 矛盾；steer 机制 ToolContext 不暴露。当前保守行为是合理工程选择，fallback 通路为可选增强，暂不实现）。
   - 超时降级：通知发送超时后的保守策略。
   - 多渠道选择策略：按紧急程度/用户状态/内容性质选择渠道的默认规则（暂不做，太复杂）。
 

@@ -7,6 +7,11 @@ pub mod audit;
 pub use audit::{AuditPlugin, ToolCallAuditHook};
 pub mod budget;
 pub mod credential_guard;
+pub mod notify;
 pub mod resource;
 pub mod safety;
 pub mod status_panel;
+pub use notify::{
+    NotificationChannel, NotificationError, NotificationMessage, NotifyPlugin, NotifyUserTool,
+    Urgency,
+};
