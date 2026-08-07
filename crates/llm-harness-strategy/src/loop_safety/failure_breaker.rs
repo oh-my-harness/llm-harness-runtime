@@ -168,10 +168,12 @@ mod tests {
         llm_harness_loop::test_utils::test_assistant_message(vec![])
     }
 
+    #[allow(clippy::result_large_err)]
     fn ok_result() -> Result<ToolResult, ToolFailure> {
         Ok(ToolResult::full(vec![], serde_json::json!({}), false))
     }
 
+    #[allow(clippy::result_large_err)]
     fn err_result() -> Result<ToolResult, ToolFailure> {
         Err(ToolFailure::new("test_error", "something failed"))
     }

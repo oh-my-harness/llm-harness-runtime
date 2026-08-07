@@ -1,8 +1,10 @@
 // crates/llm-harness-runtime/src/event.rs
-//! 通用事件唤醒机制。
+//! Generic event wait tool.
 //!
-//! runtime 只提供 `EventStream` trait（极简，只有 `next()`）和
-//! `WaitForExternalEventTool`。恢复语义归业务层。
+//! `EventStream` trait and `Event` struct are defined in
+//! `llm-harness-types` (they have no runtime-layer dependencies).
+//! This module provides `WaitForExternalEventTool`, which blocks on
+//! an injected `EventStream` and returns the event as a `ToolResult`.
 //!
 //! task 调 `WaitForExternalEventTool` 后，tool 在 `execute` 里
 //! `stream.next().await` 阻塞。event 到达 → tool 返回 → loop 续跑，
@@ -22,26 +24,8 @@ use tokio::sync::Mutex;
 use crate::lifecycle::task::TaskId;
 use crate::lifecycle::task_store::TaskStore;
 
-/// 通用事件流抽象。业务层实现。
-/// timer / IO 完成 / 上游 task 完成 / 外部信号等来源均可。
-/// runtime 只定义运行时阻塞语义，不定义恢复语义。
-///
-/// `Send` 但非 `Sync`——持有可变的等待状态（如 `mpsc::Receiver`），单线程消费。
-pub trait EventStream: Send {
-    /// 阻塞等待下一个事件。返回 None 表示流结束（不再有事件）。
-    /// 用 BoxFuture 而非 `async fn`，保证 trait 是 object-safe
-    /// （`Box<dyn EventStream>` 可用），与代码库 `ShouldStopHook`/`Tool` 签名风格一致。
-    fn next<'a>(&'a mut self) -> BoxFuture<'a, Option<Event>>;
-}
-
-/// 事件载荷。content 给 LLM 看，details 供程序判断。
-#[derive(Debug, Clone)]
-pub struct Event {
-    /// 与 ToolResult.model_content 同构。
-    pub content: Vec<DataBlock>,
-    /// 结构化数据，供程序判断。
-    pub details: Value,
-}
+// Re-export so existing `crate::lifecycle::event::EventStream` paths still work.
+pub use llm_harness_types::{Event, EventStream};
 
 /// 通用事件等待 tool。业务层注入 `EventStream`，tool 在 `execute` 里阻塞等待。
 ///

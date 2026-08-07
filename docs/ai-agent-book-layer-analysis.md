@@ -124,17 +124,17 @@
 > | 12 | 命令语义解析 | view 24 | BeforeToolCallHook + Shell 命令语义分析 | 中 |
 > | 13 | ~~持久记忆跨会话防线~~ ✅ 已完成 | view 24 | BeforeToolCallHook/AfterToolCallHook 写入审查 | 中 | `MemoryDefensePlugin`（strategy crate）实现 `BeforeToolCallHook`，扫描写入持久记忆的内容中的注入短语，防止恶意指令潜伏在长期记忆中跨会话生效。覆盖两条写入路径：memory_write 工具（始终检查 args.content）；write/edit 工具（当 path basename 匹配 memory 文件集 MEMORY.md/SOUL.md/AGENTS.md/CLAUDE.md/.cursorrules 时检查）。可配置 action: Deny（默认）/Sanitize/Warn。复用 InjectionFilterHook 提取的 InjectionDetector |
 > | 14 | ~~项目指令文件自动注入 BeforeRunHook~~ ✅ 已完成 | view 25 | BeforeRunHook 默认实现（扫描 CLAUDE.md 等） | 高 | `ProjectInstructionHook`（strategy crate）实现 `BeforeRunHook`，扫描 CLAUDE.md/AGENTS.md/.cursorrules/SOUL.md，从 working_dir 向上遍历，按子→父顺序合并后注入 system_prompt 尾部（KV Cache 友好的稳定前缀）。`ProjectInstructionConfig` 可配置 file_names + max_depth + max_bytes。XML 安全：body 经 escape_xml_text、attrs 经 escape_xml_attr 转义。大小守卫：max_bytes（默认 64 KiB）超限 skip + warn。所有 FS 失败降级为 tracing::warn + skip |
-> | 15 | 重复调用指纹检测 | view 26 | ShouldStopHook + tool+params 指纹 | 中 |
-> | 16 | 连续失败计数器 | view 26 | ShouldStopHook + per-path 计数器 | 中 |
-> | 17 | 输出触顶降级接续 | view 26 | BeforeProviderRequestHook + max_tokens 提升/续写 | 中 |
-> | 18 | 死亡螺旋防护 + 递归深度计数器 | view 26 | AfterRunHook/ShouldStopHook 错误路径禁用 | 中 |
-> | 19 | 全局 max_turns 上限 | view 26 | ShouldStopHook + 轮数计数 | 高 |
+> | ~~15~~ | ~~重复调用指纹检测~~ ✅ 已完成 | view 26 | ShouldStopHook + BeforeToolCallHook + tool+params 指纹 | 中 | `RepetitionGuardHook`（strategy crate）实现 `BeforeToolCallHook`（指纹 Deny）+ `ShouldStopHook`。`compute_fingerprint` 用 `DefaultHasher` + canonical JSON（递归排序 key）。`LoopSafetyPlugin` 一行 install。per-fingerprint 累计计数（非"连续"，防止模型交替切换） |
+> | ~~16~~ | ~~连续失败计数器~~ ✅ 已完成 | view 26 | ShouldStopHook + AfterToolCallHook + per-tool 计数器 | 中 | `FailureCircuitBreakerHook`（strategy crate）实现 `AfterToolCallHook`（Err→increment, Ok→reset，阻塞 lock 避免并行 batch 丢计数）+ `BeforeToolCallHook`（circuit open→Deny）+ `ShouldStopHook`。per-tool 独立计数，默认阈值 3 |
+> | ~~17~~ | ~~输出触顶降级接续~~ ✅ 已完成 | view 26 | ShouldStopHook + TransformContextHook 续写指令 | 中 | `TruncationContinuationHook`（strategy crate）实现 `ShouldStopHook`（MaxTokens→continue，只读判断）+ `TransformContextHook`（追加续写指令时自增 continuation_count）。不改机制层——`StreamOptions` 无 max_tokens 字段，用续写指令替代。默认续写 2 次 |
+> | ~~18~~ | ~~死亡螺旋防护 + 递归深度计数器~~ ✅ 已完成 | view 26 | PrepareNextTurnHook + ShouldStopHook 连续错误轮计数 | 中 | `DeathSpiralGuardHook`（strategy crate）实现 `PrepareNextTurnHook`（turn 边界聚合：本 turn 有任意 ToolFailure→increment，全 Ok→reset）+ `ShouldStopHook`（超阈值停止）。用 per-turn 聚合替代 per-tool-call（避免并行 batch 非确定性）。`AfterRunHook` 不存在于 runtime，用 per-turn 近似。默认阈值 5 |
+> | ~~19~~ | ~~全局 max_turns 上限~~ ✅ 已完成 | view 26 | ShouldStopHook + PrepareNextTurnHook 轮数计数 | 高 | `MaxTurnsHook`（strategy crate）实现 `ShouldStopHook`（非工具轮 clean stop）+ `PrepareNextTurnHook`（工具轮 Err→break loop）。`turn_index + 1 >= max_turns` 触发。默认 50 轮 |
 > | 20 | 批量 steer 消息编号+汇总 | view 22 | TransformContextHook 默认实现 | 低 |
 > | ~~21~~ | ~~discover_tools 元工具~~ | view 17, 23 | ~~Tool trait 实现~~ | ~~中~~ | **不做**——归用户策略层。runtime 机制层已提供完整动态工具能力（`set_tools()`/`set_active_tools()`/`NextTurnDirective.tools/active_tools`/`PrepareNextTurnHook`），业务层用这些机制自行实现工具发现策略。匹配算法、返回格式、交互流程都是业务决策，差异太大，strategy crate 提供默认实现无通用价值。与观点 1 原则一致："分类不落在 trait 上，机制层用不了"——工具发现策略同理 |
 > | ~~22~~ | ~~工具层次化组织~~ | view 17, 23 | ~~工具分类+分组策略~~ | ~~中~~ | **不做**——归用户策略层。主要价值是帮 discover_tools 缩小搜索空间，discover_tools 不做了，独立价值只剩"在 system prompt 里列分类索引帮 LLM 定位工具"——这同样是上层业务怎么组织 prompt 的事。`McpManager` 已有 server_name→tool 物理层次（`ExposedTool.server_name` + `full_name`），语义分类（搜索/读取/解析/查询）是业务决策 |
 > | 23 | 工具描述审查机制 | view 17 | MCP adapter wrapper 审计 description | 低 |
-> | 24 | 事件过滤规则 + 事件载荷上下文模板 | view 14 | EventStream wrapper + 默认模板 | 低 |
-> | 25 | Cron/Heartbeat 内置 EventStream 实现 | view 14 | TimerStream/HeartbeatStream | 低 |
+> | ~~24~~ | ~~事件过滤规则 + 事件载荷上下文模板~~ ✅ 已完成 | view 14 | EventStream wrapper + 默认模板 | 低 | `FilterStream`（predicate 过滤 wrapper，静默丢弃不匹配事件）+ `EventDetails`/`EventContext`（source/channel/event_id/timestamp/context 四维度 JSON schema）+ predicate 工厂 `by_source`/`by_channel`/`by_field`/`pass_all`。均在 `strategy/src/event_stream/` |
+> | ~~25~~ | ~~Cron/Heartbeat 内置 EventStream 实现~~ ✅ 已完成 | view 14 | TimerStream/HeartbeatStream | 低 | `TimerStream`（`TimerKind::Once` 触发后返回 None + `TimerKind::Interval` 永不返回 None）+ `HeartbeatStream`（拆 `HeartbeatHandle`+`HeartbeatStream` 共享 `Arc<AtomicU64>`，超时未 `tick()` 触发）+ descriptor 序列化用于 `TaskStore` 崩溃恢复 |
 > | 26 | 压缩 prompt 默认模板（上下文感知） | view 9 | 自定义压缩 prompt 的策略层默认实现 | 中 | ⚠️ 部分完成：`SUMMARIZATION_SYSTEM_PROMPT`/`SUMMARY_REQUEST` 硬编码在 `agent/src/compaction.rs`（机制层），`CompactionPromptSpec` 支持自定义替换。缺 strategy crate 的上下文感知默认模板 |
 > | 27 | ~~保留优先级默认规则~~ ✅ 已完成 | view 9 | `session/types.rs` + `agent/src/compaction.rs` | `CompactionPolicy::Keep` + `<no-compact>` tag（阶段二第 3 项）；Keep 条目 verbatim 保留到 summary，LLM 不合规时 also preserved |
 > | 28 | 工具结果投影默认策略 | view 9, 10 | ToolSessionProjection 默认大小阈值 | 低 | ⚠️ 部分完成：`ToolSessionProjection` enum (Full/Projected/Ephemeral) + `ToolProjectionKind` 已有（`types/tool.rs`），各工具自行选择投影策略。缺统一默认大小阈值 |
@@ -150,8 +150,8 @@
 > | ~~38~~ | ~~ContextMode::Inject 注入格式加来源标签~~ ✅ 已完成 | view 19 | `runtime/src/spawn/spawn_types.rs` + `spawner.rs` | `ContextBlock` + `ContextSource` enum (ParentConversation/File/UserInstruction/Custom) + `render_context_blocks` 输出 `[Context: <label>]` 格式。标签为 `Parent Conversation`/`File`/`User Instruction`/`Custom`，非教程建议的 `[FROM_MAIN_AGENT]`/`[FROM_USER]`/`[TOOL_RESULT]`，但功能等价 |
 > | 39 | 后台任务监控 EventStream 默认实现（ShellMonitorStream） | view 14 | 基于 BashTool 后台进程 + stdout 行流 | 低 |
 > | 40 | 外部通道 webhook 接收器默认实现 | view 14 | EventStream 默认实现 | 低 |
-> | 41 | 事件结构化模板（来源/渠道/内容/上下文四维度默认 JSON schema） | view 14 | Event details 默认模板 | 低 |
-> | 42 | 事件过滤机制（基于 Event.details 的 predicate 过滤） | view 14 | EventStream wrapper 过滤接口 | 低 |
+> | ~~41~~ | ~~事件结构化模板（来源/渠道/内容/上下文四维度默认 JSON schema）~~ ✅ 已完成 | view 14 | Event details 默认模板 | 低 | `EventDetails` + `EventContext`（`strategy/src/event_stream/template.rs`）：source/channel/event_id/timestamp/context 五字段，`with_label`/`with_reason`/`with_task_id` builder，`to_value`/`from_value` 序列化 |
+> | ~~42~~ | ~~事件过滤机制（基于 Event.details 的 predicate 过滤）~~ ✅ 已完成 | view 14 | EventStream wrapper 过滤接口 | 低 | `FilterStream`（`strategy/src/event_stream/filter.rs`）：包裹内层 `Box<dyn EventStream>`，predicate 不匹配静默丢弃，内层 None 传播。predicate 工厂 `by_source`/`by_channel`/`by_field`/`pass_all` |
 >
 > 暂不做的项目（明确标记）：
 > - 流式工具执行（view 27）— 实现复杂度高
@@ -823,7 +823,7 @@
 
 - **与协作工具的边界**（教程 line 394）：同样是"发通知"，通知对象是审批者或协作者 → 协作工具（观点 12 的 HITL）；通知对象是最终用户本人 → 用户沟通工具（本观点）。区别不在渠道，而在"通知谁、为什么通知"。
 
-#### 观点 14：事件触发工具 → 机制层基本完备 + runtime 策略层缺失
+#### 观点 14：事件触发工具 → 机制层基本完备 + runtime 策略层部分完成
 
 - **教程依据**：ch4 "事件触发工具"（line 374-384）。三类：定时器（set_timer，一次性+循环）、后台任务监控（monitor_shell，监控长命令新增输出）、外部事件通道（connect_channel，新邮件/API 回调/IM 消息）。两个时刻：注册时 Agent 主动调用工具声明关心什么事件，触发时外部事件异步回调唤醒 Agent。教程还提到事件结构化建模（来源/渠道/内容/上下文四维度）和事件处理三种策略（取消式/队列式/并行式）。
 
@@ -857,13 +857,14 @@
 
   **机制层**：基本不缺。`EventStream` trait + `WaitForExternalEventTool` + `steer`/`follow_up`/`abort` 覆盖了"注册→等待→触发→处理"的完整链路。比教程描述的"事件队列 + 事件循环"更轻量但功能等价——tool 阻塞等待代替显式事件队列，steer/follow_up 代替队列 drain，abort 代替取消式处理。
 
-  **runtime 策略层**：❌ 缺失。三类常见事件触发工具（定时器/后台监控/外部通道）没有内置实现——都要求业务层自己实现 `EventStream`。教程说这三类是"常见的"事件触发工具，runtime 策略层可提供默认实现：
-  - 定时器：基于 `tokio::time` 的 `TimerStream`（一次性 + 循环）
-  - 后台监控：基于 `BashTool` 后台进程 + stdout 行流的 `ShellMonitorStream`
-  - 外部通道：webhook 接收器的默认实现
-  - 事件结构化模板：来源/渠道/内容/上下文四维度的默认 JSON schema
-  - 事件过滤规则：触发条件+过滤规则避免无关事件唤醒 Agent 浪费算力。当前 `EventStream` trait 只有 `next()`，无过滤接口——过滤逻辑由业务层在实现中自行处理。runtime 策略层应提供默认的过滤机制（如基于 `Event.details` 字段的 predicate 过滤）
-  - 事件载荷上下文：payload 应包含足够上下文信息，减少 Agent 被唤醒后还需要额外查询的次数。当前 `Event` 有 `content`(给 LLM)+`details`(给程序)，结构上可承载上下文，但无默认模板指导应包含哪些上下文字段
+  **runtime 策略层**：⚠️ 部分完成。定时器、事件结构化模板、事件过滤已实现；后台监控和外部通道仍缺。
+  - ✅ 定时器：`TimerStream`（`strategy/src/event_stream/timer.rs`）——`TimerKind::Once`（到点触发后返回 None）+ `TimerKind::Interval`（按 interval 持续触发，永不返回 None）+ `descriptor()`/`from_descriptor()` 支持 `TaskStore` 崩溃恢复
+  - ❌ 后台监控：基于 `BashTool` 后台进程 + stdout 行流的 `ShellMonitorStream`（item 39，未实现）
+  - ❌ 外部通道：webhook 接收器的默认实现（item 40，未实现）
+  - ✅ 事件结构化模板：`EventDetails` + `EventContext`（`strategy/src/event_stream/template.rs`）——source/channel/event_id/timestamp/context 五字段 JSON schema
+  - ✅ 事件过滤规则：`FilterStream`（`strategy/src/event_stream/filter.rs`）——predicate wrapper 静默丢弃不匹配事件，predicate 工厂 `by_source`/`by_channel`/`by_field`/`pass_all`
+  - ✅ 事件载荷上下文：`EventDetails` 的 `with_label`/`with_reason`/`with_task_id` builder 提供上下文字段
+  - ✅ 心跳守护：`HeartbeatStream`（`strategy/src/event_stream/heartbeat.rs`）——拆 `HeartbeatHandle`（Clone+Send+Sync，`tick()` 重置）+ `HeartbeatStream`（impl EventStream）共享 `Arc<AtomicU64>`，超时未活动触发
 
   **用户策略层**：具体事件源的接入（邮件 webhook、GitHub PR 事件、IM 消息等）。
 
@@ -1226,8 +1227,8 @@
   | 教程机制 | runtime 实现 | 状态 |
   |---------|------------|------|
   | Hooks（事件钩子） | BeforeRunHook/AfterToolCallHook/ShouldStopHook/BeforeProviderRequestHook/AfterProviderResponseHook | ✅ 机制已有 |
-  | Cron（定时调度器） | 无内置，业务层用 EventStream 实现 | ❌ view 14 已标记 |
-  | Heartbeat（心跳守护） | 无内置，同上 | ❌ view 14 已标记 |
+  | Cron（定时调度器） | `TimerStream`（`TimerKind::Once` + `TimerKind::Interval`），`strategy/src/event_stream/timer.rs` | ✅ 已完成 |
+  | Heartbeat（心跳守护） | `HeartbeatStream`（`HeartbeatHandle` + `HeartbeatStream` 共享 `Arc<AtomicU64>`），`strategy/src/event_stream/heartbeat.rs` | ✅ 已完成 |
 
 - **五、Channel 机制对照**
 
@@ -1243,7 +1244,7 @@
   |---|--------|------|------|
   | 1 | mid-turn steer——LLM 流式响应期间或 tool 执行期间注入 steer | 机制层 | **明确不做** |
   | 2 | 外部事件实时推送——事件到达即触发，不依赖 LLM 主动调用 WaitForExternalEventTool | 机制层 | 可通过 SpawnAgentTool 替代，暂不上升为机制层改进 |
-  | 3 | Cron/Heartbeat 内置实现 | runtime 策略层 | view 14 已标记 |
+  | ~~3~~ | ~~Cron/Heartbeat 内置实现~~ ✅ 已完成 | runtime 策略层 | `TimerStream` + `HeartbeatStream`，`strategy/src/event_stream/` |
   | 4 | 事件优先级队列 | — | view 20 已暂缓 |
 
   核心结论：runtime 的"同步 loop + 异步工具"模型是有意的设计选择，不追求教程描述的完整事件驱动架构。mid-turn steer 明确不做。外部事件实时推送可通过 SpawnAgentTool 替代。
@@ -1516,7 +1517,7 @@
   |---------|------------|------|
   | 静默重试+指数退避+抖动 | `RetryConfig`（指数退避）；`delay_for` 尊重 retry_after；无随机抖动 | ⚠️ 缺抖动 |
   | 前台/后台区分 | ✅ 已满足——compaction 是唯一后台 LLM 调用：`compact()` 零次重试（无 RetryConfig 包装），失败时 context 在窗口内则 `Ok(())` 静默吞掉不终止 run，连续失败由熔断器（`compaction_failure_count`/`compaction_max_failures`）独立放弃。改进点 2 完成后即已满足，此条为遗留标记 | ✅ |
-  | 降级与接续（输出触顶） | 无——输出截断后无自动提升 max_tokens 或追加续写指令 | ❌ 缺失 |
+  | 降级与接续（输出触顶） | `TruncationContinuationHook`（strategy crate）——`ShouldStopHook` MaxTokens→continue（只读判断）+ `TransformContextHook` 追加续写指令时自增 continuation_count。注：用续写指令替代 max_tokens 提升（`StreamOptions` 无此字段） | ✅ 已完成 |
   | 模型降级 | 无——主模型过载不自动切备用模型 | ❌ 缺失 |
   | 工具错误变输入（不终止会话） | ✅ `ToolFailure` 作为 ToolResult 进入上下文 | ✅ |
 
@@ -1529,26 +1530,26 @@
   | 教程要求 | runtime 实现 | 状态 |
   |---------|------------|------|
   | 每条恢复路径熔断上限 | API 层：`max_retries`（默认 3）；压缩层：失败即终止（无重试） | ⚠️ 压缩无重试即终止，过于激进 |
-  | 死亡螺旋防护（错误路径禁调 LLM） | 无——错误路径上的副作用钩子未禁用 | ❌ 缺失 |
-  | 递归深度计数器 | 无 | ❌ 缺失 |
-  | 全局终止（max turns/budget） | `BudgetControlAdapter`（预算上限→ShouldStop）；无 max_turns | ⚠️ |
+  | 死亡螺旋防护（错误路径禁调 LLM） | `DeathSpiralGuardHook`（strategy crate）——`PrepareNextTurnHook` turn 边界聚合（本 turn 有任意 ToolFailure→increment，全 Ok→reset）+ `ShouldStopHook` 超阈值停止。用 per-turn 聚合替代 per-tool-call（避免并行 batch 非确定性） | ✅ 已完成 |
+  | 递归深度计数器 | `DeathSpiralGuardHook` 的 `consecutive_error_turns` per-turn 计数近似——真正的递归深度需机制层跟踪 sub-agent 调用栈 | ⚠️ 近似 |
+  | 全局终止（max turns/budget） | `BudgetControlAdapter`（预算上限→ShouldStop）；`MaxTurnsHook`（strategy crate）——`ShouldStopHook` + `PrepareNextTurnHook` 轮数熔断，默认 50 轮 | ✅ 已完成 |
   | 连续失败超阈值→人工升级 | 无 | ❌ 缺失 |
 
   压缩失败处理（`compaction_ops.rs:196-202`）：`Err(e)` 直接 emit `CompactionEnd { error }` 并返回 `Err(e)`，终止整个 run。教程建议压缩应有独立熔断阈值（如连续 3 次失败才放弃），而非一次失败即终止。
 
-  死亡螺旋场景：Agent 上下文溢出→触发 stop hook→hook 调用 LLM（如自动记忆提取）→再次溢出→再次触发 hook。runtime 的 `AfterRunHook`/`ShouldStopHook` 可在 stop 时调用 LLM，但错误路径上无禁用机制。
+  死亡螺旋场景：Agent 上下文溢出→触发 stop hook→hook 调用 LLM（如自动记忆提取）→再次溢出→再次触发 hook。runtime 的 `ShouldStopHook` 可在 stop 时调用 LLM。`DeathSpiralGuardHook`（strategy crate）通过 `PrepareNextTurnHook` per-turn 聚合检测连续错误轮（本 turn 有任意 ToolFailure→increment），超阈值（默认 5）后 `ShouldStopHook` 停止 loop。注：`AfterRunHook` 不存在于 runtime，用 per-turn 近似；真正的错误路径 LLM 禁用需机制层支持（error-mode flag），当前为策略层约定。
 
 - **改进点汇总**：
 
   | # | 改进点 | 归属 | 教程依据 |
   |---|--------|------|---------|
-  | 1 | 重复调用指纹检测——对"tool+params"计算指纹，相同指纹反复出现判定为无进展循环 | runtime 策略层 | line 248 |
-  | 2 | 连续失败计数器——每条恢复路径维护独立计数器，为熔断提供依据 | runtime 策略层 | line 248 |
+  | ~~1~~ | ~~重复调用指纹检测~~ ✅ 已完成——`RepetitionGuardHook`（strategy crate），`BeforeToolCallHook` Deny + `ShouldStopHook`，canonical JSON 指纹，per-fingerprint 累计计数 | runtime 策略层 | line 248 |
+  | ~~2~~ | ~~连续失败计数器~~ ✅ 已完成——`FailureCircuitBreakerHook`（strategy crate），`AfterToolCallHook` 计数（阻塞 lock）+ `BeforeToolCallHook` 熔断 Deny + `ShouldStopHook` | runtime 策略层 | line 248 |
   | 3 | 流式空闲看门狗——连接建立后无新输出超时判定为卡死，区别于连接超时 | 机制层 | line 250 |
   | 4 | 轨迹完整性自动修复——工具调用缺配对结果消息时自动修补，而非抛给模型/API | 机制层 | line 250 |
   | 5 | 退避抖动——指数退避叠加随机抖动，避免同步重试二次拥塞 | 机制层 | line 254 |
-  | 7 | 死亡螺旋防护——错误路径上禁用会再次调用 LLM 的副作用逻辑 + 递归深度计数器 | runtime 策略层 | line 264 |
-  | 8 | 全局 max_turns 上限——独立于预算的轮数熔断 | runtime 策略层 | line 264 |
+  | ~~7~~ | ~~死亡螺旋防护~~ ✅ 已完成——`DeathSpiralGuardHook`（strategy crate），`PrepareNextTurnHook` per-turn 聚合 + `ShouldStopHook` 超阈值停止。注：用 per-turn 计数近似递归深度（`AfterRunHook` 不存在于 runtime） | runtime 策略层 | line 264 |
+  | ~~8~~ | ~~全局 max_turns 上限~~ ✅ 已完成——`MaxTurnsHook`（strategy crate），`ShouldStopHook` 非工具轮 stop + `PrepareNextTurnHook` 工具轮 Err→break | runtime 策略层 | line 264 |
 
 #### 观点 27：并行工具调用、流式执行与级联中止 → 机制层
 

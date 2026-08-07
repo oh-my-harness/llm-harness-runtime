@@ -17,6 +17,7 @@ chrono.workspace = true
 parking_lot.workspace = true
 tokio = { workspace = true, features = ["time"] }
 thiserror.workspace = true
+uuid.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]

@@ -3,6 +3,11 @@
 //! 依赖 `llm-harness-types` 的公开 API 与 `llm-harness-agent` 的 Plugin/Hooks trait。
 //! 默认实现在此 crate。用户按需引入，runtime 不依赖此 crate。
 
+pub mod event_stream;
+pub use event_stream::{
+    EventContext, EventDetails, FilterStream, HeartbeatHandle, HeartbeatStream, TimerKind,
+    TimerStream, by_channel, by_field, by_source, pass_all,
+};
 pub mod audit;
 pub use audit::{AuditPlugin, ToolCallAuditHook};
 pub mod budget;

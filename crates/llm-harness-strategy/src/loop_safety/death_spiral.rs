@@ -123,11 +123,6 @@ mod tests {
         )
     }
 
-    fn hook(max_error_turns: u32) -> DeathSpiralGuardHook {
-        let state = Arc::new(Mutex::new(LoopSafetyState::default()));
-        let config = DeathSpiralGuardConfig { max_error_turns };
-        DeathSpiralGuardHook::new(state, config)
-    }
 
     // 1. Turn with an error → consecutive_error_turns becomes 1.
     #[tokio::test]
