@@ -98,8 +98,8 @@
 > | 7 | ~~退避抖动（jitter）~~ ✅ 已完成 | view 26 | `config.rs` RetryConfig | delay_for 增加 full jitter（`random(0, base*2^attempt]`），retry_after 优先不抖动 |
 > | 8 | ~~流式空闲看门狗~~ ✅ 已完成 | view 26 | `loop_fn.rs` | stream 事件间超时检测；idle watchdog hoisted Sleep + reset()，discarded MessageEnd 类型层强制 |
 > | 9 | ~~轨迹完整性自动修复~~ ✅ 已完成 | view 26 | `loop_fn.rs`/`dispatch.rs` | 未注册 ToolUse→synthetic error；执行缺结果→backfill；保证无 orphan ToolUse 到达 provider |
-> | 10 | MCP 服务器版本锁定 | view 17 | `runtime-mcp/` | 拒绝静默版本更新 |
-> | 11 | MCP 最小权限凭证管理 | view 17 | `runtime-mcp/` | 凭证作用域 |
+> | 10 | ~~MCP 服务器版本锁定~~ ✅ 已完成 | view 17 | `runtime-mcp/version_lock.rs` | `McpLockFile` 锁文件存储 server_info.version + 工具定义 sha256 快照（description_hash + input_schema_hash 分开）；首次连接自动写入，后续比对：版本不匹配或工具定义变更时按 `VersionPolicy` 决策（fail_closed / allow_with_warning / allow_and_update）；`tools/list_changed` 通知不再静默刷新，走 verify_and_lock diff + 策略路径；四种变更类型检测：added / removed / modified_desc / modified_schema |
+> | 11 | ~~MCP 最小权限凭证管理~~ ✅ 已完成 | view 17 | `runtime-mcp/credential.rs` + `strategy/credential_guard.rs` | `CredentialProvider` trait + `EnvCredentialProvider` 默认实现，支持 `${ENV:VAR}` / `${ENV:VAR:-default}` / `vault://` 引用语法；`ScopedCredential { value, allowed_tools }` 声明凭证作用域；`credentials.scoped_env` 与 env/headers 同 key 互斥校验；未解析引用 fail-closed 拒绝连接。strategy crate `McpCredentialGuardHook`（BeforeToolCallHook）默认告警模式，可选 Deny 模式 |
 > | 12 | ~~截断后完整输出保存到临时文件~~ ✅ 已完成 | view 18 | `runtime-tools/truncation.rs` + `bash.rs` | truncate_and_persist 辅助模块 + BashTool 集成；双阈值（200行/10000字节）触发，头尾各50行，完整输出持久化到 OS 临时文件 |
 > | ~~13~~ | ~~Sidecar 专用机制（与流式输出并行的轻量 LLM 门控）~~ | view 11 | ~~`loop_fn.rs`/dispatch~~ | **不做**——见下方"暂不做的项目" |
 > | ~~14~~ | ~~幂等性机制（idempotency key + 预检-确认两段式）~~ | view 11 | ~~`types/tool.rs`~~ | **不做**——见下方"暂不做的项目" |
@@ -120,18 +120,18 @@
 > | 7 | ~~自动包裹来源标签策略~~ ✅ 已完成 | view 6 | AfterToolCallHook 默认实现 | 中 | `SourceTagHook`（strategy crate）实现 `AfterToolCallHook`，在配置的外部内容工具返回 `DataBlock::Text` 时自动包裹 `<external_content source="...">` 标签。同时包裹 `model_content` 和 `session_projection`（Projected/Ephemeral），确保来源标记持久化。已有标签先 strip 再重新包裹（防伪造 source 属性）。Label 校验 `[A-Za-z0-9 _-]`。Image/Document 块透传 |
 > | 8 | ~~注入短语黑名单模板~~ ✅ 已完成 | view 6 | AfterToolCallHook + TransformContextHook 默认实现 | 低 | `InjectionFilterHook`（strategy crate）同时实现 `AfterToolCallHook`（在 session_message 拆分前过滤，防持久化绕过）和 `TransformContextHook`（过滤已累积上下文，纵深防御）。扫描工具结果文本块中的注入短语（默认覆盖中英文"忽略之前的指令"等），替换为 `[FILTERED]`。支持自定义 `InjectionPattern`（Replace/Remove 动作）。仅过滤工具结果，用户消息不过滤。过滤 model_content/Projected content/Ephemeral summary。文档标注"辅助手段"；CompactionSummary/BranchSummary/Custom 过滤 out of scope |
 > | 9 | ~~状态栏内容来源约束~~ ✅ 已完成 | view 6 | TransformContextHook 校验逻辑 | 中 | item 4（StatusPanelPlugin）已实现，状态栏内容由框架代码维护（TODO store、工具计数器、环境状态），不来自外部可污染数据源。`StatusPanelPlugin` 的内容收集器均从 `RunContext`/`ToolContext` 等可信来源读取数据 |
-> | 10 | notify_user 内置工具 + NotificationChannel trait | view 13 | Tool trait 实现 + NotificationChannel trait（均放 strategy crate，不进机制层 types/） | 高 |
+> | 10 | ~~notify_user 内置工具 + NotificationChannel trait~~ ✅ 已完成 | view 13 | Tool trait 实现 + NotificationChannel trait（均放 strategy crate，不进机制层 types/） | 高 | `NotifyUserTool`（ToolLevel::User，非 BuiltIn）让 LLM 向用户发消息但不结束 run（terminate: false）。`NotificationChannel` trait 抽象通知渠道，用户实现具体渠道（IM/邮件/Slack）并通过 RunExtensions 注入。`NotifyPlugin` 一行 install 注册工具。未配置渠道时返回 Ok + delivered:false（不终止 run，不阻塞）；发送超时 10s，tokio::select! 响应 ctx.abort |
 > | 12 | 命令语义解析 | view 24 | BeforeToolCallHook + Shell 命令语义分析 | 中 |
-> | 13 | 持久记忆跨会话防线 | view 24 | BeforeToolCallHook/AfterToolCallHook 写入审查 | 中 |
-> | 14 | 项目指令文件自动注入 BeforeRunHook | view 25 | BeforeRunHook 默认实现（扫描 CLAUDE.md 等） | 高 |
+> | 13 | ~~持久记忆跨会话防线~~ ✅ 已完成 | view 24 | BeforeToolCallHook/AfterToolCallHook 写入审查 | 中 | `MemoryDefensePlugin`（strategy crate）实现 `BeforeToolCallHook`，扫描写入持久记忆的内容中的注入短语，防止恶意指令潜伏在长期记忆中跨会话生效。覆盖两条写入路径：memory_write 工具（始终检查 args.content）；write/edit 工具（当 path basename 匹配 memory 文件集 MEMORY.md/SOUL.md/AGENTS.md/CLAUDE.md/.cursorrules 时检查）。可配置 action: Deny（默认）/Sanitize/Warn。复用 InjectionFilterHook 提取的 InjectionDetector |
+> | 14 | ~~项目指令文件自动注入 BeforeRunHook~~ ✅ 已完成 | view 25 | BeforeRunHook 默认实现（扫描 CLAUDE.md 等） | 高 | `ProjectInstructionHook`（strategy crate）实现 `BeforeRunHook`，扫描 CLAUDE.md/AGENTS.md/.cursorrules/SOUL.md，从 working_dir 向上遍历，按子→父顺序合并后注入 system_prompt 尾部（KV Cache 友好的稳定前缀）。`ProjectInstructionConfig` 可配置 file_names + max_depth + max_bytes。XML 安全：body 经 escape_xml_text、attrs 经 escape_xml_attr 转义。大小守卫：max_bytes（默认 64 KiB）超限 skip + warn。所有 FS 失败降级为 tracing::warn + skip |
 > | 15 | 重复调用指纹检测 | view 26 | ShouldStopHook + tool+params 指纹 | 中 |
 > | 16 | 连续失败计数器 | view 26 | ShouldStopHook + per-path 计数器 | 中 |
 > | 17 | 输出触顶降级接续 | view 26 | BeforeProviderRequestHook + max_tokens 提升/续写 | 中 |
 > | 18 | 死亡螺旋防护 + 递归深度计数器 | view 26 | AfterRunHook/ShouldStopHook 错误路径禁用 | 中 |
 > | 19 | 全局 max_turns 上限 | view 26 | ShouldStopHook + 轮数计数 | 高 |
 > | 20 | 批量 steer 消息编号+汇总 | view 22 | TransformContextHook 默认实现 | 低 |
-> | 21 | discover_tools 元工具 | view 17, 23 | Tool trait 实现 | 中 |
-> | 22 | 工具层次化组织 | view 17, 23 | 工具分类+分组策略 | 中 |
+> | ~~21~~ | ~~discover_tools 元工具~~ | view 17, 23 | ~~Tool trait 实现~~ | ~~中~~ | **不做**——归用户策略层。runtime 机制层已提供完整动态工具能力（`set_tools()`/`set_active_tools()`/`NextTurnDirective.tools/active_tools`/`PrepareNextTurnHook`），业务层用这些机制自行实现工具发现策略。匹配算法、返回格式、交互流程都是业务决策，差异太大，strategy crate 提供默认实现无通用价值。与观点 1 原则一致："分类不落在 trait 上，机制层用不了"——工具发现策略同理 |
+> | ~~22~~ | ~~工具层次化组织~~ | view 17, 23 | ~~工具分类+分组策略~~ | ~~中~~ | **不做**——归用户策略层。主要价值是帮 discover_tools 缩小搜索空间，discover_tools 不做了，独立价值只剩"在 system prompt 里列分类索引帮 LLM 定位工具"——这同样是上层业务怎么组织 prompt 的事。`McpManager` 已有 server_name→tool 物理层次（`ExposedTool.server_name` + `full_name`），语义分类（搜索/读取/解析/查询）是业务决策 |
 > | 23 | 工具描述审查机制 | view 17 | MCP adapter wrapper 审计 description | 低 |
 > | 24 | 事件过滤规则 + 事件载荷上下文模板 | view 14 | EventStream wrapper + 默认模板 | 低 |
 > | 25 | Cron/Heartbeat 内置 EventStream 实现 | view 14 | TimerStream/HeartbeatStream | 低 |
@@ -164,6 +164,7 @@
 > - 幂等性机制（view 11 改进点 14）— 场景不成立：(1) 工具执行是本地同步函数调用且每个 tool_use_id 仅执行一次，无机械重试循环，idempotency key 去重无消费者；(2) 先查询后变更是工具设计模式，Tool trait 的 execute 已给工具完全控制权；(3) 预检-确认两段式已有等价构建块（ToolProgress channel + EventStream + spawn_agent），拆成两工具或异步工具即可表达，无需新 Tool trait 变体；(4) 崩溃恢复策略（view 26 轨迹完整性修复）注入 synthetic error 而非重执行，不触发重复执行
 > - 中间输出过滤 hook（view 5 改进点 16）— 不需要：教程输出侧护栏检查点是"响应返回用户之前"（ch1 line 425），只有 FinalAnswer 返回用户，FinalAnswerValidator 已覆盖；中间 Progress 文本不直接返回用户，进入上下文后可由 TransformContextHook 在下一轮清洗；新增 hook 的语义复杂度（拒绝 Progress 后做什么？）和性能开销不匹配收益
 > - Sidecar 并行门控机制（view 11 改进点 13）— 优先级不高：收益仅限于 `BeforeToolCallHook` 内部做 LLM 审查的场景（数百 ms 延迟与剩余流式输出重叠），而当前无内置 LLM 审查 hook（`RuleBasedApprovalHook` 纯规则、`CostAccumulatorHook` 记账，均微秒级无并行收益）；LLM 审批工具本身不是高优先级。若后续实现 LLM 审查 hook 时再回来设计。`BeforeToolCallHook` 的输入隔离（只看 tool_name + args）已天然满足，届时只需补并行调度
+> - discover_tools 元工具 + 工具层次化组织（view 17/23 改进点 21/22）— 归用户策略层：runtime 机制层已提供完整动态工具能力（`set_tools()`/`set_active_tools()`/`NextTurnDirective.tools/active_tools`/`PrepareNextTurnHook`），业务层自行实现工具发现策略。匹配算法、返回格式、交互流程都是业务决策，strategy crate 提供默认实现无通用价值。工具层次化组织的主要价值是帮 discover_tools 缩小搜索空间，discover_tools 不做了，独立价值只剩"在 system prompt 里列分类索引"——同样是上层业务怎么组织 prompt 的事
 
 ---
 ## 第一章：AI Agent 入门
