@@ -9,7 +9,13 @@ pub mod budget;
 pub mod credential_guard;
 pub mod injection_filter;
 pub use injection_filter::{
-    InjectionAction, InjectionFilterHook, InjectionFilterPlugin, InjectionPattern,
+    InjectionAction, InjectionDetector, InjectionFilterHook, InjectionFilterPlugin,
+    InjectionPattern,
+};
+pub mod memory_defense;
+pub use memory_defense::{
+    MemoryDefenseAction, MemoryDefenseHook, MemoryDefensePlugin, MemoryDefensePluginBuilder,
+    MemoryFileSet,
 };
 pub mod notify;
 pub mod resource;

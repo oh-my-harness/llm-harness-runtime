@@ -282,10 +282,6 @@ mod tests {
                 fail: true,
             }
         }
-
-        fn messages(&self) -> Vec<NotificationMessage> {
-            self.messages.lock().clone()
-        }
     }
 
     impl NotificationChannel for MockChannel {
