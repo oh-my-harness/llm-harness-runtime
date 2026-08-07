@@ -17,6 +17,11 @@ pub use memory_defense::{
     MemoryDefenseAction, MemoryDefenseHook, MemoryDefensePlugin, MemoryDefensePluginBuilder,
     MemoryFileSet,
 };
+pub mod loop_safety;
+pub use loop_safety::{
+    DeathSpiralGuardConfig, FailureCircuitBreakerConfig, LoopSafetyConfig, LoopSafetyPlugin,
+    MaxTurnsConfig, RepetitionGuardConfig, TruncationContinuationConfig,
+};
 pub mod notify;
 pub mod resource;
 pub mod safety;
