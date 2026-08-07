@@ -16,8 +16,12 @@ pub mod resource;
 pub mod safety;
 pub mod source_tag;
 pub use source_tag::{SourceTagEntry, SourceTagHook, SourceTagPlugin};
+pub mod project_instruction;
 pub mod status_panel;
 pub use notify::{
     NotificationChannel, NotificationError, NotificationMessage, NotifyPlugin, NotifyUserTool,
     Urgency,
+};
+pub use project_instruction::{
+    ProjectInstructionConfig, ProjectInstructionHook, ProjectInstructionPlugin,
 };

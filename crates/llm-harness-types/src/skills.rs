@@ -107,3 +107,13 @@ pub fn escape_xml_attr(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
+
+/// Escape a string for safe use as XML element text (body).
+///
+/// Escapes `&`, `<`, `>` — the three characters with special meaning in XML
+/// element content. Unlike [`escape_xml_attr`], `"` is left as-is (legal in body).
+pub fn escape_xml_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
