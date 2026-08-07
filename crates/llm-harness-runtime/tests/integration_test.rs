@@ -81,6 +81,7 @@ async fn infrastructure_assembly_smoke_test() {
             payload: serde_json::json!({"from": "pending", "to": "running"}),
             decision: Some(AuditDecision::Allow),
             cost_delta: None,
+            duration_ms: None,
             prev_hash: None,
             hash: String::new(),
         })

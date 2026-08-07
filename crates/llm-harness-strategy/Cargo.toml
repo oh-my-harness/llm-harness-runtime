@@ -6,10 +6,17 @@ license.workspace = true
 
 [dependencies]
 llm-harness-types.workspace = true
+llm-harness-agent.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 llm-harness-loop = { workspace = true, features = ["test-utils"] }
+llm-harness-runtime-audit-jsonl = { path = "../llm-harness-runtime-audit-jsonl" }
+tempfile = "3"

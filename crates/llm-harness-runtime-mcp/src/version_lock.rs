@@ -259,7 +259,7 @@ mod tests {
     #[tokio::test]
     async fn load_nonexistent_returns_default() {
         let path = std::path::Path::new("/nonexistent/.mcp-lock.json");
-        let lock = McpLockFile::load_from_disk(&path).await.unwrap();
+        let lock = McpLockFile::load_from_disk(path).await.unwrap();
         assert!(lock.servers.is_empty());
     }
 }

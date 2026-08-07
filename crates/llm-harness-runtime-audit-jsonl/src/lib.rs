@@ -7,7 +7,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use anyhow::Result;
-use llm_harness_runtime::observability::audit::{AuditEntry, AuditSink};
+use llm_harness_types::audit::{AuditEntry, AuditSink};
 
 /// JSONL file-backed audit sink with SHA-256 hash-chain integrity.
 ///
@@ -136,8 +136,8 @@ impl AuditSink for JsonlAuditSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_runtime::observability::audit::{AuditDecision, AuditEventType};
     use llm_harness_types::EntryId;
+    use llm_harness_types::audit::{AuditDecision, AuditEventType};
 
     fn make_entry(trace_id: &str) -> AuditEntry {
         AuditEntry {
@@ -150,6 +150,7 @@ mod tests {
             payload: serde_json::json!({"tool": "read_file"}),
             decision: Some(AuditDecision::Allow),
             cost_delta: None,
+            duration_ms: None,
             prev_hash: None,
             hash: String::new(),
         }

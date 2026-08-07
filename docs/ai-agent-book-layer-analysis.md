@@ -113,7 +113,7 @@
 > |---|--------|---------|---------|--------|
 > | 1 | 默认危险命令黑名单 BeforeToolCallHook | view 11 | RuleBasedApprovalHook + 默认 RuleChain | 高 |
 > | 2 | 默认路径遍历防护规则 | view 11 | BeforeToolCallHook + canonicalize/boundary check | 高 |
-> | 3 | 默认审计日志格式 | view 11 | AfterToolCallHook + 结构化日志模板 | 中 | ⚠️ 部分完成：`AuditEntry`/`AuditSink` trait + `AuditEventType`/`AuditDecision`/`CostDelta` 结构化模板已有（`runtime/src/observability/audit.rs`），`JsonlAuditSink` 后端已有（`runtime-audit-jsonl` crate，含 SHA-256 hash chain）。缺默认 AfterToolCallHook 自动写入审计条目 |
+> | 3 | ~~默认审计日志格式~~ ✅ 已完成 | view 11 | AfterToolCallHook + 结构化日志模板 | 中 | `ToolCallAuditHook`（strategy crate）实现 BeforeToolCallHook + AfterToolCallHook 双 hook，自动记录工具调用的审计条目（时间、参数、结果、耗时、执行者、上下文）到 `AuditSink`。`AuditPlugin` 包装为 Plugin 一行 install 接入。审计类型从 runtime 迁移到 types crate，新增 `duration_ms` 字段 |
 > | 4 | 状态栏 XML 格式模板 + 四种内容收集器 | view 5, 8 | TransformContextHook 默认实现 | 高 |
 > | 5 | TODO write 工具 + 状态栏更新策略 | view 5 | Tool trait 实现 + TransformContextHook | 中 |
 > | 6 | Skill 元数据注入（方式三）BeforeRunHook | view 7 | BeforeRunHook 默认实现 | 高 |

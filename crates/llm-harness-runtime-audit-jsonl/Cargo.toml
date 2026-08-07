@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-llm-harness-runtime.workspace = true
+llm-harness-types.workspace = true
 anyhow.workspace              = true
 futures.workspace             = true
 serde.workspace               = true
@@ -16,5 +16,4 @@ tokio.workspace               = true
 [dev-dependencies]
 tokio             = { workspace = true, features = ["macros", "rt-multi-thread"] }
 chrono.workspace  = true
-llm-harness-types.workspace = true
 tempfile          = "3"

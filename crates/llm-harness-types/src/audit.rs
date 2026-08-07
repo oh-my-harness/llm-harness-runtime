@@ -1,6 +1,6 @@
+use crate::EntryId;
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
-use llm_harness_types::EntryId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -56,6 +56,8 @@ pub struct AuditEntry {
     pub decision: Option<AuditDecision>,
     /// Cost attributed to this event (if applicable).
     pub cost_delta: Option<CostDelta>,
+    /// Duration of the event in milliseconds (if measurable).
+    pub duration_ms: Option<u64>,
     /// SHA-256 of the previous entry (for hash chain integrity).
     pub prev_hash: Option<String>,
     /// SHA-256 of this entry: `SHA-256(serialize(content) + ":" + prev_hash)`.

@@ -8,23 +8,22 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use llm_harness_runtime::observability::audit::{
-    AuditDecision, AuditEntry, AuditEventType, AuditSink,
-};
 use llm_harness_runtime_audit_jsonl::JsonlAuditSink;
 use llm_harness_types::EntryId;
+use llm_harness_types::audit::{AuditDecision, AuditEntry, AuditEventType, AuditSink};
 
 fn make_entry(trace_id: &str, event_type: AuditEventType, decision: AuditDecision) -> AuditEntry {
     AuditEntry {
         timestamp: Utc::now(),
         trace_id: trace_id.into(),
-        session_id: EntryId(uuid::Uuid::new_v4()),
+        session_id: EntryId::new(),
         task_id: Some("task-integration".into()),
         principal: "agent".into(),
         event_type,
         payload: serde_json::json!({"note": "integration test"}),
         decision: Some(decision),
         cost_delta: None,
+        duration_ms: None,
         prev_hash: None,
         hash: String::new(),
     }

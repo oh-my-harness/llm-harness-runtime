@@ -1,8 +1,9 @@
 //! Observability + security audit.
 //!
-//! `audit` and `tracer` define sink traits; `tracing_adapter` bridges core
-//! hooks into span events consumed by a `TraceExporter`.
+//! `audit` re-exports sink traits from `llm-harness-types`; `tracer` defines
+//! a span exporter; `tracing_adapter` bridges core hooks into span events
+//! consumed by a `TraceExporter`.
 
-pub mod audit;
+pub use llm_harness_types::audit;
 pub mod tracer;
 pub mod tracing_adapter;
