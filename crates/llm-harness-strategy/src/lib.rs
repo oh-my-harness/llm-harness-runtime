@@ -43,3 +43,5 @@ pub use notify::{
 pub use project_instruction::{
     ProjectInstructionConfig, ProjectInstructionHook, ProjectInstructionPlugin,
 };
+pub mod tool_output_guard;
+pub use tool_output_guard::{ToolOutputGuardConfig, ToolOutputGuardHook, ToolOutputGuardPlugin};
