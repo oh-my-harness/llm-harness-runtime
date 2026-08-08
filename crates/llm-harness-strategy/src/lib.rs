@@ -11,6 +11,8 @@ pub use event_stream::{
 pub mod audit;
 pub use audit::{AuditPlugin, ToolCallAuditHook};
 pub mod budget;
+pub mod compaction;
+pub use compaction::context_aware_prompt_spec;
 pub mod credential_guard;
 pub mod injection_filter;
 pub use injection_filter::{
