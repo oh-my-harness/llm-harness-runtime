@@ -62,7 +62,7 @@ impl MockExecutionEnv {
             working_dir: PathBuf::from("/tmp/mock"),
             inner: Mutex::new(Inner {
                 files: HashMap::new(),
-                dirs: Vec::new(),
+                dirs: vec![PathBuf::from("/tmp/mock")],
                 last_shell_opts: None,
                 fail_temp_dir: false,
                 fail_write: false,
@@ -106,11 +106,25 @@ impl MockExecutionEnv {
     }
 
     /// Resolve a relative path against the working dir; absolute paths pass through.
+    /// Normalizes `.` components so that `working_dir/.` matches `working_dir`.
     fn normalize(&self, path: &Path) -> PathBuf {
-        if path.is_absolute() {
+        let raw = if path.is_absolute() {
             path.to_path_buf()
         } else {
             self.working_dir.join(path)
+        };
+        // Strip "." components — the mock filesystem stores canonical paths.
+        let mut cleaned = PathBuf::new();
+        for component in raw.components() {
+            if component == std::path::Component::CurDir {
+                continue;
+            }
+            cleaned.push(component);
+        }
+        if cleaned.as_os_str().is_empty() {
+            self.working_dir.clone()
+        } else {
+            cleaned
         }
     }
 }

@@ -7,6 +7,9 @@
 
 pub mod bash;
 pub mod edit;
+pub(crate) mod file_walk;
+pub mod glob;
+pub mod grep;
 pub mod read;
 pub mod snapshot;
 #[cfg(test)]
@@ -16,6 +19,8 @@ pub mod write;
 
 pub use bash::BashTool;
 pub use edit::{EditOperation, EditTool};
+pub use glob::GlobTool;
+pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use snapshot::FileSnapshotStore;
 pub use write::WriteTool;
@@ -60,6 +65,8 @@ impl Plugin for FsToolsPlugin {
         tools.push(Arc::new(WriteTool::new(self.store.clone())));
         tools.push(Arc::new(EditTool::new(self.store.clone())));
         tools.push(Arc::new(BashTool::new()));
+        tools.push(Arc::new(GrepTool::new()));
+        tools.push(Arc::new(GlobTool::new()));
     }
 }
 
@@ -69,7 +76,7 @@ mod tests {
     use llm_harness_types::Tool;
 
     #[test]
-    fn plugin_registers_four_tools() {
+    fn plugin_registers_six_tools() {
         let plugin = FsToolsPlugin::new(None);
         let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
         plugin.register_tools(&mut tools);
@@ -78,7 +85,9 @@ mod tests {
         assert!(names.contains(&"write"));
         assert!(names.contains(&"edit"));
         assert!(names.contains(&"bash"));
-        assert_eq!(names.len(), 4);
+        assert!(names.contains(&"grep"));
+        assert!(names.contains(&"glob"));
+        assert_eq!(names.len(), 6);
     }
 
     #[test]
