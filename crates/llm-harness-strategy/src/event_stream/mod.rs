@@ -1,5 +1,6 @@
 //! Built-in EventStream implementations: timer, heartbeat, filter wrapper,
-//! and the default event payload template.
+//! the default event payload template, shell process monitor, and webhook
+//! receiver.
 //!
 //! These are strategy-layer defaults for the `EventStream` trait (defined
 //! in `llm-harness-types`). They live in the strategy crate because they
@@ -18,3 +19,9 @@ pub use template::{EventContext, EventDetails};
 
 pub mod timer;
 pub use timer::{TimerKind, TimerStream};
+
+pub mod shell_monitor;
+pub use shell_monitor::{ShellMonitorConfig, ShellMonitorHandle, ShellMonitorStream};
+
+pub mod webhook;
+pub use webhook::{WebhookChannel, WebhookStream};

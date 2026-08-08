@@ -5,8 +5,9 @@
 
 pub mod event_stream;
 pub use event_stream::{
-    EventContext, EventDetails, FilterStream, HeartbeatHandle, HeartbeatStream, TimerKind,
-    TimerStream, by_channel, by_field, by_source, pass_all,
+    EventContext, EventDetails, FilterStream, HeartbeatHandle, HeartbeatStream, ShellMonitorConfig,
+    ShellMonitorHandle, ShellMonitorStream, TimerKind, TimerStream, WebhookChannel, WebhookStream,
+    by_channel, by_field, by_source, pass_all,
 };
 pub mod audit;
 pub use audit::{AuditPlugin, ToolCallAuditHook};

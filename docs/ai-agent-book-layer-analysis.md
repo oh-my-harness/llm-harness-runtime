@@ -148,8 +148,8 @@
 > | ~~36~~ | ~~模型降级（主模型过载自动切备用模型）~~ | view 26 | ~~BeforeProviderRequestHook + fallback model~~ | ~~中~~ | **不做**——见下方"暂不做的项目" |
 > | ~~37~~ | ~~连续失败超阈值→人工升级~~ | view 26 | ~~ShouldStopHook + 人工升级通知~~ | ~~中~~ | **不做**——见下方"暂不做的项目" |
 > | ~~38~~ | ~~ContextMode::Inject 注入格式加来源标签~~ ✅ 已完成 | view 19 | `runtime/src/spawn/spawn_types.rs` + `spawner.rs` | `ContextBlock` + `ContextSource` enum (ParentConversation/File/UserInstruction/Custom) + `render_context_blocks` 输出 `[Context: <label>]` 格式。标签为 `Parent Conversation`/`File`/`User Instruction`/`Custom`，非教程建议的 `[FROM_MAIN_AGENT]`/`[FROM_USER]`/`[TOOL_RESULT]`，但功能等价 |
-> | 39 | 后台任务监控 EventStream 默认实现（ShellMonitorStream） | view 14 | 基于 BashTool 后台进程 + stdout 行流 | 低 |
-> | 40 | 外部通道 webhook 接收器默认实现 | view 14 | EventStream 默认实现 | 低 |
+> | ~~39~~ | ~~后台任务监控 EventStream 默认实现（ShellMonitorStream）~~ ✅ 已完成 | view 14 | 基于 tokio::process 后台进程 + stdout 行流 | 低 | `ShellMonitorStream`（strategy crate `event_stream/shell_monitor.rs`）：`tokio::process::Command::new("sh").arg("-c")` spawn 子进程（stdout=piped, stderr=null），`BufReader` 逐行读 stdout，批量推送（max_lines/max_interval 双阈值）。三态状态机 `Reading → WaitForExit → Done`：EOF 时 buffer 非空先发 output Event 再转 WaitForExit，WaitForExit 执行 `child.wait()` 拿真实 exit_code 发 exit Event。`ShellMonitorHandle` 持有 `CancellationToken`（非 Child），kill 语义为"请求终止"，stream 在 `select!` 中监听后执行 `child.kill()` 再 fall through 到 WaitForExit 统一 wait。不实现崩溃恢复。已知限制：pull-based pipe 阻塞（两次 next() 间不读 stdout，高频输出命令会阻塞子进程） |
+> | ~~40~~ | ~~外部通道 webhook 接收器默认实现~~ ✅ 已完成 | view 14 | EventStream 默认实现 | 低 | `WebhookStream`（strategy crate `event_stream/webhook.rs`）：纯 mpsc channel 模式，`WebhookChannel`（Clone+Send+Sync）的 `push(Value)` 推入，`WebhookStream` impl `EventStream` 从 `mpsc::Receiver` 读取。透明透传——payload 直接作为 `Event.details`，content 为 `payload.to_string()`。无 label 字段（透传模式下无处使用）。不引入网络依赖——业务层自行接收 HTTP 请求后调 `push()`。不实现崩溃恢复。FilterStream 兼容性警告：payload 不含 source/channel 字段时 `by_source`/`by_channel` 过滤会全部丢弃 |
 > | ~~41~~ | ~~事件结构化模板（来源/渠道/内容/上下文四维度默认 JSON schema）~~ ✅ 已完成 | view 14 | Event details 默认模板 | 低 | `EventDetails` + `EventContext`（`strategy/src/event_stream/template.rs`）：source/channel/event_id/timestamp/context 五字段，`with_label`/`with_reason`/`with_task_id` builder，`to_value`/`from_value` 序列化 |
 > | ~~42~~ | ~~事件过滤机制（基于 Event.details 的 predicate 过滤）~~ ✅ 已完成 | view 14 | EventStream wrapper 过滤接口 | 低 | `FilterStream`（`strategy/src/event_stream/filter.rs`）：包裹内层 `Box<dyn EventStream>`，predicate 不匹配静默丢弃，内层 None 传播。predicate 工厂 `by_source`/`by_channel`/`by_field`/`pass_all` |
 >
@@ -861,10 +861,10 @@
 
   **机制层**：基本不缺。`EventStream` trait + `WaitForExternalEventTool` + `steer`/`follow_up`/`abort` 覆盖了"注册→等待→触发→处理"的完整链路。比教程描述的"事件队列 + 事件循环"更轻量但功能等价——tool 阻塞等待代替显式事件队列，steer/follow_up 代替队列 drain，abort 代替取消式处理。
 
-  **runtime 策略层**：⚠️ 部分完成。定时器、事件结构化模板、事件过滤已实现；后台监控和外部通道仍缺。
+  **runtime 策略层**：✅ 全部完成。定时器、心跳守护、后台监控、外部通道、事件结构化模板、事件过滤均已实现。
   - ✅ 定时器：`TimerStream`（`strategy/src/event_stream/timer.rs`）——`TimerKind::Once`（到点触发后返回 None）+ `TimerKind::Interval`（按 interval 持续触发，永不返回 None）+ `descriptor()`/`from_descriptor()` 支持 `TaskStore` 崩溃恢复
-  - ❌ 后台监控：基于 `BashTool` 后台进程 + stdout 行流的 `ShellMonitorStream`（item 39，未实现）
-  - ❌ 外部通道：webhook 接收器的默认实现（item 40，未实现）
+  - ✅ 后台监控：`ShellMonitorStream`（`strategy/src/event_stream/shell_monitor.rs`）——`tokio::process::Command` spawn `sh -c` 子进程（stdout=piped, stderr=null），`BufReader` 逐行读 stdout，批量推送（max_lines/max_interval 双阈值）。三态状态机 `Reading → WaitForExit → Done`。`ShellMonitorHandle` 持有 `CancellationToken`，kill 语义为"请求终止"
+  - ✅ 外部通道：`WebhookStream`（`strategy/src/event_stream/webhook.rs`）——纯 mpsc channel 模式，`WebhookChannel::push(Value)` 推入，`WebhookStream` impl `EventStream` 读取。透明透传（payload 直接作为 Event.details），不引入网络依赖
   - ✅ 事件结构化模板：`EventDetails` + `EventContext`（`strategy/src/event_stream/template.rs`）——source/channel/event_id/timestamp/context 五字段 JSON schema
   - ✅ 事件过滤规则：`FilterStream`（`strategy/src/event_stream/filter.rs`）——predicate wrapper 静默丢弃不匹配事件，predicate 工厂 `by_source`/`by_channel`/`by_field`/`pass_all`
   - ✅ 事件载荷上下文：`EventDetails` 的 `with_label`/`with_reason`/`with_task_id` builder 提供上下文字段

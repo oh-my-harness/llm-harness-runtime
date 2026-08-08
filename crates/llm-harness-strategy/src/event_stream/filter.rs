@@ -60,6 +60,10 @@ impl EventStream for FilterStream {
 // ── Predicate factories ─────────────────────────────────────────────────
 
 /// Filter events by `EventDetails.source` field.
+///
+/// Requires `Event.details` to match the `EventDetails` schema. Events
+/// with non-conforming `details` (e.g. arbitrary `WebhookStream` payloads)
+/// are silently dropped.
 pub fn by_source(source: &str) -> Box<dyn Fn(&Event) -> bool + Send> {
     let source = source.to_string();
     Box::new(move |ev: &Event| {
@@ -68,8 +72,11 @@ pub fn by_source(source: &str) -> Box<dyn Fn(&Event) -> bool + Send> {
             .unwrap_or(false)
     })
 }
-
 /// Filter events by `EventDetails.channel` field.
+///
+/// Requires `Event.details` to match the `EventDetails` schema. Events
+/// with non-conforming `details` (e.g. arbitrary `WebhookStream` payloads)
+/// are silently dropped.
 pub fn by_channel(channel: &str) -> Box<dyn Fn(&Event) -> bool + Send> {
     let channel = channel.to_string();
     Box::new(move |ev: &Event| {
