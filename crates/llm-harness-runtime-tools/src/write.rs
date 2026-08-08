@@ -35,7 +35,13 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Overwrite a file with the given content, creating parent directories as needed."
+        "Overwrite a file with the given content, creating parent directories as needed.\n\n\
+         Use when: creating new files; replacing entire file contents; writing generated code or config.\n\
+         Don't use for: modifying part of a file (use edit); appending to a file (use edit with insert); reading first (use read).\n\
+         Returns: The resolved file path and number of bytes written.\n\n\
+         Examples:\n\
+         {\"path\": \"src/main.rs\", \"content\": \"fn main() { println!(\\\"hi\\\"); }\\n\"}\n\
+         {\"path\": \"output/result.json\", \"content\": \"{\\\"status\\\": \\\"ok\\\"}\\n\"}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -46,11 +52,11 @@ impl Tool for WriteTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to write (relative to the working dir or absolute)."
+                        "description": "Path to the file (relative or absolute). e.g. \"src/main.rs\""
                     },
                     "content": {
                         "type": "string",
-                        "description": "The full new content to write to the file."
+                        "description": "Full file content to write. e.g. \"fn main() { println!(\\\"hi\\\"); }\""
                     }
                 },
                 "required": ["path", "content"]

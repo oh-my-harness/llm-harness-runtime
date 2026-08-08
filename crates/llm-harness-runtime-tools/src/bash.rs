@@ -49,7 +49,15 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return its merged stdout/stderr output."
+        "Execute a shell command and return its merged stdout/stderr output.\n\n\
+         Use when: running CLI tools, scripts, or git commands; checking build/test results; inspecting system state.\n\
+         Don't use for: reading file contents (use read); writing files (use write); editing files (use edit); searching file contents (use grep); finding files by pattern (use glob); long-running daemons or interactive sessions.\n\
+         Returns: Merged stdout+stderr text. Long output is truncated (head+tail shown, full output saved to a temp file path included in the result).\n\n\
+         Examples:\n\
+         {\"command\": \"git status\"}\n\
+         {\"command\": \"ls -la\", \"cwd\": \"src/\"}\n\
+         {\"command\": \"cargo test\", \"timeout\": 600}\n\
+         {\"command\": \"RUST_LOG=debug cargo run\", \"env\": {\"RUST_LOG\": \"debug\"}}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -59,22 +67,22 @@ impl Tool for BashTool {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute."
+                        "description": "The shell command to execute. e.g. \"git status\", \"ls -la\", \"cargo test\""
                     },
                     "cwd": {
                         "type": "string",
-                        "description": "Working directory for the command (relative to the env working dir or absolute)."
+                        "description": "Working directory (relative or absolute). e.g. \"src/\" or \"/tmp\""
                     },
                     "timeout": {
                         "type": "integer",
-                        "description": "Timeout in seconds (1..3600). Defaults to 300.",
+                        "description": "Timeout in seconds (1..3600, default 300). e.g. 120",
                         "minimum": MIN_TIMEOUT_SECS,
                         "maximum": MAX_TIMEOUT_SECS,
                         "default": DEFAULT_TIMEOUT_SECS
                     },
                     "env": {
                         "type": "object",
-                        "description": "Additional environment variables (string to string) to inject.",
+                        "description": "Additional environment variables. e.g. {\"RUST_LOG\": \"debug\", \"NODE_ENV\": \"test\"}",
                         "additionalProperties": { "type": "string" }
                     }
                 },

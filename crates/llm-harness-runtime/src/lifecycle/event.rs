@@ -94,8 +94,13 @@ impl Tool for WaitForExternalEventTool {
     }
 
     fn description(&self) -> &str {
-        "阻塞等待一个外部事件（如 CI 完成、IO 完成、上游 task 完成）。\
-         事件到达后作为结果返回。超时返回提示文本。"
+        "Block until an external event arrives (e.g. CI completion, IO completion, upstream task done).\n\n\
+         Use when: waiting for asynchronous external processes to finish; pausing until an event-driven trigger fires.\n\
+         Don't use for: polling with sleep (use bash with sleep); waiting for sub-agent results (use await_subagent_reply).\n\
+         Returns: The event payload when it arrives. Returns a hint text on timeout.\n\n\
+         Examples:\n\
+         {}\n\
+         {}"
     }
 
     fn parameters_schema(&self) -> &'static serde_json::Value {

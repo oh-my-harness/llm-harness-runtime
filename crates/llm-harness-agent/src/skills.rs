@@ -559,11 +559,11 @@ static SKILL_READ_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "properties": {
             "skill_name": {
                 "type": "string",
-                "description": "Name of the skill to read from."
+                "description": "Name of the skill to read from. e.g. \"brainstorming\""
             },
             "path": {
                 "type": "string",
-                "description": "Optional relative path within the skill directory. Omit to read the main SKILL.md file."
+                "description": "Optional relative path within the skill directory. Omit to read the main SKILL.md file. e.g. \"references/examples.md\""
             }
         },
         "required": ["skill_name"]
@@ -580,8 +580,13 @@ impl Tool for SkillReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file from a skill's directory. Use this to access skill sub-files \
-         referenced in skill content (e.g. references, examples, scripts)."
+        "Read a file from a skill's directory. Use this to access skill sub-files referenced in skill content (e.g. references, examples, scripts).\n\n\
+         Use when: loading the full content of a skill file that was mentioned in a skill's summary; accessing supporting materials within a skill.\n\
+         Don't use for: reading arbitrary project files (use read); listing directories (use read on a directory path).\n\
+         Returns: The file's content, with frontmatter parsed and large files truncated (256 KB limit).\n\n\
+         Examples:\n\
+         {\"skill_name\": \"brainstorming\", \"path\": \"references/examples.md\"}\n\
+         {\"skill_name\": \"test-driven-development\", \"path\": \"SKILL.md\"}"
     }
 
     fn parameters_schema(&self) -> &Value {

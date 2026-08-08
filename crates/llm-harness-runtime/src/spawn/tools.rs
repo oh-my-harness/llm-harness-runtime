@@ -82,18 +82,22 @@ impl SpawnAgentTool {
     pub fn new(spawner: Arc<HarnessSubAgentSpawner>) -> Self {
         let aliases = spawner.alias_names();
         let provider_desc = if aliases.is_empty() {
-            "provider 别名".to_string()
+            "Provider alias for the sub-agent's LLM.".to_string()
         } else {
-            format!("provider 别名，可选: {}", aliases.join(", "))
+            format!(
+                "Provider alias, options: {}. e.g. \"{}\"",
+                aliases.join(", "),
+                aliases[0]
+            )
         };
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
-                "prompt": { "type": "string", "description": "给 sub-agent 的任务指令" },
-                "context": { "type": "string", "description": "附加给 sub-agent 的上下文文本（如父对话摘要）" },
+                "prompt": { "type": "string", "description": "Task instruction for the sub-agent. e.g. \"Read all files in src/ and summarize the architecture\"" },
+                "context": { "type": "string", "description": "Additional context text for the sub-agent (e.g. parent conversation summary). e.g. \"The project uses PostgreSQL with Diesel ORM\"" },
                 "provider": { "type": "string", "description": provider_desc },
-                "role": { "type": "string", "description": "角色标签（如 code-reviewer）" },
-                "description": { "type": "string", "description": "职责描述" }
+                "role": { "type": "string", "description": "Role label for the sub-agent. e.g. \"code-reviewer\"" },
+                "description": { "type": "string", "description": "Responsibility description for the sub-agent. e.g. \"Reviews code for security and performance\"" }
             },
             "required": ["prompt"]
         });
@@ -111,9 +115,13 @@ impl Tool for SpawnAgentTool {
     }
 
     fn description(&self) -> &str {
-        "派发一个 sub-agent 处理子任务。派发后立即返回 agent_id，\
-         sub-agent 完成后结果自动出现在后续对话中，可同时派发多个并行工作。\
-         使用 message_subagent / await_subagent_reply 与 sub-agent 通信。"
+        "Dispatch a sub-agent to handle a sub-task. Returns agent_id immediately; sub-agent results appear in subsequent turns. Multiple sub-agents can run in parallel.\n\n\
+         Use when: delegating independent sub-tasks (e.g. research, file analysis, test execution) to parallel workers; isolating work that needs its own context window.\n\
+         Don't use for: simple sequential operations that don't need isolation; tasks requiring tight back-and-forth (use message_subagent instead after spawning).\n\
+         Returns: The spawned agent's ID (e.g. \"agent-3\").\n\n\
+         Examples:\n\
+         {\"prompt\": \"Read all files in src/ and summarize the architecture\"}\n\
+         {\"prompt\": \"Run cargo test and report any failures\", \"provider\": \"claude-3-sonnet\"}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -219,8 +227,8 @@ fn message_subagent_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "to": { "type": "string", "description": "目标 sub-agent 的 agent_id" },
-            "message": { "type": "string", "description": "要发送的文本消息" }
+            "to": { "type": "string", "description": "ID of the target sub-agent. e.g. \"agent-3\"" },
+            "message": { "type": "string", "description": "Text message to send. e.g. \"Please focus on the database layer first\"" }
         },
         "required": ["to", "message"]
     })
@@ -239,9 +247,12 @@ impl Tool for MessageSubagentTool {
     }
 
     fn description(&self) -> &str {
-        "向一个 sub-agent 发送文本消息（fire-and-forget，不等待回复）。\
-         消息会立即投递给 sub-agent；若 sub-agent 正在 await_subagent_reply \
-         则直接唤醒。使用 await_subagent_reply 等待回复。"
+        "Send a text message to a sub-agent (fire-and-forget, does not wait for a reply).\n\n\
+         Use when: providing additional instructions or context to a running sub-agent; redirecting a sub-agent's focus mid-task.\n\
+         Don't use for: waiting for a reply (use await_subagent_reply); querying status (use query_subagent); cancelling a sub-agent (use abort_subagent).\n\
+         Returns: Confirmation that the message was delivered.\n\n\
+         Examples:\n\
+         {\"to\": \"agent-3\", \"message\": \"Please focus on the database layer first\"}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -312,11 +323,11 @@ fn await_subagent_reply_schema() -> serde_json::Value {
         "properties": {
             "from": {
                 "type": "string",
-                "description": "只等待来自该 agent_id 的消息；省略则等待任意 sub-agent"
+                "description": "Only wait for messages from this agent_id. Omit to wait for any sub-agent. e.g. \"agent-3\""
             },
             "timeout": {
                 "type": "number",
-                "description": "超时秒数（默认 120）",
+                "description": "Timeout in seconds (default 120). e.g. 60",
                 "minimum": 0.001
             }
         }
@@ -336,8 +347,13 @@ impl Tool for AwaitSubagentReplyTool {
     }
 
     fn description(&self) -> &str {
-        "阻塞等待一条来自 sub-agent 的消息或完成事件。\
-         收到后作为 tool 结果返回；超时返回提示文本。"
+        "Block until a message or completion event arrives from a sub-agent.\n\n\
+         Use when: waiting for a sub-agent's response before proceeding; collecting results from a dispatched sub-agent.\n\
+         Don't use for: sending a message (use message_subagent); non-blocking status checks (use query_subagent).\n\
+         Returns: The sub-agent's message text, or a completion event with the final result. Returns a hint text on timeout.\n\n\
+         Examples:\n\
+         {\"from\": \"agent-3\", \"timeout\": 120}\n\
+         {\"from\": \"agent-3\"}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -410,7 +426,7 @@ fn query_subagent_schema() -> serde_json::Value {
         "properties": {
             "agent_id": {
                 "type": "string",
-                "description": "查询指定 agent 的状态；省略则列出全部"
+                "description": "Query a specific agent's status. Omit to list all agents. e.g. \"agent-3\""
             }
         }
     })
@@ -437,8 +453,13 @@ impl Tool for QuerySubagentTool {
     }
 
     fn description(&self) -> &str {
-        "查询 sub-agent 的状态（running / done / aborted）。\
-         传入 agent_id 查询单个；省略则列出全部。"
+        "Query the status of sub-agents (running, done, or aborted). Pass an agent_id for a single agent; omit to list all.\n\n\
+         Use when: checking if a sub-agent has finished; listing all active sub-agents before deciding to wait or proceed.\n\
+         Don't use for: getting a sub-agent's result (use await_subagent_reply); cancelling (use abort_subagent).\n\
+         Returns: Status string for a single agent, or a list of all agents with their statuses and role descriptions.\n\n\
+         Examples:\n\
+         {\"agent_id\": \"agent-3\"}\n\
+         {}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -523,7 +544,7 @@ static ABORT_SUBAGENT_SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
         "properties": {
             "agent_id": {
                 "type": "string",
-                "description": "要取消的 sub-agent ID"
+                "description": "ID of the sub-agent to cancel. e.g. \"agent-3\""
             }
         },
         "required": ["agent_id"]
@@ -540,7 +561,12 @@ impl Tool for AbortSubagentTool {
     }
 
     fn description(&self) -> &str {
-        "取消一个正在运行的 sub-agent。取消后该 sub-agent 会终止并产生 aborted 事件。"
+        "Cancel a running sub-agent. The sub-agent terminates and produces an aborted event.\n\n\
+         Use when: a sub-agent is stuck or no longer needed; cleaning up before ending a run.\n\
+         Don't use for: gracefully requesting a sub-agent to stop (use message_subagent instead).\n\
+         Returns: Confirmation of cancellation.\n\n\
+         Examples:\n\
+         {\"agent_id\": \"agent-3\"}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -616,7 +642,7 @@ fn message_main_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "message": { "type": "string", "description": "要汇报给主 agent 的文本消息" }
+            "message": { "type": "string", "description": "Text message to report to the parent agent. e.g. \"Database migration complete, proceeding to API layer\"" }
         },
         "required": ["message"]
     })
@@ -634,8 +660,12 @@ impl Tool for MessageMainTool {
     }
 
     fn description(&self) -> &str {
-        "向主 agent 发送一条文本消息（fire-and-forget）。\
-         用于 sub-agent 主动汇报中间结果或请求指示。"
+        "Send a text message to the parent agent (fire-and-forget). Used by sub-agents to report intermediate results or request guidance.\n\n\
+         Use when: a sub-agent needs to inform the parent of progress or ask a clarifying question without ending its own run.\n\
+         Don't use for: delivering the final result (the sub-agent's run completion does that automatically); waiting for a reply (use await_main_message).\n\
+         Returns: Confirmation that the message was delivered.\n\n\
+         Examples:\n\
+         {\"message\": \"Database migration complete, proceeding to API layer\"}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -711,7 +741,7 @@ fn await_main_message_schema() -> serde_json::Value {
         "properties": {
             "timeout": {
                 "type": "number",
-                "description": "超时秒数（默认 120）",
+                "description": "Timeout in seconds (default 120). e.g. 300",
                 "minimum": 0.001
             }
         }
@@ -731,8 +761,12 @@ impl Tool for AwaitMainMessageTool {
     }
 
     fn description(&self) -> &str {
-        "阻塞等待一条来自主 agent 的消息。\
-         收到后作为 tool 结果返回；超时返回提示文本。"
+        "Block until a message arrives from the parent agent.\n\n\
+         Use when: a sub-agent has asked a question and is waiting for the parent's response; pausing for further instructions.\n\
+         Don't use for: sending a message (use message_main); checking if the parent is still active.\n\
+         Returns: The parent agent's message text. Returns a hint text on timeout.\n\n\
+         Examples:\n\
+         {\"timeout\": 300}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {

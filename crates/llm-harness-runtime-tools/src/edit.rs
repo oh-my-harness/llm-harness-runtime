@@ -84,7 +84,14 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &str {
-        "Apply line-level swap/insert/delete operations to a file, with hashline tag verification."
+        "Apply line-level swap, insert, or delete operations to a file with optional staleness checking.\n\n\
+         Use when: modifying specific lines in an existing file; making targeted edits without rewriting the whole file; applying multiple edits in sequence.\n\
+         Don't use for: creating new files (use write); replacing entire file content (use write); byte-exact binary edits.\n\
+         Returns: The resolved file path and number of operations applied. Fails if a staleness tag is provided and the file has changed since the last read.\n\n\
+         Examples:\n\
+         {\"path\": \"src/main.rs\", \"operations\": [{\"type\": \"swap\", \"start\": 5, \"end\": 8, \"lines\": [\"    println!(\\\"hello\\\");\"]}]}\n\
+         {\"path\": \"src/main.rs\", \"operations\": [{\"type\": \"insert\", \"start\": 10, \"lines\": [\"// TODO: refactor\", \"\"]}, {\"type\": \"delete\", \"start\": 15, \"end\": 18}]}\n\
+         {\"path\": \"src/main.rs\", \"tag\": \"A1B2\", \"operations\": [{\"type\": \"delete\", \"start\": 20, \"end\": 25}]}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -94,15 +101,15 @@ impl Tool for EditTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to edit (relative to the working dir or absolute)."
+                        "description": "Path to the file (relative or absolute). e.g. \"src/main.rs\""
                     },
                     "tag": {
                         "type": "string",
-                        "description": "Optional 4-hex content-hash tag from a prior read. When present and a snapshot store is attached, the edit is rejected if the tag does not match the current snapshot."
+                        "description": "Optional 4-hex staleness tag from a prior read (prevents editing a stale file). e.g. \"A1B2\""
                     },
                     "operations": {
                         "type": "array",
-                        "description": "Ordered list of edit operations (swap/insert/delete). Line numbers are 1-indexed and refer to the state after prior operations.",
+                        "description": "Ordered list of swap/insert/delete operations. Line numbers are 1-indexed and refer to the state after prior operations. e.g. [{\"type\":\"swap\",\"start\":5,\"end\":8,\"lines\":[\"new line\"]}]",
                         "items": {
                             "type": "object",
                             "oneOf": [

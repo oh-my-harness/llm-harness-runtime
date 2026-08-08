@@ -58,7 +58,15 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file (with hashline anchoring when a snapshot store is attached) or list a directory."
+        "Read a file's contents with line numbers, or list a directory's entries.\n\n\
+         Use when: inspecting source code, config files, or any text file; browsing directory structure; reading a range of lines from a large file.\n\
+         Don't use for: executing commands (use bash); writing or modifying files (use write/edit); searching file contents (use grep).\n\
+         Returns: Line-numbered file content with a header tag for safe editing. Directory reads return entry names with sizes and timestamps. Range reads include 1 leading and 3 trailing context lines.\n\n\
+         Examples:\n\
+         {\"path\": \"src/main.rs\"}\n\
+         {\"path\": \"./tests/\"}\n\
+         {\"path\": \"src/main.rs\", \"offset\": 50, \"limit\": 100}\n\
+         {\"path\": \"config.json\", \"raw\": true}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -68,19 +76,19 @@ impl Tool for ReadTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file or directory to read (relative to the working dir or absolute)."
+                        "description": "Path to the file or directory (relative or absolute). e.g. \"src/main.rs\" or \"./tests/\""
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "1-indexed starting line. When given together with `limit`, the returned range is expanded by 1 leading and 3 trailing context lines."
+                        "description": "1-indexed starting line for range reads. e.g. 50 (starts at line 50)"
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of lines to return starting at `offset`."
+                        "description": "Maximum number of lines to return. e.g. 100"
                     },
                     "raw": {
                         "type": "boolean",
-                        "description": "If true, emit plain text with no header or line numbers and skip snapshot recording.",
+                        "description": "If true, return plain text without headers or line numbers. e.g. false",
                         "default": false
                     }
                 },

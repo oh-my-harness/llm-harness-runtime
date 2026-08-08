@@ -269,11 +269,11 @@ impl PlanWorkflowTool {
 fn plan_workflow_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
-        "description": "提交一个 workflow 计划。包含 steps（步骤列表）、edges（步骤间跳转边）和 entry_step（入口步骤 ID）。校验规则：1) entry_step 必须等于某个 step 的 id；2) edge 的 from/to 必须引用已存在的 step id；3) 非 entry step 必须有入边（不能孤立）；4) 同一步不能有多条无条件出边；5) step/edge 数量上限 1000/5000；6) condition 的 pointer 必须是 RFC 6901 JSON Pointer（以 / 开头）；7) 数值条件值不能是 NaN/Infinity。校验失败会返回具体错误信息，请根据错误修正后重试。",
+        "description": "Submit a workflow plan. Contains steps (step list), edges (transitions between steps), and entry_step (entry step ID). Validation rules: 1) entry_step must equal a step's id; 2) edge from/to must reference existing step ids; 3) non-entry steps must have inbound edges (no orphans); 4) a step cannot have multiple unconditional outbound edges; 5) step/edge count limits 1000/5000; 6) condition pointer must be RFC 6901 JSON Pointer (starts with /); 7) numeric condition values cannot be NaN/Infinity. Validation failures return specific error messages — fix and retry.",
         "examples": [{
             "steps": [
-                {"kind": "llm", "id": "analyze", "name": "分析", "prompt": "分析输入数据"},
-                {"kind": "llm", "id": "report", "name": "报告", "prompt": "生成报告"}
+                {"kind": "llm", "id": "analyze", "name": "Analyze", "prompt": "Analyze the input data"},
+                {"kind": "llm", "id": "report", "name": "Report", "prompt": "Generate a report"}
             ],
             "edges": [
                 {"from": "analyze", "to": "report"},
@@ -286,34 +286,34 @@ fn plan_workflow_schema() -> serde_json::Value {
                 "oneOf": [
                     {
                         "type": "object",
-                        "description": "LLM 步骤：构造一个 AgentHarness 运行一次 prompt",
+                        "description": "LLM step: runs a prompt through an AgentHarness",
                         "properties": {
-                            "kind": { "type": "string", "const": "llm", "description": "固定值 'llm'" },
-                            "id": { "type": "string", "description": "步骤唯一标识，用于 edges 的 from/to 引用。不能为空，不能重复" },
-                            "name": { "type": "string", "description": "人类可读名称" },
-                            "prompt": { "type": "string", "description": "step agent 的指令（必填）" },
-                            "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "本步允许调用的工具名列表。空数组 = 不允许任何工具" },
+                            "kind": { "type": "string", "const": "llm", "description": "Fixed value 'llm'" },
+                            "id": { "type": "string", "description": "Unique step identifier for edge from/to references. Must not be empty or duplicate" },
+                            "name": { "type": "string", "description": "Human-readable name" },
+                            "prompt": { "type": "string", "description": "Instruction for the step agent (required)" },
+                            "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "List of tool names allowed in this step. Empty array = no tools" },
                             "policy": step_policy_schema()
                         },
                         "required": ["kind", "id", "name", "prompt"]
                     },
                     {
                         "type": "object",
-                        "description": "Executor 步骤：调用注册的 executor 函数执行领域逻辑",
+                        "description": "Executor step: calls a registered executor function for domain logic",
                         "properties": {
-                            "kind": { "type": "string", "const": "executor", "description": "固定值 'executor'" },
-                            "id": { "type": "string", "description": "步骤唯一标识，用于 edges 的 from/to 引用。不能为空，不能重复" },
-                            "name": { "type": "string", "description": "人类可读名称" },
-                            "executor_name": { "type": "string", "description": "已注册的 executor 名称（必填，不能为空）" },
-                            "config": { "type": "object", "description": "传给 executor 的配置参数（可选）" },
+                            "kind": { "type": "string", "const": "executor", "description": "Fixed value 'executor'" },
+                            "id": { "type": "string", "description": "Unique step identifier for edge from/to references. Must not be empty or duplicate" },
+                            "name": { "type": "string", "description": "Human-readable name" },
+                            "executor_name": { "type": "string", "description": "Registered executor name (required, must not be empty)" },
+                            "config": { "type": "object", "description": "Configuration parameters passed to the executor (optional)" },
                             "policy": step_policy_schema()
                         },
                         "required": ["kind", "id", "name", "executor_name"]
                     }
                 ]
-            }, "description": "步骤列表。每个步骤有唯一 id，edges 和 entry_step 通过 id 引用"},
-            "edges": { "type": "array", "items": edge_schema(), "description": "步骤间的跳转边。from/to 引用 step id。可带 condition 实现条件跳转" },
-            "entry_step": { "type": "string", "description": "入口步骤的 id，必须等于 steps 中某个 step 的 id" }
+            }, "description": "Step list. Each step has a unique id; edges and entry_step reference by id"},
+            "edges": { "type": "array", "items": edge_schema(), "description": "Transitions between steps. from/to reference step ids. Optional condition for conditional branching" },
+            "entry_step": { "type": "string", "description": "Entry step id, must match a step in steps" }
         },
         "required": ["steps", "edges", "entry_step"]
     })
@@ -322,10 +322,10 @@ fn plan_workflow_schema() -> serde_json::Value {
 fn edge_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
-        "description": "步骤间的跳转边。无条件 = 顺序执行；有 condition = 条件跳转（judge 求值 condition 决定是否走这条边）",
+        "description": "Transition between steps. No condition = sequential; with condition = conditional branch (judge evaluates condition to decide)",
         "properties": {
-            "from": { "type": "string", "description": "源步骤 id（必须存在于 steps 中）" },
-            "to": { "type": "string", "description": "目标步骤 id（必须存在于 steps 中）" },
+            "from": { "type": "string", "description": "Source step id (must exist in steps)" },
+            "to": { "type": "string", "description": "Target step id (must exist in steps)" },
             "condition": condition_schema()
         },
         "required": ["from", "to"]
@@ -334,7 +334,7 @@ fn edge_schema() -> serde_json::Value {
 
 fn condition_schema() -> serde_json::Value {
     serde_json::json!({
-        "description": "边条件。省略 = 无条件边（顺序执行）。字符串 = 自定义 judge 标签。对象 = 声明式条件表达式（op + pointer + value）",
+        "description": "Edge condition. Omitted = unconditional (sequential). String = custom judge label. Object = declarative condition expression (op + pointer + value)",
         "oneOf": [
             {
                 "type": "string",
@@ -348,34 +348,34 @@ fn condition_schema() -> serde_json::Value {
 fn condition_expr_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
-        "description": "声明式条件表达式。pointer 是 RFC 6901 JSON Pointer（以 / 开头），指向上一步 structured 输出的 JSON 字段。例如 /score 指向 {\"score\": 0.85} 中的 score 字段",
+        "description": "Declarative condition expression. pointer is RFC 6901 JSON Pointer (starts with /), pointing to a JSON field in the previous step's structured output. e.g. /score points to {\"score\": 0.85}",
         "oneOf": [
             {
                 "properties": {
-                    "op": { "type": "string", "const": "exists", "description": "pointer 指向的字段存在时走这条边" },
-                    "pointer": { "type": "string", "description": "RFC 6901 JSON Pointer，如 /score" }
+                    "op": { "type": "string", "const": "exists", "description": "Take this edge when the pointer field exists" },
+                    "pointer": { "type": "string", "description": "RFC 6901 JSON Pointer, e.g. /score" }
                 },
                 "required": ["op", "pointer"]
             },
             {
                 "properties": {
-                    "op": { "type": "string", "const": "missing", "description": "pointer 指向的字段不存在时走这条边" },
-                    "pointer": { "type": "string", "description": "RFC 6901 JSON Pointer，如 /score" }
+                    "op": { "type": "string", "const": "missing", "description": "Take this edge when the pointer field does not exist" },
+                    "pointer": { "type": "string", "description": "RFC 6901 JSON Pointer, e.g. /score" }
                 },
                 "required": ["op", "pointer"]
             },
             {
                 "properties": {
-                    "op": { "type": "string", "enum": ["eq", "ne"], "description": "eq = 等于；ne = 不等于" },
-                    "pointer": { "type": "string", "description": "RFC 6901 JSON Pointer，如 /status" },
+                    "op": { "type": "string", "enum": ["eq", "ne"], "description": "eq = equals; ne = not equals" },
+                    "pointer": { "type": "string", "description": "RFC 6901 JSON Pointer, e.g. /status" },
                     "value": {}
                 },
                 "required": ["op", "pointer", "value"]
             },
             {
                 "properties": {
-                    "op": { "type": "string", "enum": ["gt", "gte", "lt", "lte"], "description": "gt=大于, gte=大于等于, lt=小于, lte=小于等于" },
-                    "pointer": { "type": "string", "description": "RFC 6901 JSON Pointer，如 /score" },
+                    "op": { "type": "string", "enum": ["gt", "gte", "lt", "lte"], "description": "gt=greater than, gte=greater or equal, lt=less than, lte=less or equal" },
+                    "pointer": { "type": "string", "description": "RFC 6901 JSON Pointer, e.g. /score" },
                     "value": { "type": "number" }
                 },
                 "required": ["op", "pointer", "value"]
@@ -436,7 +436,12 @@ impl Tool for PlanWorkflowTool {
     }
 
     fn description(&self) -> &str {
-        "提交一个 workflow 计划（steps + edges + entry_step）。校验通过后落盘，返回 task_id。\n\n规则：1) entry_step 必须是 steps 中某个 step 的 id；2) edges 的 from/to 必须引用已存在的 step id；3) 非 entry step 必须有入边；4) condition.pointer 是 RFC 6901 JSON Pointer（以 / 开头），指向上一步 structured 输出的 JSON 字段。校验失败会返回具体错误，请修正后重试。"
+        "Submit a workflow plan (steps + edges + entry_step) for execution. Validates the plan, persists it, and returns a task_id.\n\n\
+         Use when: orchestrating multi-step tasks with conditional branching; defining a DAG of steps with structured transitions.\n\
+         Don't use for: simple sequential tool calls (just call tools directly); dynamic runtime decisions (use sub-agents instead).\n\
+         Returns: task_id on success. Returns specific validation errors on failure (entry_step not in steps, dangling edge references, missing inbound edges for non-entry steps, invalid JSON pointer in conditions).\n\n\
+         Examples:\n\
+         {\"entry_step\": \"fetch\", \"steps\": [{\"kind\": \"llm\", \"id\": \"fetch\", \"name\": \"Fetch\", \"prompt\": \"Fetch the data\"}, {\"kind\": \"llm\", \"id\": \"process\", \"name\": \"Process\", \"prompt\": \"Process the data\"}], \"edges\": [{\"from\": \"fetch\", \"to\": \"process\"}]}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
