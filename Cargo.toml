@@ -20,6 +20,7 @@ members = [
     # crates/llm-harness-py — 已迁移到 Senza 仓库 (github.com/oh-my-harness/Senza)
     "crates/llm-harness-runtime-trace-otel",
     "crates/session-viewer",
+    "crates/llm-harness-live-tests",
     # examples
     # coding-agent is now a separate repo: https://github.com/oh-my-harness/coding-agent.git
     # It depends on this workspace's crates via git rev.
@@ -44,6 +45,11 @@ llm-harness-runtime-knowledge = { path = "crates/llm-harness-runtime-knowledge" 
 llm-harness-runtime-knowledge-local = { path = "crates/llm-harness-runtime-knowledge-local" }
 llm-harness-runtime-session-recall = { path = "crates/llm-harness-runtime-session-recall" }
 llm-harness-runtime-memory = { path = "crates/llm-harness-runtime-memory" }
+llm-harness-runtime-mcp = { path = "crates/llm-harness-runtime-mcp" }
+llm-harness-runtime-audit-jsonl = { path = "crates/llm-harness-runtime-audit-jsonl" }
+llm-harness-runtime-trace-otel = { path = "crates/llm-harness-runtime-trace-otel" }
+llm-harness-runtime-sandbox-os = { path = "crates/llm-harness-runtime-sandbox-os" }
+llm-harness-live-tests = { path = "crates/llm-harness-live-tests" }
 
 # API adapter — separate repo
 llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "193117cbb8398aadeca74a925cfd699617f8c861" }

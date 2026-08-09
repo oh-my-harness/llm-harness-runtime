@@ -1,0 +1,44 @@
+[package]
+name = "llm-harness-live-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["live-llm"]
+live-llm = [
+    "dep:llm-harness-loop",
+    "dep:llm-harness-runtime",
+    "dep:llm-harness-runtime-sandbox-os",
+    "dep:llm-harness-agent",
+    "dep:llm-harness-types",
+    "dep:tokio",
+    "dep:tempfile",
+]
+
+[dependencies]
+llm-harness-loop = { workspace = true, features = ["test-utils"], optional = true }
+llm-harness-runtime = { workspace = true, optional = true }
+llm-harness-runtime-sandbox-os = { workspace = true, optional = true }
+llm-harness-agent = { workspace = true, optional = true }
+llm-harness-types = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"], optional = true }
+tempfile = { workspace = true, optional = true }
+
+[dev-dependencies]
+llm-harness-strategy.workspace = true
+llm-harness-runtime-tools.workspace = true
+llm-harness-runtime-mcp.workspace = true
+llm-harness-runtime-knowledge.workspace = true
+llm-harness-runtime-knowledge-local.workspace = true
+llm-harness-runtime-memory.workspace = true
+llm-harness-runtime-session-recall.workspace = true
+llm-harness-runtime-audit-jsonl.workspace = true
+llm-harness-runtime-trace-otel.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio-util.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true

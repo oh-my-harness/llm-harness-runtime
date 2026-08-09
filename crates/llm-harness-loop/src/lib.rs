@@ -54,6 +54,38 @@ pub use llm_adapter::types::Message as LlmMessage;
 pub use llm_adapter::types::RequestContent;
 pub use llm_adapter::types::ResponseFormat;
 pub use llm_adapter::types::StreamEvent as AdapterStreamEvent;
+/// Factory for an OpenAI-compatible provider with reasoning parsing enabled.
+///
+/// Use this instead of `OpenAIProvider::builder(api_key).build()` when
+/// connecting to OpenAI-compatible endpoints that emit `reasoning` /
+/// `reasoning_content` fields — e.g. vLLM-hosted models (GLM, Qwen),
+/// DeepSeek, or any endpoint whose streaming responses contain a
+/// `delta.reasoning` field.
+///
+/// Enables:
+/// - `parse_reasoning_content(true)` — parse `delta.reasoning` into reasoning blocks
+/// - `tolerant_keepalive(true)` — tolerate keepalive bytes in SSE streams
+///
+/// For the official OpenAI API (`api.openai.com`), `OpenAIProvider::builder()`
+/// is sufficient — reasoning models (o-series, GPT-5) use `reasoning_effort`,
+/// not `reasoning_content`, and no keepalive is sent.
+///
+/// # Example
+///
+/// ```
+/// # use llm_harness_loop::openai_compatible;
+/// let client = openai_compatible("sk-your-key", "https://api.hyper-op.com");
+/// ```
+pub fn openai_compatible(
+    api_key: impl Into<String>,
+    base_url: impl Into<String>,
+) -> OpenAIProvider {
+    OpenAIProvider::builder(api_key)
+        .base_url(base_url)
+        .parse_reasoning_content(true)
+        .tolerant_keepalive(true)
+        .build()
+}
 
 #[cfg(test)]
 mod tests {
