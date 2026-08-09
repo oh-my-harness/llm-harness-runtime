@@ -28,19 +28,64 @@ llm-harness-runtime = { git = "https://github.com/oh-my-harness/llm-harness-runt
 
 ```
 crates/
-├── llm-harness-types/      # core type definitions
-├── llm-harness-loop/       # agent loop
-├── llm-harness-agent/      # agent harness
-├── llm-harness-runtime/    # runtime: workflow engine, executors, event stream, builder
-├── llm-harness-runtime-knowledge/ # backend-neutral knowledge and access contracts
-├── llm-harness-runtime-knowledge-local/ # root-confined Markdown/Text knowledge source
-├── llm-harness-runtime-session-recall/ # opt-in authoritative cross-Session history recall
-├── llm-harness-runtime-memory/ # composable memory read/write contracts and service
-├── llm-harness-runtime-sandbox-*/  # sandbox backends (bwrap, seatbelt, os)
-├── llm-harness-runtime-mcp/        # MCP integration
-├── llm-harness-runtime-audit-jsonl/ # audit logging
-├── llm-harness-runtime-trace-otel/  # OpenTelemetry tracing
-└── session-viewer/         # session viewer (visualize JsonlSessionRepo sessions)
+├── llm-harness-types/               # core type definitions
+├── llm-harness-loop/                # agent loop engine
+├── llm-harness-agent/               # agent harness (session, compaction, skills)
+├── llm-harness-runtime/             # runtime: builder, workflow, spawn, lifecycle, sandbox
+├── llm-harness-strategy/            # strategy layer: safety, loop-safety, status panel,
+│                                    #   memory defense, notify, injection filter,
+│                                    #   context-aware compaction, event streams
+├── llm-harness-runtime-tools/       # built-in tools: bash, read, write, edit, grep, glob
+├── llm-harness-runtime-mcp/         # MCP server integration (tools, prompts, resources)
+├── llm-harness-runtime-knowledge/   # backend-neutral knowledge access contracts
+├── llm-harness-runtime-knowledge-local/ # local Markdown/Text knowledge source (BM25)
+├── llm-harness-runtime-memory/      # composable memory read/write + mutation gate
+├── llm-harness-runtime-session-recall/ # cross-Session history recall (in-memory + SQLite FTS5)
+├── llm-harness-runtime-sandbox-*/   # sandbox backends (bwrap, seatbelt, os)
+├── llm-harness-runtime-audit-jsonl/ # audit logging (JSONL + hash chain)
+├── llm-harness-runtime-trace-otel/  # OpenTelemetry tracing export
+├── llm-harness-live-tests/          # live LLM integration tests (23 examples + 62+ tests)
+└── session-viewer/                  # session viewer (visualize JsonlSessionRepo sessions)
+```
+
+---
+
+## Features
+
+- **Loop engine** — sync loop with async tools, retry with exponential backoff + jitter,
+  streaming, parallel/sequential tool execution, dynamic config (thinking level, temperature)
+- **Agent harness** — session persistence (InMemory + Jsonl), branching/fork/navigate,
+  compaction with circuit breaker + context-aware prompt, skills, prompt templates,
+  model switching, RunExtensions
+- **Runtime** — HarnessBuilder assembly, WorkflowEngine (linear/conditional/loop/executor),
+  crash recovery + pause/cancel, OsEnvSandbox, sub-agent spawn + MessageBus,
+  tracing + audit (hash chain), budget/pricing control, rule-chain approval
+- **Strategy** — SafetyDefaultsPlugin (bash blacklist + path traversal),
+  InjectionFilterPlugin, StatusPanelPlugin + todo_write, SourceTagPlugin,
+  ProjectInstructionPlugin (CLAUDE.md auto-inject), LoopSafetyPlugin (max_turns,
+  repetition, failure breaker, death spiral, truncation continuation),
+  MemoryDefensePlugin, ToolOutputGuardPlugin, NotifyPlugin,
+  context-aware compaction prompt, EventStreams (Timer, Heartbeat,
+  ShellMonitor, Webhook, Filter)
+- **Infrastructure tools** — BashTool, ReadTool, WriteTool, EditTool, GrepTool, GlobTool
+  (FsToolsPlugin), MCP integration, Knowledge (search/read/evidence), Memory
+  (write/forget + mutation gate), SessionRecall (history search + projector)
+- **Sandboxing** — OsEnv (production), bwrap (Linux), seatbelt (macOS)
+
+---
+
+## Live LLM Integration Tests
+
+The `llm-harness-live-tests` crate contains 23 runnable examples and 62+ tests
+covering all 5 architecture layers with real LLM APIs.
+
+```bash
+# Run all tests (requires .env with API keys)
+source .env
+cargo test --features live-llm -p llm-harness-live-tests -- --test-threads=1
+
+# Run a single example
+cargo run --features live-llm -p llm-harness-live-tests --example 22_fs_tools
 ```
 
 ---
