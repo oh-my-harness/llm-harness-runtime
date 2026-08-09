@@ -26,7 +26,12 @@ impl UsageLedger {
         self.state.lock().unwrap().clone()
     }
 
-    pub(crate) fn shared_state(&self) -> Arc<Mutex<CostAggregate>> {
+    /// Returns the shared cost state, the same `Arc` held by
+    /// `CostAccumulatorHook` and `AgentHarness`.
+    ///
+    /// Callers can use this to construct `BudgetControlAdapter` (from
+    /// `llm-harness-strategy`) and wire it as a `should_stop` hook.
+    pub fn shared_state(&self) -> Arc<Mutex<CostAggregate>> {
         self.state.clone()
     }
 }

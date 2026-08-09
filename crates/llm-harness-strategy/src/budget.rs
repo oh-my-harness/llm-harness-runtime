@@ -27,6 +27,7 @@ use llm_harness_types::{BudgetExceededHook, CostAggregate, ShouldStopCtx, Should
 ///
 /// Cost accumulation is handled separately by `CostAccumulatorHook`; this
 /// adapter holds no pricing or model state.
+#[derive(Clone)]
 pub struct BudgetControlAdapter {
     cost: Arc<Mutex<CostAggregate>>,
     budget_limit: f64,
