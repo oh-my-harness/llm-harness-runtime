@@ -97,13 +97,15 @@ async fn auto_compact_triggers_on_threshold() {
         }
     };
 
-    // context_window=800: small enough to trigger compaction within 5 turns,
-    // large enough to avoid NoValidBoundary (which occurs when there's not
-    // enough content to find a valid cut point).
+    // context_window=1200: large enough for the compactor to find a valid
+    // cut boundary (800 was too small — LLM single-turn responses exceeded
+    // the usable window, causing NoValidBoundary on every turn).
+    // max_tokens=256: short responses so compaction triggers within 5 turns
+    // while leaving enough context for a valid cut point.
     let (harness, _tmp) = make_harness_with(entry, |b| {
         b.model_info(Some(ModelInfo {
-            context_window: 800,
-            max_tokens: 1024,
+            context_window: 1200,
+            max_tokens: 256,
         }))
         .compaction_model(
             &entry.model,
@@ -122,18 +124,15 @@ async fn auto_compact_triggers_on_threshold() {
     for i in 1..=5 {
         let cap = EventCapture::subscribe(&harness);
         match with_timeout(
-            SINGLE_TURN,
+            MULTI_TURN,
             harness.prompt(format!(
-                "Tell me fact #{i} about oceans. Give a detailed explanation with at least 3 sentences."
+                "Tell me fact #{i} about oceans. One sentence only."
             )),
         )
         .await
         {
             Ok(_) => {}
             Err(e) => {
-                // NoValidBoundary can occur if the model produces a very long
-                // first response. Log and continue — we still want to observe
-                // compaction on subsequent turns.
                 eprintln!("Turn {i}: prompt error (continuing): {e}");
                 continue;
             }
