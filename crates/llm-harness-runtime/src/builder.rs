@@ -22,8 +22,8 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use llm_harness_agent::{
-    AgentHarness, AgentHarnessOptions, CompactionModelConfig, HarnessHooks, ModelInfo, Plugin,
-    PromptTemplate, Skill,
+    AgentHarness, AgentHarnessOptions, CompactionModelConfig, CompactionPromptSpec, HarnessHooks,
+    ModelInfo, Plugin, PromptTemplate, Skill,
 };
 use llm_harness_loop::{ConvertToLlmHook, FinalAnswerMode, LlmClient, RetryConfig};
 use llm_harness_types::{
@@ -150,6 +150,10 @@ pub struct HarnessBuilder {
     compaction_reserve_tokens: Option<u32>,
     /// Compaction keep-recent tokens override.
     compaction_keep_recent_tokens: Option<u32>,
+    /// Custom compaction prompt spec. `None` → hardcoded constants.
+    compaction_prompt: Option<CompactionPromptSpec>,
+    /// Current task query intent for context-aware compaction.
+    compaction_query: Option<String>,
     /// Enable automatic compaction at each turn start.
     auto_compact: bool,
     /// Steer/follow-up queue capacity.
@@ -192,6 +196,8 @@ impl HarnessBuilder {
             stream_options: None,
             compaction_reserve_tokens: None,
             compaction_keep_recent_tokens: None,
+            compaction_prompt: None,
+            compaction_query: None,
             skill_read_tool_enabled: true,
             readable_skills: None,
             auto_compact: false,
@@ -419,6 +425,19 @@ impl HarnessBuilder {
         self
     }
 
+    /// Set a custom compaction prompt spec. `None` uses hardcoded constants.
+    pub fn compaction_prompt(mut self, prompt: Option<CompactionPromptSpec>) -> Self {
+        self.compaction_prompt = prompt;
+        self
+    }
+
+    /// Set the current task query intent for context-aware compaction.
+    /// `None` disables task-aware compaction.
+    pub fn compaction_query(mut self, query: Option<String>) -> Self {
+        self.compaction_query = query;
+        self
+    }
+
     /// Enable automatic compaction at each turn start.
     pub fn auto_compact(mut self, enabled: bool) -> Self {
         self.auto_compact = enabled;
@@ -635,6 +654,12 @@ impl HarnessBuilder {
         }
         if let Some(tokens) = self.compaction_keep_recent_tokens {
             opts.compaction_keep_recent_tokens = Some(tokens);
+        }
+        if let Some(ref prompt) = self.compaction_prompt {
+            opts.compaction_prompt = Some(prompt.clone());
+        }
+        if let Some(ref query) = self.compaction_query {
+            opts.compaction_query = Some(query.clone());
         }
         opts.auto_compact = self.auto_compact;
         if let Some(cap) = self.queue_capacity {
@@ -1132,6 +1157,8 @@ mod tests {
             .response_format(Some(llm_harness_loop::ResponseFormat::JsonObject))
             .compaction_reserve_tokens(Some(1024))
             .compaction_keep_recent_tokens(Some(2048))
+            .compaction_prompt(None)
+            .compaction_query(None)
             .queue_capacity(Some(64));
     }
     // ── build_options field propagation tests (Task 4) ────────────────────────

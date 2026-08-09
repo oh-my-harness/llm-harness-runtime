@@ -34,6 +34,7 @@ pub use loop_safety::{
 pub mod notify;
 pub mod resource;
 pub mod safety;
+pub use safety::SafetyDefaultsPlugin;
 pub mod source_tag;
 pub use source_tag::{SourceTagEntry, SourceTagHook, SourceTagPlugin};
 pub mod project_instruction;
@@ -45,5 +46,6 @@ pub use notify::{
 pub use project_instruction::{
     ProjectInstructionConfig, ProjectInstructionHook, ProjectInstructionPlugin,
 };
+pub use status_panel::{StatusPanelConfig, StatusPanelPlugin};
 pub mod tool_output_guard;
 pub use tool_output_guard::{ToolOutputGuardConfig, ToolOutputGuardHook, ToolOutputGuardPlugin};
