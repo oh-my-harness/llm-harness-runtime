@@ -203,8 +203,9 @@ impl AfterTurnHook for AsyncSpawnHook {
             let msg = self.drain_and_format().or_else(|| self.status_hint());
             if let Some(msg) = msg
                 && let Some(h) = self.follow_up_handle.lock().as_ref()
+                && let Err(e) = h.follow_up_message(msg)
             {
-                h.follow_up_message(msg);
+                tracing::warn!("follow_up message dropped: {:?}", e);
             }
             // 不返回值：drain 是纯副作用。loop 的 should_stop 由其他 hook
             // （如 StructuredOutputCoordinator）或默认 true 决定。

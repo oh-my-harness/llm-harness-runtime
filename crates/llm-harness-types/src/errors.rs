@@ -213,12 +213,21 @@ pub enum HarnessError {
     Template(#[from] TemplateError),
 }
 /// 消息通道错误（steer / event channel 满 or 关闭）。
-#[derive(thiserror::Error, Debug, Clone, Copy)]
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelError {
     #[error("channel full")]
     Full,
     #[error("channel closed")]
     Closed,
+}
+
+impl<T> From<tokio::sync::mpsc::error::TrySendError<T>> for ChannelError {
+    fn from(e: tokio::sync::mpsc::error::TrySendError<T>) -> Self {
+        match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => ChannelError::Full,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => ChannelError::Closed,
+        }
+    }
 }
 
 #[cfg(test)]

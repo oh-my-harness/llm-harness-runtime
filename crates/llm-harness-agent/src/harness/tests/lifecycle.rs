@@ -325,13 +325,15 @@ async fn continue_run_drives_loop_with_empty_initial() {
         MockResponse::text("handled follow-up"),
     ]);
     h.prompt("initial").await.unwrap(); // 消费 "first"，phase 回到 Idle
-    // 注入 follow_up
-    h.follow_up_message(AgentMessage::User(UserMessage {
+    // Idle 阶段调用 follow_up_message 返回 Err(Closed)——follow_up_rx 已被
+    // reset_channels drop。continue_run 本身会驱动 LLM 调用。
+    let result = h.follow_up_message(AgentMessage::User(UserMessage {
         content: vec![ContentBlock::Text {
             text: "please respond".into(),
         }],
         timestamp: chrono::Utc::now(),
     }));
+    assert_eq!(result, Err(ChannelError::Closed));
     h.continue_run().await.unwrap(); // 应消费 "handled follow-up"
     let ctx = h.session.build_context().await.unwrap();
     let assistant_count = ctx

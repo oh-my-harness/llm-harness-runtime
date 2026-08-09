@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use llm_harness_types::AgentMessage;
+use llm_harness_types::{AgentMessage, ChannelError};
 
 use super::state::HarnessInner;
 
@@ -23,17 +23,16 @@ pub struct FollowUpHandle {
 impl FollowUpHandle {
     /// 注入一条 follow_up 消息到 harness 当前的 follow_up channel。
     ///
-    /// 与既有 `AgentHarness::follow_up_message`（`harness.rs:963`）语义一致：
-    /// 正常路径不会失败——should_stop 返回 true 后 loop 在 `loop_fn.rs:519`
-    /// 立即 `try_recv` 取走，`reset_channels` 在下一次 `prompt()` 才调。
+    /// 返回 `Err(ChannelError::Closed)` 当 harness 已 drop（Weak upgrade 失败）
+    /// 或 harness 处于 Idle 阶段（channel 被 `reset_channels` 替换）。
+    /// 返回 `Err(ChannelError::Full)` 表示队列已满。
     ///
     /// 持 `Weak` 而非 `Arc`：打断 `harness.inner → async_spawn_hook/peer_hook
     /// → FollowUpHandle → harness.inner` 的引用环。harness drop 后 upgrade
-    /// 失败，静默 no-op（hook 的宿主已不存在）。
-    pub fn follow_up_message(&self, msg: AgentMessage) {
-        if let Some(inner) = self.inner.upgrade() {
-            let inner = inner.lock().unwrap();
-            let _ = inner.follow_up_tx.try_send(msg);
-        }
+    /// 失败，返回 `Err(Closed)`。
+    pub fn follow_up_message(&self, msg: AgentMessage) -> Result<(), ChannelError> {
+        let inner = self.inner.upgrade().ok_or(ChannelError::Closed)?;
+        let inner = inner.lock().unwrap();
+        inner.follow_up_tx.try_send(msg).map_err(ChannelError::from)
     }
 }

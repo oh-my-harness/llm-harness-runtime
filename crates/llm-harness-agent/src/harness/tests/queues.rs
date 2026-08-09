@@ -114,12 +114,14 @@ async fn follow_up_handle_injects_message_into_loop() {
 
     // Wait until the loop enters should_stop, then inject via the handle.
     entered.notified().await;
-    handle.follow_up_message(AgentMessage::User(UserMessage {
-        content: vec![ContentBlock::Text {
-            text: "please say 'saw follow-up'".into(),
-        }],
-        timestamp: chrono::Utc::now(),
-    }));
+    handle
+        .follow_up_message(AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::Text {
+                text: "please say 'saw follow-up'".into(),
+            }],
+            timestamp: chrono::Utc::now(),
+        }))
+        .unwrap();
     inject.notify_one();
 
     prompt_task.await.unwrap().unwrap();
@@ -136,4 +138,85 @@ async fn follow_up_handle_injects_message_into_loop() {
         assistant_count, 2,
         "follow_up should trigger a second turn consuming the second mock response"
     );
+}
+
+#[tokio::test]
+async fn follow_up_message_returns_closed_when_idle() {
+    // After prompt() returns, harness is Idle — follow_up_tx points to a
+    // channel whose receiver was dropped by reset_channels() on the next
+    // run. The message is undeliverable.
+    let h = make_harness(vec![MockResponse::text("ok")]);
+    h.prompt("hello").await.unwrap();
+    let result = h.follow_up_message(AgentMessage::User(UserMessage {
+        content: vec![ContentBlock::Text {
+            text: "should fail".into(),
+        }],
+        timestamp: chrono::Utc::now(),
+    }));
+    assert_eq!(result, Err(ChannelError::Closed));
+}
+
+#[tokio::test]
+async fn follow_up_message_returns_full_when_capacity_exceeded() {
+    // With queue_capacity=1 and the loop running (receiver alive), filling
+    // the channel then sending one more should return Err(Full).
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let inject = Arc::new(tokio::sync::Notify::new());
+    let hook = Arc::new(CoordinatingShouldStop {
+        entered: entered.clone(),
+        inject: inject.clone(),
+        call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    });
+
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("first"),
+        MockResponse::text("second"),
+    ]));
+    let env = Arc::new(NoOpEnv);
+    let opts = AgentHarnessOptions {
+        queue_capacity: 1,
+        hooks: HarnessHooks {
+            should_stop: vec![hook],
+            ..HarnessHooks::none()
+        },
+        ..AgentHarnessOptions::new("test-model")
+    };
+    let h = Arc::new(AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, env, opts).await);
+
+    let prompt_task = tokio::spawn({
+        let h = h.clone();
+        async move { h.prompt("hello").await }
+    });
+
+    // Wait until should_stop is entered — the loop is now holding follow_up_rx.
+    entered.notified().await;
+
+    // Fill the capacity-1 channel.
+    h.follow_up("filler");
+    // Second send should fail with Full.
+    let result = h.follow_up_message(AgentMessage::User(UserMessage {
+        content: vec![ContentBlock::Text {
+            text: "overflow".into(),
+        }],
+        timestamp: chrono::Utc::now(),
+    }));
+    assert_eq!(result, Err(ChannelError::Full));
+
+    // Let the loop proceed and finish.
+    inject.notify_one();
+    prompt_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn follow_up_handle_returns_closed_after_harness_dropped() {
+    let h = make_harness(vec![MockResponse::text("ok")]);
+    let handle = h.follow_up_handle();
+    drop(h);
+    let result = handle.follow_up_message(AgentMessage::User(UserMessage {
+        content: vec![ContentBlock::Text {
+            text: "gone".into(),
+        }],
+        timestamp: chrono::Utc::now(),
+    }));
+    assert_eq!(result, Err(ChannelError::Closed));
 }

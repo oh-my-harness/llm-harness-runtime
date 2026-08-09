@@ -480,8 +480,7 @@ async fn skill_metadata_injected_before_run() {
         client.clone() as Arc<dyn LlmClient>,
         env,
         opts,
-    ))
-    .unwrap();
+    ));
 
     let _ = harness.prompt("hello").await;
 

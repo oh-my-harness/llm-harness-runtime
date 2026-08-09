@@ -291,8 +291,11 @@ impl Agent {
     }
 
     /// Enqueue a text message as a follow-up (processed after the loop stops naturally).
+    ///
+    /// ⚠️ **仅在 run 进行中有效。** Idle 阶段调用会静默丢失消息（错误被忽略）。
+    /// 需要检测丢失时用 [`follow_up_message`](Agent::follow_up_message)。
     pub fn follow_up(&self, text: impl Into<String>) {
-        self.follow_up_message(AgentMessage::User(UserMessage {
+        let _ = self.follow_up_message(AgentMessage::User(UserMessage {
             content: vec![ContentBlock::Text { text: text.into() }],
             timestamp: chrono::Utc::now(),
         }));
@@ -303,16 +306,20 @@ impl Agent {
     /// Returns `Err` if the steer channel is full or closed.
     pub fn steer_message(&self, msg: AgentMessage) -> Result<(), ChannelError> {
         let inner = self.inner.lock().unwrap();
-        inner.steer_tx.try_send(msg).map_err(|e| match e {
-            tokio::sync::mpsc::error::TrySendError::Full(_) => ChannelError::Full,
-            tokio::sync::mpsc::error::TrySendError::Closed(_) => ChannelError::Closed,
-        })
+        inner.steer_tx.try_send(msg).map_err(ChannelError::from)
     }
 
-    /// Enqueue a full message as a follow-up.
-    pub fn follow_up_message(&self, msg: AgentMessage) {
+    /// Enqueue a full message as a follow-up (processed after the loop stops naturally).
+    ///
+    /// 返回 `Err(ChannelError::Closed)` 表示消息未投递——通常因为 agent 处于
+    /// Idle 阶段（上一个 run 已结束，follow_up_rx 被 `reset_channels()` drop）。
+    /// 返回 `Err(ChannelError::Full)` 表示队列已满。
+    ///
+    /// **设计意图**：follow_up 用于 run 进行中 should_stop 触发后注入消息。
+    /// Idle 阶段的多轮对话应使用 `prompt()`。
+    pub fn follow_up_message(&self, msg: AgentMessage) -> Result<(), ChannelError> {
         let inner = self.inner.lock().unwrap();
-        let _ = inner.follow_up_tx.try_send(msg);
+        inner.follow_up_tx.try_send(msg).map_err(ChannelError::from)
     }
 
     /// Drain the steer queue. Only callable when Idle.

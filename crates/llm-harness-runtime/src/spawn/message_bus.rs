@@ -435,10 +435,7 @@ impl MessageBus {
     /// Try to re-send an event back to the event channel (non-blocking).
     /// Used by IdleWatcher to put a received event back so should_stop can drain it.
     pub(crate) fn try_resend_event(&self, event: SubAgentEvent) -> Result<(), ChannelError> {
-        self.event_tx.try_send(event).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => ChannelError::Full,
-            mpsc::error::TrySendError::Closed(_) => ChannelError::Closed,
-        })
+        self.event_tx.try_send(event).map_err(ChannelError::from)
     }
 
     /// Re-send an event back to the event channel (async, blocks if full).
