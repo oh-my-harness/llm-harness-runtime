@@ -67,13 +67,61 @@ pub enum ToolError {
     Other(#[from] anyhow::Error),
 }
 
+// ── ProviderErrorKind ─────────────────────────────────────────────────────────
+
+/// Structured provider error kind, preserving LlmError variant information.
+///
+/// When `AgentError::ProviderTyped` is used, the `kind` field carries the
+/// specific provider error category so that SDK layers (e.g. Senza's PyO3
+/// bindings) can map to distinct exception types.
+#[derive(thiserror::Error, Debug, Clone)]
+#[non_exhaustive]
+pub enum ProviderErrorKind {
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("forbidden")]
+    Forbidden,
+    #[error("rate limit exceeded")]
+    RateLimit {
+        retry_after: Option<std::time::Duration>,
+    },
+    #[error("provider overloaded")]
+    Overloaded {
+        retry_after: Option<std::time::Duration>,
+    },
+    #[error("server error: {0}")]
+    ServerError(String),
+    #[error("timeout")]
+    Timeout,
+    #[error("stream error: {0}")]
+    Stream(String),
+    #[error(
+        "stream incomplete: {received_chunks} chunks received, finish_reason={finish_reason:?}"
+    )]
+    StreamIncomplete {
+        received_chunks: u32,
+        finish_reason: Option<String>,
+    },
+    #[error("network error")]
+    Network,
+    #[error("decode error: {0}")]
+    Decode(String),
+    #[error("provider error: {code}")]
+    Other { code: String },
+}
+
 // ── AgentError ────────────────────────────────────────────────────────────────
 
 /// Agent 运行时错误。
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum AgentError {
-    #[error("llm provider error: {0}")]
-    Provider(String),
+    #[error("llm provider error: {message}")]
+    ProviderTyped {
+        message: String,
+        kind: ProviderErrorKind,
+    },
     #[error("tool error: {tool_name}: {message}")]
     Tool { tool_name: String, message: String },
     #[error("final answer rejected ({code}): {message}")]
@@ -244,7 +292,10 @@ mod tests {
 
     #[test]
     fn agent_error_is_clone() {
-        let e = AgentError::Provider("rate limit".into());
+        let e = AgentError::ProviderTyped {
+            message: "rate limit".into(),
+            kind: ProviderErrorKind::RateLimit { retry_after: None },
+        };
         let e2 = e.clone();
         assert_eq!(e.to_string(), e2.to_string());
     }

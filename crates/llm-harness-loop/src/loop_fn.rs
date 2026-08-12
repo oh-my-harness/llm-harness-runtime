@@ -5,6 +5,44 @@ use llm_adapter::provider::Provider;
 use llm_harness_types::*;
 use uuid::Uuid;
 
+/// Convert an `LlmError` into a typed `AgentError::ProviderTyped`,
+/// preserving the error variant information for SDK layers.
+///
+/// Note: this matches exhaustively against the external `llm_adapter::LlmError`
+/// enum. A new variant there intentionally fails compilation here so the map is
+/// kept complete rather than silently degrading new errors to `Other`.
+fn llm_error_to_agent_error(e: llm_adapter::LlmError) -> AgentError {
+    use llm_adapter::LlmError;
+    let kind = match &e {
+        LlmError::InvalidRequest(msg) => ProviderErrorKind::InvalidRequest(msg.clone()),
+        LlmError::Unauthorized => ProviderErrorKind::Unauthorized,
+        LlmError::Forbidden => ProviderErrorKind::Forbidden,
+        LlmError::RateLimit { retry_after } => ProviderErrorKind::RateLimit {
+            retry_after: *retry_after,
+        },
+        LlmError::Overloaded { retry_after } => ProviderErrorKind::Overloaded {
+            retry_after: *retry_after,
+        },
+        LlmError::ServerError(msg) => ProviderErrorKind::ServerError(msg.clone()),
+        LlmError::Timeout => ProviderErrorKind::Timeout,
+        LlmError::Network(_) => ProviderErrorKind::Network,
+        LlmError::Stream(msg) => ProviderErrorKind::Stream(msg.clone()),
+        LlmError::StreamIncomplete {
+            received_chunks,
+            finish_reason,
+        } => ProviderErrorKind::StreamIncomplete {
+            received_chunks: *received_chunks,
+            finish_reason: finish_reason.clone(),
+        },
+        LlmError::Decode(_) => ProviderErrorKind::Decode(e.to_string()),
+        LlmError::Provider { code, .. } => ProviderErrorKind::Other { code: code.clone() },
+    };
+    AgentError::ProviderTyped {
+        message: e.to_string(),
+        kind,
+    }
+}
+
 use crate::config::LoopConfig;
 use crate::final_answer::{
     FinalAnswerMissingBehavior, FinalAnswerMode, FinalAnswerToolConfig, builtin_final_answer_tool,
@@ -316,9 +354,10 @@ fn run_loop(
                     {
                         Ok(result) => result,
                         Err(_) => {
-                            yield AgentEvent::Error(AgentError::Provider(format!(
-                                "provider request timed out after {timeout_ms}ms"
-                            )));
+                            yield AgentEvent::Error(AgentError::ProviderTyped {
+                                message: format!("provider request timed out after {timeout_ms}ms"),
+                                kind: ProviderErrorKind::Timeout,
+                            });
                             break 'main;
                         }
                     }
@@ -351,7 +390,7 @@ fn run_loop(
                         continue;
                     }
                     Err(e) => {
-                        yield AgentEvent::Error(AgentError::Provider(e.to_string()));
+                        yield AgentEvent::Error(llm_error_to_agent_error(e));
                         break 'main;
                     }
                 };
@@ -427,7 +466,7 @@ fn run_loop(
                                     }
                                 }
                                 Some(Err(e)) => {
-                                    break Err(AgentError::Provider(e.to_string()));
+                                    break Err(llm_error_to_agent_error(e));
                                 }
                                 None => break Ok(final_message),
                             }
@@ -913,7 +952,7 @@ fn run_loop(
 #[cfg(test)]
 #[cfg(feature = "test-utils")]
 mod tests {
-    use super::{active_tool_subset, apply_next_turn_directive};
+    use super::{active_tool_subset, apply_next_turn_directive, llm_error_to_agent_error};
 
     use crate::test_utils::{MockLlmClient, MockResponse, NoOpEnv};
     use crate::{
@@ -2822,5 +2861,90 @@ mod tests {
             tool_exec_ends, 0,
             "no ToolExecutionEnd for empty tool_calls"
         );
+    }
+
+    #[test]
+    fn llm_error_to_agent_error_maps_every_variant_to_typed_kind() {
+        use llm_adapter::LlmError as E;
+
+        // LlmError::Network(reqwest::Error) is not constructible in a unit
+        // test; its mapping (-> ProviderErrorKind::Network) is covered by the
+        // exhaustive compiler check on llm_error_to_agent_error itself.
+        type KindPredicate = fn(&ProviderErrorKind) -> bool;
+        let cases: Vec<(E, KindPredicate)> = vec![
+            (E::InvalidRequest("bad".into()), |k| {
+                matches!(k, ProviderErrorKind::InvalidRequest(_))
+            }),
+            (E::Unauthorized, |k| {
+                matches!(k, ProviderErrorKind::Unauthorized)
+            }),
+            (E::Forbidden, |k| matches!(k, ProviderErrorKind::Forbidden)),
+            (E::RateLimit { retry_after: None }, |k| {
+                matches!(k, ProviderErrorKind::RateLimit { retry_after: None })
+            }),
+            (
+                E::RateLimit {
+                    retry_after: Some(std::time::Duration::from_secs(5)),
+                },
+                |k| matches!(k, ProviderErrorKind::RateLimit { retry_after: Some(d) } if *d == std::time::Duration::from_secs(5)),
+            ),
+            (E::Overloaded { retry_after: None }, |k| {
+                matches!(k, ProviderErrorKind::Overloaded { retry_after: None })
+            }),
+            (E::ServerError("boom".into()), |k| {
+                matches!(k, ProviderErrorKind::ServerError(_))
+            }),
+            (E::Timeout, |k| matches!(k, ProviderErrorKind::Timeout)),
+            (E::Stream("cut".into()), |k| {
+                matches!(k, ProviderErrorKind::Stream(_))
+            }),
+            (
+                E::StreamIncomplete {
+                    received_chunks: 3,
+                    finish_reason: None,
+                },
+                |k| {
+                    matches!(
+                        k,
+                        ProviderErrorKind::StreamIncomplete {
+                            received_chunks: 3,
+                            finish_reason: None
+                        }
+                    )
+                },
+            ),
+            (
+                E::StreamIncomplete {
+                    received_chunks: 5,
+                    finish_reason: Some("length".into()),
+                },
+                |k| matches!(k, ProviderErrorKind::StreamIncomplete { received_chunks: 5, finish_reason: Some(fr) } if fr == "length"),
+            ),
+            (
+                E::Decode(serde_json::from_str::<i32>("not-an-int").unwrap_err()),
+                |k| matches!(k, ProviderErrorKind::Decode(_)),
+            ),
+            (
+                E::Provider {
+                    code: "E429".into(),
+                    message: "x".into(),
+                },
+                |k| matches!(k, ProviderErrorKind::Other { code } if code == "E429"),
+            ),
+        ];
+
+        for (llm_err, expect_kind) in cases {
+            let err = llm_error_to_agent_error(llm_err);
+            let AgentError::ProviderTyped { message, kind } = &err else {
+                panic!("expected ProviderTyped, got {err:?}");
+            };
+            assert!(
+                expect_kind(kind),
+                "unexpected kind {kind:?} for {message:?}"
+            );
+            // Display must surface the human-readable message (issue: it was dropped).
+            assert!(!message.is_empty());
+            assert!(err.to_string().contains(message));
+        }
     }
 }

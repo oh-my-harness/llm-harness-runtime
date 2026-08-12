@@ -747,7 +747,7 @@ mod tests {
         let agent = make_agent(vec![MockResponse::rate_limit_error()]);
         let result = agent.prompt("hi").await;
         assert!(
-            matches!(result, Err(AgentError::Provider(_))),
+            matches!(result, Err(AgentError::ProviderTyped { .. })),
             "prompt must return Err when the loop emits an error event, got {result:?}"
         );
         // Phase must still reset to Idle even on error.
