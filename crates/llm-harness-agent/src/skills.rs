@@ -54,6 +54,10 @@ fn is_valid_skill_name(name: &str) -> bool {
 /// Returns `(fields, body)` where `fields` is a map of `kebab-case` keys to
 /// their string values. If there is no frontmatter the map is empty and `body`
 /// is the full input.
+///
+/// Supports YAML block scalars (`|` for literal multiline, `>` for folded
+/// multiline) for values that span multiple lines. YAML lists and other
+/// structured types are not supported — all values are strings.
 pub fn parse_frontmatter(text: &str) -> (HashMap<String, String>, String) {
     // Normalize CRLF to LF so the byte-based fence detection below works
     // for files saved on Windows. Owned body is fine — all callers already
@@ -96,28 +100,71 @@ pub fn parse_frontmatter(text: &str) -> (HashMap<String, String>, String) {
         .unwrap_or("")
         .trim_start_matches('\n');
 
-    for line in fm_text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    let mut lines = fm_text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if let Some(colon_pos) = line.find(':') {
-            let key = line[..colon_pos].trim().to_lowercase();
-            let raw_val = line[colon_pos + 1..].trim();
-            // Strip surrounding quotes.
-            let val = raw_val
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix('"'))
-                .or_else(|| {
-                    raw_val
-                        .strip_prefix('\'')
-                        .and_then(|s| s.strip_suffix('\''))
-                })
-                .unwrap_or(raw_val)
-                .to_string();
+        let Some(colon_pos) = trimmed.find(':') else {
+            continue;
+        };
+        let key = trimmed[..colon_pos].trim().to_lowercase();
+        let raw_val = trimmed[colon_pos + 1..].trim();
+
+        // YAML block scalars: `|` (literal, preserve newlines) and `>`
+        // (folded, join lines with spaces). Collect subsequent indented
+        // lines as the block content.
+        if raw_val == "|" || raw_val == ">" {
+            let base_indent = line.len() - line.trim_start().len();
+            let mut block: Vec<&str> = Vec::new();
+            while let Some(next) = lines.peek() {
+                let next_trimmed = next.trim();
+                if next_trimmed.is_empty() {
+                    block.push("");
+                    lines.next();
+                } else {
+                    let next_indent = next.len() - next.trim_start().len();
+                    if next_indent > base_indent {
+                        block.push(next_trimmed);
+                        lines.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            let val = if raw_val == ">" {
+                block
+                    .into_iter()
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                // Drop trailing empty lines to match YAML semantics.
+                while block.last().is_some_and(|l| l.is_empty()) {
+                    block.pop();
+                }
+                block.join("\n")
+            };
             if !key.is_empty() {
                 fields.insert(key, val);
             }
+            continue;
+        }
+
+        // Strip surrounding quotes.
+        let val = raw_val
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| {
+                raw_val
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+            })
+            .unwrap_or(raw_val)
+            .to_string();
+        if !key.is_empty() {
+            fields.insert(key, val);
         }
     }
 
@@ -1314,6 +1361,48 @@ mod tests {
         assert_eq!(fields.get("name").unwrap(), "foo");
         assert_eq!(fields.get("description").unwrap(), "hello");
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn parse_frontmatter_literal_block_scalar() {
+        let text = "---\nname: my-skill\ndescription: |\n  Line one.\n  Line two.\n---\nbody\n";
+        let (fields, body) = parse_frontmatter(text);
+        assert_eq!(fields.get("name").unwrap(), "my-skill");
+        assert_eq!(fields.get("description").unwrap(), "Line one.\nLine two.");
+        assert_eq!(body, "body\n");
+    }
+
+    #[test]
+    fn parse_frontmatter_folded_block_scalar() {
+        let text = "---\nname: my-skill\ndescription: >\n  This is a long\n  description text.\n---\nbody\n";
+        let (fields, body) = parse_frontmatter(text);
+        assert_eq!(
+            fields.get("description").unwrap(),
+            "This is a long description text."
+        );
+        assert_eq!(body, "body\n");
+    }
+
+    #[test]
+    fn parse_frontmatter_block_scalar_with_blank_line() {
+        let text = "---\ndescription: |\n  Para one.\n\n  Para two.\n---\nbody\n";
+        let (fields, _) = parse_frontmatter(text);
+        assert_eq!(fields.get("description").unwrap(), "Para one.\n\nPara two.");
+    }
+
+    #[test]
+    fn parse_frontmatter_block_scalar_trailing_empty_lines_dropped() {
+        let text = "---\ndescription: |\n  Content.\n\n\n---\nbody\n";
+        let (fields, _) = parse_frontmatter(text);
+        assert_eq!(fields.get("description").unwrap(), "Content.");
+    }
+
+    #[test]
+    fn parse_frontmatter_block_scalar_stops_at_non_indented_line() {
+        let text = "---\ndescription: |\n  Block content.\nlabel: other\n---\nbody\n";
+        let (fields, _) = parse_frontmatter(text);
+        assert_eq!(fields.get("description").unwrap(), "Block content.");
+        assert_eq!(fields.get("label").unwrap(), "other");
     }
 
     #[tokio::test]

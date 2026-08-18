@@ -12,8 +12,13 @@ use crate::session::types::{CompactionEntry, CompactionPolicy, SessionEntry, Ses
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Bytes per token for the rough character-count heuristic (≈4 bytes/token for
-/// ASCII; CJK text is over-estimated since UTF-8 uses 3 bytes/char).
+/// Divisor for the rough character-count token heuristic. Weights each char
+/// by its UTF-8 byte length: ASCII ≈ 4 chars/token (1 byte, weight 1), 2-byte
+/// scripts (Cyrillic, Arabic, Latin ext.) ≈ 2 chars/token (weight 2), and
+/// 3–4 byte scripts (CJK, Hangul, emoji) ≈ 1 char/token (weight 4). The
+/// weighted sum divided by this constant gives an estimate that stays
+/// conservative for non-ASCII text — compaction triggers earlier rather than
+/// later, which is the safe direction.
 const CHARS_PER_TOKEN: usize = 4;
 /// Fixed token estimate for an image content block (images aren't tokenized by char count).
 const IMAGE_TOKEN_ESTIMATE: usize = 250;
@@ -325,7 +330,16 @@ pub struct CompactionPreparation {
 // ── Token estimation ──────────────────────────────────────────────────────────
 
 fn estimate_tokens_for_text(s: &str) -> usize {
-    (s.len() / CHARS_PER_TOKEN).max(1)
+    let mut weight = 0usize;
+    for ch in s.chars() {
+        // 1-byte (ASCII): ~4 chars/token; 2-byte: ~2 chars/token; 3-4 byte: ~1 char/token.
+        weight += match ch.len_utf8() {
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+    }
+    (weight / CHARS_PER_TOKEN).max(1)
 }
 
 fn estimate_tokens_for_content_blocks(blocks: &[ContentBlock]) -> usize {
@@ -546,6 +560,16 @@ pub async fn compact(
                 }
                 _ => String::new(),
             };
+            // Inject file operations so the summary LLM sees which files were
+            // touched — same information as the custom-prompt path.
+            let file_ops_section = if preparation.file_operations.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\nFiles touched in this conversation:\n{}\n",
+                    format_file_operations(&preparation.file_operations)
+                )
+            };
             let uc = if let Some(prev) = &preparation.previous_summary {
                 format!(
                     "{query_prefix}The messages below are NEW conversation messages to \
@@ -554,13 +578,13 @@ pub async fn compact(
                     <previous-summary>\n{prev}\n</previous-summary>\n\n\
                     New conversation:\n<conversation>\n{conversation_text}\n</conversation>\n\n\
                     Update the summary to incorporate the new information. Preserve existing \
-                    completed items, update in-progress items, add new progress.\n\n{SUMMARY_REQUEST}"
+                    completed items, update in-progress items, add new progress.\n\n{SUMMARY_REQUEST}{file_ops_section}"
                 )
             } else {
                 format!(
                     "{query_prefix}Here is the conversation to summarize:\n\n\
                     <conversation>\n{conversation_text}\n</conversation>\n\n\
-                    {SUMMARY_REQUEST}"
+                    {SUMMARY_REQUEST}{file_ops_section}"
                 )
             };
             (
@@ -573,12 +597,7 @@ pub async fn compact(
             let file_ops = if preparation.file_operations.is_empty() {
                 String::new()
             } else {
-                preparation
-                    .file_operations
-                    .iter()
-                    .map(|op| format!("- {:?}: {}", op.kind, op.path.display()))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                format_file_operations(&preparation.file_operations)
             };
             let q = query.unwrap_or("");
             let uc = render_template(
@@ -640,14 +659,9 @@ pub async fn compact(
     let full_summary = if preparation.file_operations.is_empty() {
         summary_text
     } else {
-        let file_lines: Vec<String> = preparation
-            .file_operations
-            .iter()
-            .map(|op| format!("- {:?}: {}", op.kind, op.path.display()))
-            .collect();
         format!(
             "{summary_text}\n\n## Files Touched\n{}",
-            file_lines.join("\n")
+            format_file_operations(&preparation.file_operations)
         )
     };
 
@@ -797,6 +811,14 @@ fn data_blocks_to_text(blocks: &[DataBlock]) -> String {
                 name.as_deref().unwrap_or("unnamed")
             ),
         })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Format file operations as a bulleted list (`- Read: path`).
+fn format_file_operations(ops: &[FileOperation]) -> String {
+    ops.iter()
+        .map(|op| format!("- {:?}: {}", op.kind, op.path.display()))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1566,6 +1588,118 @@ mod tests {
         assert!(
             user_content.contains("Modify"),
             "file_operations must render Modify kind"
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_for_text_cjk_not_underestimated() {
+        // Regression: s.len() (bytes) / 4 underestimated CJK text because
+        // each Chinese char is 3 bytes but costs ~1-2 tokens. 100 CJK chars
+        // should estimate >= 100 tokens (1 token/char), not 75 (bytes/4).
+        let cjk = "字".repeat(100);
+        let tokens = estimate_tokens_for_text(&cjk);
+        assert!(
+            tokens >= 100,
+            "100 CJK chars should estimate >= 100 tokens, got {tokens}"
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_for_text_ascii_unchanged() {
+        // ASCII: 4 chars/token, same as before the fix.
+        let ascii = "a".repeat(100);
+        assert_eq!(estimate_tokens_for_text(&ascii), 25);
+    }
+
+    #[test]
+    fn estimate_tokens_for_text_mixed() {
+        // Mixed: 50 ASCII (50/4=12) + 50 CJK (50*4/4=50) = 62.
+        let mixed = format!("{}{}", "a".repeat(50), "字".repeat(50));
+        assert_eq!(estimate_tokens_for_text(&mixed), 62);
+    }
+
+    #[tokio::test]
+    async fn compact_hardcoded_prompt_injects_file_operations() {
+        // Regression: the hardcoded prompt path (prompt: None) did not
+        // inject file_operations into the user content, so the summary LLM
+        // was blind to which files were touched.
+        let client = MockLlmClient::new(vec![llm_harness_loop::test_utils::MockResponse::text(
+            "summary text",
+        )]);
+
+        let msg = AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::Text {
+                text: "hello world".into(),
+            }],
+            timestamp: chrono::Utc::now(),
+        });
+        let entry = SessionEntry {
+            id: EntryId::new(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            payload: SessionEntryPayload::Message(msg.clone()),
+            compaction_policy: None,
+        };
+        let prep = CompactionPreparation {
+            entries_to_compress: vec![entry],
+            kept_entries: vec![],
+            compress_from_entry: EntryId::new(),
+            cut_point: EntryId::new(),
+            previous_summary: None,
+            estimated_tokens: 100,
+            file_operations: vec![
+                FileOperation {
+                    path: PathBuf::from("/src/main.rs"),
+                    kind: FileOpKind::Read,
+                    at_entry: EntryId::new(),
+                },
+                FileOperation {
+                    path: PathBuf::from("/src/lib.rs"),
+                    kind: FileOpKind::Modify,
+                    at_entry: EntryId::new(),
+                },
+            ],
+        };
+        // prompt: None → hardcoded path.
+        let summary = CompactionSummaryConfig {
+            summary_model: "test-model".into(),
+            summary_model_info: crate::agent::ModelInfo {
+                context_window: 200_000,
+                max_tokens: 8192,
+            },
+            prompt: None,
+        };
+
+        let result = compact(&client, prep, &summary, None, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        // The LLM must have seen file operations in the user content.
+        let captured = client.captured_requests.lock().unwrap();
+        let req = &captured[0];
+        let user_content = format!("{:?}", req.messages().get(1).expect("has user message"));
+        assert!(
+            user_content.contains("/src/main.rs"),
+            "hardcoded path must inject file paths into prompt, got: {user_content}"
+        );
+        assert!(
+            user_content.contains("/src/lib.rs"),
+            "hardcoded path must inject all file paths"
+        );
+        assert!(
+            user_content.contains("Read"),
+            "hardcoded path must inject operation kind"
+        );
+
+        // The structural append (## Files Touched) must also be present in
+        // the final summary — it's the deterministic fallback.
+        let summary_text = match &result.summary_message {
+            AgentMessage::CompactionSummary(cs) => &cs.summary,
+            _ => unreachable!(),
+        };
+        assert!(
+            summary_text.contains("## Files Touched"),
+            "Files Touched section must be in final summary"
         );
     }
 }
