@@ -1,12 +1,249 @@
-//! Advanced streaming loop API for `llm-harness-core`.
+//! # llm-harness-loop — Agent Loop Configuration Guide
 //!
 //! This crate owns the stateless LLM loop: converting harness messages to
-//! provider requests, consuming streaming responses, dispatching tool calls, and
-//! emitting `AgentEvent` values.
+//! provider requests, consuming streaming responses, dispatching tool calls,
+//! and emitting `AgentEvent` values.
 //!
 //! Most SDK users should start with `llm_harness_agent::Agent` or
-//! `llm_harness_agent::AgentHarness`. Use this crate directly when building a custom
-//! runtime, testing loop behavior, or integrating at the framework layer.
+//! `llm_harness_agent::AgentHarness`. Use this crate directly when building a
+//! custom runtime, testing loop behavior, or integrating at the framework layer.
+//!
+//! ## Quick Start
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use llm_harness_loop::{
+//!     agent_loop, LoopConfig, DefaultConvertToLlm, openai_compatible,
+//! };
+//! use llm_harness_types::*;
+//!
+//! let client = Arc::new(openai_compatible("sk-...", "https://api.openai.com"));
+//! let run = Arc::new(RunContext::new(RunRequest::single("What is 2+2?")));
+//! let config = LoopConfig {
+//!     run,
+//!     model: "gpt-4o".into(),
+//!     max_tokens: 1024,
+//!     temperature: None,
+//!     thinking_level: ThinkingLevel::Off,
+//!     tools: vec![],
+//!     active_tools: None,
+//!     default_execution_mode: ToolExecutionMode::Parallel,
+//!     final_answer_mode: FinalAnswerMode::default(),
+//!     env: Arc::new(llm_harness_loop::test_utils::NoOpEnv),
+//!     abort: tokio_util::sync::CancellationToken::new(),
+//!     stream_options: StreamOptions::default(),
+//!     convert_to_llm: Arc::new(DefaultConvertToLlm),
+//!     transform_context: None,
+//!     prepare_next_turn: None,
+//!     should_stop: None,
+//!     before_provider_request: None,
+//!     after_provider_response: None,
+//!     final_answer_validator: None,
+//!     steer_rx: None,
+//!     follow_up_rx: None,
+//!     retry: None,
+//!     response_format: None,
+//! };
+//! let ctx = AgentContext {
+//!     system_prompt: None,
+//!     messages: vec![AgentMessage::User(UserMessage {
+//!         content: vec![ContentBlock::Text { text: "What is 2+2?".into() }],
+//!         ..Default::default()
+//!     })],
+//! };
+//! // let stream = agent_loop(client, ctx, config);
+//! // while let Some(event) = stream.next().await { /* handle AgentEvent */ }
+//! ```
+//!
+//! ## LoopConfig Field Reference
+//!
+//! ### Required fields
+//!
+//! | Field | Type | Notes |
+//! |-------|------|-------|
+//! | `run` | `Arc<RunContext>` | Immutable run context; carries run ID, prompt, metadata. |
+//! | `model` | `String` | Model ID, e.g. `"claude-sonnet-4-6"`, `"gpt-4o"`. |
+//! | `max_tokens` | `u32` | Max generation tokens per turn. |
+//! | `tools` | `Vec<Arc<dyn Tool>>` | Tool list; usually wrapped in `HookedTool` if hooks are used. |
+//! | `env` | `Arc<dyn ExecutionEnv>` | Execution environment for tool calls. |
+//! | `abort` | `CancellationToken` | Cancellation signal; checked by loop and passed to `ToolContext`. |
+//! | `convert_to_llm` | `Arc<dyn ConvertToLlmHook>` | Converts `AgentMessage` → adapter `Message`. Use `DefaultConvertToLlm` unless you need custom message types. |
+//!
+//! ### Sampling
+//!
+//! | Field | Type | Default | Notes |
+//! |-------|------|---------|-------|
+//! | `thinking_level` | `ThinkingLevel` | `Off` | Reasoning depth. `Off` = disabled, `Minimal`→`XHigh` = increasing effort, `Budget(n)` = explicit token budget (Anthropic 4.6 only). Each provider translates to its own wire format. |
+//! | `temperature` | `Option<f32>` | `None` | `None` = provider default. |
+//! | `response_format` | `Option<ResponseFormat>` | `None` | Set to `JsonObject` for structured output. |
+//!
+//! ### Tool configuration
+//!
+//! | Field | Type | Default | Notes |
+//! |-------|------|---------|-------|
+//! | `active_tools` | `Option<HashSet<String>>` | `None` (all) | Subset of `tools` available this run. `None` = all registered tools. |
+//! | `default_execution_mode` | `ToolExecutionMode` | `Parallel` | `Parallel` = concurrent `join_all`; `Sequential` = sub-group barrier. |
+//! | `final_answer_mode` | `FinalAnswerMode` | `Heuristic` | See [Final Answer Modes](#final-answer-modes) below. |
+//!
+//! ### Stream options (`stream_options: StreamOptions`)
+//!
+//! | Field | Default | Notes |
+//! |-------|---------|-------|
+//! | `timeout_ms` | `None` | Overall request timeout. `None` = no timeout. |
+//! | `stream_idle_timeout_ms` | `None` | Per-event idle watchdog. If no `StreamEvent` arrives within this window, the stream is dropped and retried. A partial `MessageEnd` is emitted before retry to close any open message. |
+//! | `max_retries` | `None` | Overrides `RetryConfig.max_retries` if set. |
+//! | `max_retry_delay_ms` | `None` | Caps retry delay. |
+//! | `headers` / `metadata` / `cache_config` | empty | Require provider adapter support to pass through. |
+//!
+//! ### Retry (`retry: Option<RetryConfig>`)
+//!
+//! `None` disables retry. When set, the loop retries on transient provider
+//! errors (5xx, connection, timeout) with exponential backoff (`base_delay_ms`
+//! doubled per attempt). `stream_opts.max_retries` overrides
+//! `RetryConfig.max_retries` at runtime.
+//!
+//! ### Reactive injection
+//!
+//! | Field | Type | Notes |
+//! |-------|------|-------|
+//! | `steer_rx` | `Option<Receiver<AgentMessage>>` | Injects messages between turns to redirect the agent mid-run. Drained at turn boundaries. |
+//! | `follow_up_rx` | `Option<Receiver<AgentMessage>>` | Queued messages processed after the loop naturally stops. Each triggers a new run. |
+//!
+//! ## Final Answer Modes
+//!
+//! `final_answer_mode` controls how the loop decides a turn is the final
+//! user-visible answer vs. intermediate progress.
+//!
+//! | Mode | Plain text ends | `final_answer` tool | `terminal_text_classification` |
+//! |------|----------------|---------------------|-------------------------------|
+//! | `Heuristic` (default) | `FinalAnswer` | Not registered | `FinalAnswer` |
+//! | `Tool(Error)` | Error: "was required but not called" | Registered; calling it produces `FinalAnswer` | `Progress` |
+//! | `Tool(Fallback)` | `FinalAnswer` (heuristic fallback) | Registered; calling it produces `FinalAnswer` | `FinalAnswer` |
+//!
+//! **When to use which:**
+//!
+//! - **`Heuristic`** — Simple chatbots, single-turn Q&A. Any non-tool stop is the answer.
+//! - **`Tool(Error)`** — Multi-step agents where you need a hard guarantee: the
+//!   model must explicitly call `final_answer` to end the run. Prevents the
+//!   model from stopping prematurely and presenting intermediate text as final.
+//! - **`Tool(Fallback)`** — Transition mode: the tool is available but plain
+//!   text still works as a fallback. Useful when migrating from `Heuristic` to
+//!   `Tool(Error)` incrementally.
+//!
+//! Construction helpers:
+//!
+//! ```ignore
+//! use llm_harness_loop::FinalAnswerMode;
+//!
+//! FinalAnswerMode::default();                   // Heuristic
+//! FinalAnswerMode::required_tool();             // Tool(Error)
+//! FinalAnswerMode::tool_with_text_fallback();   // Tool(Fallback)
+//! ```
+//!
+//! ## Hook System
+//!
+//! Hooks are optional trait objects inserted into the loop at well-defined
+//! points. All hooks are `Send + Sync` and return `BoxFuture`.
+//!
+//! ### Hook call order (per turn)
+//!
+//! ```text
+//! ┌─ BeforeTurnHook (notification, no return value)
+//! ├─ TransformContextHook (can replace entire AgentContext)
+//! ├─ BeforeProviderRequestHook (can modify StreamOptions in-place)
+//! ├─ [LLM streaming — TextDelta / ToolCallDelta / ThinkingDelta / ...]
+//! ├─ AfterProviderResponseHook (observation: status, usage, latency)
+//! ├─ [If FinalAnswer] → FinalAnswerValidator → MessageEnd → break
+//! ├─ [If ToolUse] → BeforeToolCallHook → execute → AfterToolCallHook
+//! ├─ PrepareNextTurnHook (can override model, temperature, tools, etc.)
+//! ├─ AfterTurnHook (notification, no return value)
+//! └─ ShouldStopHook (only on non-tool natural stop; return true to stop)
+//! ```
+//!
+//! `BeforeRunHook` fires once before the first turn (can inject messages and
+//! override system prompt). `BeforeCompactHook` fires when context compaction
+//! is triggered (harness layer, not bare loop).
+//!
+//! ### Observation vs. decision hooks
+//!
+//! | Hook | Type | Can modify? |
+//! |------|------|-------------|
+//! | `BeforeRunHook` | Decision | Inject messages, override system prompt |
+//! | `BeforeTurnHook` | Observation | No |
+//! | `TransformContextHook` | Decision | Replace `AgentContext` entirely |
+//! | `BeforeProviderRequestHook` | Decision | Mutate `StreamOptions` in-place |
+//! | `AfterProviderResponseHook` | Observation | No (cost tracking, logging) |
+//! | `BeforeToolCallHook` | Decision | `Allow` / `Modify(args)` / `Deny(failure)` |
+//! | `AfterToolCallHook` | Decision | `Passthrough` / `Replace(result)` |
+//! | `PrepareNextTurnHook` | Decision | Override model, temperature, tools, thinking, response_format |
+//! | `AfterTurnHook` | Observation | No |
+//! | `ShouldStopHook` | Decision | `true` = stop, `false` = force another turn |
+//! | `FinalAnswerValidator` | Decision | `Ok` = commit, `Err` = reject (loop breaks) |
+//! | `BeforeCompactHook` | Decision | `Proceed` / `Skip` / `Compact` / `Override(result)` |
+//!
+//! ### Composite hooks
+//!
+//! When multiple hooks of the same type are needed, wrap them in the
+//! corresponding `Composite*` type (e.g. `CompositeBeforeToolCallHook`).
+//! Composites run hooks in order; decision hooks use "last wins" semantics
+//! (each hook sees the previous hook's decision).
+//!
+//! ## Dynamic Configuration via PrepareNextTurnHook
+//!
+//! `PrepareNextTurnHook` returns a `NextTurnDirective` that can override
+//! per-turn settings. Fields use double-`Option` where meaningful:
+//!
+//! | Field | `None` | `Some(None)` | `Some(Some(value))` |
+//! |-------|--------|---------------|---------------------|
+//! | `temperature` | Keep current | Clear (use provider default) | Set to `value` |
+//! | `response_format` | Keep current | Clear (no format) | Set to `value` |
+//! | `model` | Keep current | N/A | Switch to `value` |
+//! | `thinking_level` | Keep current | N/A | Set to `value` |
+//! | `tools` | Keep current | N/A | Replace entire tool list |
+//! | `active_tools` | Keep current | N/A | Filter to this subset |
+//! | `context` | Keep current | N/A | Replace entire `AgentContext` |
+//!
+//! Common use cases:
+//!
+//! - **Model switching** — Use a cheaper model for follow-up turns after an
+//!   expensive reasoning model does the heavy lifting.
+//! - **Tool phasing** — Restrict tools in early turns (planning), expand in
+//!   later turns (execution).
+//! - **Temperature ramp** — Start with `temperature = 0` for deterministic
+//!   planning, increase for creative execution.
+//!
+//! ## Common Recipes
+//!
+//! ### Minimal chat loop (no tools)
+//!
+//! No tools, heuristic final answer, no hooks. The loop runs one turn and
+//! stops on `EndTurn`.
+//!
+//! ### Agent with tools + safety
+//!
+//! Wrap each tool in `HookedTool` with a `BeforeToolCallHook` that validates
+//! arguments and checks permissions (`Allow` / `Deny`). Use
+//! `FinalAnswerMode::required_tool()` to force explicit completion. Add an
+//! `AfterProviderResponseHook` for cost tracking.
+//!
+//! ### Long conversation with compaction
+//!
+//! Use `TransformContextHook` to check context size and compact when it
+//! exceeds a threshold. The hook returns a new `AgentContext` with a
+//! summarized message list. (The `AgentHarness` layer provides a built-in
+//! compaction implementation with circuit breaker and context-aware prompts.)
+//!
+//! ### Structured output
+//!
+//! Set `response_format = Some(ResponseFormat::JsonObject)` and
+//! `final_answer_mode = FinalAnswerMode::default()`. The model's plain-text
+//! response is treated as the final answer and must be valid JSON.
+//!
+//! ### Truncation continuation
+//!
+//! When `stop_reason == MaxTokens`, the loop normally stops. Implement
+//! `ShouldStopHook` returning `false` to force another turn, letting the
+//! model continue from where it was cut off.
 
 pub mod composite;
 pub mod config;
