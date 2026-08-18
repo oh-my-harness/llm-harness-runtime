@@ -9,11 +9,47 @@ use super::types::*;
 /// High-level session interface: appends entries, builds effective LLM context,
 /// and manages branch operations.
 ///
-/// Wraps a `SessionStorage` and provides the tree semantics on top.
+/// Wraps a [`SessionStorage`] and provides tree semantics on top.
 /// All methods take `&self`. Single storage calls are thread-safe, but
 /// multi-step operations like [`Session::append`] and [`Session::fork_branch`]
 /// are NOT atomic — concurrent callers must serialize themselves (e.g. via
-/// `AgentHarness`'s phase guard). See `SessionStorage` docs.
+/// `AgentHarness`'s phase guard). See [`SessionStorage`] docs.
+///
+/// # Entry tree model
+///
+/// Entries form a tree, not a flat list. Each [`SessionEntry`] points to its
+/// parent. The **active cursor** is the current leaf — [`build_context`]
+/// returns only the root-to-cursor path. Entries off the active path are
+/// preserved but excluded from the LLM context until the cursor navigates
+/// to their branch.
+///
+/// Three entry categories coexist on the same tree:
+///
+/// | [`SessionEntryKind`] | Content | Role |
+/// |----------------------|---------|------|
+/// | `Message` | `AgentMessage` (user / assistant / tool-result) | Conversation turns |
+/// | `Config` | model / thinking-level / active-tools / response-format changes | Sampling state at a point in the tree |
+/// | `Compaction` | summary message + first-kept entry reference | Replaces older messages with a summary |
+///
+/// `build_context` walks the active path, applies config changes in order
+/// (last value wins for each setting), and replaces everything before the
+/// last compaction entry with the compaction summary.
+///
+/// # Branching
+///
+/// - **Append** ([`append`]) — adds a child under the current active cursor,
+///   then advances the cursor to the new entry.
+/// - **Fork** ([`fork_branch`]) — creates a new branch from an arbitrary
+///   entry (not necessarily the current cursor). The new session starts
+///   with the root-to-fork-point path copied from the source.
+/// - **Navigate** ([`navigate_to`]) — moves the active cursor to a different
+///   leaf. No data is deleted; the previous branch remains accessible by
+///   navigating back.
+///
+/// [`build_context`]: Session::build_context
+/// [`append`]: Session::append
+/// [`fork_branch`]: Session::fork_branch
+/// [`navigate_to`]: Session::navigate_to
 pub struct Session {
     storage: Arc<dyn SessionStorage>,
 }
