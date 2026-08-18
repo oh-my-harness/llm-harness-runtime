@@ -1,9 +1,18 @@
 use std::{collections::HashSet, sync::Arc};
 
 use futures::{Stream, StreamExt};
+use llm_adapter::LlmError;
 use llm_adapter::provider::Provider;
 use llm_harness_types::*;
 use uuid::Uuid;
+
+use crate::config::LoopConfig;
+use crate::final_answer::{
+    FinalAnswerMissingBehavior, FinalAnswerMode, FinalAnswerToolConfig, builtin_final_answer_tool,
+};
+use crate::stream_state::TerminalTextClassification;
+
+type ToolSelection = (Vec<Arc<dyn Tool>>, Option<FinalAnswerToolConfig>);
 
 /// Convert an `LlmError` into a typed `AgentError::ProviderTyped`,
 /// preserving the error variant information for SDK layers.
@@ -11,8 +20,7 @@ use uuid::Uuid;
 /// Note: this matches exhaustively against the external `llm_adapter::LlmError`
 /// enum. A new variant there intentionally fails compilation here so the map is
 /// kept complete rather than silently degrading new errors to `Other`.
-fn llm_error_to_agent_error(e: llm_adapter::LlmError) -> AgentError {
-    use llm_adapter::LlmError;
+fn llm_error_to_agent_error(e: LlmError) -> AgentError {
     let kind = match &e {
         LlmError::InvalidRequest(msg) => ProviderErrorKind::InvalidRequest(msg.clone()),
         LlmError::Unauthorized => ProviderErrorKind::Unauthorized,
@@ -42,14 +50,6 @@ fn llm_error_to_agent_error(e: llm_adapter::LlmError) -> AgentError {
         kind,
     }
 }
-
-use crate::config::LoopConfig;
-use crate::final_answer::{
-    FinalAnswerMissingBehavior, FinalAnswerMode, FinalAnswerToolConfig, builtin_final_answer_tool,
-};
-use crate::stream_state::TerminalTextClassification;
-
-type ToolSelection = (Vec<Arc<dyn Tool>>, Option<FinalAnswerToolConfig>);
 
 fn active_tool_subset(
     tools: &[Arc<dyn Tool>],
