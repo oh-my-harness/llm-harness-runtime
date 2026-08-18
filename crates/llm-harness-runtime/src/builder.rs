@@ -28,7 +28,7 @@ use llm_harness_agent::{
 use llm_harness_loop::{ConvertToLlmHook, FinalAnswerMode, LlmClient, RetryConfig};
 use llm_harness_types::{
     AfterProviderResponseHook, AfterTurnHook, ExecutionEnv, PricingProvider, ShouldStopHook,
-    StreamOptions, ThinkingLevel, Tool,
+    StreamOptions, ThinkingLevel, Tool, ToolExecutionMode,
 };
 
 use crate::control::{cost::UsageLedger, cost_hook::CostAccumulatorHook};
@@ -142,6 +142,8 @@ pub struct HarnessBuilder {
     retry: Option<RetryConfig>,
     /// Final-answer classification mode.
     final_answer_mode: Option<FinalAnswerMode>,
+    /// Default tool execution mode for batches (overrides the `Parallel` default).
+    default_execution_mode: Option<ToolExecutionMode>,
     /// Custom context converter.
     convert_to_llm: Option<Arc<dyn ConvertToLlmHook>>,
     /// Stream options for LLM requests.
@@ -192,6 +194,7 @@ impl HarnessBuilder {
             model_info: None,
             retry: None,
             final_answer_mode: None,
+            default_execution_mode: None,
             convert_to_llm: None,
             stream_options: None,
             compaction_reserve_tokens: None,
@@ -398,6 +401,16 @@ impl HarnessBuilder {
     /// Set the final-answer classification mode.
     pub fn final_answer_mode(mut self, mode: FinalAnswerMode) -> Self {
         self.final_answer_mode = Some(mode);
+        self
+    }
+
+    /// Set the default tool execution mode for batches with multiple tool calls.
+    ///
+    /// `Parallel` (default) runs tools concurrently via `join_all`.
+    /// `Sequential` runs them one-at-a-time with sub-group barriers.
+    /// Individual tools can still override via `Tool::execution_mode()`.
+    pub fn default_execution_mode(mut self, mode: ToolExecutionMode) -> Self {
+        self.default_execution_mode = Some(mode);
         self
     }
 
@@ -642,6 +655,9 @@ impl HarnessBuilder {
         }
         if let Some(mode) = &self.final_answer_mode {
             opts.final_answer_mode = mode.clone();
+        }
+        if let Some(mode) = self.default_execution_mode {
+            opts.default_execution_mode = mode;
         }
         if let Some(ref converter) = self.convert_to_llm {
             opts.convert_to_llm = Some(converter.clone());
@@ -1272,6 +1288,14 @@ mod tests {
     }
 
     #[test]
+    fn build_options_applies_default_execution_mode() {
+        let opts = HarnessBuilder::new("m")
+            .default_execution_mode(ToolExecutionMode::Sequential)
+            .build_options(None);
+        assert_eq!(opts.default_execution_mode, ToolExecutionMode::Sequential);
+    }
+
+    #[test]
     fn build_options_applies_stream_options() {
         let so = StreamOptions {
             timeout_ms: Some(30_000),
@@ -1310,6 +1334,7 @@ mod tests {
     #[test]
     fn build_options_defaults_when_no_setter_called() {
         let opts = HarnessBuilder::new("m").build_options(None);
+        assert_eq!(opts.default_execution_mode, ToolExecutionMode::Parallel);
         assert_eq!(opts.system_prompt, None);
         assert_eq!(opts.thinking_level, ThinkingLevel::Off);
         assert_eq!(opts.temperature, None);

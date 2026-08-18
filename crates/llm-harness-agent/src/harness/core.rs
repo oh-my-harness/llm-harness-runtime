@@ -111,6 +111,7 @@ impl AgentHarness {
             tools: opts.tools,
             active_tools: None,
             final_answer_mode: opts.final_answer_mode,
+            default_execution_mode: opts.default_execution_mode,
             system_prompt: opts.system_prompt,
             streaming_message: None,
             tools_overwritten_mid_run: false,

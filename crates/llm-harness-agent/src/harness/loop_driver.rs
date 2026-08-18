@@ -140,6 +140,7 @@ impl AgentHarness {
             response_format,
             active_tools,
             final_answer_mode,
+            default_execution_mode,
             max_tokens,
         ) = {
             let inner = self.inner.lock().unwrap();
@@ -153,6 +154,7 @@ impl AgentHarness {
                 st.response_format.clone(),
                 st.active_tools.clone(),
                 st.final_answer_mode.clone(),
+                st.default_execution_mode,
                 inner.max_tokens,
             )
         };
@@ -209,7 +211,7 @@ impl AgentHarness {
             thinking_level,
             tools,
             active_tools,
-            default_execution_mode: ToolExecutionMode::Parallel,
+            default_execution_mode,
             final_answer_mode,
             env: self.env.clone(),
             abort,

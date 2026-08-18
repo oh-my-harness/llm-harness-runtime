@@ -29,6 +29,10 @@ pub struct AgentHarnessOptions {
     pub tools: Vec<Arc<dyn Tool>>,
     /// Final-answer classification mode.
     pub final_answer_mode: FinalAnswerMode,
+    /// Default tool execution mode for batches with multiple tool calls.
+    /// `Parallel` = concurrent `join_all`; `Sequential` = one-at-a-time.
+    /// Individual tools can override via `Tool::execution_mode()`.
+    pub default_execution_mode: ToolExecutionMode,
     /// Initial system prompt.
     pub system_prompt: Option<String>,
     /// Maximum output tokens per LLM call.
@@ -91,8 +95,9 @@ impl AgentHarnessOptions {
             thinking_level: ThinkingLevel::Off,
             temperature: None,
             response_format: None,
-            tools: vec![],
             final_answer_mode: FinalAnswerMode::default(),
+            default_execution_mode: ToolExecutionMode::Parallel,
+            tools: vec![],
             system_prompt: None,
             max_tokens: DEFAULT_MAX_TOKENS,
             skills: vec![],

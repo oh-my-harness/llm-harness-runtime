@@ -35,6 +35,8 @@ pub struct HarnessState {
     pub active_tools: Option<HashSet<String>>,
     /// Final-answer classification mode.
     pub final_answer_mode: FinalAnswerMode,
+    /// Default tool execution mode for batches (configurable via options).
+    pub default_execution_mode: ToolExecutionMode,
     /// System prompt.
     pub system_prompt: Option<String>,
     /// Streaming assistant message snapshot; `None` when not streaming.
