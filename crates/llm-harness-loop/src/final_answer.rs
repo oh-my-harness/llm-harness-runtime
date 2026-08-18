@@ -71,7 +71,7 @@ pub(crate) fn builtin_final_answer_tool() -> Arc<dyn Tool> {
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Final answer text to show to the user."
+                    "description": "The complete final answer text to present to the user. e.g. \"The refund window is 30 days from the purchase date.\""
                 }
             },
             "required": ["text"],
@@ -98,7 +98,13 @@ impl Tool for BuiltinFinalAnswerTool {
     }
 
     fn description(&self) -> &str {
-        "Use this only when ready to give the final answer to the user."
+        "Deliver the final answer to the user. Calling this tool ends the agent loop.\n\n\
+         Use when: all tool calls are complete and the task is fully resolved; you have the complete answer ready to present.\n\
+         Don't use for: intermediate results or progress updates (use plain text instead); partial answers while tools are still running.\n\
+         Returns: The text you provide is shown to the user as the final response. The agent loop terminates immediately.\n\n\
+         Examples:\n\
+         {\"text\": \"The refund window is 30 days from the purchase date.\"}\n\
+         {\"text\": \"I've updated the configuration file and verified the service restarts correctly.\"}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -127,3 +133,37 @@ impl Tool for BuiltinFinalAnswerTool {
 }
 
 llm_harness_types::assert_builtin_registered!(BuiltinFinalAnswerTool => DEFAULT_FINAL_ANSWER_TOOL_NAME);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn description_follows_unified_format() {
+        let tool = builtin_final_answer_tool();
+        let desc = tool.description();
+        assert!(desc.contains("Use when:"), "missing Use when section");
+        assert!(
+            desc.contains("Don't use for:"),
+            "missing Don't use for section"
+        );
+        assert!(desc.contains("Returns:"), "missing Returns section");
+        assert!(desc.contains("Examples:"), "missing Examples section");
+    }
+
+    #[test]
+    fn text_parameter_has_concrete_example() {
+        let tool = builtin_final_answer_tool();
+        let schema = tool.parameters_schema();
+        let text_desc = schema
+            .get("properties")
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.get("description"))
+            .and_then(|d| d.as_str())
+            .expect("text parameter must have a description");
+        assert!(
+            text_desc.contains("e.g."),
+            "text parameter description must contain a concrete e.g. example, got: {text_desc}"
+        );
+    }
+}
