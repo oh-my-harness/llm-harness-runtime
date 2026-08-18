@@ -1,8 +1,6 @@
 use anyhow::Result;
 use futures::future::BoxFuture;
 
-use crate::{PromptTemplate, Skill};
-
 /// Description of a context resource.
 #[derive(Debug, Clone)]
 pub struct ResourceDescriptor {
@@ -32,12 +30,4 @@ pub trait ResourceProvider: Send + Sync {
 
     /// Read a specific resource by URI.
     fn read<'a>(&'a self, uri: &'a str) -> BoxFuture<'a, Result<ResourceContent>>;
-}
-
-/// Harness runtime resources, provided via `BeforeRunHook` context.
-pub struct AgentHarnessResources {
-    /// Loaded skills (metadata only; full content via `skill_read` tool).
-    pub skills: Vec<Skill>,
-    /// Loaded prompt templates.
-    pub templates: Vec<PromptTemplate>,
 }

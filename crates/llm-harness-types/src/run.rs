@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AgentMessage, ContentBlock, UserMessage};
+use crate::{AgentMessage, ContentBlock, PromptTemplate, Skill, UserMessage};
 
 type SharedRunValue = Arc<dyn Any + Send + Sync>;
 
@@ -298,6 +298,14 @@ impl RunContext {
     pub fn local(&self) -> &RunLocalState {
         &self.local
     }
+}
+
+/// Harness runtime resources, provided via `BeforeRunHook` context.
+pub struct AgentHarnessResources {
+    /// Loaded skills (metadata only; full content via `skill_read` tool).
+    pub skills: Vec<Skill>,
+    /// Loaded prompt templates.
+    pub templates: Vec<PromptTemplate>,
 }
 
 #[cfg(test)]
