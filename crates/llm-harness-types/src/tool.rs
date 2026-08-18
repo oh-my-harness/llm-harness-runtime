@@ -514,6 +514,44 @@ pub struct ToolContext {
     pub update_tx: mpsc::Sender<ToolProgress>,
 }
 
+// ── Credential scope lookup ──────────────────────────────────────────────────
+
+/// Credential lookup result for a tool call.
+#[derive(Debug, Clone)]
+pub enum CredentialLookup {
+    /// Tool is not on a server with scoped credential declarations.
+    /// No warning needed.
+    NotScoped,
+    /// Tool is authorized for the listed credential keys.
+    Authorized(Vec<String>),
+    /// Tool is on a server with scoped credentials but not in any
+    /// allowed_tools list. Warning or denial depends on policy.
+    Unauthorized,
+}
+
+/// A lookup function that maps tool full_name to its credential status.
+pub type CredentialLookupFn = std::sync::Arc<dyn Fn(&str) -> CredentialLookup + Send + Sync>;
+
+/// Build a `CredentialLookupFn` from per-tool authorization data.
+pub fn build_credential_lookup(
+    authorized: std::collections::HashMap<String, Vec<String>>,
+    unauthorized: std::collections::HashSet<String>,
+) -> CredentialLookupFn {
+    std::sync::Arc::new(move |tool_name: &str| {
+        if let Some(creds) = authorized.get(tool_name) {
+            if creds.is_empty() {
+                CredentialLookup::Unauthorized
+            } else {
+                CredentialLookup::Authorized(creds.clone())
+            }
+        } else if unauthorized.contains(tool_name) {
+            CredentialLookup::Unauthorized
+        } else {
+            CredentialLookup::NotScoped
+        }
+    })
+}
+
 /// 工具 trait——框架调用工具的唯一接口。
 pub trait Tool: Send + Sync {
     /// 工具的稳定程序标识符；在 session log 和 LLM tool definition 中使用。
