@@ -13,12 +13,12 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use llm_harness_loop::{
-//!     agent_loop, LoopConfig, DefaultConvertToLlm, openai_compatible,
+//!     agent_loop, LoopConfig, DefaultConvertToLlm, FinalAnswerMode, openai_compatible,
 //! };
 //! use llm_harness_types::*;
 //!
 //! let client = Arc::new(openai_compatible("sk-...", "https://api.openai.com"));
-//! let run = Arc::new(RunContext::new(RunRequest::single("What is 2+2?")));
+//! let run = Arc::new(RunContext::new(RunRequest::from_text("What is 2+2?")));
 //! let config = LoopConfig {
 //!     run,
 //!     model: "gpt-4o".into(),
@@ -29,10 +29,10 @@
 //!     active_tools: None,
 //!     default_execution_mode: ToolExecutionMode::Parallel,
 //!     final_answer_mode: FinalAnswerMode::default(),
-//!     env: Arc::new(llm_harness_loop::test_utils::NoOpEnv),
+//!     env: Arc::new(UnsupportedEnv::new()),
 //!     abort: tokio_util::sync::CancellationToken::new(),
 //!     stream_options: StreamOptions::default(),
-//!     convert_to_llm: Arc::new(DefaultConvertToLlm),
+//!     convert_to_llm: Arc::new(DefaultConvertToLlm::new()),
 //!     transform_context: None,
 //!     prepare_next_turn: None,
 //!     should_stop: None,
@@ -48,7 +48,7 @@
 //!     system_prompt: None,
 //!     messages: vec![AgentMessage::User(UserMessage {
 //!         content: vec![ContentBlock::Text { text: "What is 2+2?".into() }],
-//!         ..Default::default()
+//!         timestamp: chrono::Utc::now(),
 //!     })],
 //! };
 //! // let stream = agent_loop(client, ctx, config);
