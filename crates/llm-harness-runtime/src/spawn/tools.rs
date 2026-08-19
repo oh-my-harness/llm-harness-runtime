@@ -818,7 +818,7 @@ mod tests {
     use crate::spawn::spawn_types::SubAgentResult;
     use crate::spawn::spawner::JsonlSessionFactory;
     use llm_harness_loop::test_utils::{MockLlmClient, MockResponse, NoOpEnv};
-    use llm_harness_runtime_platform::env::EnvFactory;
+    use llm_harness_platform::env::EnvFactory;
     use llm_harness_types::{AgentError, CostAggregate, ExecutionEnv};
     use tokio_util::sync::CancellationToken;
 

@@ -130,7 +130,7 @@ impl AfterToolCallHook for ToolCallAuditHook {
 ///
 /// ```ignore
 /// use llm_harness_strategy::AuditPlugin;
-/// use llm_harness_runtime_audit_jsonl::JsonlAuditSink;
+/// use llm_harness_audit_jsonl::JsonlAuditSink;
 /// use std::sync::Arc;
 ///
 /// let sink = Arc::new(JsonlAuditSink::new("audit.jsonl"));

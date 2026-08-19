@@ -3,7 +3,7 @@ use crate::spawn::spawner::JsonlSessionFactory;
 use anyhow::Result; // StepExecutor::execute returns anyhow::Result
 use futures::future::BoxFuture;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
-use llm_harness_runtime_platform::env::EnvFactory;
+use llm_harness_platform::env::EnvFactory;
 use llm_harness_types::{
     AgentError, BeforeTurnCtx, BeforeTurnHook, ContentBlock, DataBlock, ExecutionEnv, ToolContext,
     ToolFailure, ToolResult,

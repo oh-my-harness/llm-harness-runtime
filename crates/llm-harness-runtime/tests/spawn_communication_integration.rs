@@ -20,6 +20,7 @@ use std::time::Duration;
 use llm_harness_agent::HarnessBuilder;
 use llm_harness_agent::{AgentHarness, IdleWatcherHook, Plugin};
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse, NoOpEnv};
+use llm_harness_platform::env::EnvFactory;
 use llm_harness_runtime::spawn::delivery::IdleWatcher;
 use llm_harness_runtime::spawn::message_bus::{
     AgentEntry, AgentStatus, MessageBus, SendReceipt, SubAgentEvent, message_bus_pair,
@@ -27,7 +28,6 @@ use llm_harness_runtime::spawn::message_bus::{
 use llm_harness_runtime::spawn::spawn_types::SpawnOptions;
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_runtime::spawn::tools::SpawnAgentTool;
-use llm_harness_runtime_platform::env::EnvFactory;
 use llm_harness_types::ExecutionEnv;
 use tokio_util::sync::CancellationToken;
 

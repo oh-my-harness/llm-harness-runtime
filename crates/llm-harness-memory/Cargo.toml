@@ -1,0 +1,28 @@
+[package]
+name = "llm-harness-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+test-utils = []
+
+[dependencies]
+llm-harness-agent.workspace = true
+llm-harness-types.workspace = true
+llm-harness-knowledge.workspace = true
+base64.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+llm-harness-loop = { workspace = true, features = ["test-utils"] }
+llm_adapter.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

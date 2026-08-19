@@ -22,7 +22,7 @@ use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFa
 use llm_harness_runtime::spawn::tools::{
     AwaitSubagentReplyTool, QuerySubagentTool, SpawnAgentTool,
 };
-use llm_harness_runtime_sandbox::OsEnvFactory;
+use llm_harness_sandbox::OsEnvFactory;
 
 // ── NoopPlugin for sub-agents (no recursive spawning) ──────────────────────
 

@@ -13,20 +13,20 @@ use chrono::Utc;
 use llm_harness_agent::{
     JsonlSessionRepo, Session, SessionRecallScope, SessionRepo, session::CreateSessionOptions,
 };
+use llm_harness_knowledge::access::{
+    AllowAllAuthorizer, KnowledgeAccessContext, KnowledgeAccessControl, KnowledgeScope,
+    PrincipalRef,
+};
+use llm_harness_knowledge::{
+    EvidenceAuthority, EvidenceProviderId, KnowledgeCitationPolicy, KnowledgePlugin,
+    KnowledgePluginConfig, KnowledgeRegistry, KnowledgeToolConfig,
+};
 use llm_harness_live_tests::skip_if_none;
 use llm_harness_live_tests::{
     CapturedEvent, EventCapture, LiveProvider, MULTI_TURN, SINGLE_TURN, assert_event_emitted,
     assert_tool_was_called, make_harness_with, with_timeout,
 };
-use llm_harness_runtime_knowledge::access::{
-    AllowAllAuthorizer, KnowledgeAccessContext, KnowledgeAccessControl, KnowledgeScope,
-    PrincipalRef,
-};
-use llm_harness_runtime_knowledge::{
-    EvidenceAuthority, EvidenceProviderId, KnowledgeCitationPolicy, KnowledgePlugin,
-    KnowledgePluginConfig, KnowledgeRegistry, KnowledgeToolConfig,
-};
-use llm_harness_runtime_session_recall::{
+use llm_harness_session_recall::{
     InMemorySessionRecallIndex, SessionRecallAccessContext, SessionRecallIndex,
     SessionRecallKnowledgeSource, SessionRecallProjector, SessionRecallService,
 };
@@ -142,7 +142,7 @@ async fn session_recall_search_finds_history() {
 
     let registry = Arc::new(
         KnowledgeRegistry::builder(access_control.clone())
-            .source(source.clone() as Arc<dyn llm_harness_runtime_knowledge::KnowledgeSource>)
+            .source(source.clone() as Arc<dyn llm_harness_knowledge::KnowledgeSource>)
             .build()
             .expect("registry build should succeed"),
     );

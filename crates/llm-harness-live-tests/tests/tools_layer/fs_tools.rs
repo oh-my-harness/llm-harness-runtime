@@ -10,7 +10,7 @@ use llm_harness_live_tests::{
     EventCapture, LiveProvider, SINGLE_TURN, assert_tool_was_called, make_harness_with_env,
     skip_if_none, with_timeout,
 };
-use llm_harness_runtime_tools::{FileSnapshotStore, FsToolsPlugin};
+use llm_harness_tools::{FileSnapshotStore, FsToolsPlugin};
 use parking_lot::RwLock;
 
 // ── Helpers ─────────────────────────────────────────────────────────────

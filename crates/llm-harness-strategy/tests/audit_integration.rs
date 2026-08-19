@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
+use llm_harness_audit_jsonl::JsonlAuditSink;
 use llm_harness_loop::test_utils::test_assistant_message;
-use llm_harness_runtime_audit_jsonl::JsonlAuditSink;
 use llm_harness_strategy::audit::ToolCallAuditHook;
 use llm_harness_types::{
     AfterToolCallCtx, AfterToolCallHook, BeforeToolCallCtx, BeforeToolCallHook, RunContext,

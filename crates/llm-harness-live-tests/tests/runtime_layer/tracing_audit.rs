@@ -14,14 +14,14 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use llm_harness_agent::HarnessHooks;
+use llm_harness_audit_jsonl::JsonlAuditSink;
 use llm_harness_live_tests::{
     EventCapture, LiveProvider, MULTI_TURN, make_harness_with, skip_if_none, with_timeout,
 };
 use llm_harness_runtime::tracer::{CaptureLevel, SpanCaptureConfig, SpanKind};
 use llm_harness_runtime::tracing_adapter::TracingHookAdapter;
-use llm_harness_runtime_audit_jsonl::JsonlAuditSink;
-use llm_harness_runtime_trace_otel::InMemoryTraceExporter;
 use llm_harness_strategy::AuditPlugin;
+use llm_harness_trace_otel::InMemoryTraceExporter;
 use llm_harness_types::audit::AuditSink;
 use llm_harness_types::{
     AfterProviderResponseHook, AfterToolCallHook, AfterTurnHook, BeforeProviderRequestHook,

@@ -8,7 +8,7 @@ license.workspace = true
 llm-harness-agent.workspace  = true
 llm-harness-loop.workspace = true
 llm-harness-types.workspace = true
-llm-harness-runtime-platform.workspace = true
+llm-harness-platform.workspace = true
 regex.workspace              = true
 anyhow.workspace            = true
 async-trait.workspace       = true
@@ -29,9 +29,9 @@ tracing.workspace              = true
 [dev-dependencies]
 llm-harness-loop = { workspace = true, features = ["test-utils"] }
 llm-harness-strategy.workspace = true
-llm-harness-runtime-sandbox.workspace  = true
-llm-harness-runtime-audit-jsonl.workspace = true
-llm-harness-runtime-trace-otel.workspace  = true
+llm-harness-sandbox.workspace  = true
+llm-harness-audit-jsonl.workspace = true
+llm-harness-trace-otel.workspace  = true
 chrono.workspace  = true
 futures.workspace = true
 tokio     = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }

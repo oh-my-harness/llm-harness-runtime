@@ -36,5 +36,5 @@ pub mod rules;
 pub mod workflow;
 
 pub mod lifecycle;
-pub use llm_harness_runtime_platform::{audit, prompt, sandbox, tracer, tracing_adapter};
+pub use llm_harness_platform::{audit, prompt, sandbox, tracer, tracing_adapter};
 pub mod spawn;

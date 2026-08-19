@@ -1,0 +1,21 @@
+[package]
+name    = "llm-harness-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+llm-harness-types.workspace = true
+llm-harness-agent.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

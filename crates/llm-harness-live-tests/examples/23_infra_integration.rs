@@ -21,20 +21,20 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use llm_harness_knowledge::{
+    AllowAllAuthorizer, EvidenceAuthority, EvidenceProviderId, KnowledgeAccessContext,
+    KnowledgeAccessControl, KnowledgePlugin, KnowledgePluginConfig, KnowledgeRegistry,
+    KnowledgeScope, PrincipalRef,
+};
+use llm_harness_knowledge_local::{
+    DocumentParserRegistry, DocumentRootConfig, LocalDocumentSource, LocalDocumentSourceConfig,
+    OsDocumentFileSystem,
+};
 use llm_harness_live_tests::{
     EventCapture, LiveProvider, MULTI_TURN, SINGLE_TURN, make_harness_with_env, with_timeout,
 };
 use llm_harness_runtime::lifecycle::event::WaitForExternalEventTool;
 use llm_harness_runtime::lifecycle::task::TaskId;
-use llm_harness_runtime_knowledge::{
-    AllowAllAuthorizer, EvidenceAuthority, EvidenceProviderId, KnowledgeAccessContext,
-    KnowledgeAccessControl, KnowledgePlugin, KnowledgePluginConfig, KnowledgeRegistry,
-    KnowledgeScope, PrincipalRef,
-};
-use llm_harness_runtime_knowledge_local::{
-    DocumentParserRegistry, DocumentRootConfig, LocalDocumentSource, LocalDocumentSourceConfig,
-    OsDocumentFileSystem,
-};
 use llm_harness_strategy::{EventDetails, TimerStream, WebhookStream};
 use llm_harness_types::{EventStream, RunRequest};
 use tokio::sync::Mutex;
@@ -387,7 +387,7 @@ fn part4_memory_session_recall_construction() {
     // SessionRecall indexes past sessions so the LLM can search conversation
     // history. The wiring is:
     //
-    //   use llm_harness_runtime_session_recall::*;
+    //   use llm_harness_session_recall::*;
     //
     //   // 1. Create an index (InMemorySessionRecallIndex for tests,
     //   //    SqliteSessionRecallIndex for persistence).

@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use llm_harness_live_tests::skip_if_none;
 use llm_harness_live_tests::{LiveProvider, SINGLE_TURN, with_timeout};
-use llm_harness_runtime_mcp::config::McpServerConfig;
-use llm_harness_runtime_mcp::{McpManager, McpToolAdapter, McpToolSource};
+use llm_harness_mcp::config::McpServerConfig;
+use llm_harness_mcp::{McpManager, McpToolAdapter, McpToolSource};
 use llm_harness_types::Tool;
 
 // ── Tests ──────────────────────────────────────────────────────────────

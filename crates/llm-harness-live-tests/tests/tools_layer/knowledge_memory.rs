@@ -3,25 +3,25 @@
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
+use llm_harness_knowledge::access::{
+    AllowAllAuthorizer, KnowledgeAccessContext, KnowledgeAccessControl, KnowledgeScope,
+    PrincipalRef,
+};
+use llm_harness_knowledge::{
+    EvidenceAuthority, EvidenceProviderId, KnowledgeCitationPolicy, KnowledgeError,
+    KnowledgePlugin, KnowledgePluginConfig, KnowledgeRef, KnowledgeRegistry,
+    KnowledgeRequestContext, KnowledgeSource, KnowledgeToolConfig,
+};
+use llm_harness_knowledge_local::{
+    DocumentFileSystem, DocumentParserRegistry, DocumentRootConfig, LocalDocumentSource,
+    LocalDocumentSourceConfig, OsDocumentFileSystem, content_revision,
+};
 use llm_harness_live_tests::skip_if_none;
 use llm_harness_live_tests::{
     CapturedEvent, EventCapture, LiveProvider, MULTI_TURN, SINGLE_TURN, assert_event_emitted,
     assert_tool_was_called, make_harness_with, with_timeout,
 };
-use llm_harness_runtime_knowledge::access::{
-    AllowAllAuthorizer, KnowledgeAccessContext, KnowledgeAccessControl, KnowledgeScope,
-    PrincipalRef,
-};
-use llm_harness_runtime_knowledge::{
-    EvidenceAuthority, EvidenceProviderId, KnowledgeCitationPolicy, KnowledgeError,
-    KnowledgePlugin, KnowledgePluginConfig, KnowledgeRef, KnowledgeRegistry,
-    KnowledgeRequestContext, KnowledgeSource, KnowledgeToolConfig,
-};
-use llm_harness_runtime_knowledge_local::{
-    DocumentFileSystem, DocumentParserRegistry, DocumentRootConfig, LocalDocumentSource,
-    LocalDocumentSourceConfig, OsDocumentFileSystem, content_revision,
-};
-use llm_harness_runtime_memory::{
+use llm_harness_memory::{
     MemoryConsistency, MemoryDeleteReceipt, MemoryMutationGate, MemoryMutationGateError,
     MemoryMutationRequest, MemoryPlugin, MemoryService, MemoryStore, MemoryStoreDescriptor,
     MemoryVisibility, MemoryWrite, MemoryWritePolicy, MemoryWriteReceipt, SecureMemoryWritePolicy,

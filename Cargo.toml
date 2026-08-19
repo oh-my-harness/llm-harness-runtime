@@ -4,20 +4,20 @@ members = [
     "crates/llm-harness-loop",
     "crates/llm-harness-agent",
     # runtime
-    "crates/llm-harness-runtime-platform",
+    "crates/llm-harness-platform",
     "crates/llm-harness-runtime",
-    "crates/llm-harness-runtime-sandbox",
-    "crates/llm-harness-runtime-mcp",
-    "crates/llm-harness-runtime-tools",
+    "crates/llm-harness-sandbox",
+    "crates/llm-harness-mcp",
+    "crates/llm-harness-tools",
     "crates/llm-harness-strategy",
-    "crates/llm-harness-runtime-knowledge",
-    "crates/llm-harness-runtime-knowledge-local",
-    "crates/llm-harness-runtime-session-recall",
-    "crates/llm-harness-runtime-memory",
-    "crates/llm-harness-runtime-audit-jsonl",
+    "crates/llm-harness-knowledge",
+    "crates/llm-harness-knowledge-local",
+    "crates/llm-harness-session-recall",
+    "crates/llm-harness-memory",
+    "crates/llm-harness-audit-jsonl",
     # pyo3 sdk
     # crates/llm-harness-py — 已迁移到 Senza 仓库 (github.com/oh-my-harness/Senza)
-    "crates/llm-harness-runtime-trace-otel",
+    "crates/llm-harness-trace-otel",
     "crates/session-viewer",
     "crates/llm-harness-live-tests",
     # examples
@@ -37,19 +37,19 @@ llm-harness-types  = { path = "crates/llm-harness-types" }
 llm-harness-loop   = { path = "crates/llm-harness-loop" }
 llm-harness-agent  = { path = "crates/llm-harness-agent" }
 # Runtime (within this workspace)
-llm-harness-runtime-platform = { path = "crates/llm-harness-runtime-platform" }
+llm-harness-platform = { path = "crates/llm-harness-platform" }
 llm-harness-runtime = { path = "crates/llm-harness-runtime" }
-llm-harness-runtime-tools = { path = "crates/llm-harness-runtime-tools" }
+llm-harness-tools = { path = "crates/llm-harness-tools" }
 llm-harness-strategy = { path = "crates/llm-harness-strategy" }
-llm-harness-runtime-knowledge = { path = "crates/llm-harness-runtime-knowledge" }
-llm-harness-runtime-knowledge-local = { path = "crates/llm-harness-runtime-knowledge-local" }
-llm-harness-runtime-session-recall = { path = "crates/llm-harness-runtime-session-recall" }
-llm-harness-runtime-memory = { path = "crates/llm-harness-runtime-memory" }
-llm-harness-runtime-mcp = { path = "crates/llm-harness-runtime-mcp" }
-llm-harness-runtime-audit-jsonl = { path = "crates/llm-harness-runtime-audit-jsonl" }
-llm-harness-runtime-trace-otel = { path = "crates/llm-harness-runtime-trace-otel" }
+llm-harness-knowledge = { path = "crates/llm-harness-knowledge" }
+llm-harness-knowledge-local = { path = "crates/llm-harness-knowledge-local" }
+llm-harness-session-recall = { path = "crates/llm-harness-session-recall" }
+llm-harness-memory = { path = "crates/llm-harness-memory" }
+llm-harness-mcp = { path = "crates/llm-harness-mcp" }
+llm-harness-audit-jsonl = { path = "crates/llm-harness-audit-jsonl" }
+llm-harness-trace-otel = { path = "crates/llm-harness-trace-otel" }
 llm-harness-live-tests = { path = "crates/llm-harness-live-tests" }
-llm-harness-runtime-sandbox = { path = "crates/llm-harness-runtime-sandbox" }
+llm-harness-sandbox = { path = "crates/llm-harness-sandbox" }
 # API adapter — separate repo
 llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "193117cbb8398aadeca74a925cfd699617f8c861" }
 

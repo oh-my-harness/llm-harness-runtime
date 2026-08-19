@@ -20,7 +20,7 @@
 //! | [`ObservedSessionRepo`] | Wrapper around any `SessionRepo` that emits [`SessionMutation`] events to a [`SessionMutationObserver`]. Required when cross-session recall indexing is enabled. |
 //!
 //! For recall: wrap `JsonlSessionRepo` with `ObservedSessionRepo`, install a `SessionMutationObserver`
-//! (e.g. `SessionRecallProjector` from `llm-harness-runtime-session-recall`), and the rest is automatic.
+//! (e.g. `SessionRecallProjector` from `llm-harness-session-recall`), and the rest is automatic.
 //! Without the wrapper, `update_recall_settings` on `InMemorySessionStorage` returns `RecallMetadataUnsupported`.
 //!
 //! ## Entry tree model

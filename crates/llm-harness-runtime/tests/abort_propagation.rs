@@ -18,7 +18,7 @@ use llm_harness_runtime::spawn::delivery::async_spawn_pair;
 use llm_harness_runtime::spawn::message_bus::message_bus_pair;
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_runtime::spawn::tools::SpawnAgentTool;
-use llm_harness_runtime_sandbox::{OsEnv, OsEnvFactory};
+use llm_harness_sandbox::{OsEnv, OsEnvFactory};
 use llm_harness_types::{ExecutionEnv, HarnessError, HarnessPhase};
 use tokio::sync::Notify;
 

@@ -28,4 +28,4 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 async-trait.workspace = true
 llm_adapter.workspace = true
-llm-harness-runtime-sandbox.workspace = true
+llm-harness-sandbox.workspace = true

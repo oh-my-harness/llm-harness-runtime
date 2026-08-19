@@ -12,14 +12,14 @@ use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
+use llm_harness_platform::env::EnvFactory;
 use llm_harness_runtime::spawn::spawner::JsonlSessionFactory;
 use llm_harness_runtime::workflow::engine::{
     WorkflowEngine, WorkflowEngineConfig, WorkflowRunRequest,
 };
 use llm_harness_runtime::workflow::error::WorkflowError;
 use llm_harness_runtime::workflow::model::WorkflowStatus;
-use llm_harness_runtime_platform::env::EnvFactory;
-use llm_harness_runtime_sandbox::OsEnvSandbox;
+use llm_harness_sandbox::OsEnvSandbox;
 use llm_harness_types::{
     AgentError, DataBlock, ExecutionEnv, Tool, ToolContext, ToolFailure, ToolResult,
 };
@@ -216,7 +216,7 @@ async fn workflow_request_extensions_reach_llm_step_tools_without_cross_run_leak
 async fn workflow_engine_tracing_emits_spans() {
     use llm_harness_runtime::tracer::{CaptureLevel, SpanCaptureConfig, SpanStatus};
     use llm_harness_runtime::tracing_adapter::TracingHookAdapter;
-    use llm_harness_runtime_trace_otel::InMemoryTraceExporter;
+    use llm_harness_trace_otel::InMemoryTraceExporter;
 
     let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
         "Hello from tracer.",

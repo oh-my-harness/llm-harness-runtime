@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use llm_harness_runtime::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
-use llm_harness_runtime_sandbox::OsEnvSandbox;
+use llm_harness_sandbox::OsEnvSandbox;
 use llm_harness_types::{EnvError, ExecutionEnv, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
 

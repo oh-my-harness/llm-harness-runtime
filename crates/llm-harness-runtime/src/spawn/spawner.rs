@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use llm_harness_agent::{HarnessBuildError, HarnessBuilder};
 
-use llm_harness_runtime_platform::env::EnvFactory;
+use llm_harness_platform::env::EnvFactory;
 
 // ── SessionFactory ────────────────────────────────────────────────────────
 

@@ -24,5 +24,5 @@ tokio-util.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-util.workspace = true
 llm-harness-loop = { workspace = true, features = ["test-utils"] }
-llm-harness-runtime-audit-jsonl.workspace = true
+llm-harness-audit-jsonl.workspace = true
 tempfile = "3"

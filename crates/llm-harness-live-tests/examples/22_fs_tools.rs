@@ -25,7 +25,7 @@ use std::sync::Arc;
 use llm_harness_live_tests::{
     EventCapture, LiveProvider, SINGLE_TURN, make_harness_with_env, with_timeout,
 };
-use llm_harness_runtime_tools::{FileSnapshotStore, FsToolsPlugin};
+use llm_harness_tools::{FileSnapshotStore, FsToolsPlugin};
 use parking_lot::RwLock;
 
 #[tokio::main]

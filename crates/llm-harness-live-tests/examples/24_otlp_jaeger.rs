@@ -18,7 +18,7 @@ use llm_harness_live_tests::{
     EventCapture, LiveProvider, SINGLE_TURN, make_harness_with, with_timeout,
 };
 use llm_harness_runtime::tracing_adapter::TracingHookAdapter;
-use llm_harness_runtime_trace_otel::{OtlpConfig, OtlpTraceExporter};
+use llm_harness_trace_otel::{OtlpConfig, OtlpTraceExporter};
 use llm_harness_types::{
     AfterProviderResponseHook, AfterToolCallHook, AfterTurnHook, BeforeProviderRequestHook,
     BeforeTurnHook, DataBlock, Tool, ToolContext, ToolFailure, ToolResult,

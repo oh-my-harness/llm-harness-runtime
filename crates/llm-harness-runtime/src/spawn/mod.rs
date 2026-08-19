@@ -3,7 +3,7 @@
 //! `spawner` builds a fresh `AgentHarness` per sub-agent; `message_bus`
 //! provides unified event + message routing; `tools` exposes spawning and
 //! communication to the LLM.
-pub use llm_harness_runtime_platform::env::EnvFactory;
+pub use llm_harness_platform::env::EnvFactory;
 
 pub mod delivery;
 pub mod message_bus;
