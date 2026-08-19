@@ -8,7 +8,6 @@ pub mod transport;
 pub mod types;
 mod utils;
 pub mod version_lock;
-pub mod workflow;
 
 pub use builder::{
     HarnessBuilderMcpExt, McpAgentHarness, McpHarnessBuilder, McpManagerOwnership, McpPromptMeta,
@@ -17,7 +16,6 @@ pub use builder::{
 };
 pub use manager::{ConnectionStatus, ExposedTool, McpManager, McpManagerError, McpToolCache};
 pub use session::{McpSession, McpSessionError, PREFERRED_PROTOCOL_VERSION};
-pub use workflow::{McpWorkflowConfig, McpWorkflowEngine};
 
 use std::sync::Arc;
 
@@ -25,7 +23,7 @@ use anyhow::{Result, anyhow};
 use base64::Engine;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use llm_harness_runtime::platform::prompt::{ArgumentDef, PromptSource, PromptSourceTemplate};
+use llm_harness_runtime_platform::prompt::{ArgumentDef, PromptSource, PromptSourceTemplate};
 use llm_harness_types::{DataBlock, Tool, ToolContext, ToolFailure, ToolResult};
 use llm_harness_types::{ResourceContent, ResourceDescriptor, ResourceProvider};
 use serde_json::Value;
@@ -372,4 +370,130 @@ mod tests {
 
         assert_eq!(result.structured_content, Some(json!({"value": 1})));
     }
+}
+
+// ── MCP workflow assembly ─────────────────────────────────────────────────
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use crate::config::{McpConfigFile, McpServerConfig};
+
+/// MCP 工具装配结果——消费方据此注入 `WorkflowEngineConfig` 或 `HarnessBuilder`。
+///
+/// 不依赖 runtime crate。字段类型只来自 `llm-harness-types` 和 mcp 内部类型。
+pub struct McpParts {
+    /// MCP manager（共享或独占）。
+    pub manager: Arc<McpManager>,
+    /// manager 所有权。
+    pub ownership: McpManagerOwnership,
+    /// 已发现的 MCP 工具，转为 `Arc<dyn Tool>`。
+    pub tools: Vec<Arc<dyn Tool>>,
+    /// 资源注入 hook（仅当配置了 resource_policy 时存在）。
+    pub resource_hook: Option<Arc<McpResourceInjectionHook>>,
+    /// 已发现的 MCP prompt registry。
+    pub prompts: Arc<McpPromptRegistry>,
+}
+
+#[derive(Default)]
+pub struct McpWorkflowConfig {
+    servers: Vec<(String, McpServerConfig)>,
+    config_files: Vec<PathBuf>,
+    manager: Option<Arc<McpManager>>,
+    resource_policy: Option<McpResourceInjectionPolicy>,
+}
+
+impl McpWorkflowConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mcp_server(mut self, name: impl Into<String>, config: McpServerConfig) -> Self {
+        self.servers.push((name.into(), config));
+        self
+    }
+
+    pub fn mcp_config_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config_files.push(path.into());
+        self
+    }
+
+    pub fn with_mcp_manager(mut self, manager: Arc<McpManager>) -> Self {
+        self.manager = Some(manager);
+        self
+    }
+
+    pub fn resource_injection(mut self, policy: McpResourceInjectionPolicy) -> Self {
+        self.resource_policy = Some(policy);
+        self
+    }
+
+    /// 连接 MCP server、发现工具和 prompt、构建 resource hook。
+    /// 返回消费方自行注入 runtime 引擎所需的全部零件。
+    pub async fn prepare(self) -> Result<McpParts> {
+        let (manager, ownership) = prepare_manager(&self).await?;
+        let runtime = Arc::new(McpRuntimeHandle::new(Arc::clone(&manager), ownership));
+
+        let adapters = match McpToolSource::new(Arc::clone(&manager))
+            .into_adapters()
+            .await
+        {
+            Ok(adapters) => adapters,
+            Err(error) => {
+                runtime.shutdown_if_owned().await?;
+                return Err(error);
+            }
+        };
+        let tools: Vec<Arc<dyn Tool>> = adapters
+            .into_iter()
+            .map(|adapter| Arc::new(adapter) as Arc<dyn Tool>)
+            .collect();
+        let resource_hook = self
+            .resource_policy
+            .map(|policy| Arc::new(McpResourceInjectionHook::new(Arc::clone(&manager), policy)));
+        let prompts = match McpPromptRegistry::discover(Arc::clone(&manager)).await {
+            Ok(prompts) => Arc::new(prompts),
+            Err(error) => {
+                runtime.shutdown_if_owned().await?;
+                return Err(error);
+            }
+        };
+        Ok(McpParts {
+            manager,
+            ownership,
+            tools,
+            resource_hook,
+            prompts,
+        })
+    }
+}
+
+async fn prepare_manager(
+    mcp: &McpWorkflowConfig,
+) -> Result<(Arc<McpManager>, McpManagerOwnership)> {
+    let mut configs = HashMap::new();
+    for path in &mcp.config_files {
+        let file = McpConfigFile::from_file(path).await?;
+        for (name, config) in file.mcp_servers {
+            if configs.insert(name.clone(), config).is_some() {
+                tracing::warn!(server = name, file = %path.display(), "overriding duplicate MCP server config");
+            }
+        }
+    }
+    for (name, config) in &mcp.servers {
+        if configs.insert(name.clone(), config.clone()).is_some() {
+            tracing::warn!(
+                server = name,
+                "programmatic MCP server overrides file config"
+            );
+        }
+    }
+    let (manager, ownership) = match &mcp.manager {
+        Some(manager) => (Arc::clone(manager), McpManagerOwnership::Shared),
+        None => (Arc::new(McpManager::default()), McpManagerOwnership::Owned),
+    };
+    if !configs.is_empty() {
+        manager.discover_and_connect(configs).await?;
+    }
+    Ok((manager, ownership))
 }

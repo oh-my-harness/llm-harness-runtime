@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use futures::future::BoxFuture;
-use llm_harness_runtime::observability::tracer::{SpanEvent, TraceExporter};
+use llm_harness_runtime_platform::tracer::{SpanEvent, TraceExporter};
 
 /// In-memory `TraceExporter` for unit and integration testing.
 ///
@@ -53,7 +53,7 @@ impl TraceExporter for InMemoryTraceExporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_runtime::observability::tracer::{SpanId, SpanKind, SpanStatus, TraceId};
+    use llm_harness_runtime_platform::tracer::{SpanId, SpanKind, SpanStatus, TraceId};
     use std::collections::HashMap;
 
     fn make_span(name: &str) -> SpanEvent {

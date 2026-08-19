@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use llm_harness_runtime::platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
+use llm_harness_runtime_platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_types::{EnvError, ExecutionEnv, ShellOptions};
 use tokio_util::sync::CancellationToken;
 
@@ -346,7 +346,7 @@ async fn sandbox_validate_config_rejects_denylist() {
 #[tokio::test]
 async fn sandbox_validate_config_rejects_net_allowlist() {
     let config = SandboxConfig {
-        net_allowlist: vec![llm_harness_runtime::platform::sandbox::NetRule {
+        net_allowlist: vec![llm_harness_runtime_platform::sandbox::NetRule {
             host: "example.com".to_string(),
             port_range: None,
         }],

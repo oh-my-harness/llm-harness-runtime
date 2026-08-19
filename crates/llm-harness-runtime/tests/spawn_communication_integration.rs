@@ -25,10 +25,9 @@ use llm_harness_runtime::spawn::message_bus::{
     AgentEntry, AgentStatus, MessageBus, SendReceipt, SubAgentEvent, message_bus_pair,
 };
 use llm_harness_runtime::spawn::spawn_types::SpawnOptions;
-use llm_harness_runtime::spawn::spawner::{
-    EnvFactory, HarnessSubAgentSpawner, JsonlSessionFactory,
-};
+use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_runtime::spawn::tools::SpawnAgentTool;
+use llm_harness_runtime_platform::env::EnvFactory;
 use llm_harness_types::ExecutionEnv;
 use tokio_util::sync::CancellationToken;
 

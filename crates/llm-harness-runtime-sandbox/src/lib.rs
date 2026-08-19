@@ -47,7 +47,7 @@ pub struct BwrapSandbox;
 impl BwrapSandbox {
     /// Returns an error on non-Linux platforms (fail-closed).
     pub fn new(
-        _config: llm_harness_runtime::platform::sandbox::SandboxConfig,
+        _config: llm_harness_runtime_platform::sandbox::SandboxConfig,
     ) -> anyhow::Result<Self> {
         Err(anyhow::anyhow!("BwrapSandbox is only available on Linux"))
     }
@@ -67,7 +67,7 @@ pub struct SeatbeltSandbox {
 impl SeatbeltSandbox {
     /// Returns an error on non-macOS platforms (fail-closed).
     pub fn new(
-        _config: llm_harness_runtime::platform::sandbox::SandboxConfig,
+        _config: llm_harness_runtime_platform::sandbox::SandboxConfig,
     ) -> anyhow::Result<Self> {
         Err(anyhow::anyhow!(
             "SeatbeltSandbox is only available on macOS"

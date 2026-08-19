@@ -783,8 +783,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
-use llm_harness_runtime::platform::sandbox::{Sandbox, SandboxConfig};
-use llm_harness_runtime::spawn::spawner::EnvFactory;
+use llm_harness_runtime_platform::env::EnvFactory;
+use llm_harness_runtime_platform::sandbox::{Sandbox, SandboxConfig};
 
 /// 基于真实 OS 的 `EnvFactory` 实现，使用 `OsEnv`。
 pub struct OsEnvFactory;
@@ -856,7 +856,7 @@ impl Sandbox for OsEnvSandbox {
 #[cfg(test)]
 mod sandbox_tests {
     use super::*;
-    use llm_harness_runtime::platform::sandbox::ResourceLimits;
+    use llm_harness_runtime_platform::sandbox::ResourceLimits;
 
     #[tokio::test]
     async fn os_env_sandbox_starts() {

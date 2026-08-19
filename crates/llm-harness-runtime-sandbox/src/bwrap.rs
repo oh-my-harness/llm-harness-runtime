@@ -24,7 +24,7 @@ use cap_std::fs::{Dir, MetadataExt, OpenOptions};
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use llm_harness_runtime::platform::sandbox::{Sandbox, SandboxConfig};
+use llm_harness_runtime_platform::sandbox::{Sandbox, SandboxConfig};
 use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
 

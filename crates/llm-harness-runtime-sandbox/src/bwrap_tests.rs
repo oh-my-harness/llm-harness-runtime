@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use llm_harness_runtime::platform::sandbox::{NetRule, ResourceLimits, SandboxConfig};
+use llm_harness_runtime_platform::sandbox::{NetRule, ResourceLimits, SandboxConfig};
 use llm_harness_types::ShellOptions;
 use tokio_util::sync::CancellationToken;
 

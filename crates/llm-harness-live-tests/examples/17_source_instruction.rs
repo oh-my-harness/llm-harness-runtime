@@ -28,7 +28,7 @@ use futures::future::BoxFuture;
 use llm_harness_agent::AgentHarness;
 use llm_harness_agent::HarnessBuilder;
 use llm_harness_live_tests::{EventCapture, LiveProvider, SINGLE_TURN, with_timeout};
-use llm_harness_runtime::platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
+use llm_harness_runtime::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_runtime_sandbox::OsEnvSandbox;
 use llm_harness_strategy::{ProjectInstructionPlugin, SourceTagEntry, SourceTagPlugin};
 use llm_harness_types::{DataBlock, ExecutionEnv, Tool, ToolContext, ToolFailure, ToolResult};

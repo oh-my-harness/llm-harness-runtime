@@ -19,13 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use llm_harness_agent::{HarnessBuildError, HarnessBuilder};
 
-// ── EnvFactory ────────────────────────────────────────────────────────────
-
-/// `ExecutionEnv` 的抽象工厂，使 `HarnessSubAgentSpawner` 无需
-/// 直接依赖 `llm-harness-runtime-sandbox`。
-pub trait EnvFactory: Send + Sync {
-    fn create(&self, cwd: &Path) -> Result<Arc<dyn ExecutionEnv>, AgentError>;
-}
+use llm_harness_runtime_platform::env::EnvFactory;
 
 // ── SessionFactory ────────────────────────────────────────────────────────
 

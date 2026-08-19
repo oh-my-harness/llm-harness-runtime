@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use llm_harness_agent::HarnessHooks;
-use llm_harness_runtime::observability::tracer::{CaptureLevel, SpanCaptureConfig, SpanStatus};
-use llm_harness_runtime::observability::tracing_adapter::TracingHookAdapter;
+use llm_harness_runtime::tracer::{CaptureLevel, SpanCaptureConfig, SpanStatus};
+use llm_harness_runtime::tracing_adapter::TracingHookAdapter;
 use llm_harness_runtime_trace_otel::InMemoryTraceExporter;
 use llm_harness_types::{BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook};
 

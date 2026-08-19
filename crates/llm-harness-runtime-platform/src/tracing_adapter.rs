@@ -9,7 +9,7 @@ use llm_harness_types::{
     BeforeProviderRequestHook,
 };
 
-use crate::observability::tracer::{
+use crate::tracer::{
     AttributeValue, CaptureLevel, SpanCaptureConfig, SpanEvent, SpanId, SpanKind, SpanStatus,
     TraceExporter, TraceId,
 };
@@ -387,7 +387,7 @@ impl AfterTurnHook for TracingHookAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observability::tracer::test_util::{NoopExporter, RecordingExporter};
+    use crate::tracer::test_util::{NoopExporter, RecordingExporter};
 
     #[test]
     fn adapter_construction() {
