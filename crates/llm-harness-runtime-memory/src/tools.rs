@@ -35,7 +35,14 @@ impl Tool for MemoryWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Persist a durable user-approved fact or preference. Do not use for secrets, external documents, or unapproved inferences."
+        "Persist a durable fact or preference for future conversations. Written content is readable via knowledge_search in subsequent turns or sessions.\n\n\
+         Use when: the user communicates a durable fact or preference worth persisting across sessions, whether or not they explicitly say \"remember\" — e.g. preferences, environment details, project context.\n\
+         Don't use for: secrets, API keys, or credentials; storing full documents (use write); inferences or guesses the user did not state; transient information that only matters for the current task.\n\
+         Returns: JSON object with reference (source_id, item_id, revision) and visibility state. The reference can be used with memory_forget to delete, or with knowledge_search/knowledge_read to retrieve later.\n\n\
+         Examples:\n\
+         {\"content\": \"User prefers responses in Chinese\"}\n\
+         {\"content\": \"User's timezone is UTC+8\", \"kind\": \"preference\"}\n\
+         {\"content\": \"Project uses Rust 1.75\", \"kind\": \"fact\", \"ttl_seconds\": 86400}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -46,16 +53,16 @@ impl Tool for MemoryWriteTool {
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "The concise durable fact or preference the user approved remembering."
+                        "description": "The concise durable fact or preference the user approved remembering. e.g. \"User prefers concise answers\", \"Project uses Rust 1.75\""
                     },
                     "kind": {
                         "type": "string",
-                        "description": "Optional application-defined memory category."
+                        "description": "Optional application-defined memory category. e.g. \"preference\", \"fact\", \"context\""
                     },
                     "ttl_seconds": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Optional requested lifetime; policy determines the final TTL."
+                        "description": "Optional requested lifetime in seconds; policy determines the final TTL. e.g. 3600"
                     }
                 },
                 "required": ["content"],
@@ -133,7 +140,12 @@ impl Tool for MemoryForgetTool {
     }
 
     fn description(&self) -> &str {
-        "Delete a memory using an exact reference previously returned by memory or knowledge tools."
+        "Delete a previously stored memory by its exact reference. The reference must match what was returned by memory_write or knowledge_read.\n\n\
+         Use when: the user asks to forget or delete a specific memory; cleaning up outdated or incorrect stored information.\n\
+         Don't use for: guessing references without a prior write or read; bulk deletion (call once per reference).\n\
+         Returns: JSON object confirming the deletion with the reference and visibility state.\n\n\
+         Examples:\n\
+         {\"reference\": {\"source_id\": \"memory\", \"item_id\": \"a1b2c3\", \"revision\": \"rev-1\"}}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -144,10 +156,20 @@ impl Tool for MemoryForgetTool {
                 "properties": {
                     "reference": {
                         "type": "object",
+                        "description": "Exact reference returned by memory_write or knowledge_read. Must be used as-is. e.g. {\"source_id\": \"memory\", \"item_id\": \"a1b2c3\", \"revision\": \"rev-1\"}",
                         "properties": {
-                            "source_id": {"type": "string"},
-                            "item_id": {"type": "string"},
-                            "revision": {"type": "string"}
+                            "source_id": {
+                                "type": "string",
+                                "description": "Knowledge source ID. e.g. \"memory\""
+                            },
+                            "item_id": {
+                                "type": "string",
+                                "description": "Opaque item identifier. e.g. \"a1b2c3\""
+                            },
+                            "revision": {
+                                "type": "string",
+                                "description": "Revision token from the original write or read. e.g. \"rev-1\""
+                            }
                         },
                         "required": ["source_id", "item_id", "revision"],
                         "additionalProperties": false
