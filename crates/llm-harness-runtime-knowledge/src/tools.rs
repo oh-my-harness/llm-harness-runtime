@@ -52,7 +52,14 @@ impl Tool for KnowledgeSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search authorized knowledge sources. Optionally select one source; otherwise results are safely federated. Returns lightweight references; use knowledge_read to inspect evidence."
+        "Search knowledge sources for relevant information. Returns lightweight references with snippets — use knowledge_read to inspect full content.\n\n\
+         Use when: looking up documentation, technical specs, or reference material; finding background information before answering a question; locating specific topics across knowledge sources.\n\
+         Don't use for: reading full content of a search hit (use knowledge_read); searching the local filesystem (use grep); finding files by name pattern (use glob).\n\
+         Returns: JSON object with hits (each containing reference, title, snippet, suggested_selectors, uri) and source_failures. Each hit's reference is needed by knowledge_read to retrieve full content.\n\n\
+         Examples:\n\
+         {\"query\": \"rust async runtime\"}\n\
+         {\"query\": \"API authentication\", \"source_id\": \"docs\"}\n\
+         {\"query\": \"deployment guide\", \"domains\": [\"engineering\"], \"limit\": 5}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -61,10 +68,24 @@ impl Tool for KnowledgeSearchTool {
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
-                    "source_id": {"type": "string"},
-                    "domains": {"type": "array", "items": {"type": "string"}},
-                    "limit": {"type": "integer", "minimum": 1}
+                    "query": {
+                        "type": "string",
+                        "description": "Search query text. e.g. \"rust async runtime\", \"API authentication\""
+                    },
+                    "source_id": {
+                        "type": "string",
+                        "description": "Restrict search to a specific knowledge source by ID. If omitted, all sources are searched. e.g. \"docs\", \"wiki\""
+                    },
+                    "domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Filter sources by domain. e.g. [\"engineering\", \"security\"]"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum number of results to return. e.g. 5"
+                    }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -215,7 +236,14 @@ impl Tool for KnowledgeReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read authorized evidence using an opaque reference returned by knowledge_search."
+        "Retrieve full content of a knowledge item found via knowledge_search. Returns the content blocks plus a citation handle to reference in your answer.\n\n\
+         Use when: you have a reference from knowledge_search and need the full text; reading specific sections or line ranges of a document; retrieving evidence to support your answer.\n\
+         Don't use for: searching for information (use knowledge_search); reading local files (use read); guessing a reference without first searching.\n\
+         Returns: Text content blocks with a citation handle (e.g. [K:abc123:1]). Include this handle in your final answer when citing the retrieved information. Content may be truncated if it exceeds the byte limit.\n\n\
+         Examples:\n\
+         {\"reference\": {\"source_id\": \"docs\", \"item_id\": \"rust-async\"}}\n\
+         {\"reference\": {\"source_id\": \"docs\", \"item_id\": \"api-guide\"}, \"selector\": {\"kind\": \"line_range\", \"start\": 1, \"end\": 50}}\n\
+         {\"reference\": {\"source_id\": \"wiki\", \"item_id\": \"deployment\"}, \"selector\": {\"kind\": \"sections\", \"sections\": [{\"id\": \"intro\"}]}}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -225,16 +253,26 @@ impl Tool for KnowledgeReadTool {
             "properties": {
                 "reference": {
                     "type": "object",
+                    "description": "Opaque reference returned by knowledge_search. Must be used as-is without modification.",
                     "properties": {
-                        "source_id": {"type": "string"},
-                        "item_id": {"type": "string"},
-                        "revision": {"type": ["string", "null"]}
+                        "source_id": {
+                            "type": "string",
+                            "description": "Knowledge source ID. e.g. \"docs\", \"wiki\""
+                        },
+                        "item_id": {
+                            "type": "string",
+                            "description": "Opaque item identifier within the source. e.g. \"rust-async\", \"api-guide\""
+                        },
+                        "revision": {
+                            "type": ["string", "null"],
+                            "description": "Optional revision token for versioned content. e.g. \"rev-3\""
+                        }
                     },
                     "required": ["source_id", "item_id"],
                     "additionalProperties": false
                 },
                 "selector": {
-                    "description": "Structured selector returned or suggested by knowledge_search.",
+                    "description": "Which part of the document to read. If omitted, reads the entire document. Use selectors suggested by knowledge_search hits when available. e.g. {\"kind\": \"document\"}",
                     "oneOf": [
                         {
                             "type": "object",
