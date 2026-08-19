@@ -8,6 +8,10 @@ license.workspace = true
 llm-harness-runtime-platform.workspace = true
 anyhow.workspace = true
 futures.workspace             = true
+opentelemetry.workspace       = true
+opentelemetry_sdk.workspace   = true
+opentelemetry-otlp.workspace  = true
+tokio = { workspace = true, features = ["sync", "rt"] }
 
 [dev-dependencies]
 tokio  = { workspace = true, features = ["macros", "rt-multi-thread"] }

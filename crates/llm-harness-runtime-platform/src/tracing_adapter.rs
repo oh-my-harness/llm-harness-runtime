@@ -6,7 +6,7 @@ use futures::future::BoxFuture;
 use llm_harness_types::{
     AfterProviderResponseCtx, AfterProviderResponseHook, AfterToolCallCtx, AfterToolCallDecision,
     AfterToolCallHook, AfterTurnCtx, AfterTurnHook, BeforeProviderRequestCtx,
-    BeforeProviderRequestHook,
+    BeforeProviderRequestHook, BeforeTurnCtx, BeforeTurnHook,
 };
 
 use crate::tracer::{
@@ -380,6 +380,14 @@ impl AfterTurnHook for TracingHookAdapter {
             if !completed.is_empty() {
                 let _ = self.exporter.export(&completed).await;
             }
+        })
+    }
+}
+
+impl BeforeTurnHook for TracingHookAdapter {
+    fn before_turn<'a>(&'a self, ctx: BeforeTurnCtx<'a>) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            self.begin_turn(ctx.turn_index);
         })
     }
 }

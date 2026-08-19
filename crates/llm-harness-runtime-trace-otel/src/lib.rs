@@ -1,3 +1,8 @@
+mod convert;
+mod otlp;
+
+pub use otlp::{OtlpConfig, OtlpTraceExporter};
+
 use std::sync::Mutex;
 
 use anyhow::Result;
