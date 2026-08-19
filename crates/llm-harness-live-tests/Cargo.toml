@@ -10,7 +10,7 @@ default = ["live-llm"]
 live-llm = [
     "dep:llm-harness-loop",
     "dep:llm-harness-runtime",
-    "dep:llm-harness-runtime-sandbox-os",
+    "dep:llm-harness-runtime-sandbox",
     "dep:llm-harness-agent",
     "dep:llm-harness-types",
     "dep:tokio",
@@ -20,7 +20,7 @@ live-llm = [
 [dependencies]
 llm-harness-loop = { workspace = true, features = ["test-utils"], optional = true }
 llm-harness-runtime = { workspace = true, optional = true }
-llm-harness-runtime-sandbox-os = { workspace = true, optional = true }
+llm-harness-runtime-sandbox = { workspace = true, optional = true }
 llm-harness-agent = { workspace = true, optional = true }
 llm-harness-types = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"], optional = true }

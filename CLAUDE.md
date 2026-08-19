@@ -113,9 +113,7 @@ llm-harness-runtime/          ← 本仓库根
 │   ├── llm-harness-loop/     (agent loop 引擎)
 │   ├── llm-harness-agent/    (AgentHarness, Session, skills)
 │   ├── llm-harness-runtime/  (CompositeHook, ToolRegistry, TaskRunner)
-│   ├── llm-harness-runtime-sandbox-os/
-│   ├── llm-harness-runtime-sandbox-bwrap/
-│   ├── llm-harness-runtime-sandbox-seatbelt/
+│   ├── llm-harness-runtime-sandbox/  (os/bwrap/seatbelt backends, feature-gated)
 │   ├── llm-harness-runtime-mcp/
 │   ├── llm-harness-runtime-audit-jsonl/
 │   ├── llm-harness-runtime-trace-otel/
@@ -139,7 +137,7 @@ llm-harness-types      → llm_adapter (外部 git 依赖，非内部 crate)
 
 **硬性规则：**
 - `llm-harness-types` 不依赖其他内部 crate，保持纯类型/trait 声明。可依赖外部 git crate（如 `llm_adapter`）用于 re-export 共享类型。
-- `llm-harness-runtime-*` 各 crate 不相互依赖（可单独使用）。
+- `llm-harness-runtime-sandbox` 不依赖其他 runtime 后端 crate；其他 `llm-harness-runtime-*` 各 crate 不相互依赖（可单独使用）。
 - `llm-harness-py` 已迁移到 Senza 仓库，通过 git 依赖引用本仓库 crate，不再在本 workspace 内。
 - 依赖方向不允许反转（下层不依赖上层）。
 

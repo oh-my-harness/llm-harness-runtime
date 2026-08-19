@@ -1,9 +1,10 @@
-//! Shared shell output draining logic used by `OsEnv` and `BwrapEnv`.
+//! Shared shell output draining logic used by `OsEnv`, `BwrapEnv`, and
+//! `SeatbeltEnv`.
 //!
-//! Both backends spawn a child process (directly or via `bwrap`) and need the
-//! same stdout/stderr draining, UTF-8 boundary handling, timeout, and abort
-//! logic. Extracting it here avoids code duplication and keeps
-//! `utf8_safe_boundary` as an internal detail.
+//! All three backends spawn a child process (directly, via `bwrap`, or via
+//! `sandbox-exec`) and need the same stdout/stderr draining, UTF-8 boundary
+//! handling, timeout, and abort logic. Extracting it here avoids code
+//! duplication and keeps `utf8_safe_boundary` as an internal detail.
 
 use llm_harness_types::{EnvError, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;

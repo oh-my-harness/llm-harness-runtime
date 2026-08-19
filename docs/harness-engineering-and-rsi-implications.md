@@ -165,7 +165,7 @@ instruction prompts → structured context → workflow → harness code → opt
 **实现**：`Sandbox` trait 有 `start/reset/shutdown`，`SandboxConfig` 有 `fs_allowlist/denylist`、`net_allowlist`、`ResourceLimits`（CPU/memory/disk/timeout）。`shell` executor 在 sandbox 内执行命令。
 
 **不够好**：
-- **无实际资源计量**：`ResourceLimits` 声明了限制，但 sandbox 后端是否真正 enforce 取决于实现（`sandbox-os` / `bwrap` / `seatbelt`）。runtime 层不聚合 sandbox 的实际资源消耗。
+- **无实际资源计量**：`ResourceLimits` 声明了限制，但 sandbox 后端是否真正 enforce 取决于实现（`os` / `bwrap` / `seatbelt`，均在 `llm-harness-runtime-sandbox` crate 内按 feature 启用）。runtime 层不聚合 sandbox 的实际资源消耗。
 - **无多 sandbox 管理**：如果并行跑多个 sub-agent 各用一个 sandbox，没有统一的资源池管理和计费。
 
 **文章对照**：文章的 "process manager: launch jobs, inspect logs, cancel failed runs" 隐含对多个 sandbox 后端任务的管理。

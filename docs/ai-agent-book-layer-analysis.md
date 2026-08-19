@@ -723,7 +723,7 @@
   - 观点 10 已讨论。不上升为统一策略层。
 
   **8. 沙盒隔离**（OS 级 / 容器 / microVM / 资源配额）
-  - 机制层：✅ 已具备。`Sandbox` trait + `SandboxConfig`（fs_allowlist/denylist, net_allowlist, ResourceLimits: max_cpus/max_memory_mb/max_disk_mb/timeout）+ `OsEnvSandbox`（开发用）+ `sandbox-bwrap`（Linux）/ `sandbox-seatbelt`（macOS）（生产用）。
+  - 机制层：✅ 已具备。`Sandbox` trait + `SandboxConfig`（fs_allowlist/denylist, net_allowlist, ResourceLimits: max_cpus/max_memory_mb/max_disk_mb/timeout）+ `OsEnvSandbox`（开发用）+ `BwrapSandbox`（Linux）/ `SeatbeltSandbox`（macOS）（生产用），均在 `llm-harness-runtime-sandbox` crate 内按 feature 启用。
   - runtime 策略层：无。隔离层级选择是部署决策。
 
   **9. 可观测性**（日志、审计追踪、性能指标、告警）
@@ -882,7 +882,7 @@
 
 - **code_interpreter**：不需要在 runtime-tools 中内置。
   - `bash` 是比 `code_interpreter` 更通用的执行器——`python -c "..."` 或 `python script.py` 就能做 code_interpreter 做的事。
-  - 教程说 code_interpreter 的价值是"沙盒环境 + 预装库"——沙盒由 `Sandbox` trait + `sandbox-bwrap`/`sandbox-seatbelt` 解决，预装库是部署配置，不是 runtime 的职责。
+  - 教程说 code_interpreter 的价值是"沙盒环境 + 预装库"——沙盒由 `Sandbox` trait + `BwrapSandbox`/`SeatbeltSandbox` 解决，预装库是部署配置，不是 runtime 的职责。
   - code_interpreter 与 bash 的区别在于"隔离级别"，但 runtime 的 `ExecutionEnv` + `Sandbox` 已抽象了隔离层级，`bash` 可以在 sandbox 中运行。
   - 结论：`bash` + `Sandbox` = `code_interpreter`，不需要单独内置。如果某个部署需要更严格的 Python 专用沙盒，那是用户自定义工具。
 

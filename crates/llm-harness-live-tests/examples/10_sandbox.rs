@@ -20,7 +20,7 @@ use llm_harness_live_tests::{
     EventCapture, LiveProvider, SINGLE_TURN, make_harness_with, with_timeout,
 };
 use llm_harness_runtime::platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
-use llm_harness_runtime_sandbox_os::OsEnvSandbox;
+use llm_harness_runtime_sandbox::OsEnvSandbox;
 use llm_harness_types::{ExecutionEnv, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
 

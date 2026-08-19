@@ -23,7 +23,7 @@ use llm_harness_runtime::spawn::delivery::{IdleWatcher, async_spawn_pair};
 use llm_harness_runtime::spawn::message_bus::{MessageBus, message_bus_pair};
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_runtime::spawn::tools::SpawnAgentTool;
-use llm_harness_runtime_sandbox_os::{OsEnv, OsEnvFactory};
+use llm_harness_runtime_sandbox::{OsEnv, OsEnvFactory};
 use llm_harness_types::ExecutionEnv;
 use std::sync::Arc;
 struct NoopPlugin;

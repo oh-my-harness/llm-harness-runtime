@@ -28,9 +28,9 @@ tracing.workspace              = true
 [dev-dependencies]
 llm-harness-loop = { workspace = true, features = ["test-utils"] }
 llm-harness-strategy.workspace = true
-llm-harness-runtime-sandbox-os  = { path = "../llm-harness-runtime-sandbox-os" }
-llm-harness-runtime-audit-jsonl = { path = "../llm-harness-runtime-audit-jsonl" }
-llm-harness-runtime-trace-otel  = { path = "../llm-harness-runtime-trace-otel" }
+llm-harness-runtime-sandbox.workspace  = true
+llm-harness-runtime-audit-jsonl.workspace = true
+llm-harness-runtime-trace-otel.workspace  = true
 chrono.workspace  = true
 futures.workspace = true
 tokio     = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }

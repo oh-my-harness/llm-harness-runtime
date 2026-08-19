@@ -1622,7 +1622,7 @@ mod tests {
     #[test]
     fn build_registers_skill_read_tool_when_skills_present() {
         use llm_harness_loop::test_utils::MockLlmClient;
-        use llm_harness_runtime_sandbox_os::OsEnv;
+        use llm_harness_runtime_sandbox::OsEnv;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let env: Arc<dyn llm_harness_types::ExecutionEnv> = Arc::new(OsEnv::new(tmp.path()));
@@ -1659,7 +1659,7 @@ mod tests {
     #[test]
     fn disable_skill_read_tool_opt_out() {
         use llm_harness_loop::test_utils::MockLlmClient;
-        use llm_harness_runtime_sandbox_os::OsEnv;
+        use llm_harness_runtime_sandbox::OsEnv;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let env: Arc<dyn llm_harness_types::ExecutionEnv> = Arc::new(OsEnv::new(tmp.path()));
@@ -1682,7 +1682,7 @@ mod tests {
     #[test]
     fn build_sets_readable_skills_when_skills_present() {
         use llm_harness_loop::test_utils::MockLlmClient;
-        use llm_harness_runtime_sandbox_os::OsEnv;
+        use llm_harness_runtime_sandbox::OsEnv;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let env: Arc<dyn llm_harness_types::ExecutionEnv> = Arc::new(OsEnv::new(tmp.path()));
@@ -1717,7 +1717,7 @@ mod tests {
     #[test]
     fn disable_skill_read_tool_leaves_readable_skills_none() {
         use llm_harness_loop::test_utils::MockLlmClient;
-        use llm_harness_runtime_sandbox_os::OsEnv;
+        use llm_harness_runtime_sandbox::OsEnv;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let env: Arc<dyn llm_harness_types::ExecutionEnv> = Arc::new(OsEnv::new(tmp.path()));

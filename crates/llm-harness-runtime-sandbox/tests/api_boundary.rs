@@ -32,7 +32,7 @@ impl ForgeCrate {
              version = \"0.1.0\"\n\
              edition = \"2021\"\n\n\
              [dependencies]\n\
-             llm-harness-runtime-sandbox-os = {{ path = {serialized_path} }}\n"
+             llm-harness-runtime-sandbox = {{ path = {serialized_path} }}\n"
         );
         std::fs::write(dir.join("Cargo.toml"), cargo_toml).expect("write forge Cargo.toml");
 
@@ -148,7 +148,7 @@ fn child_reaper_api_boundaries_are_enforced() {
     forge.write_bin(
         "positive",
         r#"
-use llm_harness_runtime_sandbox_os::{
+use llm_harness_runtime_sandbox::{
     ChildLease, ChildReaper, SpawnAdmission, drain_child_output_guarded,
 };
 fn check_types(_: Option<ChildLease>, _: Option<SpawnAdmission>) {}
@@ -238,7 +238,7 @@ fn probes() -> Vec<Probe> {
         Probe {
             name: "child_lease_construction",
             source: r#"
-use llm_harness_runtime_sandbox_os::ChildLease;
+use llm_harness_runtime_sandbox::ChildLease;
 fn probe() {
     let _ = ChildLease { id: 0, core: None, stdout: None, stderr: None, confirmed: false };
 }
@@ -255,7 +255,7 @@ fn main() {}
         Probe {
             name: "spawn_admission_construction",
             source: r#"
-use llm_harness_runtime_sandbox_os::SpawnAdmission;
+use llm_harness_runtime_sandbox::SpawnAdmission;
 fn probe() { let _ = SpawnAdmission { core: None, epoch: 0 }; }
 fn main() {}
 "#
@@ -269,8 +269,7 @@ fn main() {}
 }
 
 fn method_probe(name: &'static str, symbol: &'static str, body: &'static str) -> Probe {
-    let source =
-        format!("use llm_harness_runtime_sandbox_os::ChildLease;\n{body}\nfn main() {{}}\n");
+    let source = format!("use llm_harness_runtime_sandbox::ChildLease;\n{body}\nfn main() {{}}\n");
     Probe {
         name,
         source,
@@ -281,7 +280,7 @@ fn method_probe(name: &'static str, symbol: &'static str, body: &'static str) ->
 
 fn field_probe(name: &'static str, type_name: &'static str, field: &'static str) -> Probe {
     let source = format!(
-        "use llm_harness_runtime_sandbox_os::{type_name};\n\
+        "use llm_harness_runtime_sandbox::{type_name};\n\
          fn probe(value: &{type_name}) {{ let _ = &value.{field}; }}\n\
          fn main() {{}}\n"
     );
@@ -295,7 +294,7 @@ fn field_probe(name: &'static str, type_name: &'static str, field: &'static str)
 
 fn trait_probe(name: &'static str, type_name: &'static str, trait_name: &'static str) -> Probe {
     let source = format!(
-        "use llm_harness_runtime_sandbox_os::{type_name};\n\
+        "use llm_harness_runtime_sandbox::{type_name};\n\
          fn require_trait<T: {trait_name}>() {{}}\n\
          fn probe() {{ require_trait::<{type_name}>(); }}\n\
          fn main() {{}}\n"

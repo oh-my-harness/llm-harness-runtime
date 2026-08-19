@@ -21,7 +21,7 @@ use llm_harness_runtime::spawn::spawner::JsonlSessionFactory;
 use llm_harness_runtime::workflow::engine::{WorkflowEngine, WorkflowEngineConfig, WorkflowEvent};
 use llm_harness_runtime::workflow::judge::EdgeConditionJudge;
 use llm_harness_runtime::workflow::model::{Edge, Step, Workflow};
-use llm_harness_runtime_sandbox_os::OsEnvFactory;
+use llm_harness_runtime_sandbox::OsEnvFactory;
 use llm_harness_types::{DataBlock, Tool, ToolContext, ToolFailure, ToolResult};
 
 // ── Echo tool (for Part 3) ──────────────────────────────────────────────────

@@ -21,7 +21,7 @@ use llm_harness_runtime::spawn::spawner::JsonlSessionFactory;
 use llm_harness_runtime::workflow::engine::{WorkflowEngine, WorkflowEngineConfig};
 use llm_harness_runtime::workflow::judge::EdgeConditionJudge;
 use llm_harness_runtime::workflow::model::{Edge, Step, Workflow, WorkflowStatus};
-use llm_harness_runtime_sandbox_os::OsEnvFactory;
+use llm_harness_runtime_sandbox::OsEnvFactory;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 

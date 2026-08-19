@@ -18,7 +18,7 @@ use llm_harness_runtime::workflow::engine::{
 };
 use llm_harness_runtime::workflow::error::WorkflowError;
 use llm_harness_runtime::workflow::model::WorkflowStatus;
-use llm_harness_runtime_sandbox_os::OsEnvSandbox;
+use llm_harness_runtime_sandbox::OsEnvSandbox;
 use llm_harness_types::{
     AgentError, DataBlock, ExecutionEnv, Tool, ToolContext, ToolFailure, ToolResult,
 };

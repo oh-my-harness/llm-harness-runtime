@@ -7,7 +7,7 @@
 
 ```
 types  ──┐
-loop   ──┼──→  runtime  ──→  runtime-sandbox-os / bwrap / seatbelt
+loop   ──┼──→  runtime  ──→  runtime-sandbox (os/bwrap/seatbelt)
 agent  ──┘                ──→  runtime-audit-jsonl
                           ──→  runtime-trace-otel
                           ──→  runtime-mcp
@@ -19,7 +19,7 @@ agent  ──┘                ──→  runtime-audit-jsonl
 - `agent`：`AgentHarness` + `Session` + `Plugin` + `SubAgentSpawner` trait。
 - **`runtime`（本 crate）**：把 agent 拼装成可运行系统——harness 构建、sub-agent 派发、workflow 编排、cost/budget/audit/trace/sandbox 的 trait 与粘合层。
 
-`runtime` 不直接依赖任何 sandbox/audit/trace 后端 crate；后端 crate 依赖 runtime 实现 trait。dev-dependencies 里有 `runtime-sandbox-os` / `runtime-audit-jsonl` / `runtime-trace-otel`，仅用于测试。
+- `runtime` 不直接依赖任何 sandbox/audit/trace 后端 crate；后端 crate 依赖 runtime 实现 trait。dev-dependencies 里有 `runtime-sandbox` / `runtime-audit-jsonl` / `runtime-trace-otel`，仅用于测试。
 
 ## 2. 目录结构
 

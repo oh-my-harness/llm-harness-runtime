@@ -9,8 +9,6 @@ use tokio_util::sync::CancellationToken;
 use crate::shell_runner::drain_child_output;
 
 /// Concrete `ExecutionEnv` backed by the real OS filesystem and shell.
-///
-/// Reimplemented from `llm-harness-core` to bypass the `#[cfg(test)]` gate.
 #[derive(Debug)]
 pub struct OsEnv {
     working_dir: PathBuf,
@@ -776,5 +774,143 @@ mod tests {
         let out = env.execute_shell(cmd, opts).await.unwrap();
         assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
         assert_eq!(out.stdout.trim(), "injected_value_42");
+    }
+}
+
+// ── OsEnvFactory ──────────────────────────────────────────────────────────
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use anyhow::Result;
+use llm_harness_runtime::platform::sandbox::{Sandbox, SandboxConfig};
+use llm_harness_runtime::spawn::spawner::EnvFactory;
+
+/// 基于真实 OS 的 `EnvFactory` 实现，使用 `OsEnv`。
+pub struct OsEnvFactory;
+
+impl EnvFactory for OsEnvFactory {
+    fn create(&self, cwd: &Path) -> Result<Arc<dyn ExecutionEnv>, llm_harness_types::AgentError> {
+        Ok(Arc::new(OsEnv::new(cwd)))
+    }
+}
+
+/// Pure `OsEnv` wrapper without security isolation.
+///
+/// Suitable for development and testing. For production isolation,
+/// enable the `bwrap` feature (Linux) or `seatbelt` feature (macOS).
+pub struct OsEnvSandbox {
+    env: Arc<OsEnv>,
+    config: SandboxConfig,
+    running: AtomicBool,
+}
+
+impl OsEnvSandbox {
+    /// Create a new `OsEnvSandbox`.
+    ///
+    /// Uses `config.work_dir` if set; otherwise falls back to the current
+    /// working directory.
+    pub fn new(config: SandboxConfig) -> Self {
+        let working_dir = config
+            .work_dir
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        Self {
+            env: Arc::new(OsEnv::new(working_dir)),
+            config,
+            running: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Sandbox for OsEnvSandbox {
+    fn start(&self) -> BoxFuture<'_, Result<()>> {
+        async move {
+            self.running.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn env(&self) -> Arc<dyn ExecutionEnv> {
+        self.env.clone()
+    }
+
+    fn reset(&self) -> BoxFuture<'_, Result<()>> {
+        async move { Ok(()) }.boxed()
+    }
+
+    fn shutdown(self: Box<Self>) -> BoxFuture<'static, Result<()>> {
+        async move { Ok(()) }.boxed()
+    }
+
+    fn config(&self) -> &SandboxConfig {
+        &self.config
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    use super::*;
+    use llm_harness_runtime::platform::sandbox::ResourceLimits;
+
+    #[tokio::test]
+    async fn os_env_sandbox_starts() {
+        let config = SandboxConfig {
+            fs_allowlist: vec![],
+            fs_denylist: vec![],
+            net_allowlist: vec![],
+            resource_limits: ResourceLimits {
+                max_cpus: None,
+                max_memory_mb: None,
+                max_disk_mb: None,
+                timeout: None,
+            },
+            work_dir: None,
+        };
+        let sandbox = OsEnvSandbox::new(config);
+        sandbox.start().await.unwrap();
+        assert!(sandbox.is_running());
+        assert!(sandbox.env().working_dir().exists());
+        Box::new(sandbox).shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sandbox_env_can_read_write() {
+        use std::path::Path;
+        use tokio_util::sync::CancellationToken;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config = SandboxConfig {
+            fs_allowlist: vec![],
+            fs_denylist: vec![],
+            net_allowlist: vec![],
+            resource_limits: ResourceLimits {
+                max_cpus: None,
+                max_memory_mb: None,
+                max_disk_mb: None,
+                timeout: None,
+            },
+            work_dir: Some(tmp.path().to_path_buf()),
+        };
+        let sandbox = OsEnvSandbox::new(config);
+        sandbox.start().await.unwrap();
+
+        let env = sandbox.env();
+        let abort = CancellationToken::new();
+        env.write_file(Path::new("hello.txt"), b"hello world", abort.clone())
+            .await
+            .unwrap();
+        let content = env
+            .read_text_file(Path::new("hello.txt"), abort)
+            .await
+            .unwrap();
+        assert_eq!(content, "hello world");
+
+        Box::new(sandbox).shutdown().await.unwrap();
     }
 }

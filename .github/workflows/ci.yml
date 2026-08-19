@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
       - name: Check out repository
@@ -49,4 +49,9 @@ jobs:
 
       - name: Run bwrap sandbox isolation tests (Linux only)
         if: runner.os == 'Linux'
-        run: cargo test -p llm-harness-runtime-sandbox-bwrap -- --include-ignored
+        run: cargo test -p llm-harness-runtime-sandbox --features bwrap -- --include-ignored
+
+
+      - name: Run seatbelt sandbox isolation tests (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo test -p llm-harness-runtime-sandbox --features seatbelt -- seatbelt_tests

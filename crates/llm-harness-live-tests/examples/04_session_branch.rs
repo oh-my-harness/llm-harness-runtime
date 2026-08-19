@@ -183,7 +183,7 @@ async fn main() {
     // Build a new harness with the reloaded session
     let env: std::sync::Arc<dyn llm_harness_types::ExecutionEnv> = {
         use llm_harness_runtime::platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
-        use llm_harness_runtime_sandbox_os::OsEnvSandbox;
+        use llm_harness_runtime_sandbox::OsEnvSandbox;
         let config = SandboxConfig {
             fs_allowlist: vec![tmp2.path().to_path_buf()],
             fs_denylist: vec![],

@@ -15,7 +15,7 @@ use llm_harness_runtime::observability::tracer::{CaptureLevel, SpanCaptureConfig
 use llm_harness_runtime::observability::tracing_adapter::TracingHookAdapter;
 use llm_harness_runtime::platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_runtime_audit_jsonl::JsonlAuditSink;
-use llm_harness_runtime_sandbox_os::OsEnvSandbox;
+use llm_harness_runtime_sandbox::OsEnvSandbox;
 use llm_harness_runtime_trace_otel::InMemoryTraceExporter;
 use llm_harness_types::{
     AfterProviderResponseHook, AfterToolCallHook, AfterTurnHook, BeforeProviderRequestHook, EntryId,

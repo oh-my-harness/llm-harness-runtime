@@ -855,7 +855,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use llm_harness_runtime_sandbox_os::OsEnv;
+    use llm_harness_runtime_sandbox::OsEnv;
 
     // ── format_skills_metadata ───────────────────────────────────────────────
 
@@ -1153,7 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn format_skill_invocation_wraps_content() {
-        use llm_harness_runtime_sandbox_os::OsEnv;
+        use llm_harness_runtime_sandbox::OsEnv;
 
         let tmp = TempDir::new().unwrap();
         let skill_dir = tmp.path().join("deploy");
@@ -1578,7 +1578,7 @@ mod tests {
     #[cfg(feature = "test-utils")]
     #[tokio::test]
     async fn skill_read_tool_reads_main_file() {
-        use llm_harness_runtime_sandbox_os::OsEnv;
+        use llm_harness_runtime_sandbox::OsEnv;
         use llm_harness_types::Tool;
 
         let tmp = TempDir::new().unwrap();
@@ -1612,7 +1612,7 @@ mod tests {
     #[cfg(feature = "test-utils")]
     #[tokio::test]
     async fn skill_read_tool_reads_subfile() {
-        use llm_harness_runtime_sandbox_os::OsEnv;
+        use llm_harness_runtime_sandbox::OsEnv;
         use llm_harness_types::Tool;
 
         let tmp = TempDir::new().unwrap();
@@ -1648,7 +1648,7 @@ mod tests {
     #[cfg(feature = "test-utils")]
     #[tokio::test]
     async fn skill_read_tool_unknown_skill_returns_error() {
-        use llm_harness_runtime_sandbox_os::OsEnv;
+        use llm_harness_runtime_sandbox::OsEnv;
         use llm_harness_types::Tool;
 
         let tmp = TempDir::new().unwrap();
@@ -1667,7 +1667,7 @@ mod tests {
     #[cfg(feature = "test-utils")]
     #[tokio::test]
     async fn skill_read_tool_traversal_returns_error() {
-        use llm_harness_runtime_sandbox_os::OsEnv;
+        use llm_harness_runtime_sandbox::OsEnv;
         use llm_harness_types::Tool;
 
         let tmp = TempDir::new().unwrap();

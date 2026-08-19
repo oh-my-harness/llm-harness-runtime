@@ -15,7 +15,7 @@ mod inner {
     use llm_harness_agent::AgentHarness;
     use llm_harness_agent::HarnessBuilder;
     use llm_harness_runtime::platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
-    use llm_harness_runtime_sandbox_os::OsEnvSandbox;
+    use llm_harness_runtime_sandbox::OsEnvSandbox;
 
     /// A configured live LLM provider with its model name.
     pub struct LiveProviderEntry {

@@ -5,9 +5,7 @@ members = [
     "crates/llm-harness-agent",
     # runtime
     "crates/llm-harness-runtime",
-    "crates/llm-harness-runtime-sandbox-os",
-    "crates/llm-harness-runtime-sandbox-bwrap",
-    "crates/llm-harness-runtime-sandbox-seatbelt",
+    "crates/llm-harness-runtime-sandbox",
     "crates/llm-harness-runtime-mcp",
     "crates/llm-harness-runtime-tools",
     "crates/llm-harness-strategy",
@@ -48,9 +46,8 @@ llm-harness-runtime-memory = { path = "crates/llm-harness-runtime-memory" }
 llm-harness-runtime-mcp = { path = "crates/llm-harness-runtime-mcp" }
 llm-harness-runtime-audit-jsonl = { path = "crates/llm-harness-runtime-audit-jsonl" }
 llm-harness-runtime-trace-otel = { path = "crates/llm-harness-runtime-trace-otel" }
-llm-harness-runtime-sandbox-os = { path = "crates/llm-harness-runtime-sandbox-os" }
 llm-harness-live-tests = { path = "crates/llm-harness-live-tests" }
-
+llm-harness-runtime-sandbox = { path = "crates/llm-harness-runtime-sandbox" }
 # API adapter — separate repo
 llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "193117cbb8398aadeca74a925cfd699617f8c861" }
 

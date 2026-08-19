@@ -17,6 +17,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::shell_runner::{ChildReaper, drain_child_output_guarded};
 use anyhow::Result;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, MetadataExt, OpenOptions};
@@ -24,27 +25,12 @@ use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_runtime::platform::sandbox::{Sandbox, SandboxConfig};
-use llm_harness_runtime_sandbox_os::drain_child_output_guarded;
 use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
 
 // ── Path helpers ───────────────────────────────────────────────────────────
 
-/// Lexically normalize a path: resolve `.` and `..` components without
-/// touching the filesystem.
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            c => out.push(c.as_os_str()),
-        }
-    }
-    out
-}
+// lexical_normalize is shared via the `lifecycle` module.
 
 /// Map an `io::Error` to `EnvError`, preserving the offending path.
 fn map_io_err(e: std::io::Error, path: PathBuf) -> EnvError {
@@ -73,43 +59,9 @@ fn modified_to_datetime(meta: &cap_std::fs::Metadata) -> DateTime<Utc> {
     DateTime::from_timestamp(secs, nsecs).unwrap_or_default()
 }
 
-// ── Lifecycle state ────────────────────────────────────────────────────────
-
-/// Sandbox lifecycle state, tracked atomically to coordinate shutdown.
-///
-/// - `Running`: normal operation; new work is admitted.
-/// - `Resetting`: reset is in progress; new work is rejected so reset can
-///   acquire the lock without racing against a newly-admitted command.
-///   After cleanup, the state transitions back to `Running`.
-/// - `ShuttingDown`: shutdown has begun; new work is rejected, active
-///   commands are cancelled and killed.
-/// - `Stopped`: shutdown is complete; no further operations are possible.
-/// - `Tainted`: reset cleanup failed or panicked mid-mutation; the sandbox
-///   is unusable and must be shut down and recreated.  New work is rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-enum LifecycleState {
-    Running = 0,
-    Resetting = 1,
-    ShuttingDown = 2,
-    Stopped = 3,
-    Tainted = 4,
-}
-
-impl LifecycleState {
-    fn from_atomic(v: u8) -> Self {
-        match v {
-            0 => LifecycleState::Running,
-            1 => LifecycleState::Resetting,
-            2 => LifecycleState::ShuttingDown,
-            3 => LifecycleState::Stopped,
-            _ => LifecycleState::Tainted,
-        }
-    }
-}
-/// Maximum time `shutdown()` waits for an active shell command to terminate
-/// after sending kill before proceeding with workspace deletion.
-const SHUTDOWN_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+// LifecycleState, SHUTDOWN_KILL_GRACE, and lexical_normalize are shared
+// with seatbelt.rs via the `lifecycle` module.
+use crate::lifecycle::{LifecycleAtomic, LifecycleState, SHUTDOWN_KILL_GRACE, lexical_normalize};
 
 // ── ResetLifecycleGuard ────────────────────────────────────────────────────
 
@@ -121,12 +73,11 @@ const SHUTDOWN_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(
 /// await point — including token swap, lock acquisition timeout,
 /// `spawn_blocking` errors, and workspace clearing I/O errors.
 ///
-/// The guard is created by [`BwrapEnv::begin_reset`] (transitioning
+/// The guard is created by [`BwrapEnv::lifecycle`] `begin_reset` (transitioning
 /// `Running` → `Resetting`).  On `Drop`, if not completed, it calls
-/// [`BwrapEnv::finish_reset`] to roll back to `Running`.  If shutdown stole
-/// the state (`Resetting` → `ShuttingDown`) while reset was in progress,
-/// `finish_reset` returns `false` and the guard does nothing — shutdown
-/// handles cleanup.
+/// `finish_reset` to roll back to `Running`.  If shutdown stole the state
+/// (`Resetting` → `ShuttingDown`) while reset was in progress, `finish_reset`
+/// returns `false` and the guard does nothing — shutdown handles cleanup.
 ///
 /// Once mutation starts (inside the blocking cleanup task), the guard must
 /// be **handed off** via [`ResetLifecycleGuard::handoff`] so that dropping
@@ -143,7 +94,7 @@ impl ResetLifecycleGuard {
     /// Returns `None` if the sandbox is not in `Running` state (already
     /// resetting, shutting down, or stopped).
     fn begin(env: Arc<BwrapEnv>) -> Option<Self> {
-        if env.begin_reset() {
+        if env.lifecycle.begin_reset() {
             Some(Self {
                 env,
                 completed: false,
@@ -169,7 +120,7 @@ impl Drop for ResetLifecycleGuard {
             // Roll back to Running.  If shutdown stole the state
             // (Resetting -> ShuttingDown), finish_reset() returns false
             // and we do nothing — shutdown handles cleanup.
-            self.env.finish_reset();
+            self.env.lifecycle.finish_reset();
         }
     }
 }
@@ -179,19 +130,19 @@ impl Drop for ResetLifecycleGuard {
 /// RAII guard used inside the blocking cleanup task to ensure the sandbox
 /// transitions to `Tainted` if cleanup panics or returns an error.
 ///
-/// On success, [`BwrapEnv::finish_reset`] transitions `Resetting → Running`
-/// before this guard drops, so the `taint` CAS fails (state is no longer
-/// `Resetting`) and the drop is a no-op.  On error,
-/// [`BwrapEnv::taint`] transitions `Resetting → Tainted` before drop, so
-/// the drop CAS also fails.  Only on **panic** (where neither method was
-/// called) does the drop perform the `Resetting → Tainted` transition.
+/// On success, `finish_reset` transitions `Resetting → Running` before this
+/// guard drops, so the `taint` CAS fails (state is no longer `Resetting`)
+/// and the drop is a no-op.  On error, `taint` transitions `Resetting →
+/// Tainted` before drop, so the drop CAS also fails.  Only on **panic**
+/// (where neither method was called) does the drop perform the `Resetting
+/// → Tainted` transition.
 struct TaintOnDrop {
     env: Arc<BwrapEnv>,
 }
 
 impl Drop for TaintOnDrop {
     fn drop(&mut self) {
-        self.env.taint();
+        self.env.lifecycle.taint();
     }
 }
 
@@ -230,7 +181,7 @@ pub struct BwrapEnv {
     owned: bool,
     /// Lifecycle state: `Running` admits new work; `ShuttingDown`/`Stopped`
     /// reject new work and trigger cancellation of active commands.
-    lifecycle: std::sync::atomic::AtomicU8,
+    lifecycle: LifecycleAtomic,
     /// Internal cancellation token fired when shutdown begins.  Active
     /// shell commands observe this via `drain_child_output`, which kills
     /// and waits the child when the token fires.
@@ -265,7 +216,6 @@ impl BwrapEnv {
             Some(p) => p.clone(),
             None => {
                 // Generate a unique directory to prevent cross-agent sharing
-                // when work_dir is not explicitly configured.
                 let id = uuid::Uuid::new_v4();
                 PathBuf::from(format!("/tmp/sandbox-bwrap-{id}"))
             }
@@ -330,7 +280,7 @@ impl BwrapEnv {
             caps,
             config,
             owned,
-            lifecycle: std::sync::atomic::AtomicU8::new(LifecycleState::Running as u8),
+            lifecycle: LifecycleAtomic::new(),
             shutdown_token: std::sync::Mutex::new(CancellationToken::new()),
             reset_lock: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
@@ -359,101 +309,7 @@ impl BwrapEnv {
 
     /// Returns the current lifecycle state.
     fn lifecycle(&self) -> LifecycleState {
-        LifecycleState::from_atomic(self.lifecycle.load(std::sync::atomic::Ordering::SeqCst))
-    }
-
-    /// Transition to `ShuttingDown`. Returns `true` if this call performed
-    /// the transition.  Accepts both `Running` and `Resetting` as valid
-    /// starting states so shutdown can interrupt an in-progress reset.
-    fn begin_shutdown(&self) -> bool {
-        // Try Running -> ShuttingDown first (common case).
-        if self
-            .lifecycle
-            .compare_exchange(
-                LifecycleState::Running as u8,
-                LifecycleState::ShuttingDown as u8,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_ok()
-        {
-            return true;
-        }
-        // Try Tainted -> ShuttingDown (shutdown of a tainted sandbox).
-        if self
-            .lifecycle
-            .compare_exchange(
-                LifecycleState::Tainted as u8,
-                LifecycleState::ShuttingDown as u8,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_ok()
-        {
-            return true;
-        }
-        // Try Resetting -> ShuttingDown (shutdown during reset).
-        self.lifecycle
-            .compare_exchange(
-                LifecycleState::Resetting as u8,
-                LifecycleState::ShuttingDown as u8,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_ok()
-    }
-
-    /// Transition `Running -> Resetting`. Returns `true` if this call
-    /// performed the transition.  Fails if the sandbox is already
-    /// resetting, shutting down, or stopped.
-    fn begin_reset(&self) -> bool {
-        self.lifecycle
-            .compare_exchange(
-                LifecycleState::Running as u8,
-                LifecycleState::Resetting as u8,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_ok()
-    }
-
-    /// Transition `Resetting -> Running`. Returns `true` on success.
-    /// Fails if shutdown stole the state (Resetting -> ShuttingDown) while
-    /// reset was in progress — in that case, reset returns Ok and lets
-    /// shutdown handle cleanup.
-    fn finish_reset(&self) -> bool {
-        self.lifecycle
-            .compare_exchange(
-                LifecycleState::Resetting as u8,
-                LifecycleState::Running as u8,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_ok()
-    }
-
-    /// Transition `Resetting -> Tainted`.  Called when reset cleanup fails
-    /// or panics — the workspace may be partially mutated and cannot be
-    /// trusted, so the sandbox becomes permanently unusable.  Returns
-    /// `true` if this call performed the transition.  No-op if the state
-    /// has already moved away from `Resetting` (e.g. shutdown stole it).
-    fn taint(&self) -> bool {
-        self.lifecycle
-            .compare_exchange(
-                LifecycleState::Resetting as u8,
-                LifecycleState::Tainted as u8,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
-            .is_ok()
-    }
-
-    /// Transition to `Stopped`.
-    fn finish_shutdown(&self) {
-        self.lifecycle.store(
-            LifecycleState::Stopped as u8,
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        self.lifecycle.load()
     }
 
     /// Clone the current shutdown token.  Callers should clone once and use
@@ -1061,7 +917,7 @@ impl ExecutionEnv for BwrapEnv {
             // REAPER_QUEUE_CAPACITY, preventing unbounded reaper resource
             // growth.  If the reaper is unavailable or at capacity, refuse
             // to spawn (fail-closed).
-            let reaper = llm_harness_runtime_sandbox_os::ChildReaper::global()
+            let reaper = ChildReaper::global()
                 .ok_or_else(|| EnvError::Other("child reaper unavailable".into()))?;
             let admission = reaper
                 .try_admit()
@@ -1341,10 +1197,10 @@ impl Sandbox for BwrapSandbox {
                     let result = env.clear_work_dir_contents();
                     match &result {
                         Ok(()) => {
-                            env.finish_reset();
+                            env.lifecycle.finish_reset();
                         }
                         Err(_) => {
-                            env.taint();
+                            env.lifecycle.taint();
                         }
                     }
                     result
@@ -1364,7 +1220,7 @@ impl Sandbox for BwrapSandbox {
                     // not (cancellation path).  Ensure Tainted in either
                     // case — taint() is a CAS from Resetting, so it is a
                     // no-op if already transitioned.
-                    self.env.taint();
+                    self.env.lifecycle.taint();
                     Err(anyhow::anyhow!("reset task failed: {join_err}"))
                 }
             }
@@ -1377,10 +1233,10 @@ impl Sandbox for BwrapSandbox {
         async move {
             // Transition to ShuttingDown.  This causes new operations to
             // be rejected via acquire_op_lock.
-            let was_running = sandbox.env.begin_shutdown();
+            let was_running = sandbox.env.lifecycle.begin_shutdown();
             if !was_running {
                 // Already shutting down or stopped.
-                sandbox.env.finish_shutdown();
+                sandbox.env.lifecycle.finish_shutdown();
                 sandbox.running.store(false, Ordering::SeqCst);
                 return Ok(());
             }
@@ -1410,7 +1266,7 @@ impl Sandbox for BwrapSandbox {
                     // holding the lock and may be writing to the workspace.
                     // Do NOT delete the workspace; preserve it to avoid
                     // corrupting in-flight work.
-                    sandbox.env.finish_shutdown();
+                    sandbox.env.lifecycle.finish_shutdown();
                     sandbox.running.store(false, Ordering::SeqCst);
                     return Err(anyhow::anyhow!(
                         "shutdown timed out waiting for lock; workspace preserved"
@@ -1418,7 +1274,7 @@ impl Sandbox for BwrapSandbox {
                 }
             }
 
-            sandbox.env.finish_shutdown();
+            sandbox.env.lifecycle.finish_shutdown();
             sandbox.running.store(false, Ordering::SeqCst);
             Ok(())
         }
@@ -1464,5 +1320,5 @@ enum CleanupMode {
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
+#[path = "bwrap_tests.rs"]
 mod tests;
