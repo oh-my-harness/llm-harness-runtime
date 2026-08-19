@@ -14,6 +14,10 @@
 //! The `shell_runner` module is shared infrastructure used by all backends:
 //! child process reaping, output draining, and UTF-8 boundary handling.
 
+#[cfg(any(
+    all(feature = "bwrap", target_os = "linux"),
+    all(feature = "seatbelt", target_os = "macos")
+))]
 mod lifecycle;
 pub mod shell_runner;
 

@@ -1,51 +1,40 @@
 # llm-harness-runtime 框架文档
 
-> 定位：在 `types` / `loop` / `agent` 之上的**平台层**。
-> 不含具体后端实现（sandbox/audit/trace/mcp 各有独立 crate），只定义 trait + 编排逻辑 + 默认参考实现。
+> 定位：在 `types` / `loop` / `agent` / `platform` 之上的**编排层**。
+> 不含具体后端实现（sandbox/audit/trace/mcp 各有独立 crate），只定义 workflow 编排、sub-agent 派发、规则匹配 + 通过 `llm-harness-platform` re-export 横切 trait。
 
 ## 1. 在 workspace 中的位置
 
 ```
 types  ──┐
-loop   ──┼──→  runtime  ──→  runtime-sandbox (os/bwrap/seatbelt)
-agent  ──┘                ──→  runtime-audit-jsonl
-                          ──→  runtime-trace-otel
-                          ──→  runtime-mcp
-                          ──→  ffi
+loop   ──┼──→  agent  ──→  runtime  ──→  sandbox (os/bwrap/seatbelt)
+platform ─┘                │           ──→  audit-jsonl
+                           │           ──→  trace-otel
+                           │           ──→  mcp
+                           │           ──→  strategy
+                           └──→  knowledge / knowledge-local / memory / session-recall / tools
 ```
 
 - `types`：纯数据 trait（`Tool`/`ExecutionEnv`/hooks/`CostAggregate`/`PricingProvider`）。
 - `loop`：单 agent 的 turn 循环 + LLM client。
-- `agent`：`AgentHarness` + `Session` + `Plugin` + `SubAgentSpawner` trait。
-- **`runtime`（本 crate）**：把 agent 拼装成可运行系统——harness 构建、sub-agent 派发、workflow 编排、cost/budget/audit/trace/sandbox 的 trait 与粘合层。
+- `agent`：`HarnessBuilder` + `AgentHarness` + `Session` + `Plugin` + cost tracking + compaction + skills。
+- `platform`：横切 trait 定义（`Sandbox`/`AuditSink`/`TraceExporter`/`PromptSource`）+ `env.rs`。
+- **`runtime`（本 crate）**：把 agent 拼装成可运行系统——sub-agent 派发、workflow 编排、规则匹配、task 持久化。从 `platform` re-export 横切 trait。
 
-- `runtime` 不直接依赖任何 sandbox/audit/trace 后端 crate；后端 crate 依赖 runtime 实现 trait。dev-dependencies 里有 `runtime-sandbox` / `runtime-audit-jsonl` / `runtime-trace-otel`，仅用于测试。
+- `runtime` 不直接依赖任何 sandbox/audit/trace 后端 crate；后端 crate 依赖 `platform` 实现 trait。dev-dependencies 里有 `sandbox` / `audit-jsonl` / `trace-otel`，仅用于测试。
 
 ## 2. 目录结构
 
 ```
 src/
-├── lib.rs
-├── builder.rs          # HarnessBuilder——所有路径汇聚点，留顶层
-├── rules/              # 规则匹配层（Predicate/Rule/RuleChain/RuleBasedApprovalHook）
+├── lib.rs             # pub mod 声明: rules / workflow / lifecycle / spawn
+│                      # re-export platform: audit / prompt / sandbox / tracer / tracing_adapter
+├── rules/             # 规则匹配层（Predicate/Rule/RuleChain/RuleBasedApprovalHook）
 │   ├── predicate.rs    # Predicate trait
 │   ├── rule.rs         # Rule + Decision
 │   ├── chain.rs        # RuleChain + RuleChainBuilder
 │   ├── predicates.rs   # 内置 predicate：Contains/NumberRangeField/RegexField/RateLimit
 │   └── hook.rs         # RuleBasedApprovalHook（impl BeforeToolCallHook）
-├── platform/           # 横切 trait + adapter（后端 crate 实现的接口）
-│   ├── sandbox.rs      # Sandbox trait + SandboxConfig/NetRule/ResourceLimits
-│   ├── resource.rs     # ResourceProvider trait + ResourceInjector
-│   ├── prompt.rs       # PromptSource trait + PromptTemplateCompiler
-│   ├── mcp.rs          # McpClientHandle trait + Mcp* 类型
-├── observability/      # 可观测 + 安全审计
-│   ├── audit.rs        # AuditSink trait + AuditEntry（SHA-256 hash chain）
-│   ├── tracer.rs       # TraceExporter trait + Span* 类型
-│   └── tracing_adapter.rs # core hooks → span 事件桥接
-├── control/            # 运行时控制流：成本/预算
-│   ├── cost.rs         # 从 types re-export CostAggregate/ModelCost/PricingProvider/TokenPrice
-│   ├── cost_hook.rs    # CostAccumulatorHook（AfterProviderResponseHook）
-│   └── budget.rs       # BudgetExceededHook trait + BudgetControlAdapter（ShouldStopHook）
 ├── spawn/              # sub-agent 派发 + 通信
 │   ├── spawner.rs      # HarnessSubAgentSpawner（impl SubAgentSpawner）+ EnvFactory/SessionFactory/JsonlSessionFactory
 │   ├── message_bus.rs  # MessageBus：统一事件通道 + agent 注册表 + 消息路由
@@ -58,99 +47,108 @@ src/
 │   └── event.rs        # EventStream trait + WaitForExternalEventTool
 └── workflow/           # 流程编排引擎
     ├── model.rs        # 纯数据模型（Workflow/Step/Edge/WorkflowState/Transition/...）
-    ├── engine.rs       # WorkflowEngine——唯一执行引擎（~3000 行）
+    ├── engine/         # WorkflowEngine——唯一执行引擎（拆为子模块）
+    │   ├── mod.rs       # WorkflowEngine 主体 + run() 主循环
+    │   ├── config.rs    # 引擎配置
+    │   ├── event.rs     # WorkflowEvent 广播
+    │   ├── request.rs   # LLM step 请求构建
+    │   ├── runner.rs    # step 执行（run_llm_step / run_executor_step）
+    │   ├── structured.rs # SubmitStepResultTool + 结构化结果传递
+    │   ├── prompt_context.rs # step prompt 构建
+    │   ├── json_parse.rs # JSON 解析辅助
+    │   └── tests.rs     # 引擎测试
     ├── executor.rs     # StepExecutor trait + JsonTransformExecutor
     ├── judge.rs        # StepTransitionJudge trait + NoopJudge/EdgeConditionJudge
     ├── gate.rs         # WorkflowGateHook + build_gate_approval_hook（门禁双闸）
-    └── plan.rs         # validate_workflow 公共校验 + PlanWorkflowTool
+    ├── plan.rs         # validate_workflow 公共校验 + PlanWorkflowTool
+    └── error.rs        # workflow 错误类型
 ```
 
-### 2.1 Harness 构建
-| 模块 | 职责 |
-|---|---|
-| `builder.rs` | `HarnessBuilder`：fluent API 收集 tools/hooks/skills/templates/providers/pricing/budget/compaction_model，解析 provider（精确 + 最长前缀 glob），惰性创建共享 `CostAggregate`，注入 `CostAccumulatorHook` + 可选 `BudgetControlAdapter`，产出 `AgentHarness`。 |
-### 2.2 Sub-agent 派发（`spawn/`）
+> **注**：`HarnessBuilder` 已迁移到 `llm-harness-agent` crate（`crates/llm-harness-agent/src/builder.rs`）。
+> 横切 trait（Sandbox/AuditSink/TraceExporter/PromptSource）已迁移到 `llm-harness-platform` crate，runtime 通过 `pub use llm_harness_platform::{...}` re-export。
+> cost/budget 控制流已迁移：`CostAccumulatorHook`/`UsageLedger` 在 `llm-harness-agent/src/harness/`，`BudgetControlAdapter`/`BudgetExceededHook` 在 `llm-harness-strategy/src/budget.rs`。
+> `ResourceProvider`/`ResourceInjector` 在 `llm-harness-strategy/src/resource.rs`。
+
+### 2.1 Sub-agent 派发（`spawn/`）
 | 模块 | 职责 |
 |---|---|
 | `spawner.rs` | `HarnessSubAgentSpawner`（impl `SubAgentSpawner`）。`spawn_inner` 统一构建：env → message bus 注册 → sub plugin → session → harness → abort token → tokio task + 事件收集。公开入口：`spawn` / `spawn_async`。还含 `EnvFactory` / `SessionFactory` / `JsonlSessionFactory`。 |
 | `message_bus.rs` | `MessageBus`：统一事件通道（`SubAgentEvent` 广播）+ agent 注册表（`AgentEntry`/`AgentStatus`）+ 消息路由（`SendReceipt`）。`EventRxGuard` RAII 借还 event rx。`message_bus_pair()` 工厂。 |
 | `delivery.rs` | 异步投递 + 通信桥接：`AsyncSpawnHandle`（abort 句柄）、`AsyncSpawnHook`（should_stop 时排空 event channel）、`IdleWatcher`（sub idle 时唤醒 main）、`SubAgentMessageConverter`（sub 消息格式转换）、`async_spawn_pair()`。 |
-| `tools.rs` | LLM 可见 tools：`SpawnAgentTool`（`spawn_agent`，带 `wait` 参数区分 sync/async）、`MessageSubagentTool` / `MessageMainTool`（方向消息发送）、`AwaitSubagentReplyTool` / `AwaitMainMessageTool`（阻塞等待回复）、`QuerySubagentTool`（查 agent 列表）、`AbortSubagentTool`（中止 sub-agent）。 |
+| `tools.rs` | LLM 可见 tools：`SpawnAgentTool`（`spawn_agent`，带 `wait` 参数区分 sync/async）、`MessageSubagentTool` / `MessageMainTool`（方向消息发送）、`AwaitSubagentReplyTool` / `AwaitMainMessageTool`（阻塞等待回复）、`QuerySubagentTool`（查 agent 列表，含角色描述）、`AbortSubagentTool`（中止 sub-agent）。 |
 | `spawn_types.rs` | `SpawnOptions`（启动配置）、`ProviderSelection`（provider 选择策略）、`ContextMode`（上下文传递方式）、`SubAgentHandle`（join + abort）、`SubAgentResult`（最终答案 + cost）。 |
 
-### 2.3 Workflow 编排（`workflow/`）
+### 2.2 Workflow 编排（`workflow/`）
 | 模块 | 职责 |
 |---|---|
 | `model.rs` | 纯数据模型：`Workflow`/`Step`（Llm\|Executor）/`Edge`/`EdgeCondition`/`ConditionExpr`/`WorkflowStatus`/`WorkflowState`/`StepResult`/`StepRecord`/`Transition`/`WorkflowContext`。可序列化，走 TaskStore 落盘。 |
-| `engine.rs` | `WorkflowEngine`——**唯一执行引擎**。`new`/`new_free_task`/`restore` 三入口；`run()` 主循环：取 current_step → max_steps 阀 → 构 abort → `run_step_with_policy`（retry/timeout）→ `decide_transition`（judge）→ `apply_transition`（校验+落盘）→ cancel/pause 守卫。`run_llm_step` 每步用 `HarnessBuilder` 起新 harness，注入 gate hook + SubmitStepResultTool + SyncSpawnAgentTool。还含 `WorkflowEvent` 广播。 |
+| `engine/` | `WorkflowEngine`——**唯一执行引擎**。`new`/`new_free_task`/`restore` 三入口；`run()` 主循环：取 current_step → max_steps 阀 → 构 abort → `run_step_with_policy`（retry/timeout）→ `decide_transition`（judge）→ `apply_transition`（校验+落盘）→ cancel/pause 守卫。`run_llm_step` 每步用 `HarnessBuilder`（来自 `llm-harness-agent`）起新 harness，注入 gate hook + SubmitStepResultTool + SyncSpawnAgentTool。还含 `WorkflowEvent` 广播。 |
 | `executor.rs` | 非 LLM step：`StepExecutor` trait + `ExecutorCtx` + 内置 `JsonTransformExecutor`（`json_transform`）。`shell`/`http_call` 常量定义但实现在 engine 内联。 |
 | `judge.rs` | `StepTransitionJudge` trait + `NoopJudge`（自由 task）+ `EdgeConditionJudge`（声明式条件，对 `StepResult.structured` 求 `ConditionExpr`）。 |
 | `gate.rs` | 流程门禁双闸：`WorkflowGateHook`（`PrepareNextTurnHook`，按 current_step 收窄工具集）+ `build_gate_approval_hook`（`RuleBasedApprovalHook` 兜底 Deny）。 |
 | `plan.rs` | `validate_workflow` 公共校验（来源无关）+ `PlanWorkflowTool`（LLM 产出 plan 落盘）。 |
 
-### 2.4 持久化与生命周期（`lifecycle/`）
+### 2.3 持久化与生命周期（`lifecycle/`）
 | 模块 | 职责 |
 |---|---|
 | `task.rs` | `TaskId`/`TaskError`/`TaskResult`/`Checkpoint` 纯数据。 |
 | `task_store.rs` | `TaskStore` trait：workflow_state / workflow / checkpoints / event_wait 四类持久化。`JsonlTaskStore` 参考实现。单进程独占（`tokio::Mutex`），崩溃恢复=旧进程确认死后新进程 load。 |
 | `event.rs` | 通用事件唤醒：`EventStream` trait + `WaitForExternalEventTool`（阻塞等事件，落盘 descriptor 供恢复）。 |
 
-### 2.5 平台层 trait（`platform/`）
+### 2.4 规则匹配（`rules/`）
 | 模块 | 职责 |
+|---|---|
+| `predicate.rs` | `Predicate` trait——规则的条件判定抽象。 |
+| `rule.rs` | `Rule` + `Decision`——规则定义与决策结果。 |
+| `chain.rs` | `RuleChain` + `RuleChainBuilder`——多规则链式组合。 |
+| `predicates.rs` | 内置 predicate：`Contains`/`NumberRangeField`/`RegexField`/`RateLimit`。 |
+| `hook.rs` | `RuleBasedApprovalHook`（impl `BeforeToolCallHook`）——把规则链接入工具审批。 |
+
+### 2.5 横切 trait（re-export from `llm-harness-platform`）
+runtime 通过 `pub use llm_harness_platform::{audit, prompt, sandbox, tracer, tracing_adapter}` re-export 以下模块：
+
+| 模块（在 `llm-harness-platform` 中） | 职责 |
 |---|---|
 | `sandbox.rs` | `Sandbox` trait（start/env/reset/shutdown）+ `SandboxConfig`/`NetRule`/`ResourceLimits`。 |
-| `resource.rs` | `ResourceProvider` trait + `ResourceInjector`（把 resource 内容拼到 system prompt 尾部）。 |
-| `prompt.rs` | `PromptSource` trait + `PromptTemplateCompiler`（`{{name}}` → `$1` 位置参数）。 |
-| `mcp.rs` | `McpClientHandle` trait + `McpToolDef`/`McpResult`/`McpContent`/`McpError`。 |
-
-
-### 2.6 可观测 + 审计（`observability/`）
-| 模块 | 职责 |
-|---|---|
 | `audit.rs` | `AuditSink` trait + `AuditEntry`（含 SHA-256 hash chain）+ `AuditEventType`/`AuditDecision`/`CostDelta`。 |
 | `tracer.rs` | `TraceExporter` trait + `SpanEvent`/`SpanId`/`TraceId`/`SpanKind`/`SpanStatus`/`AttributeValue`。 |
 | `tracing_adapter.rs` | 把 core hooks（BeforeProviderRequest/AfterProviderResponse/AfterToolCall/AfterTurn）桥接成 span 事件，写入 `TraceExporter`。 |
+| `prompt.rs` | `PromptSource` trait + `PromptTemplateCompiler`（`{{name}}` → `$1` 位置参数）。 |
+| `env.rs` | 环境抽象辅助。 |
 
-### 2.7 运行时控制流（`control/`）
-| 模块 | 职责 |
-|---|---|
-| `cost.rs` | 从 types re-export `CostAggregate`/`ModelCost`/`PricingProvider`/`TokenPrice`。 |
-| `cost_hook.rs` | `CostAccumulatorHook`（`AfterProviderResponseHook`），写共享 `Arc<Mutex<CostAggregate>>`。 |
-| `budget.rs` | `BudgetExceededHook` trait（业务层）+ `BudgetControlAdapter`（`ShouldStopHook`，读 cost → 超限问 hook）。surveillance 模式只统计不停。 |
-
-人工审批不设独立 trait——业务层直接实现 `BeforeToolCallHook`，用核心 `Allow`/`Modify`/`Deny` 决策词汇 + `ToolResult.terminate`（true=硬拒绝, false=建议重试）覆盖全部审批语义。规则审批走 `rules` 模块的 `RuleBasedApprovalHook`。
-
-### 2.8 杂项
-| 模块 | 职责 |
-|---|---|
-| `lib.rs` | `pub mod` 声明：顶层 `builder`/`rules`/`workflow` + 5 个分组 `control`/`lifecycle`/`observability`/`platform`/`spawn`。无 re-export，路径即物理路径。错误处理直接用 `anyhow::Result`，无独立 error 模块。 |
 ## 3. 核心抽象 trait 清单
 
-runtime 定义的对外 trait（业务层/后端 crate 实现）：
+runtime 直接定义的对外 trait（业务层/后端 crate 实现）：
 
 ```
 EnvFactory          SessionFactory         PluginFactory
 TaskStore           EventStream
-PricingProvider*    BudgetExceededHook
-AuditSink           TraceExporter
-Sandbox             ResourceProvider       PromptSource
-McpClientHandle
 StepExecutor        StepTransitionJudge
 ```
-> `PricingProvider` 实际定义在 types，runtime re-export。
+
+从 `llm-harness-platform` re-export 的 trait：
+
+```
+Sandbox             AuditSink              TraceExporter
+PromptSource
+```
+
+> `PricingProvider`/`BudgetExceededHook` 定义在 `types`，`ResourceProvider` 在 `strategy`。
+> `McpTransport` trait 定义在 `llm-harness-mcp` crate。
 
 runtime 自己实现的（impl core trait）：
 - `HarnessSubAgentSpawner` impl `SubAgentSpawner`
-- `CostAccumulatorHook` impl `AfterProviderResponseHook`
-- `BudgetControlAdapter` impl `ShouldStopHook`
 - `WorkflowGateHook` impl `PrepareNextTurnHook`
-- `SpanContextMap`（tracing_adapter）impl 一组 core hooks
 - `JsonTransformExecutor` impl `StepExecutor`
 - `EdgeConditionJudge` / `NoopJudge` impl `StepTransitionJudge`
 
+> `CostAccumulatorHook`（impl `AfterProviderResponseHook`）在 `llm-harness-agent/src/harness/cost_hook.rs`。
+> `BudgetControlAdapter`（impl `ShouldStopHook`）在 `llm-harness-strategy/src/budget.rs`。
+> `SpanContextMap`（tracing_adapter）impl 一组 core hooks，在 `llm-harness-platform`。
+
 ## 4. 关键数据流
 
-### 4.1 Harness 构建（`HarnessBuilder::build`）
+### 4.1 Harness 构建（`HarnessBuilder::build`，在 `llm-harness-agent`）
 ```
 install(plugin) ─→ tools/hooks/skills/templates 累积
 provider(pattern, client) ─→ ProviderMatcher 入列
@@ -222,10 +220,13 @@ run()
 6. **sub-agent 通信**：`MessageBus` 统一管理 agent 注册表（`AgentEntry`）+ 事件通道（`SubAgentEvent` 广播）+ 消息路由（`send_message` → `SendReceipt`）。`AsyncSpawnHook` 在 should_stop 时排空 event channel。`IdleWatcher` 在 sub idle 时唤醒 main。
 7. **cost 共享**：`CostAggregate` 用 `Arc<Mutex<...>>` 在 `CostAccumulatorHook` / `BudgetControlAdapter` / `AgentHarnessOptions.cost` 间共享，`usage()` 读 live 状态。
 8. **崩溃恢复**：单进程独占，`TaskStore` 无跨进程锁；恢复语义=旧进程确认死后新进程 load + `validate_workflow` 重校验。
-9. **后端解耦**：runtime 只定义 trait（Sandbox/AuditSink/TraceExporter/McpClientHandle/...），具体后端在独立 crate 实现，dev-deps 拉来测试。
-1. `lib.rs`（模块清单）→ `control/cost.rs` / `lifecycle/task.rs`（基础类型）
-2. `builder.rs`（HarnessBuilder 是所有路径的汇聚点）
+9. **后端解耦**：runtime 通过 `platform` re-export 横切 trait（Sandbox/AuditSink/TraceExporter/PromptSource），具体后端在独立 crate 实现，dev-deps 拉来测试。
+
+## 6. 阅读顺序
+
+1. `lib.rs`（模块清单 + platform re-export）
+2. `lifecycle/task.rs`（基础类型）→ `lifecycle/task_store.rs`（持久化）
 3. `spawn/spawner.rs` + `spawn/message_bus.rs` + `spawn/delivery.rs`（sub-agent 派发 + 通信）
 4. `workflow/model.rs`（纯数据模型）→ `workflow/judge.rs` → `workflow/gate.rs` → `workflow/plan.rs`（编排外围）
-5. `workflow/engine.rs`（核心，~3000 行，最后精读）
-6. 横切 trait 模块按需读：`control/`（cost_hook/budget）、`observability/`（audit/tracer/tracing_adapter）、`platform/`（sandbox/resource/prompt/mcp）
+5. `workflow/engine/`（核心，拆为子模块，最后精读 `mod.rs` + `runner.rs`）
+6. 横切 trait 模块按需读：`llm-harness-platform`（sandbox/audit/tracer/tracing_adapter/prompt/env）、`llm-harness-strategy`（budget/resource/safety/loop_safety/event_stream 等）

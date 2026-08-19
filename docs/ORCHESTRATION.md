@@ -227,7 +227,7 @@ pub enum WorkflowEvent {
 
 ## 6. 上层 Agent 接入方式
 
-以 EDA Agent 为例（`eda-agent/src/workflow_adapter/`）：
+以上层 Agent 为例（领域 adapter 将领域 DSL 翻译为 runtime 抽象）：
 
 ```
 EDA 领域概念            adapter 翻译               runtime 抽象
@@ -250,10 +250,10 @@ StageContext   →  executor   →  WorkflowContext
 
 ## 7. 已知限制 / 待实现
 
-见 GitHub issues：
-- #37 并行 fan-out / fan-in（LangGraph Send API）
-- #38 子图嵌套
-- #39 时间旅行（历史 checkpoint 恢复）
-- #40 State reducer（并行分支 state 合并）
-- #41 Step 级结果缓存（通用 done marker）
-- #42 Judge 主动暂停（对齐 LangGraph interrupt）
+以下能力尚未实现，列为后续规划：
+- 并行 fan-out / fan-in（对齐 LangGraph Send API）
+- 子图嵌套
+- 时间旅行（历史 checkpoint 恢复）
+- State reducer（并行分支 state 合并）
+- Step 级结果缓存（通用 done marker）
+- Judge 主动暂停（对齐 LangGraph interrupt）

@@ -97,10 +97,13 @@ Strong success criteria let the LLM loop independently. Weak criteria ("make it 
 本仓库是 oh-my-harness 的主 monorepo，包含从 API 适配层到运行时基础设施的全部 crate。`llm-api-adapter` 作为独立 git repo 引用。
 
 **核心职责：**
-1. **类型与 trait 定义**：Hook trait、Tool trait、Session/Message 类型（`llm-harness-types`）
-2. **Agent loop 引擎**：ReAct 循环、工具调度、streaming（`llm-harness-loop`）
-3. **高层 agent 抽象**：`AgentHarness`、session 树、compaction、skills（`llm-harness-agent`）
-4. **运行时基础设施**：CompositeHook、ToolRegistry、TaskRunner、Sandbox、MCP、Audit、Auth（`llm-harness-runtime` 及各 `-runtime-*` crate）
+1. **类型与 trait 定义**：Hook trait、Tool trait、Session/Message 类型、RunContext（`llm-harness-types`）
+2. **Agent loop 引擎**：ReAct 循环、工具调度、streaming、retry+backoff（`llm-harness-loop`）
+3. **高层 agent 抽象**：`HarnessBuilder`、`AgentHarness`、Session 树、compaction、skills、cost tracking（`llm-harness-agent`）
+4. **运行时编排**：WorkflowEngine、sub-agent spawn、task 持久化、规则匹配（`llm-harness-runtime`）
+5. **平台层 trait**：Sandbox/AuditSink/TraceExporter/PromptSource trait 定义（`llm-harness-platform`）
+6. **策略层**：safety、loop-safety、status panel、event streams、injection filter、memory defense、notify、compaction prompt、budget（`llm-harness-strategy`）
+7. **后端 crate**（各独立可选）：tools（bash/read/write/edit/grep/glob）、mcp、knowledge/knowledge-local、memory、session-recall、sandbox、audit-jsonl、trace-otel
 
 ## Crate 结构与依赖规则
 
@@ -109,15 +112,25 @@ llm-harness-runtime/          ← 本仓库根
 ├── Cargo.toml                (workspace)
 ├── CLAUDE.md
 ├── crates/
-│   ├── llm-harness-types/    (Run/Hook/Tool trait + 所有共享类型)
-│   ├── llm-harness-loop/     (agent loop 引擎)
-│   ├── llm-harness-agent/    (AgentHarness, Session, skills)
-│   ├── llm-harness-runtime/  (CompositeHook, ToolRegistry, TaskRunner)
-│   ├── llm-harness-runtime-sandbox/  (os/bwrap/seatbelt backends, feature-gated)
-│   ├── llm-harness-runtime-mcp/
-│   ├── llm-harness-runtime-audit-jsonl/
-│   ├── llm-harness-runtime-trace-otel/
-│   └── (llm-harness-py 已迁移到 github.com/oh-my-harness/Senza)
+│   ├── llm-harness-types/              # core type definitions (Hook/Tool trait + 共享类型)
+│   ├── llm-harness-loop/               # agent loop 引擎 (ReAct 循环 + LLM client)
+│   ├── llm-harness-agent/              # AgentHarness, Session, skills, HarnessBuilder
+│   ├── llm-harness-runtime/            # 平台层: workflow engine, spawn, lifecycle, rules
+│   ├── llm-harness-platform/           # 横切 trait + adapter (sandbox/audit/prompt/tracer/env)
+│   ├── llm-harness-strategy/           # 策略层: safety, loop-safety, status panel,
+│   │                                   #   memory defense, notify, injection filter,
+│   │                                   #   context-aware compaction, event streams
+│   ├── llm-harness-tools/              # built-in tools: bash, read, write, edit, grep, glob
+│   ├── llm-harness-mcp/                # MCP server integration (tools, prompts, resources)
+│   ├── llm-harness-knowledge/          # backend-neutral knowledge access contracts
+│   ├── llm-harness-knowledge-local/    # local Markdown/Text knowledge source (BM25)
+│   ├── llm-harness-memory/             # composable memory read/write + mutation gate
+│   ├── llm-harness-session-recall/     # cross-Session history recall (in-memory + SQLite FTS5)
+│   ├── llm-harness-sandbox/            # sandbox backends (bwrap, seatbelt, os)
+│   ├── llm-harness-audit-jsonl/        # audit logging (JSONL + hash chain)
+│   ├── llm-harness-trace-otel/         # OpenTelemetry tracing export
+│   ├── llm-harness-live-tests/         # live LLM integration tests
+│   └── session-viewer/                 # session viewer (visualize JsonlSessionRepo sessions)
 ├── docs/
 
 外部依赖（独立 git repo）：
@@ -128,19 +141,29 @@ llm-harness-runtime/          ← 本仓库根
 
 ```
 # llm-harness-py 已迁移到 Senza 仓库，通过 git 依赖引用本仓库的 crate
-llm-harness-runtime-*  → llm-harness-runtime
-llm-harness-runtime    → llm-harness-agent
-llm-harness-agent      → llm-harness-loop
-llm-harness-loop       → llm-harness-types, llm_adapter
-llm-harness-types      → llm_adapter (外部 git 依赖，非内部 crate)
+llm-harness-strategy     → llm-harness-runtime, llm-harness-agent
+llm-harness-runtime      → llm-harness-agent, llm-harness-platform
+llm-harness-platform     → llm-harness-agent
+llm-harness-agent        → llm-harness-loop
+llm-harness-loop         → llm-harness-types, llm_adapter
+llm-harness-types        → llm_adapter (外部 git 依赖，非内部 crate)
+# 后端 crate 各自依赖其上层 trait crate，互不依赖：
+llm-harness-sandbox      → llm-harness-platform
+llm-harness-audit-jsonl  → llm-harness-platform
+llm-harness-trace-otel   → llm-harness-platform
+llm-harness-mcp          → llm-harness-runtime
+llm-harness-tools        → llm-harness-types
+llm-harness-knowledge-*  → llm-harness-types (knowledge) / llm-harness-agent (memory)
+llm-harness-session-recall → llm-harness-agent, llm-harness-knowledge
 ```
+
 
 **硬性规则：**
 - `llm-harness-types` 不依赖其他内部 crate，保持纯类型/trait 声明。可依赖外部 git crate（如 `llm_adapter`）用于 re-export 共享类型。
-- `llm-harness-runtime-sandbox` 不依赖其他 runtime 后端 crate；其他 `llm-harness-runtime-*` 各 crate 不相互依赖（可单独使用）。
+- `llm-harness-platform` 定义横切 trait（Sandbox/AuditSink/TraceExporter/PromptSource 等），不依赖 runtime。
+- `llm-harness-sandbox` 不依赖其他后端 crate；其他后端 crate（`-audit-jsonl`/`-trace-otel`/`-mcp`/`-knowledge-*`/`-memory`/`-session-recall`）互不依赖（可单独使用）。
 - `llm-harness-py` 已迁移到 Senza 仓库，通过 git 依赖引用本仓库 crate，不再在本 workspace 内。
 - 依赖方向不允许反转（下层不依赖上层）。
-
 
 ## 设计文档
 
@@ -148,9 +171,16 @@ llm-harness-types      → llm_adapter (外部 git 依赖，非内部 crate)
 
 | 文件 | 内容 |
 |---|---|
-| `gap-analysis-platform-vs-business.md` | 平台 vs 业务层 gap 分析，trait 引入决策框架 |
-| `reference-production-multi-agent-harness.md` | 外部参考文章（李维山博客） |
-| `superpowers/specs/2026-06-17-plugin-system-design.md` | Plugin 系统设计规范 |
+| `docs/design/` | 设计规范文档（final-answer contract、non-LLM step、memory/knowledge integration、MCP 系列、multi-agent support、billing usage contract 等） |
+| `docs/strategy-guide.md` | 策略层使用指南（safety/loop-safety/status-panel/event-stream/injection-filter/memory-defense/notify/budget 等 15 个模块） |
+| `docs/mcp-guide.md` | MCP 集成指南（配置/连接管理/工具适配/版本锁定/凭证作用域） |
+| `docs/tools-guide.md` | 内置工具使用指南（bash/read/write/edit/grep/glob） |
+| `docs/crate-reference.md` | 基础设施 crate 参考（types/platform/audit-jsonl/trace-otel/knowledge/knowledge-local/memory） |
+| `docs/runtime-framework.md` | runtime crate 框架文档（目录结构、核心 trait、数据流） |
+| `docs/ORCHESTRATION.md` | WorkflowEngine 编排能力总览 |
+| `docs/product-roadmap.md` | 产品路线图（当前能力 + 规划） |
+| `docs/session-recall-integration.md` | Session Recall 集成指南 |
+| `docs/archive/` | 已归档的研究/分析文档（harness engineering、RSI、ai-agent-book 分层分析等） |
 
 ## 核心开发原则
 

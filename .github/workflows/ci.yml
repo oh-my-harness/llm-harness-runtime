@@ -17,6 +17,7 @@ concurrency:
 env:
   CARGO_HTTP_PROXY: ""
   CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   rust:
@@ -31,8 +32,24 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Configure private Git dependencies
+        shell: bash
+        env:
+          PRIVATE_DEPS_TOKEN: ${{ secrets.OH_MY_HARNESS_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${PRIVATE_DEPS_TOKEN:-}" ]]; then
+            echo "::error title=Missing OH_MY_HARNESS_READ_TOKEN::Create a repository secret named OH_MY_HARNESS_READ_TOKEN with read access to private git dependencies such as oh-my-harness/llm-api-adapter."
+            exit 1
+          fi
+          echo "::add-mask::${PRIVATE_DEPS_TOKEN}"
+          git config --global url."https://x-access-token:${PRIVATE_DEPS_TOKEN}@github.com/".insteadOf "https://github.com/"
+
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
 
       - name: Install bubblewrap (Linux only)
         if: runner.os == 'Linux'
@@ -45,13 +62,12 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --exclude llm-harness-live-tests
 
       - name: Run bwrap sandbox isolation tests (Linux only)
         if: runner.os == 'Linux'
-        run: cargo test -p llm-harness-runtime-sandbox --features bwrap -- --include-ignored
-
+        run: cargo test -p llm-harness-sandbox --features bwrap -- --include-ignored
 
       - name: Run seatbelt sandbox isolation tests (macOS only)
         if: runner.os == 'macOS'
-        run: cargo test -p llm-harness-runtime-sandbox --features seatbelt -- seatbelt_tests
+        run: cargo test -p llm-harness-sandbox --features seatbelt -- seatbelt_tests

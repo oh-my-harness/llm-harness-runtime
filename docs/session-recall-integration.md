@@ -1,6 +1,6 @@
 # Session Recall integration
 
-`llm-harness-runtime-session-recall` provides opt-in History Recall over durable
+`llm-harness-session-recall` provides opt-in History Recall over durable
 runtime Sessions. `SessionRepo` remains the only authority for conversation
 bodies; the recall index is a disposable candidate projection.
 
@@ -14,8 +14,8 @@ projection and exact read.
 use std::sync::Arc;
 
 use llm_harness_agent::{ObservedSessionRepo, SessionMutationObserver, SessionRepo};
-use llm_harness_runtime_knowledge::KnowledgeAccessControl;
-use llm_harness_runtime_session_recall::{
+use llm_harness_knowledge::KnowledgeAccessControl;
+use llm_harness_session_recall::{
     HistoryRecallPlugin, HistoryRecallPluginConfig, InMemorySessionRecallIndex,
     SessionRecallIndex, SessionRecallKnowledgeSource, SessionRecallProjector,
     SessionRecallService,
@@ -68,13 +68,13 @@ For a durable local projection, enable the portable bundled SQLite backend:
 
 ```toml
 [dependencies]
-llm-harness-runtime-session-recall = { version = "0.3", features = ["sqlite-bundled"] }
+llm-harness-session-recall = { version = "0.3", features = ["sqlite-bundled"] }
 ```
 
 Then open the derived FTS5 database and reconcile it at startup:
 
 ```rust
-use llm_harness_runtime_session_recall::SqliteSessionRecallIndex;
+use llm_harness_session_recall::SqliteSessionRecallIndex;
 
 let index: Arc<dyn SessionRecallIndex> = Arc::new(
     SqliteSessionRecallIndex::open(state_dir.join("session-recall.sqlite3"))?
@@ -131,7 +131,7 @@ cross-Session results.
 
 ```rust
 use llm_harness_agent::SessionRecallScope;
-use llm_harness_runtime_session_recall::{
+use llm_harness_session_recall::{
     HistoryRecallRequest, SessionRecallAccessContext,
 };
 use llm_harness_types::RunRequest;
@@ -151,7 +151,7 @@ Applications using the automatic plugin may explicitly observe the bounded
 references that passed exact read, for example to render source-jump links:
 
 ```rust
-use llm_harness_runtime_session_recall::HistoryRecallObservation;
+use llm_harness_session_recall::HistoryRecallObservation;
 
 let observation = HistoryRecallObservation::new();
 let request = RunRequest::from_text(user_prompt)
@@ -207,7 +207,7 @@ authority boundary.
 Run the reproducible local baseline with:
 
 ```text
-cargo bench -p llm-harness-runtime-session-recall --bench sqlite_recall --features sqlite-bundled
+cargo bench -p llm-harness-session-recall --bench sqlite_recall --features sqlite-bundled
 ```
 
 The benchmark reports bulk indexing time, SQLite/WAL bytes, search p50/p95/p99,
