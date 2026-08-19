@@ -9,7 +9,6 @@
 //! - Cost aggregation (`PricingProvider`, `CostAggregate`)
 //! - Audit logging (`AuditSink`)
 //! - Budget control (`BudgetExceededHook` trait; `BudgetControlAdapter` in `llm-harness-strategy`)
-//! - Harness construction (`HarnessBuilder`)
 //!
 //! # Tracing / diagnostic logging
 //!
@@ -33,11 +32,9 @@
 //! The Python bindings crate (`llm-harness-py`) does this automatically in its
 //! `#[pymodule]` entry point.
 
-pub mod builder;
 pub mod rules;
 pub mod workflow;
 
-pub mod control;
 pub mod lifecycle;
 pub mod observability;
 pub mod platform;

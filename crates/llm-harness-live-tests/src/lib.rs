@@ -13,7 +13,7 @@ mod inner {
     use std::time::Duration;
 
     use llm_harness_agent::AgentHarness;
-    use llm_harness_runtime::builder::HarnessBuilder;
+    use llm_harness_agent::HarnessBuilder;
     use llm_harness_runtime::platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
     use llm_harness_runtime_sandbox_os::OsEnvSandbox;
 

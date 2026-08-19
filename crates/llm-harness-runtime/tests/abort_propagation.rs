@@ -11,9 +11,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use llm_harness_agent::HarnessBuilder;
 use llm_harness_agent::Plugin;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
-use llm_harness_runtime::builder::HarnessBuilder;
 use llm_harness_runtime::spawn::delivery::async_spawn_pair;
 use llm_harness_runtime::spawn::message_bus::message_bus_pair;
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};

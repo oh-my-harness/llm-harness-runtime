@@ -17,7 +17,7 @@ use llm_harness_loop::LlmClient;
 use llm_harness_types::{AgentError, AgentEvent, ExecutionEnv, HarnessError, HarnessPhase};
 use tokio_util::sync::CancellationToken;
 
-use crate::builder::{HarnessBuildError, HarnessBuilder};
+use llm_harness_agent::{HarnessBuildError, HarnessBuilder};
 
 // ── EnvFactory ────────────────────────────────────────────────────────────
 

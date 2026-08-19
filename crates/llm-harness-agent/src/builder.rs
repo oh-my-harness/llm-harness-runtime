@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use llm_harness_runtime::builder::HarnessBuilder;
+//! use llm_harness_agent::HarnessBuilder;
 //!
 //! let harness = HarnessBuilder::new("claude-3-5-sonnet-20241022")
 //!     .install(&my_auth_plugin)
@@ -18,20 +18,23 @@
 //!     .await?;
 //! ```
 
+use glob::Pattern;
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
-use llm_harness_agent::{
+use crate::{
     AgentHarness, AgentHarnessOptions, CompactionModelConfig, CompactionPromptSpec, HarnessHooks,
     ModelInfo, Plugin, PromptTemplate, Skill,
 };
 use llm_harness_loop::{ConvertToLlmHook, FinalAnswerMode, LlmClient, RetryConfig};
 use llm_harness_types::{
-    AfterProviderResponseHook, AfterTurnHook, ExecutionEnv, PricingProvider, ShouldStopHook,
-    StreamOptions, ThinkingLevel, Tool, ToolExecutionMode,
+    AfterProviderResponseHook, AfterToolCallHook, AfterTurnHook, BeforeCompactHook,
+    BeforeProviderRequestHook, BeforeRunHook, BeforeToolCallHook, BeforeTurnHook, ExecutionEnv,
+    FinalAnswerValidator, PrepareNextTurnHook, PricingProvider, ShouldStopHook, StreamOptions,
+    ThinkingLevel, Tool, ToolExecutionMode, TransformContextHook,
 };
 
-use crate::control::{cost::UsageLedger, cost_hook::CostAccumulatorHook};
+use crate::harness::{UsageLedger, cost_hook::CostAccumulatorHook};
 use thiserror::Error;
 
 // ── Provider matching ─────────────────────────────────────────────────────────
@@ -39,34 +42,37 @@ use thiserror::Error;
 /// Internal representation of an LLM provider matcher.
 ///
 /// Supports exact pattern matching (e.g., "claude-3") or glob patterns
-/// (e.g., "claude-*"). Glob patterns are matched using a longest-prefix-match
-/// strategy: the most specific glob (longest prefix) is selected if multiple
-/// globs match.
+/// (e.g., "claude-*", "*-sonnet", "claude-3-*-sonnet"). Glob patterns are
+/// matched using a longest-pattern-match strategy: the most specific glob
+/// (longest pattern string) is selected if multiple globs match.
 struct ProviderMatcher {
     /// The pattern string (either exact or glob).
     pattern: String,
     /// Whether this pattern contains wildcards.
     is_glob: bool,
-    /// The longest prefix before any wildcard (for matching).
-    prefix: String,
+    /// Pre-compiled glob pattern (only used when `is_glob`).
+    compiled: Pattern,
     /// The LLM client for this provider.
     client: Arc<dyn LlmClient>,
 }
 
 impl ProviderMatcher {
     /// Create a new provider matcher.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pattern` contains an invalid glob (e.g. unclosed `[`).
+    /// This is a build-time programming error, not a runtime condition:
+    /// better to fail fast than silently route requests to the wrong provider.
     fn new(pattern: impl Into<String>, client: Arc<dyn LlmClient>) -> Self {
         let pattern = pattern.into();
         let is_glob = pattern.contains('*');
-        let prefix = if is_glob {
-            pattern.split('*').next().unwrap_or("").to_string()
-        } else {
-            pattern.clone()
-        };
+        let compiled = Pattern::new(&pattern)
+            .unwrap_or_else(|e| panic!("invalid glob pattern {pattern:?}: {e}"));
         Self {
             pattern,
             is_glob,
-            prefix,
+            compiled,
             client,
         }
     }
@@ -77,8 +83,8 @@ impl ProviderMatcher {
             // Exact match.
             self.pattern == model
         } else {
-            // Glob match: model must start with the prefix.
-            model.starts_with(&self.prefix)
+            // Glob match via the compiled pattern.
+            self.compiled.matches(model)
         }
     }
 }
@@ -156,6 +162,9 @@ pub struct HarnessBuilder {
     compaction_prompt: Option<CompactionPromptSpec>,
     /// Current task query intent for context-aware compaction.
     compaction_query: Option<String>,
+    /// Max consecutive compaction failures before circuit breaker trips.
+    /// `None` → default (3, clamped to minimum 1).
+    compaction_max_failures: Option<u32>,
     /// Enable automatic compaction at each turn start.
     auto_compact: bool,
     /// Steer/follow-up queue capacity.
@@ -201,6 +210,7 @@ impl HarnessBuilder {
             compaction_keep_recent_tokens: None,
             compaction_prompt: None,
             compaction_query: None,
+            compaction_max_failures: None,
             skill_read_tool_enabled: true,
             readable_skills: None,
             auto_compact: false,
@@ -275,6 +285,92 @@ impl HarnessBuilder {
         self
     }
 
+    /// Register a `BeforeRunHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.before_run`.
+    pub fn before_run_hook(mut self, hook: Arc<dyn BeforeRunHook>) -> Self {
+        self.hooks.before_run.push(hook);
+        self
+    }
+
+    /// Register a `BeforeTurnHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.before_turn`.
+    pub fn before_turn_hook(mut self, hook: Arc<dyn BeforeTurnHook>) -> Self {
+        self.hooks.before_turn.push(hook);
+        self
+    }
+
+    /// Register a `BeforeToolCallHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.before_tool_call`.
+    pub fn before_tool_call_hook(mut self, hook: Arc<dyn BeforeToolCallHook>) -> Self {
+        self.hooks.before_tool_call.push(hook);
+        self
+    }
+
+    /// Register an `AfterToolCallHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.after_tool_call`.
+    pub fn after_tool_call_hook(mut self, hook: Arc<dyn AfterToolCallHook>) -> Self {
+        self.hooks.after_tool_call.push(hook);
+        self
+    }
+
+    /// Register a `TransformContextHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.transform_context`.
+    pub fn transform_context_hook(mut self, hook: Arc<dyn TransformContextHook>) -> Self {
+        self.hooks.transform_context.push(hook);
+        self
+    }
+
+    /// Register a `PrepareNextTurnHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.prepare_next_turn`.
+    pub fn prepare_next_turn_hook(mut self, hook: Arc<dyn PrepareNextTurnHook>) -> Self {
+        self.hooks.prepare_next_turn.push(hook);
+        self
+    }
+
+    /// Register a `BeforeProviderRequestHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.before_provider_request`.
+    pub fn before_provider_request_hook(
+        mut self,
+        hook: Arc<dyn BeforeProviderRequestHook>,
+    ) -> Self {
+        self.hooks.before_provider_request.push(hook);
+        self
+    }
+
+    /// Register an `AfterProviderResponseHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.after_provider_response`.
+    pub fn after_provider_response_hook(
+        mut self,
+        hook: Arc<dyn AfterProviderResponseHook>,
+    ) -> Self {
+        self.hooks.after_provider_response.push(hook);
+        self
+    }
+
+    /// Register a `FinalAnswerValidator` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.final_answer_validator`.
+    pub fn final_answer_validator_hook(mut self, hook: Arc<dyn FinalAnswerValidator>) -> Self {
+        self.hooks.final_answer_validator.push(hook);
+        self
+    }
+
+    /// Register a `BeforeCompactHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.before_compact`.
+    pub fn before_compact_hook(mut self, hook: Arc<dyn BeforeCompactHook>) -> Self {
+        self.hooks.before_compact.push(hook);
+        self
+    }
+
     /// Set hook collections directly. Push semantics: the provided hooks
     /// are appended to the builder's existing hooks. Call multiple times
     /// to compose hooks from multiple sources.
@@ -327,7 +423,7 @@ impl HarnessBuilder {
     ///
     /// When resolving a model at build time:
     /// 1. Exact patterns are checked first
-    /// 2. If no exact match, the longest-prefix glob is used
+    /// 2. If no exact match, the longest-pattern glob is used
     /// 3. If no provider matches, [`HarnessBuildError::NoMatchingProvider`] is returned
     ///
     /// # Arguments
@@ -338,6 +434,10 @@ impl HarnessBuilder {
     /// # Returns
     ///
     /// `self` for method chaining.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pattern` is an invalid glob (e.g. unclosed `[`).
     pub fn provider(mut self, pattern: impl Into<String>, client: Arc<dyn LlmClient>) -> Self {
         self.providers.push(ProviderMatcher::new(pattern, client));
         self
@@ -356,7 +456,7 @@ impl HarnessBuilder {
     ///
     /// `model_info` should reflect the compaction model's real
     /// `context_window` and `max_tokens`, used for prompt budget checks
-    /// in `compact()`. The compaction client is resolved at build time
+    /// in `compact()`. The compaction client is resolved at build time.
     pub fn compaction_model(mut self, model: impl Into<String>, model_info: ModelInfo) -> Self {
         self.compaction_model = Some((model.into(), model_info));
         self
@@ -451,6 +551,13 @@ impl HarnessBuilder {
         self
     }
 
+    /// Override max consecutive compaction failures before circuit breaker trips.
+    /// `None` uses default (3, clamped to minimum 1).
+    pub fn compaction_max_failures(mut self, max: Option<u32>) -> Self {
+        self.compaction_max_failures = max;
+        self
+    }
+
     /// Enable automatic compaction at each turn start.
     pub fn auto_compact(mut self, enabled: bool) -> Self {
         self.auto_compact = enabled;
@@ -511,7 +618,7 @@ impl HarnessBuilder {
     pub fn build_with_session(
         self,
         env: Arc<dyn ExecutionEnv>,
-        session: llm_harness_agent::Session,
+        session: crate::Session,
     ) -> Result<AgentHarness, HarnessBuildError> {
         let builder = self.inject_skill_read_tool(&env);
         let (client, opts) = builder.resolve_and_build()?;
@@ -529,11 +636,10 @@ impl HarnessBuilder {
             };
             if !readable.is_empty() {
                 let store = Arc::new(RwLock::new(readable));
-                self.tools
-                    .push(Arc::new(llm_harness_agent::SkillReadTool::new(
-                        store.clone(),
-                        env.clone(),
-                    )));
+                self.tools.push(Arc::new(crate::SkillReadTool::new(
+                    store.clone(),
+                    env.clone(),
+                )));
                 self.readable_skills = Some(store);
             }
         }
@@ -557,7 +663,7 @@ impl HarnessBuilder {
     ///
     /// Selection order:
     /// 1. Exact pattern match
-    /// 2. Longest-prefix glob match
+    /// 2. Longest-pattern glob match
     /// 3. Error if no match
     fn resolve_provider(&self, model: &str) -> Result<Arc<dyn LlmClient>, HarnessBuildError> {
         if self.providers.is_empty() {
@@ -571,12 +677,14 @@ impl HarnessBuilder {
             }
         }
 
-        // Second pass: longest-prefix glob match.
+        // Second pass: longest-pattern glob match. A longer pattern string is
+        // generally more specific (e.g., "claude-3-*" beats "claude-*").
         let mut best_match: Option<&ProviderMatcher> = None;
         for matcher in &self.providers {
             if matcher.is_glob
                 && matcher.matches(model)
-                && (best_match.is_none() || matcher.prefix.len() > best_match.unwrap().prefix.len())
+                && (best_match.is_none()
+                    || matcher.pattern.len() > best_match.unwrap().pattern.len())
             {
                 best_match = Some(matcher);
             }
@@ -677,6 +785,9 @@ impl HarnessBuilder {
         if let Some(ref query) = self.compaction_query {
             opts.compaction_query = Some(query.clone());
         }
+        if let Some(max) = self.compaction_max_failures {
+            opts.compaction_max_failures = Some(max);
+        }
         opts.auto_compact = self.auto_compact;
         if let Some(cap) = self.queue_capacity {
             opts.queue_capacity = cap;
@@ -693,54 +804,105 @@ mod tests {
     // ── Provider matching tests ────────────────────────────────────────────────
 
     #[test]
-    fn test_provider_matcher_exact() {
-        // Create a simple mock client using a placeholder approach.
-        // Since we can't easily mock LlmClient in a unit test, we use a
-        // simplified test that checks the matching logic without instantiation.
-        let pattern = "claude-3-5-sonnet";
-        let is_glob = pattern.contains('*');
-        assert!(!is_glob);
-    }
-
-    #[test]
-    fn test_provider_matcher_glob() {
-        let pattern = "claude-*";
-        let is_glob = pattern.contains('*');
-        assert!(is_glob);
-        let prefix = pattern.split('*').next().unwrap_or("");
-        assert_eq!(prefix, "claude-");
-    }
-
-    #[test]
-    fn test_provider_matcher_glob_prefix() {
-        let pattern = "claude-3-*";
-        let is_glob = pattern.contains('*');
-        assert!(is_glob);
-        let prefix = pattern.split('*').next().unwrap_or("");
-        assert_eq!(prefix, "claude-3-");
-    }
-
-    #[test]
     fn test_builder_no_provider() {
         let builder = HarnessBuilder::new("claude-3-5-sonnet");
         let err = builder.resolve_provider("claude-3-5-sonnet");
         assert!(matches!(err, Err(HarnessBuildError::NoProvider)));
     }
 
+    #[cfg(feature = "test-utils")]
+    fn mock_client() -> Arc<dyn LlmClient> {
+        use llm_harness_loop::test_utils::MockLlmClient;
+        Arc::new(MockLlmClient::new(vec![]))
+    }
+
+    #[cfg(feature = "test-utils")]
     #[test]
-    fn test_builder_provider_pattern_extraction() {
-        // Test that patterns are correctly parsed (without needing an actual client).
-        let exact = "claude-3-5-sonnet";
-        assert!(!exact.contains('*'));
+    fn provider_exact_match_resolves_exact_client() {
+        let exact = mock_client();
+        let glob = mock_client();
+        let builder = HarnessBuilder::new("claude-3-sonnet")
+            .provider("claude-3-sonnet", exact.clone())
+            .provider("claude-*", glob);
+        let resolved = builder.resolve_provider("claude-3-sonnet").unwrap();
+        assert!(Arc::ptr_eq(&resolved, &exact));
+    }
 
-        let glob = "claude-*";
-        assert!(glob.contains('*'));
-        let prefix = glob.split('*').next().unwrap_or("");
-        assert_eq!(prefix, "claude-");
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn provider_glob_match_resolves_glob_client() {
+        let glob = mock_client();
+        let builder = HarnessBuilder::new("claude-3-5-sonnet").provider("claude-*", glob.clone());
+        let resolved = builder.resolve_provider("claude-3-5-sonnet").unwrap();
+        assert!(Arc::ptr_eq(&resolved, &glob));
+    }
 
-        // Test matching logic without instantiation
-        let model = "claude-3-5-sonnet";
-        assert!(model.starts_with(prefix));
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn provider_no_match_returns_error() {
+        let client = mock_client();
+        let builder = HarnessBuilder::new("gpt-4o").provider("claude-*", client);
+        let err = builder.resolve_provider("gpt-4o");
+        assert!(matches!(
+            err,
+            Err(HarnessBuildError::NoMatchingProvider { .. })
+        ));
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn provider_longest_pattern_glob_wins() {
+        let short = mock_client();
+        let long = mock_client();
+        let builder = HarnessBuilder::new("claude-3-5-sonnet")
+            .provider("c*", short)
+            .provider("claude-*", long.clone());
+        let resolved = builder.resolve_provider("claude-3-5-sonnet").unwrap();
+        assert!(Arc::ptr_eq(&resolved, &long));
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn provider_glob_matches_suffix() {
+        let client = mock_client();
+        let builder = HarnessBuilder::new("claude-3-5-sonnet").provider("*-sonnet", client.clone());
+        let resolved = builder.resolve_provider("claude-3-5-sonnet").unwrap();
+        assert!(Arc::ptr_eq(&resolved, &client));
+
+        // Suffix-only glob must NOT match a model without that suffix.
+        let err = builder.resolve_provider("claude-3-5-haiku");
+        assert!(matches!(
+            err,
+            Err(HarnessBuildError::NoMatchingProvider { .. })
+        ));
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn provider_glob_matches_middle() {
+        let client = mock_client();
+        let builder =
+            HarnessBuilder::new("claude-3-5-sonnet").provider("claude-3-*-sonnet", client.clone());
+        // Matches: middle wildcard bridges "claude-3-" and "-sonnet".
+        let resolved = builder.resolve_provider("claude-3-5-sonnet").unwrap();
+        assert!(Arc::ptr_eq(&resolved, &client));
+
+        // Does NOT match: literal prefix "claude-3-" doesn't match "claude-4-".
+        let err = builder.resolve_provider("claude-4-5-sonnet");
+        assert!(matches!(
+            err,
+            Err(HarnessBuildError::NoMatchingProvider { .. })
+        ));
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    #[should_panic(expected = "invalid glob pattern")]
+    fn provider_invalid_glob_panics() {
+        let client = mock_client();
+        // Unclosed `[` is an invalid glob — must panic rather than silently
+        // fall back to a catch-all that routes every model to this client.
+        let _ = HarnessBuilder::new("m").provider("claude-[3*", client);
     }
 
     // ── Plugin integration tests ───────────────────────────────────────────────
@@ -970,57 +1132,6 @@ mod tests {
         assert_eq!(builder.skills.len(), 2);
     }
 
-    /// Test 5: Provider exact match takes priority over glob patterns.
-    ///
-    /// When both "claude-3-sonnet" (exact) and "claude-*" (glob) are registered,
-    /// the exact pattern should be preferred for model "claude-3-sonnet".
-    #[test]
-    fn test_provider_exact_match_takes_priority() {
-        // Verify that exact patterns are checked before globs.
-        let exact = "claude-3-sonnet";
-        let glob = "claude-*";
-
-        // Exact match check.
-        assert!(exact == "claude-3-sonnet");
-
-        // Glob prefix extraction.
-        let prefix = glob.split('*').next().unwrap_or("");
-        assert_eq!(prefix, "claude-");
-
-        // Model matches glob prefix.
-        assert!("claude-3-sonnet".starts_with(prefix));
-
-        // Exact match should be selected first due to resolution order.
-        assert_eq!(exact, "claude-3-sonnet");
-    }
-
-    /// Test 6: Longest-prefix glob takes priority over shorter globs.
-    ///
-    /// When both "c*" (prefix: 1) and "claude-*" (prefix: 7) match a model,
-    /// the longest prefix (most specific) should be selected.
-    #[test]
-    fn test_provider_longest_prefix_glob_wins() {
-        let model = "claude-3-5-sonnet";
-
-        // Pattern 1: "c*" (prefix length 1)
-        let pattern1 = "c*";
-        let prefix1 = pattern1.split('*').next().unwrap_or("");
-        assert_eq!(prefix1, "c");
-        assert!(model.starts_with(prefix1));
-        assert_eq!(prefix1.len(), 1);
-
-        // Pattern 2: "claude-*" (prefix length 7)
-        let pattern2 = "claude-*";
-        let prefix2 = pattern2.split('*').next().unwrap_or("");
-        assert_eq!(prefix2, "claude-");
-        assert!(model.starts_with(prefix2));
-        assert_eq!(prefix2.len(), 7);
-
-        // Longest prefix should be selected.
-        assert!(prefix2.len() > prefix1.len());
-        assert_eq!(prefix2, "claude-");
-    }
-
     /// Test 7: Plugin with multiple tools — all are accumulated.
     #[test]
     fn test_builder_plugin_with_multiple_tools() {
@@ -1132,6 +1243,71 @@ mod tests {
     }
 
     #[test]
+    fn builder_before_turn_hook_appends_to_hooks() {
+        use futures::future::BoxFuture;
+        use llm_harness_types::{BeforeTurnCtx, BeforeTurnHook};
+        use std::sync::Arc;
+
+        struct Nop;
+        impl BeforeTurnHook for Nop {
+            fn before_turn<'a>(&'a self, _ctx: BeforeTurnCtx<'a>) -> BoxFuture<'a, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        let builder = HarnessBuilder::new("m")
+            .before_turn_hook(Arc::new(Nop))
+            .before_turn_hook(Arc::new(Nop));
+        assert_eq!(builder.hooks.before_turn.len(), 2);
+    }
+
+    #[test]
+    fn builder_before_compact_hook_appends_to_hooks() {
+        use futures::future::BoxFuture;
+        use llm_harness_types::{BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook};
+        use std::sync::Arc;
+
+        struct Allow;
+        impl BeforeCompactHook for Allow {
+            fn before_compact<'a>(
+                &'a self,
+                _ctx: BeforeCompactCtx<'a>,
+            ) -> BoxFuture<'a, BeforeCompactDecision> {
+                Box::pin(async { BeforeCompactDecision::Proceed })
+            }
+        }
+
+        let builder = HarnessBuilder::new("m")
+            .before_compact_hook(Arc::new(Allow))
+            .before_compact_hook(Arc::new(Allow));
+        assert_eq!(builder.hooks.before_compact.len(), 2);
+    }
+
+    #[test]
+    fn builder_final_answer_validator_hook_appends_to_hooks() {
+        use futures::future::BoxFuture;
+        use llm_harness_types::{
+            FinalAnswerValidationCtx, FinalAnswerValidationError, FinalAnswerValidator,
+        };
+        use std::sync::Arc;
+
+        struct Accept;
+        impl FinalAnswerValidator for Accept {
+            fn validate<'a>(
+                &'a self,
+                _: FinalAnswerValidationCtx<'a>,
+            ) -> BoxFuture<'a, Result<(), FinalAnswerValidationError>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let builder = HarnessBuilder::new("m")
+            .final_answer_validator_hook(Arc::new(Accept))
+            .final_answer_validator_hook(Arc::new(Accept));
+        assert_eq!(builder.hooks.final_answer_validator.len(), 2);
+    }
+
+    #[test]
     fn build_options_injects_accumulator_without_pricing() {
         let builder = HarnessBuilder::new("test-model");
         let opts = builder.build_options(None);
@@ -1175,6 +1351,7 @@ mod tests {
             .compaction_keep_recent_tokens(Some(2048))
             .compaction_prompt(None)
             .compaction_query(None)
+            .compaction_max_failures(Some(5))
             .queue_capacity(Some(64));
     }
     // ── build_options field propagation tests (Task 4) ────────────────────────
@@ -1324,6 +1501,14 @@ mod tests {
     }
 
     #[test]
+    fn build_options_applies_compaction_max_failures() {
+        let opts = HarnessBuilder::new("m")
+            .compaction_max_failures(Some(5))
+            .build_options(None);
+        assert_eq!(opts.compaction_max_failures, Some(5));
+    }
+
+    #[test]
     fn build_options_applies_queue_capacity() {
         let opts = HarnessBuilder::new("m")
             .queue_capacity(Some(64))
@@ -1349,6 +1534,7 @@ mod tests {
         );
         assert_eq!(opts.compaction_reserve_tokens, None);
         assert_eq!(opts.compaction_keep_recent_tokens, None);
+        assert_eq!(opts.compaction_max_failures, None);
         assert_eq!(opts.queue_capacity, 32); // DEFAULT_QUEUE_CAPACITY
     }
 
@@ -1432,6 +1618,7 @@ mod tests {
         assert!(observed.load(Ordering::SeqCst));
     }
 
+    #[cfg(feature = "test-utils")]
     #[test]
     fn build_registers_skill_read_tool_when_skills_present() {
         use llm_harness_loop::test_utils::MockLlmClient;
@@ -1453,6 +1640,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-utils")]
     #[test]
     fn build_no_skill_read_tool_when_no_skills() {
         use llm_harness_loop::test_utils::MockLlmClient;
@@ -1467,6 +1655,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-utils")]
     #[test]
     fn disable_skill_read_tool_opt_out() {
         use llm_harness_loop::test_utils::MockLlmClient;
@@ -1489,6 +1678,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-utils")]
     #[test]
     fn build_sets_readable_skills_when_skills_present() {
         use llm_harness_loop::test_utils::MockLlmClient;
@@ -1509,6 +1699,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-utils")]
     #[test]
     fn build_no_readable_skills_when_no_skills() {
         use llm_harness_loop::test_utils::MockLlmClient;
@@ -1522,6 +1713,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-utils")]
     #[test]
     fn disable_skill_read_tool_leaves_readable_skills_none() {
         use llm_harness_loop::test_utils::MockLlmClient;

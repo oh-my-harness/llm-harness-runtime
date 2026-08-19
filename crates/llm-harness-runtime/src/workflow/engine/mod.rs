@@ -26,8 +26,6 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::builder::{HarnessBuildError, HarnessBuilder};
-use crate::control::cost::CostAggregate;
 use crate::lifecycle::task::{Checkpoint, TaskError, TaskId, TaskResult};
 use crate::lifecycle::task_store::TaskStore;
 use crate::spawn::spawner::HarnessSubAgentSpawner;
@@ -41,6 +39,8 @@ use crate::workflow::model::{
     WorkflowContext, WorkflowState, WorkflowStatus,
 };
 use crate::workflow::plan::validate_workflow;
+use llm_harness_agent::{HarnessBuildError, HarnessBuilder};
+use llm_harness_types::CostAggregate;
 
 /// 空实现 Plugin：build_step_spawner 的 sub-agent plugin factory 占位。
 /// 流程场景下 sub-agent 不需要额外 plugin（工具集由 step 的 allowed_tools 控制）。

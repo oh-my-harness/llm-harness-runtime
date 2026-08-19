@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use llm_harness_loop::LlmClient;
 
-use crate::builder::HarnessBuilder;
 use crate::spawn::spawner::{EnvFactory, SessionFactory};
+use llm_harness_agent::HarnessBuilder;
 
 /// Builder 定制闭包。接收已预设 model + provider 的 HarnessBuilder，
 /// 返回定制后的 builder。每步构造 harness 时调用一次。

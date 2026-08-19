@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use llm_harness_agent::HarnessBuilder;
 use llm_harness_agent::{AgentHarness, HarnessHooks, Session};
-use llm_harness_runtime::builder::HarnessBuilder;
 use llm_harness_types::{AgentError, BeforeRunCtx, BeforeRunHook, BeforeRunResult, ExecutionEnv};
 use parking_lot::RwLock;
 

@@ -19,12 +19,12 @@ use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::control::cost::CostAggregate;
 use crate::lifecycle::task::TaskId;
 use crate::workflow::model::{
     Step, StepId, StepRecord, StepResult, StructuredStatus, WorkflowContext,
 };
 use anyhow::Result;
+use llm_harness_types::CostAggregate;
 
 pub const JSON_TRANSFORM_EXECUTOR_NAME: &str = "json_transform";
 pub const SHELL_EXECUTOR_NAME: &str = "shell";

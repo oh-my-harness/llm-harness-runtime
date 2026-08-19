@@ -13,13 +13,13 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use llm_harness_agent::HarnessBuilder;
 use llm_harness_agent::{
     PromptTemplate, Skill, invoke_template, load_prompt_templates, load_skills,
 };
 use llm_harness_live_tests::{
     EventCapture, LiveProvider, SINGLE_TURN, make_harness_with_env, make_skill_dir, with_timeout,
 };
-use llm_harness_runtime::builder::HarnessBuilder;
 use llm_harness_types::{DataBlock, Tool, ToolContext, ToolFailure, ToolResult};
 
 // ── Plugin: registers skills + templates from directory ──────────────────

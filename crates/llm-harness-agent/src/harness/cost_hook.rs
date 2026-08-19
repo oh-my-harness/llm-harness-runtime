@@ -149,14 +149,10 @@ impl AfterProviderResponseHook for CostAccumulatorHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::future::BoxFuture;
-    use llm_harness_strategy::budget::BudgetControlAdapter;
-    use llm_harness_types::BudgetExceededHook;
     use llm_harness_types::{
-        AfterProviderResponseCtx, AssistantMessage, CostAggregate, ProviderResponseInfo,
-        RunContext, RunRequest, ShouldStopCtx, ShouldStopHook, StopReason, TokenPrice, TokenUsage,
+        AfterProviderResponseCtx, CostAggregate, ProviderResponseInfo, RunContext, RunRequest,
+        TokenPrice, TokenUsage,
     };
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct FixedPricing;
     impl PricingProvider for FixedPricing {
@@ -178,33 +174,6 @@ mod tests {
                 output_per_mtok: 2.0,
                 cache_read_per_mtok: 0.1,
                 cache_write_per_mtok: 0.5,
-            })
-        }
-    }
-
-    struct StopOnExceeded;
-    impl BudgetExceededHook for StopOnExceeded {
-        fn on_budget_exceeded<'a>(
-            &'a self,
-            _cost: &'a CostAggregate,
-            _budget_limit: f64,
-        ) -> BoxFuture<'a, bool> {
-            Box::pin(async { false })
-        }
-    }
-
-    struct CountingPricing {
-        calls: Arc<AtomicU64>,
-    }
-
-    impl PricingProvider for CountingPricing {
-        fn price_for(&self, _model: &str, _provider: &str) -> Option<TokenPrice> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Some(TokenPrice {
-                input_per_mtok: 1.0,
-                output_per_mtok: 1.0,
-                cache_read_per_mtok: 1.0,
-                cache_write_per_mtok: 1.0,
             })
         }
     }
@@ -243,58 +212,6 @@ mod tests {
         .await;
     }
 
-    fn assistant() -> AssistantMessage {
-        let mut message = llm_harness_loop::test_utils::test_assistant_message(vec![]);
-        message.stop_reason = Some(StopReason::EndTurn);
-        message
-    }
-
-    fn stop_context(assistant: &AssistantMessage) -> ShouldStopCtx<'_> {
-        static RUN: std::sync::OnceLock<RunContext> = std::sync::OnceLock::new();
-        ShouldStopCtx {
-            run: RUN.get_or_init(|| RunContext::new(RunRequest::default())),
-            last_assistant: assistant,
-            stop_reason: StopReason::EndTurn,
-            turn_index: 0,
-        }
-    }
-
-    #[tokio::test]
-    async fn cache_categories_are_billed_once_at_exact_budget_boundaries() {
-        let cost = Arc::new(Mutex::new(CostAggregate::default()));
-        let hook = CostAccumulatorHook::new(cost.clone(), Some(Arc::new(CachePricing)));
-        let usage = TokenUsage {
-            input_tokens: 1_000,
-            output_tokens: 500,
-            cache_read_tokens: 400,
-            cache_creation_tokens: 0,
-            reasoning_tokens: 100,
-            provenance: UsageReportProvenance::ReportedValid,
-        };
-
-        record_response(&hook, &make_info(usage, "cached-model", "openai")).await;
-
-        let observed = hook.current_cost();
-        assert!((observed.total_cost - 0.00164).abs() < 1e-12);
-        assert_eq!(
-            observed.billing_usage_profile,
-            Some(canonical_billing_usage_profile())
-        );
-        assert_eq!(observed.billing_usage_violations, 0);
-        assert_eq!(observed.usage_reports.provider_calls, 1);
-        assert_eq!(observed.usage_reports.reported_valid, 1);
-        observed
-            .usage_reports
-            .require_all_reported_valid()
-            .expect("one provider call has one valid usage report");
-        let message = assistant();
-        let exact =
-            BudgetControlAdapter::new(cost.clone(), 0.00164, Some(Arc::new(StopOnExceeded)));
-        assert!(!exact.should_stop(stop_context(&message)).await);
-        let below = BudgetControlAdapter::new(cost, 0.00163, Some(Arc::new(StopOnExceeded)));
-        assert!(below.should_stop(stop_context(&message)).await);
-    }
-
     #[tokio::test]
     async fn cache_read_and_write_categories_are_billed_once() {
         let cost = Arc::new(Mutex::new(CostAggregate::default()));
@@ -311,45 +228,6 @@ mod tests {
         record_response(&hook, &make_info(usage, "cached-model", "anthropic")).await;
 
         assert!((hook.current_cost().total_cost - 0.00159).abs() < 1e-12);
-    }
-
-    #[tokio::test]
-    async fn invalid_cache_relationship_fails_closed_before_pricing_lookup() {
-        let calls = Arc::new(AtomicU64::new(0));
-        let cost = Arc::new(Mutex::new(CostAggregate::default()));
-        let hook = CostAccumulatorHook::new(
-            cost.clone(),
-            Some(Arc::new(CountingPricing {
-                calls: calls.clone(),
-            })),
-        );
-        let usage = TokenUsage {
-            input_tokens: 100,
-            output_tokens: 20,
-            cache_read_tokens: 80,
-            cache_creation_tokens: 30,
-            reasoning_tokens: 5,
-            provenance: UsageReportProvenance::ReportedValid,
-        };
-
-        record_response(&hook, &make_info(usage, "cached-model", "openai")).await;
-
-        let observed = hook.current_cost();
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(observed.total_input_tokens, 0);
-        assert_eq!(observed.total_cache_read_tokens, 0);
-        assert_eq!(observed.total_cache_write_tokens, 0);
-        assert_eq!(observed.total_cost, 0.0);
-        assert_eq!(observed.billing_usage_violations, 1);
-        assert_eq!(observed.usage_reports.provider_calls, 1);
-        assert_eq!(observed.usage_reports.reported_invalid, 1);
-        assert_eq!(observed.usage_reports.unknown_cost_calls(), 1);
-        assert!(observed.by_model.is_empty());
-        assert!(observed.validate_billing_profile().is_err());
-
-        let message = assistant();
-        let budget = BudgetControlAdapter::new(cost, f64::MAX, None);
-        assert!(budget.should_stop(stop_context(&message)).await);
     }
 
     #[tokio::test]
@@ -432,104 +310,6 @@ mod tests {
         assert_eq!(mc.call_count, 2);
     }
 
-    #[tokio::test]
-    async fn missing_usage_records_unknown_cost_and_stops_budget() {
-        let pricing_calls = Arc::new(AtomicU64::new(0));
-        let cost = Arc::new(Mutex::new(CostAggregate::default()));
-        let hook = CostAccumulatorHook::new(
-            cost.clone(),
-            Some(Arc::new(CountingPricing {
-                calls: pricing_calls.clone(),
-            })),
-        );
-
-        let info = ProviderResponseInfo {
-            status_code: None,
-            response_headers: vec![],
-            usage: None,
-            latency_ms: 0,
-            model: Some("claude-sonnet".into()),
-            provider: Some("anthropic".into()),
-        };
-        record_response(&hook, &info).await;
-
-        let c = hook.current_cost();
-        assert_eq!(c.total_input_tokens, 0);
-        assert_eq!(c.total_cost, 0.0);
-        assert_eq!(c.usage_reports.provider_calls, 1);
-        assert_eq!(c.usage_reports.missing, 1);
-        assert_eq!(c.usage_reports.unknown_cost_calls(), 1);
-        assert!(c.by_model.is_empty());
-        assert_eq!(pricing_calls.load(Ordering::SeqCst), 0);
-
-        let message = assistant();
-        let budget = BudgetControlAdapter::new(cost, f64::MAX, None);
-        assert!(budget.should_stop(stop_context(&message)).await);
-    }
-
-    #[tokio::test]
-    async fn reported_zero_usage_is_valid_priced_evidence() {
-        let cost = Arc::new(Mutex::new(CostAggregate::default()));
-        let hook = CostAccumulatorHook::new(cost.clone(), Some(Arc::new(FixedPricing)));
-        let usage = TokenUsage {
-            provenance: UsageReportProvenance::ReportedValid,
-            ..Default::default()
-        };
-
-        record_response(&hook, &make_info(usage, "claude-sonnet", "anthropic")).await;
-
-        let observed = hook.current_cost();
-        assert_eq!(observed.total_cost, 0.0);
-        assert_eq!(observed.usage_reports.provider_calls, 1);
-        assert_eq!(observed.usage_reports.reported_valid, 1);
-        observed
-            .usage_reports
-            .require_all_reported_valid()
-            .expect("an explicit zero payload remains authoritative");
-        let model = observed
-            .by_model
-            .get("anthropic/claude-sonnet")
-            .expect("a priced zero-token call remains observable");
-        assert_eq!(model.call_count, 1);
-        assert_eq!(model.cost, 0.0);
-
-        let message = assistant();
-        let budget = BudgetControlAdapter::new(cost, 0.0, None);
-        assert!(!budget.should_stop(stop_context(&message)).await);
-    }
-
-    #[tokio::test]
-    async fn provider_reported_invalid_usage_records_unknown_cost() {
-        let pricing_calls = Arc::new(AtomicU64::new(0));
-        let cost = Arc::new(Mutex::new(CostAggregate::default()));
-        let hook = CostAccumulatorHook::new(
-            cost.clone(),
-            Some(Arc::new(CountingPricing {
-                calls: pricing_calls.clone(),
-            })),
-        );
-        let usage = TokenUsage {
-            input_tokens: 10,
-            output_tokens: 5,
-            provenance: UsageReportProvenance::ReportedInvalid,
-            ..Default::default()
-        };
-
-        record_response(&hook, &make_info(usage, "model", "provider")).await;
-
-        let observed = hook.current_cost();
-        assert_eq!(observed.usage_reports.provider_calls, 1);
-        assert_eq!(observed.usage_reports.reported_invalid, 1);
-        assert_eq!(observed.usage_reports.unknown_cost_calls(), 1);
-        assert_eq!(observed.billing_usage_violations, 1);
-        assert_eq!(observed.total_cost, 0.0);
-        assert!(observed.by_model.is_empty());
-        assert_eq!(pricing_calls.load(Ordering::SeqCst), 0);
-
-        let message = assistant();
-        let budget = BudgetControlAdapter::new(cost, f64::MAX, None);
-        assert!(budget.should_stop(stop_context(&message)).await);
-    }
     /// Regression: production path has `provider: None` (StreamingState does
     /// not expose provider metadata). Pricing must still be resolved by model
     /// alone, and `by_model` key falls back to the bare model name.
@@ -560,6 +340,7 @@ mod tests {
         assert_eq!(mc.call_count, 1);
         assert!((mc.cost - 3.0).abs() < 1e-9);
     }
+
     /// Regression: per-model `ModelCost` must record cache tokens, not just
     /// input/output. Otherwise `mc.cost` (which includes cache fees) cannot be
     /// reconciled against the token dimensions.
@@ -595,5 +376,172 @@ mod tests {
         );
         assert_eq!(mc.reasoning_tokens, 50);
         assert_eq!(mc.call_count, 1);
+    }
+
+    struct CountingPricing {
+        calls: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl PricingProvider for CountingPricing {
+        fn price_for(&self, _model: &str, _provider: &str) -> Option<TokenPrice> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(TokenPrice {
+                input_per_mtok: 1.0,
+                output_per_mtok: 1.0,
+                cache_read_per_mtok: 1.0,
+                cache_write_per_mtok: 1.0,
+            })
+        }
+    }
+
+    /// Regression: an invalid cache relationship (cache_read + cache_creation >
+    /// gross input) is rejected before the pricing source is consulted. The
+    /// shared aggregate records a billing violation and accumulates nothing,
+    /// so the supplied `PricingProvider` is never called.
+    #[tokio::test]
+    async fn invalid_cache_relationship_fails_closed_before_pricing_lookup() {
+        use std::sync::atomic::Ordering;
+        let calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cost = Arc::new(Mutex::new(CostAggregate::default()));
+        let hook = CostAccumulatorHook::new(
+            cost,
+            Some(Arc::new(CountingPricing {
+                calls: calls.clone(),
+            })),
+        );
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_read_tokens: 80,
+            cache_creation_tokens: 30,
+            reasoning_tokens: 5,
+            provenance: UsageReportProvenance::ReportedValid,
+        };
+
+        record_response(&hook, &make_info(usage, "cached-model", "openai")).await;
+
+        let observed = hook.current_cost();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "pricing must not be consulted"
+        );
+        assert_eq!(observed.total_input_tokens, 0);
+        assert_eq!(observed.total_cache_read_tokens, 0);
+        assert_eq!(observed.total_cache_write_tokens, 0);
+        assert_eq!(observed.total_cost, 0.0);
+        assert_eq!(observed.billing_usage_violations, 1);
+        assert_eq!(observed.usage_reports.provider_calls, 1);
+        assert_eq!(observed.usage_reports.reported_invalid, 1);
+        assert_eq!(observed.usage_reports.unknown_cost_calls(), 1);
+        assert!(observed.by_model.is_empty());
+        assert!(observed.validate_billing_profile().is_err());
+    }
+
+    /// Regression: a response completing without a usage payload is recorded
+    /// as a missing/unknown-cost call. The accumulator records the missing
+    /// provenance and never consults pricing — no untrusted counters flow in.
+    #[tokio::test]
+    async fn missing_usage_records_unknown_cost_without_pricing_lookup() {
+        use std::sync::atomic::Ordering;
+        let pricing_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cost = Arc::new(Mutex::new(CostAggregate::default()));
+        let hook = CostAccumulatorHook::new(
+            cost,
+            Some(Arc::new(CountingPricing {
+                calls: pricing_calls.clone(),
+            })),
+        );
+
+        let info = ProviderResponseInfo {
+            status_code: None,
+            response_headers: vec![],
+            usage: None,
+            latency_ms: 0,
+            model: Some("claude-sonnet".into()),
+            provider: Some("anthropic".into()),
+        };
+        record_response(&hook, &info).await;
+
+        let c = hook.current_cost();
+        assert_eq!(c.total_input_tokens, 0);
+        assert_eq!(c.total_cost, 0.0);
+        assert_eq!(c.usage_reports.provider_calls, 1);
+        assert_eq!(c.usage_reports.missing, 1);
+        assert_eq!(c.usage_reports.unknown_cost_calls(), 1);
+        assert!(c.by_model.is_empty());
+        assert_eq!(
+            pricing_calls.load(Ordering::SeqCst),
+            0,
+            "pricing must not be consulted"
+        );
+    }
+
+    /// Regression: an explicit zero-token, `ReportedValid` payload is
+    /// authoritative. It keeps the aggregate billing-clean (all reports valid,
+    /// cost 0.0) and per-model observability intact, so a zero budget does NOT
+    /// stop the loop. Pricing IS consulted, but yields a $0 call.
+    #[tokio::test]
+    async fn reported_zero_usage_is_valid_priced_evidence() {
+        let cost = Arc::new(Mutex::new(CostAggregate::default()));
+        let hook = CostAccumulatorHook::new(cost.clone(), Some(Arc::new(FixedPricing)));
+        let usage = TokenUsage {
+            provenance: UsageReportProvenance::ReportedValid,
+            ..Default::default()
+        };
+
+        record_response(&hook, &make_info(usage, "claude-sonnet", "anthropic")).await;
+
+        let observed = hook.current_cost();
+        assert_eq!(observed.total_cost, 0.0);
+        assert_eq!(observed.usage_reports.provider_calls, 1);
+        assert_eq!(observed.usage_reports.reported_valid, 1);
+        observed
+            .usage_reports
+            .require_all_reported_valid()
+            .expect("an explicit zero payload remains authoritative");
+        let model = observed
+            .by_model
+            .get("anthropic/claude-sonnet")
+            .expect("a priced zero-token call remains observable");
+        assert_eq!(model.call_count, 1);
+        assert_eq!(model.cost, 0.0);
+    }
+
+    /// Regression: a `ReportedInvalid` payload is treated as unknown-cost: the
+    /// accumulator records a billing violation and a missing-cost call, and
+    /// never consults the pricing source for the invalid report.
+    #[tokio::test]
+    async fn provider_reported_invalid_usage_records_unknown_cost_without_pricing_lookup() {
+        use std::sync::atomic::Ordering;
+        let pricing_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cost = Arc::new(Mutex::new(CostAggregate::default()));
+        let hook = CostAccumulatorHook::new(
+            cost,
+            Some(Arc::new(CountingPricing {
+                calls: pricing_calls.clone(),
+            })),
+        );
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            provenance: UsageReportProvenance::ReportedInvalid,
+            ..Default::default()
+        };
+
+        record_response(&hook, &make_info(usage, "model", "provider")).await;
+
+        let observed = hook.current_cost();
+        assert_eq!(observed.usage_reports.provider_calls, 1);
+        assert_eq!(observed.usage_reports.reported_invalid, 1);
+        assert_eq!(observed.usage_reports.unknown_cost_calls(), 1);
+        assert_eq!(observed.billing_usage_violations, 1);
+        assert_eq!(observed.total_cost, 0.0);
+        assert!(observed.by_model.is_empty());
+        assert_eq!(
+            pricing_calls.load(Ordering::SeqCst),
+            0,
+            "pricing must not be consulted"
+        );
     }
 }

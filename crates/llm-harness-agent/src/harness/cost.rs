@@ -1,13 +1,9 @@
-//! Cost types re-exported from `llm-harness-types`.
-//!
-//! Originally defined here; moved to `llm-harness-types` so the agent crate
-//! (which sits below runtime in the dependency chain) can hold
-//! `CostAggregate` / `PricingProvider` without reversing the dependency
-//! direction.
+//! Caller-owned cost accounting state (`UsageLedger`), backed by the shared
+//! `CostAggregate` type from `llm-harness-types`.
 
 use std::sync::{Arc, Mutex};
 
-pub use llm_harness_types::{CostAggregate, ModelCost, PricingProvider, TokenPrice};
+use llm_harness_types::CostAggregate;
 
 /// Caller-owned accounting state that survives cancellation of a harness run.
 ///

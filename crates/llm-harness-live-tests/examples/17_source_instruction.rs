@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use llm_harness_agent::AgentHarness;
+use llm_harness_agent::HarnessBuilder;
 use llm_harness_live_tests::{EventCapture, LiveProvider, SINGLE_TURN, with_timeout};
-use llm_harness_runtime::builder::HarnessBuilder;
 use llm_harness_runtime::platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_runtime_sandbox_os::OsEnvSandbox;
 use llm_harness_strategy::{ProjectInstructionPlugin, SourceTagEntry, SourceTagPlugin};

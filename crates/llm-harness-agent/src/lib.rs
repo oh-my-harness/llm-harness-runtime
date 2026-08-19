@@ -1,16 +1,34 @@
-//! Primary framework SDK facade for `llm-harness-core`.
+//! Primary framework SDK facade — the user-facing entry point for building
+//! and running LLM agents.
 //!
-//! This crate exposes the user-facing core runtime: `Agent` for lightweight
-//! stateful runs, `AgentHarness` for session-backed agents, session
-//! repositories, compaction, and skills/templates.
+//! This crate provides:
 //!
-//! Concrete tools, settings/auth/model registries, product prompts, CLI/TUI
-//! entrypoints, and extension runtimes belong above core, for example in
-//! `llm-harness-runtime` or a domain-agent repository.
+//! - **[`HarnessBuilder`]** — fluent builder for constructing an
+//!   [`AgentHarness`] with plugins, LLM providers, tools, hooks, skills,
+//!   and cost tracking. This is the main entry point for most users.
+//! - **[`AgentHarness`]** — session-backed agent runtime: manages the
+//!   turn loop, tool dispatch, compaction, streaming, and event emission.
+//! - **[`Agent`]** — lightweight stateful runner for single-turn or
+//!   few-shot use cases without full session persistence.
+//! - **Sessions** — `Session`, `SessionRepo`, `JsonlSessionRepo`,
+//!   `InMemorySessionRepo` for conversation persistence and branching.
+//! - **Compaction** — `compact()`, `CompactionModelConfig`,
+//!   `CompactionPromptSpec` for context-window management.
+//! - **Skills & Templates** — `Skill`, `PromptTemplate`, `SkillReadTool`
+//!   for loading and invoking markdown-based skills.
+//! - **Cost tracking** — `UsageLedger` for caller-owned cost accounting
+//!   that survives run cancellation; `CostAggregate` (via `types`) for
+//!   token/cost snapshots.
+//! - **Hooks** — `HarnessHooks`, `Plugin` trait for composable
+//!   before/after-run, before/after-turn, before/after-tool-call,
+//!   should-stop, and transform-context extensions.
 //!
-//! For common imports, use [`prelude`].
+//! Concrete platform infrastructure (sandboxes, workflow engine, spawn,
+//! tracing, audit) lives in `llm-harness-runtime`. Strategy plugins
+//! (safety, budget, audit) live in `llm-harness-strategy`.
 
 pub mod agent;
+pub mod builder;
 pub mod compaction;
 pub mod harness;
 pub mod plugin;
@@ -18,6 +36,7 @@ pub mod session;
 pub mod skills;
 
 pub use agent::{Agent, AgentOptions, AgentPhase, AgentState, ModelInfo};
+pub use builder::{HarnessBuildError, HarnessBuilder};
 pub use compaction::{
     CompactionModelConfig, CompactionPreparation, CompactionPromptSpec, CompactionSummaryConfig,
     CompactionThresholdConfig, compact,
@@ -25,7 +44,7 @@ pub use compaction::{
 pub use harness::{
     AbortCascadeHook, AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AsyncSpawnHookHandle,
     CompactionStats, FollowUpHandle, HarnessHooks, HarnessState, HarnessToolCallResult,
-    IdleWatcherHook,
+    IdleWatcherHook, UsageLedger,
 };
 pub use llm_harness_loop::{
     DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior, FinalAnswerMode,

@@ -201,7 +201,7 @@ async fn main() {
         sandbox.env()
     };
 
-    let builder = llm_harness_runtime::builder::HarnessBuilder::new(&entry.model)
+    let builder = llm_harness_agent::HarnessBuilder::new(&entry.model)
         .provider("*", entry.client.clone())
         .max_tokens(1024);
     let harness3 = builder.build_with_session(env, session).unwrap();

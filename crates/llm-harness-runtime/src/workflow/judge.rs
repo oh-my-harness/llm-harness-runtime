@@ -311,8 +311,8 @@ fn compare_number(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::cost::CostAggregate;
     use crate::workflow::model::StructuredStatus;
+    use llm_harness_types::CostAggregate;
 
     fn make_step_with_id(id: &str) -> Step {
         Step::llm(id, id, "do", vec![])

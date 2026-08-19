@@ -675,7 +675,7 @@ impl llm_harness_agent::AbortCascadeHook for MessageBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builder::HarnessBuilder;
+    use llm_harness_agent::HarnessBuilder;
     use llm_harness_loop::LlmClient;
     use llm_harness_loop::test_utils::{MockLlmClient, MockResponse, NoOpEnv};
     use llm_harness_types::ExecutionEnv;

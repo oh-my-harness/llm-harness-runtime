@@ -12,13 +12,13 @@
 //! push 到 `ctx.messages`），不写 session。因此验证主 agent 的 LLM 请求
 //! 包含 sub-agent 结果文本，证明投递链路完整。
 
+use llm_harness_agent::HarnessBuilder;
 use llm_harness_agent::Plugin;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_loop::{
     ChatRequest, ChatResponse, LlmClient, LlmError, LlmMessage, ProviderCapabilities,
     RequestContent, StreamHandle,
 };
-use llm_harness_runtime::builder::HarnessBuilder;
 use llm_harness_runtime::spawn::delivery::{IdleWatcher, async_spawn_pair};
 use llm_harness_runtime::spawn::message_bus::{MessageBus, message_bus_pair};
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};

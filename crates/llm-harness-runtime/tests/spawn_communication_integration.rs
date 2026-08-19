@@ -17,9 +17,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use llm_harness_agent::HarnessBuilder;
 use llm_harness_agent::{AgentHarness, IdleWatcherHook, Plugin};
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse, NoOpEnv};
-use llm_harness_runtime::builder::HarnessBuilder;
 use llm_harness_runtime::spawn::delivery::IdleWatcher;
 use llm_harness_runtime::spawn::message_bus::{
     AgentEntry, AgentStatus, MessageBus, SendReceipt, SubAgentEvent, message_bus_pair,

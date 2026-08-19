@@ -12,21 +12,20 @@
 //!   Cost tracking is split across three crates:
 //!   - `llm-harness-types`: contracts (TokenPrice, PricingProvider,
 //!     CostAggregate, BudgetExceededHook)
-//!   - `llm-harness-runtime`: accumulation (UsageLedger, CostAccumulatorHook)
+//!   - `llm-harness-agent`: accumulation (UsageLedger, CostAccumulatorHook)
 //!   - `llm-harness-strategy`: decisions (BudgetControlAdapter)
 //!
 //!   The builder injects `CostAccumulatorHook` internally and wires it to
 //!   the shared `Arc<Mutex<CostAggregate>>` inside `UsageLedger`. The
 //!   `BudgetControlAdapter` needs that same `Arc` to read accumulated cost.
-//!   However, `UsageLedger::shared_state()` is `pub(crate)` — it cannot be
-//!   called from outside the runtime crate. This means end-users cannot
-//!   directly wire `BudgetControlAdapter` to the harness's internal cost
-//!   state without runtime-crate access.
+//!   `UsageLedger::shared_state()` is public, so external consumers can
+//!   extract it directly and wire `BudgetControlAdapter` as a `should_stop`
+//!   hook on the same builder.
 //!
-//!   Part 1 (cost tracking) works fully from external code. Part 2
-//!   demonstrates `BudgetControlAdapter` construction with a standalone
-//!   cost state (mirroring the runtime's own unit tests) and documents
-//!   the wiring path for in-crate consumers.
+//!   Part 1 demonstrates cost tracking via `UsageLedger`. Part 2 constructs
+//!   `BudgetControlAdapter` with the ledger's own shared state — the real
+//!   in-harness enforcement wiring — and also shows a standalone adapter
+//!   construction for reference.
 //!
 //! Run:
 //!   source .env
@@ -35,12 +34,13 @@
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
+use llm_harness_agent::UsageLedger;
 use llm_harness_live_tests::{
     EventCapture, LiveProvider, MULTI_TURN, make_harness_with, with_timeout,
 };
-use llm_harness_runtime::control::cost::{CostAggregate, PricingProvider, TokenPrice, UsageLedger};
 use llm_harness_strategy::budget::BudgetControlAdapter;
 use llm_harness_types::BudgetExceededHook;
+use llm_harness_types::{CostAggregate, PricingProvider, TokenPrice};
 
 // ── Fixed pricing provider ──────────────────────────────────────────────
 //
@@ -225,28 +225,21 @@ async fn main() {
     // Arc<Mutex<CostAggregate>> and, when total_cost exceeds budget_limit,
     // consults the optional BudgetExceededHook.
     //
-    // Wiring limitation:
+    // Wiring:
     //   The adapter needs the SAME Arc<Mutex<CostAggregate>> that the
     //   builder injects into CostAccumulatorHook. That Arc lives inside
-    //   UsageLedger, but UsageLedger::shared_state() is pub(crate) —
-    //   callable only from within the llm-harness-runtime crate.
-    //   External consumers cannot extract it to wire BudgetControlAdapter.
+    //   UsageLedger, and UsageLedger::shared_state() is public — external
+    //   consumers can extract it directly to wire BudgetControlAdapter.
     //
-    //   The runtime's own unit tests (budget_tests.rs) construct a
-    //   standalone Arc<Mutex<CostAggregate::default()>> and pass it to
-    //   both the adapter and (directly) the accumulator. From outside
-    //   the crate, the pattern is:
-    //
-    //     1. Build the harness with usage_ledger + pricing (as in Part 1).
-    //     2. Read cost via ledger.snapshot() or harness.usage() after
-    //        each turn for surveillance (no enforcement).
-    //     3. For enforcement, use the builder's .should_stop_hook() with
-    //        a custom hook that reads from ledger.snapshot() internally.
+    //   In-harness pattern:
+    //     1. Create the UsageLedger before building the harness.
+    //     2. Extract shared_state() and construct BudgetControlAdapter.
+    //     3. Register the adapter via the builder's .should_stop_hook().
+    //     4. Build the harness with usage_ledger + pricing.
     //
     //   Below we demonstrate BudgetControlAdapter construction with a
-    //   standalone cost state, matching the unit-test pattern, to show
+    //   standalone cost state (matching the unit-test pattern) to show
     //   the API surface and the BudgetExceededHook callback.
-
     println!("\n── Part 2: BudgetControlAdapter construction ──\n");
 
     // Standalone shared cost state (as in budget_tests.rs).

@@ -12,11 +12,13 @@ chrono.workspace            = true
 futures.workspace           = true
 serde.workspace             = true
 serde_json.workspace        = true
+thiserror.workspace         = true
 tokio     = { workspace = true, features = ["full"] }
 tokio-util.workspace        = true
 
 uuid.workspace              = true
 tracing.workspace           = true
+glob.workspace              = true
 
 [features]
 test-utils = ["llm-harness-loop/test-utils"]
