@@ -10,7 +10,28 @@ jobs:
     # 组织 owner 仍可绕过——这是 Free 计划的硬限制
     if: github.event.pusher.name != 'dependabot[bot]'
     steps:
+      - name: Check if push is a merged PR
+        id: pr-check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 对该 push 的每个 commit，查询是否对应已合并的 PR
+          # squash merge 会触发 push 事件，需要反查确认
+          for sha in ${{ join(github.event.commits.*.id, ' ') }}; do
+            echo "Checking commit $sha..."
+            pr_json=$(gh api \
+              "repos/${{ github.repository }}/commits/${sha}/pulls" \
+              --jq '.[] | select(.state == "closed" and .merged_at != null)')
+            if [ -n "$pr_json" ]; then
+              pr_number=$(echo "$pr_json" | jq -r '.number')
+              echo "Found merged PR #$pr_number for commit $sha"
+              echo "is_pr_merge=true" >> "$GITHUB_OUTPUT"
+              break
+            fi
+          done
+
       - name: Block direct push to main
+        if: steps.pr-check.outputs.is_pr_merge != 'true'
         run: |
           echo "❌ Direct push to main is not allowed."
           echo "Please use a pull request instead."
