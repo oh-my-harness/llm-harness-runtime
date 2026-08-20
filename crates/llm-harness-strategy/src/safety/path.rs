@@ -240,11 +240,24 @@ mod tests {
         assert!(static_check("../../etc/passwd", root, &cfg).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn static_check_denies_absolute_outside_root() {
         let root = Path::new("/workspace");
         let cfg = default_config();
         let result = static_check("/etc/passwd", root, &cfg);
+        assert!(matches!(
+            result,
+            Err(PathViolation::AbsoluteOutsideRoot { .. })
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn static_check_denies_absolute_outside_root() {
+        let root = Path::new("C:\\workspace");
+        let cfg = default_config();
+        let result = static_check("C:\\etc\\passwd", root, &cfg);
         assert!(matches!(
             result,
             Err(PathViolation::AbsoluteOutsideRoot { .. })
@@ -269,6 +282,7 @@ mod tests {
         assert!(static_check("/workspace/src/main.rs", root, &cfg).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn static_check_denies_absolute_traversal_escape_when_allowed() {
         let root = Path::new("/workspace");
@@ -278,12 +292,32 @@ mod tests {
         assert!(static_check("/workspace/../etc/passwd", root, &cfg).is_err());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn static_check_denies_absolute_traversal_escape_when_allowed() {
+        let root = Path::new("C:\\workspace");
+        let cfg = PathSafetyConfig::new().allow_absolute(true);
+        // C:\workspace\..\etc\passwd lexically starts with C:\workspace but
+        // resolves to C:\etc\passwd — must be rejected.
+        assert!(static_check("C:\\workspace\\..\\etc\\passwd", root, &cfg).is_err());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn static_check_denies_absolute_outside_root_even_when_allowed() {
         let root = Path::new("/workspace");
         let cfg = PathSafetyConfig::new().allow_absolute(true);
         // /etc is outside /workspace
         assert!(static_check("/etc/passwd", root, &cfg).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn static_check_denies_absolute_outside_root_even_when_allowed() {
+        let root = Path::new("C:\\workspace");
+        let cfg = PathSafetyConfig::new().allow_absolute(true);
+        // C:\etc is outside C:\workspace
+        assert!(static_check("C:\\etc\\passwd", root, &cfg).is_err());
     }
 
     #[test]
