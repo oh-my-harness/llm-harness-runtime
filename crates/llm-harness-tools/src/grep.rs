@@ -465,6 +465,7 @@ mod tests {
             DataBlock::Text { text, .. } => text.clone(),
             _ => panic!("expected text"),
         };
+        let text = text.replace('\\', "/");
         assert!(text.contains("src/main.rs:2:"));
         assert!(text.contains("println!"));
     }
@@ -491,6 +492,7 @@ mod tests {
             DataBlock::Text { text, .. } => text.clone(),
             _ => panic!("expected text"),
         };
+        let text = text.replace('\\', "/");
         assert!(text.contains("src/main.rs:1:"));
         assert!(text.contains("src/utils/helper.rs:2:"));
     }

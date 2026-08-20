@@ -423,18 +423,23 @@ mod tests {
         )
         .unwrap();
 
-        // First next() → output event with both lines
-        let e1 = stream.next().await.unwrap();
-        let text = text_of_event(&e1);
-        assert!(text.contains("line1"), "got: {text}");
-        assert!(text.contains("line2"), "got: {text}");
+        // Collect all output events until the exit event. Batching is
+        // non-deterministic (interval ticks may split output), so we
+        // accumulate rather than assuming a single output event.
+        let mut combined = String::new();
+        loop {
+            let e = stream.next().await.unwrap();
+            if e.details["channel"] == "shell_monitor.exit" {
+                break;
+            }
+            combined.push_str(&text_of_event(&e));
+            combined.push('\n');
+        }
 
-        // Second next() → exit event
-        let e2 = stream.next().await.unwrap();
-        let exit_text = text_of_event(&e2);
-        assert!(exit_text.contains("process exited"), "got: {exit_text}");
+        assert!(combined.contains("line1"), "got: {combined}");
+        assert!(combined.contains("line2"), "got: {combined}");
 
-        // Third next() → None
+        // Stream exhausted after exit event.
         assert!(stream.next().await.is_none());
     }
 
