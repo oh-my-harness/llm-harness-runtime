@@ -1,11 +1,11 @@
 //! 11 — Spawn Sub-Agent: main agent dispatches sub-agents and collects results.
 //!
 //! Demonstrates:
-//! - Wiring MessageBus, HarnessSubAgentSpawner, AsyncSpawnHook, IdleWatcher
+//! - Wiring MessageBus, HarnessSubAgentSpawner, SpawnPlugin
 //! - SpawnAgentTool: main agent spawns a sub-agent (async, fire-and-forget)
 //! - AwaitSubagentReplyTool: main agent blocks waiting for sub-agent reply
 //! - QuerySubagentTool: main agent queries sub-agent status
-//! - Sub-agent results delivered back via event channel + AsyncSpawnHook
+//! - Sub-agent results delivered back via event_sink + SpawnPlugin hooks
 //!
 //! Run:
 //!   source .env
@@ -18,10 +18,9 @@ use llm_harness_live_tests::{
     EventCapture, LiveProvider, MULTI_TURN, make_harness_with, with_timeout,
 };
 use llm_harness_loop::convert::DefaultConvertToLlm;
-use llm_harness_runtime::spawn::delivery::{
-    IdleWatcher, SubAgentMessageConverter, async_spawn_pair,
-};
-use llm_harness_runtime::spawn::message_bus::{MAIN_AGENT_ID, message_bus_pair};
+use llm_harness_runtime::spawn::delivery::SubAgentMessageConverter;
+use llm_harness_runtime::spawn::message_bus::{MAIN_AGENT_ID, MessageBus};
+use llm_harness_runtime::spawn::plugin::SpawnPlugin;
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_runtime::spawn::tools::{
     AwaitSubagentReplyTool, QuerySubagentTool, SpawnAgentTool,
@@ -50,7 +49,7 @@ async fn make_spawn_harness(
     tempfile::TempDir,
 ) {
     // 1. Message bus — shared between main agent and sub-agents.
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
 
     // 2. Session dir for sub-agent JSONL sessions.
     let session_tmp = tempfile::tempdir().unwrap();
@@ -68,14 +67,13 @@ async fn make_spawn_harness(
 
     let spawner = Arc::new(spawner);
 
-    // 4. Async spawn hook — drains sub-agent completion events and injects
+    // 4. SpawnPlugin — drains sub-agent completion events and injects
     //    them as follow_up messages into the main agent's conversation.
-    let async_hook = async_spawn_pair(bus.clone());
+    let spawn_plugin = SpawnPlugin::new(bus.clone());
 
-    // 5. Build the main agent harness with spawn tools + async hook + converter.
+    // 5. Build the main agent harness with spawn tools + plugin + converter.
     let spawner_clone = spawner.clone();
     let bus_clone = bus.clone();
-    let async_hook_for_builder = async_hook.clone();
     let (harness, sandbox_tmp) = make_harness_with(entry, |b| {
         b.tool(Arc::new(SpawnAgentTool::new(spawner_clone.clone())))
             .tool(Arc::new(AwaitSubagentReplyTool::new(
@@ -83,7 +81,7 @@ async fn make_spawn_harness(
                 MAIN_AGENT_ID,
             )))
             .tool(Arc::new(QuerySubagentTool::new(bus_clone.clone())))
-            .after_turn_hook(async_hook_for_builder)
+            .install(spawn_plugin.as_ref())
             .convert_to_llm(Some(Arc::new(
                 DefaultConvertToLlm::new()
                     .with_custom_converter(Arc::new(SubAgentMessageConverter)),
@@ -99,23 +97,8 @@ async fn make_spawn_harness(
 
     let harness = Arc::new(harness);
 
-    // 6. Wire hooks into the harness (after build, since they need &harness).
-    //    IdleWatcher's continue_run callback holds a Weak<AgentHarness> to
-    //    avoid a reference cycle (F-1 fix).
-    let watcher = IdleWatcher::new(bus.clone(), {
-        let h = Arc::downgrade(&harness);
-        Arc::new(move || {
-            let h = h.clone();
-            Box::pin(async move {
-                if let Some(h) = h.upgrade() {
-                    let _ = h.continue_run().await;
-                }
-            })
-        })
-    });
-    harness.set_idle_watcher(Arc::new(watcher));
-    harness.set_async_spawn_hook(async_hook.clone());
-    harness.set_abort_cascade_hook(bus.clone());
+    // 6. Wire harness weak ref into plugin (after build, since it needs &harness).
+    spawn_plugin.set_harness_weak(Arc::downgrade(&harness));
 
     (harness, session_tmp, sandbox_tmp)
 }

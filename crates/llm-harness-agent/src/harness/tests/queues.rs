@@ -53,9 +53,8 @@ async fn clear_queues_rejected_when_not_idle() {
 
 /// A `ShouldStopHook` that coordinates with the test on its **first** call:
 /// signals `entered`, waits for `inject` before returning `true`. On
-/// subsequent calls it returns `true` immediately. This eliminates timing
 /// races — the follow_up is injected while should_stop is held, exactly
-/// how real hooks (`AsyncSpawnHook`) behave.
+/// how real hooks (`SpawnPlugin`'s AfterTurnHook) behave.
 struct CoordinatingShouldStop {
     entered: Arc<tokio::sync::Notify>,
     inject: Arc<tokio::sync::Notify>,

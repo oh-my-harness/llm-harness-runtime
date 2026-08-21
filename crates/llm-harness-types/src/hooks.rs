@@ -381,6 +381,31 @@ pub trait BeforeCompactHook: Send + Sync {
     ) -> BoxFuture<'a, BeforeCompactDecision>;
 }
 
+// ── AfterRunHook ──────────────────────────────────────────────────────────────
+
+/// run_loop 结束、harness 回到 Idle 后调用。
+///
+/// 可在此 spawn 等待 task（如等待子 agent 完成后调 `continue_run`）。
+/// wait task 应捕获 `Weak<AgentHarness>` 而非 `Arc`，以打断引用环。
+/// `BeforeRunHook` 负责取消 pending 的 wait task。
+pub trait AfterRunHook: Send + Sync {
+    /// 在 run_loop 结束后调用。
+    fn after_run(&self) -> BoxFuture<'_, ()>;
+}
+
+// ── OnAbortHook ───────────────────────────────────────────────────────────────
+
+/// harness.abort() 时调用。
+///
+/// 在 `AfterRunHook` 之前执行（`abort()` → cancel self token → `drive_loop`
+/// 返回 → `run_loop` cleanup → `drop(guard)` → `after_run()`），让
+/// `AfterRunHook` 能检查标志跳过 wait task。
+/// 非阻塞：只置标志/cancel token，不 join sub-agent task。
+/// 幂等：可重复调用。
+pub trait OnAbortHook: Send + Sync {
+    /// abort 时调用。
+    fn on_abort(&self);
+}
 #[cfg(test)]
 mod tests {
     use super::*;

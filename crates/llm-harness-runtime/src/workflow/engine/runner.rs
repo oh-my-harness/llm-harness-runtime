@@ -92,7 +92,14 @@ impl llm_harness_types::BeforeRunHook for StructuredPromptHook {
     > {
         Box::pin(async move {
             let existing = ctx.system_prompt.take().unwrap_or_default();
-            *ctx.system_prompt = Some(format!("{existing}{seg}", seg = self.segment));
+            // Idempotent: only append if segment is not already present.
+            // This prevents unbounded growth when continue_run calls
+            // before_run_hook repeatedly (each sub-agent completion wake).
+            if !existing.contains(self.segment) {
+                *ctx.system_prompt = Some(format!("{existing}{seg}", seg = self.segment));
+            } else {
+                *ctx.system_prompt = Some(existing);
+            }
             Ok(llm_harness_types::BeforeRunResult {
                 additional_messages: vec![],
                 system_prompt: None,
@@ -1227,22 +1234,18 @@ impl super::WorkflowEngine {
             builder = builder.tool(tool.clone());
         }
         let post_build_spawn_setup: Option<(
-            Arc<crate::spawn::delivery::AsyncSpawnHook>,
+            Arc<crate::spawn::plugin::SpawnPlugin>,
             Arc<crate::spawn::message_bus::MessageBus>,
         )> = if allowed_tools.iter().any(|t| t == SPAWN_AGENT_TOOL_NAME) {
-            let bus = crate::spawn::message_bus::message_bus_pair();
-            let async_hook = crate::spawn::delivery::async_spawn_pair(bus.clone());
+            let bus = crate::spawn::message_bus::MessageBus::new();
+            let plugin = crate::spawn::plugin::SpawnPlugin::new(bus.clone());
             let spawner = Arc::new(self.build_step_spawner(bus.clone(), step.id(), attempt_seq));
-            // Register the main agent on the bus. The main_id must match
-            // what MessageMainTool / AwaitSubagentReplyTool use.
             bus.register(
                 crate::spawn::message_bus::MAIN_AGENT_ID,
                 crate::spawn::message_bus::AgentEntry {
                     status: crate::spawn::message_bus::AgentStatus::Running,
                     harness: None,
                     is_main: true,
-                    // role/description 仅子 agent 支持。主 agent 是唯一的，
-                    // 无需 role 标签区分，QuerySubagentTool 输出中也不展示。
                     role: None,
                     description: None,
                 },
@@ -1267,17 +1270,13 @@ impl super::WorkflowEngine {
             builder = builder.tool(Arc::new(crate::spawn::tools::AbortSubagentTool::new(
                 bus.clone(),
             )));
-            // AsyncSpawnHook 注册为 after_turn（drain sub-agent 消息），
-            // 不再注册为 should_stop——避免 OR 语义压制 coordinator 升级。
-            // 实际注册在下方 hook_state.after_turn.push 处。
-            // AsyncSpawnHook 注入 CustomMessage{type:"sub_agent_message"}，
-            // 需注册 converter 否则 agent loop 报错。
             builder = builder.convert_to_llm(Some(Arc::new(
                 llm_harness_loop::convert::DefaultConvertToLlm::new().with_custom_converter(
                     Arc::new(crate::spawn::delivery::SubAgentMessageConverter),
                 ),
             )));
-            Some((async_hook, bus))
+            builder = builder.install(plugin.as_ref());
+            Some((plugin, bus))
         } else {
             None
         };
@@ -1311,9 +1310,6 @@ impl super::WorkflowEngine {
         let mut hook_state = HarnessHooks::none();
         hook_state.prepare_next_turn.push(gate_hook);
         hook_state.before_tool_call.push(approval_hook);
-        if let Some((ref async_hook, _)) = post_build_spawn_setup {
-            hook_state.after_turn.push(async_hook.clone());
-        }
         if let Some(ref coord) = structured_coordinator {
             // Layer 1：BeforeRunHook 在 system prompt 追加结构化输出约束。
             hook_state
@@ -1337,21 +1333,8 @@ impl super::WorkflowEngine {
                 })?,
         );
         harness.set_abort_token(step_abort.clone());
-        if let Some((async_hook, bus)) = post_build_spawn_setup {
-            let watcher = crate::spawn::delivery::IdleWatcher::new(bus.clone(), {
-                let h = Arc::downgrade(&harness);
-                Arc::new(move || {
-                    let h = h.clone();
-                    Box::pin(async move {
-                        if let Some(h) = h.upgrade() {
-                            let _ = h.continue_run().await;
-                        }
-                    })
-                })
-            });
-            harness.set_idle_watcher(Arc::new(watcher));
-            harness.set_async_spawn_hook(async_hook);
-            harness.set_abort_cascade_hook(bus);
+        if let Some((plugin, _bus)) = post_build_spawn_setup {
+            plugin.set_harness_weak(Arc::downgrade(&harness));
         }
 
         // g. step 指令。步骤间上下文注入：在 step.prompt 前拼接 step_history 摘要。

@@ -261,10 +261,11 @@ pub mod test_utils;
 
 // Top-level re-exports
 pub use composite::{
-    CompositeAfterProviderResponseHook, CompositeAfterToolCallHook, CompositeAfterTurnHook,
-    CompositeBeforeCompactHook, CompositeBeforeProviderRequestHook, CompositeBeforeRunHook,
-    CompositeBeforeToolCallHook, CompositeBeforeTurnHook, CompositeFinalAnswerValidator,
-    CompositePrepareNextTurnHook, CompositeShouldStopHook, CompositeTransformContextHook,
+    CompositeAfterProviderResponseHook, CompositeAfterRunHook, CompositeAfterToolCallHook,
+    CompositeAfterTurnHook, CompositeBeforeCompactHook, CompositeBeforeProviderRequestHook,
+    CompositeBeforeRunHook, CompositeBeforeToolCallHook, CompositeBeforeTurnHook,
+    CompositeFinalAnswerValidator, CompositePrepareNextTurnHook, CompositeShouldStopHook,
+    CompositeTransformContextHook,
 };
 pub use config::{LoopConfig, RetryConfig};
 pub use convert::{ConvertToLlmHook, CustomMessageConverter, DefaultConvertToLlm};

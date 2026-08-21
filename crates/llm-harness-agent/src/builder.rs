@@ -28,10 +28,10 @@ use crate::{
 };
 use llm_harness_loop::{ConvertToLlmHook, FinalAnswerMode, LlmClient, RetryConfig};
 use llm_harness_types::{
-    AfterProviderResponseHook, AfterToolCallHook, AfterTurnHook, BeforeCompactHook,
+    AfterProviderResponseHook, AfterRunHook, AfterToolCallHook, AfterTurnHook, BeforeCompactHook,
     BeforeProviderRequestHook, BeforeRunHook, BeforeToolCallHook, BeforeTurnHook, ExecutionEnv,
-    FinalAnswerValidator, PrepareNextTurnHook, PricingProvider, ShouldStopHook, StreamOptions,
-    ThinkingLevel, Tool, ToolExecutionMode, TransformContextHook,
+    FinalAnswerValidator, OnAbortHook, PrepareNextTurnHook, PricingProvider, ShouldStopHook,
+    StreamOptions, ThinkingLevel, Tool, ToolExecutionMode, TransformContextHook,
 };
 
 use crate::harness::{UsageLedger, cost_hook::CostAccumulatorHook};
@@ -293,6 +293,22 @@ impl HarnessBuilder {
         self
     }
 
+    /// Register an `AfterRunHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.after_run`.
+    pub fn after_run_hook(mut self, hook: Arc<dyn AfterRunHook>) -> Self {
+        self.hooks.after_run.push(hook);
+        self
+    }
+
+    /// Register an `OnAbortHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.on_abort`.
+    pub fn on_abort_hook(mut self, hook: Arc<dyn OnAbortHook>) -> Self {
+        self.hooks.on_abort.push(hook);
+        self
+    }
+
     /// Register a `BeforeTurnHook` without wrapping it in a Plugin.
     ///
     /// Push semantics: appended to `hooks.before_turn`.
@@ -393,6 +409,8 @@ impl HarnessBuilder {
             .final_answer_validator
             .extend(hooks.final_answer_validator);
         self.hooks.before_compact.extend(hooks.before_compact);
+        self.hooks.after_run.extend(hooks.after_run);
+        self.hooks.on_abort.extend(hooks.on_abort);
         self
     }
 
