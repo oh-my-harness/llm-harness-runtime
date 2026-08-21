@@ -894,7 +894,6 @@ fn parse_file_op_kind(kind: &str) -> Option<FileOpKind> {
 mod tests {
     use chrono::Utc;
     use llm_harness_loop::test_utils::MockLlmClient;
-    use llm_harness_types::*;
 
     use crate::session::types::{SessionEntry, SessionEntryPayload};
 
