@@ -159,76 +159,87 @@ async fn abort_cancels_token() {
     assert!(token.is_cancelled());
 }
 #[tokio::test]
-async fn abort_invokes_cascade_hook() {
+async fn abort_invokes_on_abort_hook() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct CountingHook(Arc<AtomicUsize>);
-    impl AbortCascadeHook for CountingHook {
-        fn cancel_all_subagents(&self) {
+    impl OnAbortHook for CountingHook {
+        fn on_abort(&self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
-    let h = make_harness(vec![]);
     let counter = Arc::new(AtomicUsize::new(0));
-    h.set_abort_cascade_hook(Arc::new(CountingHook(counter.clone())));
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let mut opts = AgentHarnessOptions::new("test-model");
+    opts.hooks = HarnessHooks {
+        on_abort: vec![Arc::new(CountingHook(counter.clone()))],
+        ..HarnessHooks::none()
+    };
+    let h =
+        AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, Arc::new(NoOpEnv), opts).await;
     h.abort();
     assert_eq!(
         counter.load(Ordering::SeqCst),
         1,
-        "abort should call cascade hook once"
+        "abort should call on_abort hook once"
     );
 }
 #[tokio::test]
-async fn abort_invokes_cascade_hook_twice_after_reabort() {
-    // 回归测试：abort_cascade_hook 是生命周期持久配置（plan: "abort 不终止
-    // agent 生命周期，可再被 prompt"）。take() 会消耗 hook 导致第二次 abort
-    // 静默跳过级联；必须用 clone() 保留。
+async fn abort_invokes_on_abort_hook_twice_after_reabort() {
+    // 回归测试：on_abort hooks 是生命周期持久的（Vec<Arc<dyn OnAbortHook>>
+    // 遍历不 consume），re-prompt 后再次 abort() 仍触发。
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct CountingHook(Arc<AtomicUsize>);
-    impl AbortCascadeHook for CountingHook {
-        fn cancel_all_subagents(&self) {
+    impl OnAbortHook for CountingHook {
+        fn on_abort(&self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
-    let h = make_harness(vec![]);
     let counter = Arc::new(AtomicUsize::new(0));
-    h.set_abort_cascade_hook(Arc::new(CountingHook(counter.clone())));
-    // 模拟一次运行中的 abort。
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let mut opts = AgentHarnessOptions::new("test-model");
+    opts.hooks = HarnessHooks {
+        on_abort: vec![Arc::new(CountingHook(counter.clone()))],
+        ..HarnessHooks::none()
+    };
+    let h =
+        AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, Arc::new(NoOpEnv), opts).await;
+    // 第一次 abort
     let token = CancellationToken::new();
     h.inner.lock().unwrap().current_abort = Some(token.clone());
     h.abort();
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        1,
-        "first abort should call cascade hook"
-    );
-    // re-prompt 后再次 abort（plan 支持的场景），hook 应仍被调用。
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "first abort");
+    // re-prompt 后再次 abort
     let token2 = CancellationToken::new();
     h.inner.lock().unwrap().current_abort = Some(token2.clone());
     h.abort();
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        2,
-        "second abort should STILL call cascade hook (hook is lifetime-persistent)"
-    );
+    assert_eq!(counter.load(Ordering::SeqCst), 2, "second abort");
 }
 #[tokio::test]
-async fn abort_cancels_idle_watcher() {
+async fn after_run_hook_called_after_run_loop() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    struct CountingWatcher(Arc<AtomicUsize>);
-    impl IdleWatcherHook for CountingWatcher {
-        fn on_idle(&self) {}
-        fn cancel(&self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
+    struct CountingHook(Arc<AtomicUsize>);
+    impl AfterRunHook for CountingHook {
+        fn after_run(&self) -> futures::future::BoxFuture<'_, ()> {
+            let c = self.0.clone();
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::SeqCst);
+            })
         }
     }
-    let h = make_harness(vec![]);
     let counter = Arc::new(AtomicUsize::new(0));
-    h.set_idle_watcher(Arc::new(CountingWatcher(counter.clone())));
-    h.abort();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("hello")]));
+    let mut opts = AgentHarnessOptions::new("test-model");
+    opts.hooks = HarnessHooks {
+        after_run: vec![Arc::new(CountingHook(counter.clone()))],
+        ..HarnessHooks::none()
+    };
+    let h =
+        AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, Arc::new(NoOpEnv), opts).await;
+    h.prompt("hi").await.unwrap();
     assert_eq!(
         counter.load(Ordering::SeqCst),
         1,
-        "abort should cancel idle watcher"
+        "after_run hook should be called once after run_loop"
     );
 }
 #[tokio::test]
@@ -342,4 +353,47 @@ async fn continue_run_drives_loop_with_empty_initial() {
         .filter(|m| matches!(m, AgentMessage::Assistant(_)))
         .count();
     assert_eq!(assistant_count, 2);
+}
+
+#[tokio::test]
+async fn continue_run_calls_before_run_hook() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountingHook(Arc<AtomicUsize>);
+    impl BeforeRunHook for CountingHook {
+        fn before_run<'a>(
+            &'a self,
+            _ctx: llm_harness_types::BeforeRunCtx<'a>,
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<llm_harness_types::BeforeRunResult, llm_harness_types::AgentError>,
+        > {
+            let c = self.0.clone();
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(llm_harness_types::BeforeRunResult {
+                    additional_messages: vec![],
+                    system_prompt: None,
+                })
+            })
+        }
+    }
+    let counter = Arc::new(AtomicUsize::new(0));
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("first"),
+        MockResponse::text("second"),
+    ]));
+    let mut opts = AgentHarnessOptions::new("test-model");
+    opts.hooks = HarnessHooks {
+        before_run: vec![Arc::new(CountingHook(counter.clone()))],
+        ..HarnessHooks::none()
+    };
+    let h =
+        AgentHarness::new_in_memory(client as Arc<dyn LlmClient>, Arc::new(NoOpEnv), opts).await;
+    h.prompt("hello").await.unwrap(); // before_run called once
+    h.continue_run().await.unwrap(); // before_run called again
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "before_run should be called for both prompt() and continue_run()"
+    );
 }

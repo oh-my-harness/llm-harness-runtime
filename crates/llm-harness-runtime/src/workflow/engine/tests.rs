@@ -3528,7 +3528,7 @@ async fn executor_step_creates_no_session_dir() {
 /// 构造 spawner 并 spawn 一个最小 sub-agent,验证 on-disk 目录结构。
 #[tokio::test]
 async fn subagent_session_lands_in_subagents_subdir() {
-    use crate::spawn::message_bus::message_bus_pair;
+    use crate::spawn::message_bus::MessageBus;
     use crate::spawn::spawn_types::SpawnOptions;
     use crate::spawn::spawner::HarnessSubAgentSpawner;
 
@@ -3543,10 +3543,13 @@ async fn subagent_session_lands_in_subagents_subdir() {
         customize_builder: None,
     };
     let engine = WorkflowEngine::new_free_task("do work".into(), vec![], config).unwrap();
-    let bus = message_bus_pair();
-    // 取出 event_rx guard,用于等待 sub-agent 完成事件(避免 tokio 运行时
-    // 关闭时仍有挂起的后台 task)。
-    let mut event_guard = bus.take_event_rx().expect("event_rx available");
+    let bus = MessageBus::new();
+    // Set up event sink to collect sub-agent completion events.
+    let events = Arc::new(std::sync::Mutex::new(vec![]));
+    let events_clone = events.clone();
+    bus.set_event_sink(Arc::new(move |event| {
+        events_clone.lock().unwrap().push(event);
+    }));
     let spawner: HarnessSubAgentSpawner = engine.build_step_spawner(bus, &"run".into(), 1);
 
     // spawn 一个最小 sub-agent。spawn_async 返回 session_id(String)。
@@ -3560,16 +3563,18 @@ async fn subagent_session_lands_in_subagents_subdir() {
     assert!(!session_id.is_empty(), "session_id should be non-empty");
 
     // 等待 sub-agent 后台 task 完成并投递 Done 事件。
-    let done = event_guard.recv().await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let evs = events.lock().unwrap();
+    assert_eq!(evs.len(), 1, "one Done event should be pushed");
     assert!(
         matches!(
-            done,
-            Some(crate::spawn::message_bus::SubAgentEvent::Done { .. })
+            &evs[0],
+            crate::spawn::message_bus::SubAgentEvent::Done { .. }
         ),
         "expected SubAgentEvent::Done, got {:?}",
-        done
+        evs[0]
     );
-    drop(event_guard);
+    drop(evs);
 
     // 期望:sessions/<task_id>/run-1/sub-agents/<session_id>/ 存在
     let task_dirs: Vec<_> = std::fs::read_dir(dir.path().join("sessions"))

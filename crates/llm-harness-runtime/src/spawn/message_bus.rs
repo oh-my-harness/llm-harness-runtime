@@ -6,21 +6,19 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use llm_harness_agent::{AgentHarness, AgentHarnessEvent};
-use llm_harness_types::{AgentError, AgentMessage, ChannelError, CustomMessage};
+use llm_harness_types::{AgentError, AgentMessage, CustomMessage};
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::spawn::spawn_types::{SubAgentHandle, SubAgentResult};
-
-pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// The conventional agent ID for the main agent in the `MessageBus` registry.
 /// Tools like `MessageSubagentTool` and `AwaitSubagentReplyTool` use this as
 /// their `main_id`, and track tasks look up waiters under this key.
 pub const MAIN_AGENT_ID: &str = "Main";
 
-/// Sub-agent event delivered to the main agent via the event channel.
+/// Sub-agent event delivered to the main agent via the event sink callback.
 #[derive(Debug, Clone)]
 pub enum SubAgentEvent {
     /// Sub-agent completed (success/failure/abort).
@@ -84,7 +82,7 @@ impl AgentEntry {
 /// Send receipt from MessageBus::send.
 #[derive(Debug)]
 pub enum SendReceipt {
-    /// Delivered to a waiter or injected via steer/event channel.
+    /// Delivered to a waiter or injected via steer/event sink.
     Injected,
     /// Agent not found or terminated.
     Failed(String),
@@ -96,76 +94,94 @@ struct Waiter {
     tx: oneshot::Sender<SubAgentEvent>,
 }
 
-/// RAII guard for borrowing the event_rx. Drop returns rx to the bus.
-pub struct EventRxGuard {
-    rx: Option<mpsc::Receiver<SubAgentEvent>>,
-    registry: Arc<MessageBus>,
-}
+type EventSink = Arc<dyn Fn(SubAgentEvent) + Send + Sync>;
 
-impl EventRxGuard {
-    pub fn try_recv(&mut self) -> Option<SubAgentEvent> {
-        self.rx.as_mut()?.try_recv().ok()
-    }
-
-    pub async fn recv(&mut self) -> Option<SubAgentEvent> {
-        self.rx.as_mut()?.recv().await
-    }
-}
-
-impl Drop for EventRxGuard {
-    fn drop(&mut self) {
-        if let Some(rx) = self.rx.take() {
-            self.registry.return_event_rx(rx);
-        }
-    }
-}
-
-/// Unified message bus: event channel + agent registry + waiter table.
+/// Unified message bus: event sink + agent registry + waiter table.
 pub struct MessageBus {
-    event_tx: mpsc::Sender<SubAgentEvent>,
-    event_rx: Mutex<Option<mpsc::Receiver<SubAgentEvent>>>,
+    event_sink: Mutex<Option<EventSink>>,
     in_flight: Arc<AtomicUsize>,
     agents: Mutex<HashMap<String, AgentEntry>>,
     waiters: Mutex<HashMap<String, Vec<Waiter>>>,
     subagent_aborts: Mutex<HashMap<String, CancellationToken>>,
-    /// Set by IdleWatcher when the idle timeout fires. Consumed (swap to
-    /// false) by `should_stop` to inject a one-shot status hint so the LLM
-    /// knows sub-agents are still running.
     idle_timeout_fired: AtomicBool,
 }
 
 impl MessageBus {
-    /// Create a new MessageBus with a fresh event channel.
-    pub fn new() -> (Arc<Self>, mpsc::Receiver<SubAgentEvent>) {
-        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-        let bus = Arc::new(Self {
-            event_tx: tx,
-            event_rx: Mutex::new(None), // rx held externally for test; production uses take_event_rx
+    /// Create a new MessageBus with no event sink. Main agent events are
+    /// silently dropped until `set_event_sink` is called (by SpawnPlugin).
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            event_sink: Mutex::new(None),
             in_flight: Arc::new(AtomicUsize::new(0)),
             agents: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
             subagent_aborts: Mutex::new(HashMap::new()),
             idle_timeout_fired: AtomicBool::new(false),
-        });
-        (bus, rx)
+        })
     }
 
-    /// Create for tests: returns bus plus a separate receiver for test
-    /// assertions. event_rx is left as None (test uses the returned rx
-    /// directly, not via take_event_rx).
-    #[cfg(test)]
-    fn new_for_test() -> (Self, mpsc::Receiver<SubAgentEvent>) {
-        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-        let bus = Self {
-            event_tx: tx,
-            event_rx: Mutex::new(None),
-            in_flight: Arc::new(AtomicUsize::new(0)),
-            agents: Mutex::new(HashMap::new()),
-            waiters: Mutex::new(HashMap::new()),
-            subagent_aborts: Mutex::new(HashMap::new()),
-            idle_timeout_fired: AtomicBool::new(false),
+    /// Set the event sink callback. Called by `SpawnPlugin::new` to route
+    /// main-agent events (sub-agent completions, sub→main messages) into
+    /// the plugin's internal queue.
+    pub fn set_event_sink(&self, sink: EventSink) {
+        *self.event_sink.lock() = Some(sink);
+    }
+
+    /// Push an event to waiters (if matched) or the event sink (if set).
+    /// Called by track task (fallback when no waiter matched) and `send()`
+    /// for main-agent delivery.
+    ///
+    /// Waiter matching here covers the race where `send()` is called after
+    /// the track task already checked waiters (no match) but before
+    /// `bus.wait()` registers a waiter — in that window the event would be
+    /// lost to the waiter. By re-checking here we catch late-arriving waiters
+    /// for Message events. Done events are handled by the track task's own
+    /// waiter check + the `bus.wait()` post-registration agent-status check.
+    fn push_event(&self, event: SubAgentEvent) {
+        // Try to match a waiter for this event's target.
+        let target = match &event {
+            SubAgentEvent::Done { agent_id, .. } => agent_id.clone(),
+            SubAgentEvent::Message { agent_id, .. } => agent_id.clone(),
         };
-        (bus, rx)
+        let waiter_match = {
+            let mut waiters = self.waiters.lock();
+            let mut matched = None;
+            // Match under the event source's own ID.
+            if let Some(list) = waiters.get_mut(&target)
+                && let Some(idx) = list
+                    .iter()
+                    .position(|w| w.from.is_none() || w.from.as_deref() == Some(&target))
+            {
+                let waiter = list.remove(idx);
+                if list.is_empty() {
+                    waiters.remove(&target);
+                }
+                matched = Some(waiter);
+            }
+            // Match under MAIN_AGENT_ID with from=Some(source).
+            if matched.is_none()
+                && let Some(list) = waiters.get_mut(MAIN_AGENT_ID)
+                && let Some(idx) = list.iter().position(|w| w.from.as_deref() == Some(&target))
+            {
+                let waiter = list.remove(idx);
+                if list.is_empty() {
+                    waiters.remove(MAIN_AGENT_ID);
+                }
+                matched = Some(waiter);
+            }
+            matched
+        };
+        let event = match waiter_match {
+            Some(waiter) => match waiter.tx.send(event) {
+                Ok(()) => return,
+                Err(err) => err, // tx closed; fall through to event sink
+            },
+            None => event,
+        };
+        let sink = self.event_sink.lock();
+        if let Some(sink) = sink.as_ref() {
+            sink(event);
+        }
     }
 
     /// Register an agent.
@@ -242,9 +258,9 @@ impl MessageBus {
         };
 
         if let Some(waiter) = waiter_match {
-            // Deliver via oneshot — does not go through steer or event channel.
+            // Deliver via oneshot — does not go through steer or event sink.
             // If tx.send() fails, the waiter's rx was dropped (timeout/abort in
-            // progress). Fall through to steer/event-channel delivery below.
+            // progress). Fall through to steer/event-sink delivery below.
             let msg = SubAgentEvent::Message {
                 agent_id: from.to_string(),
                 body: body.to_string(),
@@ -289,15 +305,12 @@ impl MessageBus {
             }
         };
 
-        // 3. Main agent: send to event channel (should_stop / IdleWatcher).
+        // 3. Main agent: deliver via event sink.
         if is_main {
-            let _ = self
-                .event_tx
-                .send(SubAgentEvent::Message {
-                    agent_id: from.to_string(),
-                    body: body.to_string(),
-                })
-                .await;
+            self.push_event(SubAgentEvent::Message {
+                agent_id: from.to_string(),
+                body: body.to_string(),
+            });
             return SendReceipt::Injected;
         }
 
@@ -329,6 +342,29 @@ impl MessageBus {
                 .entry(agent_id.to_string())
                 .or_default()
                 .push(waiter);
+        }
+
+        // Race fix: the sub-agent may have completed between the track task's
+        // waiter check and our registration above. If filter_from targets a
+        // specific agent that is already Done, synthesize the event now.
+        if let Some(from_id) = filter_from {
+            let agents = self.agents.lock();
+            if let Some(entry) = agents.get(from_id)
+                && let AgentStatus::Done(result) = &entry.status
+            {
+                // Remove our waiter (we're returning early).
+                let mut waiters = self.waiters.lock();
+                if let Some(list) = waiters.get_mut(agent_id) {
+                    list.retain(|w| !w.tx.is_closed());
+                    if list.is_empty() {
+                        waiters.remove(agent_id);
+                    }
+                }
+                return Some(SubAgentEvent::Done {
+                    agent_id: from_id.to_string(),
+                    result: Ok((**result).clone()),
+                });
+            }
         }
 
         let result = match timeout {
@@ -398,7 +434,7 @@ impl MessageBus {
         self.in_flight.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Called by IdleWatcher when the idle timeout fires.
+    /// Called by SpawnPlugin's AfterRunHook wait task when the idle timeout fires.
     pub(crate) fn set_idle_timeout_fired(&self) {
         self.idle_timeout_fired.store(true, Ordering::Relaxed);
     }
@@ -409,21 +445,8 @@ impl MessageBus {
         self.idle_timeout_fired.swap(false, Ordering::Relaxed)
     }
 
-    pub fn take_event_rx(self: &Arc<Self>) -> Option<EventRxGuard> {
-        let mut guard = self.event_rx.lock();
-        guard.take().map(|rx| EventRxGuard {
-            rx: Some(rx),
-            registry: self.clone(),
-        })
-    }
-
-    fn return_event_rx(&self, rx: mpsc::Receiver<SubAgentEvent>) {
-        let mut guard = self.event_rx.lock();
-        *guard = Some(rx);
-    }
-
-    pub(crate) fn cancel_all(&self) {
-        // Iterate and cancel — do NOT drain (mem::take). The AbortCascadeHook
+    pub fn cancel_all(&self) {
+        // Iterate and cancel — do NOT drain (mem::take). The OnAbortHook
         // contract requires re-callable: harness.abort() may be invoked again
         // after re-prompt. CancellationToken::cancel() is idempotent, so
         // cancelling already-cancelled tokens is harmless.
@@ -431,17 +454,6 @@ impl MessageBus {
         for token in aborts.values() {
             token.cancel();
         }
-    }
-    /// Try to re-send an event back to the event channel (non-blocking).
-    /// Used by IdleWatcher to put a received event back so should_stop can drain it.
-    pub(crate) fn try_resend_event(&self, event: SubAgentEvent) -> Result<(), ChannelError> {
-        self.event_tx.try_send(event).map_err(ChannelError::from)
-    }
-
-    /// Re-send an event back to the event channel (async, blocks if full).
-    /// Used by IdleWatcher to put a received event back so should_stop can drain it.
-    pub(crate) async fn resend_event(&self, event: SubAgentEvent) {
-        let _ = self.event_tx.send(event).await;
     }
 
     pub(crate) fn register_subagent_abort(&self, agent_id: &str, token: CancellationToken) {
@@ -468,11 +480,10 @@ impl MessageBus {
 
     /// Track a sub-agent: spawn a background task to join the handle.
     /// On completion: update status=Done, send SubAgentEvent::Done
-    /// (via waiter if matched, else to event channel).
+    /// (via waiter if matched, else to event sink).
     #[cfg(test)]
     pub(crate) fn track(self: &Arc<Self>, handle: SubAgentHandle, agent_id: String) -> String {
         let abort = handle.abort_token();
-        let event_tx = self.event_tx.clone();
         let in_flight = self.in_flight.clone();
         let id = agent_id.clone();
         let registry = self.clone();
@@ -531,7 +542,7 @@ impl MessageBus {
             };
             // Try oneshot delivery first. send() consumes `event` and returns
             // Err(t) if the waiter's rx was dropped (timeout/abort) — in that
-            // case fall back to the event channel so the Done event is not lost.
+            // case fall back to the event sink so the Done event is not lost.
             let event = match waiter_match {
                 Some(waiter) => match waiter.tx.send(event) {
                     Ok(()) => {
@@ -544,7 +555,7 @@ impl MessageBus {
                 },
                 None => event,
             };
-            let _ = event_tx.send(event).await;
+            registry.push_event(event);
 
             registry.subagent_aborts.lock().remove(&id_for_remove);
             registry.remove_agent(&id_for_remove);
@@ -556,14 +567,13 @@ impl MessageBus {
 
     /// Track a sub-agent, returning an AsyncSpawnHandle.
     /// On completion: update status=Done, deliver SubAgentEvent::Done
-    /// (via waiter if matched, else to event channel).
+    /// (via waiter if matched, else to event sink).
     pub(crate) fn track_with_oneshot(
         self: &Arc<Self>,
         handle: SubAgentHandle,
         agent_id: String,
     ) -> crate::spawn::delivery::AsyncSpawnHandle {
         let abort = handle.abort_token();
-        let event_tx = self.event_tx.clone();
         let id = agent_id.clone();
         let registry = self.clone();
 
@@ -591,7 +601,7 @@ impl MessageBus {
                 result,
             };
 
-            // Try waiter match first, else event channel.
+            // Try waiter match first, else event sink.
             // 1. Check for a waiter registered under this agent's ID
             //    (e.g. sub-agent awaiting a message from itself).
             // 2. Check for a waiter registered under MAIN_AGENT_ID with a `from`
@@ -626,7 +636,7 @@ impl MessageBus {
             };
             // Try oneshot delivery first. send() consumes `event` and returns
             // Err(t) if the waiter's rx was dropped (timeout/abort) — in that
-            // case fall back to the event channel so the Done event is not lost.
+            // case fall back to the event sink so the Done event is not lost.
             let event = match waiter_match {
                 Some(waiter) => match waiter.tx.send(event) {
                     Ok(()) => {
@@ -635,11 +645,11 @@ impl MessageBus {
                         registry.in_flight.fetch_sub(1, Ordering::Relaxed);
                         return;
                     }
-                    Err(e) => e, // rx dropped, fall back to event channel
+                    Err(e) => e, // rx dropped, fall back to event sink
                 },
                 None => event,
             };
-            let _ = event_tx.send(event).await;
+            registry.push_event(event);
 
             registry.subagent_aborts.lock().remove(&id_for_remove);
             registry.remove_agent(&id_for_remove);
@@ -647,28 +657,6 @@ impl MessageBus {
         });
 
         crate::spawn::delivery::AsyncSpawnHandle::new(agent_id, abort)
-    }
-}
-
-/// Create a paired MessageBus with the event_rx stored internally so that
-/// `take_event_rx` works in production. The caller retrieves the receiver
-/// later via `bus.take_event_rx()` (typically wrapped in an `EventRxGuard`).
-pub fn message_bus_pair() -> Arc<MessageBus> {
-    let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
-    Arc::new(MessageBus {
-        event_tx: tx,
-        event_rx: Mutex::new(Some(rx)),
-        in_flight: Arc::new(AtomicUsize::new(0)),
-        agents: Mutex::new(HashMap::new()),
-        waiters: Mutex::new(HashMap::new()),
-        subagent_aborts: Mutex::new(HashMap::new()),
-        idle_timeout_fired: AtomicBool::new(false),
-    })
-}
-
-impl llm_harness_agent::AbortCascadeHook for MessageBus {
-    fn cancel_all_subagents(&self) {
-        self.cancel_all();
     }
 }
 
@@ -697,8 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_to_agent_with_waiter_delivers_via_oneshot() {
-        let (bus, _event_rx) = MessageBus::new_for_test();
-        let bus = Arc::new(bus);
+        let bus = MessageBus::new();
 
         // Register a sub agent with a real harness.
         let harness = make_harness().await;
@@ -745,9 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_to_sub_without_waiter_steers_message() {
-        let (bus, _event_rx) = MessageBus::new_for_test();
-        let bus = Arc::new(bus);
-
+        let bus = MessageBus::new();
         let harness = make_harness().await;
         bus.register(
             "sub-1",
@@ -773,8 +758,12 @@ mod tests {
 
     #[tokio::test]
     async fn send_to_main_without_waiter_sends_event() {
-        let (bus, mut event_rx) = MessageBus::new_for_test();
-        let bus = Arc::new(bus);
+        let bus = MessageBus::new();
+        let events = Arc::new(std::sync::Mutex::new(vec![]));
+        let events_clone = events.clone();
+        bus.set_event_sink(Arc::new(move |event| {
+            events_clone.lock().unwrap().push(event);
+        }));
 
         bus.register(
             MAIN_AGENT_ID,
@@ -790,8 +779,9 @@ mod tests {
         let receipt = bus.send("sub-1", MAIN_AGENT_ID, "report from sub").await;
         assert!(matches!(receipt, SendReceipt::Injected));
 
-        let event = event_rx.recv().await.expect("should receive event");
-        match event {
+        let evs = events.lock().unwrap();
+        assert_eq!(evs.len(), 1, "one event should be pushed");
+        match &evs[0] {
             SubAgentEvent::Message { agent_id, body } => {
                 assert_eq!(agent_id, "sub-1");
                 assert_eq!(body, "report from sub");
@@ -802,8 +792,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_to_unknown_agent_returns_failed() {
-        let (bus, _event_rx) = MessageBus::new_for_test();
-        let bus = Arc::new(bus);
+        let bus = MessageBus::new();
 
         let receipt = bus.send("main", "nonexistent", "hello").await;
         assert!(matches!(receipt, SendReceipt::Failed(_)));
@@ -811,8 +800,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_status_returns_all_agents() {
-        let (bus, _event_rx) = MessageBus::new_for_test();
-        let bus = Arc::new(bus);
+        let bus = MessageBus::new();
 
         bus.register(
             MAIN_AGENT_ID,
@@ -841,8 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_times_out_returns_none() {
-        let (bus, _event_rx) = MessageBus::new_for_test();
-        let bus = Arc::new(bus);
+        let bus = MessageBus::new();
 
         bus.register(
             "sub-1",
@@ -868,8 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_all_aborts_all_running_subagents() {
-        let (bus, _rx) = MessageBus::new();
-        let bus = Arc::new(bus);
+        let bus = MessageBus::new();
 
         let token1 = CancellationToken::new();
         let token2 = CancellationToken::new();
@@ -899,8 +885,7 @@ mod tests {
         // a subsequent send() does not match a stale oneshot and lose the
         // message. With a sub-agent (non-main, harness=None), send() should
         // return Failed (harness detached) — NOT match a dead waiter.
-        let (bus, _event_rx) = MessageBus::new_for_test();
-        let bus = Arc::new(bus);
+        let bus = MessageBus::new();
 
         bus.register(
             "sub-1",
@@ -944,8 +929,7 @@ mod tests {
     async fn send_to_done_agent_returns_failed() {
         // Fix 2: sending to a Done sub-agent must return Failed, not
         // silently return Injected (false success).
-        let (bus, _event_rx) = MessageBus::new_for_test();
-        let bus = Arc::new(bus);
+        let bus = MessageBus::new();
 
         let done_result = SubAgentResult {
             final_answer: "done".into(),
@@ -972,26 +956,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_bus_pair_stores_event_rx_internally() {
-        // Fix 3: message_bus_pair() must store the event receiver in event_rx
-        // so take_event_rx() returns Some in production.
-        let bus = message_bus_pair();
-        let guard = bus
-            .take_event_rx()
-            .expect("take_event_rx should return Some");
-        // Dropping the guard returns rx to the bus.
-        drop(guard);
-        // Can take again after return.
-        let _guard2 = bus
-            .take_event_rx()
-            .expect("take_event_rx should work after guard drop");
-    }
-
-    #[tokio::test]
     async fn abort_agent_cancels_registered_token() {
         // Fix 4: abort_agent cancels a specific sub-agent's token.
-        let (bus, _rx) = MessageBus::new();
-        let bus = Arc::new(bus);
+        let bus = MessageBus::new();
 
         let token = CancellationToken::new();
         bus.register_subagent_abort("sub-1", token.clone());

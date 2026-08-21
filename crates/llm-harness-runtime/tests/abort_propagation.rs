@@ -2,7 +2,7 @@
 //!
 //! 行为预期（abort 级联实现后）：
 //! - `MessageBus` 在 `track_with_oneshot()` 时存入 sub-agent 的 abort token。
-//! - 主 agent `abort()` 经 `AbortCascadeHook::cancel_all_subagents()` 取消所有
+//! - 主 agent `abort()` 经 `SpawnPlugin` 的 `OnAbortHook` 调用 `bus.cancel_all()` 取消所有
 //!   in-flight sub-agent 的 abort token。
 //! - 测试通过独立 entry signal 确认 sub-agent 已进入 BlockingTool，再触发
 //!   主 agent abort；sub-agent join 返回 `Err(Aborted)`，in_flight 因 abort 归零。
@@ -13,9 +13,11 @@ use std::time::Duration;
 
 use llm_harness_agent::HarnessBuilder;
 use llm_harness_agent::Plugin;
+use llm_harness_loop::convert::DefaultConvertToLlm;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
-use llm_harness_runtime::spawn::delivery::async_spawn_pair;
-use llm_harness_runtime::spawn::message_bus::message_bus_pair;
+use llm_harness_runtime::spawn::delivery::SubAgentMessageConverter;
+use llm_harness_runtime::spawn::message_bus::MessageBus;
+use llm_harness_runtime::spawn::plugin::SpawnPlugin;
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_runtime::spawn::tools::SpawnAgentTool;
 use llm_harness_sandbox::{OsEnv, OsEnvFactory};
@@ -148,8 +150,8 @@ async fn abort_cancels_inflight_subagent() {
     let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new(std::env::current_dir().unwrap()));
     let session_dir = tempfile::tempdir().expect("create isolated session directory");
 
-    let registry = message_bus_pair();
-    let async_hook = async_spawn_pair(registry.clone());
+    let registry = MessageBus::new();
+    let spawn_plugin = SpawnPlugin::new(registry.clone());
     let plugin_tool_entered = sub_tool_entered.clone();
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
@@ -173,26 +175,16 @@ async fn abort_cancels_inflight_subagent() {
         .tool(Arc::new(BlockingTool {
             entered: main_tool_entered.clone(),
         }))
-        .after_turn_hook(async_hook.clone())
+        .convert_to_llm(Some(Arc::new(
+            DefaultConvertToLlm::new().with_custom_converter(Arc::new(SubAgentMessageConverter)),
+        )))
+        .install(spawn_plugin.as_ref())
         .build(env.clone())
         .await
         .unwrap();
     let harness = Arc::new(harness);
 
-    let watcher = llm_harness_runtime::spawn::delivery::IdleWatcher::new(registry.clone(), {
-        let h = Arc::downgrade(&harness);
-        Arc::new(move || {
-            let h = h.clone();
-            Box::pin(async move {
-                if let Some(h) = h.upgrade() {
-                    let _ = h.continue_run().await;
-                }
-            })
-        })
-    });
-    harness.set_idle_watcher(Arc::new(watcher));
-    harness.set_async_spawn_hook(async_hook.clone());
-    harness.set_abort_cascade_hook(registry.clone());
+    spawn_plugin.set_harness_weak(Arc::downgrade(&harness));
 
     let h_clone = harness.clone();
     let main_task = tokio::spawn(async move { h_clone.prompt("please spawn a sub-agent").await });
@@ -286,8 +278,8 @@ async fn abort_does_not_affect_future_spawns() {
     let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new(std::env::current_dir().unwrap()));
     let session_dir = tempfile::tempdir().expect("create isolated session directory");
 
-    let registry = message_bus_pair();
-    let async_hook = async_spawn_pair(registry.clone());
+    let registry = MessageBus::new();
+    let spawn_plugin = SpawnPlugin::new(registry.clone());
     let plugin_tool_entered = tool_entered.clone();
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
@@ -308,26 +300,16 @@ async fn abort_does_not_affect_future_spawns() {
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
-        .after_turn_hook(async_hook.clone())
+        .convert_to_llm(Some(Arc::new(
+            DefaultConvertToLlm::new().with_custom_converter(Arc::new(SubAgentMessageConverter)),
+        )))
+        .install(spawn_plugin.as_ref())
         .build(env.clone())
         .await
         .unwrap();
     let harness = Arc::new(harness);
 
-    let watcher = llm_harness_runtime::spawn::delivery::IdleWatcher::new(registry.clone(), {
-        let h = Arc::downgrade(&harness);
-        Arc::new(move || {
-            let h = h.clone();
-            Box::pin(async move {
-                if let Some(h) = h.upgrade() {
-                    let _ = h.continue_run().await;
-                }
-            })
-        })
-    });
-    harness.set_idle_watcher(Arc::new(watcher));
-    harness.set_async_spawn_hook(async_hook.clone());
-    harness.set_abort_cascade_hook(registry.clone());
+    spawn_plugin.set_harness_weak(Arc::downgrade(&harness));
 
     // 第一轮：spawn 慢 sub-agent
     let h_clone = harness.clone();
@@ -420,12 +402,12 @@ async fn abort_does_not_affect_future_spawns() {
     );
 }
 
-/// 场景：主 agent spawn sub-agent 后进入 Idle（IdleWatcher 运行中），
-/// 此时 abort → watcher 被 cancel + sub-agent 被 cancel。
+/// 场景：主 agent spawn sub-agent 后进入 Idle（SpawnPlugin 的 AfterRunHook 运行中），
+/// 此时 abort → wait task 被 cancel + sub-agent 被 cancel。
 /// 断言：abort 后主 agent 不被 aborted completion 重新唤醒
 /// （main_client 的 call_count 保持 2，不会因 follow_up 续命）。
 #[tokio::test]
-async fn idle_watcher_abort() {
+async fn spawn_plugin_abort() {
     let tool_entered = Arc::new(Notify::new());
     let main_client = Arc::new(MockLlmClient::new(vec![
         MockResponse::tool_use(
@@ -446,8 +428,8 @@ async fn idle_watcher_abort() {
     let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new(std::env::current_dir().unwrap()));
     let session_dir = tempfile::tempdir().expect("create isolated session directory");
 
-    let registry = message_bus_pair();
-    let async_hook = async_spawn_pair(registry.clone());
+    let registry = MessageBus::new();
+    let spawn_plugin = SpawnPlugin::new(registry.clone());
     let plugin_tool_entered = tool_entered.clone();
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
@@ -468,26 +450,16 @@ async fn idle_watcher_abort() {
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
-        .after_turn_hook(async_hook.clone())
+        .convert_to_llm(Some(Arc::new(
+            DefaultConvertToLlm::new().with_custom_converter(Arc::new(SubAgentMessageConverter)),
+        )))
+        .install(spawn_plugin.as_ref())
         .build(env.clone())
         .await
         .unwrap();
     let harness = Arc::new(harness);
 
-    let watcher = llm_harness_runtime::spawn::delivery::IdleWatcher::new(registry.clone(), {
-        let h = Arc::downgrade(&harness);
-        Arc::new(move || {
-            let h = h.clone();
-            Box::pin(async move {
-                if let Some(h) = h.upgrade() {
-                    let _ = h.continue_run().await;
-                }
-            })
-        })
-    });
-    harness.set_idle_watcher(Arc::new(watcher));
-    harness.set_async_spawn_hook(async_hook.clone());
-    harness.set_abort_cascade_hook(registry.clone());
+    spawn_plugin.set_harness_weak(Arc::downgrade(&harness));
 
     let h_clone = harness.clone();
     let main_task = tokio::spawn(async move { h_clone.prompt("please spawn a sub-agent").await });

@@ -7,6 +7,7 @@ pub use llm_harness_platform::env::EnvFactory;
 
 pub mod delivery;
 pub mod message_bus;
+pub mod plugin;
 pub mod spawn_types;
 pub mod spawner;
 pub mod tools;

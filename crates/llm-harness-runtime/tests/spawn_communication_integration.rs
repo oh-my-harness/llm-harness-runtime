@@ -1,7 +1,7 @@
 //! End-to-end integration tests for the spawn communication system.
 //!
-//! Exercises the full MessageBus ↔ HarnessSubAgentSpawner ↔ AsyncSpawnHook ↔
-//! IdleWatcher lifecycle: spawn → message → complete → abort.
+//! Exercises the full MessageBus ↔ HarnessSubAgentSpawner ↔ SpawnPlugin
+//! lifecycle: spawn → message → complete → abort.
 //!
 //! Tests are organized in two tiers:
 //! - **MessageBus-level**: exercise `send`/`wait`/`register` directly —
@@ -18,13 +18,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use llm_harness_agent::HarnessBuilder;
-use llm_harness_agent::{AgentHarness, IdleWatcherHook, Plugin};
+use llm_harness_agent::{AgentHarness, Plugin};
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse, NoOpEnv};
 use llm_harness_platform::env::EnvFactory;
-use llm_harness_runtime::spawn::delivery::IdleWatcher;
 use llm_harness_runtime::spawn::message_bus::{
-    AgentEntry, AgentStatus, MessageBus, SendReceipt, SubAgentEvent, message_bus_pair,
+    AgentEntry, AgentStatus, MessageBus, SendReceipt, SubAgentEvent,
 };
+use llm_harness_runtime::spawn::plugin::SpawnPlugin;
 use llm_harness_runtime::spawn::spawn_types::SpawnOptions;
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_runtime::spawn::tools::SpawnAgentTool;
@@ -125,11 +125,16 @@ async fn wait_for_in_flight_zero(bus: &MessageBus) {
 // ── Test 1: async_spawn_completion_test ────────────────────────────────────
 //
 // Main agent spawns sub via `spawn_async`, sub completes, the Done event
-// arrives on the event channel (consumed via `take_event_rx`).
+// arrives via the event sink.
 
 #[tokio::test]
 async fn async_spawn_completion_test() {
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
+    let events = Arc::new(std::sync::Mutex::new(vec![]));
+    let events_clone = events.clone();
+    bus.set_event_sink(Arc::new(move |event| {
+        events_clone.lock().unwrap().push(event);
+    }));
     let (spawner, _dir) = make_spawner(bus.clone(), vec![MockResponse::text("sub done")]);
 
     let agent_id = spawner
@@ -144,23 +149,17 @@ async fn async_spawn_completion_test() {
     // Wait for the track task to complete and deliver the Done event.
     wait_for_in_flight_zero(&bus).await;
 
-    // Borrow the event rx and verify a Done event was delivered.
-    let mut guard = bus
-        .take_event_rx()
-        .expect("event_rx should be available after track task completes");
-
-    let event = tokio::time::timeout(Duration::from_secs(5), guard.recv())
-        .await
-        .expect("should receive event within 5s")
-        .expect("event should be Some");
-
-    match event {
+    // Verify a Done event was delivered via the event sink.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let evs = events.lock().unwrap();
+    assert_eq!(evs.len(), 1, "one event should be pushed");
+    match &evs[0] {
         SubAgentEvent::Done {
             agent_id: id,
             result,
         } => {
-            assert_eq!(id, agent_id);
-            let r = result.expect("result should be Ok");
+            assert_eq!(id, &agent_id);
+            let r = result.as_ref().expect("result should be Ok");
             assert!(
                 r.final_answer.contains("sub done"),
                 "final_answer should contain 'sub done', got: {}",
@@ -185,8 +184,7 @@ async fn async_spawn_completion_test() {
 
 #[tokio::test]
 async fn message_subagent_steer_test() {
-    let (bus, _event_rx) = MessageBus::new();
-    let bus = Arc::new(bus);
+    let bus = MessageBus::new();
 
     // Build a real harness so the steer path has a harness to inject into.
     let harness = make_harness(vec![MockResponse::text("ok")]).await;
@@ -234,9 +232,12 @@ async fn message_subagent_steer_test() {
 
 #[tokio::test]
 async fn custom_message_persistence_no_waiter_test() {
-    let (bus, event_rx) = MessageBus::new();
-    let bus = Arc::new(bus);
-    let mut event_rx = event_rx;
+    let bus = MessageBus::new();
+    let events = Arc::new(std::sync::Mutex::new(vec![]));
+    let events_clone = events.clone();
+    bus.set_event_sink(Arc::new(move |event| {
+        events_clone.lock().unwrap().push(event);
+    }));
 
     // Register a sub-agent with a real harness (steer path).
     let sub_harness = make_harness(vec![MockResponse::text("ok")]).await;
@@ -260,20 +261,16 @@ async fn custom_message_persistence_no_waiter_test() {
     let receipt = bus.send("Main", "sub-1", "hello sub").await;
     assert!(matches!(receipt, SendReceipt::Failed(_)));
 
-    // 2. Sub → Main (no waiter): bus routes to the event channel as
-    //    SubAgentEvent::Message. The event channel consumer wraps it in
-    //    CustomMessage{type:"sub_agent_message"} in drain_and_format.
+    // 2. Sub → Main (no waiter): bus routes to the event sink as
+    //    SubAgentEvent::Message.
     let receipt = bus.send("sub-1", "Main", "report to main").await;
     assert!(matches!(receipt, SendReceipt::Injected));
 
-    // Verify the event channel received a Message event (which drain_and_format
-    // wraps as CustomMessage{type:"sub_agent_message"}).
-    let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
-        .await
-        .expect("should receive event within 5s")
-        .expect("event should be Some");
-
-    match event {
+    // Verify the event sink received a Message event.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let evs = events.lock().unwrap();
+    assert_eq!(evs.len(), 1, "one event should be pushed");
+    match &evs[0] {
         SubAgentEvent::Message { agent_id, body } => {
             assert_eq!(agent_id, "sub-1");
             assert!(
@@ -288,29 +285,31 @@ async fn custom_message_persistence_no_waiter_test() {
 // ── Test 3: message_main_should_stop_test ──────────────────────────────────
 //
 // Sub sends a message to main (no waiter). The bus routes it to the event
-// channel. We verify the event channel receives SubAgentEvent::Message.
+// sink. We verify the event sink receives SubAgentEvent::Message.
 
 #[tokio::test]
 async fn message_main_should_stop_test() {
-    let (bus, mut event_rx) = MessageBus::new();
-    let bus = Arc::new(bus);
+    let bus = MessageBus::new();
+    let events = Arc::new(std::sync::Mutex::new(vec![]));
+    let events_clone = events.clone();
+    bus.set_event_sink(Arc::new(move |event| {
+        events_clone.lock().unwrap().push(event);
+    }));
 
     register_main(&bus);
     register_sub(&bus, "sub-1");
 
-    // Sub sends a message to main — no waiter, is_main=true → event channel.
+    // Sub sends a message to main — no waiter, is_main=true → event sink.
     let receipt = bus.send("sub-1", "Main", "report from sub").await;
     assert!(
         matches!(receipt, SendReceipt::Injected),
         "send to Main without waiter should return Injected, got {receipt:?}"
     );
 
-    let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
-        .await
-        .expect("should receive event within 5s")
-        .expect("event should be Some");
-
-    match event {
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let evs = events.lock().unwrap();
+    assert_eq!(evs.len(), 1, "one event should be pushed");
+    match &evs[0] {
         SubAgentEvent::Message { agent_id, body } => {
             assert_eq!(agent_id, "sub-1");
             assert_eq!(body, "report from sub");
@@ -326,7 +325,7 @@ async fn message_main_should_stop_test() {
 
 #[tokio::test]
 async fn await_subagent_reply_test() {
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
     register_main(&bus);
     register_sub(&bus, "sub-1");
 
@@ -372,7 +371,7 @@ async fn await_subagent_reply_test() {
 
 #[tokio::test]
 async fn await_main_message_test() {
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
     register_sub(&bus, "sub-1");
     register_main(&bus);
 
@@ -413,22 +412,32 @@ async fn await_main_message_test() {
 
 // ── Test 6: idle_watcher_wake_test ─────────────────────────────────────────
 //
-// IdleWatcher detects activity (Done event) on the event channel and invokes
-// the continue_run callback. We test the IdleWatcher directly: create a bus,
-// track a quick-completing handle, start the watcher, and verify the callback
-// fires.
-//
-// Note: `track()` is `pub(crate)` and unavailable to integration tests. We
-// use `spawner.spawn_async()` instead, which internally calls
-// `track_with_oneshot`. The Done event is delivered to the event channel,
-// which the IdleWatcher picks up.
+// SpawnPlugin's AfterRunHook wait task detects in-flight sub-agents and
+// invokes continue_run when they complete. We test by wiring a real harness
+// with SpawnPlugin, spawning a sub-agent, and verifying the main agent
+// processes the completion via continue_run.
 
 #[tokio::test]
 async fn idle_watcher_wake_test() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
+    let spawn_plugin = SpawnPlugin::new(bus.clone());
     let (spawner, _dir) = make_spawner(bus.clone(), vec![MockResponse::text("done")]);
+
+    // Build a main harness with SpawnPlugin installed.
+    let client: Arc<dyn llm_harness_loop::LlmClient> = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("main waiting"),
+        MockResponse::text("main woke up"),
+    ]));
+    let env: Arc<dyn ExecutionEnv> = Arc::new(NoOpEnv);
+    let harness = Arc::new(
+        HarnessBuilder::new("test-model")
+            .provider("test-model", client)
+            .install(spawn_plugin.as_ref())
+            .build(env)
+            .await
+            .expect("build harness"),
+    );
+    spawn_plugin.set_harness_weak(Arc::downgrade(&harness));
 
     // Spawn a sub-agent — this registers it on the bus and starts tracking.
     let _agent_id = spawner
@@ -441,45 +450,33 @@ async fn idle_watcher_wake_test() {
 
     assert_eq!(bus.in_flight_count(), 1);
 
-    let called = Arc::new(AtomicUsize::new(0));
-    let watcher = IdleWatcher::new(bus.clone(), {
-        let c = called.clone();
-        Arc::new(move || {
-            let c = c.clone();
-            Box::pin(async move {
-                c.fetch_add(1, Ordering::SeqCst);
-            })
-        })
-    });
+    // Start the main harness — it will run one turn, then go Idle.
+    // AfterRunHook should detect the in-flight sub and spawn a wait task.
+    // When the sub completes, the wait task calls continue_run.
+    harness
+        .prompt("start")
+        .await
+        .expect("first prompt should succeed");
 
-    // Start the watcher — it should detect the in-flight sub and begin
-    // listening on the event channel.
-    watcher.on_idle();
-
-    // Wait for the sub to complete and the watcher to fire continue_run.
+    // Wait for the sub to complete and the wait task to fire continue_run.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if called.load(Ordering::SeqCst) >= 1 {
+        if bus.in_flight_count() == 0 {
             break;
         }
         if std::time::Instant::now() > deadline {
             panic!(
-                "IdleWatcher continue_run callback not invoked within 10s (called={}, in_flight={})",
-                called.load(Ordering::SeqCst),
+                "sub-agent did not complete within 10s (in_flight={})",
                 bus.in_flight_count()
             );
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    assert!(
-        called.load(Ordering::SeqCst) >= 1,
-        "continue_run callback should be invoked at least once"
-    );
-
-    // Clean up the watcher.
-    watcher.cancel();
-    wait_for_in_flight_zero(&bus).await;
+    // Wait for harness to return to Idle (continue_run completed).
+    tokio::time::timeout(Duration::from_secs(5), harness.wait_for_idle())
+        .await
+        .expect("harness should return to Idle within 5s");
 }
 
 // ── Test 7: abort_propagation_test ─────────────────────────────────────────
@@ -544,7 +541,7 @@ impl Plugin for BlockingToolPlugin {
 
 #[tokio::test]
 async fn abort_propagation_test() {
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
 
     // Build a spawner whose sub-agent uses BlockingToolPlugin.
     let client = Arc::new(MockLlmClient::new(vec![MockResponse::tool_use(
@@ -623,11 +620,11 @@ async fn abort_propagation_test() {
 // tests. We use `spawner.spawn_async()` which internally calls it. The track
 // task, on completion, tries to match a waiter registered under the sub's
 // agent_id — if found, the Done event is delivered via oneshot to
-// `bus.wait()`, bypassing the event channel.
+// `bus.wait()`, bypassing the event sink.
 
 #[tokio::test]
 async fn done_event_matches_waiter_test() {
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
     let (spawner, _dir) = make_spawner(bus.clone(), vec![MockResponse::text("completed")]);
 
     // Spawn the sub-agent first. The sub takes at least one LLM round-trip
@@ -689,7 +686,7 @@ async fn done_event_matches_waiter_test() {
 
 #[tokio::test]
 async fn query_status_after_completion_test() {
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
     let (spawner, _dir) = make_spawner(bus.clone(), vec![MockResponse::text("finished")]);
 
     let agent_id = spawner
@@ -714,15 +711,13 @@ async fn query_status_after_completion_test() {
 
 // ── Bonus: cancel_all_aborts_inflight_subagents_test ───────────────────────
 //
-// `cancel_all_subagents()` (AbortCascadeHook) cancels all in-flight sub-agents
+// `cancel_all()` cancels all in-flight sub-agents
 // registered via spawn_async. We spawn two blocking sub-agents, call
 // cancel_all, and verify both terminate.
 
 #[tokio::test]
 async fn cancel_all_aborts_inflight_subagents_test() {
-    use llm_harness_agent::AbortCascadeHook;
-
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
 
     // Build a spawner whose sub-agent uses BlockingToolPlugin.
     let client = Arc::new(MockLlmClient::new(vec![
@@ -758,7 +753,7 @@ async fn cancel_all_aborts_inflight_subagents_test() {
     assert_eq!(bus.in_flight_count(), 2, "both subs should be in-flight");
 
     // Cancel all in-flight sub-agents.
-    bus.cancel_all_subagents();
+    bus.cancel_all();
 
     // Both should terminate quickly.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -784,7 +779,7 @@ async fn cancel_all_aborts_inflight_subagents_test() {
 
 #[tokio::test]
 async fn send_to_aborted_agent_fails_test() {
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
     register_main(&bus);
     register_sub(&bus, "sub-1");
 
@@ -805,7 +800,7 @@ async fn send_to_aborted_agent_fails_test() {
 
 #[tokio::test]
 async fn wait_filter_by_from_test() {
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
     register_main(&bus);
     register_sub(&bus, "sub-1");
     register_sub(&bus, "sub-2");
@@ -853,7 +848,7 @@ async fn wait_filter_by_from_test() {
 
 #[tokio::test]
 async fn wait_times_out_test() {
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
     register_sub(&bus, "sub-1");
 
     let result = bus
@@ -883,7 +878,7 @@ async fn wait_times_out_test() {
 
 #[tokio::test]
 async fn wait_aborts_on_cancel_test() {
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
     register_sub(&bus, "sub-1");
 
     let abort = CancellationToken::new();
@@ -910,12 +905,17 @@ async fn wait_aborts_on_cancel_test() {
 // ── Bonus: spawn_agent_tool_e2e_test ───────────────────────────────────────
 //
 // End-to-end: the SpawnAgentTool (LLM-visible tool) spawns a sub-agent via
-// the spawner, and the Done event arrives on the event channel. This
-// exercises the tool → spawner → bus → track → event channel path.
+// the spawner, and the Done event arrives via the event sink. This
+// exercises the tool → spawner → bus → track → event sink path.
 
 #[tokio::test]
 async fn spawn_agent_tool_e2e_test() {
-    let bus = message_bus_pair();
+    let bus = MessageBus::new();
+    let events = Arc::new(std::sync::Mutex::new(vec![]));
+    let events_clone = events.clone();
+    bus.set_event_sink(Arc::new(move |event| {
+        events_clone.lock().unwrap().push(event);
+    }));
     let (spawner, _dir) = make_spawner(bus.clone(), vec![MockResponse::text("tool spawned ok")]);
     let tool = SpawnAgentTool::new(spawner);
 
@@ -950,21 +950,17 @@ async fn spawn_agent_tool_e2e_test() {
     // Wait for the sub to complete.
     wait_for_in_flight_zero(&bus).await;
 
-    // Verify the Done event arrived on the event channel.
-    let mut guard = bus.take_event_rx().expect("event_rx should be available");
-
-    let event = tokio::time::timeout(Duration::from_secs(5), guard.recv())
-        .await
-        .expect("should receive event within 5s")
-        .expect("event should be Some");
-
-    match event {
+    // Verify the Done event arrived via the event sink.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let evs = events.lock().unwrap();
+    assert_eq!(evs.len(), 1, "one event should be pushed");
+    match &evs[0] {
         SubAgentEvent::Done {
             agent_id: id,
             result,
         } => {
-            assert_eq!(id, agent_id);
-            let r = result.expect("result should be Ok");
+            assert_eq!(id, &agent_id);
+            let r = result.as_ref().expect("result should be Ok");
             assert!(
                 r.final_answer.contains("tool spawned ok"),
                 "final_answer should contain 'tool spawned ok', got: {}",

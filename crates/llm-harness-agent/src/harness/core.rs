@@ -23,7 +23,6 @@ use crate::skills::{
 
 use super::event::AgentHarnessEvent;
 use super::follow_up::FollowUpHandle;
-use super::hooks::{AbortCascadeHook, AsyncSpawnHookHandle, IdleWatcherHook};
 use super::options::AgentHarnessOptions;
 use super::state::{HarnessHooks, HarnessInner, HarnessState};
 use crate::skills::{SkillReadTool, dedup_skills, dedup_templates, filter_readable};
@@ -156,9 +155,6 @@ impl AgentHarness {
             }),
             auto_compact: opts.auto_compact,
             active_tool_names: std::collections::HashMap::new(),
-            idle_watcher: None,
-            async_spawn_hook: None,
-            abort_cascade_hook: None,
             compaction_query: opts.compaction_query,
             compaction_max_failures: opts.compaction_max_failures.unwrap_or(3).max(1),
             compaction_failure_count: 0,
@@ -196,8 +192,8 @@ impl AgentHarness {
     ///
     /// Known limitation: the Idle check and the `Turning` phase transition
     /// happen in separate lock acquisitions (the latter inside `run_loop`).
-    /// A concurrent `continue_run` from an `IdleWatcher` can win the race in
-    /// that window. The practical impact is bounded — a `before_run` hook's
+    /// A concurrent `continue_run` from SpawnPlugin's wait task can win the
+    /// race in that window. The practical impact is bounded — a `before_run`
     /// `system_prompt` edit may be left applied while the run fails to start
     /// — and `system_prompt` is not persisted, so the stale value is
     /// overwritten on the next successful prompt.
@@ -213,33 +209,18 @@ impl AgentHarness {
         let run = Arc::new(RunContext::new(request));
         let messages = run.initial_messages().to_vec();
 
-        // 1. Guard Idle phase; consume queued_next_turn; clone watcher.
-        let (queued, watcher) = {
+        let queued = {
             let mut inner = self.inner.lock().unwrap();
             if inner.state.phase != HarnessPhase::Idle {
                 return Err(HarnessError::NotIdle(inner.state.phase));
             }
             inner.state.error_message = None;
-            let q = std::mem::take(&mut inner.state.queued_next_turn);
-            let w = inner.idle_watcher.clone();
-            (q, w)
+            std::mem::take(&mut inner.state.queued_next_turn)
         };
-        // 取消已有 watcher（让位给用户 prompt；watcher 在 cancel 分支 break，
-        // guard drop 归还 rx，run_loop 的 borrow_completion_rx 能取到）
-        if let Some(w) = &watcher {
-            w.cancel();
-        }
 
-        // 2. Auto-compaction (Idle phase, before run starts).
-        // Non-InsufficientTokens errors propagate to abort the run — the
-        // context is too large and continuing would fail downstream.
         self.try_auto_compact().await?;
         let initial: Vec<AgentMessage> = queued.into_iter().chain(messages).collect();
-
-        // 3. before_run hook.
         let initial = self.run_before_run_hook(&run, initial).await?;
-
-        // 4. Drive the loop.
         self.run_loop(run, initial).await
     }
 
@@ -763,32 +744,13 @@ impl AgentHarness {
             inner: Arc::downgrade(&self.inner),
         }
     }
-    /// 配置 Idle watcher（opt-in）。不设则无自动唤醒（行为退化为旧设计）。
-    pub fn set_idle_watcher(&self, watcher: Arc<dyn IdleWatcherHook>) {
-        self.inner.lock().unwrap().idle_watcher = Some(watcher);
-    }
 
-    /// 配置 AsyncSpawnHook 引用（loop 启动时 borrow completion_rx）。
-    /// 自动回填 `FollowUpHandle`（修复 F-6：生产中 follow_up_handle 从未 set
-    /// 导致 should_stop 永远走 handle_ready=false 死循环）。
-    pub fn set_async_spawn_hook(&self, hook: Arc<dyn AsyncSpawnHookHandle>) {
-        hook.set_follow_up_handle(self.follow_up_handle());
-        self.inner.lock().unwrap().async_spawn_hook = Some(hook);
-    }
-
-    /// 配置 Abort 级联 hook（opt-in）。abort() 时取消所有 in-flight sub-agent。
-    pub fn set_abort_cascade_hook(&self, hook: Arc<dyn AbortCascadeHook>) {
-        self.inner.lock().unwrap().abort_cascade_hook = Some(hook);
-    }
-
-    /// 不注入初始消息，驱动一轮 agent loop 直到再次 Idle。
-    /// 供 Idle watcher 收到 completion 后唤醒主 agent。
-    /// 自带 Idle 守卫（与 `prompt_with_messages` 对称）。
-    ///
-    /// Known limitation: the Idle check and the `Turning` phase transition
-    /// happen in separate lock acquisitions (the latter inside `run_loop`),
-    /// the same TOCTOU window documented on `prompt_with_messages`. A
-    /// concurrent caller can win the race in that window.
+    /// Drive another agent loop turn without injecting initial messages.
+    /// Called by SpawnPlugin's wait task after a sub-agent completes.
+    /// `BeforeRunHook` drains the completion queue and returns
+    /// `additional_messages`, so the LLM sees sub-agent results on its
+    /// first turn (no wasted LLM call). Self-guarded for Idle (symmetric
+    /// with `prompt_with_messages`).
     pub async fn continue_run(&self) -> Result<(), HarnessError> {
         {
             let inner = self.inner.lock().unwrap();
@@ -796,26 +758,9 @@ impl AgentHarness {
                 return Err(HarnessError::NotIdle(inner.state.phase));
             }
         }
-        // 预排空 completion channel：把 sub-agent 结果格式化为 AgentMessage，
-        // 作为 initial 传入 run_loop，让 LLM 第一轮就能看到结果。
-        // borrow → drain → release → run_loop 内部再 borrow。
-        let initial: Vec<AgentMessage> = {
-            let async_hook = self.inner.lock().unwrap().async_spawn_hook.clone();
-            if let Some(h) = &async_hook {
-                h.borrow_completion_rx();
-                let drained = h.drain_completions();
-                h.release_completion_rx();
-                drained.into_iter().collect()
-            } else {
-                vec![]
-            }
-        };
-        // No auto-compaction here: continue_run is called by IdleWatcher after
-        // a sub-agent completion. The completion result (if any) is now in
-        // `initial` and will be persisted by run_loop. Auto-compaction runs at
-        // prompt_with_messages entry instead.
-        let run = Arc::new(RunContext::new(RunRequest::new(initial)));
+        let run = Arc::new(RunContext::new(RunRequest::new(vec![])));
         let initial = run.initial_messages().to_vec();
+        let initial = self.run_before_run_hook(&run, initial).await?;
         self.run_loop(run, initial).await
     }
 
@@ -877,30 +822,16 @@ impl AgentHarness {
             || !inner.state.queued_next_turn.is_empty()
     }
 
-    /// Cancel the current run, idle watcher, and all in-flight sub-agents.
+    /// Cancel the current run and all in-flight sub-agents.
     ///
-    /// 先取消 Idle watcher，再级联取消所有 in-flight sub-agent（通过
-    /// `AbortCascadeHook`），最后 cancel 自己的 abort token。顺序很重要：
-    /// 先 cancel watcher 使其在 aborted completion 到达前退出 recv 循环，
-    /// 避免 aborted completion 触发 continue_run 唤醒已 abort 的主 agent。
+    /// `OnAbortHook`s run first (synchronously), setting flags and cancelling
+    /// sub-agent tokens. Then the self abort token is cancelled, causing
+    /// `drive_loop` to return and `run_loop` to clean up. `AfterRunHook`
+    /// (called after `run_loop` cleanup) checks the abort flag to skip
+    /// spawning a wait task.
     pub fn abort(&self) {
-        // 先取 cascade hook 和 watcher（持锁），释放锁后再调用
-        // （hook/watcher 内部可能加自己的锁，避免死锁）。
-        let (cascade_hook, watcher) = {
-            let inner = self.inner.lock().unwrap();
-            let hook = inner.abort_cascade_hook.clone();
-            let w = inner.idle_watcher.clone();
-            (hook, w)
-        };
-        // 先取消 watcher，再级联取消 sub-agent。顺序很重要：
-        // 若先 cancel sub-agent，它们的 aborted completion 会被 watcher 接收并
-        // 触发 continue_run 唤醒已 abort 的主 agent。先 cancel watcher 使其在
-        // aborted completion 到达前退出 recv 循环。
-        if let Some(w) = watcher {
-            w.cancel();
-        }
-        if let Some(hook) = cascade_hook {
-            hook.cancel_all_subagents();
+        for hook in &self.hooks.on_abort {
+            hook.on_abort();
         }
         let mut inner = self.inner.lock().unwrap();
         if let Some(token) = inner.current_abort.take() {

@@ -71,7 +71,7 @@ fn format_event(event: &SubAgentEvent) -> String {
 /// LLM tool: spawn a sub-agent (async, fire-and-forget).
 ///
 /// Always calls `spawner.spawn_async(opts)` and returns the `agent_id`
-/// immediately; results arrive later via the event channel.
+/// immediately; results arrive later via the SpawnPlugin event sink.
 pub struct SpawnAgentTool {
     spawner: Arc<HarnessSubAgentSpawner>,
     /// 实例级 schema，包含运行时注册的 provider 别名。
@@ -621,8 +621,8 @@ llm_harness_types::assert_builtin_registered!(AbortSubagentTool => ABORT_SUBAGEN
 /// LLM tool: sub-agent sends a fire-and-forget message to the main agent.
 ///
 /// `bus.send(sub_id, MAIN_AGENT_ID, message)` delivers to a matching main-side
-/// waiter (via oneshot) or routes to the event channel for the main loop's
-/// `should_stop` / `IdleWatcher` to pick up.
+/// waiter (via oneshot) or routes to the SpawnPlugin's event sink for the
+/// `AfterTurnHook` / `AfterRunHook` to pick up.
 pub struct MessageMainTool {
     bus: Arc<MessageBus>,
     sub_id: String,
@@ -689,7 +689,7 @@ impl Tool for MessageMainTool {
                 .to_string();
 
             // select! on ctx.abort so the sub-agent is not stuck forever if
-            // the event channel is full and the main agent is not consuming.
+            // the main agent is not consuming events.
             let receipt = tokio::select! {
                 r = self.bus.send(&self.sub_id, MAIN_AGENT_ID, &message) => r,
                 _ = ctx.abort.cancelled() => {
@@ -814,7 +814,7 @@ llm_harness_types::assert_builtin_registered!(AwaitMainMessageTool => AWAIT_MAIN
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spawn::message_bus::{AgentEntry, AgentStatus, message_bus_pair};
+    use crate::spawn::message_bus::{AgentEntry, AgentStatus, MessageBus};
     use crate::spawn::spawn_types::SubAgentResult;
     use crate::spawn::spawner::JsonlSessionFactory;
     use llm_harness_loop::test_utils::{MockLlmClient, MockResponse, NoOpEnv};
@@ -874,7 +874,7 @@ mod tests {
     /// Build a SpawnAgentTool backed by a real (lightweight) spawner.
     fn make_spawn_tool() -> (SpawnAgentTool, Arc<MessageBus>) {
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let spawner = HarnessSubAgentSpawner::new(
             "test-model",
             client,
@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn message_subagent_schema_fields() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let tool = MessageSubagentTool::new(bus, MAIN_AGENT_ID);
         assert_eq!(tool.name(), MESSAGE_SUBAGENT_TOOL_NAME);
         assert_eq!(tool.execution_mode(), ToolExecutionMode::Parallel);
@@ -1036,7 +1036,7 @@ mod tests {
     async fn message_subagent_sends_to_registered_agent() {
         // Sub registered with harness=None (detached). send() correctly
         // returns Failed because the steer channel is unavailable.
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_sub(&bus, "sub-1");
         let tool = MessageSubagentTool::new(bus.clone(), MAIN_AGENT_ID);
         let ctx = make_tool_context();
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_subagent_unknown_agent_returns_error() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let tool = MessageSubagentTool::new(bus, MAIN_AGENT_ID);
         let ctx = make_tool_context();
         let args = serde_json::json!({"to": "ghost", "message": "hello"});
@@ -1061,7 +1061,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_subagent_missing_fields_returns_error() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_sub(&bus, "sub-1");
         let tool = MessageSubagentTool::new(bus, MAIN_AGENT_ID);
         let ctx = make_tool_context();
@@ -1077,7 +1077,7 @@ mod tests {
 
     #[test]
     fn await_subagent_reply_schema_and_mode() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let tool = AwaitSubagentReplyTool::new(bus, MAIN_AGENT_ID);
         assert_eq!(tool.name(), AWAIT_SUBAGENT_REPLY_TOOL_NAME);
         assert_eq!(tool.execution_mode(), ToolExecutionMode::Sequential);
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_subagent_reply_receives_message() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_main(&bus);
         register_sub(&bus, "sub-1");
 
@@ -1119,7 +1119,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_subagent_reply_times_out() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_main(&bus);
 
         let tool = AwaitSubagentReplyTool::new(bus, MAIN_AGENT_ID);
@@ -1140,7 +1140,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_subagent_reply_formats_done_event() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_main(&bus);
         register_sub(&bus, "sub-1");
 
@@ -1172,7 +1172,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_subagent_reply_aborts_on_cancel() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_main(&bus);
 
         let abort = CancellationToken::new();
@@ -1200,7 +1200,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_subagent_reply_filters_by_from() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_main(&bus);
         register_sub(&bus, "sub-1");
         register_sub(&bus, "sub-2");
@@ -1232,7 +1232,7 @@ mod tests {
 
     #[test]
     fn query_subagent_schema_fields() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let tool = QuerySubagentTool::new(bus);
         assert_eq!(tool.name(), QUERY_SUBAGENT_TOOL_NAME);
         assert_eq!(tool.execution_mode(), ToolExecutionMode::Parallel);
@@ -1242,7 +1242,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_subagent_lists_all() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_main(&bus);
         register_sub(&bus, "sub-1");
         register_sub(&bus, "sub-2");
@@ -1264,7 +1264,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_subagent_single_agent() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_main(&bus);
         register_sub(&bus, "sub-1");
 
@@ -1284,7 +1284,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_subagent_unknown_returns_empty() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_main(&bus);
 
         let tool = QuerySubagentTool::new(bus);
@@ -1303,7 +1303,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_subagent_shows_done_status() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         bus.register(
             "sub-1",
             AgentEntry {
@@ -1331,7 +1331,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_subagent_includes_role_and_description() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         bus.register(
             "sub-1",
             AgentEntry {
@@ -1368,7 +1368,7 @@ mod tests {
 
     #[test]
     fn message_main_schema_fields() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let tool = MessageMainTool::new(bus, "sub-1");
         assert_eq!(tool.name(), MESSAGE_MAIN_TOOL_NAME);
         assert_eq!(tool.execution_mode(), ToolExecutionMode::Parallel);
@@ -1380,7 +1380,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_main_sends_to_main() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_main(&bus);
 
         let tool = MessageMainTool::new(bus.clone(), "sub-1");
@@ -1397,7 +1397,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_main_missing_message_returns_error() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_main(&bus);
 
         let tool = MessageMainTool::new(bus, "sub-1");
@@ -1408,7 +1408,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_main_main_not_registered_returns_error() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         // Main not registered → send fails.
         let tool = MessageMainTool::new(bus, "sub-1");
         let ctx = make_tool_context();
@@ -1423,7 +1423,7 @@ mod tests {
 
     #[test]
     fn await_main_message_schema_and_mode() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let tool = AwaitMainMessageTool::new(bus, "sub-1");
         assert_eq!(tool.name(), AWAIT_MAIN_MESSAGE_TOOL_NAME);
         assert_eq!(tool.execution_mode(), ToolExecutionMode::Sequential);
@@ -1433,7 +1433,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_main_message_receives_from_main() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_sub(&bus, "sub-1");
         register_main(&bus);
 
@@ -1459,7 +1459,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_main_message_times_out() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_sub(&bus, "sub-1");
 
         let tool = AwaitMainMessageTool::new(bus, "sub-1");
@@ -1476,7 +1476,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_main_message_aborts_on_cancel() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         register_sub(&bus, "sub-1");
 
         let abort = CancellationToken::new();

@@ -1,11 +1,10 @@
 //! 端到端测试：主 agent spawn 异步 sub-agent，结果异步投递回主 agent 对话。
 //!
 //! 覆盖两条路径：
-//! - Running 期间：sub-agent 在主 agent 仍在跑时完成，AsyncSpawnHook 在
-//!   should_stop 排空 completion channel，注入 follow_up，主 agent 下一 turn
-//!   看到结果。
-//! - Idle 期间：主 agent spawn 后进入 Idle，IdleWatcher 监听 completion channel，
-//!   sub-agent 完成时自动调 continue_run 唤醒主 agent。
+//! - Running 期间：sub-agent 在主 agent 仍在跑时完成，AfterTurnHook 排空
+//!   completion queue，注入 follow_up，主 agent 下一 turn 看到结果。
+//! - Idle 期间：主 agent spawn 后进入 Idle，AfterRunHook 的 wait task 监听
+//!   completion queue，sub-agent 完成时自动调 continue_run 唤醒主 agent。
 //!
 //! 断言策略：follow_up 消息注入到 LLM 的对话上下文（`captured_requests`），
 //! 而非 session 持久化层——follow_up 是 loop 内 ephemeral 注入（`loop_fn.rs`
@@ -19,8 +18,8 @@ use llm_harness_loop::{
     ChatRequest, ChatResponse, LlmClient, LlmError, LlmMessage, ProviderCapabilities,
     RequestContent, StreamHandle,
 };
-use llm_harness_runtime::spawn::delivery::{IdleWatcher, async_spawn_pair};
-use llm_harness_runtime::spawn::message_bus::{MessageBus, message_bus_pair};
+use llm_harness_runtime::spawn::message_bus::MessageBus;
+use llm_harness_runtime::spawn::plugin::SpawnPlugin;
 use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
 use llm_harness_runtime::spawn::tools::SpawnAgentTool;
 use llm_harness_sandbox::{OsEnv, OsEnvFactory};
@@ -102,8 +101,8 @@ async fn async_delivery_running_period_sub_completes_during_loop() {
     std::fs::create_dir_all(&session_dir).unwrap();
 
     // sub-agent spawner：必须 enable_async_delivery，否则 spawn_async 返回错误。
-    let registry = message_bus_pair();
-    let async_hook = async_spawn_pair(registry.clone());
+    let registry = MessageBus::new();
+    let spawn_plugin = SpawnPlugin::new(registry.clone());
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
@@ -120,7 +119,7 @@ async fn async_delivery_running_period_sub_completes_during_loop() {
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
-        .after_turn_hook(async_hook.clone())
+        .install(spawn_plugin.as_ref())
         .convert_to_llm(Some(Arc::new(
             DefaultConvertToLlm::new().with_custom_converter(Arc::new(SubAgentMessageConverter)),
         )))
@@ -129,21 +128,10 @@ async fn async_delivery_running_period_sub_completes_during_loop() {
         .unwrap();
     let harness = Arc::new(harness);
 
-    // 配置 IdleWatcher（continue_run 回调捕获 Weak<AgentHarness> 打断引用环 F-1）
-    let watcher = IdleWatcher::new(registry.clone(), {
-        let h = Arc::downgrade(&harness);
-        Arc::new(move || {
-            let h = h.clone();
-            Box::pin(async move {
-                if let Some(h) = h.upgrade() {
-                    let _ = h.continue_run().await;
-                }
-            })
-        })
-    });
-    harness.set_idle_watcher(Arc::new(watcher));
-    harness.set_async_spawn_hook(async_hook.clone());
-    harness.set_abort_cascade_hook(registry.clone());
+    // SpawnPlugin 已在 builder.install 中注册全部 hooks（AfterRunHook 的 wait task
+    // 监听 sub-agent 完成事件并唤醒主 agent）。
+    // 回填 harness weak，使 AfterRunHook 能通过 continue_run 唤醒主 agent。
+    spawn_plugin.set_harness_weak(Arc::downgrade(&harness));
 
     // 启动主 agent
     harness
@@ -152,7 +140,7 @@ async fn async_delivery_running_period_sub_completes_during_loop() {
         .unwrap();
 
     // 等待 sub-agent 完成 + 结果投递。Running 场景下若 sub-agent 在主 loop
-    // 期间完成，should_stop 排空注入；若在主 loop 结束后完成，IdleWatcher 唤醒。
+    // 期间完成，AfterTurnHook 排空注入；若在主 loop 结束后完成，wait task 唤醒。
     wait_for_in_flight_zero(&registry).await;
     // 确定性等待：follow_up 注入会触发主 agent 额外 LLM 调用（>=3）。
     // 轮询 call_count 而非固定 sleep，避免 CI 负载下的 flake。
@@ -189,7 +177,7 @@ async fn async_delivery_running_period_sub_completes_during_loop() {
 }
 
 /// 场景 2：主 agent spawn 后进 Idle（等用户输入或 sub-agent），
-/// IdleWatcher 监听 completion channel，sub-agent 完成时自动 continue_run 唤醒。
+/// AfterRunHook wait task 监听 completion queue，sub-agent 完成时自动 continue_run 唤醒。
 #[tokio::test]
 async fn async_delivery_idle_period_watcher_wakes_main() {
     // 主 agent：调 spawn 后立即停（无第二条 response——除非被唤醒）
@@ -209,8 +197,8 @@ async fn async_delivery_idle_period_watcher_wakes_main() {
     let _ = std::fs::remove_dir_all(&session_dir);
     std::fs::create_dir_all(&session_dir).unwrap();
 
-    let registry = message_bus_pair();
-    let async_hook = async_spawn_pair(registry.clone());
+    let registry = MessageBus::new();
+    let spawn_plugin = SpawnPlugin::new(registry.clone());
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
@@ -226,7 +214,7 @@ async fn async_delivery_idle_period_watcher_wakes_main() {
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
-        .after_turn_hook(async_hook.clone())
+        .install(spawn_plugin.as_ref())
         .convert_to_llm(Some(Arc::new(
             DefaultConvertToLlm::new().with_custom_converter(Arc::new(SubAgentMessageConverter)),
         )))
@@ -234,27 +222,14 @@ async fn async_delivery_idle_period_watcher_wakes_main() {
         .await
         .unwrap();
     let harness = Arc::new(harness);
-    let watcher = IdleWatcher::new(registry.clone(), {
-        let h = Arc::downgrade(&harness);
-        Arc::new(move || {
-            let h = h.clone();
-            Box::pin(async move {
-                if let Some(h) = h.upgrade() {
-                    let _ = h.continue_run().await;
-                }
-            })
-        })
-    });
-    harness.set_idle_watcher(Arc::new(watcher));
-    harness.set_async_spawn_hook(async_hook.clone());
-    harness.set_abort_cascade_hook(registry.clone());
+    spawn_plugin.set_harness_weak(Arc::downgrade(&harness));
 
     harness.prompt("spawn a sub-agent").await.unwrap();
 
     // prompt 返回后主 agent 进 Idle。sub-agent 可能已完成或仍在跑。
-    // IdleWatcher 应自动唤醒处理。等待 sub-agent 完成 + watcher 投递。
+    // AfterRunHook wait task 应自动唤醒处理。等待 sub-agent 完成 + 投递。
     wait_for_in_flight_zero(&registry).await;
-    // 确定性等待：watcher 唤醒后 follow_up 注入触发主 agent 额外 LLM 调用（>=3）。
+    // 确定性等待：wait task 唤醒后 follow_up 注入触发主 agent 额外 LLM 调用（>=3）。
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let calls = main_client
@@ -351,8 +326,8 @@ async fn continue_run_idle_path_no_wasted_llm_call() {
     let _ = std::fs::remove_dir_all(&session_dir);
     std::fs::create_dir_all(&session_dir).unwrap();
 
-    let registry = message_bus_pair();
-    let async_hook = async_spawn_pair(registry.clone());
+    let registry = MessageBus::new();
+    let spawn_plugin = SpawnPlugin::new(registry.clone());
     let spawner = Arc::new(
         HarnessSubAgentSpawner::new(
             "sub-model",
@@ -368,7 +343,7 @@ async fn continue_run_idle_path_no_wasted_llm_call() {
     let harness = HarnessBuilder::new("main-model")
         .provider("main-model", main_client.clone())
         .tool(Arc::new(SpawnAgentTool::new(spawner.clone())))
-        .after_turn_hook(async_hook.clone())
+        .install(spawn_plugin.as_ref())
         .convert_to_llm(Some(Arc::new(
             DefaultConvertToLlm::new().with_custom_converter(Arc::new(SubAgentMessageConverter)),
         )))
@@ -376,20 +351,7 @@ async fn continue_run_idle_path_no_wasted_llm_call() {
         .await
         .unwrap();
     let harness = Arc::new(harness);
-    let watcher = IdleWatcher::new(registry.clone(), {
-        let h = Arc::downgrade(&harness);
-        Arc::new(move || {
-            let h = h.clone();
-            Box::pin(async move {
-                if let Some(h) = h.upgrade() {
-                    let _ = h.continue_run().await;
-                }
-            })
-        })
-    });
-    harness.set_idle_watcher(Arc::new(watcher));
-    harness.set_async_spawn_hook(async_hook.clone());
-    harness.set_abort_cascade_hook(registry.clone());
+    spawn_plugin.set_harness_weak(Arc::downgrade(&harness));
 
     harness.prompt("spawn a sub-agent").await.unwrap();
 

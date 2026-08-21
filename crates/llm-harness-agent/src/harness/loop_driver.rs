@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use llm_harness_loop::CompositeAfterRunHook;
 use llm_harness_loop::CompositePrepareNextTurnHook;
 use llm_harness_loop::{
     CompositeAfterProviderResponseHook, CompositeAfterToolCallHook, CompositeAfterTurnHook,
@@ -89,13 +90,23 @@ impl AgentHarness {
             .unwrap_or_default();
 
         // 内联注入 skills 元数据（方式三第一层）。
+        // Idempotency: skip if initial already contains a skills metadata
+        // message (e.g. continue_run re-entering before_run after a previous
+        // injection in the same run, or additional_messages from a hook).
         if has_skill_readiness {
-            let metadata = crate::skills::format_skills_metadata(&resources.skills, true);
-            if !metadata.is_empty() {
-                initial.push(AgentMessage::User(UserMessage {
-                    content: vec![ContentBlock::Text { text: metadata }],
-                    timestamp: chrono::Utc::now(),
-                }));
+            let already_injected = initial.iter().any(|m| {
+                matches!(m, AgentMessage::User(u) if u.content.iter().any(|c| {
+                    matches!(c, ContentBlock::Text { text } if text.starts_with("<available-skills>"))
+                }))
+            });
+            if !already_injected {
+                let metadata = crate::skills::format_skills_metadata(&resources.skills, true);
+                if !metadata.is_empty() {
+                    initial.push(AgentMessage::User(UserMessage {
+                        content: vec![ContentBlock::Text { text: metadata }],
+                        timestamp: chrono::Utc::now(),
+                    }));
+                }
             }
         }
 
@@ -254,8 +265,8 @@ impl AgentHarness {
         run: Arc<RunContext>,
         initial: Vec<AgentMessage>,
     ) -> Result<(), HarnessError> {
-        // 1. Setup: channels, abort token, system prompt, hooks.
-        let (steer_rx, follow_up_rx, abort, system_prompt, original_tools, async_hook, watcher) = {
+        // 1. Setup: channels, abort token, system prompt, original tools.
+        let (steer_rx, follow_up_rx, abort, system_prompt, original_tools) = {
             let mut inner = self.inner.lock().unwrap();
             inner.state.streaming_message = None;
             inner.state.pending_tool_calls.clear();
@@ -263,17 +274,10 @@ impl AgentHarness {
             let abort = inner.current_abort.take().unwrap_or_default();
             inner.current_abort = Some(abort.clone());
             let sp = inner.state.system_prompt.clone();
-            // clone Vec<Arc<dyn Tool>>（浅拷贝指针，非工具本体），用于 loop 结束后
-            // 恢复未包装的 tools，避免下次 build_loop_config 二次包装 HookedTool。
             let ot = inner.state.tools.clone();
-            let async_hook = inner.async_spawn_hook.clone();
-            let watcher = inner.idle_watcher.clone();
-            (steer_rx, follow_up_rx, abort, sp, ot, async_hook, watcher)
+            (steer_rx, follow_up_rx, abort, sp, ot)
         };
         let _guard = self.enter_phase(HarnessPhase::Turning)?;
-        if let Some(h) = &async_hook {
-            h.borrow_completion_rx();
-        }
 
         let result = self
             .drive_loop(run, initial, steer_rx, follow_up_rx, abort, system_prompt)
@@ -286,33 +290,23 @@ impl AgentHarness {
             inner.state.pending_tool_calls.clear();
             inner.active_tool_names.clear();
             inner.current_abort = None;
-            // On error, the run is discarded: reset the mid-run flag so the
-            // selective restore below rolls back to original_tools.
             if let Err(ref e) = result {
                 inner.state.error_message = Some(e.to_string());
                 inner.state.pending_session_writes.clear();
                 inner.state.tools_overwritten_mid_run = false;
             }
-            // Restore original unwrapped tools so the next call to `build_loop_config`
-            // doesn't re-wrap already-HookedTool-wrapped tools (double-wrapping) —
-            // unless `set_tools` overwrote the tools mid-run, in which case keep the
-            // new (unwrapped) set; next `build_loop_config` will wrap them as needed.
             if inner.state.tools_overwritten_mid_run {
                 inner.state.tools_overwritten_mid_run = false;
             } else {
                 inner.state.tools = original_tools;
             }
         }
-        // Release the completion_rx borrow BEFORE dropping the guard (which
-        // restores Idle). Otherwise a concurrent caller seeing Idle could
-        // borrow_completion_rx before the previous run released it.
-        if let Some(h) = &async_hook {
-            h.release_completion_rx();
-        }
-        drop(_guard);
-        // Idle 后：若配置了 watcher，让其检查 in-flight 并按需启动
-        if let Some(w) = &watcher {
-            w.on_idle();
+        drop(_guard); // Restore Idle.
+
+        // AfterRunHook: replaces watcher.on_idle().
+        if !self.hooks.after_run.is_empty() {
+            let composite = Arc::new(CompositeAfterRunHook::new(self.hooks.after_run.clone()));
+            composite.after_run().await;
         }
 
         result

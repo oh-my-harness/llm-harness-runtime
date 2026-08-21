@@ -42,9 +42,8 @@ pub use compaction::{
     CompactionThresholdConfig, compact,
 };
 pub use harness::{
-    AbortCascadeHook, AgentHarness, AgentHarnessEvent, AgentHarnessOptions, AsyncSpawnHookHandle,
-    CompactionStats, FollowUpHandle, HarnessHooks, HarnessState, HarnessToolCallResult,
-    IdleWatcherHook, UsageLedger,
+    AgentHarness, AgentHarnessEvent, AgentHarnessOptions, CompactionStats, FollowUpHandle,
+    HarnessHooks, HarnessState, HarnessToolCallResult, UsageLedger,
 };
 pub use llm_harness_loop::{
     DEFAULT_FINAL_ANSWER_TOOL_NAME, FinalAnswerMissingBehavior, FinalAnswerMode,

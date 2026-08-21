@@ -68,7 +68,7 @@ pub struct HarnessSubAgentSpawner {
     session_factory: Arc<dyn SessionFactory>,
     session_base_dir: PathBuf,
     /// 共享 MessageBus。`spawn_async` 把 sub-agent 注册到 bus 并 track，
-    /// 完成后结果经 event channel 投递回主 agent。
+    /// 完成后结果经 event sink 投递回主 agent。
     message_bus: Arc<MessageBus>,
     /// builder 定制闭包（与 WorkflowEngine 的共享闭包同源）。
     builder_customize: Option<Arc<dyn Fn(HarnessBuilder) -> HarnessBuilder + Send + Sync>>,
@@ -379,11 +379,12 @@ impl HarnessSubAgentSpawner {
             // 9. 启动 tokio task。abort_token 注入 harness，使 handle.abort()
             // 能到达 agent loop。
             let abort_clone = abort_token.clone();
+            let abort_check = abort_token.clone();
             let session_id_clone = session_id.clone();
             let join = tokio::spawn(async move {
                 // 将 abort token 注入 harness，使 handle.abort()
                 // 能到达 agent loop。
-                harness.set_abort_token(abort_clone);
+                harness.set_abort_token(abort_clone.clone());
 
                 // Bridge: broadcast → unbounded mpsc。
                 // event_task 从 mpsc 读，不会因 broadcast buffer 满而 Lagged。
@@ -443,7 +444,13 @@ impl HarnessSubAgentSpawner {
                     (final_answer, text_delta_output, tool_count)
                 });
 
-                if let Err(e) = harness.prompt(&prompt).await {
+                let prompt_result = harness.prompt(&prompt).await;
+                if abort_check.is_cancelled() {
+                    event_task.abort();
+                    bridge.abort();
+                    return Err(AgentError::Aborted);
+                }
+                if let Err(e) = prompt_result {
                     event_task.abort();
                     bridge.abort();
                     return Err(match e {
@@ -476,7 +483,7 @@ impl HarnessSubAgentSpawner {
     }
 
     /// Spawn sub-agent 后台执行（task 异步跑），经 `bus.track_with_oneshot`
-    /// 返回 agent_id。结果经 event channel 投递给主 agent 的 hook/watcher。
+    /// 返回 agent_id。结果经 event sink 投递给主 agent 的 SpawnPlugin hooks。
     ///
     /// agent_id 取 session_id。
     pub fn spawn_async(&self, opts: SpawnOptions) -> BoxFuture<'_, Result<String, AgentError>> {
@@ -597,7 +604,7 @@ impl SessionFactory for JsonlSessionFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spawn::message_bus::message_bus_pair;
+    use crate::spawn::message_bus::MessageBus;
     use parking_lot::Mutex;
 
     use llm_harness_agent::session::repo::InMemorySessionRepo;
@@ -809,7 +816,7 @@ mod tests {
     async fn known_alias_uses_correct_client_and_model() {
         let default_client = Arc::new(MockLlmClient::new(vec![]));
         let fast_client = Arc::new(MockLlmClient::new(vec![]));
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let (spawner, factory, _client) = make_spawner(default_client, "default-model", bus);
         let spawner = spawner.alias("fast", fast_client, "fast-model");
 
@@ -828,7 +835,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_alias_returns_error() {
         let client = Arc::new(MockLlmClient::new(vec![]));
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let (spawner, _factory, _client) = make_spawner(client, "default-model", bus);
 
         let err = spawner
@@ -849,7 +856,7 @@ mod tests {
     #[tokio::test]
     async fn inherit_uses_default_model() {
         let client = Arc::new(MockLlmClient::new(vec![]));
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let (spawner, factory, _client) = make_spawner(client, "default-model", bus);
 
         let (_handle, _session_id) = spawner
@@ -868,7 +875,7 @@ mod tests {
         let mock = MockResponse::text("response from sub-agent");
         let client = Arc::new(MockLlmClient::new(vec![mock]));
         let client_clone = client.clone();
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let (spawner, _factory, _) = make_spawner(client, "default-model", bus);
 
         let (handle, _session_id) = spawner
@@ -928,7 +935,7 @@ mod tests {
             MockResponse::text("the real answer"),
         ];
         let client = Arc::new(MockLlmClient::new(responses));
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let spawner = make_spawner_with_echo(client, "mock-model", bus);
 
         let (handle, _session_id) = spawner
@@ -950,7 +957,7 @@ mod tests {
     #[tokio::test]
     async fn final_answer_falls_back_to_empty_when_no_final_answer() {
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::rate_limit_error()]));
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let (spawner, _factory, _) = make_spawner(client, "mock-model", bus);
 
         let (handle, _session_id) = spawner
@@ -986,7 +993,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_async_returns_agent_id_and_tracks_in_flight() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let spawner = make_async_test_spawner(bus.clone());
 
         let opts = SpawnOptions {
@@ -1007,7 +1014,7 @@ mod tests {
     /// returns ResourceLimitExceeded immediately.
     #[tokio::test]
     async fn max_concurrent_zero_rejects_spawn() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let spawner = make_async_test_spawner(bus.clone()).max_concurrent(Some(0));
         let opts = SpawnOptions {
             prompt: "say hi".into(),
@@ -1025,7 +1032,7 @@ mod tests {
     /// on the error path so the counter doesn't drift.
     #[tokio::test]
     async fn max_concurrent_releases_slot_on_spawn_failure() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         // NoOpSessionFactory → spawn_inner fails at session creation.
         let client = Arc::new(MockLlmClient::new(vec![]));
         let dir = tempfile::tempdir().unwrap();
@@ -1066,7 +1073,7 @@ mod tests {
 
     #[test]
     fn pending_spawn_reservation_is_cancelled_and_releases_slot_on_drop() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let token = CancellationToken::new();
         let pending_id = "pending-test".to_string();
         bus.register_subagent_abort(&pending_id, token.clone());
@@ -1087,7 +1094,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropping_spawn_future_during_session_create_cleans_pending_state() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let factory = Arc::new(BlockingSessionFactory::new());
         let client = Arc::new(MockLlmClient::new(vec![]));
         let dir = tempfile::tempdir().unwrap();
@@ -1131,7 +1138,7 @@ mod tests {
     /// after the sub-agent completes (verifies no double-increment).
     #[tokio::test]
     async fn max_concurrent_balanced_after_successful_spawn() {
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let spawner = make_async_test_spawner(bus.clone()).max_concurrent(Some(5));
         let opts = SpawnOptions {
             prompt: "say hi".into(),
@@ -1262,7 +1269,7 @@ mod tests {
     #[tokio::test]
     async fn role_description_propagate_to_query() {
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let (spawner, _factory, _) = make_spawner(client, "default-model", bus.clone());
 
         let (handle, _session_id) = spawner
@@ -1300,7 +1307,7 @@ mod tests {
     async fn per_spawn_system_prompt_overrides_global() {
         let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
         let client_clone = client.clone();
-        let bus = message_bus_pair();
+        let bus = MessageBus::new();
         let (spawner, _factory, _) = make_spawner(client, "default-model", bus);
         let spawner = spawner.builder_customize(Some(Arc::new(|b| {
             b.system_prompt(Some("global-prompt".to_string()))

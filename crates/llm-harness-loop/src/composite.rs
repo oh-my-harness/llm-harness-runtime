@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use llm_harness_types::{
-    AfterProviderResponseCtx, AfterProviderResponseHook, AfterToolCallCtx, AfterToolCallDecision,
-    AfterToolCallHook, AfterTurnCtx, AfterTurnHook, AgentContext, AgentError, BeforeCompactCtx,
-    BeforeCompactDecision, BeforeCompactHook, BeforeProviderRequestCtx, BeforeProviderRequestHook,
-    BeforeRunCtx, BeforeRunHook, BeforeRunResult, BeforeToolCallCtx, BeforeToolCallDecision,
-    BeforeToolCallHook, BeforeTurnCtx, BeforeTurnHook, FinalAnswerValidationCtx,
-    FinalAnswerValidationError, FinalAnswerValidator, PrepareNextTurnCtx, PrepareNextTurnHook,
-    ShouldStopCtx, ShouldStopHook, TransformContextCtx, TransformContextHook,
+    AfterProviderResponseCtx, AfterProviderResponseHook, AfterRunHook, AfterToolCallCtx,
+    AfterToolCallDecision, AfterToolCallHook, AfterTurnCtx, AfterTurnHook, AgentContext,
+    AgentError, BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook,
+    BeforeProviderRequestCtx, BeforeProviderRequestHook, BeforeRunCtx, BeforeRunHook,
+    BeforeRunResult, BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook, BeforeTurnCtx,
+    BeforeTurnHook, FinalAnswerValidationCtx, FinalAnswerValidationError, FinalAnswerValidator,
+    PrepareNextTurnCtx, PrepareNextTurnHook, ShouldStopCtx, ShouldStopHook, TransformContextCtx,
+    TransformContextHook,
 };
 
 /// Chains final-answer validators in registration order.
@@ -485,6 +486,30 @@ impl BeforeCompactHook for CompositeBeforeCompactHook {
                 }
             }
             BeforeCompactDecision::Proceed
+        })
+    }
+}
+
+/// Chains multiple `AfterRunHook` implementations (all-execute semantics).
+///
+/// All hooks execute in registration order (observing only, no return value).
+pub struct CompositeAfterRunHook {
+    hooks: Vec<Arc<dyn AfterRunHook>>,
+}
+
+impl CompositeAfterRunHook {
+    /// Create a composite from a list of hooks.
+    pub fn new(hooks: Vec<Arc<dyn AfterRunHook>>) -> Self {
+        Self { hooks }
+    }
+}
+
+impl AfterRunHook for CompositeAfterRunHook {
+    fn after_run(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            for hook in &self.hooks {
+                hook.after_run().await;
+            }
         })
     }
 }

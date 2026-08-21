@@ -6,7 +6,6 @@ use llm_harness_types::*;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{AbortCascadeHook, AsyncSpawnHookHandle, IdleWatcherHook};
 use crate::agent::ModelInfo;
 use crate::compaction::{CompactionPromptSpec, CompactionSummaryConfig, CompactionThresholdConfig};
 use crate::session::types::*;
@@ -87,8 +86,11 @@ pub struct HarnessHooks {
     pub final_answer_validator: Vec<Arc<dyn FinalAnswerValidator>>,
     /// Called before compaction to decide whether to proceed.
     pub before_compact: Vec<Arc<dyn BeforeCompactHook>>,
+    /// Called after run_loop ends and harness returns to Idle.
+    pub after_run: Vec<Arc<dyn AfterRunHook>>,
+    /// Called when harness.abort() is invoked, before AfterRunHook.
+    pub on_abort: Vec<Arc<dyn OnAbortHook>>,
 }
-
 impl HarnessHooks {
     /// All hooks absent (default state).
     pub fn none() -> Self {
@@ -105,6 +107,8 @@ impl HarnessHooks {
             after_provider_response: vec![],
             final_answer_validator: vec![],
             before_compact: vec![],
+            after_run: vec![],
+            on_abort: vec![],
         }
     }
 }
@@ -132,15 +136,6 @@ pub(super) struct HarnessInner {
     pub(super) auto_compact: bool,
     /// Maps tool_use_id → tool_name for in-flight tool calls.
     pub(super) active_tool_names: std::collections::HashMap<String, String>,
-    /// Idle watcher（opt-in）。harness 持 watcher 的 `Arc`，watcher 的
-    /// continue_run 闭包须捕获 `Weak<AgentHarness>` 而非 `Arc`，以打断
-    /// `Arc<AgentHarness>` → inner.idle_watcher → 闭包 → `Arc<AgentHarness>`
-    /// 的引用环。None 则无 watcher。
-    pub(super) idle_watcher: Option<Arc<dyn IdleWatcherHook>>,
-    /// AsyncSpawnHook 引用（opt-in）。None 则无异步投递。
-    pub(super) async_spawn_hook: Option<Arc<dyn AsyncSpawnHookHandle>>,
-    /// Abort 级联 hook（opt-in）。None 则 abort 不级联到 sub-agent。
-    pub(super) abort_cascade_hook: Option<Arc<dyn AbortCascadeHook>>,
     /// Shared accumulated cost state. Populated by `CostAccumulatorHook`
     /// (injected via `after_provider_response` by `HarnessBuilder`).
     /// Read by `AgentHarness::usage()`.

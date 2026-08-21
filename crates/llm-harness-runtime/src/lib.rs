@@ -13,7 +13,7 @@
 //! # Tracing / diagnostic logging
 //!
 //! This crate emits diagnostic warnings via `tracing::warn!` (session parse
-//! failures, event-store I/O errors, IdleWatcher event drops, etc.).  These
+//! failures, event-store I/O errors, SpawnPlugin event drops, etc.).  These
 //! calls are no-ops unless a `tracing_subscriber` is installed.
 //!
 //! **Embedding applications must initialize a subscriber.**  For example:

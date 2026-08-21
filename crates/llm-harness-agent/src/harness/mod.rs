@@ -4,7 +4,6 @@ mod cost;
 pub(crate) mod cost_hook;
 mod event;
 mod follow_up;
-mod hooks;
 mod loop_driver;
 mod options;
 mod phase_guard;
@@ -16,7 +15,6 @@ pub use core::AgentHarness;
 pub use cost::UsageLedger;
 pub use event::{AgentHarnessEvent, CompactionStats, HarnessToolCallResult};
 pub use follow_up::FollowUpHandle;
-pub use hooks::{AbortCascadeHook, AsyncSpawnHookHandle, IdleWatcherHook};
 pub use options::AgentHarnessOptions;
 pub use state::{HarnessHooks, HarnessState};
 
