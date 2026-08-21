@@ -11,7 +11,7 @@ static TODO_WRITE_SCHEMA: std::sync::LazyLock<serde_json::Value> = std::sync::La
     serde_json::json!({
         "type": "object",
         "properties": {
-            "action": { "type": "string", "enum": ["rewrite", "update"] },
+            "action": { "type": "string", "enum": ["rewrite", "update", "add", "clear"] },
             "items": {
                 "type": "array",
                 "items": {
@@ -25,6 +25,7 @@ static TODO_WRITE_SCHEMA: std::sync::LazyLock<serde_json::Value> = std::sync::La
                 }
             },
             "id": { "type": "string" },
+            "content": { "type": "string" },
             "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"] }
         },
         "required": ["action"]
@@ -55,10 +56,12 @@ impl Tool for TodoWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Create or update the agent's TODO list. Use `rewrite` to replace the \
-         entire list, or `update` to change a single item's status. \
-         The current TODO list is shown in the <agent_status> block at the \
-         end of the context each turn."
+        "Manage your TODO list. Actions: \
+         'add' (append a new item; requires `id` + `content`, `status` optional defaults to pending), \
+         'update' (change item status by `id`; requires `id` + `status`), \
+         'rewrite' (replace entire list; requires `items` array), \
+         'clear' (remove all items; no arguments). \
+         The current list is shown in the <agent_status> block at the end of the context each turn."
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -112,6 +115,48 @@ fn run_todo_write(store: &TodoStore, args: &serde_json::Value) -> Result<ToolRes
                     format!("TODO item `{}` not found", id),
                 ))
             }
+        }
+        "add" => {
+            let id = args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolFailure::invalid_arguments("missing `id` field"))?
+                .to_string();
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolFailure::invalid_arguments("missing `content` field"))?
+                .to_string();
+            let status = parse_status(args).unwrap_or(TodoStatus::Pending);
+            if store.contains_id(&id) {
+                return Err(ToolFailure::invalid_arguments(format!(
+                    "TODO item `{}` already exists; use 'update' to change its status or a different id to add a new item",
+                    id
+                )));
+            }
+            let id_display = id.clone();
+            store.add(TodoItem {
+                id,
+                content,
+                status,
+                updated_at: chrono::Utc::now(),
+            });
+            Ok(ToolResult::full(
+                vec![DataBlock::text(format!(
+                    "TODO `{}` added to list.",
+                    id_display
+                ))],
+                serde_json::json!({ "action": "add", "count": store.snapshot().len() }),
+                false,
+            ))
+        }
+        "clear" => {
+            store.clear();
+            Ok(ToolResult::full(
+                vec![DataBlock::text("TODO list cleared.")],
+                serde_json::json!({ "action": "clear" }),
+                false,
+            ))
         }
         other => Err(ToolFailure::invalid_arguments(format!(
             "unknown action: `{}`",
@@ -263,6 +308,119 @@ mod tests {
             "id": "1",
             "status": "invalid_status"
         });
+        let result = tool.execute(args, &make_ctx()).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, "invalid_arguments");
+    }
+    #[tokio::test]
+    async fn add_action_appends_item() {
+        let store = TodoStore::new();
+        store.rewrite(vec![TodoItem::new("1", "task A")]);
+        let tool = TodoWriteTool::new(store.clone());
+        let args = json!({
+            "action": "add",
+            "id": "2",
+            "content": "task B"
+        });
+        let result = tool.execute(args, &make_ctx()).await.unwrap();
+        assert!(!result.terminate);
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[1].id, "2");
+        assert_eq!(snap[1].content, "task B");
+        assert_eq!(snap[1].status, TodoStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn add_action_with_explicit_status() {
+        let store = TodoStore::new();
+        let tool = TodoWriteTool::new(store.clone());
+        let args = json!({
+            "action": "add",
+            "id": "1",
+            "content": "task A",
+            "status": "in_progress"
+        });
+        let result = tool.execute(args, &make_ctx()).await.unwrap();
+        assert!(!result.terminate);
+        assert_eq!(store.snapshot()[0].status, TodoStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn add_action_missing_id_returns_failure() {
+        let store = TodoStore::new();
+        let tool = TodoWriteTool::new(store);
+        let args = json!({
+            "action": "add",
+            "content": "task A"
+        });
+        let result = tool.execute(args, &make_ctx()).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, "invalid_arguments");
+    }
+
+    #[tokio::test]
+    async fn add_action_missing_content_returns_failure() {
+        let store = TodoStore::new();
+        let tool = TodoWriteTool::new(store);
+        let args = json!({
+            "action": "add",
+            "id": "1"
+        });
+        let result = tool.execute(args, &make_ctx()).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, "invalid_arguments");
+    }
+
+    #[tokio::test]
+    async fn add_action_duplicate_id_returns_failure() {
+        let store = TodoStore::new();
+        store.rewrite(vec![TodoItem::new("1", "task A")]);
+        let tool = TodoWriteTool::new(store.clone());
+        let args = json!({
+            "action": "add",
+            "id": "1",
+            "content": "duplicate task"
+        });
+        let result = tool.execute(args, &make_ctx()).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, "invalid_arguments");
+        // Original item is untouched.
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].content, "task A");
+    }
+
+    #[tokio::test]
+    async fn clear_action_empties_list() {
+        let store = TodoStore::new();
+        store.rewrite(vec![
+            TodoItem::new("1", "task A"),
+            TodoItem::new("2", "task B"),
+        ]);
+        let tool = TodoWriteTool::new(store.clone());
+        let args = json!({"action": "clear"});
+        let result = tool.execute(args, &make_ctx()).await.unwrap();
+        assert!(!result.terminate);
+        assert!(store.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_action_on_empty_store_is_noop() {
+        let store = TodoStore::new();
+        let tool = TodoWriteTool::new(store.clone());
+        let args = json!({"action": "clear"});
+        let result = tool.execute(args, &make_ctx()).await.unwrap();
+        assert!(!result.terminate);
+        assert!(store.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_action_returns_failure() {
+        let store = TodoStore::new();
+        let tool = TodoWriteTool::new(store);
+        let args = json!({"action": "frobnicate"});
         let result = tool.execute(args, &make_ctx()).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, "invalid_arguments");
