@@ -6,12 +6,12 @@ use std::sync::Arc;
 
 use llm_harness_live_tests::skip_if_none;
 use llm_harness_live_tests::{LiveProvider, MULTI_TURN, with_timeout};
-use llm_harness_runtime::lifecycle::task_store::{JsonlTaskStore, TaskStore};
-use llm_harness_runtime::spawn::spawner::JsonlSessionFactory;
-use llm_harness_runtime::workflow::engine::{WorkflowEngine, WorkflowEngineConfig};
-use llm_harness_runtime::workflow::judge::EdgeConditionJudge;
-use llm_harness_runtime::workflow::model::{Edge, Step, Workflow, WorkflowStatus};
 use llm_harness_sandbox::OsEnvFactory;
+use llm_harness_subagents::spawner::JsonlSessionFactory;
+use llm_harness_workflow::lifecycle::task_store::{JsonlTaskStore, TaskStore};
+use llm_harness_workflow::workflow::engine::{WorkflowEngine, WorkflowEngineConfig};
+use llm_harness_workflow::workflow::judge::EdgeConditionJudge;
+use llm_harness_workflow::workflow::model::{Edge, Step, Workflow, WorkflowStatus};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 

@@ -5,7 +5,8 @@ members = [
     "crates/llm-harness-agent",
     # runtime
     "crates/llm-harness-platform",
-    "crates/llm-harness-runtime",
+    "crates/llm-harness-subagents",
+    "crates/llm-harness-workflow",
     "crates/llm-harness-sandbox",
     "crates/llm-harness-mcp",
     "crates/llm-harness-tools",
@@ -38,7 +39,8 @@ llm-harness-loop   = { path = "crates/llm-harness-loop" }
 llm-harness-agent  = { path = "crates/llm-harness-agent" }
 # Runtime (within this workspace)
 llm-harness-platform = { path = "crates/llm-harness-platform" }
-llm-harness-runtime = { path = "crates/llm-harness-runtime" }
+llm-harness-subagents = { path = "crates/llm-harness-subagents" }
+llm-harness-workflow = { path = "crates/llm-harness-workflow" }
 llm-harness-tools = { path = "crates/llm-harness-tools" }
 llm-harness-strategy = { path = "crates/llm-harness-strategy" }
 llm-harness-knowledge = { path = "crates/llm-harness-knowledge" }

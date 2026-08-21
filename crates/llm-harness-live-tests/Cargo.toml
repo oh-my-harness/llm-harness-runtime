@@ -9,7 +9,9 @@ publish = false
 default = ["live-llm"]
 live-llm = [
     "dep:llm-harness-loop",
-    "dep:llm-harness-runtime",
+    "dep:llm-harness-subagents",
+    "dep:llm-harness-workflow",
+    "dep:llm-harness-platform",
     "dep:llm-harness-sandbox",
     "dep:llm-harness-agent",
     "dep:llm-harness-types",
@@ -18,8 +20,10 @@ live-llm = [
 ]
 
 [dependencies]
+llm-harness-subagents = { workspace = true, optional = true }
+llm-harness-workflow = { workspace = true, optional = true }
+llm-harness-platform = { workspace = true, optional = true }
 llm-harness-loop = { workspace = true, features = ["test-utils"], optional = true }
-llm-harness-runtime = { workspace = true, optional = true }
 llm-harness-sandbox = { workspace = true, optional = true }
 llm-harness-agent = { workspace = true, optional = true }
 llm-harness-types = { workspace = true, optional = true }

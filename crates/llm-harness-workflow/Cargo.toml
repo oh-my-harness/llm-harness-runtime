@@ -1,0 +1,40 @@
+[package]
+name    = "llm-harness-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+llm-harness-agent.workspace  = true
+llm-harness-loop.workspace = true
+llm-harness-types.workspace = true
+llm-harness-platform.workspace = true
+llm-harness-subagents.workspace = true
+regex.workspace              = true
+anyhow.workspace            = true
+async-trait.workspace       = true
+chrono.workspace             = true
+futures.workspace           = true
+serde.workspace             = true
+serde_json.workspace        = true
+reqwest.workspace            = true
+base64.workspace            = true
+sha2.workspace               = true
+parking_lot.workspace     = true
+thiserror.workspace         = true
+tokio = { workspace = true, features = ["time", "fs"] }
+tokio-util.workspace        = true
+uuid.workspace              = true
+tracing.workspace              = true
+
+[dev-dependencies]
+llm-harness-loop = { workspace = true, features = ["test-utils"] }
+llm-harness-strategy.workspace = true
+llm-harness-sandbox.workspace  = true
+llm-harness-audit-jsonl.workspace = true
+llm-harness-trace-otel.workspace  = true
+chrono.workspace  = true
+futures.workspace = true
+tokio     = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tokio-util = { workspace = true }
+tempfile  = "3"

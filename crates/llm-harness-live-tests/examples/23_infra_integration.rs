@@ -33,10 +33,10 @@ use llm_harness_knowledge_local::{
 use llm_harness_live_tests::{
     EventCapture, LiveProvider, MULTI_TURN, SINGLE_TURN, make_harness_with_env, with_timeout,
 };
-use llm_harness_runtime::lifecycle::event::WaitForExternalEventTool;
-use llm_harness_runtime::lifecycle::task::TaskId;
 use llm_harness_strategy::{EventDetails, TimerStream, WebhookStream};
 use llm_harness_types::{EventStream, RunRequest};
+use llm_harness_workflow::lifecycle::event::WaitForExternalEventTool;
+use llm_harness_workflow::lifecycle::task::TaskId;
 use tokio::sync::Mutex;
 
 // ── main ─────────────────────────────────────────────────────────────────────

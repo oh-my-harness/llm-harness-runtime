@@ -14,14 +14,12 @@ use llm_harness_live_tests::{
     EventCapture, LiveProvider, MULTI_TURN, assert_tool_was_called, make_harness_with, with_timeout,
 };
 use llm_harness_loop::convert::DefaultConvertToLlm;
-use llm_harness_runtime::spawn::delivery::SubAgentMessageConverter;
-use llm_harness_runtime::spawn::message_bus::{MAIN_AGENT_ID, MessageBus};
-use llm_harness_runtime::spawn::plugin::SpawnPlugin;
-use llm_harness_runtime::spawn::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
-use llm_harness_runtime::spawn::tools::{
-    AwaitSubagentReplyTool, QuerySubagentTool, SpawnAgentTool,
-};
 use llm_harness_sandbox::OsEnvFactory;
+use llm_harness_subagents::delivery::SubAgentMessageConverter;
+use llm_harness_subagents::message_bus::{MAIN_AGENT_ID, MessageBus};
+use llm_harness_subagents::plugin::SpawnPlugin;
+use llm_harness_subagents::spawner::{HarnessSubAgentSpawner, JsonlSessionFactory};
+use llm_harness_subagents::tools::{AwaitSubagentReplyTool, QuerySubagentTool, SpawnAgentTool};
 
 // ── NoopPlugin for sub-agents (no recursive spawning) ──────────────────────
 

@@ -100,7 +100,7 @@ Strong success criteria let the LLM loop independently. Weak criteria ("make it 
 1. **类型与 trait 定义**：Hook trait、Tool trait、Session/Message 类型、RunContext（`llm-harness-types`）
 2. **Agent loop 引擎**：ReAct 循环、工具调度、streaming、retry+backoff（`llm-harness-loop`）
 3. **高层 agent 抽象**：`HarnessBuilder`、`AgentHarness`、Session 树、compaction、skills、cost tracking（`llm-harness-agent`）
-4. **运行时编排**：WorkflowEngine、sub-agent spawn、task 持久化、规则匹配（`llm-harness-runtime`）
+4. **运行时编排**：sub-agent spawn（`llm-harness-subagents`）、WorkflowEngine、task 持久化、规则匹配（`llm-harness-workflow`）
 5. **平台层 trait**：Sandbox/AuditSink/TraceExporter/PromptSource trait 定义（`llm-harness-platform`）
 6. **策略层**：safety、loop-safety、status panel、event streams、injection filter、memory defense、notify、compaction prompt、budget（`llm-harness-strategy`）
 7. **后端 crate**（各独立可选）：tools（bash/read/write/edit/grep/glob）、mcp、knowledge/knowledge-local、memory、session-recall、sandbox、audit-jsonl、trace-otel
@@ -115,7 +115,8 @@ llm-harness-runtime/          ← 本仓库根
 │   ├── llm-harness-types/              # core type definitions (Hook/Tool trait + 共享类型)
 │   ├── llm-harness-loop/               # agent loop 引擎 (ReAct 循环 + LLM client)
 │   ├── llm-harness-agent/              # AgentHarness, Session, skills, HarnessBuilder
-│   ├── llm-harness-runtime/            # 平台层: workflow engine, spawn, lifecycle, rules
+│   ├── llm-harness-subagents/         # spawn: sub-agent fork, async delivery, main↔sub 通信
+│   ├── llm-harness-workflow/          # workflow engine, lifecycle, rules (依赖 subagents)
 │   ├── llm-harness-platform/           # 横切 trait + adapter (sandbox/audit/prompt/tracer/env)
 │   ├── llm-harness-strategy/           # 策略层: safety, loop-safety, status panel,
 │   │                                   #   memory defense, notify, injection filter,
@@ -140,9 +141,9 @@ llm-harness-runtime/          ← 本仓库根
 依赖方向（A → B 表示 A 依赖 B）：
 
 ```
-# llm-harness-py 已迁移到 Senza 仓库，通过 git 依赖引用本仓库的 crate
-llm-harness-strategy     → llm-harness-runtime, llm-harness-agent
-llm-harness-runtime      → llm-harness-agent, llm-harness-platform
+llm-harness-strategy     → llm-harness-workflow, llm-harness-agent
+llm-harness-workflow      → llm-harness-subagents, llm-harness-agent, llm-harness-platform
+llm-harness-subagents     → llm-harness-agent, llm-harness-platform
 llm-harness-platform     → llm-harness-agent
 llm-harness-agent        → llm-harness-loop
 llm-harness-loop         → llm-harness-types, llm_adapter
@@ -151,8 +152,7 @@ llm-harness-types        → llm_adapter (外部 git 依赖，非内部 crate)
 llm-harness-sandbox      → llm-harness-platform
 llm-harness-audit-jsonl  → llm-harness-platform
 llm-harness-trace-otel   → llm-harness-platform
-llm-harness-mcp          → llm-harness-runtime
-llm-harness-tools        → llm-harness-types
+llm-harness-mcp          → llm-harness-agent
 llm-harness-knowledge-*  → llm-harness-types (knowledge) / llm-harness-agent (memory)
 llm-harness-session-recall → llm-harness-agent, llm-harness-knowledge
 ```
@@ -160,7 +160,7 @@ llm-harness-session-recall → llm-harness-agent, llm-harness-knowledge
 
 **硬性规则：**
 - `llm-harness-types` 不依赖其他内部 crate，保持纯类型/trait 声明。可依赖外部 git crate（如 `llm_adapter`）用于 re-export 共享类型。
-- `llm-harness-platform` 定义横切 trait（Sandbox/AuditSink/TraceExporter/PromptSource 等），不依赖 runtime。
+- `llm-harness-platform` 定义横切 trait（Sandbox/AuditSink/TraceExporter/PromptSource 等），不依赖 subagents/workflow。
 - `llm-harness-sandbox` 不依赖其他后端 crate；其他后端 crate（`-audit-jsonl`/`-trace-otel`/`-mcp`/`-knowledge-*`/`-memory`/`-session-recall`）互不依赖（可单独使用）。
 - `llm-harness-py` 已迁移到 Senza 仓库，通过 git 依赖引用本仓库 crate，不再在本 workspace 内。
 - 依赖方向不允许反转（下层不依赖上层）。

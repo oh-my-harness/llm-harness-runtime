@@ -51,7 +51,7 @@
 | `prompt` | `PromptSource` trait、`PromptSourceTemplate`、`ArgumentDef` | 提示模板源 |
 | `env` | 环境辅助 | 环境抽象辅助 |
 
-> `llm-harness-runtime` 通过 `pub use llm_harness_platform::{audit, prompt, sandbox, tracer, tracing_adapter}` re-export 这些模块。
+> 消费者直接依赖 `llm-harness-platform` 访问这些模块（不再通过 runtime re-export）。
 
 ---
 

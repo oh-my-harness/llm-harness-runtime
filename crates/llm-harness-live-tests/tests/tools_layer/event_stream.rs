@@ -19,13 +19,13 @@ use llm_harness_live_tests::{
     CapturedEvent, EventCapture, LiveProvider, MULTI_TURN, assert_event_emitted,
     assert_tool_was_called, make_harness_with, with_timeout,
 };
-use llm_harness_runtime::lifecycle::event::WaitForExternalEventTool;
-use llm_harness_runtime::lifecycle::task::TaskId;
-use llm_harness_runtime::lifecycle::task_store::JsonlTaskStore;
 use llm_harness_strategy::{
     HeartbeatStream, ShellMonitorConfig, ShellMonitorStream, TimerStream, WebhookStream,
 };
 use llm_harness_types::{EventStream, Tool};
+use llm_harness_workflow::lifecycle::event::WaitForExternalEventTool;
+use llm_harness_workflow::lifecycle::task::TaskId;
+use llm_harness_workflow::lifecycle::task_store::JsonlTaskStore;
 use tokio::sync::Mutex;
 
 // ── Tests ───────────────────────────────────────────────────────────────
