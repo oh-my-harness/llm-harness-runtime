@@ -1,7 +1,7 @@
-# llm-harness-runtime 框架文档
+# 编排层框架文档（subagents + workflow）
 
 > 定位：在 `types` / `loop` / `agent` / `platform` 之上的**编排层**。
-> 不含具体后端实现（sandbox/audit/trace/mcp 各有独立 crate），只定义 workflow 编排、sub-agent 派发、规则匹配 + 通过 `llm-harness-platform` re-export 横切 trait。
+> 不含具体后端实现（sandbox/audit/trace/mcp 各有独立 crate），只定义 sub-agent 派发（`llm-harness-subagents`）、workflow 编排 + task 持久化 + 规则匹配（`llm-harness-workflow`）。横切 trait 直接由 `llm-harness-platform` 提供。
 
 ## 1. 在 workspace 中的位置
 

@@ -21,11 +21,11 @@ use llm_harness_agent::HarnessHooks;
 use llm_harness_live_tests::{
     EventCapture, LiveProvider, SINGLE_TURN, make_harness_with, with_timeout,
 };
-use llm_harness_runtime::rules::{
-    Contains, Decision, RateLimit, Rule, RuleBasedApprovalHook, RuleChain,
-};
 use llm_harness_types::{
     BeforeToolCallHook, DataBlock, Tool, ToolContext, ToolFailure, ToolResult,
+};
+use llm_harness_workflow::rules::{
+    Contains, Decision, RateLimit, Rule, RuleBasedApprovalHook, RuleChain,
 };
 
 // ── Echo tool ────────────────────────────────────────────────────────────────

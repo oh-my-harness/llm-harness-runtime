@@ -17,12 +17,12 @@ use std::sync::LazyLock;
 
 use futures::future::BoxFuture;
 use llm_harness_live_tests::{LiveProvider, MULTI_TURN, with_timeout};
-use llm_harness_runtime::spawn::spawner::JsonlSessionFactory;
-use llm_harness_runtime::workflow::engine::{WorkflowEngine, WorkflowEngineConfig, WorkflowEvent};
-use llm_harness_runtime::workflow::judge::EdgeConditionJudge;
-use llm_harness_runtime::workflow::model::{Edge, Step, Workflow};
 use llm_harness_sandbox::OsEnvFactory;
+use llm_harness_subagents::spawner::JsonlSessionFactory;
 use llm_harness_types::{DataBlock, Tool, ToolContext, ToolFailure, ToolResult};
+use llm_harness_workflow::workflow::engine::{WorkflowEngine, WorkflowEngineConfig, WorkflowEvent};
+use llm_harness_workflow::workflow::judge::EdgeConditionJudge;
+use llm_harness_workflow::workflow::model::{Edge, Step, Workflow};
 
 // ── Echo tool (for Part 3) ──────────────────────────────────────────────────
 

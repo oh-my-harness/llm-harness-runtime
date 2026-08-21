@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use llm_harness_live_tests::{
     EventCapture, LiveProvider, SINGLE_TURN, make_harness_with, with_timeout,
 };
-use llm_harness_runtime::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
+use llm_harness_platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_sandbox::OsEnvSandbox;
 use llm_harness_types::{ExecutionEnv, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;

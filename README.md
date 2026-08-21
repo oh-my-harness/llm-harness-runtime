@@ -21,7 +21,7 @@ graph TD
     end
 
     subgraph "编排层"
-        RT[llm-harness-runtime<br/>workflow / spawn / lifecycle / rules]
+        RT[llm-harness-subagents + llm-harness-workflow<br/>spawn / workflow / lifecycle / rules]
     end
 
     subgraph "Agent 层"
@@ -78,7 +78,8 @@ graph TD
 | `llm-harness-types` | 核心 trait 与类型（Tool/Hook/Message/RunContext） | [crate-reference.md](docs/crate-reference.md) |
 | `llm-harness-loop` | Agent loop 引擎：ReAct 循环、streaming、retry+backoff | crate 内 lib.rs |
 | `llm-harness-agent` | HarnessBuilder、AgentHarness、Session、Compaction、Skills | crate 内 lib.rs |
-| `llm-harness-runtime` | Workflow 引擎、sub-agent spawn、task 持久化、规则匹配 | [runtime-framework.md](docs/runtime-framework.md) · [ORCHESTRATION.md](docs/ORCHESTRATION.md) |
+| `llm-harness-subagents` | Sub-agent spawn、async delivery、main↔sub 通信 | [runtime-framework.md](docs/runtime-framework.md) · [ORCHESTRATION.md](docs/ORCHESTRATION.md) |
+| `llm-harness-workflow` | Workflow 引擎、task 持久化、规则匹配 | [runtime-framework.md](docs/runtime-framework.md) · [ORCHESTRATION.md](docs/ORCHESTRATION.md) |
 | `llm-harness-platform` | 横切 trait（Sandbox/AuditSink/TraceExporter/PromptSource） | [crate-reference.md](docs/crate-reference.md) |
 | `llm-harness-strategy` | 策略层：safety、loop-safety、status-panel、event-stream、injection-filter、memory-defense、notify、budget | **[strategy-guide.md](docs/strategy-guide.md)** |
 | `llm-harness-tools` | 内置工具：bash、read、write、edit、grep、glob | **[tools-guide.md](docs/tools-guide.md)** |
@@ -201,8 +202,7 @@ Linux（bubblewrap）、macOS（seatbelt）、跨平台（OS 原生 + 路径限�
 
 Downstream Rust 项目通过 git rev 消费 workspace crates：
 
-```toml
-llm-harness-runtime = { git = "https://github.com/oh-my-harness/llm-harness-runtime", rev = "<commit-sha>" }
+llm-harness-workflow = { git = "https://github.com/oh-my-harness/llm-harness-runtime", rev = "<commit-sha>" }
 ```
 
 ---

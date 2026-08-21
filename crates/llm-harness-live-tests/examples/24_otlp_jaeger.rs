@@ -8,7 +8,7 @@
 //!   source .env
 //!   cargo run -p llm-harness-live-tests --example 24_otlp_jaeger
 //!
-use llm_harness_runtime::tracer::{CaptureLevel, SpanCaptureConfig, SpanStatus, TraceExporter};
+use llm_harness_platform::tracer::{CaptureLevel, SpanCaptureConfig, SpanStatus, TraceExporter};
 
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ use llm_harness_agent::HarnessHooks;
 use llm_harness_live_tests::{
     EventCapture, LiveProvider, SINGLE_TURN, make_harness_with, with_timeout,
 };
-use llm_harness_runtime::tracing_adapter::TracingHookAdapter;
+use llm_harness_platform::tracing_adapter::TracingHookAdapter;
 use llm_harness_trace_otel::{OtlpConfig, OtlpTraceExporter};
 use llm_harness_types::{
     AfterProviderResponseHook, AfterToolCallHook, AfterTurnHook, BeforeProviderRequestHook,

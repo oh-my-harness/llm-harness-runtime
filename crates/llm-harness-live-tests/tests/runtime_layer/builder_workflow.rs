@@ -15,12 +15,12 @@ use llm_harness_live_tests::{
     assert_tool_was_called, make_harness_with, with_timeout,
 };
 
-use llm_harness_runtime::spawn::spawner::JsonlSessionFactory;
-use llm_harness_runtime::workflow::engine::{WorkflowEngine, WorkflowEngineConfig};
-use llm_harness_runtime::workflow::judge::EdgeConditionJudge;
-use llm_harness_runtime::workflow::model::{Edge, EdgeCondition, Step, Workflow};
 use llm_harness_sandbox::OsEnvFactory;
+use llm_harness_subagents::spawner::JsonlSessionFactory;
 use llm_harness_types::{DataBlock, Tool, ToolContext, ToolFailure, ToolResult};
+use llm_harness_workflow::workflow::engine::{WorkflowEngine, WorkflowEngineConfig};
+use llm_harness_workflow::workflow::judge::EdgeConditionJudge;
+use llm_harness_workflow::workflow::model::{Edge, EdgeCondition, Step, Workflow};
 
 // ── Echo tool (for plugin_registers_tools) ────────────────────────────────
 
@@ -207,7 +207,7 @@ async fn linear_workflow_completes() {
 
     assert_eq!(
         engine.state().await,
-        llm_harness_runtime::workflow::model::WorkflowStatus::Succeeded
+        llm_harness_workflow::workflow::model::WorkflowStatus::Succeeded
     );
 
     let history = engine.step_history().await;
@@ -275,7 +275,7 @@ async fn conditional_routing_directs_correctly() {
 
     assert_eq!(
         engine.state().await,
-        llm_harness_runtime::workflow::model::WorkflowStatus::Succeeded,
+        llm_harness_workflow::workflow::model::WorkflowStatus::Succeeded,
         "workflow should reach Succeeded"
     );
 

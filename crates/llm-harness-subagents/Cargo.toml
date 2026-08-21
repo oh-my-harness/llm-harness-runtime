@@ -1,0 +1,28 @@
+[package]
+name    = "llm-harness-subagents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+llm-harness-agent.workspace  = true
+llm-harness-loop.workspace = true
+llm-harness-types.workspace = true
+llm-harness-platform.workspace = true
+chrono.workspace             = true
+futures.workspace           = true
+serde.workspace             = true
+serde_json.workspace        = true
+parking_lot.workspace     = true
+tokio = { workspace = true, features = ["time", "fs"] }
+tokio-util.workspace        = true
+uuid.workspace              = true
+tracing.workspace              = true
+
+[dev-dependencies]
+llm-harness-loop = { workspace = true, features = ["test-utils"] }
+llm-harness-sandbox.workspace  = true
+tokio     = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tokio-util = { workspace = true }
+async-trait.workspace = true
+tempfile  = "3"
