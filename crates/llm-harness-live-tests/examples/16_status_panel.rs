@@ -8,6 +8,9 @@
 //!   the tool was called and the store reflects the changes.
 //! - Part 3: Run a conversation with multiple `echo` tool calls. Show the
 //!   ToolCallCounter tracks per-tool call counts.
+//! - Part 4: Prompt the LLM to use `todo_write` with `add` (append a single
+//!   item) then `clear` (remove all items). Show the new actions work
+//!   end-to-end.
 //!
 //! The `StatusPanelPlugin` registers three things in one `install` call:
 //!   1. `todo_write` tool — writes to a shared `TodoStore`
@@ -83,19 +86,20 @@ async fn main() {
         .as_ref()
         .or(provider.anthropic.as_ref())
         .expect("set OPENAI_API_KEY or ANTHROPIC_API_KEY to run this example");
-
     println!("Provider: {} | Model: {}\n", entry.name, entry.model);
-
     part1_todo_create(entry).await;
     println!();
     part2_todo_update(entry).await;
     println!();
     part3_tool_counter(entry).await;
+    println!();
+    part4_add_and_clear(entry).await;
 
     println!("\n--- Summary ---");
     println!("Part 1: todo_write creates todos in the shared store ✅");
     println!("Part 2: todo_write updates todo statuses ✅");
     println!("Part 3: ToolCallCounter tracks per-tool call counts ✅");
+    println!("Part 4: todo_write 'add' appends, 'clear' empties ✅");
 }
 
 // ── Part 1: Install plugin + create todos ────────────────────────────────────
@@ -198,6 +202,77 @@ async fn part2_todo_update(entry: &llm_harness_live_tests::LiveProviderEntry) {
     println!("  item 1 status:         {:?}", item1.map(|t| t.status));
     println!("  item 2 status:         {:?}", item2.map(|t| t.status));
     let _ = TodoStatus::Pending; // suppress unused import warning if LLM didn't call tool
+}
+
+// ── Part 4: add / clear actions ──────────────────────────────────────────────
+
+async fn part4_add_and_clear(entry: &llm_harness_live_tests::LiveProviderEntry) {
+    println!("--- Part 4: todo_write (add / clear) ---\n");
+
+    let plugin = StatusPanelPlugin::new(StatusPanelConfig::default());
+    let todo_store = plugin.todo_store().clone();
+
+    let (harness, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
+
+    // Start with one seeded item so we can see `add` append to it.
+    use llm_harness_strategy::status_panel::TodoItem;
+    todo_store.rewrite(vec![TodoItem::new("1", "seeded task")]);
+    println!("Seeded TodoStore ({} item):", todo_store.snapshot().len());
+    for t in &todo_store.snapshot() {
+        println!("  [{}] {} — {}", t.id, t.content, t.status);
+    }
+
+    // --- add ---
+    let cap = EventCapture::subscribe(&harness);
+    let prompt = "Call the todo_write tool with exactly these arguments: \
+                  {\"action\": \"add\", \"id\": \"2\", \"content\": \"added by LLM\", \"status\": \"pending\"}. \
+                  This appends a new item to the existing list.";
+    println!("\nLLM prompt: {}", prompt);
+    with_timeout(SINGLE_TURN, harness.prompt(prompt))
+        .await
+        .expect("prompt failed");
+    cap.settle().await;
+
+    let tools_called = cap.tool_calls();
+    let todos = todo_store.snapshot();
+
+    println!("\nTools called: {:?}", tools_called);
+    println!("TodoStore after 'add' ({} items):", todos.len());
+    for t in &todos {
+        println!("  [{}] {} — {}", t.id, t.content, t.status);
+    }
+
+    let add_called = tools_called.iter().any(|t| t == "todo_write");
+    let has_added = todos
+        .iter()
+        .any(|t| t.id == "2" && t.content == "added by LLM");
+    let has_seeded = todos.iter().any(|t| t.id == "1");
+    println!("\nObservation (add):");
+    println!("  todo_write called:    {}", add_called);
+    println!("  seeded item present:  {}", has_seeded);
+    println!("  added item present:   {}", has_added);
+
+    // --- clear ---
+    let cap = EventCapture::subscribe(&harness);
+    let prompt = "Call the todo_write tool with exactly these arguments: \
+                  {\"action\": \"clear\"}. This removes all items from the todo list.";
+    println!("\nLLM prompt: {}", prompt);
+    with_timeout(SINGLE_TURN, harness.prompt(prompt))
+        .await
+        .expect("prompt failed");
+    cap.settle().await;
+
+    let tools_called = cap.tool_calls();
+    let todos = todo_store.snapshot();
+
+    println!("\nTools called: {:?}", tools_called);
+    println!("TodoStore after 'clear' ({} items):", todos.len());
+
+    let clear_called = tools_called.iter().any(|t| t == "todo_write");
+    let is_empty = todos.is_empty();
+    println!("\nObservation (clear):");
+    println!("  todo_write called:  {}", clear_called);
+    println!("  store is empty:     {}", is_empty);
 }
 
 // ── Part 3: Tool call counter ────────────────────────────────────────────────
