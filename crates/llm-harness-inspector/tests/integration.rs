@@ -11,10 +11,17 @@ async fn make_test_harness() -> Arc<AgentHarness> {
     Arc::new(AgentHarness::new_in_memory(client, env, opts).await)
 }
 
+fn make_state(harness: Arc<AgentHarness>) -> llm_harness_inspector::state::InspectorState {
+    llm_harness_inspector::state::InspectorState {
+        harness,
+        token: llm_harness_inspector::state::AuthToken::new("test-token".into()),
+    }
+}
+
 #[tokio::test]
 async fn config_endpoint_returns_model() {
     let harness = make_test_harness().await;
-    let state = llm_harness_inspector::state::InspectorState { harness };
+    let state = make_state(harness);
     let json = llm_harness_inspector::routes::config::get_config(axum::extract::State(state))
         .await
         .0;
@@ -25,7 +32,7 @@ async fn config_endpoint_returns_model() {
 #[tokio::test]
 async fn session_endpoint_returns_metadata() {
     let harness = make_test_harness().await;
-    let state = llm_harness_inspector::state::InspectorState { harness };
+    let state = make_state(harness);
     let json = llm_harness_inspector::routes::config::get_session(axum::extract::State(state))
         .await
         .0;
@@ -84,4 +91,20 @@ fn ws_message_snapshot_has_correct_type() {
     let json = serde_json::to_value(&msg).unwrap();
     assert!(json["data"]["state"].is_object());
     assert!(json["data"]["usage"].is_object());
+}
+
+#[test]
+fn auth_token_matches_correct() {
+    let token = llm_harness_inspector::state::AuthToken::new("secret123".into());
+    assert!(token.matches("secret123"));
+    assert!(!token.matches("wrong"));
+    assert!(!token.matches(""));
+}
+
+#[test]
+fn auth_token_generate_is_unique() {
+    let t1 = llm_harness_inspector::state::AuthToken::generate();
+    let t2 = llm_harness_inspector::state::AuthToken::generate();
+    assert!(!t1.as_str().is_empty());
+    assert_ne!(t1.as_str(), t2.as_str());
 }

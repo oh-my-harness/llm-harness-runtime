@@ -1,6 +1,6 @@
 //! axum server lifecycle and public Inspector API.
 
-use crate::state::InspectorState;
+use crate::state::{AuthToken, InspectorState};
 use llm_harness_agent::AgentHarness;
 use std::sync::Arc;
 
@@ -58,8 +58,11 @@ impl InspectorBuilder {
     }
 
     pub async fn mount(self) -> Result<Inspector, InspectorError> {
+        let token = AuthToken::generate();
+        let token_str = token.as_str().to_string();
         let state = InspectorState {
             harness: self.harness,
+            token,
         };
         let app = crate::routes::build_router(state);
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", self.port))
@@ -75,6 +78,11 @@ impl InspectorBuilder {
                 .await
                 .ok();
         });
+        tracing::info!(
+            "Agent Inspector listening on http://127.0.0.1:{}  (ws token: {})",
+            self.port,
+            token_str,
+        );
         Ok(Inspector {
             shutdown: Some(shutdown_tx),
             handle: Some(handle),

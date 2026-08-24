@@ -116,12 +116,23 @@
   /* ── Event stream ── */
   #stream-container {
     flex: 1;
-    overflow-y: auto;
-    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
   #stream {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
     max-width: 900px;
     margin: 0 auto;
+    width: 100%;
+  }
+  #control-bar {
+    flex-shrink: 0;
+    padding: 8px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--bg);
   }
   .msg {
     margin-bottom: 12px;
@@ -189,6 +200,44 @@
   }
   .tool-card .tool-result.error { color: #f0a0a0; }
   .tool-card .tool-result.ok { color: var(--green); }
+  /* ── Control bar ── */
+  #control-bar {
+    border-top: 1px solid var(--border);
+    padding: 10px 16px;
+    background: var(--bg-panel);
+    flex-shrink: 0;
+  }
+  .control-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .control-row:last-child { margin-bottom: 0; }
+  .control-row input {
+    flex: 1;
+    background: var(--bg-input);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 14px;
+    outline: none;
+  }
+  .control-row input:focus { border-color: var(--accent); }
+  .btn {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-accent { background: var(--accent); color: #fff; }
+  .btn-danger { background: var(--red); color: #fff; }
+  .btn-success { background: var(--green); color: #000; }
+
   /* ── Scrollbar ── */
   ::-webkit-scrollbar { width: 8px; }
   ::-webkit-scrollbar-track { background: var(--bg); }
@@ -216,8 +265,19 @@
     </aside>
     <div id="stream-container">
       <div id="stream"></div>
+      <div id="control-bar">
+        <div class="control-row">
+          <input type="text" id="inject-input" placeholder="Inject message to running agent…" autocomplete="off">
+          <button id="inject-btn" class="btn btn-accent">Send</button>
+          <button id="abort-btn" class="btn btn-danger">Abort</button>
+        </div>
+        <div class="control-row">
+          <input type="text" id="prompt-input" placeholder="Start new task (idle only)…" autocomplete="off">
+          <button id="prompt-btn" class="btn btn-success">Start</button>
+        </div>
+      </div>
     </div>
-  </div>
+</div>
 </div>
 <script>
 (function() {
@@ -614,6 +674,50 @@
         $("config-panel").innerHTML = '<span class="value" style="color:var(--text-dim)">Failed to load config</span>';
       });
   }
+
+  // ── Control bar: inject / abort / prompt ──
+  function postJSON(url, body) {
+    return fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(function(r) { return r.json(); });
+  }
+
+  $("inject-btn").addEventListener("click", function() {
+    var text = $("inject-input").value.trim();
+    if (!text) return;
+    $("inject-input").value = "";
+    postJSON("/api/inject", { text: text }).then(function(res) {
+      if (res.ok) appendSystem("Injected: " + text);
+      else appendError("Inject failed: " + (res.error || "unknown"));
+    }).catch(function(e) { appendError("Inject error: " + e); });
+  });
+
+  $("inject-input").addEventListener("keydown", function(e) {
+    if (e.key === "Enter") $("inject-btn").click();
+  });
+
+  $("abort-btn").addEventListener("click", function() {
+    postJSON("/api/abort", {}).then(function(res) {
+      if (res.ok) appendSystem("Abort sent");
+      else appendError("Abort failed: " + (res.error || "unknown"));
+    }).catch(function(e) { appendError("Abort error: " + e); });
+  });
+
+  $("prompt-btn").addEventListener("click", function() {
+    var text = $("prompt-input").value.trim();
+    if (!text) return;
+    $("prompt-input").value = "";
+    postJSON("/api/prompt", { text: text }).then(function(res) {
+      if (res.ok) appendSystem("Task started: " + text);
+      else appendError("Prompt failed: " + (res.error || "unknown"));
+    }).catch(function(e) { appendError("Prompt error: " + e); });
+  });
+
+  $("prompt-input").addEventListener("keydown", function(e) {
+    if (e.key === "Enter") $("prompt-btn").click();
+  });
 
   // ── Init ──
   fetchConfig();

@@ -16,8 +16,14 @@ parking_lot.workspace       = true
 glob.workspace              = true
 regex.workspace             = true
 tokio-util.workspace        = true
+reqwest.workspace           = true
+encoding_rs.workspace       = true
+anyhow.workspace            = true
+tracing.workspace              = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 uuid.workspace              = true
 chrono.workspace            = true
+tempfile.workspace          = true
+llm-harness-sandbox.workspace = true
