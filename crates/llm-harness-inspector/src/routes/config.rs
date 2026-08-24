@@ -30,10 +30,13 @@ pub async fn get_config(State(state): State<InspectorState>) -> Json<serde_json:
 }
 
 pub async fn get_session(State(state): State<InspectorState>) -> Json<serde_json::Value> {
+    let mut errors: Vec<String> = Vec::new();
+
     let metadata = match state.harness.session_metadata().await {
         Ok(m) => Some(m),
         Err(e) => {
             tracing::warn!("inspector: session_metadata failed: {e}");
+            errors.push(format!("session_metadata: {e}"));
             None
         }
     };
@@ -41,6 +44,7 @@ pub async fn get_session(State(state): State<InspectorState>) -> Json<serde_json
         Ok(b) => b,
         Err(e) => {
             tracing::warn!("inspector: list_branches failed: {e}");
+            errors.push(format!("list_branches: {e}"));
             Vec::new()
         }
     };
@@ -48,6 +52,7 @@ pub async fn get_session(State(state): State<InspectorState>) -> Json<serde_json
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("inspector: read_active_path failed: {e}");
+            errors.push(format!("read_active_path: {e}"));
             Vec::new()
         }
     };
@@ -68,5 +73,6 @@ pub async fn get_session(State(state): State<InspectorState>) -> Json<serde_json
         "metadata": metadata,
         "branches": branches_json,
         "active_path": active_path,
+        "_errors": errors,
     }))
 }

@@ -6,6 +6,7 @@
 //! hashline anchors (4-hex content tags) to detect stale edits.
 
 pub mod bash;
+pub mod code_exec;
 pub mod edit;
 pub(crate) mod file_walk;
 pub mod glob;
@@ -14,15 +15,21 @@ pub mod read;
 pub mod snapshot;
 #[cfg(test)]
 pub mod test_env;
+pub(crate) mod text_decode;
 pub mod truncation;
+pub mod web_fetch;
+pub mod web_search;
 pub mod write;
 
 pub use bash::BashTool;
+pub use code_exec::CodeExecTool;
 pub use edit::{EditOperation, EditTool};
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use snapshot::FileSnapshotStore;
+pub use web_fetch::WebFetchTool;
+pub use web_search::{WebSearchConfig, WebSearchTool};
 pub use write::WriteTool;
 
 use std::path::{Path, PathBuf};
@@ -70,6 +77,34 @@ impl Plugin for FsToolsPlugin {
     }
 }
 
+/// Plugin that registers `web_search` and `web_fetch` tools with a shared
+/// `WebSearchConfig`.
+pub struct WebToolsPlugin {
+    config: WebSearchConfig,
+}
+
+impl WebToolsPlugin {
+    pub fn new(config: WebSearchConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl Default for WebToolsPlugin {
+    fn default() -> Self {
+        Self::new(WebSearchConfig::default())
+    }
+}
+
+impl Plugin for WebToolsPlugin {
+    fn name(&self) -> &str {
+        "web-tools"
+    }
+
+    fn register_tools(&self, tools: &mut Vec<Arc<dyn Tool>>) {
+        tools.push(Arc::new(WebSearchTool::with_config(self.config.clone())));
+        tools.push(Arc::new(WebFetchTool::with_config(self.config.clone())));
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +129,22 @@ mod tests {
     fn plugin_name() {
         let plugin = FsToolsPlugin::new(None);
         assert_eq!(plugin.name(), "fs-tools");
+    }
+
+    #[test]
+    fn web_tools_plugin_registers_two_tools() {
+        let plugin = WebToolsPlugin::default();
+        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        plugin.register_tools(&mut tools);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"web_search"));
+        assert!(names.contains(&"web_fetch"));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn web_tools_plugin_name() {
+        let plugin = WebToolsPlugin::default();
+        assert_eq!(plugin.name(), "web-tools");
     }
 }
