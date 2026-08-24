@@ -27,7 +27,7 @@ async fn manual_compact_reduces_tokens() {
         }
     };
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.model_info(Some(ModelInfo {
             context_window: 500,
             max_tokens: 1024,
@@ -102,7 +102,7 @@ async fn auto_compact_triggers_on_threshold() {
     // the usable window, causing NoValidBoundary on every turn).
     // max_tokens=256: short responses so compaction triggers within 5 turns
     // while leaving enough context for a valid cut point.
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.model_info(Some(ModelInfo {
             context_window: 1200,
             max_tokens: 256,
@@ -166,7 +166,7 @@ async fn compaction_preserves_recall() {
         }
     };
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.model_info(Some(ModelInfo {
             context_window: 500,
             max_tokens: 1024,
@@ -238,7 +238,7 @@ async fn circuit_breaker_api_works() {
     };
 
     // No auto_compact — we want manual compact to have something to compress.
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.model_info(Some(ModelInfo {
             context_window: 500,
             max_tokens: 1024,

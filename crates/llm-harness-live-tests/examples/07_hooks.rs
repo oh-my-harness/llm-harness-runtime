@@ -277,7 +277,7 @@ async fn main() {
 
     let counters = Arc::new(HookCounters::default());
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&HooksPlugin {
             counters: counters.clone(),
         })

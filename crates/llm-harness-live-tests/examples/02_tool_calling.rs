@@ -142,7 +142,7 @@ async fn main() {
 
     println!("Provider: {} | Model: {}", entry.name, entry.model);
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.tool(Arc::new(WeatherTool::new()))
             .tool(Arc::new(TimeTool::new()))
             .system_prompt(Some(

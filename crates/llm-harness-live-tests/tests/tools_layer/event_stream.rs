@@ -42,7 +42,7 @@ async fn timer_stream_fires() {
     let entry = entry.unwrap();
 
     let task_dir = tempfile::tempdir().unwrap();
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         let fire_at = chrono::Utc::now() + chrono::Duration::seconds(2);
         let stream: Box<dyn EventStream> = Box::new(TimerStream::once(fire_at, "test-timer"));
         let stream_arc = Arc::new(Mutex::new(stream));
@@ -87,7 +87,7 @@ async fn webhook_stream_receives_payload() {
     let entry = entry.unwrap();
 
     let task_dir = tempfile::tempdir().unwrap();
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         let (channel, stream) = WebhookStream::new(16);
         let stream_arc = Arc::new(Mutex::new(stream));
         let task_store = Arc::new(JsonlTaskStore::new(task_dir.path().join("tasks")));
@@ -137,7 +137,7 @@ async fn heartbeat_stream_times_out() {
     let entry = entry.unwrap();
 
     let task_dir = tempfile::tempdir().unwrap();
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         let (_handle, stream) = HeartbeatStream::new(Duration::from_secs(1), "test-heartbeat");
         let stream_arc = Arc::new(Mutex::new(stream));
         let task_store = Arc::new(JsonlTaskStore::new(task_dir.path().join("tasks")));
@@ -180,7 +180,7 @@ async fn shell_monitor_stream_captures_output() {
     let entry = entry.unwrap();
 
     let task_dir = tempfile::tempdir().unwrap();
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         let (_handle, stream) = ShellMonitorStream::new(
             "echo hello-from-shell",
             None,

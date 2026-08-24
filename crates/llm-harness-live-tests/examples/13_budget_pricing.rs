@@ -149,7 +149,7 @@ async fn main() {
     let ledger = UsageLedger::default();
     let pricing: Arc<dyn PricingProvider> = Arc::new(FixedPricing);
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.usage_ledger(ledger.clone()).pricing(pricing.clone())
     })
     .await;

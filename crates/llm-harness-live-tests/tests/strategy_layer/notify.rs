@@ -54,7 +54,8 @@ async fn notify_user_tool_called() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| b.install(&NotifyPlugin::new())).await;
+    let (harness, _inspector, _tmp) =
+        make_harness_with(entry, |b| b.install(&NotifyPlugin::new())).await;
     let cap = EventCapture::subscribe(&harness);
 
     let (channel, _messages) = RecordingChannel::new();
@@ -82,7 +83,8 @@ async fn channel_receives_message() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| b.install(&NotifyPlugin::new())).await;
+    let (harness, _inspector, _tmp) =
+        make_harness_with(entry, |b| b.install(&NotifyPlugin::new())).await;
     let cap = EventCapture::subscribe(&harness);
 
     let (channel, messages) = RecordingChannel::new();

@@ -32,7 +32,7 @@ async fn main() {
     println!("--- Part 1: Manual compaction (10 turns) ---\n");
 
     // Use very small reserve/keep-recent to force compaction with few messages
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         use llm_harness_agent::ModelInfo;
         b.model_info(Some(ModelInfo {
             context_window: 500,
@@ -115,7 +115,7 @@ async fn main() {
     // ── Part 2: Auto-compact (10+ turns) ────────────────────────────────────
     println!("--- Part 2: Auto-compact (up to 10 turns) ---\n");
 
-    let (harness2, _tmp2) = make_harness_with(entry, |b| {
+    let (harness2, _inspector, _tmp2) = make_harness_with(entry, |b| {
         use llm_harness_agent::ModelInfo;
         b.model_info(Some(ModelInfo {
             context_window: 800,

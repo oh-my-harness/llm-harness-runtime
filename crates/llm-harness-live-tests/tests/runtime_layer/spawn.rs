@@ -68,7 +68,7 @@ async fn make_spawn_harness(
     // 5. Build the main agent harness with spawn tools + plugin + converter.
     let spawner_clone = spawner.clone();
     let bus_clone = bus.clone();
-    let (harness, sandbox_tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, sandbox_tmp) = make_harness_with(entry, |b| {
         b.tool(Arc::new(SpawnAgentTool::new(spawner_clone.clone())))
             .tool(Arc::new(AwaitSubagentReplyTool::new(
                 bus_clone.clone(),
@@ -88,8 +88,6 @@ async fn make_spawn_harness(
             ))
     })
     .await;
-
-    let harness = Arc::new(harness);
 
     // 6. Wire harness weak ref into plugin (after build, since it needs &harness).
     spawn_plugin.set_harness_weak(Arc::downgrade(&harness));

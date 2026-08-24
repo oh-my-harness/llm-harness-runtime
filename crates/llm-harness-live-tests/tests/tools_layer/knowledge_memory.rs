@@ -135,7 +135,7 @@ async fn knowledge_search_returns_results() {
     let source = Arc::new(make_doc_source(&doc_dir, access_control.clone()).await);
     let plugin = make_knowledge_plugin(source, access_control);
 
-    let (harness, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
     let cap = EventCapture::subscribe(&harness);
 
     let request = RunRequest::from_text(
@@ -168,7 +168,7 @@ async fn knowledge_read_returns_content() {
     let source = Arc::new(make_doc_source(&doc_dir, access_control.clone()).await);
     let plugin = make_knowledge_plugin(source, access_control);
 
-    let (harness, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
     let cap = EventCapture::subscribe(&harness);
 
     let request = RunRequest::from_text(
@@ -304,7 +304,7 @@ async fn memory_write_saves_and_read_back() {
     );
     let plugin = MemoryPlugin::new(service);
 
-    let (harness, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
     let cap = EventCapture::subscribe(&harness);
 
     let request = RunRequest::from_text(

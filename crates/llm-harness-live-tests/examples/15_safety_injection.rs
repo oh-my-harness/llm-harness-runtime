@@ -237,7 +237,7 @@ async fn part1_command_blacklist(entry: &llm_harness_live_tests::LiveProviderEnt
     // LLM turn: prompt the model to call bash with a safe command.
     // SafetyDefaultsPlugin is installed; the safe call should succeed.
     let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(BashTool) as Arc<dyn Tool>];
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         let b = b.install(&SafetyDefaultsPlugin::new());
         let b = tools.into_iter().fold(b, |b, t| b.tool(t));
         b.system_prompt(Some(
@@ -289,7 +289,7 @@ async fn part2_path_traversal(entry: &llm_harness_live_tests::LiveProviderEntry)
 
     // LLM turn: prompt the model to call read with a safe relative path.
     let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(ReadFileTool) as Arc<dyn Tool>];
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         let b = b.install(&SafetyDefaultsPlugin::new());
         let b = tools.into_iter().fold(b, |b, t| b.tool(t));
         b.system_prompt(Some(
@@ -344,7 +344,7 @@ async fn part3_injection_filter(entry: &llm_harness_live_tests::LiveProviderEntr
     // LLM turn: the fetch_notes tool returns text containing an injection
     // phrase. InjectionFilterPlugin sanitizes it before the LLM sees it.
     let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(InjectionEchoTool) as Arc<dyn Tool>];
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         let b = b.install(&InjectionFilterPlugin::default());
         let b = tools.into_iter().fold(b, |b, t| b.tool(t));
         b.system_prompt(Some(
@@ -389,7 +389,7 @@ async fn part4_combined(entry: &llm_harness_live_tests::LiveProviderEntry) {
         Arc::new(BashTool) as Arc<dyn Tool>,
         Arc::new(InjectionEchoTool) as Arc<dyn Tool>,
     ];
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         let b = b.install(&SafetyDefaultsPlugin::new());
         let b = b.install(&InjectionFilterPlugin::default());
         let b = tools.into_iter().fold(b, |b, t| b.tool(t));

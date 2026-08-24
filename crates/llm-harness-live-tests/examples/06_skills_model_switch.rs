@@ -113,7 +113,8 @@ async fn main() {
     println!("--- Part 1: Skill registration + skill_read (10 turns) ---\n");
 
     // Build harness with echo tool, then load skills from temp dir
-    let (harness, env, tmp) = make_harness_with_env(entry, |b| b.install(&EchoTool)).await;
+    let (harness, env, _inspector, tmp) =
+        make_harness_with_env(entry, |b| b.install(&EchoTool)).await;
 
     // Create skill directories
     let skills_dir = tmp.path().join("skills");

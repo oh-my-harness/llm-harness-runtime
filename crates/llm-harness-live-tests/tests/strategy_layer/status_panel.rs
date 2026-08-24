@@ -23,7 +23,7 @@ async fn status_bar_xml_appears() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&StatusPanelPlugin::new(StatusPanelConfig::default()))
     })
     .await;
@@ -50,7 +50,7 @@ async fn todo_write_updates_status() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&StatusPanelPlugin::new(StatusPanelConfig::default()))
     })
     .await;
@@ -89,7 +89,7 @@ async fn todo_write_add_appends_item() {
     let plugin = StatusPanelPlugin::new(StatusPanelConfig::default());
     let todo_store = plugin.todo_store().clone();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
 
     // Start empty — the LLM must create an item via `add`.
     assert!(todo_store.snapshot().is_empty());
@@ -131,7 +131,7 @@ async fn todo_write_clear_empties_list() {
     let plugin = StatusPanelPlugin::new(StatusPanelConfig::default());
     let todo_store = plugin.todo_store().clone();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
 
     // Seed items so we can verify `clear` actually empties the list.
     use llm_harness_strategy::status_panel::TodoItem;

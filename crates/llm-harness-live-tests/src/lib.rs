@@ -129,22 +129,53 @@ mod inner {
         (tmp, sandbox)
     }
 
+    /// Holds the Inspector server alive for the lifetime of the harness.
+    /// When dropped, the Inspector server shuts down.
+    pub struct InspectorHandle(Option<llm_harness_inspector::Inspector>);
+
+    impl Drop for InspectorHandle {
+        fn drop(&mut self) {
+            drop(self.0.take());
+        }
+    }
+
+    async fn maybe_mount_inspector(harness: AgentHarness) -> (Arc<AgentHarness>, InspectorHandle) {
+        let harness = Arc::new(harness);
+        let inspector = match llm_harness_inspector::Inspector::from_env(harness.clone()) {
+            Some(builder) => match builder.mount().await {
+                Ok(inspector) => {
+                    println!(
+                        "🔧 Inspector running at http://127.0.0.1:{}",
+                        inspector.bound_addr().map(|a| a.port()).unwrap_or(8080)
+                    );
+                    Some(inspector)
+                }
+                Err(e) => {
+                    eprintln!("⚠️  Inspector mount failed: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+        (harness, InspectorHandle(inspector))
+    }
+
     /// Build an `AgentHarness` with a real provider, tempdir sandbox, and InMemorySessionRepo.
     ///
     /// The returned `TempDir` must be held alive for the duration of the harness usage.
-    pub async fn make_harness(entry: &LiveProviderEntry) -> (AgentHarness, tempfile::TempDir) {
+    pub async fn make_harness(
+        entry: &LiveProviderEntry,
+    ) -> (Arc<AgentHarness>, InspectorHandle, tempfile::TempDir) {
         make_harness_with(entry, |b| b).await
     }
 
     /// Build an `AgentHarness` with a customization callback for injecting
     /// tools, hooks, plugins, etc.
     ///
-    /// The callback receives the builder by value and returns it, enabling
-    /// the chained builder API (`builder.tool(...).system_prompt(...)`).
     pub async fn make_harness_with(
         entry: &LiveProviderEntry,
         customize: impl FnOnce(HarnessBuilder) -> HarnessBuilder,
-    ) -> (AgentHarness, tempfile::TempDir) {
+    ) -> (Arc<AgentHarness>, InspectorHandle, tempfile::TempDir) {
         let (tmp, sandbox) = make_sandbox();
         sandbox.start().await.unwrap();
         let env: Arc<dyn llm_harness_types::ExecutionEnv> = sandbox.env();
@@ -156,7 +187,8 @@ mod inner {
         let builder = customize(builder);
 
         let harness = builder.build(env).await.unwrap();
-        (harness, tmp)
+        let (harness, inspector) = maybe_mount_inspector(harness).await;
+        (harness, inspector, tmp)
     }
     /// Like `make_harness_with`, but also returns the `ExecutionEnv` so callers
     /// can use it for `load_skills` / `load_prompt_templates` after build.
@@ -164,8 +196,9 @@ mod inner {
         entry: &LiveProviderEntry,
         customize: impl FnOnce(HarnessBuilder) -> HarnessBuilder,
     ) -> (
-        AgentHarness,
+        Arc<AgentHarness>,
         Arc<dyn llm_harness_types::ExecutionEnv>,
+        InspectorHandle,
         tempfile::TempDir,
     ) {
         let (tmp, sandbox) = make_sandbox();
@@ -179,7 +212,8 @@ mod inner {
         let builder = customize(builder);
 
         let harness = builder.build(env.clone()).await.unwrap();
-        (harness, env, tmp)
+        let (harness, inspector) = maybe_mount_inspector(harness).await;
+        (harness, env, inspector, tmp)
     }
     /// Build an `AgentHarness` with a Jsonl-backed session for persistence tests.
     ///
@@ -188,7 +222,7 @@ mod inner {
     pub async fn make_harness_with_session(
         entry: &LiveProviderEntry,
         customize: impl FnOnce(HarnessBuilder) -> HarnessBuilder,
-    ) -> (AgentHarness, tempfile::TempDir) {
+    ) -> (Arc<AgentHarness>, InspectorHandle, tempfile::TempDir) {
         let (tmp, sandbox) = make_sandbox();
         sandbox.start().await.unwrap();
         let env: Arc<dyn llm_harness_types::ExecutionEnv> = sandbox.env();
@@ -210,7 +244,8 @@ mod inner {
         let builder = customize(builder);
 
         let harness = builder.build_with_session(env, session).unwrap();
-        (harness, tmp)
+        let (harness, inspector) = maybe_mount_inspector(harness).await;
+        (harness, inspector, tmp)
     }
 
     // ── EventCapture ─────────────────────────────────────────────────────────────
@@ -407,8 +442,8 @@ mod inner {
 }
 #[cfg(feature = "live-llm")]
 pub use inner::{
-    COMPACTION, CapturedEvent, EventCapture, LiveProvider, LiveProviderEntry, MULTI_TURN,
-    SINGLE_TURN, SMOKE_TIMEOUT, SPAWN, assert_event_emitted, assert_text_contains,
+    COMPACTION, CapturedEvent, EventCapture, InspectorHandle, LiveProvider, LiveProviderEntry,
+    MULTI_TURN, SINGLE_TURN, SMOKE_TIMEOUT, SPAWN, assert_event_emitted, assert_text_contains,
     assert_tool_was_called, make_harness, make_harness_with, make_harness_with_env,
     make_harness_with_session, make_skill_dir, with_timeout,
 };

@@ -15,6 +15,7 @@ live-llm = [
     "dep:llm-harness-sandbox",
     "dep:llm-harness-agent",
     "dep:llm-harness-types",
+    "dep:llm-harness-inspector",
     "dep:tokio",
     "dep:tempfile",
 ]
@@ -26,6 +27,7 @@ llm-harness-platform = { workspace = true, optional = true }
 llm-harness-loop = { workspace = true, features = ["test-utils"], optional = true }
 llm-harness-sandbox = { workspace = true, optional = true }
 llm-harness-agent = { workspace = true, optional = true }
+llm-harness-inspector = { workspace = true, features = ["inspect"], optional = true }
 llm-harness-types = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"], optional = true }
 tempfile = { workspace = true, optional = true }

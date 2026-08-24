@@ -115,7 +115,7 @@ async fn main() {
     println!("Traces will be visible at: http://localhost:16686\n");
     let (exporter, adapter, trace_hooks) = build_otlp_tracing_hooks();
 
-    let (harness, _tmp) =
+    let (harness, _inspector, _tmp) =
         make_harness_with(entry, |b| b.hooks(trace_hooks).tool(Arc::new(EchoTool))).await;
 
     // Start a session span so all turn/llm_call/tool spans have a common parent.

@@ -21,7 +21,7 @@ async fn prompt_continues_after_settled() {
         }
     };
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
 
     // Turn 1: initial prompt.
     let capture1 = EventCapture::subscribe(&harness);
@@ -52,7 +52,7 @@ async fn prompt_preserves_session_history() {
         }
     };
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
 
     // Turn 1: tell the LLM a secret word.
     let capture1 = EventCapture::subscribe(&harness);
@@ -95,7 +95,7 @@ async fn set_system_prompt_affects_next_turn() {
         }
     };
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
 
     // Turn 1: normal prompt.
     let capture1 = EventCapture::subscribe(&harness);
