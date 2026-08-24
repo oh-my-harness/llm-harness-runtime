@@ -161,7 +161,7 @@ async fn build_harness(
     chain: RuleChain,
     tools: Vec<Arc<dyn Tool>>,
 ) -> (
-    llm_harness_agent::AgentHarness,
+    Arc<llm_harness_agent::AgentHarness>,
     tempfile::TempDir,
     Arc<RuleBasedApprovalHook>,
 ) {
@@ -172,7 +172,7 @@ async fn build_harness(
         ..HarnessHooks::none()
     };
 
-    let (harness, tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, tmp) = make_harness_with(entry, |b| {
         let b = b.hooks(hooks);
         tools.into_iter().fold(b, |b, t| b.tool(t))
     })

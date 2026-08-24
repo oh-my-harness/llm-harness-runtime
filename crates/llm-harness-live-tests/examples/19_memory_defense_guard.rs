@@ -167,7 +167,7 @@ async fn part1_memory_defense(entry: &llm_harness_live_tests::LiveProviderEntry)
 
     let write_tool: Arc<dyn Tool> = Arc::new(WriteFileTool);
 
-    let (harness, _env, _tmp) =
+    let (harness, _env, _inspector, _tmp) =
         make_harness_with_env(entry, |b| b.install(&plugin).tool(write_tool)).await;
 
     let cap = EventCapture::subscribe(&harness);
@@ -229,11 +229,12 @@ async fn part2_output_guard(entry: &llm_harness_live_tests::LiveProviderEntry) {
     let big_output_tool: Arc<dyn Tool> = Arc::new(BigOutputTool);
 
     // Phase 1: get an env we can reuse.
-    let (_h0, env, _t0) = make_harness_with_env(entry, |b| b.tool(big_output_tool.clone())).await;
+    let (_h0, env, _inspector, _t0) =
+        make_harness_with_env(entry, |b| b.tool(big_output_tool.clone())).await;
 
     // Phase 2: rebuild with ToolOutputGuardPlugin using the captured env.
     let guard_plugin = ToolOutputGuardPlugin::new(env);
-    let (harness, _env2, _tmp) =
+    let (harness, _env2, _inspector, _tmp) =
         make_harness_with_env(entry, |b| b.install(&guard_plugin).tool(big_output_tool)).await;
 
     let cap = EventCapture::subscribe(&harness);
@@ -277,7 +278,7 @@ async fn part3_combined(entry: &llm_harness_live_tests::LiveProviderEntry) {
     let big_output_tool: Arc<dyn Tool> = Arc::new(BigOutputTool);
 
     // Phase 1: obtain env.
-    let (_h0, env, _t0) = make_harness_with_env(entry, |b| {
+    let (_h0, env, _inspector, _t0) = make_harness_with_env(entry, |b| {
         b.tool(write_tool.clone()).tool(big_output_tool.clone())
     })
     .await;
@@ -288,7 +289,7 @@ async fn part3_combined(entry: &llm_harness_live_tests::LiveProviderEntry) {
         .build();
     let guard_plugin = ToolOutputGuardPlugin::new(env);
 
-    let (harness, _env2, _tmp) = make_harness_with_env(entry, |b| {
+    let (harness, _env2, _inspector, _tmp) = make_harness_with_env(entry, |b| {
         b.install(&memory_plugin)
             .install(&guard_plugin)
             .tool(write_tool)

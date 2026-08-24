@@ -113,7 +113,7 @@ async fn tracing_emits_spans() {
 
     let (exporter, trace_hooks) = build_tracing_hooks();
 
-    let (harness, _tmp) =
+    let (harness, _inspector, _tmp) =
         make_harness_with(entry, |b| b.hooks(trace_hooks).tool(Arc::new(EchoTool))).await;
 
     for prompt in ECHO_PROMPTS {
@@ -151,7 +151,7 @@ async fn audit_writes_jsonl_and_validates_hash_chain() {
     let audit_path = audit_dir.path().join("audit.jsonl");
     let sink: Arc<dyn AuditSink> = Arc::new(JsonlAuditSink::new(audit_path.clone()));
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&AuditPlugin::new(sink).with_trace_id("test-trace"))
             .tool(Arc::new(EchoTool))
     })
@@ -208,7 +208,7 @@ async fn trace_id_propagates_to_audit() {
     let audit_path = audit_dir.path().join("audit.jsonl");
     let sink: Arc<dyn AuditSink> = Arc::new(JsonlAuditSink::new(audit_path.clone()));
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.hooks(trace_hooks)
             .install(&AuditPlugin::new(sink).with_trace_id(trace_id))
             .tool(Arc::new(EchoTool))

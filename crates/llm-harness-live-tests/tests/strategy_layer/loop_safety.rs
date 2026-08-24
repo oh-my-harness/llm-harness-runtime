@@ -130,7 +130,7 @@ async fn max_turns_stops_loop() {
         ..LoopSafetyConfig::default()
     };
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&LoopSafetyPlugin::new(config))
             .system_prompt(Some(
                 "You are a helpful assistant. Use the echo tool whenever possible.".into(),
@@ -190,7 +190,7 @@ async fn repetition_detected() {
         ..LoopSafetyConfig::default()
     };
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&LoopSafetyPlugin::new(config))
             .system_prompt(Some(
                 "You are a helpful assistant. When asked to call a tool, call it.".into(),
@@ -244,7 +244,7 @@ async fn consecutive_failure_breaker() {
         ..LoopSafetyConfig::default()
     };
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&LoopSafetyPlugin::new(config))
             .system_prompt(Some(
                 "You are a helpful assistant. When asked to use a tool, use it.".into(),

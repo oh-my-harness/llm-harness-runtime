@@ -11,6 +11,7 @@ mod compaction;
 mod config;
 mod cost;
 mod lifecycle;
+mod metadata;
 mod phase_guard;
 mod prepare_next_turn;
 mod queues;

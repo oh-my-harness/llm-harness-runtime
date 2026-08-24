@@ -594,6 +594,11 @@ impl AgentHarness {
     pub async fn list_branches(&self) -> Result<Vec<BranchInfo>, HarnessError> {
         Ok(self.session.list_branches().await?)
     }
+
+    /// Return the current session's metadata.
+    pub async fn session_metadata(&self) -> Result<SessionMetadata, HarnessError> {
+        Ok(self.session.metadata().await?)
+    }
     /// Return all entries on the active cursor's path (root-first).
     ///
     /// UI calls this after `BranchSwitched` to reload the conversation.

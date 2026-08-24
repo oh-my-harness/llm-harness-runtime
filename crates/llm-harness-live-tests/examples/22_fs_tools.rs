@@ -64,7 +64,8 @@ async fn part1_bash(entry: &llm_harness_live_tests::LiveProviderEntry) {
     let store = Arc::new(RwLock::new(FileSnapshotStore::new()));
     let plugin = FsToolsPlugin::new(Some(store));
 
-    let (harness, env, _tmp) = make_harness_with_env(entry, |b| b.install(&plugin)).await;
+    let (harness, env, _inspector, _tmp) =
+        make_harness_with_env(entry, |b| b.install(&plugin)).await;
 
     let cap = EventCapture::subscribe(&harness);
 
@@ -104,7 +105,8 @@ async fn part2_write_read(entry: &llm_harness_live_tests::LiveProviderEntry) {
     let store = Arc::new(RwLock::new(FileSnapshotStore::new()));
     let plugin = FsToolsPlugin::new(Some(store));
 
-    let (harness, env, _tmp) = make_harness_with_env(entry, |b| b.install(&plugin)).await;
+    let (harness, env, _inspector, _tmp) =
+        make_harness_with_env(entry, |b| b.install(&plugin)).await;
 
     let cap = EventCapture::subscribe(&harness);
 
@@ -144,7 +146,8 @@ async fn part3_edit(entry: &llm_harness_live_tests::LiveProviderEntry) {
     let store = Arc::new(RwLock::new(FileSnapshotStore::new()));
     let plugin = FsToolsPlugin::new(Some(store));
 
-    let (harness, env, _tmp) = make_harness_with_env(entry, |b| b.install(&plugin)).await;
+    let (harness, env, _inspector, _tmp) =
+        make_harness_with_env(entry, |b| b.install(&plugin)).await;
 
     // Pre-create a file with known content for the LLM to edit.
     let edit_file = env.working_dir().join("editable.txt");
@@ -209,7 +212,8 @@ async fn part4_grep_glob(entry: &llm_harness_live_tests::LiveProviderEntry) {
     let store = Arc::new(RwLock::new(FileSnapshotStore::new()));
     let plugin = FsToolsPlugin::new(Some(store));
 
-    let (harness, env, _tmp) = make_harness_with_env(entry, |b| b.install(&plugin)).await;
+    let (harness, env, _inspector, _tmp) =
+        make_harness_with_env(entry, |b| b.install(&plugin)).await;
 
     // Pre-create several files in the temp dir for the LLM to search.
     let dir = env.working_dir();

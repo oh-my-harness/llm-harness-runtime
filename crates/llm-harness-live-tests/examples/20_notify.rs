@@ -83,7 +83,8 @@ async fn part1_single_notification(entry: &llm_harness_live_tests::LiveProviderE
     println!("--- Part 1: NotifyPlugin + ConsoleChannel (single notification) ---\n");
 
     // The plugin only registers the tool; the channel is per-run.
-    let (harness, _tmp) = make_harness_with(entry, |b| b.install(&NotifyPlugin::new())).await;
+    let (harness, _inspector, _tmp) =
+        make_harness_with(entry, |b| b.install(&NotifyPlugin::new())).await;
 
     let cap = EventCapture::subscribe(&harness);
 
@@ -127,7 +128,8 @@ async fn part1_single_notification(entry: &llm_harness_live_tests::LiveProviderE
 async fn part2_multiple_urgency(entry: &llm_harness_live_tests::LiveProviderEntry) {
     println!("--- Part 2: multiple notifications with urgency levels ---\n");
 
-    let (harness, _tmp) = make_harness_with(entry, |b| b.install(&NotifyPlugin::new())).await;
+    let (harness, _inspector, _tmp) =
+        make_harness_with(entry, |b| b.install(&NotifyPlugin::new())).await;
 
     let cap = EventCapture::subscribe(&harness);
 

@@ -122,7 +122,7 @@ async fn normal_command_allowed() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&SafetyDefaultsPlugin::new())
             .tool(std::sync::Arc::new(EchoTool))
     })
@@ -156,7 +156,7 @@ async fn bash_blacklist_deny() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&SafetyDefaultsPlugin::new())
             .tool(std::sync::Arc::new(BashTool))
     })
@@ -198,7 +198,7 @@ async fn injection_phrase_filtered() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&InjectionFilterPlugin::default())
             .tool(std::sync::Arc::new(EchoTool))
     })
@@ -240,7 +240,7 @@ async fn safety_and_injection_combined() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&SafetyDefaultsPlugin::new())
             .install(&InjectionFilterPlugin::default())
             .tool(std::sync::Arc::new(EchoTool))

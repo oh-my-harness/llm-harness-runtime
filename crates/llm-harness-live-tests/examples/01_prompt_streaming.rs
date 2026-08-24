@@ -26,7 +26,7 @@ async fn main() {
     println!("Provider: {} | Model: {}", entry.name, entry.model);
 
     // 2. Build harness.
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
     println!("Harness built. Working dir: {:?}\n", _tmp.path());
 
     // 3. Subscribe to events for streaming.

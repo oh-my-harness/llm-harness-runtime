@@ -17,7 +17,7 @@ async fn inmemory_session_grows_with_turns() {
         }
     };
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
 
     for i in 1..=3 {
         let cap = EventCapture::subscribe(&harness);
@@ -52,7 +52,7 @@ async fn fork_creates_independent_branch() {
         }
     };
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
 
     // 3 turns on main branch
     for i in 1..=3 {
@@ -115,7 +115,7 @@ async fn navigate_switches_active_branch() {
         }
     };
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
 
     // 2 turns on main branch
     for i in 1..=2 {
@@ -177,7 +177,7 @@ async fn branch_summary_generated() {
         }
     };
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
 
     // 3 turns
     for i in 1..=3 {
@@ -234,7 +234,7 @@ async fn jsonl_session_survives_reload() {
         }
     };
 
-    let (harness, tmp) = make_harness_with_session(entry, |b| b).await;
+    let (harness, _inspector, tmp) = make_harness_with_session(entry, |b| b).await;
 
     // 3 turns — tell the LLM a memorable fact
     let prompts = [

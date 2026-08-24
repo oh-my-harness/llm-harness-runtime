@@ -74,7 +74,7 @@ async fn tool_result_wrapped_in_source_tags() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.tool(Arc::new(EchoTool))
             .install(&SourceTagPlugin::new(vec![SourceTagEntry {
                 tool: "echo".into(),
@@ -144,7 +144,7 @@ async fn claude_md_injected_into_system_prompt() {
     // plugin referencing that env in a second build. The plugin's hook reads
     // from env.working_dir() at before_run time, so CLAUDE.md written to the
     // phase-1 working_dir is visible when prompt() runs.
-    let (_h0, env, _t0) = make_harness_with_env(entry, |b| b).await;
+    let (_h0, env, _inspector, _t0) = make_harness_with_env(entry, |b| b).await;
 
     // Write CLAUDE.md into the sandbox working directory before prompting.
     // The BeforeRunHook reads this file when `prompt()` is invoked.
@@ -157,7 +157,8 @@ async fn claude_md_injected_into_system_prompt() {
 
     // Phase 2: rebuild with ProjectInstructionPlugin using the captured env.
     let plugin = ProjectInstructionPlugin::new(env);
-    let (harness, _env2, _tmp) = make_harness_with_env(entry, |b| b.install(&plugin)).await;
+    let (harness, _env2, _inspector, _tmp) =
+        make_harness_with_env(entry, |b| b.install(&plugin)).await;
 
     let cap = EventCapture::subscribe(&harness);
 

@@ -114,7 +114,7 @@ async fn single_tool_call_round_trips() {
         }
     };
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.tool(Arc::new(EchoTool::new())).system_prompt(Some(
             "You must call tools using the function calling mechanism, not by describing \
                  the call in text. Always invoke tools via tool_call."
@@ -146,7 +146,7 @@ async fn tool_error_propagates_to_llm() {
         }
     };
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.tool(Arc::new(ErrorTool::new()))
             .tool(Arc::new(EchoTool::new()))
             .system_prompt(Some(

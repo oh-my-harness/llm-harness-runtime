@@ -216,7 +216,7 @@ async fn main() {
 
     // make_harness_with internally creates + starts an OsEnvSandbox and wires
     // it into the harness so tool execution lands inside the sandbox env.
-    let (harness, _tmp) = make_harness_with(entry, |b| b).await;
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| b).await;
     println!("Harness built with sandbox-backed ExecutionEnv.");
 
     let capture = EventCapture::subscribe(&harness);

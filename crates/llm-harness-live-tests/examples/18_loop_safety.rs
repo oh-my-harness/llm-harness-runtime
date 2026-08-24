@@ -166,7 +166,7 @@ async fn part1_max_turns(entry: &llm_harness_live_tests::LiveProviderEntry) {
         ..LoopSafetyConfig::default()
     };
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&LoopSafetyPlugin::new(config))
             .tool(Arc::new(EchoTool) as Arc<dyn Tool>)
     })
@@ -234,7 +234,7 @@ async fn part2_repetition_guard(entry: &llm_harness_live_tests::LiveProviderEntr
         ..LoopSafetyConfig::default()
     };
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&LoopSafetyPlugin::new(config))
             .tool(Arc::new(EchoTool) as Arc<dyn Tool>)
     })
@@ -290,7 +290,7 @@ async fn part3_failure_circuit_breaker(entry: &llm_harness_live_tests::LiveProvi
         ..LoopSafetyConfig::default()
     };
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&LoopSafetyPlugin::new(config))
             .tool(Arc::new(FailingTool) as Arc<dyn Tool>)
     })
@@ -343,7 +343,7 @@ async fn part4_death_spiral_guard(entry: &llm_harness_live_tests::LiveProviderEn
         ..LoopSafetyConfig::default()
     };
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&LoopSafetyPlugin::new(config))
             .tool(Arc::new(FailingTool) as Arc<dyn Tool>)
     })

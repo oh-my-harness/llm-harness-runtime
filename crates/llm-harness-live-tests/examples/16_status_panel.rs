@@ -113,7 +113,7 @@ async fn part1_todo_create(entry: &llm_harness_live_tests::LiveProviderEntry) {
     let todo_store = plugin.todo_store().clone();
     let tool_counter = plugin.tool_counter().clone();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&plugin).tool(Arc::new(EchoTool) as Arc<dyn Tool>)
     })
     .await;
@@ -157,7 +157,7 @@ async fn part2_todo_update(entry: &llm_harness_live_tests::LiveProviderEntry) {
     let todo_store = plugin.todo_store().clone();
     let tool_counter = plugin.tool_counter().clone();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&plugin).tool(Arc::new(EchoTool) as Arc<dyn Tool>)
     })
     .await;
@@ -212,7 +212,7 @@ async fn part4_add_and_clear(entry: &llm_harness_live_tests::LiveProviderEntry) 
     let plugin = StatusPanelPlugin::new(StatusPanelConfig::default());
     let todo_store = plugin.todo_store().clone();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
 
     // Start with one seeded item so we can see `add` append to it.
     use llm_harness_strategy::status_panel::TodoItem;
@@ -284,7 +284,7 @@ async fn part3_tool_counter(entry: &llm_harness_live_tests::LiveProviderEntry) {
     let tool_counter = plugin.tool_counter().clone();
     let todo_store = plugin.todo_store().clone();
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&plugin).tool(Arc::new(EchoTool) as Arc<dyn Tool>)
     })
     .await;

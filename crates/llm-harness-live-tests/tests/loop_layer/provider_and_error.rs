@@ -18,7 +18,7 @@ async fn openai_provider_connects_and_returns_text() {
         }
     };
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
     let capture = EventCapture::subscribe(&harness);
 
     with_timeout(MULTI_TURN, harness.prompt("Say hello."))
@@ -42,7 +42,7 @@ async fn anthropic_provider_connects_and_returns_text() {
         }
     };
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
     let capture = EventCapture::subscribe(&harness);
 
     with_timeout(MULTI_TURN, harness.prompt("Say hello."))
@@ -66,7 +66,7 @@ async fn streaming_produces_text_deltas_then_settled() {
         }
     };
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
     let capture = EventCapture::subscribe(&harness);
 
     with_timeout(MULTI_TURN, harness.prompt("Count from 1 to 5."))
@@ -110,7 +110,7 @@ async fn invalid_api_key_surfaces_as_error() {
     };
 
     let result = with_timeout(MULTI_TURN, async {
-        let (harness, _tmp) = make_harness_with(&entry, |b| b).await;
+        let (harness, _inspector, _tmp) = make_harness_with(&entry, |b| b).await;
         harness.prompt("Hello").await
     })
     .await;

@@ -376,7 +376,7 @@ async fn before_run_fires_once_per_prompt() {
     };
 
     let counters = Arc::new(HookCounters::default());
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&BeforeRunOnlyPlugin {
             counters: counters.clone(),
         })
@@ -409,7 +409,7 @@ async fn before_turn_and_after_turn_fire_per_turn() {
     };
 
     let counters = Arc::new(HookCounters::default());
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&TurnPairPlugin {
             counters: counters.clone(),
         })
@@ -451,7 +451,7 @@ async fn tool_call_hooks_fire_symmetrically() {
     };
 
     let counters = Arc::new(HookCounters::default());
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&ToolCallPairPlugin {
             counters: counters.clone(),
         })
@@ -489,7 +489,7 @@ async fn should_stop_fires_on_natural_stop() {
     };
 
     let counters = Arc::new(HookCounters::default());
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&ShouldStopOnlyPlugin {
             counters: counters.clone(),
         })
@@ -522,7 +522,7 @@ async fn after_provider_response_tracks_llm_calls() {
     };
 
     let counters = Arc::new(HookCounters::default());
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&AfterProviderResponseOnlyPlugin {
             counters: counters.clone(),
         })
@@ -555,7 +555,7 @@ async fn all_hooks_registered_and_exercised() {
     };
 
     let counters = Arc::new(HookCounters::default());
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(&AllHooksPlugin {
             counters: counters.clone(),
         })

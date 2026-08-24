@@ -166,7 +166,8 @@ async fn session_recall_search_finds_history() {
     .expect("KnowledgePlugin creation should succeed");
 
     // ── Phase 3: new harness with a DIFFERENT session ──────────────────
-    let (harness, _harness_tmp) = make_harness_with(entry, |b| b.install(&plugin)).await;
+    let (harness, _inspector, _harness_tmp) =
+        make_harness_with(entry, |b| b.install(&plugin)).await;
     let cap = EventCapture::subscribe(&harness);
 
     let access = make_access_context();

@@ -9,6 +9,8 @@
 //! - After 3 turns of conversation, manual `compact()` succeeds.
 //! - `CompactionStart` and `CompactionEnd` events are emitted.
 
+use std::sync::Arc;
+
 use llm_harness_agent::ModelInfo;
 use llm_harness_live_tests::skip_if_none;
 use llm_harness_live_tests::{
@@ -22,8 +24,8 @@ use llm_harness_strategy::context_aware_prompt_spec;
 /// has content to compress.
 async fn make_context_aware_harness(
     entry: &llm_harness_live_tests::LiveProviderEntry,
-) -> (llm_harness_agent::AgentHarness, tempfile::TempDir) {
-    let (harness, tmp) = make_harness_with_session(entry, |b| {
+) -> (Arc<llm_harness_agent::AgentHarness>, tempfile::TempDir) {
+    let (harness, _inspector, tmp) = make_harness_with_session(entry, |b| {
         b.max_tokens(1024)
             .model_info(Some(ModelInfo {
                 context_window: 800,

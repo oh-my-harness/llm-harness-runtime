@@ -91,7 +91,7 @@ async fn builder_assembles_and_runs() {
     let entry = providers.all_providers().into_iter().next();
     skip_if_none!(entry);
     let entry = entry.unwrap();
-    let (harness, _tmp) = make_harness_with(entry, |b| b).await;
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| b).await;
     let cap = EventCapture::subscribe(&harness);
 
     with_timeout(SINGLE_TURN, harness.prompt("Say hello"))
@@ -113,7 +113,7 @@ async fn provider_glob_matches() {
     let entry = providers.all_providers().into_iter().next();
     skip_if_none!(entry);
     let entry = entry.unwrap();
-    let (harness, _tmp) = make_harness_with(entry, |b| b).await;
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| b).await;
     let cap = EventCapture::subscribe(&harness);
 
     with_timeout(
@@ -139,7 +139,8 @@ async fn plugin_registers_tools() {
     let entry = providers.all_providers().into_iter().next();
     skip_if_none!(entry);
     let entry = entry.unwrap();
-    let (harness, _tmp) = make_harness_with(entry, |b| b.tool(Arc::new(EchoTool))).await;
+    let (harness, _inspector, _tmp) =
+        make_harness_with(entry, |b| b.tool(Arc::new(EchoTool))).await;
     let cap = EventCapture::subscribe(&harness);
 
     with_timeout(

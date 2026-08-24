@@ -127,13 +127,13 @@ async fn make_sandbox_and_env() -> (tempfile::TempDir, Arc<dyn ExecutionEnv>) {
 async fn build_with_env(
     entry: &llm_harness_live_tests::LiveProviderEntry,
     customize: impl FnOnce(HarnessBuilder, &Arc<dyn ExecutionEnv>) -> HarnessBuilder,
-) -> (AgentHarness, Arc<dyn ExecutionEnv>, tempfile::TempDir) {
+) -> (Arc<AgentHarness>, Arc<dyn ExecutionEnv>, tempfile::TempDir) {
     let (tmp, env) = make_sandbox_and_env().await;
     let builder = HarnessBuilder::new(&entry.model)
         .provider("*", entry.client.clone())
         .max_tokens(1024);
     let builder = customize(builder, &env);
-    let harness = builder.build(env.clone()).await.unwrap();
+    let harness = Arc::new(builder.build(env.clone()).await.unwrap());
     (harness, env, tmp)
 }
 

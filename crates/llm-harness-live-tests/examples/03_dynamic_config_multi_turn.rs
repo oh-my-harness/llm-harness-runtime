@@ -36,7 +36,7 @@ async fn main() {
 
     println!("Provider: {} | Model: {}\n", entry.name, entry.model);
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
 
     // ── Turn 1: Establish two facts to remember ─────────────────────────────
     prompt_turn(

@@ -69,7 +69,7 @@ async fn openai_provider_smoke() {
         }
     };
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
     let capture = EventCapture::subscribe(&harness);
 
     with_timeout(MULTI_TURN, harness.prompt("Say hello in one word."))
@@ -92,7 +92,7 @@ async fn anthropic_provider_smoke() {
         }
     };
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
     let capture = EventCapture::subscribe(&harness);
 
     with_timeout(MULTI_TURN, harness.prompt("Say hello in one word."))

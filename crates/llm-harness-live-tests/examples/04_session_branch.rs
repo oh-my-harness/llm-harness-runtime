@@ -32,7 +32,7 @@ async fn main() {
     // ── Part 1: InMemory session — basic conversation ───────────────────────
     println!("--- Part 1: InMemory session ---\n");
 
-    let (harness, _tmp) = make_harness(entry).await;
+    let (harness, _inspector, _tmp) = make_harness(entry).await;
 
     // 10 turns to build up a substantial conversation
     let prompts = [
@@ -128,7 +128,7 @@ async fn main() {
     // ── Part 4: Jsonl persistence ───────────────────────────────────────────
     println!("--- Part 4: Jsonl persistence ---\n");
 
-    let (harness2, tmp2) = make_harness_with_session(entry, |b| b).await;
+    let (harness2, _inspector, tmp2) = make_harness_with_session(entry, |b| b).await;
 
     // 10 turns to test Jsonl persistence with substantial history
     let jsonl_prompts = [

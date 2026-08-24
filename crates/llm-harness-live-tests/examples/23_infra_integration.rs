@@ -85,7 +85,7 @@ async fn part1_timer_stream(entry: &llm_harness_live_tests::LiveProviderEntry) {
 
     // WaitForExternalEventTool persists the wait descriptor for crash
     // recovery via TaskStore. Here we pass None (no recovery) for simplicity.
-    let (harness, _env, _tmp) = make_harness_with_env(entry, |b| {
+    let (harness, _env, _inspector, _tmp) = make_harness_with_env(entry, |b| {
         let tool = WaitForExternalEventTool::new(
             stream_arc,
             EventDetails::new("timer", "timer.once").to_value(),
@@ -149,7 +149,7 @@ async fn part2_webhook_stream(entry: &llm_harness_live_tests::LiveProviderEntry)
         let _ = channel.push(payload).await;
     });
 
-    let (harness, _env, _tmp) = make_harness_with_env(entry, |b| {
+    let (harness, _env, _inspector, _tmp) = make_harness_with_env(entry, |b| {
         let tool = WaitForExternalEventTool::new(
             stream_arc,
             serde_json::json!({"source": "webhook", "channel": "deploy"}),
@@ -276,7 +276,8 @@ async fn part3_knowledge_search(entry: &llm_harness_live_tests::LiveProviderEntr
     );
 
     // Build the harness with the plugin installed.
-    let (harness, _env, _tmp) = make_harness_with_env(entry, |b| b.install(&plugin)).await;
+    let (harness, _env, _inspector, _tmp) =
+        make_harness_with_env(entry, |b| b.install(&plugin)).await;
 
     let cap = EventCapture::subscribe(&harness);
 

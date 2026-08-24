@@ -155,7 +155,7 @@ async fn dangerous_write_blocked() {
         executed: executed.clone(),
     });
 
-    let (harness, _tmp) = make_harness_with(entry, |b| {
+    let (harness, _inspector, _tmp) = make_harness_with(entry, |b| {
         b.install(
             &MemoryDefensePlugin::builder()
                 .action(MemoryDefenseAction::Deny)
@@ -199,11 +199,12 @@ async fn oversized_output_truncated() {
     let big_output_tool: Arc<dyn Tool> = Arc::new(BigOutputTool);
 
     // Phase 1: build once to obtain an `env` we can hand to the plugin.
-    let (_h0, env, _t0) = make_harness_with_env(entry, |b| b.tool(big_output_tool.clone())).await;
+    let (_h0, env, _inspector, _t0) =
+        make_harness_with_env(entry, |b| b.tool(big_output_tool.clone())).await;
 
     // Phase 2: rebuild with ToolOutputGuardPlugin using the captured env.
     let guard_plugin = ToolOutputGuardPlugin::new(env);
-    let (harness, _env2, _tmp) =
+    let (harness, _env2, _inspector, _tmp) =
         make_harness_with_env(entry, |b| b.install(&guard_plugin).tool(big_output_tool)).await;
 
     let cap = EventCapture::subscribe(&harness);

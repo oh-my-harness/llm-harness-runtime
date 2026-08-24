@@ -119,7 +119,7 @@ async fn main() {
 
     let (exporter, _adapter, trace_hooks) = build_tracing_hooks();
 
-    let (harness, _tmp) =
+    let (harness, _inspector, _tmp) =
         make_harness_with(entry, |b| b.hooks(trace_hooks).tool(Arc::new(EchoTool))).await;
 
     let prompts = [
@@ -196,7 +196,7 @@ async fn main() {
     let audit_path = audit_dir.path().join("audit.jsonl");
     let sink: Arc<dyn AuditSink> = Arc::new(JsonlAuditSink::new(audit_path.clone()));
 
-    let (harness2, _tmp2) = make_harness_with(entry, |b| {
+    let (harness2, _inspector, _tmp2) = make_harness_with(entry, |b| {
         b.install(&AuditPlugin::new(sink).with_trace_id("trace-audit-demo"))
             .tool(Arc::new(EchoTool))
     })
@@ -261,7 +261,7 @@ async fn main() {
     let audit_path3 = _tmp2.path().join("combined_audit.jsonl");
     let sink3: Arc<dyn AuditSink> = Arc::new(JsonlAuditSink::new(audit_path3.clone()));
 
-    let (harness3, _tmp3) = make_harness_with(entry, |b| {
+    let (harness3, _inspector, _tmp3) = make_harness_with(entry, |b| {
         b.hooks(trace_hooks3)
             .install(&AuditPlugin::new(sink3).with_trace_id("trace-combined-demo"))
             .tool(Arc::new(EchoTool))

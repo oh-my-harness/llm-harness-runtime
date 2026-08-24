@@ -109,7 +109,8 @@ async fn skills_loaded_and_readable() {
     };
 
     // Build harness with echo tool installed; we need env for load_skills.
-    let (harness, env, tmp) = make_harness_with_env(entry, |b| b.install(&EchoTool)).await;
+    let (harness, env, _inspector, tmp) =
+        make_harness_with_env(entry, |b| b.install(&EchoTool)).await;
 
     // Create 3 skill directories under a temp skills dir.
     let skills_dir = tmp.path().join("skills");
@@ -198,7 +199,7 @@ async fn templates_expand_placeholders() {
     };
 
     // We need env for load_prompt_templates; harness content is incidental.
-    let (harness, env, tmp) = make_harness_with_env(entry, |b| b).await;
+    let (harness, env, _inspector, tmp) = make_harness_with_env(entry, |b| b).await;
 
     // Create 2 template files.
     let templates_dir = tmp.path().join("templates");
@@ -266,7 +267,7 @@ async fn model_switch_records_entry() {
         }
     };
 
-    let (harness, _env, _tmp) = make_harness_with_env(entry, |b| b).await;
+    let (harness, _env, _inspector, _tmp) = make_harness_with_env(entry, |b| b).await;
 
     // 2 turns on the original model.
     let prompts1 = ["Tell me a short joke.", "What is 2 + 2?"];
@@ -338,7 +339,8 @@ async fn echo_tool_called_by_llm() {
         }
     };
 
-    let (harness, _env, _tmp) = make_harness_with_env(entry, |b| b.install(&EchoTool)).await;
+    let (harness, _env, _inspector, _tmp) =
+        make_harness_with_env(entry, |b| b.install(&EchoTool)).await;
 
     // 10 turns explicitly asking the LLM to use the echo tool.
     let prompts = [

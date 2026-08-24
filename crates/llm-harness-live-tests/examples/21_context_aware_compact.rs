@@ -19,6 +19,8 @@
 //!   source .env
 //!   cargo run -p llm-harness-live-tests --example 21_context_aware_compact
 
+use std::sync::Arc;
+
 use llm_harness_agent::session::SessionEntryPayload;
 use llm_harness_agent::{AgentHarness, ModelInfo};
 use llm_harness_live_tests::{
@@ -32,7 +34,11 @@ async fn make_session_harness_with_compaction_prompt(
     entry: &llm_harness_live_tests::LiveProviderEntry,
     context_window: u32,
     auto_compact: bool,
-) -> (AgentHarness, tempfile::TempDir) {
+) -> (
+    Arc<AgentHarness>,
+    llm_harness_live_tests::InspectorHandle,
+    tempfile::TempDir,
+) {
     make_harness_with_session(entry, |b| {
         b.model_info(Some(ModelInfo {
             context_window,
@@ -133,7 +139,8 @@ async fn main() {
     // ── Part 1: Auto-compact with context-aware prompt ─────────────────────
     println!("--- Part 1: Auto-compact with context-aware prompt (10 turns) ---\n");
 
-    let (harness, _tmp) = make_session_harness_with_compaction_prompt(entry, 1200, true).await;
+    let (harness, _inspector, _tmp) =
+        make_session_harness_with_compaction_prompt(entry, 1200, true).await;
 
     // Set a compaction query so {query} is populated in the template.
     harness.set_compaction_query(Some(
@@ -200,7 +207,8 @@ async fn main() {
     // ── Part 2: Manual compact with context-aware prompt ───────────────────
     println!("--- Part 2: Manual compact with context-aware prompt (3 turns) ---\n");
 
-    let (harness2, _tmp2) = make_session_harness_with_compaction_prompt(entry, 800, false).await;
+    let (harness2, _inspector, _tmp2) =
+        make_session_harness_with_compaction_prompt(entry, 800, false).await;
 
     harness2.set_compaction_query(Some(
         "User is discussing database migration strategies for a Python web app".to_string(),

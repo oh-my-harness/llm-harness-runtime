@@ -19,8 +19,9 @@ use parking_lot::RwLock;
 async fn make_fs_harness(
     entry: &llm_harness_live_tests::LiveProviderEntry,
 ) -> (
-    llm_harness_agent::AgentHarness,
+    Arc<llm_harness_agent::AgentHarness>,
     Arc<dyn llm_harness_types::ExecutionEnv>,
+    llm_harness_live_tests::InspectorHandle,
     tempfile::TempDir,
 ) {
     let store = Arc::new(RwLock::new(FileSnapshotStore::new()));
@@ -38,7 +39,7 @@ async fn bash_executes_and_returns_output() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, _env, _tmp) = make_fs_harness(entry).await;
+    let (harness, _env, _inspector, _tmp) = make_fs_harness(entry).await;
 
     let cap = EventCapture::subscribe(&harness);
 
@@ -65,7 +66,7 @@ async fn read_returns_file_content() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, env, _tmp) = make_fs_harness(entry).await;
+    let (harness, env, _inspector, _tmp) = make_fs_harness(entry).await;
 
     // Pre-create a file with known content.
     std::fs::write(env.working_dir().join("greeting.txt"), "hello-from-test\n").unwrap();
@@ -95,7 +96,7 @@ async fn write_creates_file() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, env, _tmp) = make_fs_harness(entry).await;
+    let (harness, env, _inspector, _tmp) = make_fs_harness(entry).await;
 
     let cap = EventCapture::subscribe(&harness);
 
@@ -128,7 +129,7 @@ async fn edit_modifies_file() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, env, _tmp) = make_fs_harness(entry).await;
+    let (harness, env, _inspector, _tmp) = make_fs_harness(entry).await;
 
     // Pre-create a file with 3 lines.
     std::fs::write(
@@ -164,7 +165,7 @@ async fn grep_searches_content() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, env, _tmp) = make_fs_harness(entry).await;
+    let (harness, env, _inspector, _tmp) = make_fs_harness(entry).await;
 
     // Pre-create files with known content containing the search target.
     std::fs::write(env.working_dir().join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
@@ -195,7 +196,7 @@ async fn glob_matches_files() {
     skip_if_none!(entry);
     let entry = entry.unwrap();
 
-    let (harness, env, _tmp) = make_fs_harness(entry).await;
+    let (harness, env, _inspector, _tmp) = make_fs_harness(entry).await;
 
     // Pre-create files with known names.
     std::fs::write(env.working_dir().join("report_01.txt"), "data\n").unwrap();
