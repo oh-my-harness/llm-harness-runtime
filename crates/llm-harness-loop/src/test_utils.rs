@@ -189,6 +189,44 @@ impl MockResponse {
         }
     }
 
+    /// Text response preceded by a reasoning/thinking block.
+    /// Emits `ReasoningDelta` (→ `AgentEvent::ThinkingDelta`) then `TextDelta`.
+    pub fn text_with_thinking(thinking: &str, text: &str) -> Self {
+        let th = thinking.to_owned();
+        let t = text.to_owned();
+        Self {
+            model: "mock-model".into(),
+            stream_error: None,
+            stream_impl: None,
+            events: vec![
+                // Reasoning block
+                Ok(StreamEvent::ContentStart {
+                    index: 0,
+                    kind: llm_adapter::types::ContentKind::Reasoning,
+                }),
+                Ok(StreamEvent::ReasoningDelta { index: 0, text: th }),
+                Ok(StreamEvent::ContentStop {
+                    index: 0,
+                    signature: None,
+                }),
+                // Text block
+                Ok(StreamEvent::ContentStart {
+                    index: 1,
+                    kind: llm_adapter::types::ContentKind::Text,
+                }),
+                Ok(StreamEvent::TextDelta { index: 1, text: t }),
+                Ok(StreamEvent::ContentStop {
+                    index: 1,
+                    signature: None,
+                }),
+                Ok(StreamEvent::MessageStop {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                }),
+            ],
+        }
+    }
+
     /// Simple text response with an explicit, authoritative all-zero report.
     pub fn text_with_reported_zero(text: &str) -> Self {
         Self::text(text).with_reported_usage(Usage::default())

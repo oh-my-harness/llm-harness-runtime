@@ -4219,3 +4219,158 @@ async fn finalizing_executor_completes_after_step_timeout() {
     assert!(fixture.published.load(Ordering::SeqCst));
     assert_eq!(engine.context().lock().await.variables["finalized"], true);
 }
+
+// ── TextDelta / ThinkingDelta forwarding tests ────────────────────────────
+
+/// A workflow with a single LLM step should forward TextDelta events to
+/// subscribers, in addition to StepStarted / StepFinished.
+#[tokio::test]
+async fn text_delta_events_forwarded_to_subscribers() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("Hello world!")]));
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine =
+        Arc::new(WorkflowEngine::new_free_task("say hello".into(), vec![], config).unwrap());
+    let mut rx = engine.subscribe();
+    let engine_clone = engine.clone();
+    let mut run_handle = tokio::spawn(async move { engine_clone.run().await });
+
+    let mut events = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            ev = rx.recv() => {
+                match ev {
+                    Ok(e) => events.push(e),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+            _ = &mut run_handle => break,
+        }
+    }
+
+    // Collect text from TextDelta events and the final output from StepFinished.
+    let mut delta_text = String::new();
+    let mut step_output: Option<String> = None;
+    let mut saw_text_delta = false;
+    for ev in &events {
+        match ev {
+            WorkflowEvent::TextDelta { text, .. } => {
+                saw_text_delta = true;
+                delta_text.push_str(text);
+            }
+            WorkflowEvent::StepFinished { result, .. } => {
+                step_output = Some(result.output.clone());
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_text_delta, "expected at least one TextDelta event");
+    assert_eq!(
+        delta_text, "Hello world!",
+        "concatenated TextDelta should match input"
+    );
+    assert_eq!(
+        step_output.as_deref().unwrap_or(""),
+        "Hello world!",
+        "StepFinished output should match TextDelta concatenation"
+    );
+}
+
+/// ThinkingDelta events should be forwarded to subscribers.
+#[tokio::test]
+async fn thinking_delta_events_forwarded_to_subscribers() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text_with_thinking(
+        "Let me think...",
+        "The answer.",
+    )]));
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine =
+        Arc::new(WorkflowEngine::new_free_task("think and answer".into(), vec![], config).unwrap());
+    let mut rx = engine.subscribe();
+    let engine_clone = engine.clone();
+    let mut run_handle = tokio::spawn(async move { engine_clone.run().await });
+
+    let mut events = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            ev = rx.recv() => {
+                match ev {
+                    Ok(e) => events.push(e),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+            _ = &mut run_handle => break,
+        }
+    }
+
+    let mut saw_thinking_delta = false;
+    let mut thinking_text = String::new();
+    let mut saw_text_delta = false;
+    for ev in &events {
+        match ev {
+            WorkflowEvent::ThinkingDelta { thinking, .. } => {
+                saw_thinking_delta = true;
+                thinking_text.push_str(thinking);
+            }
+            WorkflowEvent::TextDelta { .. } => {
+                saw_text_delta = true;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_thinking_delta,
+        "expected at least one ThinkingDelta event"
+    );
+    assert_eq!(thinking_text, "Let me think...");
+    assert!(saw_text_delta, "expected TextDelta alongside ThinkingDelta");
+}
+
+/// When nobody subscribes (channel has 0 receivers), send errors are silently
+/// ignored and the step still completes normally.
+#[tokio::test]
+async fn text_delta_channel_full_does_not_block_step() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("Done.")]));
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new_free_task("just respond".into(), vec![], config).unwrap();
+    // Intentionally do NOT subscribe — broadcast send with 0 receivers returns Ok(0).
+    let result = engine.run().await.unwrap();
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert!(
+        result
+            .final_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("Done.")
+    );
+}

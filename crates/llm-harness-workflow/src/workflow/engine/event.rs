@@ -69,6 +69,19 @@ pub enum WorkflowEvent {
         step_id: StepId,
         progress: StepProgress,
     },
+    /// LLM step 的 streaming text delta。
+    /// 高频事件，overflow 时优先丢弃——订阅者应容忍丢事件，
+    /// StepFinished 的 StepResult.output 有完整输出兜底。
+    TextDelta {
+        step_id: StepId,
+        text: String,
+    },
+    /// LLM step 的 streaming thinking delta（推理/思考过程）。
+    /// 高频事件，overflow 时优先丢弃。
+    ThinkingDelta {
+        step_id: StepId,
+        thinking: String,
+    },
 }
 
 /// 从 `AgentEvent` 裁剪出粗粒度进度事件。

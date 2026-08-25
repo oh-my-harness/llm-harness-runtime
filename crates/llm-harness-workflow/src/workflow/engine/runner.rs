@@ -1403,6 +1403,16 @@ impl super::WorkflowEngine {
                         Ok(event) => match event.as_ref() {
                             AgentHarnessEvent::Agent(AgentEvent::TextDelta { text, .. }) => {
                                 text_delta_output.push_str(text);
+                                let _ = self.event_tx.send(WorkflowEvent::TextDelta {
+                                    step_id: step.id().clone(),
+                                    text: text.clone(),
+                                });
+                            }
+                            AgentHarnessEvent::Agent(AgentEvent::ThinkingDelta { thinking, .. }) => {
+                                let _ = self.event_tx.send(WorkflowEvent::ThinkingDelta {
+                                    step_id: step.id().clone(),
+                                    thinking: thinking.clone(),
+                                });
                             }
                             AgentHarnessEvent::Agent(ev) => match ev {
                                 // Aborted：忽略。与 step_abort.cancelled() 同源，
