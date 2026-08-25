@@ -116,6 +116,14 @@ fn print_events(mut rx: tokio::sync::broadcast::Receiver<WorkflowEvent>) {
                     WorkflowEvent::StepProgress { step_id, progress } => {
                         println!("  [event] StepProgress {}: {:?}", step_id, progress);
                     }
+                    WorkflowEvent::TextDelta { step_id, text } => {
+                        print!("{}", text);
+                        let _ = step_id; // step_id omitted in output
+                    }
+                    WorkflowEvent::ThinkingDelta { step_id, thinking } => {
+                        print!("\x1b[2m{}\x1b[0m", thinking);
+                        let _ = step_id;
+                    }
                 },
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
