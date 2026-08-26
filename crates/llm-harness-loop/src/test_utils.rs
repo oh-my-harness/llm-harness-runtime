@@ -311,9 +311,8 @@ impl MockResponse {
     }
 
     /// Like [`MockResponse::tool_use`] but terminates with `EndTurn` instead of
-    /// `ToolUse`. Used to simulate Anthropic-style providers that return a
-    /// `structured_result` tool_use block as a terminal structured output
-    /// (no tool execution expected).
+    /// `ToolUse`. Used to simulate providers and OpenAI-compatible gateways that
+    /// emit tool-call content with an inconsistent terminal stop reason.
     pub fn tool_use_end_turn(tool_use_id: &str, tool_name: &str, args_json: &str) -> Self {
         let id = tool_use_id.to_owned();
         let name = tool_name.to_owned();

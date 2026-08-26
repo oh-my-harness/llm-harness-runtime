@@ -2832,6 +2832,35 @@ mod tests {
                 "ToolUse id '{id}' has no paired ToolResult in the second request — trajectory integrity violated"
             );
         }
+        // The mismatched provider stop reason must not commit the tool turn as
+        // FinalAnswer. Consumers rely on FinalAnswer being the last assistant
+        // message boundary in a run.
+        let completed_messages: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::MessageEnd {
+                    message,
+                    discarded: false,
+                    ..
+                } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completed_messages.len(),
+            2,
+            "tool progress and final answer must each close one message"
+        );
+        assert_eq!(
+            completed_messages[0].kind,
+            AssistantMessageKind::Progress,
+            "a message containing ToolUse cannot be committed as FinalAnswer"
+        );
+        assert_eq!(
+            completed_messages[1].kind,
+            AssistantMessageKind::FinalAnswer,
+            "the post-tool response must remain the only final answer"
+        );
     }
 
     #[tokio::test]

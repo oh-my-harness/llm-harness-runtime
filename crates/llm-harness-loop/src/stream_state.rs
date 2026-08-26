@@ -142,7 +142,15 @@ impl StreamingState {
             AdapterEvent::MessageStop { stop_reason, usage } => {
                 let content = self.build_final_content();
                 let stop_reason = convert_stop_reason(stop_reason);
-                let kind = if stop_reason == StopReason::ToolUse {
+                // Some OpenAI-compatible providers return EndTurn/Stop even
+                // when the completed message contains tool calls. The content
+                // is the authoritative signal for whether the agent loop must
+                // continue; committing such a message as FinalAnswer would
+                // allow a later MessageStart after a terminal message boundary.
+                let contains_tool_use = content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+                let kind = if contains_tool_use || stop_reason == StopReason::ToolUse {
                     AssistantMessageKind::Progress
                 } else {
                     match self.terminal_text_classification {
@@ -538,6 +546,46 @@ mod tests {
                 assert_eq!(signature.as_deref(), Some("test-signature-abc"));
             }
         }
+    }
+
+    #[test]
+    fn tool_use_block_with_end_turn_emits_progress_not_final_answer() {
+        let mut s = make_state();
+        s.process(AdapterEvent::ContentStart {
+            index: 0,
+            kind: ContentKind::ToolInvocation {
+                id: "call_1".into(),
+                name: "echo".into(),
+            },
+        });
+        s.process(AdapterEvent::ToolDelta {
+            index: 0,
+            arguments: r#"{"value":"ok"}"#.into(),
+        });
+        s.process(AdapterEvent::ContentStop {
+            index: 0,
+            signature: None,
+        });
+
+        let events = s.process(AdapterEvent::MessageStop {
+            stop_reason: AdapterStop::EndTurn,
+            usage: Usage::default(),
+        });
+        let msg_end = events
+            .iter()
+            .find(|event| matches!(event, AgentEvent::MessageEnd { .. }))
+            .expect("MessageStop must emit MessageEnd");
+
+        if let AgentEvent::MessageEnd { message, .. } = msg_end {
+            assert_eq!(message.kind, AssistantMessageKind::Progress);
+            assert!(matches!(message.stop_reason, Some(StopReason::EndTurn)));
+            assert!(message.content.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolUse { name, .. } if name == "echo"
+            )));
+        }
+        assert!(msg_end.as_progress().is_some());
+        assert!(msg_end.as_final_answer().is_none());
     }
 
     #[test]
