@@ -753,4 +753,83 @@ mod tests {
         // Phase must still reset to Idle even on error.
         assert_eq!(agent.state().phase, AgentPhase::Idle);
     }
+
+    /// Issue #29: when a non-OpenAI model returns tool call arguments with
+    /// invalid JSON, the agent must NOT crash. The parse error is embedded
+    /// in the tool args as a degradation JSON, the tool executes, and its
+    /// result feeds back to the model for self-correction.
+    #[tokio::test]
+    async fn invalid_tool_args_json_recovers_instead_of_crashing() {
+        use std::sync::atomic::Ordering;
+
+        struct EchoTool;
+        impl Tool for EchoTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echoes input"
+            }
+            fn parameters_schema(&self) -> &serde_json::Value {
+                use serde_json::json;
+                static SCHEMA: std::sync::LazyLock<serde_json::Value> =
+                    std::sync::LazyLock::new(|| {
+                        json!({
+                            "type": "object",
+                            "properties": { "msg": { "type": "string" } },
+                            "required": ["msg"]
+                        })
+                    });
+                &SCHEMA
+            }
+            fn execute<'a>(
+                &'a self,
+                _args: serde_json::Value,
+                _ctx: &'a ToolContext,
+            ) -> futures::future::BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                Box::pin(async {
+                    Ok(ToolResult::full(
+                        vec![DataBlock::text("ok")],
+                        serde_json::Value::Null,
+                        false,
+                    ))
+                })
+            }
+        }
+
+        // First response: tool_use with broken JSON (missing closing brace).
+        // Second response: clean text — the model "self-corrects" after
+        // receiving the tool result containing the parse error.
+        let client = Arc::new(MockLlmClient::new(vec![
+            MockResponse::tool_use("bad-1", "echo", r#"{"msg":"hello""#),
+            MockResponse::text("recovered"),
+        ]));
+        let opts = AgentOptions {
+            tools: vec![Arc::new(EchoTool) as Arc<dyn Tool>],
+            ..AgentOptions::new("test-model")
+        };
+        let agent = Agent::new(client.clone() as Arc<dyn LlmClient>, opts);
+
+        let result = agent.prompt("echo hello").await;
+
+        // After the fix: prompt() returns Ok — no fatal error.
+        assert!(
+            result.is_ok(),
+            "expected agent to recover from invalid tool args, got {result:?}"
+        );
+        assert_eq!(agent.state().phase, AgentPhase::Idle);
+        // No error_message should be set.
+        assert!(
+            agent.state().error_message.is_none(),
+            "expected no error_message, got {:?}",
+            agent.state().error_message
+        );
+        // Two LLM calls: broken tool call + recovery text response.
+        assert_eq!(
+            client.call_count.load(Ordering::SeqCst),
+            2,
+            "expected 2 LLM calls (broken tool call + recovery), got {}",
+            client.call_count.load(Ordering::SeqCst)
+        );
+    }
 }

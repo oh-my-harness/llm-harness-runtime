@@ -130,16 +130,11 @@ impl StreamingState {
                     self.reasoning_signatures.insert(index, sig);
                 }
                 if let Some((id, _, args)) = self.tool_blocks.get(&index) {
-                    let (parsed, parse_error) = parse_tool_args(id, args);
-                    let mut events = Vec::new();
-                    if let Some(err) = parse_error {
-                        events.push(err);
-                    }
-                    events.push(AgentEvent::ToolCallEnd {
+                    let parsed = parse_tool_args(args);
+                    vec![AgentEvent::ToolCallEnd {
                         tool_use_id: id.clone(),
                         args: parsed,
-                    });
-                    events
+                    }]
                 } else {
                     vec![]
                 }
@@ -260,18 +255,23 @@ impl StreamingState {
     }
 }
 
-fn parse_tool_args(tool_use_id: &str, args: &str) -> (serde_json::Value, Option<AgentEvent>) {
+fn parse_tool_args(args: &str) -> serde_json::Value {
     // Some LLMs send empty string for no-arg tools; treat as empty object.
     let effective = if args.trim().is_empty() { "{}" } else { args };
-    match serde_json::from_str(effective) {
-        Ok(value) => (value, None),
-        Err(err) => (
-            serde_json::Value::Null,
-            Some(AgentEvent::Error(AgentError::Internal(format!(
-                "failed to parse tool args for {tool_use_id}: {err}"
-            )))),
-        ),
-    }
+    serde_json::from_str(effective).unwrap_or_else(|err| {
+        // Graceful degradation: non-OpenAI models (GLM, DeepSeek, Qwen, etc.)
+        // occasionally emit tool-call arguments with invalid JSON (unescaped
+        // quotes, truncation, non-ASCII keys). Returning an Error event here
+        // would crash the agent loop via loop_error / error_message pollution
+        // (issue #29). Instead, surface the parse error inside the args JSON
+        // itself — consistent with build_final_content's degradation path —
+        // so the tool executes, its result feeds back to the model, and the
+        // loop continues normally.
+        serde_json::json!({
+            "_parse_error": err.to_string(),
+            "raw": args,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -391,7 +391,11 @@ mod tests {
     }
 
     #[test]
-    fn invalid_tool_args_emit_diagnostic_before_tool_call_end() {
+    fn invalid_tool_args_emit_degraded_json_without_error_event() {
+        // Issue #29: invalid tool-call JSON must NOT produce an AgentEvent::Error.
+        // Instead, the parse error is embedded in the args as a degradation JSON
+        // (consistent with build_final_content), so the loop continues and the
+        // tool result feeds back to the model for self-correction.
         let mut s = make_state();
         s.process(AdapterEvent::ContentStart {
             index: 0,
@@ -409,14 +413,19 @@ mod tests {
             signature: None,
         });
 
-        assert!(
-            matches!(&events[0], AgentEvent::Error(AgentError::Internal(msg))
-            if msg.contains("failed to parse tool args for c1"))
-        );
-        assert!(
-            matches!(&events[1], AgentEvent::ToolCallEnd { tool_use_id, args }
-            if tool_use_id == "c1" && args.is_null())
-        );
+        // Exactly one event: ToolCallEnd with degraded args (no Error event).
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::ToolCallEnd { tool_use_id, args } => {
+                assert_eq!(tool_use_id, "c1");
+                assert!(
+                    args.get("_parse_error").is_some(),
+                    "expected _parse_error field in degraded args, got {args}"
+                );
+                assert_eq!(args["raw"], r#"{"cmd":"ls""#);
+            }
+            other => panic!("expected ToolCallEnd, got {other:?}"),
+        }
     }
 
     #[test]
