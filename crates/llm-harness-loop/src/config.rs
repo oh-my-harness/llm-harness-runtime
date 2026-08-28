@@ -132,9 +132,10 @@ pub struct LoopConfig {
     pub final_answer_validator: Option<Arc<dyn FinalAnswerValidator>>,
 
     // === Reactive injection ===
-    /// 在 turn 间注入的消息（转向）。
+    /// 在 turn 间注入的消息（转向）。turn 边界与自然停止时都会 drain；
+    /// 停止时剩余消息会触发额外一轮，而不是随 channel 一起丢失。
     pub steer_rx: Option<mpsc::Receiver<AgentMessage>>,
-    /// loop 自然停止后逐个处理的后续消息。
+    /// loop 自然停止后逐个处理的后续消息；每条触发一次新的 run。
     pub follow_up_rx: Option<mpsc::Receiver<AgentMessage>>,
 
     // === Retry ===

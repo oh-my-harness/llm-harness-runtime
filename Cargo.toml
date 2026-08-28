@@ -3,6 +3,7 @@ members = [
     "crates/llm-harness-types",
     "crates/llm-harness-loop",
     "crates/llm-harness-agent",
+    "crates/llm-harness-agent-team",
     # runtime
     "crates/llm-harness-platform",
     "crates/llm-harness-subagents",
@@ -54,6 +55,7 @@ llm-harness-trace-otel = { path = "crates/llm-harness-trace-otel" }
 llm-harness-live-tests = { path = "crates/llm-harness-live-tests" }
 llm-harness-inspector = { path = "crates/llm-harness-inspector" }
 llm-harness-sandbox = { path = "crates/llm-harness-sandbox" }
+llm-harness-agent-team = { path = "crates/llm-harness-agent-team" }
 # API adapter — separate repo
 llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "193117cbb8398aadeca74a925cfd699617f8c861" }
 

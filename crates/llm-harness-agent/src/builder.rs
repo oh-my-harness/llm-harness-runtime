@@ -218,6 +218,11 @@ impl HarnessBuilder {
         }
     }
 
+    /// The initial model ID this builder was created with.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     /// Install a plugin, accumulating its contributions.
     ///
     /// Plugins contribute tools, hooks, skills, and templates. Contributions
@@ -677,21 +682,26 @@ impl HarnessBuilder {
         Ok((client, opts))
     }
 
-    /// Resolve an LLM provider for the given model ID.
+    /// Resolve the LLM client whose pattern best matches `model`, if any.
     ///
-    /// Selection order:
+    /// Selection order mirrors [`HarnessBuildError::NoMatchingProvider`]
+    /// semantics documented on [`HarnessBuilder::provider`]:
     /// 1. Exact pattern match
     /// 2. Longest-pattern glob match
-    /// 3. Error if no match
-    fn resolve_provider(&self, model: &str) -> Result<Arc<dyn LlmClient>, HarnessBuildError> {
+    /// 3. `None` if nothing matches
+    ///
+    /// Returns `None` when no providers are registered at all — callers
+    /// wanting an error should use [`HarnessBuilder::build`], which reports
+    /// `NoProvider` / `NoMatchingProvider` with full context.
+    pub fn provider_for(&self, model: &str) -> Option<Arc<dyn LlmClient>> {
         if self.providers.is_empty() {
-            return Err(HarnessBuildError::NoProvider);
+            return None;
         }
 
         // First pass: exact match.
         for matcher in &self.providers {
             if !matcher.is_glob && matcher.matches(model) {
-                return Ok(matcher.client.clone());
+                return Some(matcher.client.clone());
             }
         }
 
@@ -708,13 +718,21 @@ impl HarnessBuilder {
             }
         }
 
-        if let Some(matcher) = best_match {
-            return Ok(matcher.client.clone());
-        }
+        best_match.map(|m| m.client.clone())
+    }
 
-        Err(HarnessBuildError::NoMatchingProvider {
-            model: model.to_string(),
-        })
+    /// Resolve an LLM provider for the given model ID.
+    ///
+    /// Selection order: exact pattern match, then longest-pattern glob
+    /// match, then `NoMatchingProvider` error.
+    fn resolve_provider(&self, model: &str) -> Result<Arc<dyn LlmClient>, HarnessBuildError> {
+        if self.providers.is_empty() {
+            return Err(HarnessBuildError::NoProvider);
+        }
+        self.provider_for(model)
+            .ok_or_else(|| HarnessBuildError::NoMatchingProvider {
+                model: model.to_string(),
+            })
     }
 
     /// Resolve the compaction model config, if set. When compaction_model is
@@ -844,6 +862,44 @@ mod tests {
             .provider("claude-*", glob);
         let resolved = builder.resolve_provider("claude-3-sonnet").unwrap();
         assert!(Arc::ptr_eq(&resolved, &exact));
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn provider_for_mirrors_resolve_provider_order() {
+        // None when no providers registered.
+        let builder = HarnessBuilder::new("claude-3-5-sonnet");
+        assert!(builder.provider_for("claude-3-5-sonnet").is_none());
+
+        let exact = mock_client();
+        let glob = mock_client();
+        let builder = HarnessBuilder::new("claude-3-5-sonnet")
+            .provider("claude-3-sonnet", exact.clone())
+            .provider("claude-*", glob.clone());
+
+        // Exact beats glob.
+        assert!(Arc::ptr_eq(
+            &builder.provider_for("claude-3-sonnet").unwrap(),
+            &exact
+        ));
+        // Glob matches the rest.
+        assert!(Arc::ptr_eq(
+            &builder.provider_for("claude-3-5-sonnet").unwrap(),
+            &glob
+        ));
+        // No match → None (not an error).
+        assert!(builder.provider_for("gpt-4o").is_none());
+
+        // Longest glob pattern wins.
+        let short = mock_client();
+        let long = mock_client();
+        let builder = HarnessBuilder::new("claude-3-5-sonnet")
+            .provider("c*", short)
+            .provider("claude-*", long.clone());
+        assert!(Arc::ptr_eq(
+            &builder.provider_for("claude-3-5-sonnet").unwrap(),
+            &long
+        ));
     }
 
     #[cfg(feature = "test-utils")]
