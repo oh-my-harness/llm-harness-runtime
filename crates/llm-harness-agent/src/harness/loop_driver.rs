@@ -1,7 +1,7 @@
 // loop_driver.rs — loop driving methods extracted from harness/mod.rs
 use std::sync::Arc;
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use llm_harness_loop::CompositeAfterRunHook;
 use llm_harness_loop::CompositePrepareNextTurnHook;
 use llm_harness_loop::{
@@ -170,7 +170,8 @@ impl AgentHarness {
             )
         };
 
-        // Wrap tools with HookedTool if before/after tool call hooks exist.
+        // Wrap tools with HookedTool if before/after tool call hooks exist,
+        // or any tool opts into duration reporting (the decorator owns both).
         let before = (!self.hooks.before_tool_call.is_empty()).then(|| {
             Arc::new(CompositeBeforeToolCallHook::new(
                 self.hooks.before_tool_call.clone(),
@@ -181,28 +182,29 @@ impl AgentHarness {
                 self.hooks.after_tool_call.clone(),
             )) as Arc<dyn AfterToolCallHook>
         });
-        let tools: Vec<Arc<dyn Tool>> = if before.is_some() || after.is_some() {
-            let wrapped: Vec<Arc<dyn Tool>> = tools
-                .into_iter()
-                .map(|t| {
-                    Arc::new(HookedTool {
-                        inner: t,
-                        before: before.clone(),
-                        after: after.clone(),
-                    }) as Arc<dyn Tool>
-                })
-                .collect();
-            // Persist wrapped tools to state so that `DefaultPrepareNextTurn`
-            // returns them on subsequent turns, preserving before/after hooks
-            // across the agent loop.
-            {
-                let mut inner = self.inner.lock().unwrap();
-                inner.state.tools.clone_from(&wrapped);
-            }
-            wrapped
-        } else {
-            tools
-        };
+        let tools: Vec<Arc<dyn Tool>> =
+            if before.is_some() || after.is_some() || tools.iter().any(|t| t.report_duration()) {
+                let wrapped: Vec<Arc<dyn Tool>> = tools
+                    .into_iter()
+                    .map(|t| {
+                        Arc::new(HookedTool {
+                            inner: t,
+                            before: before.clone(),
+                            after: after.clone(),
+                        }) as Arc<dyn Tool>
+                    })
+                    .collect();
+                // Persist wrapped tools to state so that `DefaultPrepareNextTurn`
+                // returns them on subsequent turns, preserving before/after hooks
+                // across the agent loop.
+                {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.state.tools.clone_from(&wrapped);
+                }
+                wrapped
+            } else {
+                tools
+            };
 
         // Build the default prepare_next_turn wrapper.
         let prepare_next_turn: Arc<dyn PrepareNextTurnHook> = Arc::new(DefaultPrepareNextTurn {
@@ -279,9 +281,49 @@ impl AgentHarness {
         };
         let _guard = self.enter_phase(HarnessPhase::Turning)?;
 
-        let result = self
-            .drive_loop(run, initial, steer_rx, follow_up_rx, abort, system_prompt)
-            .await;
+        // AssertUnwindSafe: state is Arc-backed shared state that stays
+        // consistent across a panic (see agent_runner.rs catch_unwind).
+        // Catching here guarantees state cleanup ALWAYS runs — the failure
+        // path in the block below, the panic path in the Err arm. The Err
+        // arm must clean up BEFORE re-raising: resume_unwind never returns,
+        // so anything after the match is skipped on that path. Skipping
+        // cleanup leaves state.tools holding the HookedTool wrappers and
+        // the next build_loop_config (panic-retry paths) double-wraps,
+        // double-firing hooks and appending duplicate duration annotations.
+        let result = match std::panic::AssertUnwindSafe(self.drive_loop(
+            run,
+            initial,
+            steer_rx,
+            follow_up_rx,
+            abort,
+            system_prompt,
+        ))
+        .catch_unwind()
+        .await
+        {
+            Ok(result) => result,
+            Err(panic_payload) => {
+                // resume_unwind never returns, so the shared cleanup block
+                // after this match is unreachable on the panic path. Restore
+                // state HERE — critically `tools`, whose wrapped value would
+                // make the next build_loop_config (agent-team's catch_unwind
+                // retry) double-wrap and double-fire hooks — then re-raise so
+                // callers observe the panic as before. Unlike the Err(result)
+                // branch, buffered session writes are KEPT: the panicked
+                // run's transcript entries must still flush (pinned by
+                // agent-team's run_panic_returns_messages_and_recovers_to_idle).
+                {
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.state.streaming_message = None;
+                    inner.state.pending_tool_calls.clear();
+                    inner.active_tool_names.clear();
+                    inner.current_abort = None;
+                    inner.state.tools_overwritten_mid_run = false;
+                    inner.state.tools = original_tools;
+                }
+                std::panic::resume_unwind(panic_payload);
+            }
+        };
 
         // Cleanup always runs, success or failure.
         {

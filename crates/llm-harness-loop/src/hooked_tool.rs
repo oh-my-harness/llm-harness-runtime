@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::future::BoxFuture;
 use llm_harness_types::*;
@@ -29,6 +30,9 @@ impl Tool for HookedTool {
     fn execution_mode(&self) -> ToolExecutionMode {
         self.inner.execution_mode()
     }
+    fn report_duration(&self) -> bool {
+        self.inner.report_duration()
+    }
 
     fn execute<'a>(
         &'a self,
@@ -55,10 +59,13 @@ impl Tool for HookedTool {
                 args
             };
 
+            let started = Instant::now();
             let result = self.inner.execute(effective_args.clone(), ctx).await;
+            let duration = started.elapsed();
 
-            // Apply after-hook
-            if let Some(h) = &self.after {
+            // Apply after-hook, then opt-in duration annotation. The annotation
+            // is applied AFTER user hooks so a Replace cannot wipe it.
+            let result = if let Some(h) = &self.after {
                 let after_ctx = AfterToolCallCtx {
                     run: &ctx.run,
                     assistant_message: &ctx.assistant_message,
@@ -66,16 +73,77 @@ impl Tool for HookedTool {
                     tool_name: self.inner.name(),
                     args: &effective_args,
                     result: &result,
+                    duration,
                     turn_index: ctx.turn_index,
                 };
-                return match h.on_complete(after_ctx).await {
+                match h.on_complete(after_ctx).await {
                     AfterToolCallDecision::Passthrough => result,
                     AfterToolCallDecision::Replace(replacement) => replacement,
-                };
-            }
+                }
+            } else {
+                result
+            };
 
-            result
+            if self.inner.report_duration() {
+                append_duration(result, duration)
+            } else {
+                result
+            }
         })
+    }
+}
+
+/// 将耗时格式化为人类可读文本（`812ms` / `2.35s`）。
+fn format_duration(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{:.2}s", d.as_secs_f64())
+    }
+}
+
+/// ToolFailure is ~144 bytes; these helpers take it by value so the lint
+/// would trip here. Mirrors agent-team's tools and failure_breaker.rs.
+#[allow(clippy::result_large_err)]
+fn append_duration(
+    result: Result<ToolResult, ToolFailure>,
+    duration: std::time::Duration,
+) -> Result<ToolResult, ToolFailure> {
+    let suffix = format!("[duration: {}]", format_duration(duration));
+    match result {
+        Ok(mut r) => {
+            mirror_duration(&mut r.session_projection, &suffix);
+            r.model_content.push(DataBlock::text(suffix));
+            Ok(r)
+        }
+        Err(mut f) => {
+            if !f.model_message.is_empty() && !f.model_message.ends_with('\n') {
+                f.model_message.push('\n');
+            }
+            f.model_message.push_str(&suffix);
+            mirror_duration(&mut f.session_projection, &suffix);
+            Err(f)
+        }
+    }
+}
+
+/// Mirror the duration annotation into the persisted projection so session
+/// replay/recall shows what the LLM saw. Same convention as source_tag.rs:
+/// "so source tags survive persistence and replay". `Full` materializes from
+/// `model_content` at persistence time and needs no mirror.
+fn mirror_duration(projection: &mut ToolSessionProjection, suffix: &str) {
+    match projection {
+        ToolSessionProjection::Full { .. } => {}
+        ToolSessionProjection::Projected { content, .. } => {
+            content.push(DataBlock::text(suffix.to_string()));
+        }
+        ToolSessionProjection::Ephemeral { summary, .. } => {
+            if !summary.is_empty() && !summary.ends_with('\n') {
+                summary.push('\n');
+            }
+            summary.push_str(suffix);
+        }
     }
 }
 
@@ -129,6 +197,303 @@ mod tests {
             turn_index: 0,
             assistant_message: Arc::new(crate::test_utils::test_assistant_message(vec![])),
             update_tx: tx,
+        }
+    }
+    /// report_duration=true 的 spy tool。
+    struct TimedTool {
+        fail: bool,
+        sleep_ms: u64,
+    }
+    impl Tool for TimedTool {
+        fn name(&self) -> &str {
+            "timed"
+        }
+        fn description(&self) -> &str {
+            "timed tool"
+        }
+        fn parameters_schema(&self) -> &serde_json::Value {
+            static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            S.get_or_init(|| serde_json::json!({}))
+        }
+        fn report_duration(&self) -> bool {
+            true
+        }
+        fn execute<'a>(
+            &'a self,
+            _: serde_json::Value,
+            _: &'a ToolContext,
+        ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+            let fail = self.fail;
+            let sleep_ms = self.sleep_ms;
+            Box::pin(async move {
+                if sleep_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                }
+                if fail {
+                    Err(ToolFailure::new("boom", "timed failure"))
+                } else {
+                    Ok(ToolResult::full(
+                        vec![DataBlock::text("ok")],
+                        serde_json::Value::Null,
+                        false,
+                    ))
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn duration_appended_when_opted_in() {
+        let t = HookedTool {
+            inner: Arc::new(TimedTool {
+                fail: false,
+                sleep_ms: 20,
+            }),
+            before: None,
+            after: None,
+        };
+        let r = t.execute(serde_json::json!({}), &make_ctx()).await.unwrap();
+        let last = r.model_content.last().unwrap();
+        let text = match last {
+            DataBlock::Text { text, .. } => text,
+            _ => panic!("expected text block"),
+        };
+        assert!(text.starts_with("[duration: "), "got: {text}");
+        assert!(!text.contains("[duration: 0ms]"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn duration_not_appended_by_default() {
+        let called = Arc::new(AtomicBool::new(false));
+        let t = HookedTool {
+            inner: Arc::new(SpyTool {
+                called,
+                terminate: false,
+            }),
+            before: None,
+            after: None,
+        };
+        let r = t.execute(serde_json::json!({}), &make_ctx()).await.unwrap();
+        assert_eq!(r.model_content.len(), 1, "no duration block expected");
+    }
+
+    #[tokio::test]
+    async fn duration_appended_on_failure() {
+        let t = HookedTool {
+            inner: Arc::new(TimedTool {
+                fail: true,
+                sleep_ms: 0,
+            }),
+            before: None,
+            after: None,
+        };
+        let err = t
+            .execute(serde_json::json!({}), &make_ctx())
+            .await
+            .unwrap_err();
+        assert!(
+            err.model_message.contains("\n[duration: "),
+            "expected \\n-prefixed duration suffix, got: {}",
+            err.model_message
+        );
+        assert!(
+            err.model_message.ends_with(']'),
+            "got: {}",
+            err.model_message
+        );
+    }
+
+    #[tokio::test]
+    async fn duration_survives_hook_replace() {
+        struct ReplaceHook;
+        impl AfterToolCallHook for ReplaceHook {
+            fn on_complete<'a>(
+                &'a self,
+                _: AfterToolCallCtx<'a>,
+            ) -> BoxFuture<'a, AfterToolCallDecision> {
+                Box::pin(async {
+                    AfterToolCallDecision::Replace(Ok(ToolResult::full(
+                        vec![DataBlock::text("replaced")],
+                        serde_json::Value::Null,
+                        false,
+                    )))
+                })
+            }
+        }
+        let t = HookedTool {
+            inner: Arc::new(TimedTool {
+                fail: false,
+                sleep_ms: 0,
+            }),
+            before: None,
+            after: Some(Arc::new(ReplaceHook)),
+        };
+        let r = t.execute(serde_json::json!({}), &make_ctx()).await.unwrap();
+        let blocks: Vec<&str> = r
+            .model_content
+            .iter()
+            .filter_map(|b| match b {
+                DataBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0], "replaced");
+        assert!(blocks[1].starts_with("[duration: "));
+    }
+
+    #[tokio::test]
+    async fn ctx_duration_excludes_hook_overhead() {
+        // hook 自身 sleep 250ms；ctx.duration 应只含 inner execute（~0ms）。
+        // bound 125ms：污染（计时含 hook）时必然 ≥250ms 超界，正常调度
+        // 抖动（µs 级）不可能触界。50ms/45ms 的旧边距在饱和 CI 上可被
+        // 去调度击穿。
+        struct SlowHook;
+        impl AfterToolCallHook for SlowHook {
+            fn on_complete<'a>(
+                &'a self,
+                ctx: AfterToolCallCtx<'a>,
+            ) -> BoxFuture<'a, AfterToolCallDecision> {
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    assert!(
+                        ctx.duration < std::time::Duration::from_millis(125),
+                        "ctx.duration should exclude hook time, got {:?}",
+                        ctx.duration
+                    );
+                    AfterToolCallDecision::Passthrough
+                })
+            }
+        }
+        let t = HookedTool {
+            inner: Arc::new(TimedTool {
+                fail: false,
+                sleep_ms: 0,
+            }),
+            before: None,
+            after: Some(Arc::new(SlowHook)),
+        };
+        let _ = t.execute(serde_json::json!({}), &make_ctx()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duration_appended_to_empty_model_content() {
+        struct EmptyTool;
+        impl Tool for EmptyTool {
+            fn name(&self) -> &str {
+                "empty"
+            }
+            fn description(&self) -> &str {
+                "empty tool"
+            }
+            fn parameters_schema(&self) -> &serde_json::Value {
+                static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+                S.get_or_init(|| serde_json::json!({}))
+            }
+            fn report_duration(&self) -> bool {
+                true
+            }
+            fn execute<'a>(
+                &'a self,
+                _: serde_json::Value,
+                _: &'a ToolContext,
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
+            }
+        }
+        let t = HookedTool {
+            inner: Arc::new(EmptyTool),
+            before: None,
+            after: None,
+        };
+        let r = t.execute(serde_json::json!({}), &make_ctx()).await.unwrap();
+        assert_eq!(r.model_content.len(), 1);
+        let DataBlock::Text { text, .. } = &r.model_content[0] else {
+            panic!("expected text block, got {:?}", r.model_content[0]);
+        };
+        assert!(text.starts_with("[duration: "), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn duration_mirrored_into_session_projection() {
+        // Projected: mirror appended to persisted content; Ephemeral: to
+        // summary; Full: no mirror (materializes from model_content).
+        struct ProjectedTool;
+        impl Tool for ProjectedTool {
+            fn name(&self) -> &str {
+                "projected"
+            }
+            fn description(&self) -> &str {
+                "projected tool"
+            }
+            fn parameters_schema(&self) -> &serde_json::Value {
+                static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+                S.get_or_init(|| serde_json::json!({}))
+            }
+            fn report_duration(&self) -> bool {
+                true
+            }
+            fn execute<'a>(
+                &'a self,
+                _: serde_json::Value,
+                _: &'a ToolContext,
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                Box::pin(async {
+                    Ok(ToolResult::projected(
+                        vec![DataBlock::text("body")],
+                        vec![DataBlock::text("body")],
+                        serde_json::Value::Null,
+                        false,
+                    ))
+                })
+            }
+        }
+        struct EphemeralTool;
+        impl Tool for EphemeralTool {
+            fn name(&self) -> &str {
+                "ephemeral"
+            }
+            fn description(&self) -> &str {
+                "ephemeral tool"
+            }
+            fn parameters_schema(&self) -> &serde_json::Value {
+                static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+                S.get_or_init(|| serde_json::json!({}))
+            }
+            fn report_duration(&self) -> bool {
+                true
+            }
+            fn execute<'a>(
+                &'a self,
+                _: serde_json::Value,
+                _: &'a ToolContext,
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                Box::pin(async {
+                    Ok(ToolResult::ephemeral(
+                        vec![DataBlock::text("body")],
+                        "Fetched page",
+                        serde_json::Value::Null,
+                        false,
+                    ))
+                })
+            }
+        }
+        for tool in [
+            Arc::new(ProjectedTool) as Arc<dyn Tool>,
+            Arc::new(EphemeralTool),
+        ] {
+            let t = HookedTool {
+                inner: tool,
+                before: None,
+                after: None,
+            };
+            let r = t.execute(serde_json::json!({}), &make_ctx()).await.unwrap();
+            let persisted = r.session_message("c1".into(), chrono::Utc::now()).unwrap();
+            let last = persisted.content.last().unwrap();
+            assert!(
+                matches!(last, DataBlock::Text { text, .. } if text.contains("[duration: ")),
+                "projection must carry duration for replay, got {last:?}"
+            );
         }
     }
 
@@ -324,5 +689,22 @@ mod tests {
             r.session_projection,
             ToolSessionProjection::Projected { .. }
         ));
+    }
+
+    #[test]
+    fn format_duration_threshold() {
+        assert_eq!(format_duration(std::time::Duration::from_millis(0)), "0ms");
+        assert_eq!(
+            format_duration(std::time::Duration::from_millis(999)),
+            "999ms"
+        );
+        assert_eq!(
+            format_duration(std::time::Duration::from_millis(1000)),
+            "1.00s"
+        );
+        assert_eq!(
+            format_duration(std::time::Duration::from_millis(2350)),
+            "2.35s"
+        );
     }
 }

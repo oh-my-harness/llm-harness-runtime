@@ -51,6 +51,10 @@ impl Tool for WebFetchTool {
         "web_fetch"
     }
 
+    fn report_duration(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Fetch a web page by URL and extract readable text content for citation-backed answers.\n\n\
          Use when: you have a specific URL from web_search results or a user-provided link; reading the full content of a documentation page, blog post, or article; extracting text from a web page for analysis.\n\

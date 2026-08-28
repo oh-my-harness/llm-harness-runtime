@@ -578,6 +578,21 @@ pub trait Tool: Send + Sync {
         ToolExecutionMode::Parallel
     }
 
+    /// 是否在返回给 LLM 的结果中附加执行耗时。默认 false。
+    ///
+    /// 返回 true 时，agent loop 的 `HookedTool` 装饰器会在结果末尾附加
+    /// `[duration: ...]` 标注（`ToolResult` 与 `ToolFailure` 都附加），
+    /// 供模型感知慢操作。默认 false——毫秒级工具加了是噪音。
+    ///
+    /// 契约：
+    /// - 仅当工具经 `HookedTool` 包装（agent loop 自动完成，或任何 hook
+    ///   存在时）才生效；直接把工具塞进自定义 `LoopConfig` 的用户拿不到标注。
+    /// - 标注在 after-hook 决策落地之后附加：hook 看到的是无标注结果，
+    ///   hook 的 `Replace` 也不能移除标注。
+    fn report_duration(&self) -> bool {
+        false
+    }
+
     /// 执行工具；返回结果或错误。
     fn execute<'a>(
         &'a self,

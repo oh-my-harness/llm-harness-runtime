@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_agent::{AgentHarness, AgentHarnessOptions};
 use llm_harness_loop::{
@@ -376,4 +377,157 @@ async fn model_change_reflected_in_session_context() {
 
     let ctx = h.build_context().await.unwrap();
     assert_eq!(ctx.last_model.as_deref(), Some("claude-opus-4-7"));
+}
+
+/// A tool that opts into duration reporting. Regression for issue #139:
+/// with NO hooks registered, loop_driver must still wrap tools with
+/// HookedTool because any tool opts in — otherwise the annotation silently
+/// never reaches the LLM.
+struct TimedEchoTool;
+
+impl Tool for TimedEchoTool {
+    fn name(&self) -> &str {
+        "timed_echo"
+    }
+    fn description(&self) -> &str {
+        "Echoes the input, reports duration"
+    }
+    fn parameters_schema(&self) -> &serde_json::Value {
+        static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+        S.get_or_init(|| serde_json::json!({}))
+    }
+    fn report_duration(&self) -> bool {
+        true
+    }
+    fn execute<'a>(
+        &'a self,
+        _args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+        Box::pin(async {
+            Ok(ToolResult::full(
+                vec![DataBlock::text("timed echo")],
+                serde_json::Value::Null,
+                false,
+            ))
+        })
+    }
+}
+
+/// A tool that opts into duration reporting and panics on the first N calls.
+/// Regression test for the panic-retry path: after a tool panic mid-run, the
+/// run_loop cleanup must still restore `state.tools`, otherwise the agent-team
+/// catch_unwind retry re-wraps the already-wrapped tools and double-fires
+/// hooks / double-appends duration annotations.
+struct PanicOnceTool {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl Tool for PanicOnceTool {
+    fn name(&self) -> &str {
+        "panic_once"
+    }
+    fn description(&self) -> &str {
+        "Panics on first call, succeeds on second"
+    }
+    fn parameters_schema(&self) -> &serde_json::Value {
+        static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+        S.get_or_init(|| serde_json::json!({}))
+    }
+    fn report_duration(&self) -> bool {
+        true
+    }
+    fn execute<'a>(
+        &'a self,
+        _args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+        Box::pin(async {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                panic!("tool blew up");
+            }
+            Ok(ToolResult::full(
+                vec![DataBlock::text("post-panic echo")],
+                serde_json::Value::Null,
+                false,
+            ))
+        })
+    }
+}
+
+#[tokio::test]
+async fn duration_annotation_wraps_tools_without_hooks() {
+    let responses = vec![
+        MockResponse::tool_use("call-1", "timed_echo", "{}"),
+        MockResponse::text("done"),
+    ];
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(TimedEchoTool)];
+    let h = make_harness_with_tools(responses, tools);
+
+    h.prompt("use timed echo").await.unwrap();
+
+    // The model-visible tool result (captured request) must carry the
+    // annotation — proves the wrap happened with zero hooks configured.
+    let ctx = h.build_context().await.unwrap();
+    let annotated = ctx.messages.iter().any(|m| {
+        if let AgentMessage::ToolResult(tr) = m {
+            tr.content
+                .iter()
+                .any(|c| matches!(c, DataBlock::Text { text, .. } if text.contains("[duration: ")))
+        } else {
+            false
+        }
+    });
+    assert!(
+        annotated,
+        "duration annotation missing from persisted tool result: {ctx:?}"
+    );
+}
+
+/// Regression for the panic-retry path: a tool panic mid-run must NOT leave
+/// HookedTool wrappers in `state.tools`, otherwise the next run (agent-team's
+/// catch_unwind retry re-runs the harness) re-wraps the already-wrapped
+/// tools — double-firing hooks and double-appending duration annotations.
+#[tokio::test]
+async fn panic_mid_run_does_not_double_wrap_tools() {
+    // Run 1: tool_use → panic. Run 2: same tool_use → succeeds, then text.
+    let responses = vec![
+        MockResponse::tool_use("call-1", "panic_once", "{}"),
+        MockResponse::tool_use("call-2", "panic_once", "{}"),
+        MockResponse::text("done"),
+    ];
+    let tool = Arc::new(PanicOnceTool {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let h = make_harness_with_tools(responses, vec![tool.clone()]);
+
+    // Run 1 panics inside the tool (propagates through HookedTool →
+    // execute_tool_batch's join_all → drive_loop → run_loop's catch_unwind,
+    // which resume_unwinds). agent-team wraps harness.run in its own
+    // catch_unwind — mirror that here.
+    let run1 = std::panic::AssertUnwindSafe(h.prompt("trigger the panic tool"))
+        .catch_unwind()
+        .await;
+    assert!(run1.is_err(), "expected run to panic");
+
+    // Run 2 (agent-team's post-panic retry re-runs the harness the same way).
+    h.prompt("retry after panic").await.unwrap();
+
+    // The second run's tool result must carry EXACTLY ONE duration
+    // annotation: double wrapping would append two.
+    let ctx = h.build_context().await.unwrap();
+    let mut annotations = 0;
+    for m in &ctx.messages {
+        if let AgentMessage::ToolResult(tr) = m {
+            annotations += tr
+                .content
+                .iter()
+                .filter(|c| matches!(c, DataBlock::Text { text, .. } if text.starts_with("[duration: ")))
+            .count();
+        }
+    }
+    assert_eq!(
+        annotations, 1,
+        "expected exactly one duration annotation, got {annotations}: {ctx:?}"
+    );
 }
