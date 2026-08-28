@@ -68,6 +68,9 @@ pub struct ExecutorCtx<'a> {
     pub abort: CancellationToken,
     /// 共享可变上下文。executor 可读写 KV，跨 step 传递业务数据。
     pub context: Arc<Mutex<WorkflowContext>>,
+    /// engine 的事件广播 sender 克隆，供 executor 在 execute() 返回前
+    /// 推送中间事件（如 LLM streaming TextDelta）。
+    pub event_tx: tokio::sync::broadcast::Sender<crate::workflow::engine::WorkflowEvent>,
 }
 
 /// Deterministic executor for a non-LLM workflow step.
@@ -1314,6 +1317,7 @@ mod tests {
             env: noop_env(),
             abort: CancellationToken::new(),
             context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+            event_tx: tokio::sync::broadcast::channel(1).0,
         }
     }
 
@@ -1682,6 +1686,7 @@ mod tests {
             env: env.clone(),
             abort: CancellationToken::new(),
             context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+            event_tx: tokio::sync::broadcast::channel(1).0,
         };
         let executor = ShellExecutor::new(["python"]);
 
@@ -1748,6 +1753,7 @@ mod tests {
             env: env.clone(),
             abort: CancellationToken::new(),
             context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+            event_tx: tokio::sync::broadcast::channel(1).0,
         };
         let executor = ShellExecutor::new(["echo"]).with_max_output_bytes(8);
 
@@ -1780,6 +1786,7 @@ mod tests {
             env: env.clone(),
             abort: CancellationToken::new(),
             context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+            event_tx: tokio::sync::broadcast::channel(1).0,
         };
         let executor = ShellExecutor::new(["echo"]).with_max_output_bytes(40);
 
@@ -1826,6 +1833,7 @@ mod tests {
             env: env.clone(),
             abort: CancellationToken::new(),
             context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+            event_tx: tokio::sync::broadcast::channel(1).0,
         };
         let executor = ShellExecutor::new(["echo"]).with_max_output_bytes(8);
 
@@ -1864,6 +1872,7 @@ mod tests {
             env: env.clone(),
             abort: CancellationToken::new(),
             context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+            event_tx: tokio::sync::broadcast::channel(1).0,
         };
         let executor = ShellExecutor::new(["echo"]).with_max_output_bytes(8);
 
@@ -1900,6 +1909,7 @@ mod tests {
             env: env.clone(),
             abort: CancellationToken::new(),
             context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+            event_tx: tokio::sync::broadcast::channel(1).0,
         };
         let executor = ShellExecutor::new(["echo"]).with_max_output_bytes(60);
 
@@ -1944,6 +1954,7 @@ mod tests {
             env: env.clone(),
             abort: CancellationToken::new(),
             context: Arc::new(tokio::sync::Mutex::new(WorkflowContext::new())),
+            event_tx: tokio::sync::broadcast::channel(1).0,
         };
         let executor = ShellExecutor::new(["echo"]).with_max_output_bytes(8);
 

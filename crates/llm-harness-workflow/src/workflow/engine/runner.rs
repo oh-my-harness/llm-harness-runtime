@@ -1108,6 +1108,7 @@ impl super::WorkflowEngine {
             env,
             abort: step_abort.clone(),
             context: self.context.clone(),
+            event_tx: self.event_tx.clone(),
         };
         let cancellation_policy = executor.cancellation_policy();
         let recovery = executor.recover(&ctx);
