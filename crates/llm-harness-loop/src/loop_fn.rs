@@ -903,6 +903,23 @@ fn run_loop(
                 };
 
                 if should_stop {
+                    // Drain any steer messages that arrived after the last
+                    // turn boundary: the run is about to end, and leftover
+                    // steer messages would be lost with the channel. Treat
+                    // them like follow-ups — inject and continue for one
+                    // more turn so the model sees them.
+                    let mut steered = false;
+                    if let Some(ref mut rx) = config.steer_rx {
+                        while let Ok(steer_msg) = rx.try_recv() {
+                            ctx.messages.push(steer_msg.clone());
+                            new_messages.push(steer_msg);
+                            steered = true;
+                        }
+                    }
+                    if steered {
+                        turn_index += 1;
+                        continue 'main;
+                    }
                     // Check follow_up channel
                     if let Some(ref mut rx) = config.follow_up_rx
                         && let Ok(follow_up_msg) = rx.try_recv()
@@ -1861,6 +1878,67 @@ mod tests {
                 }
             });
             assert!(!has_stale, "stale steer message should have been discarded");
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_loop_drains_steer_at_natural_stop() {
+        // Regression: a steer message arriving after the final turn's
+        // boundary was previously dropped with the channel when the loop
+        // stopped. The stop path must drain steer_rx and run one more turn
+        // so the message reaches the model.
+        use tokio::sync::mpsc;
+        let (steer_tx, steer_rx) = mpsc::channel(16);
+        let steer_msg = AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::Text {
+                text: "late steer".into(),
+            }],
+            timestamp: chrono::Utc::now(),
+        });
+        steer_tx.send(steer_msg).await.unwrap();
+        drop(steer_tx); // no further steers — the loop must stop after turn 1
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::text("first answer"),
+            MockResponse::text("second answer"),
+        ]);
+        cfg.steer_rx = Some(steer_rx);
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "no errors expected: {events:?}"
+        );
+        let agent_end = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+            .unwrap();
+        if let AgentEvent::AgentEnd { new_messages } = agent_end {
+            let has_steer = new_messages.iter().any(|m| {
+                if let AgentMessage::User(u) = m {
+                    u.content
+                        .iter()
+                        .any(|c| matches!(c, ContentBlock::Text { text } if text == "late steer"))
+                } else {
+                    false
+                }
+            });
+            assert!(
+                has_steer,
+                "steer message must survive the run: {new_messages:?}"
+            );
+            assert_eq!(
+                client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+                2
+            );
         }
     }
 

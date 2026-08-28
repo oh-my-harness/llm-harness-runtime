@@ -106,7 +106,7 @@
 //!
 //! | Field | Type | Notes |
 //! |-------|------|-------|
-//! | `steer_rx` | `Option<Receiver<AgentMessage>>` | Injects messages between turns to redirect the agent mid-run. Drained at turn boundaries. |
+//! | `steer_rx` | `Option<Receiver<AgentMessage>>` | Injects messages between turns to redirect the agent mid-run. Drained at turn boundaries and at natural stop (leftovers run one more turn instead of being lost). |
 //! | `follow_up_rx` | `Option<Receiver<AgentMessage>>` | Queued messages processed after the loop naturally stops. Each triggers a new run. |
 //!
 //! ## Final Answer Modes
