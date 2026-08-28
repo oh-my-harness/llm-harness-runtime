@@ -300,6 +300,7 @@ mod tests {
             tool_name,
             args: &serde_json::Value::Null,
             result,
+            duration: std::time::Duration::from_millis(42),
             turn_index: 0,
         }
     }

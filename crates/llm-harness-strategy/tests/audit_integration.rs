@@ -47,6 +47,7 @@ async fn audit_hook_writes_to_jsonl_with_valid_hash_chain() {
             tool_name,
             args: &args,
             result: &result,
+            duration: std::time::Duration::from_millis(42),
             turn_index: i,
         };
         hook.on_complete(after_ctx).await;

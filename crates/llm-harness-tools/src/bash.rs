@@ -48,6 +48,10 @@ impl Tool for BashTool {
         "bash"
     }
 
+    fn report_duration(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Execute a shell command and return its merged stdout/stderr output.\n\n\
          Use when: running CLI tools, scripts, or git commands; checking build/test results; inspecting system state.\n\

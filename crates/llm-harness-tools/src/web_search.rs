@@ -83,6 +83,10 @@ impl Tool for WebSearchTool {
         "web_search"
     }
 
+    fn report_duration(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Search the web and return ranked results with titles, URLs, and snippets.\n\n\
          Use when: answering questions about current events, recent releases, or externally verifiable facts; finding documentation, papers, or library APIs; looking up real-world entities, products, or people.\n\

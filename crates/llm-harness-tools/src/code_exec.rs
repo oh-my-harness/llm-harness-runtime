@@ -52,6 +52,10 @@ impl Tool for CodeExecTool {
         "code_exec"
     }
 
+    fn report_duration(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &str {
         "Execute code in a temporary directory and return stdout, stderr, and exit code.\n\n\
          Use when: running quick computations or data processing; testing code snippets; generating output that feeds into later steps; performing operations not covered by other tools.\n\

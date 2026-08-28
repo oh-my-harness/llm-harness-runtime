@@ -114,6 +114,7 @@ impl AfterToolCallHook for CompositeAfterToolCallHook {
                     tool_name: ctx.tool_name,
                     args: ctx.args,
                     result: &current_result,
+                    duration: ctx.duration,
                     turn_index: ctx.turn_index,
                 };
 
@@ -587,6 +588,7 @@ mod tests {
             tool_name: "web_search",
             args: &serde_json::Value::Null,
             result: &result,
+            duration: std::time::Duration::from_millis(42),
             turn_index: 0,
         };
 

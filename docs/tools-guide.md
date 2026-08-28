@@ -213,6 +213,8 @@ builder
 
 截断时：完整输出持久化到临时文件 → 返回 head + `... [truncated N bytes, full output at /tmp/...]` + tail → LLM 可通过 `read` 工具读取完整输出。
 
+**执行耗时标注**：`bash`、`code_exec`、`web_search`、`web_fetch` 的结果会附加 `[duration: ...]`（如 `[duration: 2.35s]`，1s 以内显示毫秒），由 agent loop 的工具装饰器按工具 opt-in 附加，成功与失败结果均携带。
+
 ---
 
 ## 安全注意事项

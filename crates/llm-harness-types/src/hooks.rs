@@ -171,6 +171,8 @@ pub struct AfterToolCallCtx<'a> {
     pub args: &'a serde_json::Value,
     /// 工具执行结果。
     pub result: &'a Result<ToolResult, ToolFailure>,
+    /// 工具执行耗时（仅工具本体执行，不含 hook 开销）。
+    pub duration: std::time::Duration,
     /// 当前轮次索引。
     pub turn_index: u32,
 }
