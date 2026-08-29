@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use llm_adapter::types::{
-    ImageSource as AdapterImageSource, RequestContent, ResponseContent, StopReason as AdapterStop,
-    ToolDef, ToolInvocation, Usage, UsageProvenance as AdapterUsageProvenance,
+    DocumentSource as AdapterDocumentSource, ImageSource as AdapterImageSource, RequestContent,
+    ResponseContent, StopReason as AdapterStop, ToolDef, ToolInvocation, Usage,
+    UsageProvenance as AdapterUsageProvenance,
 };
 use llm_harness_types::*;
 
@@ -39,21 +40,37 @@ pub(crate) fn tools_to_defs(tools: &[Arc<dyn Tool>]) -> Vec<ToolDef> {
         .collect()
 }
 
-/// Convert a harness ContentBlock to adapter RequestContent (for User/Tool messages).
-/// Skips Thinking and ToolUse blocks (not valid in user messages).
-pub(crate) fn content_block_to_request(cb: &ContentBlock) -> Option<RequestContent> {
+/// Convert a harness ContentBlock to adapter RequestContent (for User/Tool
+/// messages). Returns `Ok(None)` for blocks that are simply not valid in
+/// request messages (Thinking, ToolUse); Blob document handles are a hard
+/// error (silent content loss is worse than a failed run).
+pub(crate) fn content_block_to_request(
+    cb: &ContentBlock,
+) -> Result<Option<RequestContent>, AgentError> {
     match cb {
-        ContentBlock::Text { text } => Some(RequestContent::Text(text.clone())),
+        ContentBlock::Text { text } => Ok(Some(RequestContent::Text(text.clone()))),
         ContentBlock::Image { source } => {
-            let src = match source {
-                ImageSource::Base64 { media_type, data } => AdapterImageSource::Base64 {
+            Ok(Some(RequestContent::Image(image_source_to_adapter(source))))
+        }
+        ContentBlock::Document {
+            media_type, data, ..
+        } => match data {
+            BinarySource::Base64 { data } => Ok(Some(RequestContent::Document(
+                AdapterDocumentSource::Base64 {
                     media_type: media_type.clone(),
                     data: data.clone(),
                 },
-            };
-            Some(RequestContent::Image(src))
-        }
-        ContentBlock::Thinking { .. } | ContentBlock::ToolUse { .. } => None,
+            ))),
+            BinarySource::Url { url } => {
+                Ok(Some(RequestContent::Document(AdapterDocumentSource::Url {
+                    url: url.clone(),
+                })))
+            }
+            BinarySource::Blob { .. } => Err(AgentError::Internal(
+                "blob document handles cannot cross the provider boundary".into(),
+            )),
+        },
+        ContentBlock::Thinking { .. } | ContentBlock::ToolUse { .. } => Ok(None),
     }
 }
 
@@ -61,18 +78,34 @@ pub(crate) fn content_block_to_request(cb: &ContentBlock) -> Option<RequestConte
 pub(crate) fn data_block_to_request(cb: &DataBlock) -> Result<RequestContent, AgentError> {
     match cb {
         DataBlock::Text { text, .. } => Ok(RequestContent::Text(text.clone())),
-        DataBlock::Image { source } => {
-            let src = match source {
-                ImageSource::Base64 { media_type, data } => AdapterImageSource::Base64 {
+        DataBlock::Image { source } => Ok(RequestContent::Image(image_source_to_adapter(source))),
+        DataBlock::Document {
+            media_type, data, ..
+        } => match data {
+            BinarySource::Base64 { data } => {
+                Ok(RequestContent::Document(AdapterDocumentSource::Base64 {
                     media_type: media_type.clone(),
                     data: data.clone(),
-                },
-            };
-            Ok(RequestContent::Image(src))
-        }
-        DataBlock::Document { media_type, .. } => Err(AgentError::Internal(format!(
-            "provider adapter does not support document data blocks ({media_type})"
-        ))),
+                }))
+            }
+            BinarySource::Url { url } => Ok(RequestContent::Document(AdapterDocumentSource::Url {
+                url: url.clone(),
+            })),
+            BinarySource::Blob { .. } => Err(AgentError::Internal(
+                "blob document handles cannot cross the provider boundary".into(),
+            )),
+        },
+    }
+}
+
+/// Map a harness image source to the adapter's canonical image source.
+pub(crate) fn image_source_to_adapter(source: &ImageSource) -> AdapterImageSource {
+    match source {
+        ImageSource::Base64 { media_type, data } => AdapterImageSource::Base64 {
+            media_type: media_type.clone(),
+            data: data.clone(),
+        },
+        ImageSource::Url { url } => AdapterImageSource::Url { url: url.clone() },
     }
 }
 
@@ -96,6 +129,10 @@ pub(crate) fn content_block_to_response(cb: &ContentBlock) -> Option<ResponseCon
         }
         ContentBlock::Image { .. } => Some(ResponseContent::Text(
             "[image omitted: assistant image content is not supported in provider history]".into(),
+        )),
+        ContentBlock::Document { .. } => Some(ResponseContent::Text(
+            "[document omitted: assistant document content is not supported in provider history]"
+                .into(),
         )),
     }
 }
@@ -167,28 +204,12 @@ mod tests {
             BILLING_USAGE_PROFILE_VERSION
         );
         assert_eq!(
-            llm_adapter::types::BILLING_USAGE_PROFILE_DIGEST,
-            BILLING_USAGE_PROFILE_DIGEST
-        );
-        assert_eq!(
-            llm_adapter::types::BILLING_USAGE_PROFILE_CONTRACT,
-            BILLING_USAGE_PROFILE_CONTRACT
-        );
-        assert_eq!(
             llm_adapter::types::USAGE_REPORT_PROFILE_ID,
             USAGE_REPORT_PROFILE_ID
         );
         assert_eq!(
             llm_adapter::types::USAGE_REPORT_PROFILE_VERSION,
             USAGE_REPORT_PROFILE_VERSION
-        );
-        assert_eq!(
-            llm_adapter::types::USAGE_REPORT_PROFILE_DIGEST,
-            USAGE_REPORT_PROFILE_DIGEST
-        );
-        assert_eq!(
-            llm_adapter::types::USAGE_REPORT_PROFILE_CONTRACT,
-            USAGE_REPORT_PROFILE_CONTRACT
         );
     }
 
@@ -229,7 +250,7 @@ mod tests {
             text: "hello".into(),
         };
         assert!(
-            matches!(content_block_to_request(&cb), Some(RequestContent::Text(s)) if s == "hello")
+            matches!(content_block_to_request(&cb).unwrap(), Some(RequestContent::Text(s)) if s == "hello")
         );
     }
 
@@ -239,7 +260,7 @@ mod tests {
             thinking: "hm".into(),
             signature: None,
         };
-        assert!(content_block_to_request(&cb).is_none());
+        assert!(content_block_to_request(&cb).unwrap().is_none());
     }
 
     #[test]
@@ -290,5 +311,122 @@ mod tests {
             matches!(r, Some(ResponseContent::Text(text)) if text.contains("image omitted")),
             "assistant image blocks should not be silently dropped"
         );
+    }
+
+    #[test]
+    fn content_block_image_url_to_request() {
+        let cb = ContentBlock::Image {
+            source: ImageSource::Url {
+                url: "https://example.com/i.png".into(),
+            },
+        };
+        assert!(matches!(
+            content_block_to_request(&cb).unwrap(),
+            Some(RequestContent::Image(AdapterImageSource::Url { url: ref u }))
+                if u == "https://example.com/i.png"
+        ));
+    }
+
+    #[test]
+    fn data_block_image_url_bridges() {
+        let cb = DataBlock::Image {
+            source: ImageSource::Url {
+                url: "https://example.com/i.png".into(),
+            },
+        };
+        let out = data_block_to_request(&cb).unwrap();
+        assert!(matches!(
+            out,
+            RequestContent::Image(AdapterImageSource::Url { url: ref u })
+                if u == "https://example.com/i.png"
+        ));
+    }
+
+    #[test]
+    fn data_block_document_base64_bridges() {
+        let cb = DataBlock::Document {
+            name: Some("r.pdf".into()),
+            media_type: "application/pdf".into(),
+            data: BinarySource::Base64 {
+                data: "JVBERi0=".into(),
+            },
+        };
+        match data_block_to_request(&cb).unwrap() {
+            RequestContent::Document(AdapterDocumentSource::Base64 { media_type, data }) => {
+                assert_eq!(media_type, "application/pdf");
+                assert_eq!(data, "JVBERi0=");
+            }
+            other => panic!("expected Document Base64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn data_block_document_url_bridges() {
+        let cb = DataBlock::Document {
+            name: None,
+            media_type: "application/pdf".into(),
+            data: BinarySource::Url {
+                url: "https://example.com/r.pdf".into(),
+            },
+        };
+        assert!(matches!(
+            data_block_to_request(&cb).unwrap(),
+            RequestContent::Document(AdapterDocumentSource::Url { .. })
+        ));
+    }
+
+    #[test]
+    fn content_block_document_base64_to_request() {
+        let cb = ContentBlock::Document {
+            name: Some("doc.pdf".into()),
+            media_type: "application/pdf".into(),
+            data: BinarySource::Base64 {
+                data: "JVBERi0=".into(),
+            },
+        };
+        match content_block_to_request(&cb).unwrap() {
+            Some(RequestContent::Document(AdapterDocumentSource::Base64 { media_type, data })) => {
+                assert_eq!(media_type, "application/pdf");
+                assert_eq!(data, "JVBERi0=");
+            }
+            other => panic!("expected Document Base64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_block_document_url_to_request() {
+        let cb = ContentBlock::Document {
+            name: None,
+            media_type: "application/pdf".into(),
+            data: BinarySource::Url {
+                url: "https://example.com/doc.pdf".into(),
+            },
+        };
+        assert!(matches!(
+            content_block_to_request(&cb).unwrap(),
+            Some(RequestContent::Document(AdapterDocumentSource::Url { .. }))
+        ));
+    }
+
+    #[test]
+    fn content_block_document_blob_errors_not_silent() {
+        let cb = ContentBlock::Document {
+            name: None,
+            media_type: "application/pdf".into(),
+            data: BinarySource::Blob { id: "b1".into() },
+        };
+        // A user message carrying a blob document must fail the conversion,
+        // not silently drop the document from the outgoing request.
+        assert!(content_block_to_request(&cb).is_err());
+    }
+
+    #[test]
+    fn data_block_document_blob_still_errors() {
+        let cb = DataBlock::Document {
+            name: None,
+            media_type: "application/pdf".into(),
+            data: BinarySource::Blob { id: "b1".into() },
+        };
+        assert!(data_block_to_request(&cb).is_err());
     }
 }

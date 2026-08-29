@@ -32,6 +32,14 @@ mod inner {
     pub struct LiveProvider {
         pub openai: Option<LiveProviderEntry>,
         pub anthropic: Option<LiveProviderEntry>,
+        /// Official GLM endpoint (open.bigmodel.cn) — the reference endpoint
+        /// for document (`file_url`) tests; gateway `OPENAI_*` endpoints may
+        /// not support them.
+        pub glm: Option<LiveProviderEntry>,
+        /// SiliconFlow via the **Anthropic Messages protocol** (`/v1/messages`)
+        /// — exercises the adapter's Anthropic wire path against a non-Anthropic
+        /// model (Qwen-VL) without needing a Claude key.
+        pub siliconflow_anthropic: Option<LiveProviderEntry>,
     }
 
     impl LiveProvider {
@@ -74,7 +82,59 @@ mod inner {
                     }
                 });
 
-            LiveProvider { openai, anthropic }
+            let glm = env::var("BIGMODEL_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+                .map(|key| {
+                    let base_url = env::var("BIGMODEL_API_BASE")
+                        .unwrap_or_else(|_| "https://open.bigmodel.cn/api/paas/v4".to_string());
+                    let model =
+                        env::var("BIGMODEL_MODEL").unwrap_or_else(|_| "glm-5.3-flash".to_string());
+                    // GLM official URL has no /v1 prefix: strip a trailing
+                    // /vN segment and set the chat path to /chat/completions.
+                    let (base, chat_path) = match base_url.strip_suffix("/v4") {
+                        Some(b) => (b.to_string(), "/v4/chat/completions".to_string()),
+                        None => (base_url.clone(), "/v1/chat/completions".to_string()),
+                    };
+                    let client: Arc<dyn LlmClient> = Arc::new(
+                        llm_harness_loop::OpenAIProvider::builder(&key)
+                            .base_url(base)
+                            .chat_path(chat_path)
+                            .parse_reasoning_content(true)
+                            .tolerant_keepalive(true)
+                            .documents(true)
+                            .build(),
+                    );
+                    LiveProviderEntry {
+                        name: "glm".to_string(),
+                        model,
+                        client,
+                    }
+                });
+
+            let siliconflow_anthropic = env::var("SILICONFLOW_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+                .map(|key| {
+                    let base_url = env::var("SILICONFLOW_API_BASE")
+                        .unwrap_or_else(|_| "https://api.siliconflow.cn".to_string());
+                    let model = env::var("SILICONFLOW_ANTHROPIC_MODEL")
+                        .unwrap_or_else(|_| "Qwen/Qwen3-VL-8B-Instruct".to_string());
+                    let client: Arc<dyn LlmClient> =
+                        Arc::new(AnthropicProvider::builder(&key).base_url(&base_url).build());
+                    LiveProviderEntry {
+                        name: "siliconflow-anthropic".to_string(),
+                        model,
+                        client,
+                    }
+                });
+
+            LiveProvider {
+                openai,
+                anthropic,
+                glm,
+                siliconflow_anthropic,
+            }
         }
 
         /// Return all configured providers for parameterized testing.
@@ -84,6 +144,12 @@ mod inner {
                 out.push(e);
             }
             if let Some(e) = &self.anthropic {
+                out.push(e);
+            }
+            if let Some(e) = &self.glm {
+                out.push(e);
+            }
+            if let Some(e) = &self.siliconflow_anthropic {
                 out.push(e);
             }
             out

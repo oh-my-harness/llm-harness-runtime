@@ -89,6 +89,12 @@ impl MockExecutionEnv {
             .insert(normalized, content.as_bytes().to_vec());
     }
 
+    /// Seed raw binary bytes synchronously (test-setup helper).
+    pub fn write_binary_sync(&self, path: &Path, content: &[u8]) {
+        let normalized = self.normalize(path);
+        self.inner.lock().files.insert(normalized, content.to_vec());
+    }
+
     /// Seed a directory synchronously (test-setup helper).
     pub fn mkdir_sync(&self, path: &Path) {
         let normalized = self.normalize(path);

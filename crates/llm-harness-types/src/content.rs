@@ -11,6 +11,11 @@ pub enum ImageSource {
         /// Base64 编码的图片数据。
         data: String,
     },
+    /// 公网可访问的图片 URL。
+    Url {
+        /// 图片 URL。
+        url: String,
+    },
 }
 
 /// Binary data that is safe to pass through the runtime as data.
@@ -22,6 +27,8 @@ pub enum BinarySource {
     /// Opaque handle to a runtime-owned blob. Handles are intentionally not
     /// persistable in a Session projection.
     Blob { id: String },
+    /// Publicly accessible URL owned by the value.
+    Url { url: String },
 }
 
 /// External or tool-produced data that may be shown to a model.
@@ -98,6 +105,28 @@ pub enum ContentBlock {
         name: String,
         /// 工具调用参数（JSON）。
         input: serde_json::Value,
+    },
+    /// 文档内容（如 PDF），供支持文档输入的模型消费。
+    ///
+    /// 出现在用户消息（应用直发附件）与工具结果中。是否可发送由 provider
+    /// capability 决定：Anthropic 支持 URL/base64 `document` block，智谱系
+    /// 网关仅支持 URL `file_url`，多数网关不支持文档 part。
+    ///
+    /// 注意：`"type": "document"` 是 2026-08 新增的 serde tag。旧版本二进制
+    /// 读取含 document 块的新 session 会反序列化失败——与 `ImageSource::Url`
+    /// 同一演进策略（schema 前向不兼容，session 文件不做向后迁移）。
+    ///
+    /// 大小上限：与 [`DataBlock`] 不同，用户消息里的文档不做内联大小截断
+    /// （工具与 MCP 路径有 4 MiB cap，因为其内容来自 agent/第三方）。用户
+    /// 附件属于应用侧的信任边界——由应用自行限制附件大小。
+    Document {
+        /// 文件名（可选，展示用）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// MIME 类型，如 `"application/pdf"`。
+        media_type: String,
+        /// 文档数据来源。
+        data: BinarySource,
     },
 }
 
@@ -177,5 +206,59 @@ mod tests {
             },
         };
         assert!(!block.is_persistable());
+    }
+
+    #[test]
+    fn image_source_url_roundtrips_and_persists() {
+        let src = ImageSource::Url {
+            url: "https://example.com/img.png".into(),
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"url","url":"https://example.com/img.png"}"#
+        );
+        let back: ImageSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, src);
+        let block = DataBlock::Image { source: src };
+        assert!(block.is_persistable());
+    }
+
+    #[test]
+    fn content_block_document_url_roundtrips() {
+        let cb = ContentBlock::Document {
+            name: Some("doc.pdf".into()),
+            media_type: "application/pdf".into(),
+            data: BinarySource::Url {
+                url: "https://example.com/doc.pdf".into(),
+            },
+        };
+        let json = serde_json::to_string(&cb).unwrap();
+        assert!(json.contains("\"type\":\"document\""));
+        assert!(json.contains("\"type\":\"url\""));
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(&back, ContentBlock::Document { name, .. } if name.as_deref() == Some("doc.pdf"))
+        );
+    }
+
+    #[test]
+    fn binary_source_url_roundtrips_and_persists() {
+        let src = BinarySource::Url {
+            url: "https://example.com/doc.pdf".into(),
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"url","url":"https://example.com/doc.pdf"}"#
+        );
+        let back: BinarySource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, src);
+        let block = DataBlock::Document {
+            name: Some("doc.pdf".into()),
+            media_type: "application/pdf".into(),
+            data: src,
+        };
+        assert!(block.is_persistable());
     }
 }

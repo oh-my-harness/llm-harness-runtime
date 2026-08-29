@@ -18,7 +18,7 @@ that a caller-supplied price table matches a provider's market price.
 
 The canonical identity is:
 
-- ID: `llm-harness-billing-usage`
+- ID: `llm-adapter-billing-usage` (renamed from `llm-harness-billing-usage` by adapter commit e85d705; digests are runtime-local since the adapter dropped the shared self-attesting constants)
 - version: `1`
 - digest: `sha256:6afb4df926d32f3917ab28fb7ea30af87b20d7b81391d800c076f637c7eb73fb`
 
@@ -83,7 +83,7 @@ semantics.
 
 The canonical identity is:
 
-- ID: `llm-harness-usage-report`
+- ID: `llm-adapter-usage-report` (renamed from `llm-harness-usage-report` by adapter commit e85d705)
 - version: `2`
 - digest: `sha256:9d9e1d63b51fb44ef06383f1b7e92729404b7729357c25aef2d4d15bfdc288c5`
 

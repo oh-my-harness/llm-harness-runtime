@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::TokenUsage;
 
 /// Stable identity for the canonical token-accounting semantics.
-pub const BILLING_USAGE_PROFILE_ID: &str = "llm-harness-billing-usage";
+pub const BILLING_USAGE_PROFILE_ID: &str = "llm-adapter-billing-usage";
 /// Version of the canonical token-accounting semantics.
 pub const BILLING_USAGE_PROFILE_VERSION: &str = "1";
 /// Canonical, digest-bound definition of each usage category.
@@ -14,7 +14,7 @@ pub const BILLING_USAGE_PROFILE_CONTRACT: &str = "input_tokens=gross_input;cache
 pub const BILLING_USAGE_PROFILE_DIGEST: &str =
     "sha256:6afb4df926d32f3917ab28fb7ea30af87b20d7b81391d800c076f637c7eb73fb";
 /// Stable identity for provider usage-report provenance semantics.
-pub const USAGE_REPORT_PROFILE_ID: &str = "llm-harness-usage-report";
+pub const USAGE_REPORT_PROFILE_ID: &str = "llm-adapter-usage-report";
 /// Version of the provider usage-report provenance semantics.
 pub const USAGE_REPORT_PROFILE_VERSION: &str = "2";
 /// Canonical, digest-bound definition of usage-report provenance.

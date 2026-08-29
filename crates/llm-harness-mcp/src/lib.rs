@@ -24,7 +24,7 @@ use base64::Engine;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_platform::prompt::{ArgumentDef, PromptSource, PromptSourceTemplate};
-use llm_harness_types::{DataBlock, Tool, ToolContext, ToolFailure, ToolResult};
+use llm_harness_types::{DataBlock, ImageSource, Tool, ToolContext, ToolFailure, ToolResult};
 use llm_harness_types::{ResourceContent, ResourceDescriptor, ResourceProvider};
 use serde_json::Value;
 
@@ -230,27 +230,48 @@ impl ResourceProvider for McpResourceProvider {
     }
 }
 
+/// Upper bound for a single MCP-provided image (base64 payload length),
+/// matching the read tool's inline-multimodal cap. MCP servers are
+/// third-party code: an unbounded payload would be injected straight into
+/// the model context and persisted to the session while token estimation
+/// counts it as a fixed 1024.
+const MAX_MCP_IMAGE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB of base64 payload
+
 fn format_mcp_content(content: Vec<McpContent>) -> Vec<DataBlock> {
     content
         .into_iter()
-        .map(|content| {
-            let text = match content {
-                McpContent::Text { text, .. } => text,
-                McpContent::Image { mime_type, .. } => {
-                    format!("[Image: {mime_type}]")
-                }
-                McpContent::Audio { mime_type, .. } => {
-                    format!("[Audio: {mime_type}]")
-                }
-                McpContent::ResourceLink { uri, name, .. } => {
-                    format!("[Resource link: {name} ({uri})]")
-                }
-                McpContent::Resource { resource, .. } => match resource.text {
-                    Some(text) => format!("[Resource: {}]\n{text}", resource.uri),
-                    None => format!("[Resource: {}]", resource.uri),
+        .map(|content| match content {
+            // Images pass through as real content blocks — a multimodal model
+            // can consume them directly. Oversized payloads degrade to the
+            // placeholder instead of silently bloating the context.
+            McpContent::Image {
+                data, mime_type, ..
+            } if data.len() <= MAX_MCP_IMAGE_BYTES => DataBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: mime_type,
+                    data,
                 },
-            };
-            DataBlock::text(text)
+            },
+            McpContent::Image { mime_type, .. } => {
+                DataBlock::text(format!("[Image: {mime_type} — payload exceeds 4 MiB cap]"))
+            }
+            other => {
+                let text = match other {
+                    McpContent::Text { text, .. } => text,
+                    // Audio stays a placeholder: audio modality is out of
+                    // scope for the multimodal pipeline.
+                    McpContent::Audio { mime_type, .. } => format!("[Audio: {mime_type}]"),
+                    McpContent::ResourceLink { uri, name, .. } => {
+                        format!("[Resource link: {name} ({uri})]")
+                    }
+                    McpContent::Resource { resource, .. } => match resource.text {
+                        Some(text) => format!("[Resource: {}]\n{text}", resource.uri),
+                        None => format!("[Resource: {}]", resource.uri),
+                    },
+                    McpContent::Image { .. } => unreachable!("handled above"),
+                };
+                DataBlock::text(text)
+            }
         })
         .collect()
 }
@@ -331,10 +352,30 @@ mod tests {
 
         assert_eq!(formatted.len(), 5);
         assert_eq!(text(&formatted[0]), "hello");
-        assert_eq!(text(&formatted[1]), "[Image: image/png]");
+        // Image passes through as a real content block.
+        assert!(matches!(
+            &formatted[1],
+            DataBlock::Image {
+                source: ImageSource::Base64 { media_type, data }
+            } if media_type == "image/png" && data == "AA=="
+        ));
         assert_eq!(text(&formatted[2]), "[Audio: audio/wav]");
         assert_eq!(text(&formatted[3]), "[Resource link: x (file:///x)]");
         assert_eq!(text(&formatted[4]), "[Resource: file:///x]\nbody");
+    }
+
+    #[test]
+    fn oversized_image_degrades_to_placeholder() {
+        let content = vec![McpContent::Image {
+            data: "A".repeat(4 * 1024 * 1024 + 1),
+            mime_type: "image/png".to_owned(),
+            annotations: None,
+            metadata: None,
+        }];
+        let blocks = format_mcp_content(content);
+        assert!(
+            matches!(&blocks[0], DataBlock::Text { text, .. } if text.contains("exceeds 4 MiB cap"))
+        );
     }
 
     #[test]

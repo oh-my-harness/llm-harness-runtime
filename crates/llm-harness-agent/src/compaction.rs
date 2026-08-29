@@ -21,7 +21,12 @@ use crate::session::types::{CompactionEntry, CompactionPolicy, SessionEntry, Ses
 /// later, which is the safe direction.
 const CHARS_PER_TOKEN: usize = 4;
 /// Fixed token estimate for an image content block (images aren't tokenized by char count).
-const IMAGE_TOKEN_ESTIMATE: usize = 250;
+/// GLM-4V measures a single image at ~1047 tokens; OpenAI/Anthropic are the same order.
+const IMAGE_TOKEN_ESTIMATE: usize = 1024;
+/// Fixed token estimate for a document block (a few PDF pages of text equivalent).
+/// Byte length measures transfer size, not context occupancy — never derive the
+/// estimate from base64 payload length.
+const DOCUMENT_TOKEN_ESTIMATE: usize = 2000;
 
 /// System prompt used by the summary model during compaction.
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
@@ -348,6 +353,7 @@ fn estimate_tokens_for_content_blocks(blocks: &[ContentBlock]) -> usize {
         .map(|b| match b {
             ContentBlock::Text { text } => estimate_tokens_for_text(text),
             ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
+            ContentBlock::Document { .. } => DOCUMENT_TOKEN_ESTIMATE,
             ContentBlock::Thinking { thinking, .. } => estimate_tokens_for_text(thinking),
             ContentBlock::ToolUse { input, .. } => estimate_tokens_for_text(&input.to_string()),
         })
@@ -360,10 +366,9 @@ fn estimate_tokens_for_data_blocks(blocks: &[DataBlock]) -> usize {
         .map(|block| match block {
             DataBlock::Text { text, .. } => estimate_tokens_for_text(text),
             DataBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
-            DataBlock::Document { data, .. } => match data {
-                BinarySource::Base64 { data } => (data.len() / CHARS_PER_TOKEN).max(1),
-                BinarySource::Blob { .. } => 1,
-            },
+            // Document byte length measures transfer size, not context
+            // occupancy; a 2 MB base64 PDF must not estimate as ~500k tokens.
+            DataBlock::Document { .. } => DOCUMENT_TOKEN_ESTIMATE,
         })
         .sum()
 }
@@ -793,6 +798,10 @@ fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
             ContentBlock::Thinking { thinking, .. } => thinking.clone(),
             ContentBlock::ToolUse { name, input, .. } => format!("[Tool: {name}({input})]"),
             ContentBlock::Image { .. } => "[image]".to_string(),
+            ContentBlock::Document { name, .. } => match name {
+                Some(n) => format!("[document: {n}]"),
+                None => "[document]".to_string(),
+            },
         })
         .collect::<Vec<_>>()
         .join("\n")
