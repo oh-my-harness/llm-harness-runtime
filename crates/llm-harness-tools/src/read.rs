@@ -5,10 +5,12 @@
 //! subsequent `edit` can detect stale content via the [`FileSnapshotStore`].
 //! `raw` mode emits plain text with no header or line numbers.
 
+use futures::future::BoxFuture;
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
-use llm_harness_types::{DataBlock, Tool, ToolContext, ToolError, ToolFailure, ToolResult};
+use llm_harness_types::{
+    BinarySource, DataBlock, ImageSource, Tool, ToolContext, ToolError, ToolFailure, ToolResult,
+};
 use parking_lot::RwLock;
 
 use crate::resolve_path;
@@ -33,6 +35,24 @@ const READ_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Maximum directory entries listed before truncation.
 const DIR_MAX_ENTRIES: usize = 12;
+
+/// MIME type for an inline-image file extension, or `None` for unknown types.
+fn image_media_type(ext: &str) -> Option<&'static str> {
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Lowercased file extension of `path`, or the empty string.
+fn file_extension(path: &std::path::Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
 
 /// `read` tool — read a file or list a directory.
 ///
@@ -61,7 +81,7 @@ impl Tool for ReadTool {
         "Read a file's contents with line numbers, or list a directory's entries.\n\n\
          Use when: inspecting source code, config files, or any text file; browsing directory structure; reading a range of lines from a large file.\n\
          Don't use for: executing commands (use bash); writing or modifying files (use write/edit); searching file contents (use grep).\n\
-         Returns: Line-numbered file content with a header tag for safe editing. Directory reads return entry names with sizes and timestamps. Range reads include 1 leading and 3 trailing context lines.\n\n\
+         Returns: Line-numbered file content with a header tag for safe editing. Directory reads return entry names with sizes and timestamps. Range reads include 1 leading and 3 trailing context lines. Image (.png/.jpg/.jpeg/.webp) and PDF files are returned as multimodal content blocks the model can see.\n\
          Examples:\n\
          {\"path\": \"src/main.rs\"}\n\
          {\"path\": \"./tests/\"}\n\
@@ -84,7 +104,7 @@ impl Tool for ReadTool {
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of lines to return. e.g. 100"
+                        "description": "Maximum number of lines to return. e.g. 100 (ignored for image/PDF files, which return one multimodal block)"
                     },
                     "raw": {
                         "type": "boolean",
@@ -130,20 +150,17 @@ impl Tool for ReadTool {
                 .await
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
 
-            let (text, details) = if info.is_dir {
+            let (content, details) = if info.is_dir {
                 let body = read_directory(&path, ctx).await?;
-                (body, serde_json::json!({ "path": path, "is_dir": true }))
+                (
+                    vec![DataBlock::text(body)],
+                    serde_json::json!({ "path": path, "is_dir": true }),
+                )
             } else {
-                let (body, meta) =
-                    read_file(&path, offset, limit, raw, info.size, &self.store, ctx).await?;
-                (body, meta)
+                read_file(&path, offset, limit, raw, info.size, &self.store, ctx).await?
             };
 
-            Ok(ToolResult::full(
-                vec![DataBlock::text(text)],
-                details,
-                false,
-            ))
+            Ok(ToolResult::full(content, details, false))
         })
     }
 }
@@ -160,11 +177,23 @@ async fn read_file(
     size: u64,
     store: &Option<Arc<RwLock<FileSnapshotStore>>>,
     ctx: &ToolContext,
-) -> Result<(String, serde_json::Value), ToolError> {
+) -> Result<(Vec<DataBlock>, serde_json::Value), ToolError> {
     let effective_limit = limit.unwrap_or(DEFAULT_MAX_LINES);
     let requested_offset = offset.unwrap_or(1);
     // 0-indexed start (un-clamped; clamped per-path below).
     let start = requested_offset.saturating_sub(1);
+
+    // Inline multimodal images/PDFs must fail fast when oversized — the
+    // windowed text path below would silently degrade them to a placeholder.
+    // (`raw` keeps the legacy placeholder semantics instead of erroring.)
+    if !raw && size > READ_MAX_BYTES {
+        let ext = file_extension(path);
+        if image_media_type(&ext).is_some() || ext == "pdf" {
+            return Err(ToolError::Execution(format!(
+                "file too large for inline multimodal read: {size} bytes (limit {READ_MAX_BYTES})"
+            )));
+        }
+    }
 
     // Large-file path: avoid reading the whole file into memory. Read only
     // the requested window (plus context lines) by passing `max_lines` to the
@@ -185,8 +214,43 @@ async fn read_file(
                 .await
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
             let n = bytes.len();
+            let ext = file_extension(path);
+            let is_image = image_media_type(&ext).is_some();
+            let is_pdf = ext == "pdf";
+            // Inline multimodal read: images and PDFs are returned as data
+            // blocks the model can consume. `raw` keeps the legacy placeholder
+            // (the caller asked for text); oversized files are rejected rather
+            // than silently truncated.
+            if (is_image || is_pdf) && !raw {
+                use base64::Engine as _;
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let (block, kind) = if let Some(media_type) = image_media_type(&ext) {
+                    (
+                        DataBlock::Image {
+                            source: ImageSource::Base64 {
+                                media_type: media_type.to_string(),
+                                data,
+                            },
+                        },
+                        "image",
+                    )
+                } else {
+                    (
+                        DataBlock::Document {
+                            name: path.file_name().and_then(|n| n.to_str()).map(str::to_owned),
+                            media_type: "application/pdf".to_string(),
+                            data: BinarySource::Base64 { data },
+                        },
+                        "document",
+                    )
+                };
+                return Ok((
+                    vec![block],
+                    serde_json::json!({ "path": path, "bytes": n, "kind": kind }),
+                ));
+            }
             return Ok((
-                format!("[Binary file, {n} bytes]"),
+                vec![DataBlock::text(format!("[Binary file, {n} bytes]"))],
                 serde_json::json!({ "path": path, "bytes": n, "binary": true }),
             ));
         }
@@ -245,7 +309,7 @@ async fn read_file(
         text.push_str(&s);
     }
     Ok((
-        text,
+        vec![DataBlock::text(text)],
         serde_json::json!({
             "path": path,
             "total_lines": total,
@@ -269,7 +333,7 @@ async fn read_file_windowed(
     offset: Option<usize>,
     limit: Option<usize>,
     ctx: &ToolContext,
-) -> Result<(String, serde_json::Value), ToolError> {
+) -> Result<(Vec<DataBlock>, serde_json::Value), ToolError> {
     // Compute the display window: [start - leading_context, start + limit + trailing_context).
     let display_start = start.saturating_sub(RANGE_LEADING_CONTEXT_LINES);
     // Ask the env for at most (leading + limit + trailing) lines starting from
@@ -292,7 +356,7 @@ async fn read_file_windowed(
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
             let n = bytes.len();
             return Ok((
-                format!("[Binary file, {n} bytes]"),
+                vec![DataBlock::text(format!("[Binary file, {n} bytes]"))],
                 serde_json::json!({ "path": path, "bytes": n, "binary": true }),
             ));
         }
@@ -304,10 +368,10 @@ async fn read_file_windowed(
     if display_start >= available {
         // Requested window is beyond what the env returned.
         return Ok((
-            format!(
+            vec![DataBlock::text(format!(
                 "(out of bounds: offset {} is past the readable window of {available} lines; use :1 to start from the beginning)",
                 offset.unwrap_or(1)
-            ),
+            ))],
             serde_json::json!({
                 "path": path,
                 "total_lines": available,
@@ -322,7 +386,7 @@ async fn read_file_windowed(
     let sliced: Vec<&String> = lines[display_start..display_end].iter().collect();
     let text = format_output(path, &sliced, display_start, raw, None);
     Ok((
-        text,
+        vec![DataBlock::text(text)],
         serde_json::json!({
             "path": path,
             "total_lines": available,
@@ -673,5 +737,145 @@ mod tests {
         assert!(res.details["tag"].is_null(), "no tag on windowed path");
         // start_line should reflect offset 2 minus 1 leading context line = 1.
         assert_eq!(res.details["start_line"], 1);
+    }
+
+    /// 1x1 transparent PNG.
+    const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    fn seed_base64(env: &MockExecutionEnv, name: &str, b64: &str) {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("fixture must be valid base64");
+        // write_file_sync takes &str; base64 content may not be UTF-8-safe as
+        // a &str, so store via the binary path through a lossy-safe approach:
+        // write raw bytes by encoding the mock file directly.
+        let path = std::path::PathBuf::from("/tmp/mock").join(name);
+        env.write_file_sync(&path, "");
+        // Directly seed binary bytes via the mock's files map through
+        // write_file_sync would coerce to the given str; use an unsafe-free
+        // approach: re-seed with the exact bytes via write_binary helper.
+        env.write_binary_sync(&path, &bytes);
+    }
+
+    #[tokio::test]
+    async fn read_png_returns_image_block() {
+        let env = Arc::new(MockExecutionEnv::new());
+        seed_base64(&env, "test.png", PNG_1X1);
+
+        let ctx = make_ctx(env.clone());
+        let tool = ReadTool::new(None);
+
+        let res = tool
+            .execute(serde_json::json!({ "path": "test.png" }), &ctx)
+            .await
+            .expect("png read should succeed");
+        assert_eq!(res.details["kind"], "image");
+        match &res.model_content[..] {
+            [
+                DataBlock::Image {
+                    source: ImageSource::Base64 { media_type, data },
+                },
+            ] => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(data, PNG_1X1);
+            }
+            other => panic!("expected single image block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_pdf_returns_document_block() {
+        // Minimal one-page PDF (binary but stored via base64 seed).
+        let pdf_b64 = "JVBERi0xLjQKJeLjze8KMSAwIG9iago8PC9UeXBlL0NhdGFsb2cvUGFnZXMgMiAwIFI+PgplbmRvYmoKMiAwIG9iago8PC9UeXBlL1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PgplbmRvYmoKMyAwIG9iago8PC9UeXBlL1BhZ2UvUGFyZW50IDIgMCBSL01lZGlhQm94WzAgMCAzIDNdPj4KZW5kb2JqCnhyZWYKMCA0CjAwMDAwMDAwMDAgNjU1MzUgZiAKMDAwMDAwMDAxMCAwMDAwMCBuIAowMDAwMDAwMDUyIDAwMDAwIG4gCjAwMDAwMDAxMTAgMDAwMDAgbiAKdHJhaWxlcgo8PC9Sb290IDEgMCBSPj4Kc3RhcnR4cmVmCjE2NQolJUVPRgo=";
+        let env = Arc::new(MockExecutionEnv::new());
+        seed_base64(&env, "report.pdf", pdf_b64);
+
+        let ctx = make_ctx(env.clone());
+        let tool = ReadTool::new(None);
+
+        let res = tool
+            .execute(serde_json::json!({ "path": "report.pdf" }), &ctx)
+            .await
+            .expect("pdf read should succeed");
+        assert_eq!(res.details["kind"], "document");
+        match &res.model_content[..] {
+            [
+                DataBlock::Document {
+                    name,
+                    media_type,
+                    data,
+                },
+            ] => {
+                assert_eq!(name.as_deref(), Some("report.pdf"));
+                assert_eq!(media_type, "application/pdf");
+                assert!(matches!(data, BinarySource::Base64 { .. }));
+            }
+            other => panic!("expected single document block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_raw_true_returns_placeholder_for_image() {
+        let env = Arc::new(MockExecutionEnv::new());
+        seed_base64(&env, "test.png", PNG_1X1);
+
+        let ctx = make_ctx(env.clone());
+        let tool = ReadTool::new(None);
+
+        let res = tool
+            .execute(serde_json::json!({ "path": "test.png", "raw": true }), &ctx)
+            .await
+            .expect("raw binary read should succeed");
+        assert_eq!(res.details["binary"], true);
+        assert!(matches!(
+            &res.model_content[..],
+            [DataBlock::Text { text, .. }] if text.contains("[Binary file,")
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_unknown_binary_stays_placeholder() {
+        let env = Arc::new(MockExecutionEnv::new());
+        env.write_binary_sync(
+            &PathBuf::from("/tmp/mock/blob.bin"),
+            &[0x00, 0xFF, 0xFE, 0x80],
+        );
+
+        let ctx = make_ctx(env.clone());
+        let tool = ReadTool::new(None);
+
+        let res = tool
+            .execute(serde_json::json!({ "path": "blob.bin" }), &ctx)
+            .await
+            .expect("unknown binary read should succeed");
+        assert_eq!(res.details["binary"], true);
+        assert!(matches!(
+            &res.model_content[..],
+            [DataBlock::Text { text, .. }] if text.contains("[Binary file,")
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_oversized_image_errors_instead_of_degrading() {
+        // > READ_MAX_BYTES png must fail fast (declared behavior), not
+        // silently degrade to the windowed [Binary file] placeholder.
+        let env = Arc::new(MockExecutionEnv::new());
+        let path = PathBuf::from("/tmp/mock/big.png");
+        // PNG header + >4MiB of filler — the ext check only needs the name.
+        let mut bytes = vec![0x89u8, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend(std::iter::repeat_n(0u8, (4 * 1024 * 1024) + 1));
+        env.write_binary_sync(&path, &bytes);
+
+        let ctx = make_ctx(env.clone());
+        let tool = ReadTool::new(None);
+        let err = tool
+            .execute(serde_json::json!({ "path": "big.png" }), &ctx)
+            .await
+            .expect_err("oversized png should error");
+        // ToolError::Execution -> ToolFailure::execution_failed() drops the
+        // message by contract (pre-existing behavior for all tools); the
+        // reachable-error guarantee is what this test pins.
+        assert_eq!(err.code, "execution_failed");
     }
 }

@@ -62,8 +62,12 @@ impl ConvertToLlmHook for DefaultConvertToLlm {
             for msg in messages {
                 match msg {
                     AgentMessage::User(u) => {
-                        let content =
-                            u.content.iter().filter_map(content_block_to_request).collect();
+                        let mut content = Vec::with_capacity(u.content.len());
+                        for cb in &u.content {
+                            if let Some(rc) = content_block_to_request(cb)? {
+                                content.push(rc);
+                            }
+                        }
                         out.push(AdapterMessage::User(content));
                     }
                     AgentMessage::Assistant(a) => {

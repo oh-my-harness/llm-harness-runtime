@@ -33,6 +33,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"], op
 tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
+base64.workspace            = true
 llm-harness-strategy.workspace = true
 llm-harness-tools.workspace = true
 llm-harness-mcp.workspace = true

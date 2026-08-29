@@ -288,6 +288,7 @@ pub use llm_adapter::provider::Provider as LlmClient;
 pub use llm_adapter::provider::ProviderCapabilities;
 pub use llm_adapter::types::ChatRequest;
 pub use llm_adapter::types::ChatResponse;
+pub use llm_adapter::types::DocumentSource as AdapterDocumentSource;
 pub use llm_adapter::types::Message as LlmMessage;
 pub use llm_adapter::types::RequestContent;
 pub use llm_adapter::types::ResponseFormat;
@@ -303,6 +304,7 @@ pub use llm_adapter::types::StreamEvent as AdapterStreamEvent;
 /// Enables:
 /// - `parse_reasoning_content(true)` — parse `delta.reasoning` into reasoning blocks
 /// - `tolerant_keepalive(true)` — tolerate keepalive bytes in SSE streams
+/// - `documents(true)` — gateways commonly front vision/document models (GLM etc.)
 ///
 /// For the official OpenAI API (`api.openai.com`), `OpenAIProvider::builder()`
 /// is sufficient — reasoning models (o-series, GPT-5) use `reasoning_effort`,
@@ -322,6 +324,7 @@ pub fn openai_compatible(
         .base_url(base_url)
         .parse_reasoning_content(true)
         .tolerant_keepalive(true)
+        .documents(true)
         .build()
 }
 

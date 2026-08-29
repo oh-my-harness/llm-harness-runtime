@@ -4,6 +4,8 @@
 
 #[path = "loop_layer/multi_turn.rs"]
 mod multi_turn;
+#[path = "loop_layer/multimodal.rs"]
+mod multimodal;
 #[path = "loop_layer/provider_and_error.rs"]
 mod provider_and_error;
 #[path = "loop_layer/tool_dispatch.rs"]

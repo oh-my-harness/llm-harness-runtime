@@ -559,6 +559,14 @@ struct InjectedResource {
     block: String,
 }
 
+/// Render MCP prompt messages into the text domain (system-prompt injection).
+///
+/// Media blocks stay as `[Image: mime]`-style placeholders **by design**:
+/// this output lands inside the system prompt / text context, where binary
+/// payloads cannot be conveyed. Real image passthrough happens on tool
+/// *results* (`format_mcp_content` in lib.rs), which produce
+/// `DataBlock::Image` content blocks the model can consume. Audio stays a
+/// placeholder entirely (no audio pipeline).
 fn format_prompt_messages(messages: Vec<crate::types::McpPromptMessage>) -> String {
     messages
         .into_iter()
