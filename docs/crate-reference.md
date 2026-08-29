@@ -1,6 +1,6 @@
 # 基础设施 Crate 参考
 
-> 本文档覆盖 7 个基础设施 crate——它们是 runtime 层之下的基础类型、平台 trait 和后端实现。上层 crate（runtime、agent、loop、strategy）有各自的文档。
+> 本文档覆盖 7 个基础设施 crate——它们是编排层之下的基础类型、平台 trait 和后端实现。上层 crate（subagents/workflow、agent、loop、strategy）有各自的文档。
 
 ---
 
@@ -12,8 +12,9 @@
 
 | 模块 | 关键导出 |
 |------|---------|
-| `tool` | `Tool` trait、`ToolContext`、`ToolResult`、`ToolFailure`、`ToolLevel`、`ToolExecutionMode`、`ToolSessionProjection` |
-| `hooks` | `BeforeToolCallHook`、`AfterToolCallHook`、`BeforeTurnHook`、`AfterTurnHook`、`ShouldStopHook`、`TransformContextHook`、`PrepareNextTurnHook`、`BeforeRunHook`、`BeforeCompactHook`、`BeforeProviderRequestHook`、`AfterProviderResponseHook` |
+| `tool` | `Tool` trait、`ToolContext`、`ToolResult`、`ToolFailure`、`ToolLevel`、`ToolExecutionMode`、`ToolSessionProjection`、`Tool::report_duration()` |
+| `content` | `ContentBlock`（含 `Document` 文档块）、`DataBlock`、`ImageSource`（`Base64`/`Url`）、`BinarySource`（`Blob`/`Url`） |
+| `hooks` | `BeforeToolCallHook`、`AfterToolCallHook`（含 `duration` 字段）、`BeforeTurnHook`、`AfterTurnHook`、`ShouldStopHook`、`TransformContextHook`、`PrepareNextTurnHook`、`BeforeRunHook`、`AfterRunHook`、`OnAbortHook`、`BeforeCompactHook`、`BeforeProviderRequestHook`、`AfterProviderResponseHook` |
 | `messages` | `AgentMessage`、`UserMessage`、`AssistantMessage`、`ContentBlock`、`DataBlock` |
 | `env` | `ExecutionEnv` trait、`ShellOptions`、`ShellOutput`、`EnvError`、`UnsupportedEnv` |
 | `run` | `RunContext`、`RunRequest`、`RunExtensions`、`RunId` |
@@ -30,9 +31,11 @@
 
 | 类型 | 语义 | Hook 示例 |
 |------|------|----------|
-| All-Execute（观测型） | 所有 hook 依次执行，返回第一个 hook 的结果 | `BeforeProviderRequestHook`、`AfterProviderResponseHook`、`AfterTurnHook` |
+| All-Execute（观测型） | 所有 hook 依次执行，返回第一个 hook 的结果 | `BeforeProviderRequestHook`、`AfterProviderResponseHook`、`AfterTurnHook`、`AfterRunHook` |
 | First-Non-Allow（决策型） | 顺序执行，第一个返回 `Allow` 以外的决策立即短路 | `BeforeToolCallHook`（`Allow`/`Deny`/`Modify`） |
 | Chain（链式修改型） | 按序执行，每个 hook 看到前一个 hook 的修改结果 | `AfterToolCallHook`（`Passthrough`/`Patch`） |
+
+`AfterRunHook` 在 run_loop 结束、harness 回到 Idle 后调用（可 spawn 等待 task，如等子 agent 完成后 `continue_run`）；`OnAbortHook` 在 `harness.abort()` 时先于 `AfterRunHook` 调用（非阻塞、幂等），供等待方置标志跳过。
 
 ---
 
@@ -51,7 +54,7 @@
 | `prompt` | `PromptSource` trait、`PromptSourceTemplate`、`ArgumentDef` | 提示模板源 |
 | `env` | 环境辅助 | 环境抽象辅助 |
 
-> 消费者直接依赖 `llm-harness-platform` 访问这些模块（不再通过 runtime re-export）。
+> 消费者直接依赖 `llm-harness-platform` 访问这些模块（编排层 crate 不再 re-export）。
 
 ---
 
@@ -193,3 +196,44 @@ let source = LocalDocumentSource::new("/path/to/docs", Default::default())?;
 - **读写分离**：`MemoryStore`（写）不继承 `KnowledgeSource`（读），`MemoryService` 内部持有两者
 - **受信来源**：`MemoryMutationOrigin`（`ExplicitTool`/`Application`/`Capture`）由运行时注入，不从模型参数反序列化
 - **注入防御**：与 `MemoryDefensePlugin`（strategy crate）配合，扫描写入内容中的注入短语
+
+---
+
+## llm-harness-inspector
+
+Agent Inspector：独立调试 crate，通过 Web API + WebSocket 实时观察 agent 状态与事件。只依赖 `llm-harness-agent` 与 `llm-harness-types`，不侵入 Plugin trait；全部实现 feature-gated（`inspect`），不启用时零成本。
+
+### REST 端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/` | GET | 内置 Web UI（单文件 HTML，WebSocket 实时渲染） |
+| `/api/agent/config` | GET | 配置快照（model/tools/phase/budget） |
+| `/api/agent/session` | GET | 当前 session 消息历史与分支 |
+| `/api/agent/usage` | GET | token 用量与成本 |
+| `/api/agent/skills` | GET | skill 列表 |
+| `/api/inject` | POST | 注入 steer 消息（`harness.steer()`） |
+| `/api/abort` | POST | 中止当前 turn（`harness.abort()`） |
+| `/api/prompt` | POST | 发起新 prompt |
+| `/api/events` | WS | 实时事件流（首条 Snapshot 快照 + 增量透传） |
+
+事件消息格式：`{ "type": "<AgentHarnessEvent variant>", "inner_type": "<内层 AgentEvent variant 或 null>", "timestamp": "...", "data": {...} }`。不可序列化的进程内字段（如 `ToolResult.extensions`）在投影层跳过，不改变事件语义。
+
+### 使用
+
+```rust
+use llm_harness_inspector::Inspector;
+
+// 最小路径：harness 即可获得实时事件流 + 配置 + session
+let inspector = Inspector::builder(Arc::clone(&harness))
+    .port(8080)
+    .mount()
+    .await?;
+
+// 零代码挂载：SENZA_INSPECT=8080 环境变量
+if let Some(builder) = Inspector::from_env(Arc::clone(&harness)) {
+    builder.mount().await?;
+}
+```
+
+`Inspector` 通过 `Drop` 触发 server 优雅关闭。详细设计见 `docs/design/2026-08-22-inspector-web-api-design.md`，使用指南见 [inspector-guide.md](inspector-guide.md)。

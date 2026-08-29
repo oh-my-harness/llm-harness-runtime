@@ -79,10 +79,41 @@ Agent 执行命令（特别是 bash）时需要安全隔离。运行时提供沙
 #### 子 Agent 协作
 
 复杂任务可以拆给多个 Agent 并行做：
-- **派生**：主 Agent 可以派生子 Agent，分配独立任务
-- **通信**：主子 Agent 之间可以互发消息、等待回复
+- **派生**：主 Agent 可以派生子 Agent（`spawn_agent` 工具或 `HarnessSubAgentSpawner` API），分配独立任务
+- **通信**：主子 Agent 之间可以互发消息、等待回复（MessageBus 消息路由）
 - **查询**：主 Agent 可以查询子 Agent 的状态（含角色描述，如"代码审查员"）
 - **中止**：主 Agent 可以中止子 Agent
+- **并发上限**：`max_concurrent` 限制同时在飞的子 Agent 数
+- **配置定制**：`SpawnOptions` 支持 provider 继承/别名、context 传递（父对话摘要/文件/用户指令）、system prompt 与 thinking level 覆盖；`builder_customize` 闭包为所有子 Agent 统一注入插件
+- **完成通知**：`SpawnPlugin` 把子 Agent 完成事件接回主 Agent 的通用 hook 流（空闲时唤醒主 Agent 继续）
+
+#### 多 Agent 团队（Agent Team）
+
+去中心化的多 Agent 协作（`llm-harness-agent-team`）：
+- **声明式组队**：`IndividualSpec`（id/专长/模型/反思间隔）→ `AgentTeam::build` 物化为自驱动 runner
+- **P2P 社交工具**：`delegate_task`（任务委派路由）、`send_message`、`broadcast`、`search_contacts`（通讯录搜索）、`set_reminder`
+- **操作员交互**：人类通过 `AgentTeam::submit` 派活、`AgentTeam::receive` 收结果
+- **团队记忆**：SQLite 团队记忆（`TeamSqliteMemoryStore`），反思循环把可复用经验沉淀下来，跨进程重启存活
+
+#### Agent Inspector（调试观测）
+
+开发者的 Web 调试工具（`llm-harness-inspector`）：
+- **实时事件流**：WebSocket 推送全部 agent 事件（含逐 token 流式），首条快照 + 增量透传
+- **REST 端点**：配置快照、当前 session 历史、token/成本用量、skill 列表
+- **交互端点**：运行中可注入 steer 消息、中止当前 turn、发起新 prompt（human-in-the-loop）
+- **内置 Web UI**：单文件 HTML，`SENZA_INSPECT=8080` 环境变量即可给任何 agent 挂上调试界面
+
+#### 网络工具
+
+- **web_search**：9 个搜索 provider（DuckDuckGo 免 key 默认、Bing、Brave、Tavily、Serper、SerpAPI、Exa、SearXNG、Google CSE）
+- **web_fetch**：抓取网页并提取可读文本
+- **code_exec**：临时目录中执行 Python/Bash/JavaScript 代码片段，继承沙箱与 abort 传播
+
+#### 多模态
+
+Agent 可以看图、读 PDF：
+- **图片**：用户消息和工具结果都可携带图片（base64 或 URL），`read` 工具读图片文件时返回真实图片块
+- **PDF 文档**：`ContentBlock::Document`，base64（Anthropic 协议）与 URL（智谱系网关）两种路径，端点能力差异由 provider 层处理
 
 #### 持久状态
 
@@ -115,7 +146,7 @@ Agent 能主动通知用户重要事件：
 
 Agent 运行时，用户能看到当前状态：
 - **状态栏模板**：开箱即用的状态栏格式，收集当前任务、花费、预算剩余、待办事项等
-- **TODO 工具**：内置待办列表工具，Agent 能维护多步骤任务进度，不会在压缩时丢失
+- **TODO 工具**：内置待办列表工具（`todo_write`：rewrite/update/add/clear 四种动作），Agent 能维护多步骤任务进度，不会在压缩时丢失
 
 #### 上下文压缩
 
@@ -173,6 +204,12 @@ MCP（Model Context Protocol）是一个开放协议，让 Agent 连接外部工
 - **版本锁定**：锁定 MCP 服务器版本，外部服务更新不改变 Agent 行为
 - **凭证作用域**：`McpCredentialGuardHook` 检查工具调用的凭证权限
 
+#### 工具耗时标注
+
+慢工具让模型感知执行时间，便于决策：
+- **opt-in 附加**：`bash`、`code_exec`、`web_search`、`web_fetch` 的结果末尾自动附 `[duration: ...]`（成功与失败均携带）
+- **hook 无感**：标注在 after-hook 决策落地之后附加，hook 看到的是无标注结果
+
 #### 策略层独立
 
 策略代码已提取到独立 crate（`llm-harness-strategy`），编译器强制机制/策略边界：
@@ -199,8 +236,8 @@ Agent 做了什么操作、调了什么工具、花了多少钱——这些需�
 
 #### 子 Agent 配置继承
 
-**已有**：派生、通信、查询（含角色描述）、中止功能完整。
-**缺失**：子 Agent 不自动继承父 Agent 的系统提示词、工具列表和思考模式。每个子 Agent 要重新配置，容易遗漏。下一版本会支持配置继承。
+**已有**：派生、通信、查询（含角色描述）、中止、并发上限功能完整；`SpawnOptions` 可覆盖 system prompt 与 thinking level，`builder_customize` 闭包可为所有子 Agent 统一注入插件。
+**缺失**：子 Agent 不自动继承父 Agent 的工具列表。子 Agent 默认使用 `sub_plugin_factory` 提供的工具集，需要按需配置。
 
 ---
 
@@ -264,6 +301,6 @@ Agent 跑 bash 命令时，每条命令都是独立的——`cd /tmp` 在下一�
 | 持久化终端会话 | 需要 PTY 和长运行进程管理，复杂度高且安全风险大 |
 | 写入后自动 lint | 运行时提供机制（Hook），但不内置 linter。应用层可自行接入 |
 | 动态工具描述 + KV Cache 优化 | 当前数十个工具全量注入足够，优化收益不明 |
-| 中途转向（mid-turn steer） | 有意选择同步循环模型——简单且匹配模型的训练方式 |
+| 中途转向（mid-turn steer） | 基础 steer 队列已实现（`Agent::steer`，Inspector 的 `/api/inject` 也走它）；更复杂的 mid-turn 打断暂不做 |
 | 优先级消息队列 | 太复杂，当前消息按序处理足够 |
 | 多渠道通知 | 先做单通道通知，多渠道（邮件+短信+IM）是应用层的事 |

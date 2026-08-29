@@ -1,10 +1,10 @@
 # Runtime 编排能力总览
 
-> 本文档面向使用 WorkflowEngine 的上层 agent 开发者，概述 runtime 提供的编排原语、核心机制和使用方式。
+> 本文档面向使用 WorkflowEngine 的上层 agent 开发者，概述 `llm-harness-workflow` 提供的编排原语、核心机制和使用方式（sub-agent 派发在 `llm-harness-subagents`，见 [runtime-framework.md](runtime-framework.md)）。
 
 ## 1. 一句话定位
 
-runtime 提供"怎么跑流程"的通用基础设施，上层 agent 只负责"做什么"（领域逻辑）。
+workflow 层提供"怎么跑流程"的通用基础设施，上层 agent 只负责"做什么"（领域逻辑）。
 核心思想对齐 LangGraph：流程是一张图，引擎驱动图遍历，状态在节点间流动，引擎负责持久化与恢复。
 
 ## 2. 分层边界
@@ -118,13 +118,7 @@ Judge 收到 `StepCtx`（含当前步定义、执行结果、step_history、共�
 
 ### 4.4 领域执行（StepExecutor）
 
-```rust
-pub trait StepExecutor: Send + Sync {
-    fn execute<'a>(&'a self, ctx: &ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>>;
-}
-```
-
-Executor 收到 `ExecutorCtx`（含 step 定义、prev_result、env、abort token、共享 context），返回 `StepResult`。
+Executor 收到 `ExecutorCtx`（含 step 定义、prev_result、env、abort token、共享 context、`event_tx` 事件广播），返回 `StepResult`。`event_tx` 是 `broadcast::Sender<WorkflowEvent>`——executor 回调中可直接向 `engine.subscribe()` 的订阅者广播自定义进度事件。
 
 内置 executor：
 - `json_transform` — JSON 变换（确定性数据处理）

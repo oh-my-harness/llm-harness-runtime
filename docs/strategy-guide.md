@@ -67,7 +67,7 @@ builder.install(&LoopSafetyPlugin::new(config));
 | 组件 | 类型 | 行为 |
 |------|------|------|
 | 状态栏注入 | `TransformContextHook` | 在上下文末尾注入 `<agent_status>` XML，包含当前任务、花费、预算剩余、TODO 列表 |
-| TODO 工具 | `TodoWriteTool` | LLM 可调用的 `todo_write` 工具，维护待办列表（pending/in_progress/done） |
+| TODO 工具 | `TodoWriteTool` | LLM 可调用的 `todo_write` 工具，四种 action：`rewrite`（整表重写）、`update`（按 id 改状态）、`add`（新增条目）、`clear`（清空/按状态清除）；共享 `TodoStore`，状态栏注入读取同一数据 |
 | 工具调用计数 | `ToolCallCounterHook` | `AfterToolCallHook`，统计工具调用次数 |
 
 ```rust
