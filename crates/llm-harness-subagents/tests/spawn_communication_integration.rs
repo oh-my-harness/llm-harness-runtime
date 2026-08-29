@@ -970,3 +970,234 @@ async fn spawn_agent_tool_e2e_test() {
         SubAgentEvent::Message { .. } => panic!("expected Done event, got Message"),
     }
 }
+
+// ── Repro: issue #144 ──────────────────────────────────────────────────────
+//
+// await_subagent_reply hangs when the sub-agent completes BEFORE the main
+// agent calls bus.wait(). Sequence:
+//   1. spawn_async → sub completes fast (MockLlmClient).
+//   2. Track task finishes: update_status(Done) → no waiter → event goes to
+//      the sink → remove_agent erases the registry entry.
+//   3. Main agent's next turn calls bus.wait(from=agent_id): the post-
+//      registration status check finds no registry entry, the waiter never
+//      fires, and wait() blocks out its full timeout.
+
+#[tokio::test]
+async fn issue_144_wait_after_subagent_completed_with_from_filter() {
+    let bus = MessageBus::new();
+    let (spawner, _dir) = make_spawner(bus.clone(), vec![MockResponse::text("hello from sub")]);
+
+    let agent_id = spawner
+        .spawn_async(SpawnOptions {
+            prompt: "say hello".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("spawn_async should succeed");
+
+    // Sub-agent completes fully before any waiter registers.
+    wait_for_in_flight_zero(&bus).await;
+
+    // Main agent's next turn: await_subagent_reply with from=agent_id.
+    let event = bus
+        .wait(
+            "Main",
+            Some(&agent_id),
+            Some(Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(
+        event.is_some(),
+        "BUG #144: sub-agent completed before wait() was called; \
+         wait(from=agent_id) hung until timeout instead of returning the buffered Done event"
+    );
+    match event.unwrap() {
+        SubAgentEvent::Done {
+            agent_id: id,
+            result,
+        } => {
+            assert_eq!(id, agent_id);
+            let r = result.expect("result should be Ok");
+            assert!(
+                r.final_answer.contains("hello from sub"),
+                "final_answer should contain 'hello from sub', got: {}",
+                r.final_answer
+            );
+        }
+        SubAgentEvent::Message { .. } => panic!("expected Done event, got Message"),
+    }
+}
+
+// Without a `from` filter the post-registration status check is skipped
+// entirely (message_bus.rs: `if let Some(from_id) = filter_from`), so the
+// race hits unconditionally.
+
+#[tokio::test]
+async fn issue_144_wait_after_subagent_completed_no_filter() {
+    let bus = MessageBus::new();
+    let (spawner, _dir) = make_spawner(bus.clone(), vec![MockResponse::text("hello from sub")]);
+
+    let agent_id = spawner
+        .spawn_async(SpawnOptions {
+            prompt: "say hello".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("spawn_async should succeed");
+
+    wait_for_in_flight_zero(&bus).await;
+
+    let event = bus
+        .wait(
+            "Main",
+            None,
+            Some(Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(
+        event.is_some(),
+        "BUG #144: wait(from=None) after sub-agent completion hung until timeout; \
+         completed agent_id was {agent_id}"
+    );
+}
+
+// ── T2: claim is idempotent — wait() consumes the buffer exactly once ──────
+
+#[tokio::test]
+async fn issue_144_claim_is_idempotent() {
+    let bus = MessageBus::new();
+    let (spawner, _dir) = make_spawner(bus.clone(), vec![MockResponse::text("only once")]);
+
+    let agent_id = spawner
+        .spawn_async(SpawnOptions {
+            prompt: "say once".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("spawn_async should succeed");
+
+    wait_for_in_flight_zero(&bus).await;
+
+    // Buffer holds the unclaimed result.
+    assert!(
+        bus.has_unclaimed_done(),
+        "completed buffer should hold the unclaimed Done result"
+    );
+
+    // First wait claims it.
+    let event = bus
+        .wait(
+            "Main",
+            Some(&agent_id),
+            Some(Duration::from_secs(2)),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        event.is_some(),
+        "first wait should claim the buffered result"
+    );
+    assert!(
+        !bus.has_unclaimed_done(),
+        "buffer should be empty after the claim"
+    );
+
+    // Second wait finds nothing (exact-once).
+    let second = bus
+        .wait(
+            "Main",
+            Some(&agent_id),
+            Some(Duration::from_millis(200)),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(second.is_none(), "second wait must not double-deliver");
+}
+
+// ── T3: injection path survives — before_run drain still delivers Done ────
+
+#[tokio::test]
+async fn issue_144_injection_path_still_delivers_done() {
+    let bus = MessageBus::new();
+    let (spawner, _dir) = make_spawner(bus.clone(), vec![MockResponse::text("injected ok")]);
+
+    let agent_id = spawner
+        .spawn_async(SpawnOptions {
+            prompt: "say injected".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("spawn_async should succeed");
+
+    wait_for_in_flight_zero(&bus).await;
+
+    // No wait() call — simulate the plugin's before_run drain.
+    let drained = bus.drain_completed();
+    assert_eq!(drained.len(), 1, "drain should return the Done result");
+    let (id, result) = &drained[0];
+    assert_eq!(id, &agent_id);
+    assert!(
+        result.final_answer.contains("injected ok"),
+        "final_answer should contain 'injected ok', got: {}",
+        result.final_answer
+    );
+
+    // Drain is one-shot.
+    assert!(bus.drain_completed().is_empty(), "second drain is empty");
+    assert!(!bus.has_unclaimed_done());
+}
+
+// ── T4: waiter blocked while result arrives is woken and buffer is empty ──
+
+#[tokio::test]
+async fn issue_144_waiter_woken_when_result_arrives() {
+    let bus = MessageBus::new();
+    let (spawner, _dir) = make_spawner(bus.clone(), vec![MockResponse::text("woken up")]);
+
+    let agent_id = spawner
+        .spawn_async(SpawnOptions {
+            prompt: "say woken".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("spawn_async should succeed");
+
+    // Register the waiter BEFORE the sub completes (no sleep): the sub needs
+    // at least one LLM round-trip, so this waiter registration wins the race.
+    let bus_clone = bus.clone();
+    let id_clone = agent_id.clone();
+    let wait_handle = tokio::spawn(async move {
+        bus_clone
+            .wait(
+                "Main",
+                Some(&id_clone),
+                Some(Duration::from_secs(10)),
+                CancellationToken::new(),
+            )
+            .await
+    });
+
+    let event = tokio::time::timeout(Duration::from_secs(10), wait_handle)
+        .await
+        .expect("wait task should complete within 10s")
+        .expect("task should not panic");
+
+    let event = event.expect("waiter should receive the Done event");
+    match event {
+        SubAgentEvent::Done { agent_id: id, .. } => assert_eq!(id, agent_id),
+        SubAgentEvent::Message { .. } => panic!("expected Done event, got Message"),
+    }
+
+    wait_for_in_flight_zero(&bus).await;
+
+    // Track task delivered via waiter; the buffer must NOT also hold it
+    // (exact-once: claim succeeded in the track task's waiter path).
+    assert!(
+        !bus.has_unclaimed_done(),
+        "buffer must be empty after waiter delivery (no double-buffering)"
+    );
+}

@@ -40,7 +40,15 @@ impl SpawnPlugin {
         let queue_clone = queue.clone();
         let notify_clone = notify.clone();
         bus.set_event_sink(Arc::new(move |event| {
-            queue_clone.lock().unwrap().push_back(event);
+            // Ok Done payloads live in the bus's completed buffer (single
+            // source of truth); the sink is only a wakeup signal for them.
+            // Failed Done events (Err, non-Aborted) are never buffered, so
+            // they carry their payload through the queue for injection.
+            // Message events also carry their own payload — enqueue as before.
+            let is_wakeup_only = matches!(event, SubAgentEvent::Done { result: Ok(_), .. });
+            if !is_wakeup_only {
+                queue_clone.lock().unwrap().push_back(event);
+            }
             notify_clone.notify_one();
         }));
         Arc::new(Self {
@@ -52,6 +60,12 @@ impl SpawnPlugin {
             aborted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             idle_timeout,
         })
+    }
+
+    /// Test-only view of the plugin's pending event queue.
+    #[cfg(test)]
+    pub(crate) fn queue_for_test(&self) -> Arc<Mutex<VecDeque<SubAgentEvent>>> {
+        self.queue.clone()
     }
 
     pub fn set_harness_weak(&self, weak: Weak<AgentHarness>) {
@@ -67,6 +81,7 @@ impl Plugin for SpawnPlugin {
     fn register_hooks(&self, hooks: &mut HarnessHooks) {
         hooks.before_run.push(Arc::new(SpawnBeforeRun {
             queue: self.queue.clone(),
+            bus: self.bus.clone(),
             wait_task_token: self.wait_task_token.clone(),
             aborted: self.aborted.clone(),
         }));
@@ -96,6 +111,7 @@ impl Plugin for SpawnPlugin {
 
 struct SpawnBeforeRun {
     queue: Arc<Mutex<VecDeque<SubAgentEvent>>>,
+    bus: Arc<MessageBus>,
     wait_task_token: Arc<Mutex<Option<CancellationToken>>>,
     aborted: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -113,10 +129,19 @@ impl BeforeRunHook for SpawnBeforeRun {
             if let Some(token) = self.wait_task_token.lock().unwrap().take() {
                 token.cancel();
             }
-            let events: Vec<SubAgentEvent> = {
+            let mut events: Vec<SubAgentEvent> = {
                 let mut q = self.queue.lock().unwrap();
                 q.drain(..).collect()
             };
+            // Merge Done results from the bus's completed buffer (they are
+            // not enqueued into the queue anymore — sink is wakeup-only
+            // for Done).
+            for (agent_id, result) in self.bus.drain_completed() {
+                events.push(SubAgentEvent::Done {
+                    agent_id,
+                    result: Ok(result),
+                });
+            }
             let additional = format_events(events);
             Ok(BeforeRunResult {
                 additional_messages: additional,
@@ -137,7 +162,20 @@ struct SpawnAfterTurn {
 impl AfterTurnHook for SpawnAfterTurn {
     fn after_turn<'a>(&'a self, _ctx: AfterTurnCtx<'a>) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let msg = drain_and_format(&self.queue).or_else(|| status_hint(&self.bus));
+            let mut events: Vec<SubAgentEvent> = {
+                let mut q = self.queue.lock().unwrap();
+                q.drain(..).collect()
+            };
+            for (agent_id, result) in self.bus.drain_completed() {
+                events.push(SubAgentEvent::Done {
+                    agent_id,
+                    result: Ok(result),
+                });
+            }
+            let msg = (!events.is_empty())
+                .then(|| format_events(events))
+                .and_then(|mut m| (!m.is_empty()).then(|| m.remove(0)))
+                .or_else(|| status_hint(&self.bus));
             // Clone Weak out of the mutex, then drop the guard before
             // upgrading + sending. `follow_up_message` locks HarnessInner,
             // so holding the harness_weak guard across it would nest locks.
@@ -177,9 +215,9 @@ impl AfterRunHook for SpawnAfterRun {
                 return;
             }
             {
-                let q = self.queue.lock().unwrap();
-                if !q.is_empty() {
-                    drop(q);
+                let has_work =
+                    !self.queue.lock().unwrap().is_empty() || self.bus.has_unclaimed_done();
+                if has_work {
                     self.wake_harness();
                     return;
                 }
@@ -187,7 +225,7 @@ impl AfterRunHook for SpawnAfterRun {
             if self.bus.in_flight_count() == 0 {
                 // Double-check queue: track task may have pushed an event
                 // between the queue check above and this in_flight check.
-                if !self.queue.lock().unwrap().is_empty() {
+                if !self.queue.lock().unwrap().is_empty() || self.bus.has_unclaimed_done() {
                     self.wake_harness();
                 }
                 return;
@@ -213,7 +251,8 @@ impl AfterRunHook for SpawnAfterRun {
                             // via before_run hook and inject into LLM context.
                             // If empty and in_flight > 0, the notification was
                             // spurious — wait again.
-                            let has_events = !queue.lock().unwrap().is_empty();
+                            let has_events = !queue.lock().unwrap().is_empty()
+                                || bus.has_unclaimed_done();
                             if has_events {
                                 let weak = harness_weak.lock().unwrap().as_ref().and_then(|w| w.upgrade());
                                 if let Some(h) = weak {
@@ -312,24 +351,6 @@ fn format_events(events: Vec<SubAgentEvent>) -> Vec<AgentMessage> {
         data: serde_json::json!({"messages": packed}),
         timestamp: chrono::Utc::now(),
     })]
-}
-
-fn drain_and_format(queue: &Arc<Mutex<VecDeque<SubAgentEvent>>>) -> Option<AgentMessage> {
-    let events: Vec<SubAgentEvent> = {
-        let mut q = queue.lock().unwrap();
-        q.drain(..).collect()
-    };
-    let messages = format_events(events);
-    if messages.is_empty() {
-        None
-    } else {
-        Some(
-            messages
-                .into_iter()
-                .next()
-                .expect("format_events returned non-empty vec"),
-        )
-    }
 }
 
 fn status_hint(bus: &Arc<MessageBus>) -> Option<AgentMessage> {

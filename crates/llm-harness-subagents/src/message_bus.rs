@@ -103,6 +103,10 @@ pub struct MessageBus {
     agents: Mutex<HashMap<String, AgentEntry>>,
     waiters: Mutex<HashMap<String, Vec<Waiter>>>,
     subagent_aborts: Mutex<HashMap<String, CancellationToken>>,
+    /// Unclaimed successful Done results in completion order. Single source
+    /// of truth: consumed exactly once by `claim()` — either the track
+    /// task's waiter path or `wait()`'s poll path, never both.
+    completed: Mutex<Vec<(String, SubAgentResult)>>,
     idle_timeout_fired: AtomicBool,
 }
 
@@ -116,6 +120,7 @@ impl MessageBus {
             agents: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
             subagent_aborts: Mutex::new(HashMap::new()),
+            completed: Mutex::new(Vec::new()),
             idle_timeout_fired: AtomicBool::new(false),
         })
     }
@@ -138,6 +143,17 @@ impl MessageBus {
     /// for Message events. Done events are handled by the track task's own
     /// waiter check + the `bus.wait()` post-registration agent-status check.
     fn push_event(&self, event: SubAgentEvent) {
+        // Ok Done results are buffer-owned (single source of truth): NEVER
+        // match waiters here — a concurrent claim path may have already
+        // consumed the same result, and re-matching would double-deliver.
+        // Go straight to the sink, which treats Ok Done as wakeup-only.
+        if matches!(event, SubAgentEvent::Done { result: Ok(_), .. }) {
+            let sink = self.event_sink.lock();
+            if let Some(sink) = sink.as_ref() {
+                sink(event);
+            }
+            return;
+        }
         // Try to match a waiter for this event's target.
         let target = match &event {
             SubAgentEvent::Done { agent_id, .. } => agent_id.clone(),
@@ -331,6 +347,30 @@ impl MessageBus {
         timeout: Option<Duration>,
         abort: CancellationToken,
     ) -> Option<SubAgentEvent> {
+        // Issue #144: the sub-agent may have completed before this call.
+        // Claim a buffered Done result first (atomic with the track task's
+        // waiter path); fall through to the waiter path if nothing to claim.
+        // Done results are main-agent consumables ONLY: sub-side waits
+        // (AwaitMainMessageTool passes from=None) must never steal another
+        // sub's buffered completion — exact-once would make it
+        // unrecoverable for the main agent. "Main" is the registered
+        // is_main identity, not the MAIN_AGENT_ID literal — tools accept a
+        // configurable main_id, and a literal check would silently skip the
+        // fast path for custom ids.
+        let is_main = {
+            let agents = self.agents.lock();
+            match agents.get(agent_id) {
+                Some(entry) => entry.is_main,
+                None => agent_id == MAIN_AGENT_ID,
+            }
+        };
+        if is_main && let Some((claimed_id, result)) = self.claim(filter_from) {
+            return Some(SubAgentEvent::Done {
+                agent_id: claimed_id,
+                result: Ok(result),
+            });
+        }
+
         let (tx, rx) = oneshot::channel::<SubAgentEvent>();
         let waiter = Waiter {
             from: filter_from.map(String::from),
@@ -565,6 +605,42 @@ impl MessageBus {
         agent_id
     }
 
+    /// Buffer an unclaimed successful Done result (single source of truth
+    /// for completions no waiter has picked up). Aborted/failed results are
+    /// not buffered — abort is an explicit cancellation, not a completion.
+    fn buffer_done(&self, agent_id: String, result: SubAgentResult) {
+        self.completed.lock().push((agent_id, result));
+    }
+
+    /// Atomically locate + remove + return one buffered Done result.
+    /// The single consumption primitive shared by the track task's waiter
+    /// path and `wait()`'s poll path. `from=Some(id)` claims that agent's
+    /// result; `from=None` claims the earliest buffered (FIFO). `None`
+    /// return = already claimed elsewhere — do not re-deliver.
+    pub(crate) fn claim(&self, from: Option<&str>) -> Option<(String, SubAgentResult)> {
+        let mut completed = self.completed.lock();
+        let idx = match from {
+            Some(id) => completed.iter().position(|(aid, _)| aid == id)?,
+            None => {
+                if completed.is_empty() {
+                    return None;
+                }
+                0
+            }
+        };
+        Some(completed.remove(idx))
+    }
+
+    /// Drain all buffered Done results (plugin injection path).
+    pub fn drain_completed(&self) -> Vec<(String, SubAgentResult)> {
+        std::mem::take(&mut *self.completed.lock())
+    }
+
+    /// True while any Done result is unconsumed (plugin wakeup condition).
+    pub fn has_unclaimed_done(&self) -> bool {
+        !self.completed.lock().is_empty()
+    }
+
     /// Track a sub-agent, returning an AsyncSpawnHandle.
     /// On completion: update status=Done, deliver SubAgentEvent::Done
     /// (via waiter if matched, else to event sink).
@@ -595,6 +671,13 @@ impl MessageBus {
             };
             registry.update_status(&id_for_status, status);
             registry.detach_agent(&id_for_status);
+
+            // Buffer successful results BEFORE the waiter check so the
+            // result is always discoverable by a later wait() call
+            // (issue #144: sub completes before the main agent's next turn).
+            if let Ok(r) = &result {
+                registry.buffer_done(id.clone(), r.clone());
+            }
 
             let event = SubAgentEvent::Done {
                 agent_id: id.clone(),
@@ -634,22 +717,36 @@ impl MessageBus {
                 }
                 matched
             };
-            // Try oneshot delivery first. send() consumes `event` and returns
-            // Err(t) if the waiter's rx was dropped (timeout/abort) — in that
-            // case fall back to the event sink so the Done event is not lost.
-            let event = match waiter_match {
-                Some(waiter) => match waiter.tx.send(event) {
-                    Ok(()) => {
-                        registry.subagent_aborts.lock().remove(&id_for_remove);
-                        registry.remove_agent(&id_for_remove);
-                        registry.in_flight.fetch_sub(1, Ordering::Relaxed);
-                        return;
+            // Waiter matched: claim the buffered result atomically and send
+            // it via oneshot. If claim fails, wait() already consumed the
+            // result — do not re-deliver (exact-once).
+            // If the oneshot rx was dropped (waiter timed out/aborted),
+            // re-buffer the claimed result so a later wait() or the plugin's
+            // injection drain can still pick it up.
+            let delivered = match waiter_match {
+                Some(waiter) => match registry.claim(Some(&id)) {
+                    Some((claimed_id, result)) => {
+                        if waiter
+                            .tx
+                            .send(SubAgentEvent::Done {
+                                agent_id: claimed_id.clone(),
+                                result: Ok(result.clone()),
+                            })
+                            .is_ok()
+                        {
+                            true
+                        } else {
+                            registry.buffer_done(claimed_id, result);
+                            false
+                        }
                     }
-                    Err(e) => e, // rx dropped, fall back to event sink
+                    None => false,
                 },
-                None => event,
+                None => false,
             };
-            registry.push_event(event);
+            if !delivered {
+                registry.push_event(event);
+            }
 
             registry.subagent_aborts.lock().remove(&id_for_remove);
             registry.remove_agent(&id_for_remove);
@@ -969,5 +1066,167 @@ mod tests {
 
         // Aborting an unknown agent is a no-op (no panic).
         bus.abort_agent("nonexistent");
+    }
+
+    fn mk_result(answer: &str) -> SubAgentResult {
+        SubAgentResult {
+            final_answer: answer.into(),
+            tool_calls_count: 0,
+            session_id: "s1".into(),
+            cost: llm_harness_types::CostAggregate::default(),
+        }
+    }
+
+    /// Review regression 1: a FAILED Done (Err, non-Aborted) must reach the
+    /// plugin's queue with its payload intact. Goes through the REAL
+    /// SpawnPlugin sink callback — if the sink dropped Err Done as
+    /// wakeup-only, the failure would never be injectable into the main
+    /// agent's context (format_failure path dead).
+    #[tokio::test]
+    async fn failed_done_survives_plugin_sink() {
+        use crate::plugin::SpawnPlugin;
+
+        let bus = MessageBus::new();
+        let plugin = SpawnPlugin::new_with_idle_timeout(bus.clone(), Duration::from_secs(60));
+
+        // Track-task fallback for a failed sub: no waiter matched.
+        bus.push_event(SubAgentEvent::Done {
+            agent_id: "sub-failed".into(),
+            result: Err(AgentError::Internal("boom".into())),
+        });
+
+        // Failed results are never buffered on the bus (Ok only)...
+        assert!(bus.drain_completed().is_empty());
+        // ...their payload survives in the plugin queue for injection.
+        let queue = plugin.queue_for_test();
+        let events = queue.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "failed Done must be enqueued by SpawnPlugin's sink"
+        );
+        match &events[0] {
+            SubAgentEvent::Done {
+                agent_id,
+                result: Err(e),
+            } => {
+                assert_eq!(agent_id, "sub-failed");
+                assert!(matches!(e, AgentError::Internal(_)));
+            }
+            other => panic!("expected failed Done in plugin queue, got {other:?}"),
+        }
+    }
+
+    /// Review regression 2: a stale waiter whose rx was dropped (wait()
+    /// timed out mid-cleanup) must not swallow the result — the track
+    /// task's delivery block re-buffers on failed oneshot send, so a later
+    /// wait() still retrieves it.
+    #[tokio::test]
+    async fn claimed_result_rebuffered_on_send_failure() {
+        let bus = MessageBus::new();
+        bus.buffer_done("sub-1".into(), mk_result("late result"));
+
+        // Stale waiter: rx already dropped.
+        let (tx, rx) = oneshot::channel::<SubAgentEvent>();
+        drop(rx);
+
+        // Replicate the track task's delivery block (claim + send):
+        let claimed = bus.claim(Some("sub-1"));
+        assert!(claimed.is_some(), "result should be claimable");
+        let (claimed_id, result) = claimed.unwrap();
+        let send_ok = tx
+            .send(SubAgentEvent::Done {
+                agent_id: claimed_id.clone(),
+                result: Ok(result.clone()),
+            })
+            .is_ok();
+        assert!(!send_ok, "send to a dropped rx must fail");
+
+        // The production fix: re-buffer on send failure (same call the
+        // track task makes at message_bus.rs track task).
+        bus.buffer_done(claimed_id, result);
+        assert!(bus.has_unclaimed_done(), "result re-buffered after failure");
+
+        let (id, r) = bus
+            .claim(Some("sub-1"))
+            .expect("later claim must retrieve the re-buffered result");
+        assert_eq!(id, "sub-1");
+        assert_eq!(r.final_answer, "late result");
+    }
+
+    /// Review round 2: a sub-agent's wait (from=None, as
+    /// AwaitMainMessageTool issues it) must NOT steal another sub's
+    /// buffered Done result. Done results belong to the main agent's
+    /// consumption path only.
+    #[tokio::test]
+    async fn sub_side_wait_none_does_not_steal_done_results() {
+        let bus = MessageBus::new();
+        bus.buffer_done("sub-1".into(), mk_result("sub-1 result"));
+
+        // Exactly what AwaitMainMessageTool does: bus.wait(sub_id, None, ...).
+        let stolen = bus
+            .wait(
+                "sub-9",
+                None,
+                Some(Duration::from_millis(100)),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            stolen.is_none(),
+            "sub-side wait(None) must not consume sub-1's buffered Done result"
+        );
+        assert!(
+            bus.has_unclaimed_done(),
+            "sub-1's result must still be in the buffer for the main agent"
+        );
+
+        // Main side still gets it (FIFO from=None is fine under "Main").
+        let main_event = bus
+            .wait(
+                MAIN_AGENT_ID,
+                None,
+                Some(Duration::from_secs(1)),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            main_event.is_some(),
+            "main wait(None) should claim the result"
+        );
+    }
+
+    /// Review round 3, point 2: the claim fast-path must key off the
+    /// REGISTERED is_main identity, not the MAIN_AGENT_ID literal — tools
+    /// accept a configurable main_id, and a literal check would silently
+    /// skip the fast path for custom ids.
+    #[tokio::test]
+    async fn custom_main_id_still_claims_buffered_done() {
+        let bus = MessageBus::new();
+        bus.register(
+            "orchestrator",
+            AgentEntry {
+                status: AgentStatus::Running,
+                harness: None,
+                is_main: true,
+                role: None,
+                description: None,
+            },
+        );
+        bus.buffer_done("sub-1".into(), mk_result("for orchestrator"));
+
+        let event = bus
+            .wait(
+                "orchestrator",
+                Some("sub-1"),
+                Some(Duration::from_secs(1)),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            event.is_some(),
+            "custom main_id fast-path must claim the buffered Done result"
+        );
+        assert!(!bus.has_unclaimed_done());
     }
 }
