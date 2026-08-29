@@ -1,6 +1,6 @@
 # 内置工具指南
 
-> `llm-harness-tools` 提供 6 个开箱即用的工具：`bash`、`read`、`write`、`edit`、`grep`、`glob`。所有工具基于 `ExecutionEnv` 原语实现，不依赖具体操作系统。
+> `llm-harness-tools` 提供 9 个开箱即用的工具：`bash`、`read`、`write`、`edit`、`grep`、`glob`、`code_exec`、`web_search`、`web_fetch`。所有工具基于 `ExecutionEnv` 原语实现，不依赖具体操作系统。
 
 ---
 
@@ -11,7 +11,7 @@
 ```rust
 use llm_harness_tools::FsToolsPlugin;
 
-// 注册全部 6 个工具，read/edit/write 共享 FileSnapshotStore
+// 注册 bash/read/write/edit/grep/glob，read/edit/write 共享 FileSnapshotStore
 builder.install(&FsToolsPlugin::new(None));
 
 // 或传入共享 snapshot store 启用 hashline 锚定
@@ -26,7 +26,7 @@ builder.install(&FsToolsPlugin::new(Some(store)));
 ### 单独注册
 
 ```rust
-use llm_harness_tools::{BashTool, ReadTool, WriteTool, EditTool, GrepTool, GlobTool};
+use llm_harness_tools::{BashTool, ReadTool, WriteTool, EditTool, GrepTool, GlobTool, CodeExecTool, WebSearchTool, WebFetchTool};
 
 builder
     .tool(BashTool::new())
@@ -34,8 +34,104 @@ builder
     .tool(WriteTool::new(None))
     .tool(EditTool::new(None))
     .tool(GrepTool::new())
-    .tool(GlobTool::new());
+    .tool(GlobTool::new())
+    .tool(CodeExecTool::new())
+    .tool(WebSearchTool::new())
+    .tool(WebFetchTool::new());
 ```
+
+### Web 工具一键注册
+
+```rust
+use llm_harness_tools::WebToolsPlugin;
+
+// 注册 web_search + web_fetch，共享 WebSearchConfig（默认 DuckDuckGo，无需 API key）
+builder.install(&WebToolsPlugin::default());
+
+// 自定义搜索 provider 与 API key
+use llm_harness_tools::WebSearchConfig;
+let config = WebSearchConfig {
+    provider: "brave".into(),
+    api_keys: [("brave".to_string(), "YOUR_KEY".to_string())].into_iter().collect(),
+    ..Default::default()
+};
+builder.install(&WebToolsPlugin::new(config));
+```
+
+---
+
+## code_exec
+
+在临时目录中执行用户代码片段，支持 `python`、`bash`、`javascript` 三种语言。
+
+| 参数 | 类型 | 必填 | 默认 | 说明 |
+|------|------|------|------|------|
+| `language` | string | ✅ | — | `python` / `bash` / `javascript` |
+| `code` | string | ✅ | — | 要执行的代码 |
+
+**行为**：
+- 每次执行创建独立临时目录（`env.create_temp_dir("code_exec")`），写入源文件后执行
+- 通过 `env.execute_shell` 执行——遵守沙箱隔离（bwrap/seatbelt）、abort 信号与超时（默认 30s，`CodeExecTool::with_timeout` 可调）
+- 返回 `exit_code`、`stdout`、`stderr`；非零退出码**不是** ToolFailure，需检查输出中的 `exit_code`
+- 结果为 projected：session 中保留摘要，完整输出按截断策略处理
+
+**示例**：
+```json
+{"language": "python", "code": "print(sum(range(100)))"}
+{"language": "javascript", "code": "console.log(Array.from({length: 5}, (_, i) => i * 2))"}
+```
+
+---
+
+## web_search
+
+搜索网页，返回带标题、URL、摘要的排序结果。支持 9 个 provider：
+
+| Provider | 需要 API key | 说明 |
+|----------|-------------|------|
+| `duckduckgo`（默认） | ❌ | HTML 抓取 + 解析，开箱即用 |
+| `bing` | ✅ | HTML 抓取解析 |
+| `brave` | ✅ | JSON API |
+| `tavily` | ✅ | JSON API，带相关度评分 |
+| `serper` | ✅ | Google SERP API |
+| `serpapi` | ✅ | Google SERP API |
+| `exa` | ✅ | 神经搜索，带评分 |
+| `searxng` | ❌ | 自建 SearXNG 实例（`base_url` 指向实例） |
+| `google_cse` | ✅ | 需同时配置 `engine_id` |
+
+`WebSearchConfig` 关键字段：`provider`、`base_url`、`api_key`（legacy 单 key）、`api_keys`（按 provider 的 key map，优先）、`engine_id`（仅 google_cse）、`max_results`（默认 5）、`fetch_timeout_secs`（默认 12）、`max_fetch_chars`（默认 12000）。
+
+**行为**：
+- 结果格式：`N. title\n   URL: ...\n   snippet`
+- 结果为 projected：`details` 携带结构化结果（含 `sources` 引用元数据）
+- provider 无结果/被拦截/HTML 变更时返回 `[WEB] No parseable ... results found` 提示
+
+**示例**：
+```json
+{"query": "rust async runtime comparison tokio vs async-std"}
+```
+
+---
+
+## web_fetch
+
+抓取网页并提取可读文本（HTML 剥离）。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `url` | string | ✅ | HTTP/HTTPS URL |
+
+**行为**：
+- 提取页面标题 + 正文文本（截断到 `max_fetch_chars`），返回元数据（`content_type`、`truncated`、`chars`、`sources` 引用块）
+- 与 `web_search` 共享 `WebSearchConfig`（超时/字符上限）
+- 不适用于二进制文件、图片、非 HTML 内容
+
+**示例**：
+```json
+{"url": "https://doc.rust-lang.org/book/ch16-00-concurrency.html"}
+```
+
+> `code_exec`、`web_search`、`web_fetch` 与 `bash` 一样启用 `report_duration`，结果附 `[duration: ...]` 标注（见截断策略一节）。
 
 ---
 
@@ -219,7 +315,8 @@ builder
 
 ## 安全注意事项
 
-- **bash**：应配合 `SafetyDefaultsPlugin`（命令黑名单）和 `Sandbox`（沙箱隔离）使用。无沙箱时 Agent 可执行任意命令。
+- **bash / code_exec**：应配合 `SafetyDefaultsPlugin`（命令黑名单）和 `Sandbox`（沙箱隔离）使用。无沙箱时 Agent 可执行任意命令；`code_exec` 通过 `env.execute_shell` 执行，继承沙箱配置。
 - **write/edit**：应配合 `SafetyDefaultsPlugin`（路径遍历防护）。无防护时 Agent 可写入任意路径。
 - **read/grep/glob**：路径解析基于 `env.working_dir()`，相对路径在工作目录下解析。
 - **hashline 锚定**：`read` + `edit` 通过 `FileSnapshotStore` 共享 4-hex content tag，防止 LLM 对过时内容应用编辑。`write` 会使旧 tag 失效。
+- **web_search/web_fetch**：抓取的外部内容可能包含提示注入。建议配合 `InjectionFilterPlugin`（注入短语过滤）与 `SourceTagPlugin`（`<external_content>` 来源包裹）使用。
