@@ -461,6 +461,10 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
     let config = TeamConfig {
         memory_root: project_dir.join("memory"),
         session_base_dir: project_dir.join("sessions"),
+        // Studio templates describe direct peer-to-peer review and feedback
+        // routes. Full-mesh contact setup needs one slot for the operator
+        // plus every other member; retain the core default for tiny teams.
+        max_contacts_per_agent: inputs.spec.members.len().max(20),
         ..TeamConfig::default()
     };
     std::fs::create_dir_all(project_dir.join("memory"))?;
@@ -536,6 +540,22 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
     }
 
     team.build(inputs.env.clone(), providers).await?;
+
+    // AgentTeam intentionally seeds only operator contacts. Studio specs are
+    // declarative team topologies, so make every declared peer addressable
+    // before runners start; templates can then rely on reviewer→judge and
+    // judge→planner without first delegating through an intermediary.
+    let social_context = team.social_context().ok_or(TeamError::NotBuilt)?.clone();
+    for sender in &inputs.spec.members {
+        for receiver in &inputs.spec.members {
+            if sender.id != receiver.id {
+                social_context.ensure_contact(
+                    &llm_harness_agent_team::AgentId::new(&sender.id),
+                    &llm_harness_agent_team::AgentId::new(&receiver.id),
+                );
+            }
+        }
+    }
 
     // Patrol arming：task 为空 → 引擎生成默认文本（issues_dir 有值则拼入）。
     for m in &inputs.spec.members {

@@ -256,6 +256,128 @@ async fn coding_team_relay_completes_through_operator() {
     pm.shutdown("relay").await.unwrap();
 }
 
+/// The coding-team review loop depends on reviewer→judge without an
+/// intervening delegation. This deterministic chain covers a full
+/// NEEDS_CHANGES cycle and then the final PASS handoff to the operator.
+#[tokio::test]
+async fn coding_team_review_loop_returns_changes_and_passes() {
+    let _guard = FACTORY_LOCK.lock().await;
+    install_mock_chain(vec![
+        (
+            "planner",
+            vec![
+                MockResponse::tool_use(
+                    "p1",
+                    "delegate_task",
+                    r#"{"to": "reviewer", "task": "task-1: review the change", "timeout_secs": 60}"#,
+                ),
+                MockResponse::tool_use(
+                    "p2",
+                    "delegate_task",
+                    r#"{"to": "coder", "task": "task-2: fix the review finding", "timeout_secs": 60}"#,
+                ),
+                MockResponse::tool_use(
+                    "p3",
+                    "delegate_task",
+                    r#"{"to": "judge", "task": "review task-2 output", "timeout_secs": 60}"#,
+                ),
+            ],
+        ),
+        (
+            "reviewer",
+            vec![MockResponse::tool_use_end_turn(
+                "r1",
+                "send_message",
+                r#"{"to": "judge", "body": "task-1 needs a naming fix"}"#,
+            )],
+        ),
+        (
+            "judge",
+            vec![
+                MockResponse::tool_use_end_turn(
+                    "j1",
+                    "send_message",
+                    r##"{"to": "planner", "body": "NEEDS_CHANGES: fix the naming"}"##,
+                ),
+                MockResponse::tool_use_end_turn(
+                    "j2",
+                    "send_message",
+                    r##"{"to": "operator", "body": "# Code Review 报告\n\n## 总体结论: PASS\n\n无 P0/P1 finding。"}"##,
+                ),
+            ],
+        ),
+        (
+            "coder",
+            vec![MockResponse::tool_use_end_turn(
+                "c1",
+                "send_message",
+                r#"{"to": "planner", "task_id": "task-planner-1", "body": "task-2 fixed"}"#,
+            )],
+        ),
+    ]);
+
+    let repo = make_repo();
+    let data_root = unique_dir("ct-e2e-review-loop");
+    let spec = llm_harness_agent_team_studio::team_spec::TeamSpec {
+        id: "review-loop".into(),
+        template: None,
+        template_baseline: None,
+        name: "review-loop".into(),
+        repo_path: Some(repo.to_string_lossy().to_string()),
+        members: ["planner", "reviewer", "judge", "coder"]
+            .iter()
+            .map(|id| llm_harness_agent_team_studio::team_spec::MemberSpec {
+                id: (*id).into(),
+                persona: format!("{id} persona"),
+                role_label: id.to_string(),
+                model: llm_harness_agent_team_studio::team_spec::ModelRef::Explicit((*id).into()),
+                toolkits: vec![],
+                behaviors: vec![],
+                provider_override: None,
+                persona_file: None,
+            })
+            .collect(),
+    };
+    let mut pm = TeamManager::new(&data_root);
+    pm.create(spec, Some(repo), &settings(), "").await.unwrap();
+
+    pm.get("review-loop")
+        .unwrap()
+        .team
+        .submit(
+            "reviewer",
+            "review task-1, apply changes if needed, then report",
+        )
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let operator_messages = {
+            let ctx = pm
+                .get("review-loop")
+                .unwrap()
+                .team
+                .social_context()
+                .unwrap()
+                .clone();
+            ctx.drain_inbox(&AgentId::new("operator"))
+        };
+        if operator_messages
+            .iter()
+            .any(|message| message.body.contains("总体结论: PASS"))
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "review loop did not reach the operator within 10s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    pm.shutdown("review-loop").await.unwrap();
+}
+
 /// T1: chat → planner inbox receives the routed text (backend routing by
 /// explicit target, the core of the operator entry point).
 #[tokio::test]
