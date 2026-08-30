@@ -68,7 +68,7 @@ pub struct Assembled {
 }
 
 /// 资源确认后的交接路由（由 Behavior::Handoff 收集）。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HandoffRoute {
     pub resource: String,
     pub to: String,
@@ -148,7 +148,7 @@ pub fn build_member_providers(
     out
 }
 
-fn validate_spec(spec: &TeamSpec) -> Result<(), AssembleError> {
+pub fn validate_spec(spec: &TeamSpec) -> Result<(), AssembleError> {
     if spec.id.is_empty() || spec.id == "." || spec.id == ".." {
         return Err(AssembleError::InvalidTeamId(spec.id.clone()));
     }
@@ -182,6 +182,31 @@ fn validate_spec(spec: &TeamSpec) -> Result<(), AssembleError> {
         }
     }
     Ok(())
+}
+
+/// Handoff routes declared by the current spec.
+pub fn handoff_routes(spec: &TeamSpec) -> Vec<HandoffRoute> {
+    spec.members
+        .iter()
+        .flat_map(|m| {
+            m.behaviors.iter().filter_map(|behavior| match behavior {
+                Behavior::Handoff {
+                    on,
+                    to,
+                    message_template,
+                } => Some(HandoffRoute {
+                    resource: match on {
+                        crate::team_spec::Trigger::ResourceConfirmed { resource } => {
+                            resource.clone()
+                        }
+                    },
+                    to: to.clone(),
+                    message_template: message_template.clone(),
+                }),
+                _ => None,
+            })
+        })
+        .collect()
 }
 
 /// 装配一个团队。team.build 内部统一安装社交/memory/knowledge 插件
@@ -328,6 +353,7 @@ mod tests {
         TeamSpec {
             id: "t".into(),
             template: None,
+            template_baseline: None,
             name: "T".into(),
             repo_path: None,
             members,

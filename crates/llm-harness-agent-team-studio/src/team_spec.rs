@@ -16,6 +16,10 @@ pub struct TeamSpec {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<TemplateRef>,
+    /// Snapshot of the template members used when this team was created;
+    /// this is the baseline that decides which members may be upgraded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_baseline: Option<TemplateBaseline>,
     pub name: String,
     /// 工作仓库；None = 数据目录兜底（非 coding 类团队）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -35,6 +39,12 @@ impl TeamSpec {
 pub struct TemplateRef {
     pub template_id: String,
     pub version: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TemplateBaseline {
+    pub version: String,
+    pub members: Vec<MemberSpec>,
 }
 
 /// 成员规格：覆写 = 全字段替换。
@@ -58,12 +68,27 @@ pub struct MemberSpec {
 }
 
 /// 模型引用：三档（引用全局 settings）或显式模型 id。
-/// untagged 字符串：resolve 时命中三档名 → Tier，否则按 Explicit 处理。
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+/// 字符串在序列化时保持简洁；反序列化时仅把保留档位名识别为 Tier，
+/// 其余名称必须保留 Explicit 语义，避免持久化往返后回退到未知档位。
+#[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(untagged)]
 pub enum ModelRef {
     Tier(String),
     Explicit(String),
+}
+
+impl<'de> Deserialize<'de> for ModelRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if matches!(value.as_str(), "strong" | "main" | "cheap") {
+            Ok(ModelRef::Tier(value))
+        } else {
+            Ok(ModelRef::Explicit(value))
+        }
+    }
 }
 
 impl ModelRef {
@@ -143,6 +168,7 @@ mod tests {
         TeamSpec {
             id: "t".into(),
             template: None,
+            template_baseline: None,
             name: "T".into(),
             repo_path: None,
             members,
@@ -154,7 +180,7 @@ mod tests {
             id: id.into(),
             persona: "p".into(),
             role_label: "r".into(),
-            model: ModelRef::Explicit("m".into()),
+            model: ModelRef::Explicit("explicit-model".into()),
             toolkits: vec![],
             behaviors: vec![],
             provider_override: None,
@@ -185,6 +211,21 @@ mod tests {
             persona_file: None,
         }]);
         let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<TeamSpec>(&json).unwrap(), s);
+    }
+
+    #[test]
+    fn template_baseline_omitted_when_none() {
+        let s = spec(vec![member("a")]);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("template_baseline"));
+        let mut s = s;
+        s.template_baseline = Some(TemplateBaseline {
+            version: "1".into(),
+            members: s.members.clone(),
+        });
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("template_baseline"));
         assert_eq!(serde_json::from_str::<TeamSpec>(&json).unwrap(), s);
     }
 

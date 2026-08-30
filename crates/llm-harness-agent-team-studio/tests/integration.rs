@@ -118,6 +118,7 @@ fn spec_with_scout(
     TeamSpec {
         id: id.into(),
         template: None,
+        template_baseline: None,
         name: id.into(),
         repo_path: Some(repo.to_string_lossy().to_string()),
         members,

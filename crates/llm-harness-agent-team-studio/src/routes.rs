@@ -67,6 +67,7 @@ pub fn team_router(state: AppState) -> Router {
         )
         .route("/api/team/templates", get(list_templates))
         .route("/api/team/upgrade-check", post(upgrade_check))
+        .route("/api/team/upgrade-apply", post(upgrade_apply))
         .with_state(state)
 }
 
@@ -135,6 +136,10 @@ async fn register_project(
                         template_id: t.id.clone(),
                         version: t.version.clone(),
                     });
+                    t.spec.template_baseline = Some(crate::team_spec::TemplateBaseline {
+                        version: t.version.clone(),
+                        members: t.spec.members.clone(),
+                    });
                     t.spec
                 }
                 Err(e) => {
@@ -149,6 +154,7 @@ async fn register_project(
         None => crate::team_spec::TeamSpec {
             id: body.id.clone(),
             template: None,
+            template_baseline: None,
             name: body.name.clone().unwrap_or_else(|| body.id.clone()),
             repo_path: body.repo_path.clone(),
             members: vec![],
@@ -657,25 +663,7 @@ async fn upgrade_check(
         Err(e) => return err_resp(e.to_string(), StatusCode::NOT_FOUND),
     };
 
-    // 逐字段相等判定（序列化投影，跳过 id/repo_path 等实例字段）。
-    let same_as_template = |m: &crate::team_spec::MemberSpec| -> Option<bool> {
-        let original = template.spec.members.iter().find(|t| t.id == m.id)?;
-        Some(serde_json::to_value(m).ok()? == serde_json::to_value(original).ok()?)
-    };
-    let overridden: Vec<String> = entry
-        .spec
-        .members
-        .iter()
-        .filter(|m| !same_as_template(m).unwrap_or(false))
-        .map(|m| m.id.clone())
-        .collect();
-    let follow: Vec<String> = entry
-        .spec
-        .members
-        .iter()
-        .filter(|m| same_as_template(m).unwrap_or(false))
-        .map(|m| m.id.clone())
-        .collect();
+    let (follow, overridden) = member_upgrade_plan(&entry.spec, &template);
     Json(serde_json::json!({
         "template": { "id": tref.template_id, "version": tref.version },
         "template_current_version": template.version,
@@ -683,6 +671,114 @@ async fn upgrade_check(
         "overridden": overridden,
     }))
     .into_response()
+}
+
+/// Decide which instance members would follow a template upgrade. Prefer the
+/// creation-time baseline; specs saved before baselines existed fall back to
+/// exact equality with the current template.
+fn member_upgrade_plan(
+    spec: &crate::team_spec::TeamSpec,
+    template: &crate::template_store::LoadedTemplate,
+) -> (Vec<String>, Vec<String>) {
+    let mut follow = Vec::new();
+    let mut overridden = Vec::new();
+    for member in &spec.members {
+        let matches_baseline = spec.template_baseline.as_ref().and_then(|baseline| {
+            baseline
+                .members
+                .iter()
+                .find(|old| old.id == member.id)
+                .map(|old| old == member)
+        });
+        let same_as_template = template
+            .spec
+            .members
+            .iter()
+            .find(|original| original.id == member.id)
+            .is_some_and(|original| original == member);
+        if matches_baseline.unwrap_or(same_as_template) {
+            follow.push(member.id.clone());
+        } else {
+            overridden.push(member.id.clone());
+        }
+    }
+    (follow, overridden)
+}
+
+/// Apply the loaded template to members that still match the creation baseline.
+async fn upgrade_apply(
+    State(state): State<AppState>,
+    Json(body): Json<UpgradeCheckBody>,
+) -> Response {
+    let template = {
+        let pm = state.pm.read().await;
+        let Some(entry) = pm.get(&body.project) else {
+            return err_resp(
+                format!("unknown project: {}", body.project),
+                StatusCode::NOT_FOUND,
+            );
+        };
+        let Some(tref) = &entry.spec.template else {
+            return err_resp(
+                "team has no template reference".to_string(),
+                StatusCode::BAD_REQUEST,
+            );
+        };
+        let store =
+            crate::template_store::TemplateStore::new(Some(state.data_root.join("templates")));
+        match store.load(&tref.template_id) {
+            Ok(template) => template,
+            Err(e) => return err_resp(e.to_string(), StatusCode::NOT_FOUND),
+        }
+    };
+
+    let tier = state.tier.read().await.clone();
+    let base_url = crate::settings::Settings::load(&state.data_root)
+        .ok()
+        .flatten()
+        .map(|s| s.base_url)
+        .unwrap_or_default();
+    let settings = crate::settings::Settings {
+        models: tier,
+        scout_interval_secs: *state.scout_interval_secs.read().await,
+        base_url,
+    };
+    let api_key = crate::settings::load_api_key(&state.data_root).unwrap_or_default();
+    let mut pm = state.pm.write().await;
+    match pm
+        .apply_template_upgrade(&body.project, template.clone(), &settings, &api_key)
+        .await
+    {
+        Ok(outcome) => {
+            if !outcome.rebuilt.is_empty()
+                && let Some(entry) = pm.get(&body.project)
+            {
+                for member in &entry.spec.members {
+                    if outcome.rebuilt.contains(&member.id)
+                        && let Some(h) = entry
+                            .team
+                            .harness(&llm_harness_agent_team::AgentId::new(&member.id))
+                    {
+                        state
+                            .registry
+                            .register(format!("{}/{}", body.project, member.id), h);
+                    }
+                }
+            }
+            Json(serde_json::json!({
+                "ok": true,
+                "template": {
+                    "id": template.id,
+                    "version": template.version,
+                },
+                "upgraded": outcome.upgraded,
+                "overridden": outcome.overridden,
+                "rebuilt": outcome.rebuilt,
+            }))
+            .into_response()
+        }
+        Err(e) => err_resp(e.to_string(), StatusCode::CONFLICT),
+    }
 }
 
 /// Whether a member-scoped API key file exists (0600, never returned).
@@ -1958,6 +2054,74 @@ mod tests {
         )
         .await;
         assert_eq!(status, 400);
+    }
+
+    #[tokio::test]
+    async fn upgrade_apply_updates_baseline_members_and_persists_version() {
+        let (router, pm, repo) = setup().await;
+        json_post(
+            &router,
+            "/api/team/projects",
+            serde_json::json!({ "id": "p1", "repo_path": repo.to_string_lossy() }),
+        )
+        .await;
+
+        let template_dir = pm
+            .read()
+            .await
+            .data_root()
+            .join("templates")
+            .join("planner-team");
+        std::fs::create_dir_all(&template_dir).unwrap();
+        std::fs::write(
+            template_dir.join("team.json"),
+            r#"{"id":"planner-team","name":"Planner Team","version":"2","members":[{"id":"planner","persona":"template persona v2","role_label":"规划者","model":"main","toolkits":["fs"],"behaviors":[]}]}"#,
+        )
+        .unwrap();
+        {
+            let mut guard = pm.write().await;
+            let entry = guard.get_mut("p1").unwrap();
+            entry.spec.template = Some(crate::team_spec::TemplateRef {
+                template_id: "planner-team".into(),
+                version: "1".into(),
+            });
+            let mut baseline_member = entry.spec.members[0].clone();
+            baseline_member.persona = "created persona v1".into();
+            entry.spec.members[0] = baseline_member.clone();
+            entry.spec.template_baseline = Some(crate::team_spec::TemplateBaseline {
+                version: "1".into(),
+                members: vec![baseline_member],
+            });
+        }
+
+        let (status, json) = json_post(
+            &router,
+            "/api/team/upgrade-apply",
+            serde_json::json!({ "project": "p1" }),
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(json["upgraded"], serde_json::json!(["planner"]));
+        assert_eq!(json["overridden"], serde_json::json!([]));
+        assert_eq!(json["template"]["version"], "2");
+
+        let entry = pm.read().await;
+        let entry = entry.get("p1").unwrap();
+        assert_eq!(entry.spec.template.as_ref().unwrap().version, "2");
+        assert_eq!(entry.spec.members[0].persona, "template persona v2");
+        let harness = entry
+            .team
+            .harness(&llm_harness_agent_team::AgentId::new("planner"))
+            .unwrap();
+        assert_eq!(
+            harness.state().system_prompt,
+            Some("template persona v2".into())
+        );
+        let persisted =
+            std::fs::read_to_string(pm.read().await.data_root().join("teams/p1/team.json"))
+                .unwrap();
+        assert!(persisted.contains("template persona v2"));
+        assert!(persisted.contains("\"version\": \"2\""));
     }
 
     #[tokio::test]

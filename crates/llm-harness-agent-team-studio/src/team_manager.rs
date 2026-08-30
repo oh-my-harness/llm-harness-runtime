@@ -32,6 +32,11 @@ pub enum TeamManagerError {
     NoProviders,
     #[error("unknown member: {0}")]
     UnknownMember(String),
+    #[error("template membership changed; upgrade requires explicit member management: added={}, removed={}", added.join(", "), removed.join(", "))]
+    MembershipChanged {
+        added: Vec<String>,
+        removed: Vec<String>,
+    },
     #[error(transparent)]
     Assemble(#[from] engine::AssembleError),
     #[error("io: {0}")]
@@ -45,6 +50,15 @@ pub enum MemberUpdate {
     HotApplied,
     /// harness rebuilt via replace_member (model/key/url/toolkits).
     Rebuilt,
+}
+
+/// Result of applying a template upgrade.
+#[derive(Debug, PartialEq)]
+pub struct TemplateUpgradeOutcome {
+    pub version: String,
+    pub upgraded: Vec<String>,
+    pub overridden: Vec<String>,
+    pub rebuilt: Vec<String>,
 }
 
 /// One assembled team instance.
@@ -149,6 +163,11 @@ impl TeamManager {
         self.teams.get(id)
     }
 
+    /// Mutable test/management access to one registered team.
+    pub fn get_mut(&mut self, id: &str) -> Option<&mut TeamEntry> {
+        self.teams.get_mut(id)
+    }
+
     pub fn ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.teams.keys().cloned().collect();
         ids.sort();
@@ -201,6 +220,7 @@ impl TeamManager {
         let structural_change = key_changed
             || old.toolkits != member.toolkits
             || old.model != member.model
+            || old.role_label != member.role_label
             || old.provider_override != member.provider_override;
 
         let update = if structural_change {
@@ -279,6 +299,145 @@ impl TeamManager {
         }
         crate::team_manager::persist_spec(&self.data_root, &entry.spec);
         Ok(update)
+    }
+
+    /// Apply the current template to members that still match the creation
+    /// baseline. User-overridden members are left untouched.
+    pub async fn apply_template_upgrade(
+        &mut self,
+        team_id: &str,
+        template: crate::template_store::LoadedTemplate,
+        settings: &crate::settings::Settings,
+        api_key: &str,
+    ) -> Result<TemplateUpgradeOutcome, TeamManagerError> {
+        crate::engine::validate_spec(&template.spec)?;
+        let template_members = template.spec.members;
+        template_members
+            .iter()
+            .try_for_each(crate::engine::validate_toolkits)?;
+        let old_members = self
+            .teams
+            .get(team_id)
+            .ok_or_else(|| TeamManagerError::UnknownTeam(team_id.to_string()))?
+            .spec
+            .members
+            .clone();
+        let baseline_members = self
+            .teams
+            .get(team_id)
+            .ok_or_else(|| TeamManagerError::UnknownTeam(team_id.to_string()))?
+            .spec
+            .template_baseline
+            .as_ref()
+            .map(|baseline| baseline.members.clone());
+
+        let old_ids: std::collections::HashSet<&str> =
+            old_members.iter().map(|m| m.id.as_str()).collect();
+        let template_ids: std::collections::HashSet<&str> =
+            template_members.iter().map(|m| m.id.as_str()).collect();
+        let added: Vec<String> = template_members
+            .iter()
+            .filter(|m| !old_ids.contains(m.id.as_str()))
+            .map(|m| m.id.clone())
+            .collect();
+        let removed: Vec<String> = old_members
+            .iter()
+            .filter(|m| !template_ids.contains(m.id.as_str()))
+            .map(|m| m.id.clone())
+            .collect();
+        if !added.is_empty() || !removed.is_empty() {
+            return Err(TeamManagerError::MembershipChanged { added, removed });
+        }
+
+        let template_by_id = |id: &str| {
+            template_members
+                .iter()
+                .find(|m| m.id == id)
+                .cloned()
+                .expect("membership equality checked before upgrade")
+        };
+        let would_follow = |member: &crate::team_spec::MemberSpec| match &baseline_members {
+            Some(baseline) => baseline
+                .iter()
+                .find(|old| old.id == member.id)
+                .is_some_and(|old| old == member),
+            None => template_by_id(&member.id) == *member,
+        };
+        let mut outcome = TemplateUpgradeOutcome {
+            version: template.version.clone(),
+            upgraded: Vec::new(),
+            overridden: Vec::new(),
+            rebuilt: Vec::new(),
+        };
+        for old in &old_members {
+            let member = template_by_id(&old.id);
+            if !would_follow(old) {
+                outcome.overridden.push(old.id.clone());
+                continue;
+            }
+            if old == &member {
+                continue;
+            }
+            let behaviors_changed = old.behaviors != member.behaviors;
+            let update = self
+                .update_member(team_id, member.clone(), settings, api_key, false)
+                .await?;
+            if update == MemberUpdate::Rebuilt {
+                outcome.rebuilt.push(member.id.clone());
+            }
+            outcome.upgraded.push(member.id.clone());
+            if behaviors_changed
+                && member
+                    .behaviors
+                    .iter()
+                    .any(|b| matches!(b, crate::team_spec::Behavior::Patrol { .. }))
+            {
+                let entry = self
+                    .teams
+                    .get(team_id)
+                    .expect("entry must exist after member update");
+                for behavior in &member.behaviors {
+                    if let crate::team_spec::Behavior::Patrol {
+                        interval_secs,
+                        task,
+                        issues_dir,
+                    } = behavior
+                    {
+                        let dir = issues_dir.clone().unwrap_or_else(|| {
+                            entry
+                                .data_dir()
+                                .join("issues")
+                                .to_string_lossy()
+                                .to_string()
+                        });
+                        let text = if task.is_empty() {
+                            engine::default_patrol_task(&dir, *interval_secs)
+                        } else {
+                            task.clone()
+                        };
+                        if let Err(e) = entry.team.submit(&member.id, &text) {
+                            tracing::error!("patrol arming failed for {}: {e}", member.id);
+                        }
+                    }
+                }
+            }
+        }
+
+        let entry = self
+            .teams
+            .get_mut(team_id)
+            .expect("entry must exist after member updates");
+        entry.spec.template = Some(crate::team_spec::TemplateRef {
+            template_id: template.id,
+            version: template.version,
+        });
+        entry.spec.template_baseline = Some(crate::team_spec::TemplateBaseline {
+            version: outcome.version.clone(),
+            members: template_members,
+        });
+        entry.handoffs = engine::handoff_routes(&entry.spec);
+        crate::team_manager::persist_spec(&self.data_root, &entry.spec);
+        Ok(outcome)
     }
 
     /// Apply the confirmed-issue handoff routes: for each route whose
@@ -382,7 +541,7 @@ mod tests {
             id: id.into(),
             persona: "worker".into(),
             role_label: "r".into(),
-            model: ModelRef::Explicit("m".into()),
+            model: ModelRef::Tier("m".into()),
             toolkits: vec![],
             behaviors: vec![],
             provider_override: None,
@@ -394,6 +553,7 @@ mod tests {
         TeamSpec {
             id: "t".into(),
             template: None,
+            template_baseline: None,
             name: "T".into(),
             repo_path: None,
             members: vec![member("a"), member("b")],
@@ -481,6 +641,123 @@ mod tests {
             TeamManagerError::Assemble(engine::AssembleError::InvalidTeamId(_))
         ));
         assert!(!root.join("teams").exists());
+    }
+
+    #[tokio::test]
+    async fn template_upgrade_updates_unmodified_members_only() {
+        install_mock_factory();
+        let root = unique_dir("ct-tm-upgrade");
+        let mut tm = TeamManager::new(&root);
+        let old_member = member("a");
+        let baseline_member = member("b");
+        let mut spec = blank_spec();
+        spec.template = Some(crate::team_spec::TemplateRef {
+            template_id: "example".into(),
+            version: "1".into(),
+        });
+        spec.template_baseline = Some(crate::team_spec::TemplateBaseline {
+            version: "1".into(),
+            members: vec![old_member.clone(), baseline_member.clone()],
+        });
+        let mut overridden_member = baseline_member.clone();
+        overridden_member.persona = "user override".into();
+        spec.members = vec![old_member.clone(), overridden_member.clone()];
+        tm.create(spec, None, &settings(), "").await.unwrap();
+
+        let mut upgraded_member = old_member.clone();
+        upgraded_member.persona = "upgraded persona".into();
+        upgraded_member.behaviors = vec![Behavior::Handoff {
+            on: Trigger::ResourceConfirmed {
+                resource: "issues".into(),
+            },
+            to: "b".into(),
+            message_template: "issue: {body}".into(),
+        }];
+        let mut template_member = overridden_member.clone();
+        template_member.persona = "new template persona".into();
+        let template = crate::template_store::LoadedTemplate {
+            id: "example".into(),
+            version: "2".into(),
+            spec: crate::team_spec::TeamSpec {
+                id: "example".into(),
+                template: None,
+                template_baseline: None,
+                name: "Example".into(),
+                repo_path: None,
+                members: vec![upgraded_member.clone(), template_member],
+            },
+        };
+
+        let outcome = tm
+            .apply_template_upgrade("t", template, &settings(), "")
+            .await
+            .unwrap();
+        assert_eq!(outcome.version, "2");
+        assert_eq!(outcome.upgraded, vec!["a"]);
+        assert_eq!(outcome.overridden, vec!["b"]);
+
+        let entry = tm.get("t").unwrap();
+        let upgraded_spec = entry.spec.members.iter().find(|m| m.id == "a").unwrap();
+        let overridden_spec = entry.spec.members.iter().find(|m| m.id == "b").unwrap();
+        assert_eq!(upgraded_spec.persona, "upgraded persona");
+        assert_eq!(overridden_spec.persona, overridden_member.persona);
+        assert_eq!(entry.spec.template.as_ref().unwrap().version, "2");
+        assert_eq!(
+            entry.handoffs,
+            vec![engine::HandoffRoute {
+                resource: "issues".into(),
+                to: "b".into(),
+                message_template: "issue: {body}".into(),
+            }]
+        );
+        let harness = entry
+            .team
+            .harness(&llm_harness_agent_team::AgentId::new("a"))
+            .unwrap();
+        assert_eq!(
+            harness.state().system_prompt,
+            Some("upgraded persona".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn template_upgrade_rejects_membership_changes() {
+        install_mock_factory();
+        let root = unique_dir("ct-tm-upgrade-members");
+        let mut tm = TeamManager::new(&root);
+        let old_member = member("a");
+        let mut spec = blank_spec();
+        spec.template = Some(crate::team_spec::TemplateRef {
+            template_id: "example".into(),
+            version: "1".into(),
+        });
+        spec.template_baseline = Some(crate::team_spec::TemplateBaseline {
+            version: "1".into(),
+            members: vec![old_member.clone()],
+        });
+        spec.members = vec![old_member.clone(), member("b")];
+        tm.create(spec, None, &settings(), "").await.unwrap();
+
+        let template = crate::template_store::LoadedTemplate {
+            id: "example".into(),
+            version: "2".into(),
+            spec: crate::team_spec::TeamSpec {
+                id: "example".into(),
+                template: None,
+                template_baseline: None,
+                name: "Example".into(),
+                repo_path: None,
+                members: vec![old_member.clone(), member("b"), member("c")],
+            },
+        };
+        let err = tm
+            .apply_template_upgrade("t", template, &settings(), "")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "template membership changed; upgrade requires explicit member management: added=c, removed="
+        );
     }
 
     #[tokio::test]
