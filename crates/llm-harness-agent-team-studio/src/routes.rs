@@ -817,7 +817,13 @@ async fn put_agent_config(
 
     let api_key = crate::settings::load_api_key(&state.data_root).unwrap_or_default();
     match pm
-        .update_member(&body.project, member, &settings, &api_key)
+        .update_member(
+            &body.project,
+            member,
+            &settings,
+            &api_key,
+            body.api_key.is_some(),
+        )
         .await
     {
         Ok(update) => {
@@ -1828,6 +1834,25 @@ mod tests {
         );
         assert_eq!(body["override"]["api_key_set"], true);
         assert_eq!(body["override"]["base_url"], "https://o.io/v4");
+    }
+
+    #[tokio::test]
+    async fn agent_config_key_change_rebuilds_member() {
+        let (router, _pm, repo) = setup().await;
+        register_template_team(&router, &repo).await;
+
+        for key in ["sk-first", "sk-second"] {
+            let (status, json) = json_put(
+                &router,
+                "/api/team/agent/config",
+                serde_json::json!({
+                    "project": "p1", "agent": "coder", "api_key": key,
+                }),
+            )
+            .await;
+            assert_eq!(status, 200, "{json}");
+            assert_eq!(json["rebuilt"], true, "key-only change must rebuild");
+        }
     }
 
     #[tokio::test]

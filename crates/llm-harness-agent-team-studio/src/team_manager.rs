@@ -180,6 +180,7 @@ impl TeamManager {
         member: crate::team_spec::MemberSpec,
         settings: &crate::settings::Settings,
         api_key: &str,
+        key_changed: bool,
     ) -> Result<MemberUpdate, TeamManagerError> {
         let entry = self
             .teams
@@ -196,7 +197,8 @@ impl TeamManager {
         engine::validate_toolkits(&member)?;
 
         // Structural fields: always persisted into the spec.
-        let structural_change = old.toolkits != member.toolkits
+        let structural_change = key_changed
+            || old.toolkits != member.toolkits
             || old.model != member.model
             || old.provider_override != member.provider_override;
 
