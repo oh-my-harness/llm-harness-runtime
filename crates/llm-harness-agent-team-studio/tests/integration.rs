@@ -718,3 +718,121 @@ async fn live_llm_team_sends_and_receives() {
 
     pm.shutdown("live").await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires live LLM endpoint; run with --ignored"]
+async fn live_llm_review_loop_reaches_operator() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .unwrap_or_else(|_| panic!("set ANTHROPIC_API_KEY to the local LLM token"));
+    let base_url = "http://10.0.20.110:3001";
+    let model = "moonshotai/kimi-k2.6";
+
+    let repo = make_repo();
+    let data_root = unique_dir("ct-live-review-loop");
+    let mut pm = TeamManager::new(&data_root);
+    let settings = llm_harness_agent_team_studio::settings::Settings {
+        models: ModelTier {
+            strong: model.into(),
+            main: model.into(),
+            cheap: model.into(),
+        },
+        scout_interval_secs: 0,
+        base_url: base_url.into(),
+    };
+
+    let persona =
+        |text: &str| format!("你是 coding-team 成员。只执行当前消息，不要发明其他阶段。{text}");
+    let spec = llm_harness_agent_team_studio::team_spec::TeamSpec {
+        id: "live-review-loop".into(),
+        template: None,
+        template_baseline: None,
+        name: "live-review-loop".into(),
+        repo_path: Some(repo.to_string_lossy().to_string()),
+        members: vec![
+            llm_harness_agent_team_studio::team_spec::MemberSpec {
+                id: "planner".into(),
+                persona: persona(
+                    "第一次收到用户请求时，立即用 delegate_task 派给 reviewer。收到 reviewer 或 coder 消息后，把该结果用 delegate_task 派给 reviewer；收到 judge 的 NEEDS_CHANGES 后，用 delegate_task 派给 coder。不要直接回复 operator。",
+                ),
+                role_label: "planner".into(),
+                model: llm_harness_agent_team_studio::team_spec::ModelRef::Explicit(model.into()),
+                toolkits: vec![],
+                behaviors: vec![],
+                provider_override: None,
+                persona_file: None,
+            },
+            llm_harness_agent_team_studio::team_spec::MemberSpec {
+                id: "reviewer".into(),
+                persona: persona(
+                    "立即用 send_message(\"judge\", ...) 汇报：NEEDS_CHANGES: simplify the response。",
+                ),
+                role_label: "reviewer".into(),
+                model: llm_harness_agent_team_studio::team_spec::ModelRef::Explicit(model.into()),
+                toolkits: vec![],
+                behaviors: vec![],
+                provider_override: None,
+                persona_file: None,
+            },
+            llm_harness_agent_team_studio::team_spec::MemberSpec {
+                id: "coder".into(),
+                persona: persona(
+                    "立即用 send_message(\"planner\", task_id, body) 汇报：task completed。",
+                ),
+                role_label: "coder".into(),
+                model: llm_harness_agent_team_studio::team_spec::ModelRef::Explicit(model.into()),
+                toolkits: vec![],
+                behaviors: vec![],
+                provider_override: None,
+                persona_file: None,
+            },
+            llm_harness_agent_team_studio::team_spec::MemberSpec {
+                id: "judge".into(),
+                persona: persona(
+                    "第一次收到消息时，立即用 send_message(\"planner\", ...) 发送：NEEDS_CHANGES: simplify the response。第二次收到消息时，立即用 send_message(\"operator\", ...) 发送正文必须包含：## 总体结论: PASS。",
+                ),
+                role_label: "judge".into(),
+                model: llm_harness_agent_team_studio::team_spec::ModelRef::Explicit(model.into()),
+                toolkits: vec![],
+                behaviors: vec![],
+                provider_override: None,
+                persona_file: None,
+            },
+        ],
+    };
+    pm.create(spec, Some(repo), &settings, &api_key)
+        .await
+        .unwrap();
+    pm.get("live-review-loop")
+        .unwrap()
+        .team
+        .submit("planner", "run the review loop for task-1")
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(240);
+    let ctx = pm
+        .get("live-review-loop")
+        .unwrap()
+        .team
+        .social_context()
+        .unwrap()
+        .clone();
+    loop {
+        let got = ctx.drain_inbox(&AgentId::new("operator"));
+        if let Some(message) = got
+            .iter()
+            .find(|message| message.body.contains("总体结论: PASS"))
+        {
+            println!("operator received: {}", message.body);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "review loop did not reach the operator within 240s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    pm.shutdown("live-review-loop").await.unwrap();
+}
