@@ -119,6 +119,38 @@ team.shutdown();
 
 ---
 
+## Agent Team Studio：模板化团队工作台
+
+`llm-harness-agent-team-studio`（由 coding-team 演化而来）把团队变成
+**声明式配置 + 模板**：团队由 `TeamSpec`（成员 persona / model / 工具包 /
+行为）描述，从模板一键创建实例；内置 `coding-team` 模板（brainstormer /
+planner / coder / 5×reviewer / judge / debugger / scout）是第一个官方模板。
+
+```bash
+./scripts/studio.sh            # 构建 → 起服务 → 打开面板
+# 面板：http://127.0.0.1:<port>/app/team.html（数据目录 ~/.harness/agent-team-studio）
+```
+
+面板三列工作区：左列成员卡片（状态/插话/停止）、中列选中成员 session
+历史、右列 per-agent 配置（persona 热应用；model/api key/base url/工具包
+改动重建该成员 harness）；右上角 ⚙ 是全局设置模态框。
+
+关键 API：
+
+- `GET /api/team/templates` — 模板列表
+- `POST /api/team/projects {id, template_id, repo_path}` — 从模板创建团队
+- `GET/PUT /api/team/agent/config` — per-agent 配置（PUT persona 热应用，
+  model/key/url 重建）
+- `POST /api/team/upgrade-check` — 升级检查（逐字段相等判定哪些成员会跟随
+  模板升级、哪些是本地覆写）
+
+
+设计：`docs/design/2026-08-30-agent-team-studio-design.md`；实现计划：
+`docs/design/2026-08-30-agent-team-studio-plan.md`；coding-team 原始设计：
+`docs/design/2026-08-29-coding-team-design.md`。
+
+---
+
 ## 设计文档
 
 - 当前状态与评审结论：`docs/design/2026-08-25-agent-team-current-state.md`
