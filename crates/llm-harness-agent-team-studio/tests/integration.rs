@@ -55,6 +55,22 @@ fn install_mock(sequence: Vec<MockResponse>) {
     }));
 }
 
+/// Install model-isolated mock clients so an agent chain can run without
+/// sharing one response queue across concurrent runner tasks.
+fn install_mock_chain(clients: Vec<(&str, Vec<MockResponse>)>) {
+    let providers: Vec<(String, Arc<dyn llm_harness_loop::LlmClient>)> = clients
+        .into_iter()
+        .map(|(model, sequence)| {
+            let client: Arc<dyn llm_harness_loop::LlmClient> =
+                Arc::new(MockLlmClient::new(sequence));
+            (model.to_owned(), client)
+        })
+        .collect();
+    llm_harness_agent_team_studio::env_cfg::install_provider_factory(Arc::new(move || {
+        providers.clone()
+    }));
+}
+
 fn settings() -> llm_harness_agent_team_studio::settings::Settings {
     llm_harness_agent_team_studio::settings::Settings {
         models: tier(),
@@ -137,6 +153,107 @@ async fn drain_planner(pm: &RwLock<TeamManager>, project: &str) -> Vec<String> {
         .into_iter()
         .map(|m| m.body)
         .collect()
+}
+
+/// The minimal coding-team relay: planner delegates implementation, coder
+/// reports back through inbound auto-contact, planner delegates review, and
+/// judge reports to the operator. This exercises the social rules that the
+/// template personas depend on (`delegate_task`, task-id replies, and the
+/// operator gate) as one asynchronous chain.
+#[tokio::test]
+async fn coding_team_relay_completes_through_operator() {
+    let _guard = FACTORY_LOCK.lock().await;
+    install_mock_chain(vec![
+        (
+            "planner",
+            vec![
+                MockResponse::tool_use(
+                    "p1",
+                    "delegate_task",
+                    r#"{"to": "coder", "task": "task-1: implement the change", "timeout_secs": 60}"#,
+                ),
+                MockResponse::tool_use(
+                    "p2",
+                    "delegate_task",
+                    r#"{"to": "judge", "task": "review task-1 output", "timeout_secs": 60}"#,
+                ),
+            ],
+        ),
+        (
+            "coder",
+            vec![MockResponse::tool_use_end_turn(
+                "c1",
+                "send_message",
+                r#"{"to": "planner", "task_id": "task-planner-0", "body": "task-1 done"}"#,
+            )],
+        ),
+        (
+            "judge",
+            vec![MockResponse::tool_use_end_turn(
+                "j1",
+                "send_message",
+                r##"{"to": "operator", "body": "# Code Review 报告\n\n## 总体结论: PASS\n\n无 P0/P1 finding。"}"##,
+            )],
+        ),
+    ]);
+
+    let repo = make_repo();
+    let data_root = unique_dir("ct-e2e-relay");
+    let spec = llm_harness_agent_team_studio::team_spec::TeamSpec {
+        id: "relay".into(),
+        template: None,
+        template_baseline: None,
+        name: "relay".into(),
+        repo_path: Some(repo.to_string_lossy().to_string()),
+        members: ["planner", "coder", "judge"]
+            .iter()
+            .map(|id| llm_harness_agent_team_studio::team_spec::MemberSpec {
+                id: (*id).into(),
+                persona: format!("{id} persona"),
+                role_label: id.to_string(),
+                model: llm_harness_agent_team_studio::team_spec::ModelRef::Explicit((*id).into()),
+                toolkits: vec![],
+                behaviors: vec![],
+                provider_override: None,
+                persona_file: None,
+            })
+            .collect(),
+    };
+    let mut pm = TeamManager::new(&data_root);
+    pm.create(spec, Some(repo), &settings(), "").await.unwrap();
+
+    pm.get("relay")
+        .unwrap()
+        .team
+        .submit("planner", "deliver task-1 and review it")
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let operator_messages = {
+            let ctx = pm
+                .get("relay")
+                .unwrap()
+                .team
+                .social_context()
+                .unwrap()
+                .clone();
+            ctx.drain_inbox(&AgentId::new("operator"))
+        };
+        if operator_messages
+            .iter()
+            .any(|message| message.body.contains("总体结论: PASS"))
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "relay did not reach the operator within 10s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    pm.shutdown("relay").await.unwrap();
 }
 
 /// T1: chat → planner inbox receives the routed text (backend routing by
