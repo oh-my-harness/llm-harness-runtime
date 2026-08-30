@@ -114,8 +114,6 @@ impl TeamManager {
         }
         let team_id = spec.id.clone();
         let team_dir = self.data_root.join("teams").join(&team_id);
-        std::fs::create_dir_all(team_dir.join("issues"))?;
-        let issues = IssueStore::new(team_dir.join("issues"));
 
         let working_dir = repo_path.clone().unwrap_or_else(|| team_dir.clone());
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new(working_dir));
@@ -128,6 +126,9 @@ impl TeamManager {
             repo_path: repo_path.clone(),
         })
         .await?;
+
+        std::fs::create_dir_all(team_dir.join("issues"))?;
+        let issues = IssueStore::new(team_dir.join("issues"));
 
         persist_spec(&self.data_root, &spec);
         self.teams.insert(
@@ -465,6 +466,21 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, TeamManagerError::AlreadyRegistered(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_spec_does_not_create_team_directory() {
+        install_mock_factory();
+        let root = unique_dir("ct-tm-invalid-id");
+        let mut tm = TeamManager::new(&root);
+        let mut spec = blank_spec();
+        spec.id = "../escaped".into();
+        let err = tm.create(spec, None, &settings(), "").await.unwrap_err();
+        assert!(matches!(
+            err,
+            TeamManagerError::Assemble(engine::AssembleError::InvalidTeamId(_))
+        ));
+        assert!(!root.join("teams").exists());
     }
 
     #[tokio::test]

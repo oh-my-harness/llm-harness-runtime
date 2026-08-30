@@ -158,7 +158,11 @@ fn validate_spec(spec: &TeamSpec) -> Result<(), AssembleError> {
 
     let mut seen = std::collections::HashSet::new();
     for m in &spec.members {
-        if m.id.is_empty() || m.id.contains('\0') {
+        if m.id.is_empty()
+            || matches!(m.id.as_str(), "." | ".." | "operator" | "self" | "timer")
+            || m.id.contains(['/', '\\', '\0'])
+            || m.id.starts_with("reminder:")
+        {
             return Err(AssembleError::InvalidMemberId(m.id.clone()));
         }
         if !seen.insert(m.id.as_str()) {
@@ -483,6 +487,17 @@ mod tests {
         assert_eq!(out.handoffs[0].resource, "issues");
         assert_eq!(out.handoffs[0].to, "planner");
         assert_eq!(out.handoffs[0].message_template, "issue: {body}");
+    }
+
+    #[test]
+    fn invalid_member_id_rejects_unsafe_values() {
+        for id in ["a/b", "a\\b", ".", "..", "operator", "reminder:x"] {
+            let s = spec(vec![member(id, &[], ModelRef::Explicit("m".into()))]);
+            assert!(matches!(
+                validate_spec(&s),
+                Err(AssembleError::InvalidMemberId(member_id)) if member_id == id
+            ));
+        }
     }
 
     #[test]
