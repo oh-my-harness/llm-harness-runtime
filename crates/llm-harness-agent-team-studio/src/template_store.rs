@@ -25,6 +25,8 @@ const COOPERATION_FOOTNOTE: &str = "\n\n---\n## 团队协作约定（引擎附�
 pub enum TemplateError {
     #[error("template not found: {0}")]
     NotFound(String),
+    #[error("invalid template id: {0}")]
+    InvalidTemplateId(String),
     #[error("template {tpl} parse error: {source}")]
     Parse {
         tpl: String,
@@ -88,9 +90,11 @@ impl TemplateStore {
             && let Ok(entries) = std::fs::read_dir(dir)
         {
             for entry in entries.flatten() {
+                let dir_id = entry.file_name().to_string_lossy().to_string();
                 let path = entry.path().join("team.json");
                 if let Ok(raw) = std::fs::read_to_string(&path)
                     && let Ok(tf) = serde_json::from_str::<TemplateFile>(&raw)
+                    && tf.id == dir_id
                 {
                     seen.push(tf.id.clone());
                     metas.push(TemplateMeta {
@@ -116,6 +120,9 @@ impl TemplateStore {
     }
 
     pub fn load(&self, id: &str) -> Result<LoadedTemplate, TemplateError> {
+        if !is_safe_template_id(id) {
+            return Err(TemplateError::InvalidTemplateId(id.into()));
+        }
         // 1. 用户目录覆写优先
         if let Some(dir) = &self.user_dir {
             let path = dir.join(id).join("team.json");
@@ -144,6 +151,9 @@ impl TemplateStore {
             tpl: id.into(),
             source: Box::new(e),
         })?;
+        if tf.id != id {
+            return Err(TemplateError::InvalidTemplateId(id.into()));
+        }
         let mut spec: TeamSpec = serde_json::from_value(serde_json::json!({
             "id": tf.id, "name": tf.name, "members": tf.members,
         }))
@@ -176,6 +186,10 @@ impl TemplateStore {
             spec,
         })
     }
+}
+
+fn is_safe_template_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\', '\0'])
 }
 
 /// 内置模板 id 常量。
@@ -243,6 +257,15 @@ mod tests {
         assert!(matches!(
             store.load("nope"),
             Err(TemplateError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn template_path_traversal_is_rejected() {
+        let store = TemplateStore::new(Some(std::env::temp_dir()));
+        assert!(matches!(
+            store.load("../tmp"),
+            Err(TemplateError::InvalidTemplateId(_))
         ));
     }
 

@@ -146,6 +146,8 @@ mod tests {
     use std::sync::Arc;
 
     async fn built_team() -> AgentTeam {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let tier = ModelTier {
             strong: "m".into(),
             main: "m".into(),
@@ -155,10 +157,18 @@ mod tests {
             "m".into(),
             Arc::new(MockLlmClient::new(vec![])) as Arc<dyn llm_harness_loop::LlmClient>,
         )];
-        let repo = std::env::temp_dir().join(format!("ct-pulse-{}", std::process::id()));
+        let repo = std::env::temp_dir().join(format!("ct-pulse-{sequence}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
         std::fs::create_dir_all(repo.join(".git")).unwrap();
-        let mut team = AgentTeam::new();
+        let data_root =
+            std::env::temp_dir().join(format!("ct-pulse-data-{sequence}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_root);
+        let config = llm_harness_agent_team::TeamConfig {
+            memory_root: data_root.join("memory"),
+            session_base_dir: data_root.join("sessions"),
+            ..Default::default()
+        };
+        let mut team = AgentTeam::with_config(config);
         for s in crate::roles::RoleSet::standard(&tier).specs {
             team = team.member(s);
         }

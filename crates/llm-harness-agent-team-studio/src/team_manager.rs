@@ -193,6 +193,8 @@ impl TeamManager {
             .ok_or_else(|| TeamManagerError::UnknownMember(member.id.clone()))?
             .clone();
 
+        engine::validate_toolkits(&member)?;
+
         // Structural fields: always persisted into the spec.
         let structural_change = old.toolkits != member.toolkits
             || old.model != member.model

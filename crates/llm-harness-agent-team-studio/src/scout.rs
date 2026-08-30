@@ -125,8 +125,15 @@ mod tests {
         let repo = std::env::temp_dir().join(format!("ct-scout-repo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
         std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let data_root = std::env::temp_dir().join(format!("ct-scout-data-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_root);
 
-        let mut team = AgentTeam::new().member(spec(&tier));
+        let config = llm_harness_agent_team::TeamConfig {
+            memory_root: data_root.join("memory"),
+            session_base_dir: data_root.join("sessions"),
+            ..Default::default()
+        };
+        let mut team = AgentTeam::with_config(config).member(spec(&tier));
         let env: Arc<dyn llm_harness_types::ExecutionEnv> =
             Arc::new(llm_harness_sandbox::OsEnv::new(&repo));
         team.build(env, providers).await.unwrap();

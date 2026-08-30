@@ -21,12 +21,20 @@ pub const VALID_TOOLKITS: [&str; 4] = ["fs", "web", "memory", "knowledge"];
 
 #[derive(Debug, Error)]
 pub enum AssembleError {
+    #[error("invalid team id: {0}")]
+    InvalidTeamId(String),
+    #[error("duplicate member id: {0}")]
+    DuplicateMember(String),
+    #[error("invalid member id: {0}")]
+    InvalidMemberId(String),
     #[error("member {member}: unknown toolkit {toolkit}; valid: {}", valid.join(", "))]
     UnknownToolkit {
         member: String,
         toolkit: String,
         valid: Vec<String>,
     },
+    #[error("handoff on member {member} targets unknown member: {to}")]
+    UnknownHandoffTarget { member: String, to: String },
     #[error("member {member}: toolkit mcp:{server} requires MCP server config (planned)")]
     McpNotYetSupported { member: String, server: String },
     #[error("no API key configured; set one in the panel settings first")]
@@ -68,7 +76,7 @@ pub struct HandoffRoute {
 }
 
 /// 校验一个成员的 toolkits；保留名/未知包 fail fast。
-fn validate_toolkits(m: &MemberSpec) -> Result<(), AssembleError> {
+pub(crate) fn validate_toolkits(m: &MemberSpec) -> Result<(), AssembleError> {
     for tk in &m.toolkits {
         if tk == "social" {
             return Err(AssembleError::UnknownToolkit {
@@ -140,9 +148,42 @@ pub fn build_member_providers(
     out
 }
 
+fn validate_spec(spec: &TeamSpec) -> Result<(), AssembleError> {
+    if spec.id.is_empty() || spec.id == "." || spec.id == ".." {
+        return Err(AssembleError::InvalidTeamId(spec.id.clone()));
+    }
+    if spec.id.contains(['/', '\\', '\0']) {
+        return Err(AssembleError::InvalidTeamId(spec.id.clone()));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for m in &spec.members {
+        if m.id.is_empty() || m.id.contains('\0') {
+            return Err(AssembleError::InvalidMemberId(m.id.clone()));
+        }
+        if !seen.insert(m.id.as_str()) {
+            return Err(AssembleError::DuplicateMember(m.id.clone()));
+        }
+    }
+    for m in &spec.members {
+        for behavior in &m.behaviors {
+            if let Behavior::Handoff { to, .. } = behavior
+                && !seen.contains(to.as_str())
+            {
+                return Err(AssembleError::UnknownHandoffTarget {
+                    member: m.id.clone(),
+                    to: to.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 装配一个团队。team.build 内部统一安装社交/memory/knowledge 插件
 /// （团队级启用），engine 只做 spec → specs + providers 的映射。
 pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError> {
+    validate_spec(&inputs.spec)?;
     if inputs.spec.members.is_empty() {
         return Err(AssembleError::Team(TeamError::NoMembers));
     }
@@ -248,10 +289,6 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
     Ok(Assembled { team, handoffs })
 }
 
-#[cfg(test)]
-pub(crate) fn tests_probe_validate(m: &MemberSpec) -> Result<(), AssembleError> {
-    validate_toolkits(m)
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,12 +474,52 @@ mod tests {
             to: "planner".into(),
             message_template: "issue: {body}".into(),
         }];
-        let s = spec(vec![m]);
+        let s = spec(vec![
+            m,
+            member("planner", &[], ModelRef::Explicit("m".into())),
+        ]);
         let out = assemble(inputs(s.clone())).await.unwrap();
         assert_eq!(out.handoffs.len(), 1);
         assert_eq!(out.handoffs[0].resource, "issues");
         assert_eq!(out.handoffs[0].to, "planner");
         assert_eq!(out.handoffs[0].message_template, "issue: {body}");
+    }
+
+    #[test]
+    fn invalid_team_id_fails_fast() {
+        for id in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+            let mut s = spec(vec![member("w", &[], ModelRef::Explicit("m".into()))]);
+            s.id = id.into();
+            assert!(matches!(
+                validate_spec(&s),
+                Err(AssembleError::InvalidTeamId(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn duplicate_member_fails_fast() {
+        let s = spec(vec![
+            member("worker", &[], ModelRef::Explicit("m".into())),
+            member("worker", &[], ModelRef::Explicit("m".into())),
+        ]);
+        let err = validate_spec(&s).unwrap_err();
+        assert!(matches!(err, AssembleError::DuplicateMember(member_id) if member_id == "worker"));
+    }
+
+    #[test]
+    fn unknown_handoff_target_fails_fast() {
+        let mut m = member("triage", &[], ModelRef::Explicit("m".into()));
+        m.behaviors = vec![Behavior::Handoff {
+            on: Trigger::ResourceConfirmed {
+                resource: "issues".into(),
+            },
+            to: "missing".into(),
+            message_template: "issue: {body}".into(),
+        }];
+        let s = spec(vec![m]);
+        let err = validate_spec(&s).unwrap_err();
+        assert!(matches!(err, AssembleError::UnknownHandoffTarget { to, .. } if to == "missing"));
     }
 
     #[test]
@@ -452,7 +529,7 @@ mod tests {
             &["mcp:my-mcp"],
             ModelRef::Explicit("m".into()),
         )]);
-        let err = crate::engine::tests_probe_validate(&s.members[0]).unwrap_err();
+        let err = validate_toolkits(&s.members[0]).unwrap_err();
         assert!(
             matches!(err, AssembleError::McpNotYetSupported { server, .. } if server == "my-mcp")
         );
