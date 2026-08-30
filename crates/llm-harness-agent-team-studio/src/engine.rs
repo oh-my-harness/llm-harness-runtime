@@ -75,6 +75,19 @@ pub struct AssembleInputs {
 pub struct Assembled {
     pub team: AgentTeam,
     pub handoffs: Vec<HandoffRoute>,
+    /// Cancels MCP background tasks on drop; `None` when the team has no MCP toolkits.
+    pub mcp_lifecycle: Option<McpManagerLifecycle>,
+}
+
+/// RAII guard for MCP manager background tasks.
+pub struct McpManagerLifecycle {
+    manager: Arc<McpManager>,
+}
+
+impl Drop for McpManagerLifecycle {
+    fn drop(&mut self) {
+        self.manager.cancel_background_tasks();
+    }
 }
 
 /// 资源确认后的交接路由（由 Behavior::Handoff 收集）。
@@ -116,19 +129,25 @@ pub(crate) fn validate_toolkits(m: &MemberSpec) -> Result<(), AssembleError> {
     Ok(())
 }
 
-/// Collect unique MCP server names from all member toolkits.
-fn mcp_server_names(spec: &TeamSpec) -> Vec<String> {
-    let mut names = Vec::new();
+/// Collect unique MCP server names and the member IDs that request them.
+fn mcp_server_names(spec: &TeamSpec) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = Vec::new();
     for member in &spec.members {
         for toolkit in &member.toolkits {
-            if let Some(server) = toolkit.strip_prefix("mcp:")
-                && !names.iter().any(|n| n == server)
-            {
-                names.push(server.to_string());
+            if let Some(server) = toolkit.strip_prefix("mcp:") {
+                let entry = entries.iter_mut().find(|(name, _)| name == server);
+                match entry {
+                    Some((_, members)) => {
+                        if !members.contains(&member.id) {
+                            members.push_str(&format!(", {}", member.id));
+                        }
+                    }
+                    None => entries.push((server.to_string(), member.id.clone())),
+                }
             }
         }
     }
-    names
+    entries
 }
 
 /// Load MCP server configs from `.mcp.json` in the data directory.
@@ -236,24 +255,27 @@ impl Tool for McpStudioTool {
 async fn prepare_mcp_tools(
     spec: &TeamSpec,
     data_dir: &std::path::Path,
-) -> Result<Vec<(String, Vec<Arc<dyn Tool>>)>, AssembleError> {
-    let server_names = mcp_server_names(spec);
-    if server_names.is_empty() {
-        return Ok(Vec::new());
+) -> Result<(Vec<(String, Vec<Arc<dyn Tool>>)>, McpManagerLifecycle), AssembleError> {
+    let server_entries = mcp_server_names(spec);
+    if server_entries.is_empty() {
+        // No MCP requested: return an empty lifecycle so `Assembled` compiles.
+        // The guard's Drop will be a no-op because the manager has no connections.
+        let manager = Arc::new(McpManager::new());
+        return Ok((Vec::new(), McpManagerLifecycle { manager }));
     }
 
     let config_path_str = data_dir.join(".mcp.json").display().to_string();
     let config_file =
         load_mcp_configs(data_dir)?.ok_or_else(|| AssembleError::McpServerNotConfigured {
-            member: String::new(),
-            server: server_names.first().cloned().unwrap_or_default(),
+            member: server_entries[0].1.clone(),
+            server: server_entries[0].0.clone(),
             config_file: config_path_str.clone(),
         })?;
 
     let configs: std::collections::HashMap<String, llm_harness_mcp::config::McpServerConfig> =
-        server_names
+        server_entries
             .iter()
-            .filter_map(|name| {
+            .filter_map(|(name, _)| {
                 config_file
                     .mcp_servers
                     .get(name)
@@ -261,28 +283,38 @@ async fn prepare_mcp_tools(
             })
             .collect();
 
-    for name in &server_names {
+    for (name, member) in &server_entries {
         if !configs.contains_key(name) {
             return Err(AssembleError::McpServerNotConfigured {
-                member: String::new(),
+                member: member.clone(),
                 server: name.clone(),
                 config_file: config_path_str.clone(),
             });
         }
     }
 
-    let manager = McpManager::new();
-    manager.discover_and_connect(configs).await.map_err(|e| {
-        AssembleError::McpConnection(
-            server_names.first().cloned().unwrap_or_default(),
-            e.to_string(),
-        )
-    })?;
+    let manager = McpManager::with_cache_path(data_dir.join(".mcp-lock.json"));
+    manager
+        .discover_and_connect(configs)
+        .await
+        .map_err(|e| AssembleError::McpConnection(server_entries[0].0.clone(), e.to_string()))?;
 
     let manager = Arc::new(manager);
+    for (server, _) in &server_entries {
+        let status = manager.get_connection_status(server);
+        if status != llm_harness_mcp::manager::ConnectionStatus::Connected {
+            return Err(AssembleError::McpConnection(
+                server.clone(),
+                format!("server did not connect (status: {status:?})"),
+            ));
+        }
+    }
+    let lifecycle = McpManagerLifecycle {
+        manager: Arc::clone(&manager),
+    };
     let exposed_tools = manager.get_tools();
     let mut result = Vec::new();
-    for server in &server_names {
+    for (server, _) in &server_entries {
         let tools: Vec<Arc<dyn Tool>> = exposed_tools
             .iter()
             .filter(|t| t.server_name == *server)
@@ -298,7 +330,7 @@ async fn prepare_mcp_tools(
             .collect();
         result.push((server.clone(), tools));
     }
-    Ok(result)
+    Ok((result, lifecycle))
 }
 
 /// 成员级 provider 覆写 + 全局设置 → provider 列表。
@@ -419,7 +451,7 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
         validate_toolkits(m)?;
     }
 
-    let mcp_tools = prepare_mcp_tools(&inputs.spec, &inputs.data_dir).await?;
+    let (mcp_tools, mcp_lifecycle) = prepare_mcp_tools(&inputs.spec, &inputs.data_dir).await?;
     let mcp_by_server: std::collections::HashMap<&str, &[Arc<dyn Tool>]> = mcp_tools
         .iter()
         .map(|(server, tools)| (server.as_str(), tools.as_slice()))
@@ -528,7 +560,11 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
         }
     }
 
-    Ok(Assembled { team, handoffs })
+    Ok(Assembled {
+        team,
+        handoffs,
+        mcp_lifecycle: Some(mcp_lifecycle),
+    })
 }
 
 #[cfg(test)]
@@ -850,6 +886,10 @@ mod tests {
             member("a", &["mcp:x", "fs"], ModelRef::Tier("main".into())),
             member("b", &["mcp:x", "mcp:y"], ModelRef::Tier("main".into())),
         ]);
-        assert_eq!(mcp_server_names(&s), vec!["x".to_string(), "y".to_string()]);
+        let names: Vec<String> = mcp_server_names(&s)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, vec!["x".to_string(), "y".to_string()]);
     }
 }

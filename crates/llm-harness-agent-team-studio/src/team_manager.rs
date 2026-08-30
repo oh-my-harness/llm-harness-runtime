@@ -69,6 +69,8 @@ pub struct TeamEntry {
     pub team: AgentTeam,
     pub issues: IssueStore,
     pub handoffs: Vec<HandoffRoute>,
+    /// Keeps MCP manager alive while the team runs; Drop cancels background tasks.
+    pub mcp_lifecycle: Option<crate::engine::McpManagerLifecycle>,
 }
 
 impl TeamEntry {
@@ -154,6 +156,7 @@ impl TeamManager {
                 team: assembled.team,
                 issues,
                 handoffs: assembled.handoffs,
+                mcp_lifecycle: assembled.mcp_lifecycle,
             },
         );
         Ok(self.teams.get(team_id.as_str()).expect("just inserted"))
