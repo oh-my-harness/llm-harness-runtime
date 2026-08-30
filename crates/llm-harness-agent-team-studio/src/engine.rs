@@ -10,13 +10,15 @@ use thiserror::Error;
 
 use llm_harness_agent_team::{AgentTeam, IndividualSpec, TeamConfig, TeamError};
 use llm_harness_loop::LlmClient;
+use llm_harness_mcp::manager::McpManager;
 use llm_harness_types::ExecutionEnv;
+use llm_harness_types::{DataBlock, Tool, ToolContext, ToolFailure, ToolResult};
 
 use crate::scout;
 use crate::team_spec::{Behavior, MemberSpec, TeamSpec};
 
-/// 合法 toolkit 包名；`social` 是保留名（装配时单独拒绝），`mcp:<server>`
-/// 本期报"未支持"。
+/// 合法 toolkit 包名；`social` 是保留名（装配时单独拒绝），
+/// `mcp:<server>` 需要在 data_dir/.mcp.json 中有对应配置。
 pub const VALID_TOOLKITS: [&str; 4] = ["fs", "web", "memory", "knowledge"];
 
 #[derive(Debug, Error)]
@@ -35,8 +37,16 @@ pub enum AssembleError {
     },
     #[error("handoff on member {member} targets unknown member: {to}")]
     UnknownHandoffTarget { member: String, to: String },
-    #[error("member {member}: toolkit mcp:{server} requires MCP server config (planned)")]
-    McpNotYetSupported { member: String, server: String },
+    #[error("member {member}: MCP server '{server}' is not configured in {config_file}")]
+    McpServerNotConfigured {
+        member: String,
+        server: String,
+        config_file: String,
+    },
+    #[error("MCP server '{0}' failed to connect: {1}")]
+    McpConnection(String, String),
+    #[error("invalid MCP server name '{0}'")]
+    InvalidMcpServerName(String),
     #[error("no API key configured; set one in the panel settings first")]
     NoProviders,
     #[error(transparent)]
@@ -86,10 +96,14 @@ pub(crate) fn validate_toolkits(m: &MemberSpec) -> Result<(), AssembleError> {
             });
         }
         if let Some(server) = tk.strip_prefix("mcp:") {
-            return Err(AssembleError::McpNotYetSupported {
-                member: m.id.clone(),
-                server: server.to_string(),
-            });
+            if server.is_empty()
+                || server.contains('/')
+                || server.contains('\\')
+                || server.contains('\0')
+            {
+                return Err(AssembleError::InvalidMcpServerName(server.to_string()));
+            }
+            continue;
         }
         if !VALID_TOOLKITS.contains(&tk.as_str()) {
             return Err(AssembleError::UnknownToolkit {
@@ -100,6 +114,191 @@ pub(crate) fn validate_toolkits(m: &MemberSpec) -> Result<(), AssembleError> {
         }
     }
     Ok(())
+}
+
+/// Collect unique MCP server names from all member toolkits.
+fn mcp_server_names(spec: &TeamSpec) -> Vec<String> {
+    let mut names = Vec::new();
+    for member in &spec.members {
+        for toolkit in &member.toolkits {
+            if let Some(server) = toolkit.strip_prefix("mcp:")
+                && !names.iter().any(|n| n == server)
+            {
+                names.push(server.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// Load MCP server configs from `.mcp.json` in the data directory.
+fn load_mcp_configs(
+    data_dir: &std::path::Path,
+) -> Result<Option<llm_harness_mcp::config::McpConfigFile>, AssembleError> {
+    let config_path = data_dir.join(".mcp.json");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&config_path)?;
+    let config: llm_harness_mcp::config::McpConfigFile =
+        serde_json::from_str(&raw).map_err(|e| {
+            AssembleError::McpConnection(
+                String::new(),
+                format!("failed to parse {}: {e}", config_path.display()),
+            )
+        })?;
+    Ok(Some(config))
+}
+
+/// Lightweight MCP tool adapter routed through a shared manager.
+struct McpStudioTool {
+    full_name: String,
+    description: String,
+    parameters_schema: serde_json::Value,
+    manager: Arc<McpManager>,
+}
+
+impl Tool for McpStudioTool {
+    fn name(&self) -> &str {
+        &self.full_name
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn parameters_schema(&self) -> &serde_json::Value {
+        &self.parameters_schema
+    }
+
+    fn execute<'a>(
+        &'a self,
+        args: serde_json::Value,
+        _ctx: &'a ToolContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::result::Result<ToolResult, ToolFailure>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let result = self
+                .manager
+                .call_tool(&self.full_name, args)
+                .await
+                .map_err(|_| {
+                    ToolFailure::new("mcp_call_failed", "MCP tool communication failed.")
+                })?;
+            let content: Vec<DataBlock> = result
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    llm_harness_mcp::types::McpContent::Text { text, .. } => {
+                        Some(DataBlock::text(text.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if result.is_error {
+                let message = content
+                    .iter()
+                    .filter_map(|block| match block {
+                        DataBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let mut failure = ToolFailure::new(
+                    "mcp_tool_error",
+                    if message.is_empty() {
+                        "MCP tool execution failed."
+                    } else {
+                        &message
+                    },
+                );
+                failure.details = result
+                    .structured_content
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null);
+                return Err(failure);
+            }
+            Ok(ToolResult::full(
+                content,
+                result.structured_content.unwrap_or(serde_json::Value::Null),
+                false,
+            ))
+        })
+    }
+}
+
+/// Connect to required MCP servers and return (server_name, tools) pairs.
+async fn prepare_mcp_tools(
+    spec: &TeamSpec,
+    data_dir: &std::path::Path,
+) -> Result<Vec<(String, Vec<Arc<dyn Tool>>)>, AssembleError> {
+    let server_names = mcp_server_names(spec);
+    if server_names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let config_path_str = data_dir.join(".mcp.json").display().to_string();
+    let config_file =
+        load_mcp_configs(data_dir)?.ok_or_else(|| AssembleError::McpServerNotConfigured {
+            member: String::new(),
+            server: server_names.first().cloned().unwrap_or_default(),
+            config_file: config_path_str.clone(),
+        })?;
+
+    let configs: std::collections::HashMap<String, llm_harness_mcp::config::McpServerConfig> =
+        server_names
+            .iter()
+            .filter_map(|name| {
+                config_file
+                    .mcp_servers
+                    .get(name)
+                    .map(|c| (name.clone(), c.clone()))
+            })
+            .collect();
+
+    for name in &server_names {
+        if !configs.contains_key(name) {
+            return Err(AssembleError::McpServerNotConfigured {
+                member: String::new(),
+                server: name.clone(),
+                config_file: config_path_str.clone(),
+            });
+        }
+    }
+
+    let manager = McpManager::new();
+    manager.discover_and_connect(configs).await.map_err(|e| {
+        AssembleError::McpConnection(
+            server_names.first().cloned().unwrap_or_default(),
+            e.to_string(),
+        )
+    })?;
+
+    let manager = Arc::new(manager);
+    let exposed_tools = manager.get_tools();
+    let mut result = Vec::new();
+    for server in &server_names {
+        let tools: Vec<Arc<dyn Tool>> = exposed_tools
+            .iter()
+            .filter(|t| t.server_name == *server)
+            .map(|t| {
+                let adapter = McpStudioTool {
+                    full_name: t.full_name.clone(),
+                    description: t.tool_def.description.clone(),
+                    parameters_schema: t.tool_def.input_schema.clone(),
+                    manager: Arc::clone(&manager),
+                };
+                Arc::new(adapter) as Arc<dyn Tool>
+            })
+            .collect();
+        result.push((server.clone(), tools));
+    }
+    Ok(result)
 }
 
 /// 成员级 provider 覆写 + 全局设置 → provider 列表。
@@ -220,6 +419,12 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
         validate_toolkits(m)?;
     }
 
+    let mcp_tools = prepare_mcp_tools(&inputs.spec, &inputs.data_dir).await?;
+    let mcp_by_server: std::collections::HashMap<&str, &[Arc<dyn Tool>]> = mcp_tools
+        .iter()
+        .map(|(server, tools)| (server.as_str(), tools.as_slice()))
+        .collect();
+
     let project_dir = inputs.data_dir.clone();
     let config = TeamConfig {
         memory_root: project_dir.join("memory"),
@@ -243,12 +448,20 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
             // fs/web 是显式 opt-in 的成员级插件。
             let mut b = b;
             for tk in &m.toolkits {
-                b = match tk.as_str() {
-                    "fs" => b.install(&llm_harness_tools::FsToolsPlugin::new(None)),
-                    "web" => b.install(&llm_harness_tools::WebToolsPlugin::default()),
-                    // memory/knowledge 团队级已装；此处 no-op。
-                    "memory" | "knowledge" => b,
-                    _ => b, // validate_toolkits 已拦截未知包
+                if let Some(server) = tk.strip_prefix("mcp:") {
+                    if let Some(tools) = mcp_by_server.get(server) {
+                        for tool in tools.iter() {
+                            b = b.tool(Arc::clone(tool));
+                        }
+                    }
+                } else {
+                    b = match tk.as_str() {
+                        "fs" => b.install(&llm_harness_tools::FsToolsPlugin::new(None)),
+                        "web" => b.install(&llm_harness_tools::WebToolsPlugin::default()),
+                        // memory/knowledge 团队级已装；此处 no-op。
+                        "memory" | "knowledge" => b,
+                        _ => b, // validate_toolkits 已拦截未知包
+                    };
                 };
             }
             b
@@ -564,15 +777,79 @@ mod tests {
     }
 
     #[test]
-    fn mcp_toolkit_reports_dedicated_error() {
+    fn mcp_toolkit_valid_server_passes_validation() {
         let s = spec(vec![member(
             "w",
             &["mcp:my-mcp"],
             ModelRef::Explicit("m".into()),
         )]);
+        validate_toolkits(&s.members[0]).unwrap();
+    }
+
+    #[test]
+    fn mcp_toolkit_empty_server_rejected() {
+        let s = spec(vec![member("w", &["mcp:"], ModelRef::Explicit("m".into()))]);
         let err = validate_toolkits(&s.members[0]).unwrap_err();
-        assert!(
-            matches!(err, AssembleError::McpNotYetSupported { server, .. } if server == "my-mcp")
-        );
+        assert!(matches!(err, AssembleError::InvalidMcpServerName(_)));
+    }
+
+    #[test]
+    fn mcp_toolkit_path_traversal_rejected() {
+        for bad in ["mcp:../etc", "mcp:a/b", "mcp:a\\b", "mcp:a\0b"] {
+            let s = spec(vec![member("w", &[bad], ModelRef::Explicit("m".into()))]);
+            let err = validate_toolkits(&s.members[0]).unwrap_err();
+            assert!(
+                matches!(err, AssembleError::InvalidMcpServerName(_)),
+                "{bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_without_config_file_is_error() {
+        let s = spec(vec![member(
+            "w",
+            &["mcp:my-mcp"],
+            ModelRef::Explicit("m".into()),
+        )]);
+        let res = assemble(inputs(s)).await;
+        match res {
+            Err(AssembleError::McpServerNotConfigured { server, .. }) => {
+                assert_eq!(server, "my-mcp");
+            }
+            Ok(_) => panic!("expected McpServerNotConfigured, got assembled team"),
+            Err(other) => panic!("expected McpServerNotConfigured, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_server_missing_from_config_is_error() {
+        let i = inputs(spec(vec![member(
+            "w",
+            &["mcp:my-mcp"],
+            ModelRef::Explicit("m".into()),
+        )]));
+        std::fs::write(
+            i.data_dir.join(".mcp.json"),
+            r#"{"mcpServers":{"other":{"command":"true"}}}"#,
+        )
+        .unwrap();
+        let res = assemble(i).await;
+        match res {
+            Err(AssembleError::McpServerNotConfigured { server, .. }) => {
+                assert_eq!(server, "my-mcp");
+            }
+            Ok(_) => panic!("expected McpServerNotConfigured, got assembled team"),
+            Err(other) => panic!("expected McpServerNotConfigured, got {other}"),
+        }
+    }
+
+    #[test]
+    fn mcp_server_names_deduplicated() {
+        let s = spec(vec![
+            member("a", &["mcp:x", "fs"], ModelRef::Tier("main".into())),
+            member("b", &["mcp:x", "mcp:y"], ModelRef::Tier("main".into())),
+        ]);
+        assert_eq!(mcp_server_names(&s), vec!["x".to_string(), "y".to_string()]);
     }
 }
