@@ -548,6 +548,7 @@ impl AgentRunner {
                             consecutive_failures += 1;
                             error!(
                                 runner = %agent_id,
+                                error = ?harness.state().error_message,
                                 "harness run failed after consuming messages; re-queuing"
                             );
                             ctx.return_messages(&agent_id, messages);

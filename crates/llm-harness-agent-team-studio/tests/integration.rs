@@ -394,3 +394,88 @@ async fn judge_pass_reaches_operator() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Live LLM tests (require network access; run with `cargo test -- --ignored`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires live LLM endpoint; run with --ignored"]
+async fn live_llm_team_sends_and_receives() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .unwrap_or_else(|_| panic!("set ANTHROPIC_API_KEY to the local LLM token"));
+    let base_url = "http://10.0.20.110:3001";
+    let model = "moonshotai/kimi-k2.6";
+
+    let repo = make_repo();
+    let data_root = unique_dir("ct-live");
+    let mut pm = TeamManager::new(&data_root);
+
+    let settings = llm_harness_agent_team_studio::settings::Settings {
+        models: ModelTier {
+            strong: model.into(),
+            main: model.into(),
+            cheap: model.into(),
+        },
+        scout_interval_secs: 0,
+        base_url: base_url.into(),
+    };
+
+    // Minimal single-member team with no tools — we just need prompt→response.
+    let spec = llm_harness_agent_team_studio::team_spec::TeamSpec {
+        id: "live".into(),
+        template: None,
+        template_baseline: None,
+        name: "live".into(),
+        repo_path: Some(repo.to_string_lossy().to_string()),
+        members: vec![llm_harness_agent_team_studio::team_spec::MemberSpec {
+            id: "planner".into(),
+            persona: "你是 planner。收到任务后，用 send_message(\"operator\", ...) 回复一句确认。"
+                .into(),
+            role_label: "规划者".into(),
+            model: llm_harness_agent_team_studio::team_spec::ModelRef::Explicit(model.into()),
+            toolkits: vec![],
+            behaviors: vec![],
+            provider_override: None,
+            persona_file: None,
+        }],
+    };
+    pm.create(spec, Some(repo), &settings, &api_key)
+        .await
+        .unwrap();
+
+    // Submit a task and wait for the operator inbox to receive a reply.
+    pm.get("live")
+        .unwrap()
+        .team
+        .submit("planner", "请确认收到，回复：confirmed")
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    let ctx = pm
+        .get("live")
+        .unwrap()
+        .team
+        .social_context()
+        .unwrap()
+        .clone();
+    loop {
+        let got = ctx.drain_inbox(&AgentId::new("operator"));
+        if !got.is_empty() {
+            let body = &got[0].body;
+            println!("operator received: {body}");
+            assert!(!body.trim().is_empty(), "operator received empty message");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "operator inbox empty after 120s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    pm.shutdown("live").await.unwrap();
+}

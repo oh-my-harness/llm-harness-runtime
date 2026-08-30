@@ -475,6 +475,7 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| m.model.resolve(&inputs.settings.models));
         let spec = IndividualSpec::new(&m.id, &m.role_label, model).configure(|b| {
+            let b = b.max_tokens(16384);
             let b = b.system_prompt(Some(m.persona.clone()));
             // 成员级 toolkit：社交/memory/knowledge 由 team.build 统一装；
             // fs/web 是显式 opt-in 的成员级插件。
