@@ -1809,6 +1809,14 @@ mod tests {
         let mode = std::fs::metadata(&secrets).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "secrets file must be 0600");
 
+        let spec_text =
+            std::fs::read_to_string(pm.read().await.data_root().join("teams/p1/team.json"))
+                .unwrap();
+        assert!(
+            !spec_text.contains("sk-secret-x"),
+            "provider secret must not leak into team.json"
+        );
+
         // GET 不回显明文
         let body = get_json(&router, "/api/team/agent/config?project=p1&agent=coder")
             .await

@@ -200,22 +200,6 @@ impl TeamManager {
             || old.model != member.model
             || old.provider_override != member.provider_override;
 
-        // 成员级 key 只存 0600 secrets 文件（C1）；rebuild 前注入进
-        // override 供 build_member_providers 消费。spec 本身不携带明文。
-        let mut member = member;
-        if let Some(ov) = member.provider_override.as_mut()
-            && ov.api_key.as_deref().map(str::is_empty).unwrap_or(false)
-        {
-            let path = self
-                .data_root
-                .join("teams")
-                .join(team_id)
-                .join("secrets")
-                .join(&member.id);
-            if let Ok(key) = std::fs::read_to_string(&path) {
-                ov.api_key = Some(key);
-            }
-        }
         let update = if structural_change {
             // Rebuild: resolve the effective model and build providers.
             let model = member
@@ -226,6 +210,23 @@ impl TeamManager {
                 .unwrap_or_else(|| member.model.resolve(&settings.models));
             let mut member_for_providers = member.clone();
             member_for_providers.model = crate::team_spec::ModelRef::Explicit(model.clone());
+
+            // 成员级 key 只存 0600 secrets 文件（C1）；rebuild 前注入进
+            // override 供 build_member_providers 消费。这个带明文的副本只
+            // 用于装配，不进入 entry.spec / team.json。
+            if let Some(ov) = member_for_providers.provider_override.as_mut()
+                && ov.api_key.as_deref().map(str::is_empty).unwrap_or(false)
+            {
+                let path = self
+                    .data_root
+                    .join("teams")
+                    .join(team_id)
+                    .join("secrets")
+                    .join(&member.id);
+                if let Ok(key) = std::fs::read_to_string(&path) {
+                    ov.api_key = Some(key);
+                }
+            }
             let mut providers =
                 engine::build_member_providers(&member_for_providers, settings, api_key);
             if providers.is_empty() {
