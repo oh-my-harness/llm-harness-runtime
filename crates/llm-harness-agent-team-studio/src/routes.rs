@@ -2015,7 +2015,7 @@ mod tests {
         assert_eq!(status, 200, "{json}");
         assert_eq!(json["overridden"].as_array().unwrap().len(), 0);
         assert_eq!(json["would_follow"].as_array().unwrap().len(), 11);
-        assert_eq!(json["template_current_version"], "1");
+        assert_eq!(json["template_current_version"], "2");
 
         // 改一个成员 persona → 该成员进入 overridden
         let (status, _) = json_put(

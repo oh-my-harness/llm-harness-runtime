@@ -836,3 +836,115 @@ async fn live_llm_review_loop_reaches_operator() {
     }
     pm.shutdown("live-review-loop").await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires live LLM endpoint and local git; run with --ignored"]
+async fn live_llm_full_coding_team_template_completes_task() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .unwrap_or_else(|_| panic!("set ANTHROPIC_API_KEY to the local LLM token"));
+    let base_url = "http://10.0.20.110:3001";
+    let model = "moonshotai/kimi-k2.6";
+
+    let repo = unique_dir("ct-live-full-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init"]);
+    git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+    git(&["config", "user.name", "Agent Team E2E"]);
+    git(&["config", "user.email", "agent-team-e2e@example.invalid"]);
+    std::fs::write(repo.join("README.md"), "# Agent Team E2E\n").unwrap();
+    git(&["add", "README.md"]);
+    git(&["commit", "-m", "initial"]);
+
+    let mut spec = llm_harness_agent_team_studio::template_store::TemplateStore::new(None)
+        .load(llm_harness_agent_team_studio::template_store::BUILTIN_CODING_TEAM_ID)
+        .unwrap()
+        .spec;
+    for member in &mut spec.members {
+        member.model = llm_harness_agent_team_studio::team_spec::ModelRef::Explicit(model.into());
+    }
+
+    let data_root = unique_dir("ct-live-full");
+    println!("data_root: {}", data_root.display());
+    println!("repo: {}", repo.display());
+    let mut pm = TeamManager::new(&data_root);
+    let settings = llm_harness_agent_team_studio::settings::Settings {
+        models: ModelTier {
+            strong: model.into(),
+            main: model.into(),
+            cheap: model.into(),
+        },
+        scout_interval_secs: 0,
+        base_url: base_url.into(),
+    };
+    assert_eq!(spec.members.len(), 11);
+    pm.create(spec, Some(repo.clone()), &settings, &api_key)
+        .await
+        .unwrap();
+    pm.get("coding-team")
+        .unwrap()
+        .team
+        .submit(
+            "planner",
+            "bounded task: create answer.txt containing exactly 42 and verify it with `test \"$(cat answer.txt)\" = 42`. Record the plan in docs/plans/e2e.md, use team/e2e, commit the result, then run the standard review loop and report PASS or NEEDS_CHANGES to operator.",
+        )
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(900);
+    let ctx = pm
+        .get("coding-team")
+        .unwrap()
+        .team
+        .social_context()
+        .unwrap()
+        .clone();
+    loop {
+        let messages = ctx.drain_inbox(&AgentId::new("operator"));
+        let is_final_pass = |message: &llm_harness_agent_team::InboxMessage| {
+            message.from.as_str() == "judge"
+                && message.body.contains("PASS")
+                && message.body.contains("裁决明细")
+                && !message.body.contains("状态更新")
+                && !message.body.contains("NEEDS_CHANGES")
+        };
+        if let Some(message) = messages.iter().find(|message| is_final_pass(message)) {
+            println!("operator received: {}", message.body);
+            break;
+        }
+        for message in &messages {
+            println!(
+                "operator progress from {}: {}",
+                message.from.as_str(),
+                message.body
+            );
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "full coding-team task did not reach PASS within 900s"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+    let artifact = std::fs::read_to_string(repo.join("answer.txt")).unwrap();
+    assert_eq!(artifact.trim(), "42");
+    let branch = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&repo)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(branch.trim(), "team/e2e");
+    pm.shutdown("coding-team").await.unwrap();
+}

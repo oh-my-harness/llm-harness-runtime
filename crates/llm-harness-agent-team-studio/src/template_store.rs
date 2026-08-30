@@ -215,7 +215,7 @@ mod tests {
         let store = TemplateStore::new(None);
         let t = store.load("coding-team").unwrap();
         assert_eq!(t.id, "coding-team");
-        assert_eq!(t.version, "1");
+        assert_eq!(t.version, "2");
         assert_eq!(t.spec.members.len(), 11);
         let planner = t.spec.members.iter().find(|m| m.id == "planner").unwrap();
         assert!(

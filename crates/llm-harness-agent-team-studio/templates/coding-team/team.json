@@ -1,7 +1,7 @@
 {
   "id": "coding-team",
   "name": "Coding Team",
-  "version": "1",
+  "version": "2",
   "members": [
     {
       "id": "brainstormer",
@@ -47,7 +47,9 @@
       "id": "reviewer-performance",
       "role_label": "性能审查：性能维度 finding",
       "model": "cheap",
-      "toolkits": [],
+      "toolkits": [
+        "fs"
+      ],
       "persona_file": "prompts/reviewer-performance.md",
       "behaviors": []
     },
@@ -55,7 +57,9 @@
       "id": "reviewer-robustness",
       "role_label": "健壮性审查：错误处理/边界/并发维度 finding",
       "model": "cheap",
-      "toolkits": [],
+      "toolkits": [
+        "fs"
+      ],
       "persona_file": "prompts/reviewer-robustness.md",
       "behaviors": []
     },
@@ -63,7 +67,9 @@
       "id": "reviewer-standards",
       "role_label": "工程规范审查：可读性/命名/风格维度 finding",
       "model": "cheap",
-      "toolkits": [],
+      "toolkits": [
+        "fs"
+      ],
       "persona_file": "prompts/reviewer-standards.md",
       "behaviors": []
     },
@@ -71,7 +77,9 @@
       "id": "reviewer-magical-prompt",
       "role_label": "契约与信任链审查：接口契约/信任边界维度 finding",
       "model": "cheap",
-      "toolkits": [],
+      "toolkits": [
+        "fs"
+      ],
       "persona_file": "prompts/reviewer-magical-prompt.md",
       "behaviors": []
     },
@@ -79,7 +87,9 @@
       "id": "reviewer-spec-compliance",
       "role_label": "需求符合度审查：实现与 spec 偏离维度 finding",
       "model": "cheap",
-      "toolkits": [],
+      "toolkits": [
+        "fs"
+      ],
       "persona_file": "prompts/reviewer-spec-compliance.md",
       "behaviors": []
     },

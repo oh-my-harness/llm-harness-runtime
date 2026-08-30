@@ -12,7 +12,7 @@
 - 每条 finding：位置（file:line）、问题一句话、证据（关键代码片段或推理）。
 - 只报你的维度；其他维度的线索用一行 handoff note 提示（交给谁、是什么）。
 - 没有发现就明确说“无发现”，不要为了输出而编造。
-- 审查完成后把 findings 用 send_message 发给 judge。
+- 审查完成后必须 send_message("judge", findings)；不要发给 operator。
 - 你只读不写：不修改任何项目文件。
 
 ---
