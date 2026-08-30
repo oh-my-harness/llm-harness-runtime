@@ -735,7 +735,28 @@ async fn put_agent_config(
         base_url,
     };
 
-    // Member-scoped api key → 0600 file.
+    // Assemble the updated MemberSpec from the current instance.
+    let mut pm = state.pm.write().await;
+    let (current, _team_id) = {
+        let Some(entry) = pm.get(&body.project) else {
+            return err_resp(
+                format!("unknown project: {}", body.project),
+                StatusCode::NOT_FOUND,
+            );
+        };
+        match entry.spec.members.iter().find(|m| m.id == body.agent) {
+            Some(m) => (m.clone(), body.project.clone()),
+            None => {
+                return err_resp(
+                    format!("unknown member: {}", body.agent),
+                    StatusCode::NOT_FOUND,
+                );
+            }
+        }
+    };
+
+    // Member-scoped api key → 0600 file. This happens only after both IDs
+    // are known-good, so they can never construct a secrets path.
     if let Some(key) = &body.api_key {
         let secrets = state
             .data_root
@@ -760,26 +781,6 @@ async fn put_agent_config(
             let _ = std::fs::write(&path, key);
         }
     }
-
-    // Assemble the updated MemberSpec from the current instance.
-    let mut pm = state.pm.write().await;
-    let (current, _team_id) = {
-        let Some(entry) = pm.get(&body.project) else {
-            return err_resp(
-                format!("unknown project: {}", body.project),
-                StatusCode::NOT_FOUND,
-            );
-        };
-        match entry.spec.members.iter().find(|m| m.id == body.agent) {
-            Some(m) => (m.clone(), body.project.clone()),
-            None => {
-                return err_resp(
-                    format!("unknown member: {}", body.agent),
-                    StatusCode::NOT_FOUND,
-                );
-            }
-        }
-    };
 
     let mut member = current;
     if let Some(persona) = body.persona {
@@ -1832,6 +1833,26 @@ mod tests {
         )
         .await;
         assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn agent_config_does_not_write_secrets_for_unknown_ids() {
+        let (router, pm, repo) = setup().await;
+        register_template_team(&router, &repo).await;
+        let (status, _) = json_put(
+            &router,
+            "/api/team/agent/config",
+            serde_json::json!({
+                "project": "../escape",
+                "agent": "../../leaked-secret",
+                "api_key": "sk-escape",
+            }),
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        let leaked = pm.read().await.data_root().join("leaked-secret");
+        assert!(!leaked.exists(), "unknown IDs must not construct paths");
     }
 
     // ── templates / upgrade-check ────────────────────────────────────────
