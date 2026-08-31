@@ -106,7 +106,10 @@ impl BeforeToolCallHook for RepetitionGuardHook {
                     "{}: tool={}, count={}",
                     self.config.deny_message, ctx.tool_name, count
                 );
-                BeforeToolCallDecision::Deny(ToolFailure::new("repetition_detected", model_message))
+                BeforeToolCallDecision::Deny(ToolFailure::denied(
+                    "repetition_detected",
+                    model_message,
+                ))
             } else {
                 BeforeToolCallDecision::Allow
             }

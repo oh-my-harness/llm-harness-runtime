@@ -25,13 +25,45 @@ impl RuleChain {
 
     /// 评估给定 tool call，返回决策。
     pub fn evaluate(&self, tool_name: &str, args: &Value) -> Decision {
-        for rule in &self.rules {
-            if let Some(d) = rule.evaluate(tool_name, args) {
-                return d;
+        self.evaluate_matched(tool_name, args).decision
+    }
+
+    /// 评估并附带命中信息（哪条规则命中、谓词描述），供 deny 消息使用。
+    pub fn evaluate_matched(&self, tool_name: &str, args: &Value) -> EvaluatedDecision {
+        for (index, rule) in self.rules.iter().enumerate() {
+            if let Some(decision) = rule.evaluate(tool_name, args) {
+                return EvaluatedDecision {
+                    decision,
+                    matched: Some(MatchedRule {
+                        index,
+                        tool_name: rule.tool_name.clone(),
+                        describe: rule.predicate.describe(),
+                    }),
+                };
             }
         }
-        self.fallback
+        EvaluatedDecision {
+            decision: self.fallback,
+            matched: None,
+        }
     }
+}
+
+/// 命中的规则信息（`evaluate_matched` 返回）。
+#[derive(Debug, Clone)]
+pub struct MatchedRule {
+    /// 规则在链中的下标（0 起）。
+    pub index: usize,
+    /// 规则的 tool_name 匹配模式（`"*"` 表示通配）。
+    pub tool_name: String,
+    /// 谓词描述（`Predicate::describe`）。
+    pub describe: String,
+}
+
+/// `RuleChain::evaluate_matched` 的返回：决策 + 命中信息。
+pub struct EvaluatedDecision {
+    pub decision: Decision,
+    pub matched: Option<MatchedRule>,
 }
 
 pub struct RuleChainBuilder {

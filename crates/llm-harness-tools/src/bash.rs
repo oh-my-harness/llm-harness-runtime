@@ -464,7 +464,11 @@ mod tests {
             .await
             .expect_err("timeout must produce a ToolFailure");
         assert_eq!(err.code, "execution_failed");
-        assert_eq!(err.model_message, "Tool execution failed.");
+        assert!(
+            err.model_message.starts_with("command timed out"),
+            "timeout reason must reach the model, got: {}",
+            err.model_message
+        );
     }
 
     #[tokio::test]

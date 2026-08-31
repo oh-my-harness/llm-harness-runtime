@@ -22,14 +22,14 @@ pub fn deny_message(verdict: &SafetyVerdict, tool_name: &str, raw_input: &str) -
     match verdict {
         SafetyVerdict::Allow => {
             // Should not be called with Allow, but handle gracefully.
-            ToolFailure::new("safety_violation", "Allowed (no violation).")
+            ToolFailure::denied("safety_violation", "Allowed (no violation).")
         }
         SafetyVerdict::Deny { reason, suggestion } => {
             let msg = format!(
                 "Blocked by safety policy: {reason}\n\nTool: {tool_name}\nInput: {input}\n\nSuggestion: {suggestion}",
                 input = truncate(raw_input),
             );
-            ToolFailure::new("safety_violation", &msg)
+            ToolFailure::denied("safety_violation", &msg)
         }
     }
 }
@@ -40,7 +40,7 @@ pub fn path_deny_message(violation: &PathViolation, path: &str) -> ToolFailure {
         "Blocked by safety policy: {violation}\n\nTool: write/edit/read\nInput: {input}\n\nSuggestion: Use a path relative to the working directory and avoid '..' components.",
         input = truncate(path),
     );
-    ToolFailure::new("safety_violation", &msg)
+    ToolFailure::denied("safety_violation", &msg)
 }
 
 #[cfg(test)]

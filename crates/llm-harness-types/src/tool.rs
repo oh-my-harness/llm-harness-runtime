@@ -269,6 +269,18 @@ impl ToolFailure {
         Self::new("execution_failed", "Tool execution failed.")
     }
 
+    /// Construct a policy-denied failure.
+    ///
+    /// Sets `details["denied_by_policy"] = true` so downstream observers
+    /// (the audit hook) can distinguish a governance deny from an execution
+    /// failure without string-matching codes.
+    pub fn denied(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            details: serde_json::json!({ "denied_by_policy": true }),
+            ..Self::new(code, message)
+        }
+    }
+
     pub fn model_content(&self) -> Vec<DataBlock> {
         vec![DataBlock::text(&self.model_message)]
     }
@@ -311,7 +323,12 @@ impl From<ToolError> for ToolFailure {
         match error {
             ToolError::InvalidArguments(message) => Self::invalid_arguments(message),
             ToolError::Aborted => Self::aborted(),
-            ToolError::Execution(_) | ToolError::Other(_) => Self::execution_failed(),
+            // Preserve the reason: `Execution` carries the tool-specific
+            // message (timeout details, oversized file, captured output...);
+            // washing it to the generic "Tool execution failed." leaves the
+            // model unable to tell what went wrong or how to recover.
+            ToolError::Execution(message) => Self::new("execution_failed", message),
+            ToolError::Other(_) => Self::execution_failed(),
         }
     }
 }
@@ -605,6 +622,21 @@ pub trait Tool: Send + Sync {
 mod tests {
     use super::*;
     use crate::DataBlock;
+
+    #[test]
+    fn denied_marks_policy_deny() {
+        let f = ToolFailure::denied("safety_violation", "blocked");
+        assert_eq!(f.code, "safety_violation");
+        assert_eq!(f.model_message, "blocked");
+        assert_eq!(f.details["denied_by_policy"], serde_json::json!(true));
+        // Plain failures stay unmarked.
+        assert_ne!(
+            ToolFailure::new("not_found", "x")
+                .details
+                .get("denied_by_policy"),
+            Some(&serde_json::json!(true))
+        );
+    }
 
     #[test]
     fn tool_result_defaults_terminate_false() {

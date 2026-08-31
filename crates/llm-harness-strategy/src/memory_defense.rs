@@ -357,7 +357,7 @@ fn deny_failure(tool_name: &str, raw_input: &str) -> ToolFailure {
     } else {
         raw_input.chars().take(200).collect::<String>() + "..."
     };
-    ToolFailure::new(
+    ToolFailure::denied(
         "memory_defense_violation",
         format!(
             "Blocked by memory defense policy: content contains injection phrases.\n\nTool: {tool_name}\nInput: {truncated}\n\nThis content cannot be written to persistent memory."

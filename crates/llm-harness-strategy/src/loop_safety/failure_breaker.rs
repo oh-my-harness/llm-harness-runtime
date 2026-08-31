@@ -58,6 +58,13 @@ impl AfterToolCallHook for FailureCircuitBreakerHook {
             // from skipping failure count updates.
             let mut state = self.state.lock();
             match ctx.result {
+                // Policy denies (marked via ToolFailure::denied) are governance
+                // decisions, not execution failures: with fix-2 they now flow
+                // through after-hooks, so exclude them from the count — neither
+                // increment nor reset.
+                Err(f)
+                    if f.details.get("denied_by_policy")
+                        == Some(&serde_json::Value::Bool(true)) => {}
                 Err(_) => {
                     *state
                         .failure_counts
@@ -93,7 +100,7 @@ impl BeforeToolCallHook for FailureCircuitBreakerHook {
                     "{}: tool={}, failures={}",
                     self.config.deny_message, ctx.tool_name, count
                 );
-                BeforeToolCallDecision::Deny(ToolFailure::new("circuit_broken", model_message))
+                BeforeToolCallDecision::Deny(ToolFailure::denied("circuit_broken", model_message))
             } else {
                 BeforeToolCallDecision::Allow
             }
@@ -286,5 +293,24 @@ mod tests {
         let msg = assistant();
         let ctx = make_stop_ctx(&msg);
         assert!(!hook.should_stop(ctx).await);
+    }
+
+    // 7. Policy deny (denied_by_policy) → count unchanged, not reset.
+    #[tokio::test]
+    async fn after_hook_ignores_policy_denies() {
+        let state = Arc::new(Mutex::new(LoopSafetyState::default()));
+        {
+            let mut s = state.lock();
+            s.failure_counts.insert("bash".to_string(), 2);
+        }
+        let config = FailureCircuitBreakerConfig::default();
+        let hook = FailureCircuitBreakerHook::new(state.clone(), config);
+        let msg = assistant();
+        let result = Err(ToolFailure::denied("safety_violation", "blocked by policy"));
+        let ctx = make_after_ctx(&msg, "bash", &result);
+        let d = hook.on_complete(ctx).await;
+        assert!(matches!(d, AfterToolCallDecision::Passthrough));
+        // Neither incremented nor reset — deny is governance, not execution failure.
+        assert_eq!(*state.lock().failure_counts.get("bash").unwrap(), 2);
     }
 }

@@ -5,6 +5,11 @@ use futures::future::BoxFuture;
 use llm_harness_types::*;
 
 /// Decorates a `Tool` with optional before/after hooks. Stateless.
+///
+/// A before-hook `Deny` rejects the call without executing the inner tool,
+/// but the failure still flows through the after-hook (`result: Err`,
+/// near-zero duration) so observers such as audit/tracing record the denied
+/// attempt instead of it vanishing without a trace.
 pub struct HookedTool {
     /// The inner tool implementation.
     pub inner: Arc<dyn Tool>,
@@ -40,8 +45,11 @@ impl Tool for HookedTool {
         ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
-            // Apply before-hook
-            let effective_args = if let Some(h) = &self.before {
+            // Apply before-hook. `denied` carries the Deny failure: the call
+            // is rejected, but still flows through the after-hook below so
+            // observers (audit, tracing) see the denied attempt instead of the
+            // call vanishing without a trace.
+            let (effective_args, denied) = if let Some(h) = &self.before {
                 let before_ctx = BeforeToolCallCtx {
                     run: &ctx.run,
                     assistant_message: &ctx.assistant_message,
@@ -51,16 +59,22 @@ impl Tool for HookedTool {
                     turn_index: ctx.turn_index,
                 };
                 match h.on_call(before_ctx).await {
-                    BeforeToolCallDecision::Allow => args,
-                    BeforeToolCallDecision::Modify(new_args) => new_args,
-                    BeforeToolCallDecision::Deny(failure) => return Err(failure),
+                    BeforeToolCallDecision::Allow => (args, None),
+                    BeforeToolCallDecision::Modify(new_args) => (new_args, None),
+                    BeforeToolCallDecision::Deny(failure) => (args, Some(failure)),
                 }
             } else {
-                args
+                (args, None)
             };
 
             let started = Instant::now();
-            let result = self.inner.execute(effective_args.clone(), ctx).await;
+            let result = match denied {
+                // Denied before execution: duration is ~zero; the call still
+                // flows through the after-hook below so audit/tracing observe
+                // it (fixes denied calls being invisible + start_times leak).
+                Some(failure) => Err(failure),
+                None => self.inner.execute(effective_args.clone(), ctx).await,
+            };
             let duration = started.elapsed();
 
             // Apply after-hook, then opt-in duration annotation. The annotation
@@ -151,7 +165,7 @@ fn mirror_duration(projection: &mut ToolSessionProjection, suffix: &str) {
 #[cfg(feature = "test-utils")]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -624,6 +638,68 @@ mod tests {
             .unwrap_err();
         assert!(!called.load(Ordering::SeqCst));
         assert_eq!(failure.code, "denied");
+    }
+
+    #[tokio::test]
+    async fn before_deny_still_invokes_after_hook_with_err() {
+        // Denied calls must stay observable: the after-hook sees Err (with
+        // the deny failure), the inner tool is never executed, and duration
+        // is near-zero. Guards audit/tracing from missing deny events.
+        struct DenyHook;
+        impl BeforeToolCallHook for DenyHook {
+            fn on_call<'a>(
+                &'a self,
+                _: BeforeToolCallCtx<'a>,
+            ) -> BoxFuture<'a, BeforeToolCallDecision> {
+                Box::pin(async {
+                    BeforeToolCallDecision::Deny(ToolFailure::new("denied", "denied"))
+                })
+            }
+        }
+        struct ObserveAfter {
+            seen: Arc<AtomicBool>,
+            was_err: Arc<AtomicBool>,
+            code: Arc<AtomicUsize>,
+        }
+        impl AfterToolCallHook for ObserveAfter {
+            fn on_complete<'a>(
+                &'a self,
+                ctx: AfterToolCallCtx<'a>,
+            ) -> BoxFuture<'a, AfterToolCallDecision> {
+                self.seen.store(true, Ordering::SeqCst);
+                if let Err(f) = ctx.result {
+                    self.was_err.store(true, Ordering::SeqCst);
+                    // Stable small hash of the code — atomic-friendly probe.
+                    let h: usize = f.code.bytes().map(|b| b as usize).sum();
+                    self.code.store(h, Ordering::SeqCst);
+                }
+                Box::pin(async { AfterToolCallDecision::Passthrough })
+            }
+        }
+        let seen = Arc::new(AtomicBool::new(false));
+        let was_err = Arc::new(AtomicBool::new(false));
+        let code = Arc::new(AtomicUsize::new(0));
+        let t = HookedTool {
+            inner: Arc::new(SpyTool {
+                called: Arc::new(AtomicBool::new(false)),
+                terminate: false,
+            }),
+            before: Some(Arc::new(DenyHook)),
+            after: Some(Arc::new(ObserveAfter {
+                seen: seen.clone(),
+                was_err: was_err.clone(),
+                code: code.clone(),
+            })),
+        };
+        let failure = t
+            .execute(serde_json::json!({}), &make_ctx())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, "denied");
+        assert!(seen.load(Ordering::SeqCst), "after-hook must see the deny");
+        assert!(was_err.load(Ordering::SeqCst), "after-hook must see Err");
+        let expected: usize = "denied".bytes().map(|b| b as usize).sum();
+        assert_eq!(code.load(Ordering::SeqCst), expected);
     }
 
     #[tokio::test]
