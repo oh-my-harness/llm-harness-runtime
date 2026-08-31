@@ -603,6 +603,16 @@ impl SocialContext {
         }
     }
 
+    /// Drain all pending messages for clean-shutdown persistence.
+    pub fn drain_pending_messages(&self) -> Vec<InboxMessage> {
+        self.inboxes.drain_everything()
+    }
+
+    /// Restore pending messages after rebuilding the team.
+    pub fn restore_pending_messages(&self, messages: Vec<InboxMessage>) {
+        self.inboxes.restore(messages);
+    }
+
     /// Drain all pending messages for an agent, returning them in priority
     /// order.
     ///

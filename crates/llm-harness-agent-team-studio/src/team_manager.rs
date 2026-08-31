@@ -39,6 +39,8 @@ pub enum TeamManagerError {
     },
     #[error(transparent)]
     Assemble(#[from] engine::AssembleError),
+    #[error("inbox snapshot: {0}")]
+    InboxSnapshot(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -98,6 +100,16 @@ pub struct TeamManager {
     teams: HashMap<String, TeamEntry>,
 }
 
+impl Drop for TeamManager {
+    fn drop(&mut self) {
+        for (_, entry) in self.teams.drain() {
+            if let Err(e) = shutdown_entry(entry) {
+                tracing::error!("team shutdown persistence failed: {e}");
+            }
+        }
+    }
+}
+
 impl TeamManager {
     pub fn new(data_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -145,6 +157,9 @@ impl TeamManager {
 
         std::fs::create_dir_all(team_dir.join("issues"))?;
         let issues = IssueStore::new(team_dir.join("issues"));
+        assembled
+            .team
+            .restore_pending_messages(load_inbox(&team_dir)?)?;
 
         persist_spec(&self.data_root, &spec);
         self.teams.insert(
@@ -179,17 +194,19 @@ impl TeamManager {
 
     /// Shut down one team and drop it (issues/memory persist).
     pub async fn shutdown(&mut self, id: &str) -> Result<(), TeamManagerError> {
-        let mut entry = self
+        let entry = self
             .teams
             .remove(id)
             .ok_or_else(|| TeamManagerError::UnknownTeam(id.to_string()))?;
-        entry.team.shutdown();
+        shutdown_entry(entry)?;
         Ok(())
     }
 
     pub async fn shutdown_all(&mut self) {
-        for (_, mut e) in self.teams.drain() {
-            e.team.shutdown();
+        for (_, entry) in self.teams.drain() {
+            if let Err(e) = shutdown_entry(entry) {
+                tracing::error!("team shutdown persistence failed: {e}");
+            }
         }
     }
 
@@ -509,6 +526,31 @@ pub fn unpersist_spec(data_root: &Path, id: &str) {
     let _ = std::fs::remove_file(path);
 }
 
+/// Stop runners and persist any messages that were still queued. Called on
+/// explicit shutdown and from `TeamManager::drop`, so both UI shutdown and
+/// process teardown use the same recovery snapshot.
+fn shutdown_entry(mut entry: TeamEntry) -> Result<(), TeamManagerError> {
+    let messages = entry.team.drain_pending_messages()?;
+    let inbox_path = entry.data_dir().join("inbox.json");
+    let temp_path = entry.data_dir().join(".inbox.json.tmp");
+    let payload = serde_json::to_vec(&messages)
+        .map_err(|e| TeamManagerError::InboxSnapshot(e.to_string()))?;
+    std::fs::write(&temp_path, payload)?;
+    std::fs::rename(&temp_path, &inbox_path)?;
+    Ok(())
+}
+
+fn load_inbox(
+    team_dir: &Path,
+) -> Result<Vec<llm_harness_agent_team::InboxMessage>, TeamManagerError> {
+    let path = team_dir.join("inbox.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_reader(std::fs::File::open(path)?)
+        .map_err(|e| TeamManagerError::InboxSnapshot(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,7 +586,7 @@ mod tests {
             id: id.into(),
             persona: "worker".into(),
             role_label: "r".into(),
-            model: ModelRef::Tier("m".into()),
+            model: ModelRef::Tier("main".into()),
             toolkits: vec![],
             behaviors: vec![],
             provider_override: None,
@@ -818,6 +860,127 @@ mod tests {
         assert!(tm.get("t").is_none());
         // 数据留存：issues 目录仍在
         assert!(root.join("teams").join("t").join("issues").exists());
+    }
+
+    #[tokio::test]
+    async fn persisted_team_restarts_with_issues_contacts_and_runner() {
+        env_cfg::install_provider_factory(std::sync::Arc::new(|| {
+            vec![(
+                "m".into(),
+                std::sync::Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![
+                    llm_harness_loop::test_utils::MockResponse::tool_use_end_turn(
+                        "restore-1",
+                        "send_message",
+                        r#"{"to": "operator", "body": "confirm restart"}"#,
+                    ),
+                ])) as std::sync::Arc<dyn llm_harness_loop::LlmClient>,
+            )]
+        }));
+        let root = unique_dir("ct-tm-restart");
+        let repo = make_repo();
+        let mut tm = TeamManager::new(&root);
+        tm.create(blank_spec(), Some(repo), &settings(), "")
+            .await
+            .unwrap();
+
+        let issue_store = IssueStore::new(root.join("teams").join("t").join("issues"));
+        let issue = issue_store
+            .create("scout", "survives restart", "body")
+            .unwrap();
+        drop(issue_store);
+
+        tm.shutdown_all().await;
+        assert!(tm.get("t").is_none());
+
+        let specs = list_persisted(&root);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0], blank_spec());
+
+        let mut restored = TeamManager::new(&root);
+        let spec = specs.into_iter().next().unwrap();
+        restored
+            .create(spec.clone(), spec.repo_hint(), &settings(), "")
+            .await
+            .unwrap();
+
+        let issue_store = IssueStore::new(root.join("teams").join("t").join("issues"));
+        let (restored_issue, restored_path) = issue_store.load(&issue.id).unwrap();
+        assert_eq!(restored_issue.title, "survives restart");
+        assert!(restored_path.is_file());
+
+        let ctx = restored
+            .get("t")
+            .unwrap()
+            .team
+            .social_context()
+            .unwrap()
+            .clone();
+        let agent_a = llm_harness_agent_team::AgentId::new("a");
+        let agent_b = llm_harness_agent_team::AgentId::new("b");
+        let operator = llm_harness_agent_team::AgentId::new("operator");
+        assert!(ctx.has_contact(&agent_a, &agent_b));
+        assert!(ctx.has_contact(&agent_b, &agent_a));
+        assert!(ctx.has_contact(&agent_a, &operator));
+
+        restored
+            .get("t")
+            .unwrap()
+            .team
+            .submit("a", "confirm restart")
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let messages = ctx.drain_inbox(&operator);
+            if messages
+                .iter()
+                .any(|message| message.body == "confirm restart")
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "restored runner did not process operator message"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_shutdown_persists_and_restores_pending_inbox() {
+        install_mock_factory();
+        let root = unique_dir("ct-tm-inbox-recovery");
+        let mut tm = TeamManager::new(&root);
+        tm.create(blank_spec(), Some(make_repo()), &settings(), "")
+            .await
+            .unwrap();
+        let operator = llm_harness_agent_team::AgentId::new("operator");
+        let agent_a = llm_harness_agent_team::AgentId::new("a");
+        tm.get("t")
+            .unwrap()
+            .team
+            .submit("a", "recover this task")
+            .unwrap();
+
+        tm.shutdown_all().await;
+        let persisted = std::fs::read_to_string(root.join("teams/t/inbox.json")).unwrap();
+        assert!(persisted.contains("recover this task"));
+
+        let specs = list_persisted(&root);
+        let mut restored = TeamManager::new(&root);
+        let spec = specs.into_iter().next().unwrap();
+        restored
+            .create(spec.clone(), spec.repo_hint(), &settings(), "")
+            .await
+            .unwrap();
+        let ctx = restored
+            .get("t")
+            .unwrap()
+            .team
+            .social_context()
+            .unwrap()
+            .clone();
+        assert!(ctx.has_contact(&agent_a, &operator));
+        assert!(!ctx.drain_inbox(&agent_a).is_empty());
     }
 
     #[test]

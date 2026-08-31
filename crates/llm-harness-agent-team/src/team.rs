@@ -198,6 +198,31 @@ impl AgentTeam {
         self.ctx.as_ref()
     }
 
+    /// Drain pending inbox messages after stopping runners. Used by studio
+    /// lifecycle persistence on a clean shutdown.
+    pub fn drain_pending_messages(&mut self) -> Result<Vec<crate::inbox::InboxMessage>> {
+        if !self.built {
+            return Err(TeamError::NotBuilt);
+        }
+        self.shutdown();
+        let ctx = self.ctx.as_ref().ok_or(TeamError::NotBuilt)?;
+        Ok(ctx.drain_pending_messages())
+    }
+
+    /// Requeue messages persisted from the previous team instance. Call
+    /// after `build`, once all recipients and contacts exist.
+    pub fn restore_pending_messages(
+        &self,
+        messages: Vec<crate::inbox::InboxMessage>,
+    ) -> Result<()> {
+        if !self.built {
+            return Err(TeamError::NotBuilt);
+        }
+        let ctx = self.ctx.as_ref().ok_or(TeamError::NotBuilt)?;
+        ctx.restore_pending_messages(messages);
+        Ok(())
+    }
+
     /// The built harness of `agent_id` (`None` for unknown agents or
     /// before `build`). Read-only observation handle: the returned Arc is
     /// the same one the agent's runner drives.

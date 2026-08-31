@@ -203,6 +203,25 @@ impl InboxStore {
         }
     }
 
+    /// Drain every queue, with each recipient's messages in priority order.
+    pub fn drain_everything(&self) -> Vec<InboxMessage> {
+        let mut queues = self.queues.lock();
+        let mut messages = Vec::new();
+        for (_, mut queue) in queues.drain() {
+            messages.extend(queue.drain_sorted());
+        }
+        messages
+    }
+
+    /// Restore previously drained messages. Message priority controls the
+    /// rebuilt queue order; contacts and registered recipients remain the
+    /// caller's responsibility.
+    pub fn restore(&self, messages: Vec<InboxMessage>) {
+        for message in messages {
+            self.push(message);
+        }
+    }
+
     /// Whether `agent_id` has any pending messages.
     pub fn has_messages(&self, agent_id: &AgentId) -> bool {
         let queues = self.queues.lock();
@@ -323,6 +342,26 @@ mod tests {
         // After draining, no messages remain.
         assert!(!store.has_messages(&alice));
         assert!(store.drain_all(&alice).is_empty());
+    }
+
+    #[test]
+    fn drain_everything_and_restore_round_trips_priority() {
+        let store = InboxStore::new();
+        let alice = AgentId::new("alice");
+        store.push(msg("bob", "alice", "normal", priority::NORMAL));
+        store.push(msg("operator", "alice", "operator", priority::OPERATOR));
+
+        let messages = store.drain_everything();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].body, "operator");
+        assert_eq!(messages[1].body, "normal");
+        assert!(!store.has_messages(&alice));
+
+        let restored = InboxStore::new();
+        restored.restore(messages);
+        let messages = restored.drain_all(&alice);
+        assert_eq!(messages[0].body, "operator");
+        assert_eq!(messages[1].body, "normal");
     }
 
     #[tokio::test(start_paused = true)]
