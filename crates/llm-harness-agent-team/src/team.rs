@@ -539,7 +539,7 @@ impl AgentTeam {
             &target,
             task,
             crate::inbox::priority::OPERATOR,
-        );
+        )?;
         Ok(())
     }
 
@@ -770,6 +770,7 @@ impl MemoryMutationGate for AllowAllGate {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests {
     use super::*;
     use llm_harness_agent::HarnessBuildError;

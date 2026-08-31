@@ -59,7 +59,12 @@ impl BroadcastTool {
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| ToolFailure::invalid_arguments("missing string field 'message'"))?;
 
-        let broadcast_id = self.ctx.broadcast(&self.agent_id, body);
+        let broadcast_id = self.ctx.broadcast(&self.agent_id, body).map_err(|error| {
+            ToolFailure::new(
+                "inbox_journal_persistence_failed",
+                format!("failed to persist broadcast: {error}"),
+            )
+        })?;
 
         // Schedule a cancellable timeout keyed by the broadcast_id. When a
         // volunteer reply carrying that broadcast_id is drained, the runner

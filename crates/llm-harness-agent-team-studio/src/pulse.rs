@@ -131,7 +131,13 @@ pub fn pending_traffic(team: &AgentTeam) -> serde_json::Value {
                     "type": format!("{:?}", msg.message_type).to_lowercase(),
                     "body": msg.body,
                 }));
-                ctx.push_message(msg);
+                if let Err(error) = ctx.push_message(msg.clone()) {
+                    ctx.return_messages(&agent, vec![msg]);
+                    pending.push(serde_json::json!({
+                        "to": id,
+                        "error": error.to_string(),
+                    }));
+                }
             }
         }
     }

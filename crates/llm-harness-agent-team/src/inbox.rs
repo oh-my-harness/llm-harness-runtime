@@ -210,23 +210,25 @@ impl InboxStore {
         Ok(store)
     }
 
-    /// Push a message into the recipient's queue and wake exactly the
+    /// Push a durable message into the recipient's queue and wake exactly the
     /// recipient's waiters — pushes for other agents never steal the wakeup.
-    pub fn push(&self, message: InboxMessage) {
+    ///
+    /// Returns an error without enqueuing when the journal write fails, so
+    /// callers cannot mistake an unlogged message for durable delivery.
+    pub fn push(
+        &self,
+        message: InboxMessage,
+    ) -> Result<(), crate::inbox_journal::InboxJournalError> {
         let mut message = message;
         if let Some(journal) = &self.journal
             && message.journal_id.is_none()
         {
-            match journal.enqueue(&message) {
-                Ok(id) => message.journal_id = Some(id),
-                Err(error) => {
-                    tracing::error!(error = %error, "failed to journal inbox message");
-                }
-            }
+            message.journal_id = Some(journal.enqueue(&message)?);
         }
         let to = message.to.clone();
         let mut queues = self.queues.lock();
         queues.entry(to).or_default().push(message);
+        Ok(())
     }
 
     /// Requeue an already-journaled message without creating a new row.
@@ -313,6 +315,7 @@ impl InboxStore {
 }
 
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests {
     use super::*;
 
@@ -382,9 +385,9 @@ mod tests {
         let store = InboxStore::new();
         let alice = AgentId::new("alice");
 
-        store.push(msg("bob", "alice", "hello", 1));
-        store.push(msg("carol", "alice", "urgent", 10));
-        store.push(msg("dave", "alice", "normal", 5));
+        store.push(msg("bob", "alice", "hello", 1)).unwrap();
+        store.push(msg("carol", "alice", "urgent", 10)).unwrap();
+        store.push(msg("dave", "alice", "normal", 5)).unwrap();
 
         assert!(store.has_messages(&alice));
 
@@ -404,8 +407,12 @@ mod tests {
     fn drain_everything_and_restore_round_trips_priority() {
         let store = InboxStore::new();
         let alice = AgentId::new("alice");
-        store.push(msg("bob", "alice", "normal", priority::NORMAL));
-        store.push(msg("operator", "alice", "operator", priority::OPERATOR));
+        store
+            .push(msg("bob", "alice", "normal", priority::NORMAL))
+            .unwrap();
+        store
+            .push(msg("operator", "alice", "operator", priority::OPERATOR))
+            .unwrap();
 
         let messages = store.drain_everything();
         assert_eq!(messages.len(), 2);
@@ -429,7 +436,9 @@ mod tests {
         let alice = AgentId::new("alice");
 
         let store = InboxStore::with_journal(Arc::clone(&journal)).unwrap();
-        store.push(msg("operator", "alice", "crash safe", priority::OPERATOR));
+        store
+            .push(msg("operator", "alice", "crash safe", priority::OPERATOR))
+            .unwrap();
         let drained = store.drain_all(&alice);
         assert_eq!(drained.len(), 1);
         assert_eq!(journal.recover().unwrap().len(), 1);
@@ -440,6 +449,29 @@ mod tests {
 
         store.ack(&drained);
         assert!(journal.recover().unwrap().is_empty());
+    }
+
+    #[test]
+    fn journal_failure_does_not_enqueue_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("inbox.sqlite3");
+        let journal = Arc::new(crate::inbox_journal::InboxJournal::open(&path).unwrap());
+        let store = InboxStore::with_journal(Arc::clone(&journal)).unwrap();
+        let alice = AgentId::new("alice");
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute("DROP TABLE pending_messages", [])
+            .unwrap();
+
+        let error = store
+            .push(msg("bob", "alice", "lost", priority::NORMAL))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::inbox_journal::InboxJournalError::Sqlite(_)
+        ));
+        assert!(!store.has_messages(&alice));
     }
 
     #[tokio::test(start_paused = true)]

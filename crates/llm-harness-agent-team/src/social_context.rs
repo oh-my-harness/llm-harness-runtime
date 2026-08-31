@@ -520,7 +520,7 @@ impl SocialContext {
         to: &AgentId,
         body: impl Into<String>,
         priority: u32,
-    ) {
+    ) -> crate::Result<()> {
         self.apply_relation_event(from, to, crate::relation::RelationEvent::Communication);
         let message = InboxMessage {
             journal_id: None,
@@ -532,7 +532,8 @@ impl SocialContext {
             task_id: None,
             broadcast_id: None,
         };
-        self.push_message(message);
+        self.push_message(message)?;
+        Ok(())
     }
     /// Send a direct message with optional `task_id` and `broadcast_id`
     /// correlation keys. Used by the `send_message` tool when replying to
@@ -550,7 +551,7 @@ impl SocialContext {
         priority: u32,
         task_id: Option<String>,
         broadcast_id: Option<String>,
-    ) {
+    ) -> crate::Result<()> {
         self.apply_relation_event(from, to, crate::relation::RelationEvent::Communication);
         let message = InboxMessage {
             journal_id: None,
@@ -562,7 +563,8 @@ impl SocialContext {
             task_id,
             broadcast_id,
         };
-        self.push_message(message);
+        self.push_message(message)?;
+        Ok(())
     }
 
     /// Broadcast a message to all agents except the sender.
@@ -575,7 +577,7 @@ impl SocialContext {
     ///
     /// Returns the generated `broadcast_id` so callers (e.g. the broadcast
     /// tool) can register a cancellable timeout keyed by it.
-    pub fn broadcast(&self, from: &AgentId, body: impl Into<String>) -> String {
+    pub fn broadcast(&self, from: &AgentId, body: impl Into<String>) -> crate::Result<String> {
         let body = body.into();
         let broadcast_id = uuid::Uuid::now_v7().to_string();
         for info in self.registry.list() {
@@ -592,9 +594,9 @@ impl SocialContext {
                 task_id: None,
                 broadcast_id: Some(broadcast_id.clone()),
             };
-            self.push_message(message);
+            self.push_message(message)?;
         }
-        broadcast_id
+        Ok(broadcast_id)
     }
     /// Push a pre-constructed message into the recipient's inbox.
     ///
@@ -604,14 +606,15 @@ impl SocialContext {
     /// neither `send_message` back (contact gate) nor find the sender via
     /// `search_contacts`. Timer messages (from "timer"/"self") are skipped —
     /// they are system notifications, not social peers.
-    pub fn push_message(&self, message: InboxMessage) {
+    pub fn push_message(&self, message: InboxMessage) -> crate::Result<()> {
         if message.from.as_str() != reserved::TIMER
             && message.from.as_str() != reserved::SELF
             && message.from != message.to
         {
             self.ensure_contact(&message.to, &message.from);
         }
-        self.inboxes.push(message);
+        self.inboxes.push(message)?;
+        Ok(())
     }
 
     /// Return drained messages to an agent's inbox unchanged.
@@ -976,6 +979,7 @@ impl SocialContext {
     }
 }
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests {
     use super::*;
     use crate::timeout_manager::reserved;

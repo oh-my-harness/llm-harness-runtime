@@ -130,7 +130,12 @@ impl DelegateTaskTool {
             task_id: Some(task_id_str.clone()),
             broadcast_id: None,
         };
-        self.ctx.push_message(message);
+        self.ctx.push_message(message).map_err(|error| {
+            ToolFailure::new(
+                "inbox_journal_persistence_failed",
+                format!("failed to persist delegation: {error}"),
+            )
+        })?;
         // Schedule a cancellable timeout keyed by the task_id. When the
         // delegate replies (carrying the same task_id), the runner cancels
         // this timeout. If it fires, the originator is nudged to follow up.

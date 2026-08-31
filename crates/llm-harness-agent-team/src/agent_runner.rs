@@ -632,7 +632,7 @@ impl AgentRunner {
                             // and advance its tick (accelerating real contacts'
                             // decay). Reflection is a system trigger, not a
                             // social interaction.
-                            ctx.push_message(InboxMessage {
+                            if let Err(error) = ctx.push_message(InboxMessage {
                                 journal_id: None,
                                 from: agent_id.clone(),
                                 to: agent_id.clone(),
@@ -641,7 +641,13 @@ impl AgentRunner {
                                 priority: crate::inbox::priority::REFLECTION,
                                 task_id: None,
                                 broadcast_id: None,
-                            });
+                            }) {
+                                error!(
+                                    agent = %agent_id,
+                                    error = %error,
+                                    "failed to journal reflection trigger"
+                                );
+                            }
                         }
                     }
                 }
@@ -658,6 +664,7 @@ impl AgentRunner {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
