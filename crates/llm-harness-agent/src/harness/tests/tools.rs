@@ -485,7 +485,7 @@ async fn skill_metadata_injected_before_run() {
     let _ = harness.prompt("hello").await;
 
     // Verify the LLM client received a message containing <available-skills>.
-    let captured = client.captured_requests.lock().unwrap();
+    let captured = client.captured_requests.lock();
     assert!(!captured.is_empty(), "provider should have been called");
     let messages = captured[0].messages();
     let has_metadata = messages.iter().any(|m| match m {

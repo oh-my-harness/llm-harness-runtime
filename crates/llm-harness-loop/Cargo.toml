@@ -16,6 +16,7 @@ tokio-stream.workspace      = true
 tokio-util.workspace        = true
 uuid.workspace              = true
 chrono.workspace            = true
+parking_lot.workspace       = true
 fastrand.workspace            = true
 tracing.workspace             = true
 

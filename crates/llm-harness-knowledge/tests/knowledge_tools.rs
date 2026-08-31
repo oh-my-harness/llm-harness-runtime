@@ -374,7 +374,7 @@ async fn unscoped_search_federates_visible_sources() {
         .await
         .unwrap();
 
-    let requests = client.captured_requests.lock().unwrap();
+    let requests = client.captured_requests.lock();
     let result_text = requests[1]
         .messages()
         .iter()
@@ -464,7 +464,7 @@ async fn agent_searches_reads_and_persists_only_evidence_projection() {
         .unwrap();
 
     {
-        let requests = client.captured_requests.lock().unwrap();
+        let requests = client.captured_requests.lock();
         assert_eq!(requests.len(), 3);
         assert!(requests[2].messages().iter().any(|message| {
             matches!(

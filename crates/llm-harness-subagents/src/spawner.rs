@@ -900,7 +900,7 @@ mod tests {
         assert_eq!(result.tool_calls_count, 0);
 
         // Verify the prompt format via captured requests.
-        let captured = client_clone.captured_requests.lock().unwrap();
+        let captured = client_clone.captured_requests.lock();
         let first_user_msg = captured
             .first()
             .expect("should have at least one request")
@@ -1324,7 +1324,7 @@ mod tests {
 
         let _ = handle.join().await;
 
-        let captured = client_clone.captured_requests.lock().unwrap();
+        let captured = client_clone.captured_requests.lock();
         let system_msg = captured
             .first()
             .expect("should have at least one request")

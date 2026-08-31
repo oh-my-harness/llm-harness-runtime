@@ -56,14 +56,14 @@ impl CustomMessageConverter for SubAgentMessageConverter {
 
 /// 从 captured_requests 提取所有 user 消息的文本内容，拼接成单条字符串。
 fn user_text_seen_by_llm(client: &MockLlmClient) -> String {
-    let reqs = client.captured_requests.lock().unwrap();
+    let reqs = client.captured_requests.lock();
     let mut buf = String::new();
     for req in reqs.iter() {
         for msg in req.messages() {
             if let LlmMessage::User(blocks) = msg {
                 for block in blocks {
                     if let RequestContent::Text(t) = block {
-                        buf.push_str(t);
+                        buf.push_str(t.as_str());
                         buf.push('\n');
                     }
                 }
@@ -277,7 +277,7 @@ async fn wait_for_in_flight_zero(registry: &MessageBus) {
 
 /// 从 captured_requests 提取第 N 次 LLM 调用中所有 user 消息的文本内容。
 fn user_text_in_call(client: &MockLlmClient, call_index: usize) -> String {
-    let reqs = client.captured_requests.lock().unwrap();
+    let reqs = client.captured_requests.lock();
     let Some(req) = reqs.get(call_index) else {
         return String::new();
     };
@@ -286,7 +286,7 @@ fn user_text_in_call(client: &MockLlmClient, call_index: usize) -> String {
         if let LlmMessage::User(blocks) = msg {
             for block in blocks {
                 if let RequestContent::Text(t) = block {
-                    buf.push_str(t);
+                    buf.push_str(t.as_str());
                     buf.push('\n');
                 }
             }

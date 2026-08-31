@@ -267,7 +267,7 @@ async fn ephemeral_result_is_full_for_current_run_and_projected_in_session() {
     harness.prompt("read it").await.unwrap();
 
     {
-        let requests = client.captured_requests.lock().unwrap();
+        let requests = client.captured_requests.lock();
         assert_eq!(requests.len(), 2);
         assert!(requests[1].messages().iter().any(|message| {
             matches!(
