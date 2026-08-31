@@ -14,7 +14,7 @@ use std::time::Instant;
 use chrono::Utc;
 use futures::future::BoxFuture;
 use llm_harness_agent::{HarnessHooks, Plugin};
-use llm_harness_types::audit::{AuditEntry, AuditEventType, AuditSink};
+use llm_harness_types::audit::{AuditDecision, AuditEntry, AuditEventType, AuditSink};
 use llm_harness_types::{
     AfterToolCallCtx, AfterToolCallDecision, AfterToolCallHook, BeforeToolCallCtx,
     BeforeToolCallDecision, BeforeToolCallHook, EntryId,
@@ -90,15 +90,43 @@ impl AfterToolCallHook for ToolCallAuditHook {
                 .map(|start| start.elapsed().as_millis() as u64);
 
             // ToolCall events record execution outcome in payload.result_status,
-            // not in the decision field — AuditDecision is reserved for governance
-            // decisions (approval, budget enforcement), not execution results.
-            let payload = serde_json::json!({
+            // not in the decision field — unless the failure was a policy deny
+            // (ToolFailure::denied sets details["denied_by_policy"]), which is
+            // a governance decision and lands in `decision` as well.
+            let (result_status, failure_code, failure_message) = match ctx.result {
+                Ok(_) => ("success", None, None),
+                Err(failure) => {
+                    const MAX_FAILURE_MESSAGE_LEN: usize = 512;
+                    let message: String = failure
+                        .model_message
+                        .chars()
+                        .take(MAX_FAILURE_MESSAGE_LEN)
+                        .collect();
+                    let message =
+                        if message.chars().count() == failure.model_message.chars().count() {
+                            message
+                        } else {
+                            format!("{message}... (truncated)")
+                        };
+                    ("failure", Some(failure.code.as_str()), Some(message))
+                }
+            };
+            let denied_by_policy = matches!(ctx.result,
+                Err(f) if f.details.get("denied_by_policy") == Some(&serde_json::Value::Bool(true)));
+
+            let mut payload = serde_json::json!({
                 "tool_name": ctx.tool_name,
                 "tool_use_id": ctx.tool_use_id,
                 "args": ctx.args,
                 "turn_index": ctx.turn_index,
-                "result_status": if ctx.result.is_ok() { "success" } else { "failure" },
+                "result_status": result_status,
             });
+            if let Some(code) = &failure_code {
+                payload["failure_code"] = serde_json::json!(code);
+            }
+            if let Some(message) = &failure_message {
+                payload["failure_message"] = serde_json::json!(message);
+            }
 
             let entry = AuditEntry {
                 timestamp: Utc::now(),
@@ -108,7 +136,9 @@ impl AfterToolCallHook for ToolCallAuditHook {
                 principal: "agent".into(),
                 event_type: AuditEventType::ToolCall,
                 payload,
-                decision: None,
+                decision: denied_by_policy.then(|| AuditDecision::Deny {
+                    reason: failure_message.clone().unwrap_or_default(),
+                }),
                 cost_delta: None,
                 duration_ms,
                 prev_hash: None,
@@ -366,6 +396,71 @@ mod tests {
             entries[0].payload["result_status"].as_str().unwrap(),
             "failure"
         );
+    }
+
+    #[tokio::test]
+    async fn denied_failure_recorded_as_deny_decision() {
+        let sink = Arc::new(MockSink::new());
+        let hook = ToolCallAuditHook::new(sink.clone());
+
+        let run = make_run_context();
+        let assistant = make_assistant();
+        let args = serde_json::json!({"command": "rm -rf /"});
+        let failure = ToolFailure::denied("safety_violation", "dangerous command blocked");
+        let result = Err(failure);
+
+        let before_ctx = make_before_ctx(&run, &assistant, "tu-6", "bash", &args);
+        hook.on_call(before_ctx).await;
+
+        let after_ctx = make_after_ctx(&run, &assistant, "tu-6", "bash", &args, &result);
+        hook.on_complete(after_ctx).await;
+
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        // Policy deny surfaces both in payload and as an explicit decision.
+        assert_eq!(entry.payload["result_status"].as_str().unwrap(), "failure");
+        assert_eq!(
+            entry.payload["failure_code"].as_str().unwrap(),
+            "safety_violation"
+        );
+        assert_eq!(
+            entry.payload["failure_message"].as_str().unwrap(),
+            "dangerous command blocked"
+        );
+        match &entry.decision {
+            Some(AuditDecision::Deny { reason }) => {
+                assert_eq!(reason, "dangerous command blocked");
+            }
+            other => panic!("expected Deny decision, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_execution_failure_has_no_deny_decision() {
+        let sink = Arc::new(MockSink::new());
+        let hook = ToolCallAuditHook::new(sink.clone());
+
+        let run = make_run_context();
+        let assistant = make_assistant();
+        let args = serde_json::json!({});
+        let failure = ToolFailure::new("timeout", "command timed out");
+        let result = Err(failure);
+
+        let before_ctx = make_before_ctx(&run, &assistant, "tu-7", "bash", &args);
+        hook.on_call(before_ctx).await;
+
+        let after_ctx = make_after_ctx(&run, &assistant, "tu-7", "bash", &args, &result);
+        hook.on_complete(after_ctx).await;
+
+        let entries = sink.entries();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].decision.is_none());
+        assert_eq!(
+            entries[0].payload["failure_code"].as_str().unwrap(),
+            "timeout"
+        );
+        assert!(entries[0].payload.get("failure_message").is_some());
     }
 
     #[tokio::test]

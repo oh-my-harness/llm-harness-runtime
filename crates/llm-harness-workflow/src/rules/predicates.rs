@@ -22,6 +22,10 @@ impl Predicate for Contains {
     fn test(&self, tool_name: &str, _args: &Value) -> bool {
         self.allowed.iter().any(|t| t == tool_name)
     }
+
+    fn describe(&self) -> String {
+        format!("tool_name in {:?}", self.allowed)
+    }
 }
 
 /// 从 args 按 arg_path 取值。arg_path 用点号分隔（如 "config.threshold"）。
@@ -53,6 +57,10 @@ impl Predicate for NumberRangeField {
         };
         n >= self.min && n <= self.max
     }
+
+    fn describe(&self) -> String {
+        format!("args.{} in [{}, {}]", self.arg_path, self.min, self.max)
+    }
 }
 
 /// 正则匹配：args[arg_path] 匹配 pattern。
@@ -72,6 +80,10 @@ impl Predicate for RegexField {
             None => return false,
         };
         self.pattern.is_match(s)
+    }
+
+    fn describe(&self) -> String {
+        format!("args.{} ~ /{}/", self.arg_path, self.pattern.as_str())
     }
 }
 
@@ -118,11 +130,19 @@ impl Predicate for RateLimit {
                 (false, true)
             }
         };
-        // 清理空 entries 避免内存泄漏。
         if should_remove {
             calls.remove(tool_name);
         }
         result
+    }
+
+    fn describe(&self) -> String {
+        let secs = self.window.as_secs();
+        if secs > 0 {
+            format!("rate ≤ {}/{}s", self.max, secs)
+        } else {
+            format!("rate ≤ {}/{}ms", self.max, self.window.as_millis())
+        }
     }
 }
 #[cfg(test)]

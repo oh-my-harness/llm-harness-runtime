@@ -23,14 +23,23 @@ impl RuleBasedApprovalHook {
 
 impl BeforeToolCallHook for RuleBasedApprovalHook {
     fn on_call<'a>(&'a self, ctx: BeforeToolCallCtx<'a>) -> BoxFuture<'a, BeforeToolCallDecision> {
-        let decision = self.chain.evaluate(ctx.tool_name, ctx.args);
+        let evaluated = self.chain.evaluate_matched(ctx.tool_name, ctx.args);
         Box::pin(async move {
-            match decision {
+            match evaluated.decision {
                 Decision::Allow => BeforeToolCallDecision::Allow,
-                Decision::Deny => BeforeToolCallDecision::Deny(ToolFailure::new(
-                    "rule_denied",
-                    "Tool call denied by policy.",
-                )),
+                Decision::Deny => {
+                    let reason = match &evaluated.matched {
+                        Some(rule) => format!(
+                            "Tool call denied by policy: rule #{} for tool '{}' ({})",
+                            rule.index, ctx.tool_name, rule.describe
+                        ),
+                        None => format!(
+                            "Tool call denied by policy: no rule matched (fallback) for tool '{}'",
+                            ctx.tool_name
+                        ),
+                    };
+                    BeforeToolCallDecision::Deny(ToolFailure::denied("rule_denied", reason))
+                }
             }
         })
     }
@@ -91,5 +100,59 @@ mod tests {
         let ctx = make_ctx(&msg, "dangerous_tool");
         let decision = hook.on_call(ctx).await;
         assert!(matches!(decision, BeforeToolCallDecision::Deny(_)));
+    }
+
+    #[tokio::test]
+    async fn deny_message_includes_matched_rule_reason() {
+        let chain = RuleChain::builder()
+            .rule(Rule {
+                tool_name: "measure".into(),
+                predicate: Box::new(Contains::new(vec!["other_tool".into()])),
+                on_match: Decision::Allow,
+            })
+            .rule(Rule {
+                tool_name: "*".into(),
+                predicate: Box::new(Contains::new(vec!["allowed".into(), "measure".into()])),
+                on_match: Decision::Deny,
+            })
+            .fallback(Decision::Deny)
+            .build();
+        let hook = RuleBasedApprovalHook::new(chain);
+        let msg = empty_message();
+        let ctx = make_ctx(&msg, "measure");
+        let decision = hook.on_call(ctx).await;
+        match decision {
+            BeforeToolCallDecision::Deny(failure) => {
+                assert_eq!(failure.code, "rule_denied");
+                assert_eq!(failure.details["denied_by_policy"], serde_json::json!(true));
+                let message = failure.model_message;
+                assert!(message.contains("rule #1"), "got: {message}");
+                assert!(message.contains("tool 'measure'"), "got: {message}");
+                assert!(message.contains("tool_name in"), "got: {message}");
+            }
+            BeforeToolCallDecision::Allow | BeforeToolCallDecision::Modify(_) => {
+                panic!("expected Deny")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_message_reports_fallback_when_no_rule_matches() {
+        let chain = RuleChain::builder().fallback(Decision::Deny).build();
+        let hook = RuleBasedApprovalHook::new(chain);
+        let msg = empty_message();
+        let ctx = make_ctx(&msg, "dangerous_tool");
+        let decision = hook.on_call(ctx).await;
+        match decision {
+            BeforeToolCallDecision::Deny(failure) => {
+                assert_eq!(failure.code, "rule_denied");
+                let message = failure.model_message;
+                assert!(message.contains("no rule matched"), "got: {message}");
+                assert!(message.contains("fallback"), "got: {message}");
+            }
+            BeforeToolCallDecision::Allow | BeforeToolCallDecision::Modify(_) => {
+                panic!("expected Deny")
+            }
+        }
     }
 }

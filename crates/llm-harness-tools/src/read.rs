@@ -873,9 +873,15 @@ mod tests {
             .execute(serde_json::json!({ "path": "big.png" }), &ctx)
             .await
             .expect_err("oversized png should error");
-        // ToolError::Execution -> ToolFailure::execution_failed() drops the
-        // message by contract (pre-existing behavior for all tools); the
-        // reachable-error guarantee is what this test pins.
+        // ToolError::Execution keeps its message in ToolFailure
+        // ("execution_failed" + the tool-specific reason); this test pins the
+        // reachable-error guarantee and the fail-fast contract.
         assert_eq!(err.code, "execution_failed");
+        assert!(
+            err.model_message
+                .contains("file too large for inline multimodal read"),
+            "oversize reason must reach the model, got: {}",
+            err.model_message
+        );
     }
 }

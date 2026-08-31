@@ -65,7 +65,7 @@ impl BeforeToolCallHook for McpCredentialGuardHook {
                             tool = ctx.tool_name,
                             "denying MCP tool call: credential scope violation"
                         );
-                        BeforeToolCallDecision::Deny(ToolFailure::new(
+                        BeforeToolCallDecision::Deny(ToolFailure::denied(
                             "credential_scope_violation",
                             "Tool call denied: this tool is not in any credential's allowed_tools list.",
                         ))
