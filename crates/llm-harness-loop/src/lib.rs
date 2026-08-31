@@ -254,6 +254,8 @@ pub mod hooked_tool;
 pub mod loop_fn;
 pub(crate) mod stream_state;
 
+pub(crate) mod vision;
+
 mod type_bridge;
 
 #[cfg(any(test, feature = "test-utils"))]

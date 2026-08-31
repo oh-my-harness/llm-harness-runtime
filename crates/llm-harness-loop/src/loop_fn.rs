@@ -223,9 +223,14 @@ fn run_loop(
             dispatch::execute_tool_batch,
             stream_state::StreamingState,
             type_bridge::tools_to_defs,
+            vision,
         };
         use llm_adapter::types::{ChatRequest, Message as AMsg, ToolChoice};
         use tokio::sync::mpsc;
+
+        // One-shot vision degradation guard: strip image/document blocks at
+        // most once per run, so a genuinely broken provider can't loop forever.
+        let mut vision_degrade_attempted = false;
 
         yield AgentEvent::AgentStart;
 
@@ -390,6 +395,32 @@ fn run_loop(
                         continue;
                     }
                     Err(e) => {
+                        // Vision degradation (issue #145 gap 2): a text-only
+                        // provider rejects the whole request with a 400 when
+                        // history carries image/document blocks — which the
+                        // adapter surfaces as InvalidRequest. Other error
+                        // kinds (auth, transient server errors) must pass
+                        // through untouched; rewriting history on them would
+                        // corrupt the conversation on a bug, not a capability
+                        // gap.
+                        if let LlmError::InvalidRequest(_) = e
+                            && !vision_degrade_attempted
+                            && let Some(stripped) =
+                                vision::strip_vision(&mut ctx.messages, &mut new_messages)
+                        {
+                            tracing::warn!(
+                                stripped_blocks = stripped,
+                                error = %e,
+                                "provider rejected request containing image/document blocks; \
+                                 stripping them and retrying once"
+                            );
+                            yield AgentEvent::VisionDegraded {
+                                reason: e.to_string(),
+                                stripped_blocks: stripped,
+                            };
+                            vision_degrade_attempted = true;
+                            continue 'main;
+                        }
                         yield AgentEvent::Error(llm_error_to_agent_error(e));
                         break 'main;
                     }
@@ -1358,7 +1389,7 @@ mod tests {
         use llm_adapter::types::{
             StopReason as AdapterStopReason, StreamEvent as AdapterEvent, Usage as AdapterUsage,
         };
-        use std::sync::Mutex;
+        use parking_lot::Mutex;
 
         struct CaptureUsage(Arc<Mutex<Vec<TokenUsage>>>);
 
@@ -1369,7 +1400,7 @@ mod tests {
             ) -> BoxFuture<'a, ()> {
                 Box::pin(async move {
                     if let Some(usage) = &ctx.info.usage {
-                        self.0.lock().unwrap().push(usage.clone());
+                        self.0.lock().push(usage.clone());
                     }
                 })
             }
@@ -1404,7 +1435,7 @@ mod tests {
                 .collect()
                 .await;
 
-        let captured = captured.lock().unwrap();
+        let captured = captured.lock();
         assert_eq!(captured.len(), 1);
         assert_eq!(
             captured[0].provenance,
@@ -1501,7 +1532,7 @@ mod tests {
         .collect()
         .await;
 
-        let captured = client_raw.captured_requests.lock().unwrap();
+        let captured = client_raw.captured_requests.lock();
         assert_eq!(captured.len(), 1);
         assert!(
             captured[0]
@@ -2179,7 +2210,7 @@ mod tests {
                 .collect()
                 .await;
 
-        let captured = client.captured_requests.lock().unwrap();
+        let captured = client.captured_requests.lock();
         assert_eq!(captured.len(), 1, "provider should be called exactly once");
         let messages = captured[0].messages();
         assert!(
@@ -2730,7 +2761,7 @@ mod tests {
                 .collect()
                 .await;
 
-        let captured = client.captured_requests.lock().unwrap();
+        let captured = client.captured_requests.lock();
         assert_eq!(captured.len(), 1, "provider should be called exactly once");
         assert_eq!(
             captured[0].response_format(),
@@ -2786,7 +2817,7 @@ mod tests {
         // Trajectory invariant: every ToolUse id in the second request's history
         // must have a paired ToolResult. This directly verifies the core goal
         // of the design — no orphan ToolUse reaches the provider.
-        let captured = client_raw.captured_requests.lock().unwrap();
+        let captured = client_raw.captured_requests.lock();
         assert_eq!(captured.len(), 2, "two provider calls expected");
         use llm_adapter::types::{Message, ResponseContent};
         let second_request_msgs = captured[1].messages();
@@ -2883,7 +2914,7 @@ mod tests {
 
         // Trajectory invariant: the ToolUse id must have a paired ToolResult
         // in the second request's history — no orphan ToolUse reaches the provider.
-        let captured = client_raw.captured_requests.lock().unwrap();
+        let captured = client_raw.captured_requests.lock();
         assert_eq!(captured.len(), 2, "two provider calls expected");
         use llm_adapter::types::{Message, ResponseContent};
         let second_request_msgs = captured[1].messages();
@@ -3053,5 +3084,273 @@ mod tests {
             assert!(!message.is_empty());
             assert!(err.to_string().contains(message));
         }
+    }
+
+    // ── Vision degradation (issue #145 gaps 2+3) ────────────────────────────
+
+    use llm_adapter::LlmError;
+    use llm_harness_types::{
+        ImageSource, PersistedToolProjection, ProjectionMetadata, ToolProjectionKind,
+        ToolResultMessage,
+    };
+
+    fn image_user_message() -> AgentMessage {
+        AgentMessage::User(UserMessage {
+            content: vec![
+                ContentBlock::Text {
+                    text: "what is in this picture?".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Url {
+                        url: "https://example.com/pic.png".into(),
+                    },
+                },
+            ],
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    fn tool_result_with_image() -> AgentMessage {
+        AgentMessage::ToolResult(ToolResultMessage {
+            tool_use_id: "call_1".into(),
+            content: vec![
+                DataBlock::Text {
+                    text: "screenshot".into(),
+                    mime_type: None,
+                },
+                DataBlock::Image {
+                    source: ImageSource::Url {
+                        url: "https://example.com/shot.png".into(),
+                    },
+                },
+            ],
+            is_error: false,
+            projection: PersistedToolProjection {
+                kind: ToolProjectionKind::Full,
+                metadata: ProjectionMetadata::default(),
+            },
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    fn image_block_count(req: &llm_adapter::types::ChatRequest) -> usize {
+        req.messages()
+            .iter()
+            .map(|m| match m {
+                llm_adapter::types::Message::User(content) => content
+                    .iter()
+                    .filter(|c| matches!(c, llm_adapter::types::RequestContent::Image(_)))
+                    .count(),
+                llm_adapter::types::Message::Tool { content, .. } => content
+                    .iter()
+                    .filter(|c| matches!(c, llm_adapter::types::RequestContent::Image(_)))
+                    .count(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn vision_rejection_strips_blocks_retries_and_succeeds() {
+        // Turn 1: provider rejects the image-carrying request. Turn 2 (after
+        // the strip): normal completion.
+        let (client, cfg) = make_config(vec![
+            MockResponse {
+                events: vec![],
+                model: String::new(),
+                stream_error: Some(LlmError::InvalidRequest(
+                    "model does not support image input".into(),
+                )),
+                stream_impl: None,
+            },
+            MockResponse::text("I cannot see images."),
+        ]);
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![image_user_message(), tool_result_with_image()],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        // Exactly one VisionDegraded event, before completion.
+        let degraded: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::VisionDegraded { .. }))
+            .collect();
+        assert_eq!(degraded.len(), 1, "expected exactly one VisionDegraded");
+        assert!(
+            matches!(
+                &degraded[0],
+                AgentEvent::VisionDegraded {
+                    stripped_blocks: 2,
+                    ..
+                }
+            ),
+            "both image blocks should be stripped"
+        );
+
+        // Run ended normally, not in error.
+        assert!(
+            events.iter().all(|e| !matches!(e, AgentEvent::Error(_))),
+            "degradation must not surface as a terminal Error"
+        );
+        assert!(
+            events.iter().any(|e| e
+                .as_final_answer()
+                .map(|(_, _, t)| t == "I cannot see images.")
+                .unwrap_or(false)),
+            "run should complete after degradation"
+        );
+
+        // Two provider calls: first with images, second without.
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        let captured = client.captured_requests.lock();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            image_block_count(&captured[0]),
+            2,
+            "first request must still carry both image blocks"
+        );
+        assert_eq!(
+            image_block_count(&captured[1]),
+            0,
+            "retried request must be image-free"
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_rejection_strips_tool_result_images() {
+        // Same flow, but the image lives in a ToolResult (the common case for
+        // screenshot tools) and the strip notice must be appended to history.
+        let (client, cfg) = make_config(vec![
+            MockResponse {
+                events: vec![],
+                model: String::new(),
+                stream_error: Some(LlmError::InvalidRequest("no vision".into())),
+                stream_impl: None,
+            },
+            MockResponse::text("done"),
+        ]);
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![tool_result_with_image()],
+        };
+        let _events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        let captured = client.captured_requests.lock();
+        assert_eq!(captured.len(), 2);
+        let second = captured[1].messages();
+        let tool_msgs: Vec<_> = second
+            .iter()
+            .filter_map(|m| match m {
+                llm_adapter::types::Message::Tool {
+                    invocation_id,
+                    content,
+                    ..
+                } => Some((invocation_id.as_str(), content)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_msgs.len(), 1);
+        assert_eq!(tool_msgs[0].0, "call_1");
+        assert!(
+            tool_msgs[0]
+                .1
+                .iter()
+                .all(|c| matches!(c, llm_adapter::types::RequestContent::Text(_))),
+            "tool result must be text-only after strip"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_vision_rejection_after_degrade_surfaces_error() {
+        // Provider keeps rejecting; the one-shot guard must not loop — the
+        // second failure surfaces as a terminal Error with no second
+        // VisionDegraded.
+        let (client, cfg) = make_config(vec![
+            MockResponse {
+                events: vec![],
+                model: String::new(),
+                stream_error: Some(LlmError::InvalidRequest("no vision".into())),
+                stream_impl: None,
+            },
+            MockResponse {
+                events: vec![],
+                model: String::new(),
+                stream_error: Some(LlmError::InvalidRequest(
+                    "still failing for another reason".into(),
+                )),
+                stream_impl: None,
+            },
+        ]);
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![image_user_message()],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        let degraded: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::VisionDegraded { .. }))
+            .collect();
+        assert_eq!(degraded.len(), 1, "one-shot: only one VisionDegraded");
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "second failure must surface as terminal Error"
+        );
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly one degradation retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_only_rejection_does_not_trigger_degradation() {
+        // An InvalidRequest with no visual blocks in history must surface
+        // directly — no strip, no VisionDegraded, no extra provider call.
+        let (client, cfg) = make_config(vec![MockResponse {
+            events: vec![],
+            model: String::new(),
+            stream_error: Some(LlmError::InvalidRequest("bad parameter".into())),
+            stream_impl: None,
+        }]);
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert!(
+            events
+                .iter()
+                .all(|e| !matches!(e, AgentEvent::VisionDegraded { .. })),
+            "no degradation without visual blocks"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "error must surface unchanged"
+        );
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }

@@ -108,6 +108,19 @@ pub enum AgentEvent {
         /// `Display` string of the triggering `LlmError`.
         error: String,
     },
+    /// Provider rejected the request because it cannot consume image/document
+    /// blocks; the loop stripped them from history and retried the turn
+    /// (one-shot vision degradation, issue #145 gap 2).
+    ///
+    /// Emitted before the retrying turn starts. Consumers should surface this
+    /// to users — visual content produced earlier in the run is no longer
+    /// visible to the model.
+    VisionDegraded {
+        /// `Display` string of the triggering provider error.
+        reason: String,
+        /// Number of image/document blocks removed from history.
+        stripped_blocks: usize,
+    },
 }
 
 impl AgentEvent {
