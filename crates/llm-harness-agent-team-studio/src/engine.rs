@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use llm_harness_agent_team::{AgentTeam, IndividualSpec, TeamConfig, TeamError};
+use llm_harness_agent_team::{AgentTeam, InboxJournal, IndividualSpec, TeamConfig, TeamError};
 use llm_harness_loop::LlmClient;
 use llm_harness_mcp::manager::McpManager;
 use llm_harness_types::ExecutionEnv;
@@ -51,6 +51,8 @@ pub enum AssembleError {
     NoProviders,
     #[error(transparent)]
     Team(#[from] TeamError),
+    #[error(transparent)]
+    InboxJournal(#[from] llm_harness_agent_team::InboxJournalError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -458,6 +460,7 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
         .collect();
 
     let project_dir = inputs.data_dir.clone();
+    let inbox_journal = InboxJournal::open(project_dir.join("inbox.sqlite3"))?;
     let config = TeamConfig {
         memory_root: project_dir.join("memory"),
         session_base_dir: project_dir.join("sessions"),
@@ -465,6 +468,7 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
         // routes. Full-mesh contact setup needs one slot for the operator
         // plus every other member; retain the core default for tiny teams.
         max_contacts_per_agent: inputs.spec.members.len().max(20),
+        inbox_journal: Some(Arc::new(inbox_journal)),
         ..TeamConfig::default()
     };
     std::fs::create_dir_all(project_dir.join("memory"))?;

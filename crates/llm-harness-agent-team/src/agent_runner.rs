@@ -554,6 +554,7 @@ impl AgentRunner {
                             ctx.return_messages(&agent_id, messages);
                         } else {
                             consecutive_failures = 0;
+                            ctx.ack_inbox_messages(&messages);
                         }
                     }
                     Ok(Err(e)) => {
@@ -632,6 +633,7 @@ impl AgentRunner {
                             // decay). Reflection is a system trigger, not a
                             // social interaction.
                             ctx.push_message(InboxMessage {
+                                journal_id: None,
                                 from: agent_id.clone(),
                                 to: agent_id.clone(),
                                 body: task_text,
@@ -664,6 +666,7 @@ mod tests {
     fn format_inbox_messages_includes_type_labels() {
         let msgs = vec![
             InboxMessage {
+                journal_id: None,
                 from: AgentId::new("alpha"),
                 to: AgentId::new("beta"),
                 body: "hello".into(),
@@ -673,6 +676,7 @@ mod tests {
                 broadcast_id: None,
             },
             InboxMessage {
+                journal_id: None,
                 from: AgentId::new(crate::timeout_manager::reserved::TIMER),
                 to: AgentId::new("beta"),
                 body: "timeout!".into(),
@@ -693,6 +697,7 @@ mod tests {
     fn format_inbox_aggregates_broadcast_replies() {
         let msgs = vec![
             InboxMessage {
+                journal_id: None,
                 from: AgentId::new(crate::timeout_manager::reserved::OPERATOR),
                 to: AgentId::new("alice"),
                 body: "do task X".into(),
@@ -702,6 +707,7 @@ mod tests {
                 broadcast_id: None,
             },
             InboxMessage {
+                journal_id: None,
                 from: AgentId::new("bob"),
                 to: AgentId::new("alice"),
                 body: "I can help with this".into(),
@@ -711,6 +717,7 @@ mod tests {
                 broadcast_id: Some("bid-123".into()),
             },
             InboxMessage {
+                journal_id: None,
                 from: AgentId::new("carol"),
                 to: AgentId::new("alice"),
                 body: "I have experience here".into(),
@@ -735,6 +742,7 @@ mod tests {
     fn broadcast_grouping_requires_direct_type() {
         let msgs = vec![
             InboxMessage {
+                journal_id: None,
                 from: AgentId::new("eve"),
                 to: AgentId::new("alice"),
                 body: "I can help".into(),
@@ -744,6 +752,7 @@ mod tests {
                 broadcast_id: Some("bid-x".into()),
             },
             InboxMessage {
+                journal_id: None,
                 from: AgentId::new("dave"),
                 to: AgentId::new("alice"),
                 body: "please take this task".into(),
@@ -771,6 +780,7 @@ mod tests {
         let mut msgs = Vec::new();
         for bid in ["bid-c", "bid-a", "bid-b"] {
             msgs.push(InboxMessage {
+                journal_id: None,
                 from: AgentId::new(bid),
                 to: AgentId::new("alice"),
                 body: format!("reply for {bid}"),
@@ -798,6 +808,7 @@ mod tests {
     fn multiline_body_keeps_indentation() {
         let msgs = vec![
             InboxMessage {
+                journal_id: None,
                 from: AgentId::new("x"),
                 to: AgentId::new("alice"),
                 body: "line1\nline2".into(),
@@ -807,6 +818,7 @@ mod tests {
                 broadcast_id: None,
             },
             InboxMessage {
+                journal_id: None,
                 from: AgentId::new("y"),
                 to: AgentId::new("alice"),
                 body: "r1\nr2".into(),
@@ -1041,6 +1053,7 @@ mod tests {
         // Deliver a message and start the monitor WITHOUT ever running the
         // harness — the monitor drains, fails to steer, and must roll back.
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new("bob"),
             to: alice.clone(),
             body: "hello alice".into(),
@@ -1086,6 +1099,7 @@ mod tests {
         ctx.register_agent(alice.clone(), "rust");
 
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new("bob"),
             to: alice.clone(),
             body: "hello alice".into(),
@@ -1122,6 +1136,7 @@ mod tests {
         ctx.register_agent(alice.clone(), "rust");
 
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new("bob"),
             to: alice.clone(),
             body: "hello alice".into(),
@@ -1172,6 +1187,7 @@ mod tests {
         ctx.register_agent(alice.clone(), "rust");
 
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: alice.clone(),
             to: alice.clone(),
             body: "reflect".into(),
@@ -1248,6 +1264,7 @@ mod tests {
         // pre-check that the hook fails a run is implicit: run #0 fails, so
         // the message rolls back; run #2 (hook ok) consumes it.
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new("bob"),
             to: alice.clone(),
             body: "work to do".into(),
@@ -1331,6 +1348,7 @@ mod tests {
         ctx.register_agent(alice.clone(), "rust");
 
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new("bob"),
             to: alice.clone(),
             body: "work to do".into(),
@@ -1438,6 +1456,7 @@ mod tests {
         ctx.register_agent(alice.clone(), "rust");
 
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new("bob"),
             to: alice.clone(),
             body: "work to do".into(),
@@ -1518,6 +1537,7 @@ mod tests {
         // 500ms budget.
         succeed.store(false, std::sync::atomic::Ordering::SeqCst);
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new("bob"),
             to: alice.clone(),
             body: "work again".into(),
@@ -1573,6 +1593,7 @@ mod tests {
 
         // Run 1: message delivered and consumed; reflection not yet fired.
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new("bob"),
             to: alice.clone(),
             body: "first job".into(),
@@ -1597,6 +1618,7 @@ mod tests {
         // empty AND the agent to settle Idle — the reflection run has then
         // fully completed.
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new("bob"),
             to: alice.clone(),
             body: "second job".into(),
@@ -1721,6 +1743,7 @@ mod tests {
         // may occur (an endless loop would keep the transcript growing and
         // the agent perpetually Busy).
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new("bob"),
             to: alice.clone(),
             body: "real job".into(),
@@ -1812,6 +1835,7 @@ mod tests {
         ctx.register_agent(alice.clone(), "rust");
 
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new("bob"),
             to: alice.clone(),
             body: "work to do".into(),

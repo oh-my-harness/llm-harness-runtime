@@ -121,6 +121,7 @@ impl DelegateTaskTool {
         );
 
         let message = InboxMessage {
+            journal_id: None,
             from: self.agent_id.clone(),
             to: target_id.clone(),
             body: task.to_string(),

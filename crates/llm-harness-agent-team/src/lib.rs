@@ -12,6 +12,7 @@ mod contact;
 mod error;
 mod hooks;
 mod inbox;
+mod inbox_journal;
 mod individual_spec;
 mod memory_store;
 mod relation;
@@ -26,6 +27,7 @@ pub use contact::{ContactIndex, ContactRecord, ContactStore};
 pub use error::{Result, TeamError};
 pub use hooks::TeamBeforeRunHook;
 pub use inbox::{InboxMessage, InboxQueue, InboxStore, MessageType};
+pub use inbox_journal::{InboxJournal, InboxJournalError};
 pub use individual_spec::IndividualSpec;
 pub use memory_store::{
     TEAM_MEMORY_SOURCE_ID, TeamSqliteMemorySource, TeamSqliteMemoryStore,

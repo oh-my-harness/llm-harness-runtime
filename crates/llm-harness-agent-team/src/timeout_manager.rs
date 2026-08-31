@@ -62,6 +62,7 @@ impl TimeoutManager {
         let handle = tokio::spawn(async move {
             tokio::time::sleep(after).await;
             ctx.push_message(InboxMessage {
+                journal_id: None,
                 from: AgentId::new(reserved::TIMER),
                 to: agent_id.clone(),
                 body,
@@ -136,6 +137,7 @@ impl TimeoutManager {
         let handle = tokio::spawn(async move {
             tokio::time::sleep(after).await;
             ctx.push_message(InboxMessage {
+                journal_id: None,
                 from: AgentId::new(reserved::SELF),
                 to: agent_id.clone(),
                 body,

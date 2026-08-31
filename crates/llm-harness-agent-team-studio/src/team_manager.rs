@@ -7,8 +7,6 @@
 //! dir is the repo when configured, else the team data dir.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -41,8 +39,6 @@ pub enum TeamManagerError {
     },
     #[error(transparent)]
     Assemble(#[from] engine::AssembleError),
-    #[error("inbox snapshot: {0}")]
-    InboxSnapshot(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -105,9 +101,7 @@ pub struct TeamManager {
 impl Drop for TeamManager {
     fn drop(&mut self) {
         for (_, entry) in self.teams.drain() {
-            if let Err(e) = shutdown_entry(entry) {
-                tracing::error!("team shutdown persistence failed: {e}");
-            }
+            shutdown_entry(entry);
         }
     }
 }
@@ -159,9 +153,6 @@ impl TeamManager {
 
         std::fs::create_dir_all(team_dir.join("issues"))?;
         let issues = IssueStore::new(team_dir.join("issues"));
-        let pending_messages = load_inbox(&team_dir)?;
-        assembled.team.restore_pending_messages(pending_messages)?;
-        remove_inbox_snapshot(&team_dir)?;
 
         persist_spec(&self.data_root, &spec);
         self.teams.insert(
@@ -200,15 +191,13 @@ impl TeamManager {
             .teams
             .remove(id)
             .ok_or_else(|| TeamManagerError::UnknownTeam(id.to_string()))?;
-        shutdown_entry(entry)?;
+        shutdown_entry(entry);
         Ok(())
     }
 
     pub async fn shutdown_all(&mut self) {
         for (_, entry) in self.teams.drain() {
-            if let Err(e) = shutdown_entry(entry) {
-                tracing::error!("team shutdown persistence failed: {e}");
-            }
+            shutdown_entry(entry);
         }
     }
 
@@ -528,48 +517,9 @@ pub fn unpersist_spec(data_root: &Path, id: &str) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Stop runners and persist any messages that were still queued. Called on
-/// explicit shutdown and from `TeamManager::drop`, so both UI shutdown and
-/// process teardown use the same recovery snapshot.
-fn shutdown_entry(mut entry: TeamEntry) -> Result<(), TeamManagerError> {
-    let messages = entry.team.drain_pending_messages()?;
-    write_inbox_snapshot(entry.data_dir(), &messages)?;
-    Ok(())
-}
-
-fn write_inbox_snapshot(
-    team_dir: &Path,
-    messages: &[llm_harness_agent_team::InboxMessage],
-) -> Result<(), TeamManagerError> {
-    let inbox_path = team_dir.join("inbox.json");
-    let temp_path = team_dir.join(".inbox.json.tmp");
-    let payload =
-        serde_json::to_vec(messages).map_err(|e| TeamManagerError::InboxSnapshot(e.to_string()))?;
-    let mut file = File::create(&temp_path)?;
-    file.write_all(&payload)?;
-    file.sync_all()?;
-    std::fs::rename(&temp_path, &inbox_path)?;
-    File::open(team_dir)?.sync_all()?;
-    Ok(())
-}
-
-fn load_inbox(
-    team_dir: &Path,
-) -> Result<Vec<llm_harness_agent_team::InboxMessage>, TeamManagerError> {
-    let path = team_dir.join("inbox.json");
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    serde_json::from_reader(std::fs::File::open(path)?)
-        .map_err(|e| TeamManagerError::InboxSnapshot(e.to_string()))
-}
-
-fn remove_inbox_snapshot(team_dir: &Path) -> Result<(), TeamManagerError> {
-    let path = team_dir.join("inbox.json");
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-    }
-    Ok(())
+/// Stop runners; durable pending rows stay in the SQLite inbox journal.
+fn shutdown_entry(mut entry: TeamEntry) {
+    entry.team.shutdown();
 }
 
 #[cfg(test)]
@@ -984,9 +934,7 @@ mod tests {
             .unwrap();
 
         tm.shutdown_all().await;
-        let persisted = std::fs::read_to_string(root.join("teams/t/inbox.json")).unwrap();
-        assert!(persisted.contains("recover this task"));
-        assert!(!root.join("teams/t/.inbox.json.tmp").exists());
+        assert!(root.join("teams/t/inbox.sqlite3").exists());
 
         let specs = list_persisted(&root);
         let mut restored = TeamManager::new(&root);
@@ -995,7 +943,6 @@ mod tests {
             .create(spec.clone(), spec.repo_hint(), &settings(), "")
             .await
             .unwrap();
-        assert!(!root.join("teams/t/inbox.json").exists());
         let ctx = restored
             .get("t")
             .unwrap()
