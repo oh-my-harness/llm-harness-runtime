@@ -7,6 +7,8 @@
 //! dir is the repo when configured, else the team data dir.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -157,9 +159,9 @@ impl TeamManager {
 
         std::fs::create_dir_all(team_dir.join("issues"))?;
         let issues = IssueStore::new(team_dir.join("issues"));
-        assembled
-            .team
-            .restore_pending_messages(load_inbox(&team_dir)?)?;
+        let pending_messages = load_inbox(&team_dir)?;
+        assembled.team.restore_pending_messages(pending_messages)?;
+        remove_inbox_snapshot(&team_dir)?;
 
         persist_spec(&self.data_root, &spec);
         self.teams.insert(
@@ -531,12 +533,23 @@ pub fn unpersist_spec(data_root: &Path, id: &str) {
 /// process teardown use the same recovery snapshot.
 fn shutdown_entry(mut entry: TeamEntry) -> Result<(), TeamManagerError> {
     let messages = entry.team.drain_pending_messages()?;
-    let inbox_path = entry.data_dir().join("inbox.json");
-    let temp_path = entry.data_dir().join(".inbox.json.tmp");
-    let payload = serde_json::to_vec(&messages)
-        .map_err(|e| TeamManagerError::InboxSnapshot(e.to_string()))?;
-    std::fs::write(&temp_path, payload)?;
+    write_inbox_snapshot(entry.data_dir(), &messages)?;
+    Ok(())
+}
+
+fn write_inbox_snapshot(
+    team_dir: &Path,
+    messages: &[llm_harness_agent_team::InboxMessage],
+) -> Result<(), TeamManagerError> {
+    let inbox_path = team_dir.join("inbox.json");
+    let temp_path = team_dir.join(".inbox.json.tmp");
+    let payload =
+        serde_json::to_vec(messages).map_err(|e| TeamManagerError::InboxSnapshot(e.to_string()))?;
+    let mut file = File::create(&temp_path)?;
+    file.write_all(&payload)?;
+    file.sync_all()?;
     std::fs::rename(&temp_path, &inbox_path)?;
+    File::open(team_dir)?.sync_all()?;
     Ok(())
 }
 
@@ -549,6 +562,14 @@ fn load_inbox(
     }
     serde_json::from_reader(std::fs::File::open(path)?)
         .map_err(|e| TeamManagerError::InboxSnapshot(e.to_string()))
+}
+
+fn remove_inbox_snapshot(team_dir: &Path) -> Result<(), TeamManagerError> {
+    let path = team_dir.join("inbox.json");
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -605,19 +626,20 @@ mod tests {
         }
     }
 
-    fn install_mock_factory() {
-        env_cfg::install_provider_factory(std::sync::Arc::new(|| {
+    #[must_use]
+    fn install_mock_factory() -> env_cfg::TestProviderFactoryGuard {
+        env_cfg::install_test_provider_factory(std::sync::Arc::new(|| {
             vec![(
                 "m".into(),
                 std::sync::Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]))
                     as std::sync::Arc<dyn llm_harness_loop::LlmClient>,
             )]
-        }));
+        }))
     }
 
     #[tokio::test]
     async fn create_builds_team_and_persists_spec() {
-        install_mock_factory();
+        let _factory = install_mock_factory();
         let root = unique_dir("ct-tm");
         let mut tm = TeamManager::new(&root);
         tm.create(blank_spec(), Some(make_repo()), &settings(), "")
@@ -631,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_without_repo_works() {
-        install_mock_factory();
+        let _factory = install_mock_factory();
         let root = unique_dir("ct-tm-norepo");
         let mut tm = TeamManager::new(&root);
         tm.create(blank_spec(), None, &settings(), "")
@@ -643,7 +665,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_missing_repo() {
-        install_mock_factory();
+        let _factory = install_mock_factory();
         let root = unique_dir("ct-tm-badrepo");
         let mut tm = TeamManager::new(&root);
         let err = tm
@@ -660,7 +682,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_duplicate_id() {
-        install_mock_factory();
+        let _factory = install_mock_factory();
         let root = unique_dir("ct-tm-dup");
         let mut tm = TeamManager::new(&root);
         tm.create(blank_spec(), None, &settings(), "")
@@ -675,7 +697,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_spec_does_not_create_team_directory() {
-        install_mock_factory();
+        let _factory = install_mock_factory();
         let root = unique_dir("ct-tm-invalid-id");
         let mut tm = TeamManager::new(&root);
         let mut spec = blank_spec();
@@ -690,7 +712,7 @@ mod tests {
 
     #[tokio::test]
     async fn template_upgrade_updates_unmodified_members_only() {
-        install_mock_factory();
+        let _factory = install_mock_factory();
         let root = unique_dir("ct-tm-upgrade");
         let mut tm = TeamManager::new(&root);
         let old_member = member("a");
@@ -767,7 +789,7 @@ mod tests {
 
     #[tokio::test]
     async fn template_upgrade_rejects_membership_changes() {
-        install_mock_factory();
+        let _factory = install_mock_factory();
         let root = unique_dir("ct-tm-upgrade-members");
         let mut tm = TeamManager::new(&root);
         let old_member = member("a");
@@ -807,7 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_route_drives_issue_confirmation() {
-        install_mock_factory();
+        let _factory = install_mock_factory();
         let root = unique_dir("ct-tm-handoff");
         let mut spec = blank_spec();
         spec.members[0].behaviors = vec![Behavior::Handoff {
@@ -834,7 +856,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_handoff_route_means_no_submission() {
-        install_mock_factory();
+        let _factory = install_mock_factory();
         let root = unique_dir("ct-tm-nohandoff");
         let mut tm = TeamManager::new(&root);
         tm.create(blank_spec(), None, &settings(), "")
@@ -850,7 +872,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_removes_but_persists_data() {
-        install_mock_factory();
+        let _factory = install_mock_factory();
         let root = unique_dir("ct-tm-shutdown");
         let mut tm = TeamManager::new(&root);
         tm.create(blank_spec(), None, &settings(), "")
@@ -864,7 +886,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_team_restarts_with_issues_contacts_and_runner() {
-        env_cfg::install_provider_factory(std::sync::Arc::new(|| {
+        let _factory = env_cfg::install_test_provider_factory(std::sync::Arc::new(|| {
             vec![(
                 "m".into(),
                 std::sync::Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![
@@ -947,7 +969,7 @@ mod tests {
 
     #[tokio::test]
     async fn clean_shutdown_persists_and_restores_pending_inbox() {
-        install_mock_factory();
+        let _factory = install_mock_factory();
         let root = unique_dir("ct-tm-inbox-recovery");
         let mut tm = TeamManager::new(&root);
         tm.create(blank_spec(), Some(make_repo()), &settings(), "")
@@ -964,6 +986,7 @@ mod tests {
         tm.shutdown_all().await;
         let persisted = std::fs::read_to_string(root.join("teams/t/inbox.json")).unwrap();
         assert!(persisted.contains("recover this task"));
+        assert!(!root.join("teams/t/.inbox.json.tmp").exists());
 
         let specs = list_persisted(&root);
         let mut restored = TeamManager::new(&root);
@@ -972,6 +995,7 @@ mod tests {
             .create(spec.clone(), spec.repo_hint(), &settings(), "")
             .await
             .unwrap();
+        assert!(!root.join("teams/t/inbox.json").exists());
         let ctx = restored
             .get("t")
             .unwrap()

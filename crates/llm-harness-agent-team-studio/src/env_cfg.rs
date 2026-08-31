@@ -23,6 +23,29 @@ pub fn install_provider_factory(f: ProviderFactory) {
     *PROVIDER_FACTORY.write() = Some(f);
 }
 
+#[cfg(test)]
+pub struct TestProviderFactoryGuard {
+    _lock: parking_lot::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for TestProviderFactoryGuard {
+    fn drop(&mut self) {
+        *PROVIDER_FACTORY.write() = None;
+    }
+}
+
+/// Serialize tests that install the process-wide factory while retaining the
+/// factory for the lifetime of the returned guard.
+#[cfg(test)]
+#[must_use]
+pub fn install_test_provider_factory(f: ProviderFactory) -> TestProviderFactoryGuard {
+    static TEST_FACTORY_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let lock = TEST_FACTORY_LOCK.lock();
+    *PROVIDER_FACTORY.write() = Some(f);
+    TestProviderFactoryGuard { _lock: lock }
+}
+
 /// Invoke the installed factory; empty vec when none installed (routes
 /// reject the registration with a clear error in that case).
 pub fn providers_from_factory() -> Vec<(String, Arc<dyn llm_harness_loop::LlmClient>)> {

@@ -1281,17 +1281,23 @@ mod tests {
 
     /// Tests install a mock factory returning one "m" client and build the
     /// state directly (no env vars — the AppState carries tier/interval).
-    fn install_mock_factory() {
-        crate::env_cfg::install_provider_factory(Arc::new(|| {
+    #[must_use]
+    fn install_mock_factory() -> crate::env_cfg::TestProviderFactoryGuard {
+        crate::env_cfg::install_test_provider_factory(Arc::new(|| {
             vec![(
                 "m".into(),
                 Arc::new(MockLlmClient::new(vec![])) as Arc<dyn llm_harness_loop::LlmClient>,
             )]
-        }));
+        }))
     }
 
-    async fn setup() -> (Router, SharedPm, std::path::PathBuf) {
-        install_mock_factory();
+    async fn setup() -> (
+        Router,
+        SharedPm,
+        std::path::PathBuf,
+        crate::env_cfg::TestProviderFactoryGuard,
+    ) {
+        let _factory = install_mock_factory();
         let data_root = unique_dir("ct-routes");
         let pm = Arc::new(RwLock::new(TeamManager::new(&data_root)));
         let state = AppState {
@@ -1303,7 +1309,7 @@ mod tests {
             registry: llm_harness_inspector::state::HarnessRegistry::new("default"),
         };
         let router = team_router(state);
-        (router, pm, make_repo())
+        (router, pm, make_repo(), _factory)
     }
 
     async fn json_put(
@@ -1370,7 +1376,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_via_http_validates_repo() {
-        let (router, _pm, _repo) = setup().await;
+        let (router, _pm, _repo, _factory) = setup().await;
         let (status, json) = json_post(
             &router,
             "/api/team/projects",
@@ -1383,7 +1389,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_and_list_projects() {
-        let (router, _pm, repo) = setup().await;
+        let (router, _pm, repo, _factory) = setup().await;
         let (status, json) = json_post(
             &router,
             "/api/team/projects",
@@ -1398,7 +1404,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_routes_by_explicit_target() {
-        let (router, pm, repo) = setup().await;
+        let (router, pm, repo, _factory) = setup().await;
         // Register from the built-in template: members include planner and
         // brainstormer (dynamic target whitelist is exercised against them).
         let (status, json) = json_post(
@@ -1472,7 +1478,7 @@ mod tests {
 
     #[tokio::test]
     async fn confirm_issue_submits_to_planner() {
-        let (router, pm, repo) = setup().await;
+        let (router, pm, repo, _factory) = setup().await;
         json_post(
             &router,
             "/api/team/projects",
@@ -1526,7 +1532,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_issue_flips_status_without_planner_handoff() {
-        let (router, pm, repo) = setup().await;
+        let (router, pm, repo, _factory) = setup().await;
         json_post(
             &router,
             "/api/team/projects",
@@ -1561,7 +1567,7 @@ mod tests {
 
     #[tokio::test]
     async fn double_confirm_conflicts() {
-        let (router, pm, repo) = setup().await;
+        let (router, pm, repo, _factory) = setup().await;
         json_post(
             &router,
             "/api/team/projects",
@@ -1590,7 +1596,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_issue_404s() {
-        let (router, _pm, _repo) = setup().await;
+        let (router, _pm, _repo, _factory) = setup().await;
         let (status, _) = json_post(
             &router,
             "/api/team/issue/I-999/confirm",
@@ -1617,7 +1623,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_transition_publishes_event() {
-        let (_router, pm, repo) = setup().await;
+        let (_router, pm, repo, _factory) = setup().await;
         // Rebuild the router with a bus we can inspect directly.
         let bus = Arc::new(crate::events::EventBus::new());
         let mut rx = bus.subscribe();
@@ -1654,7 +1660,7 @@ mod tests {
 
     #[tokio::test]
     async fn settings_roundtrip_via_api() {
-        let (router, _pm, _repo) = setup().await;
+        let (router, _pm, _repo, _factory) = setup().await;
         // Initial state: nothing configured.
         let (status, json) = get_json(&router, "/api/team/settings").await;
         assert_eq!(status, 200);
@@ -1708,7 +1714,7 @@ mod tests {
 
     #[tokio::test]
     async fn settings_validation_rejects_empty_models() {
-        let (router, _pm, _repo) = setup().await;
+        let (router, _pm, _repo, _factory) = setup().await;
         let (status, json) = json_post(
             &router,
             "/api/team/settings",
@@ -1738,7 +1744,7 @@ mod tests {
 
     #[tokio::test]
     async fn fs_listing_marks_repos_and_skips_hidden() {
-        let (router, _pm, repo) = setup().await;
+        let (router, _pm, repo, _factory) = setup().await;
         // The repo dir contains a .git (hidden) — listing must not show it.
         let (status, json) = get_json(&router, &format!("/api/team/fs?path={}", enc(&repo))).await;
         assert_eq!(status, 200, "{json}");
@@ -1752,14 +1758,14 @@ mod tests {
 
     #[tokio::test]
     async fn fs_listing_rejects_missing_path() {
-        let (router, _pm, _repo) = setup().await;
+        let (router, _pm, _repo, _factory) = setup().await;
         let (status, _) = get_json(&router, "/api/team/fs?path=/no/such/dir").await;
         assert_eq!(status, 404);
     }
 
     #[tokio::test]
     async fn delete_project_removes_and_persists() {
-        let (router, pm, repo) = setup().await;
+        let (router, pm, repo, _factory) = setup().await;
         json_post(
             &router,
             "/api/team/projects",
@@ -1815,7 +1821,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_config_put_hot_applies_persona() {
-        let (router, pm, repo) = setup().await;
+        let (router, pm, repo, _factory) = setup().await;
         register_template_team(&router, &repo).await;
 
         let (status, json) = json_put(
@@ -1848,7 +1854,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_config_model_change_rebuilds_member() {
-        let (router, _pm, repo) = setup().await;
+        let (router, _pm, repo, _factory) = setup().await;
         register_template_team(&router, &repo).await;
 
         let (status, json) = json_put(
@@ -1870,7 +1876,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_config_tier_change_resolves_via_settings() {
-        let (router, _pm, repo) = setup().await;
+        let (router, _pm, repo, _factory) = setup().await;
         register_template_team(&router, &repo).await;
 
         // tier "cheap" resolves to the mock model "m" from settings.
@@ -1890,7 +1896,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_config_override_key_isolated() {
-        let (router, pm, repo) = setup().await;
+        let (router, pm, repo, _factory) = setup().await;
         register_template_team(&router, &repo).await;
 
         let (status, json) = json_put(
@@ -1934,7 +1940,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_config_key_change_rebuilds_member() {
-        let (router, _pm, repo) = setup().await;
+        let (router, _pm, repo, _factory) = setup().await;
         register_template_team(&router, &repo).await;
 
         for key in ["sk-first", "sk-second"] {
@@ -1953,7 +1959,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_config_unknown_member_404() {
-        let (router, _pm, repo) = setup().await;
+        let (router, _pm, repo, _factory) = setup().await;
         register_template_team(&router, &repo).await;
         let (status, _) = json_put(
             &router,
@@ -1966,7 +1972,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_config_does_not_write_secrets_for_unknown_ids() {
-        let (router, pm, repo) = setup().await;
+        let (router, pm, repo, _factory) = setup().await;
         register_template_team(&router, &repo).await;
         let (status, _) = json_put(
             &router,
@@ -1988,7 +1994,7 @@ mod tests {
 
     #[tokio::test]
     async fn templates_endpoint_lists_builtin() {
-        let (router, _pm, _repo) = setup().await;
+        let (router, _pm, _repo, _factory) = setup().await;
         let (status, json) = get_json(&router, "/api/team/templates").await;
         assert_eq!(status, 200);
         let templates = json["templates"].as_array().unwrap();
@@ -2002,7 +2008,7 @@ mod tests {
 
     #[tokio::test]
     async fn upgrade_check_classifies_overridden_members() {
-        let (router, _pm, repo) = setup().await;
+        let (router, _pm, repo, _factory) = setup().await;
         register_template_team(&router, &repo).await;
 
         // 初始：全部成员 = 模板原版（同版本）→ 无 overridden
@@ -2039,7 +2045,7 @@ mod tests {
 
     #[tokio::test]
     async fn upgrade_check_no_template_is_error() {
-        let (router, _pm, repo) = setup().await;
+        let (router, _pm, repo, _factory) = setup().await;
         let (status, _) = json_post(
             &router,
             "/api/team/projects",
@@ -2058,7 +2064,7 @@ mod tests {
 
     #[tokio::test]
     async fn upgrade_apply_updates_baseline_members_and_persists_version() {
-        let (router, pm, repo) = setup().await;
+        let (router, pm, repo, _factory) = setup().await;
         json_post(
             &router,
             "/api/team/projects",
@@ -2128,8 +2134,7 @@ mod tests {
     async fn global_base_url_survives_registration() {
         // I1 regression: base_url saved in settings.json must reach the
         // team assembly path (previously hardcoded to empty).
-        let (router, _pm, repo) = setup().await;
-        install_mock_factory();
+        let (router, _pm, repo, _factory) = setup().await;
 
         // Save settings WITH base_url + key.
         let (status, json) = json_post(
