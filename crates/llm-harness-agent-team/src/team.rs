@@ -80,6 +80,8 @@ pub struct TeamConfig {
     /// Optional durable inbox journal. Studio supplies one per team; core
     /// teams remain in-memory by default.
     pub inbox_journal: Option<Arc<crate::inbox_journal::InboxJournal>>,
+    /// Optional durable pending-timer journal. Studio supplies one per team.
+    pub timer_journal: Option<Arc<crate::timer_journal::TimeoutJournal>>,
 }
 
 impl TeamConfig {
@@ -98,6 +100,7 @@ impl Default for TeamConfig {
             session_base_dir: std::env::temp_dir().join("agent-team-sessions"),
             memory_root: std::env::temp_dir().join("agent-team-memory"),
             inbox_journal: None,
+            timer_journal: None,
         }
     }
 }
@@ -272,6 +275,7 @@ impl AgentTeam {
         let ctx = SocialContext::with_journal(
             self.config.max_contacts_per_agent,
             self.config.inbox_journal.clone(),
+            self.config.timer_journal.clone(),
         )?;
 
         // Register the operator as a peer (no runner — its inbox is drained

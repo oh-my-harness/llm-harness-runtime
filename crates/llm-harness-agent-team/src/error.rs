@@ -42,6 +42,9 @@ pub enum TeamError {
     /// The durable inbox journal could not be opened or recovered.
     #[error(transparent)]
     InboxJournal(#[from] crate::inbox_journal::InboxJournalError),
+    /// A durable timer journal could not be opened.
+    #[error(transparent)]
+    TimerJournal(#[from] crate::timer_journal::TimerJournalError),
 }
 
 /// Crate-wide result alias with [`TeamError`] as the default error type.

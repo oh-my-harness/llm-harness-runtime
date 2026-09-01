@@ -405,6 +405,7 @@ pub struct SocialContext {
     relations: Arc<RelationEngine>,
     /// Timeout bookkeeping shared with [`crate::timeout_manager::TimeoutManager`].
     timeouts: Arc<TimeoutRegistry>,
+    timer_journal: Option<Arc<crate::timer_journal::TimeoutJournal>>,
     /// Live per-agent monitor tasks, keyed by agent id. Registered by
     /// [`crate::agent_runner::spawn_monitor_task`] so shutdown can abort
     /// monitors whose runner died without running its own cleanup.
@@ -421,6 +422,7 @@ impl SocialContext {
             contacts: Arc::new(ContactStore::new()),
             relations: Arc::new(RelationEngine::default()),
             timeouts: Arc::new(TimeoutRegistry::default()),
+            timer_journal: None,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
             max_contacts,
         }
@@ -432,20 +434,53 @@ impl SocialContext {
     pub fn with_journal(
         max_contacts: usize,
         journal: Option<Arc<crate::inbox_journal::InboxJournal>>,
+        timer_journal: Option<Arc<crate::timer_journal::TimeoutJournal>>,
     ) -> crate::Result<Self> {
+        let mut inbox_journal = None;
         let inboxes = match journal {
-            Some(journal) => Arc::new(InboxStore::with_journal(journal)?),
+            Some(journal) => {
+                inbox_journal = Some(Arc::clone(&journal));
+                Arc::new(InboxStore::with_journal(journal)?)
+            }
             None => Arc::new(InboxStore::new()),
         };
-        Ok(Self {
+        let context = Self {
             registry: Arc::new(AgentRegistry::new()),
             inboxes,
             contacts: Arc::new(ContactStore::new()),
             relations: Arc::new(RelationEngine::default()),
             timeouts: Arc::new(TimeoutRegistry::default()),
+            timer_journal,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
             max_contacts,
-        })
+        };
+        if let Some(journal) = &context.timer_journal {
+            let manager = crate::timeout_manager::TimeoutManager::new(context.clone());
+            for timer in journal.restore()? {
+                let request = &timer.request;
+                let message_type = match request.kind {
+                    crate::timer_journal::TimeoutKind::Timeout => {
+                        crate::inbox::MessageType::Timeout
+                    }
+                    crate::timer_journal::TimeoutKind::SelfReminder => {
+                        crate::inbox::MessageType::SelfReminder
+                    }
+                };
+                if let Some(inbox_journal) = &inbox_journal
+                    && inbox_journal.has_timer_notification(
+                        &request.agent_id,
+                        request.task_id.as_deref(),
+                        &request.body,
+                        message_type,
+                    )?
+                {
+                    journal.ack(timer.id)?;
+                    continue;
+                }
+                manager.restore_timer(timer);
+            }
+        }
+        Ok(context)
     }
     /// Register an agent in the registry.
     pub fn register_agent(&self, id: AgentId, expertise: impl Into<String>) {
@@ -813,6 +848,32 @@ impl SocialContext {
         self.timeouts.cancel_all();
     }
 
+    pub(crate) fn schedule_timer(
+        &self,
+        request: &crate::timer_journal::TimeoutRequest,
+    ) -> Result<Option<i64>, crate::timer_journal::TimerJournalError> {
+        match &self.timer_journal {
+            Some(journal) => Ok(Some(journal.schedule(request)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn ack_timer(&self, timer_id: i64) {
+        if let Some(journal) = &self.timer_journal
+            && let Err(error) = journal.ack(timer_id)
+        {
+            tracing::error!(timer_id, error = %error, "failed to ack timer journal row");
+        }
+    }
+
+    pub(crate) fn cancel_timer(&self, agent: &AgentId, key: &str) {
+        if let Some(journal) = &self.timer_journal
+            && let Err(error) = journal.cancel(agent, key)
+        {
+            tracing::error!(agent = %agent, key, error = %error, "failed to cancel timer journal row");
+        }
+    }
+
     /// The initial relationship strength for a brand-new contact.
     pub fn initial_strength(&self) -> f64 {
         self.relations.initial_strength()
@@ -872,7 +933,11 @@ impl SocialContext {
     /// that peer. `Cancelled { peer: None }` covers peer-less timeouts
     /// (broadcast, self-reminder); `NotFound` means nothing was pending.
     pub fn cancel_timeout(&self, agent: &AgentId, key: &str) -> TimeoutCancel {
-        self.timeouts.cancel(agent, key)
+        let outcome = self.timeouts.cancel(agent, key);
+        if matches!(outcome, TimeoutCancel::Cancelled { .. }) {
+            self.cancel_timer(agent, key);
+        }
+        outcome
     }
 
     /// Cancel all pending timeouts for `agent` whose key matches the
@@ -936,6 +1001,7 @@ impl SocialContext {
                 if owned
                     && let TimeoutCancel::Cancelled { peer } = self.timeouts.cancel(agent, task_id)
                 {
+                    self.cancel_timer(agent, task_id);
                     if let Some(peer) = &peer {
                         self.apply_relation_event(
                             agent,
@@ -952,6 +1018,7 @@ impl SocialContext {
             if let Some(broadcast_id) = &msg.broadcast_id
                 && let TimeoutCancel::Cancelled { peer } = self.timeouts.cancel(agent, broadcast_id)
             {
+                self.cancel_timer(agent, broadcast_id);
                 cancelled.push(CancelledTimeout {
                     key: broadcast_id.clone(),
                     peer,
@@ -999,6 +1066,7 @@ mod tests {
                 ..Default::default()
             })),
             timeouts: Arc::new(TimeoutRegistry::default()),
+            timer_journal: None,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
             max_contacts: 10,
         };
