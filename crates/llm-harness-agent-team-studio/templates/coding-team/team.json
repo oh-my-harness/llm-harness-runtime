@@ -1,0 +1,134 @@
+{
+  "id": "coding-team",
+  "name": "Coding Team",
+  "version": "2",
+  "members": [
+    {
+      "id": "brainstormer",
+      "role_label": "需求澄清与方案设计：与人对话把想法变成可执行的 spec",
+      "model": "strong",
+      "toolkits": [
+        "fs"
+      ],
+      "persona_file": "prompts/brainstormer.md",
+      "behaviors": []
+    },
+    {
+      "id": "planner",
+      "role_label": "任务分解与派发：把 spec/需求拆成自包含的 TDD 任务",
+      "model": "strong",
+      "toolkits": [
+        "fs"
+      ],
+      "persona_file": "prompts/planner.md",
+      "behaviors": [
+        {
+          "type": "handoff",
+          "on": {
+            "kind": "resource_confirmed",
+            "resource": "issues"
+          },
+          "to": "planner",
+          "message_template": "以下 issue 已由操作员确认，按其内容拆解任务：\n\nid: {id}\ntitle: {title}\n\n{body}"
+        }
+      ]
+    },
+    {
+      "id": "coder",
+      "role_label": "按任务步骤执行 TDD 编码与验证",
+      "model": "main",
+      "toolkits": [
+        "fs"
+      ],
+      "persona_file": "prompts/coder.md",
+      "behaviors": []
+    },
+    {
+      "id": "reviewer-performance",
+      "role_label": "性能审查：性能维度 finding",
+      "model": "cheap",
+      "toolkits": [
+        "fs"
+      ],
+      "persona_file": "prompts/reviewer-performance.md",
+      "behaviors": []
+    },
+    {
+      "id": "reviewer-robustness",
+      "role_label": "健壮性审查：错误处理/边界/并发维度 finding",
+      "model": "cheap",
+      "toolkits": [
+        "fs"
+      ],
+      "persona_file": "prompts/reviewer-robustness.md",
+      "behaviors": []
+    },
+    {
+      "id": "reviewer-standards",
+      "role_label": "工程规范审查：可读性/命名/风格维度 finding",
+      "model": "cheap",
+      "toolkits": [
+        "fs"
+      ],
+      "persona_file": "prompts/reviewer-standards.md",
+      "behaviors": []
+    },
+    {
+      "id": "reviewer-magical-prompt",
+      "role_label": "契约与信任链审查：接口契约/信任边界维度 finding",
+      "model": "cheap",
+      "toolkits": [
+        "fs"
+      ],
+      "persona_file": "prompts/reviewer-magical-prompt.md",
+      "behaviors": []
+    },
+    {
+      "id": "reviewer-spec-compliance",
+      "role_label": "需求符合度审查：实现与 spec 偏离维度 finding",
+      "model": "cheap",
+      "toolkits": [
+        "fs"
+      ],
+      "persona_file": "prompts/reviewer-spec-compliance.md",
+      "behaviors": []
+    },
+    {
+      "id": "judge",
+      "role_label": "审查裁决：对抗验证 findings 并给出最终结论",
+      "model": "strong",
+      "toolkits": [
+        "fs"
+      ],
+      "persona_file": "prompts/judge.md",
+      "behaviors": []
+    },
+    {
+      "id": "debugger",
+      "role_label": "故障定位：测试失败/运行异常的根因分析",
+      "model": "main",
+      "toolkits": [
+        "fs"
+      ],
+      "persona_file": "prompts/debugger.md",
+      "behaviors": []
+    },
+    {
+      "id": "scout",
+      "role_label": "定时巡检仓库：跑测试、扫 TODO、检查可疑改动，产出候选 issue",
+      "model": "cheap",
+      "toolkits": [
+        "fs"
+      ],
+      "persona_file": "prompts/scout.md",
+      "behaviors": [
+        {
+          "type": "patrol",
+          "interval_secs": 3600,
+          "task": "",
+          "issues_dir": null
+        }
+      ]
+    }
+  ]
+}

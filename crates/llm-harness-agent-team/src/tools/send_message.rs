@@ -71,7 +71,13 @@ impl SendMessageTool {
         }
 
         self.ctx
-            .send_direct_with_task(&self.agent_id, &target_id, body, 0, task_id, broadcast_id);
+            .send_direct_with_task(&self.agent_id, &target_id, body, 0, task_id, broadcast_id)
+            .map_err(|error| {
+                ToolFailure::new(
+                    "inbox_journal_persistence_failed",
+                    format!("failed to persist message: {error}"),
+                )
+            })?;
         Ok(format!("Message sent to {to_str}."))
     }
 }

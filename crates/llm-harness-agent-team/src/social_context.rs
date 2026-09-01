@@ -425,6 +425,28 @@ impl SocialContext {
             max_contacts,
         }
     }
+
+    /// Create a social context whose new inbox messages are persisted before
+    /// delivery. Existing journal rows are restored immediately, before
+    /// recipient agents are registered.
+    pub fn with_journal(
+        max_contacts: usize,
+        journal: Option<Arc<crate::inbox_journal::InboxJournal>>,
+    ) -> crate::Result<Self> {
+        let inboxes = match journal {
+            Some(journal) => Arc::new(InboxStore::with_journal(journal)?),
+            None => Arc::new(InboxStore::new()),
+        };
+        Ok(Self {
+            registry: Arc::new(AgentRegistry::new()),
+            inboxes,
+            contacts: Arc::new(ContactStore::new()),
+            relations: Arc::new(RelationEngine::default()),
+            timeouts: Arc::new(TimeoutRegistry::default()),
+            monitor_registry: Arc::new(Mutex::new(HashMap::new())),
+            max_contacts,
+        })
+    }
     /// Register an agent in the registry.
     pub fn register_agent(&self, id: AgentId, expertise: impl Into<String>) {
         let info = AgentInfo {
@@ -498,9 +520,10 @@ impl SocialContext {
         to: &AgentId,
         body: impl Into<String>,
         priority: u32,
-    ) {
+    ) -> crate::Result<()> {
         self.apply_relation_event(from, to, crate::relation::RelationEvent::Communication);
         let message = InboxMessage {
+            journal_id: None,
             from: from.clone(),
             to: to.clone(),
             body: body.into(),
@@ -509,7 +532,8 @@ impl SocialContext {
             task_id: None,
             broadcast_id: None,
         };
-        self.push_message(message);
+        self.push_message(message)?;
+        Ok(())
     }
     /// Send a direct message with optional `task_id` and `broadcast_id`
     /// correlation keys. Used by the `send_message` tool when replying to
@@ -527,9 +551,10 @@ impl SocialContext {
         priority: u32,
         task_id: Option<String>,
         broadcast_id: Option<String>,
-    ) {
+    ) -> crate::Result<()> {
         self.apply_relation_event(from, to, crate::relation::RelationEvent::Communication);
         let message = InboxMessage {
+            journal_id: None,
             from: from.clone(),
             to: to.clone(),
             body: body.into(),
@@ -538,7 +563,8 @@ impl SocialContext {
             task_id,
             broadcast_id,
         };
-        self.push_message(message);
+        self.push_message(message)?;
+        Ok(())
     }
 
     /// Broadcast a message to all agents except the sender.
@@ -551,7 +577,7 @@ impl SocialContext {
     ///
     /// Returns the generated `broadcast_id` so callers (e.g. the broadcast
     /// tool) can register a cancellable timeout keyed by it.
-    pub fn broadcast(&self, from: &AgentId, body: impl Into<String>) -> String {
+    pub fn broadcast(&self, from: &AgentId, body: impl Into<String>) -> crate::Result<String> {
         let body = body.into();
         let broadcast_id = uuid::Uuid::now_v7().to_string();
         for info in self.registry.list() {
@@ -559,6 +585,7 @@ impl SocialContext {
                 continue;
             }
             let message = InboxMessage {
+                journal_id: None,
                 from: from.clone(),
                 to: info.id.clone(),
                 body: body.clone(),
@@ -567,9 +594,9 @@ impl SocialContext {
                 task_id: None,
                 broadcast_id: Some(broadcast_id.clone()),
             };
-            self.push_message(message);
+            self.push_message(message)?;
         }
-        broadcast_id
+        Ok(broadcast_id)
     }
     /// Push a pre-constructed message into the recipient's inbox.
     ///
@@ -579,14 +606,15 @@ impl SocialContext {
     /// neither `send_message` back (contact gate) nor find the sender via
     /// `search_contacts`. Timer messages (from "timer"/"self") are skipped —
     /// they are system notifications, not social peers.
-    pub fn push_message(&self, message: InboxMessage) {
+    pub fn push_message(&self, message: InboxMessage) -> crate::Result<()> {
         if message.from.as_str() != reserved::TIMER
             && message.from.as_str() != reserved::SELF
             && message.from != message.to
         {
             self.ensure_contact(&message.to, &message.from);
         }
-        self.inboxes.push(message);
+        self.inboxes.push(message)?;
+        Ok(())
     }
 
     /// Return drained messages to an agent's inbox unchanged.
@@ -599,8 +627,24 @@ impl SocialContext {
     pub fn return_messages(&self, agent_id: &AgentId, messages: Vec<InboxMessage>) {
         for message in messages {
             debug_assert_eq!(&message.to, agent_id, "message returned to wrong inbox");
-            self.inboxes.push(message);
+            self.inboxes.push_returned(message);
         }
+    }
+
+    /// Acknowledge durable journal rows after a runner successfully consumed
+    /// the associated messages.
+    pub fn ack_inbox_messages(&self, messages: &[InboxMessage]) {
+        self.inboxes.ack(messages);
+    }
+
+    /// Drain all pending messages for clean-shutdown persistence.
+    pub fn drain_pending_messages(&self) -> Vec<InboxMessage> {
+        self.inboxes.drain_everything()
+    }
+
+    /// Restore pending messages after rebuilding the team.
+    pub fn restore_pending_messages(&self, messages: Vec<InboxMessage>) {
+        self.inboxes.restore(messages);
     }
 
     /// Drain all pending messages for an agent, returning them in priority
@@ -617,7 +661,8 @@ impl SocialContext {
     /// SelfReminder notifications never clear marks.
     pub fn drain_inbox(&self, agent_id: &AgentId) -> Vec<InboxMessage> {
         let messages = self.inboxes.drain_all(agent_id);
-        messages
+        let mut dropped = Vec::new();
+        let messages = messages
             .into_iter()
             .filter(|msg| {
                 // Timeout and self-reminder messages carry the key but are
@@ -638,12 +683,18 @@ impl SocialContext {
                 }
                 // Drop late replies whose correlation key has fired.
                 let key = msg.task_id.as_ref().or(msg.broadcast_id.as_ref());
-                match key {
+                let keep = match key {
                     None => true,
                     Some(k) => !self.is_key_fired(agent_id, k),
+                };
+                if !keep {
+                    dropped.push(msg.clone());
                 }
+                keep
             })
-            .collect()
+            .collect();
+        self.inboxes.ack(&dropped);
+        messages
     }
 
     /// Whether an agent has any pending messages.
@@ -928,6 +979,7 @@ impl SocialContext {
     }
 }
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests {
     use super::*;
     use crate::timeout_manager::reserved;
@@ -1397,6 +1449,7 @@ mod tests {
             async move {
                 tokio::time::sleep(Duration::from_millis(30)).await;
                 ctx.push_message(InboxMessage {
+                    journal_id: None,
                     from: AgentId::new(crate::timeout_manager::reserved::TIMER),
                     to: alice.clone(),
                     body: "follow up task-0".to_string(),
@@ -1473,6 +1526,7 @@ mod tests {
             async move {
                 tokio::time::sleep(Duration::from_millis(30)).await;
                 ctx.push_message(InboxMessage {
+                    journal_id: None,
                     from: AgentId::new(crate::timeout_manager::reserved::TIMER),
                     to: alice.clone(),
                     body: "follow up task-0".to_string(),
@@ -1761,6 +1815,7 @@ mod tests {
 
         // Put the resulting Timeout notification into the queue.
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new(reserved::TIMER),
             to: alice.clone(),
             body: "task-0 timed out".into(),
@@ -1795,6 +1850,7 @@ mod tests {
 
         // A SelfReminder notification (NOT a Timeout) is drained.
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: AgentId::new(reserved::SELF),
             to: alice.clone(),
             body: "check on bob".into(),
@@ -1874,6 +1930,7 @@ mod tests {
         // Alice sends bob a delegation request. Bob has never contacted
         // alice — his contact list must still gain her as a contact.
         let message = InboxMessage {
+            journal_id: None,
             from: alice.clone(),
             to: bob.clone(),
             body: "do this task".into(),
@@ -1889,6 +1946,7 @@ mod tests {
 
         // Timer messages are system notifications — no social contact.
         let timer_msg = InboxMessage {
+            journal_id: None,
             from: AgentId::new(reserved::TIMER),
             to: alice.clone(),
             body: "timed out".into(),
@@ -2053,6 +2111,7 @@ mod tests {
         }
 
         ctx.push_message(InboxMessage {
+            journal_id: None,
             from: alice.clone(),
             to: bob.clone(),
             body: "urgent request".into(),

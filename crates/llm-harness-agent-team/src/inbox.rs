@@ -62,6 +62,10 @@ pub struct InboxMessage {
     pub task_id: Option<String>,
     /// Correlation id shared by all messages of one broadcast, when applicable.
     pub broadcast_id: Option<String>,
+    /// Durable journal row id; `None` for tests, legacy snapshots, and teams
+    /// assembled without a journal.
+    #[serde(skip)]
+    pub journal_id: Option<i64>,
 }
 
 /// Internal heap entry: pairs a message with its priority and insertion
@@ -170,6 +174,7 @@ impl InboxQueue {
 /// Per-agent inbox store, safe for concurrent access.
 pub struct InboxStore {
     queues: Mutex<HashMap<AgentId, InboxQueue>>,
+    journal: Option<Arc<crate::inbox_journal::InboxJournal>>,
 }
 
 impl Default for InboxStore {
@@ -183,12 +188,51 @@ impl InboxStore {
     pub fn new() -> Self {
         Self {
             queues: Mutex::new(HashMap::new()),
+            journal: None,
         }
     }
 
-    /// Push a message into the recipient's queue and wake exactly the
+    /// Create a store backed by a durable pending-message journal. Messages
+    /// queued through `push` are journaled first; returned/restored messages
+    /// retain their existing journal row.
+    pub fn with_journal(
+        journal: Arc<crate::inbox_journal::InboxJournal>,
+    ) -> Result<Self, crate::inbox_journal::InboxJournalError> {
+        let store = Self {
+            queues: Mutex::new(HashMap::new()),
+            journal: Some(journal.clone()),
+        };
+        for pending in journal.recover()? {
+            let mut message = pending.message;
+            message.journal_id = Some(pending.id);
+            store.push_returned(message);
+        }
+        Ok(store)
+    }
+
+    /// Push a durable message into the recipient's queue and wake exactly the
     /// recipient's waiters — pushes for other agents never steal the wakeup.
-    pub fn push(&self, message: InboxMessage) {
+    ///
+    /// Returns an error without enqueuing when the journal write fails, so
+    /// callers cannot mistake an unlogged message for durable delivery.
+    pub fn push(
+        &self,
+        message: InboxMessage,
+    ) -> Result<(), crate::inbox_journal::InboxJournalError> {
+        let mut message = message;
+        if let Some(journal) = &self.journal
+            && message.journal_id.is_none()
+        {
+            message.journal_id = Some(journal.enqueue(&message)?);
+        }
+        let to = message.to.clone();
+        let mut queues = self.queues.lock();
+        queues.entry(to).or_default().push(message);
+        Ok(())
+    }
+
+    /// Requeue an already-journaled message without creating a new row.
+    pub fn push_returned(&self, message: InboxMessage) {
         let to = message.to.clone();
         let mut queues = self.queues.lock();
         queues.entry(to).or_default().push(message);
@@ -200,6 +244,38 @@ impl InboxStore {
         match queues.get_mut(agent_id) {
             Some(q) => q.drain_sorted(),
             None => Vec::new(),
+        }
+    }
+
+    /// Drain every queue, with each recipient's messages in priority order.
+    pub fn drain_everything(&self) -> Vec<InboxMessage> {
+        let mut queues = self.queues.lock();
+        let mut messages = Vec::new();
+        for (_, mut queue) in queues.drain() {
+            messages.extend(queue.drain_sorted());
+        }
+        messages
+    }
+
+    /// Restore previously drained messages. Message priority controls the
+    /// rebuilt queue order; contacts and registered recipients remain the
+    /// caller's responsibility.
+    pub fn restore(&self, messages: Vec<InboxMessage>) {
+        for message in messages {
+            self.push_returned(message);
+        }
+    }
+
+    /// Acknowledge messages whose runner completed successfully. Ack failures
+    /// are non-fatal: the next crash recovery will redeliver the message.
+    pub fn ack(&self, messages: &[InboxMessage]) {
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        for message in messages.iter().filter_map(|message| message.journal_id) {
+            if let Err(error) = journal.ack(message) {
+                tracing::error!(journal_id = message, error = %error, "failed to ack inbox message");
+            }
         }
     }
 
@@ -239,11 +315,13 @@ impl InboxStore {
 }
 
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests {
     use super::*;
 
     fn msg(from: &str, to: &str, body: &str, priority: u32) -> InboxMessage {
         InboxMessage {
+            journal_id: None,
             from: AgentId::new(from),
             to: AgentId::new(to),
             body: body.to_string(),
@@ -307,9 +385,9 @@ mod tests {
         let store = InboxStore::new();
         let alice = AgentId::new("alice");
 
-        store.push(msg("bob", "alice", "hello", 1));
-        store.push(msg("carol", "alice", "urgent", 10));
-        store.push(msg("dave", "alice", "normal", 5));
+        store.push(msg("bob", "alice", "hello", 1)).unwrap();
+        store.push(msg("carol", "alice", "urgent", 10)).unwrap();
+        store.push(msg("dave", "alice", "normal", 5)).unwrap();
 
         assert!(store.has_messages(&alice));
 
@@ -323,6 +401,77 @@ mod tests {
         // After draining, no messages remain.
         assert!(!store.has_messages(&alice));
         assert!(store.drain_all(&alice).is_empty());
+    }
+
+    #[test]
+    fn drain_everything_and_restore_round_trips_priority() {
+        let store = InboxStore::new();
+        let alice = AgentId::new("alice");
+        store
+            .push(msg("bob", "alice", "normal", priority::NORMAL))
+            .unwrap();
+        store
+            .push(msg("operator", "alice", "operator", priority::OPERATOR))
+            .unwrap();
+
+        let messages = store.drain_everything();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].body, "operator");
+        assert_eq!(messages[1].body, "normal");
+        assert!(!store.has_messages(&alice));
+
+        let restored = InboxStore::new();
+        restored.restore(messages);
+        let messages = restored.drain_all(&alice);
+        assert_eq!(messages[0].body, "operator");
+        assert_eq!(messages[1].body, "normal");
+    }
+
+    #[test]
+    fn journaled_message_survives_store_drop_until_acked() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            crate::inbox_journal::InboxJournal::open(temp.path().join("inbox.sqlite3")).unwrap(),
+        );
+        let alice = AgentId::new("alice");
+
+        let store = InboxStore::with_journal(Arc::clone(&journal)).unwrap();
+        store
+            .push(msg("operator", "alice", "crash safe", priority::OPERATOR))
+            .unwrap();
+        let drained = store.drain_all(&alice);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(journal.recover().unwrap().len(), 1);
+
+        drop(store);
+        let store = InboxStore::with_journal(Arc::clone(&journal)).unwrap();
+        assert!(store.has_messages(&alice));
+
+        store.ack(&drained);
+        assert!(journal.recover().unwrap().is_empty());
+    }
+
+    #[test]
+    fn journal_failure_does_not_enqueue_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("inbox.sqlite3");
+        let journal = Arc::new(crate::inbox_journal::InboxJournal::open(&path).unwrap());
+        let store = InboxStore::with_journal(Arc::clone(&journal)).unwrap();
+        let alice = AgentId::new("alice");
+
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute("DROP TABLE pending_messages", [])
+            .unwrap();
+
+        let error = store
+            .push(msg("bob", "alice", "lost", priority::NORMAL))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::inbox_journal::InboxJournalError::Sqlite(_)
+        ));
+        assert!(!store.has_messages(&alice));
     }
 
     #[tokio::test(start_paused = true)]

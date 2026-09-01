@@ -61,7 +61,8 @@ impl TimeoutManager {
         let register_agent = agent_id.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(after).await;
-            ctx.push_message(InboxMessage {
+            if let Err(error) = ctx.push_message(InboxMessage {
+                journal_id: None,
                 from: AgentId::new(reserved::TIMER),
                 to: agent_id.clone(),
                 body,
@@ -69,7 +70,10 @@ impl TimeoutManager {
                 priority: crate::inbox::priority::TIMEOUT,
                 task_id,
                 broadcast_id: None,
-            });
+            }) {
+                tracing::error!(agent = %agent_id, error = %error, "failed to journal timeout");
+                return;
+            }
             if let Some(k) = cleanup_key {
                 // Some(peer) ⇒ a delegation timed out: the collaboration
                 // failed, weakening the bond toward the delegate. If the
@@ -135,7 +139,8 @@ impl TimeoutManager {
         let register_agent = agent_id.clone();
         let handle = tokio::spawn(async move {
             tokio::time::sleep(after).await;
-            ctx.push_message(InboxMessage {
+            if let Err(error) = ctx.push_message(InboxMessage {
+                journal_id: None,
                 from: AgentId::new(reserved::SELF),
                 to: agent_id.clone(),
                 body,
@@ -143,7 +148,14 @@ impl TimeoutManager {
                 priority: crate::inbox::priority::SELF_REMINDER,
                 task_id,
                 broadcast_id: None,
-            });
+            }) {
+                tracing::error!(
+                    agent = %agent_id,
+                    error = %error,
+                    "failed to journal self-reminder"
+                );
+                return;
+            }
             if let Some(k) = cleanup_key {
                 ctx.remove_timeout(&agent_id, &k);
             }
@@ -190,6 +202,7 @@ mod reserved_tests {
 }
 
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests {
     use super::*;
 
