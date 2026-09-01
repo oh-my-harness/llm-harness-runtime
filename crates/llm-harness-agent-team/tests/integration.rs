@@ -281,10 +281,22 @@ fn contact_decay_and_forget() {
 // MockLlmClients through the cluster-A failure paths and the message flow.
 // ---------------------------------------------------------------------------
 
-use llm_harness_agent_team::{AgentTeam, IndividualSpec, OperatorMessage};
+use llm_harness_agent_team::{AgentTeam, IndividualSpec, OperatorMessage, TeamConfig};
 use llm_harness_loop::LlmClient;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_sandbox::OsEnv;
+
+fn test_team() -> AgentTeam {
+    let config = TeamConfig {
+        memory_root: std::env::temp_dir().join(format!(
+            "agent-team-memory-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )),
+        ..TeamConfig::default()
+    };
+    AgentTeam::with_config(config)
+}
 
 /// Poll `probe` every 250ms until it returns true or the cap elapses.
 async fn wait_until(mut probe: impl FnMut() -> bool, cap: Duration, what: &str) {
@@ -343,7 +355,7 @@ async fn full_message_flow_through_team() {
         ),
         MockResponse::text("done"),
     ]));
-    let mut team = AgentTeam::new()
+    let mut team = test_team()
         .member(IndividualSpec::new("a1", "analysis", "model-a1"))
         .member(IndividualSpec::new("a2", "writing", "model-a2"));
     let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
@@ -412,7 +424,7 @@ async fn shutdown_cleans_pending_state() {
         ),
         MockResponse::text("scheduled"),
     ]));
-    let mut team = AgentTeam::new().member(IndividualSpec::new("a1", "analysis", "model-a1"));
+    let mut team = test_team().member(IndividualSpec::new("a1", "analysis", "model-a1"));
     let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
     team.build(
         env,
@@ -488,7 +500,7 @@ async fn broadcast_two_phase_aggregation() {
         ),
         MockResponse::text("done"),
     ]));
-    let mut team = AgentTeam::new()
+    let mut team = test_team()
         .member(IndividualSpec::new("a1", "analysis", "model-a1"))
         .member(IndividualSpec::new("a2", "research", "model-a2"))
         .member(IndividualSpec::new("a3", "research", "model-a3"));
