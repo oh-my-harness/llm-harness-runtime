@@ -17,7 +17,7 @@ graph TD
     end
 
     subgraph "策略层（可选）"
-        ST[llm-harness-strategy<br/>safety / loop-safety / status-panel<br/>event-stream / injection-filter<br/>memory-defense / notify / budget]
+        ST[llm-harness-strategy<br/>safety / loop-safety / status-panel<br/>event-stream / injection-filter<br/>observation-shielding / memory-defense<br/>notify / budget]
     end
 
     subgraph "编排层"
@@ -94,7 +94,7 @@ graph TD
 | `llm-harness-agent-team` | 去中心化多 Agent 协作（AgentTeam、社交工具、团队记忆） | **[agent-team-guide.md](docs/agent-team-guide.md)** |
 | `llm-harness-inspector` | Agent 调试 Web API（REST + WebSocket 事件流） | **[inspector-guide.md](docs/inspector-guide.md)** |
 | `llm-harness-platform` | 横切 trait（Sandbox/AuditSink/TraceExporter/PromptSource） | [crate-reference.md](docs/crate-reference.md) |
-| `llm-harness-strategy` | 策略层：safety、loop-safety、status-panel、event-stream、injection-filter、memory-defense、notify、budget | **[strategy-guide.md](docs/strategy-guide.md)** |
+| `llm-harness-strategy` | 策略层：safety、loop-safety、status-panel、event-stream、injection-filter、observation-shielding、memory-defense、notify、budget | **[strategy-guide.md](docs/strategy-guide.md)** |
 | `llm-harness-tools` | 内置工具：bash、read、write、edit、grep、glob、code_exec、web_search、web_fetch | **[tools-guide.md](docs/tools-guide.md)** |
 | `llm-harness-mcp` | MCP 协议集成：传输、会话、多服务器管理、版本锁定 | **[mcp-guide.md](docs/mcp-guide.md)** |
 | `llm-harness-knowledge` | 后端无关的知识访问契约 | [crate-reference.md](docs/crate-reference.md) |
@@ -180,7 +180,7 @@ ReAct 循环（思考→调工具→看结果→再思考），支持 streaming�
 去中心化多 Agent 协作：声明式组队（`IndividualSpec` → `AgentTeam`）、P2P 社交工具（delegate_task/send_message/broadcast/search_contacts/set_reminder）、SQLite 团队记忆 + 反思循环。详见 [agent-team-guide.md](docs/agent-team-guide.md)。
 
 ### Strategy Layer
-15 个策略 Plugin：安全防护、循环安全（5 个 Hook）、状态栏+TODO、事件流（timer/heartbeat/filter/webhook/shell_monitor）、注入防御、来源标记、记忆防线、通知、工具输出保护、MCP 凭证保护、compaction prompt、项目指令注入、审计、预算控制。详见 [strategy-guide.md](docs/strategy-guide.md)。
+16 个策略 Plugin：安全防护、循环安全（5 个 Hook）、状态栏+TODO、事件流（timer/heartbeat/filter/webhook/shell_monitor）、注入防御、来源标记、记忆防线、通知、工具输出保护、观察屏蔽、MCP 凭证保护、compaction prompt、项目指令注入、审计、预算控制。详见 [strategy-guide.md](docs/strategy-guide.md)。
 
 ### Tools
 9 个内置工具：bash、read、write、edit、grep、glob、code_exec、web_search（9 个搜索 provider）、web_fetch。详见 [tools-guide.md](docs/tools-guide.md)。
@@ -211,7 +211,7 @@ Linux（bubblewrap）、macOS（seatbelt）、跨平台（OS 原生 + 路径限�
 | 文档 | 内容 |
 |------|------|
 | [MISSION.md](MISSION.md) | 使命与第一性原理 |
-| [strategy-guide.md](docs/strategy-guide.md) | 策略层 15 个模块使用指南 |
+| [strategy-guide.md](docs/strategy-guide.md) | 策略层 16 个模块使用指南 |
 | [mcp-guide.md](docs/mcp-guide.md) | MCP 集成指南 |
 | [tools-guide.md](docs/tools-guide.md) | 内置工具使用指南 |
 | [agent-team-guide.md](docs/agent-team-guide.md) | 多 Agent 团队协作指南 |

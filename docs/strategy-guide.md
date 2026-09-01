@@ -237,6 +237,36 @@ builder.install(&ToolOutputGuardPlugin::with_config(env.clone(), config));
 
 ---
 
+## 观察屏蔽（Observation Shielding）
+
+**模块**：`observation_shielding.rs`
+
+`ObservationShieldingPlugin` 在每次 LLM 调用前，把超过保留窗口的旧工具输出替换为占位符，降低长任务中噪声对上下文的挤占。
+
+| 配置 | 默认值 | 说明 |
+|------|--------|------|
+| `retained_turns` | 5 | 保留最近 N 个 assistant turn 内产生的工具观察 |
+| `placeholder` | 固定英文提示 | 替换旧观察的文本 |
+
+结果按对应 `ToolUse` 所属的 assistant turn 归组；最近 N 个 turn 内的所有结果保持原样。没有映射到 assistant turn 的结果不改写，便于兼容导入的历史上下文。会话日志仍保存完整工具输出，因此本策略只改变下一次模型可见的上下文。
+
+```rust
+use llm_harness_strategy::{ObservationShieldingConfig, ObservationShieldingPlugin};
+
+builder.install(&ObservationShieldingPlugin::default());
+
+let config = ObservationShieldingConfig {
+    retained_turns: 2,
+    placeholder: "[older observation hidden]".into(),
+    ..Default::default()
+};
+builder.install(&ObservationShieldingPlugin::new(config));
+```
+
+注册的 Hook：`TransformContextHook`（每次 LLM 调用前改写上下文）。
+
+---
+
 ## MCP 凭证保护（MCP Credential Guard）
 
 **模块**：`credential_guard.rs`
