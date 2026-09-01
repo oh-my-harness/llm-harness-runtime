@@ -780,6 +780,18 @@ mod tests {
     use llm_harness_agent::HarnessBuildError;
     use llm_harness_sandbox::OsEnv;
 
+    fn test_team() -> AgentTeam {
+        let config = TeamConfig {
+            memory_root: std::env::temp_dir().join(format!(
+                "agent-team-memory-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            )),
+            ..TeamConfig::default()
+        };
+        AgentTeam::with_config(config)
+    }
+
     #[test]
     fn team_new_and_member_addition() {
         let team = AgentTeam::new();
@@ -801,7 +813,7 @@ mod tests {
 
     #[tokio::test]
     async fn team_build_without_members_fails() {
-        let mut team = AgentTeam::new();
+        let mut team = test_team();
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
         let result = team.build(env, vec![]).await;
         assert!(result.is_err());
@@ -810,7 +822,7 @@ mod tests {
 
     #[tokio::test]
     async fn team_build_rejects_duplicate_member_ids() {
-        let mut team = AgentTeam::new()
+        let mut team = test_team()
             .member(IndividualSpec::new("a1", "analysis", "gpt-4o"))
             .member(IndividualSpec::new("a1", "writing", "gpt-4o"));
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
@@ -823,8 +835,7 @@ mod tests {
 
     #[tokio::test]
     async fn team_build_rejects_operator_id() {
-        let mut team =
-            AgentTeam::new().member(IndividualSpec::new("operator", "analysis", "gpt-4o"));
+        let mut team = test_team().member(IndividualSpec::new("operator", "analysis", "gpt-4o"));
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
         let result = team.build(env, vec![]).await;
         assert!(matches!(result.unwrap_err(), TeamError::ReservedAgentId(_)));
@@ -833,7 +844,7 @@ mod tests {
     #[tokio::test]
     async fn build_rejects_reserved_agent_id() {
         for id in ["timer", "self", "operator", "reminder:x"] {
-            let mut team = AgentTeam::new().member(IndividualSpec::new(id, "analysis", "gpt-4o"));
+            let mut team = test_team().member(IndividualSpec::new(id, "analysis", "gpt-4o"));
             let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
             let result = team.build(env, vec![]).await;
             match result {
@@ -847,7 +858,7 @@ mod tests {
     async fn team_build_with_subagents_requires_providers() {
         // allow_subagents(true) constructs the spawner eagerly → fails with
         // NoProviders when the provider list is empty.
-        let mut team = AgentTeam::new()
+        let mut team = test_team()
             .member(IndividualSpec::new("a1", "analysis", "gpt-4o").allow_subagents(true));
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
         let result = team.build(env, vec![]).await;
@@ -859,7 +870,7 @@ mod tests {
         // Default (no allow_subagents): the spawn infrastructure is skipped
         // entirely, so the empty provider list surfaces from harness
         // provider resolution instead of the spawner path.
-        let mut team = AgentTeam::new().member(IndividualSpec::new("a1", "analysis", "gpt-4o"));
+        let mut team = test_team().member(IndividualSpec::new("a1", "analysis", "gpt-4o"));
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
         let result = team.build(env, vec![]).await;
         match result {
@@ -877,7 +888,7 @@ mod tests {
         // would drain it within milliseconds.
         let client: Arc<dyn LlmClient> =
             Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]));
-        let mut team = AgentTeam::new()
+        let mut team = test_team()
             .member(IndividualSpec::new("ok-agent", "analysis", "test-model"))
             .member(IndividualSpec::new("bad-agent", "writing", "no-such-model"));
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
@@ -920,7 +931,7 @@ mod tests {
     async fn submit_rejects_unregistered_agent() {
         let client: Arc<dyn LlmClient> =
             Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]));
-        let mut team = AgentTeam::new().member(IndividualSpec::new("a1", "analysis", "test-model"));
+        let mut team = test_team().member(IndividualSpec::new("a1", "analysis", "test-model"));
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
         team.build(env, vec![("test-model".into(), client)])
             .await
@@ -942,7 +953,7 @@ mod tests {
     async fn receive_yields_operator_messages_with_sender() {
         let client: Arc<dyn LlmClient> =
             Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]));
-        let mut team = AgentTeam::new().member(IndividualSpec::new("a1", "analysis", "test-model"));
+        let mut team = test_team().member(IndividualSpec::new("a1", "analysis", "test-model"));
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
         team.build(env, vec![("test-model".into(), client)])
             .await
@@ -950,7 +961,7 @@ mod tests {
 
         assert!(team.receive().is_ok());
         // An unbuilt team errors instead of panicking.
-        let unbuilt = AgentTeam::new();
+        let unbuilt = test_team();
         assert!(matches!(unbuilt.receive(), Err(TeamError::NotBuilt)));
 
         // Simulate an agent → operator message and drain it.
@@ -966,7 +977,7 @@ mod tests {
     async fn agent_status_reports_member_state() {
         let client: Arc<dyn LlmClient> =
             Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]));
-        let mut team = AgentTeam::new().member(IndividualSpec::new("a1", "analysis", "test-model"));
+        let mut team = test_team().member(IndividualSpec::new("a1", "analysis", "test-model"));
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
         team.build(env, vec![("test-model".into(), client)])
             .await
@@ -985,7 +996,7 @@ mod tests {
         assert_eq!(team.agent_status("a1"), Some(SocialAgentStatus::Busy));
 
         // An unbuilt team cannot observe anything.
-        let unbuilt = AgentTeam::new().member(IndividualSpec::new("a1", "x", "test-model"));
+        let unbuilt = test_team().member(IndividualSpec::new("a1", "x", "test-model"));
         assert_eq!(unbuilt.agent_status("a1"), None);
     }
 
@@ -995,7 +1006,7 @@ mod tests {
         // reflection task's memory_write/knowledge_search tools exist.
         let client: Arc<dyn LlmClient> =
             Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]));
-        let mut team = AgentTeam::new().member(IndividualSpec::new("a1", "analysis", "test-model"));
+        let mut team = test_team().member(IndividualSpec::new("a1", "analysis", "test-model"));
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
         team.build(env, vec![("test-model".into(), client)])
             .await
@@ -1029,7 +1040,7 @@ mod tests {
         // member statuses were all left dangling.
         let client: Arc<dyn LlmClient> =
             Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]));
-        let mut team = AgentTeam::new()
+        let mut team = test_team()
             .member(IndividualSpec::new("a1", "analysis", "test-model"))
             .member(IndividualSpec::new("a2", "writing", "test-model"));
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
@@ -1075,7 +1086,7 @@ mod tests {
 
     #[test]
     fn social_context_is_none_before_build() {
-        let team = AgentTeam::new().member(IndividualSpec::new("a1", "analysis", "test-model"));
+        let team = test_team().member(IndividualSpec::new("a1", "analysis", "test-model"));
         assert!(team.social_context().is_none());
         assert!(team.harness(&AgentId::new("a1")).is_none());
     }
@@ -1084,7 +1095,7 @@ mod tests {
     async fn getters_work_after_build() {
         let client: Arc<dyn LlmClient> =
             Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]));
-        let mut team = AgentTeam::new()
+        let mut team = test_team()
             .member(IndividualSpec::new("a1", "analysis", "test-model"))
             .member(IndividualSpec::new("a2", "writing", "test-model"));
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
@@ -1119,7 +1130,7 @@ mod tests {
     }
 
     async fn built_two_member_team() -> AgentTeam {
-        let mut team = AgentTeam::new()
+        let mut team = test_team()
             .member(IndividualSpec::new("a1", "analysis", "m-old"))
             .member(IndividualSpec::new("a2", "writing", "m-old"));
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
@@ -1173,7 +1184,7 @@ mod tests {
 
     #[tokio::test]
     async fn replace_member_not_built_fails() {
-        let mut team = AgentTeam::new();
+        let mut team = test_team();
         let result = team
             .replace_member(
                 "a1",
