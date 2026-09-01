@@ -1131,7 +1131,7 @@ async fn custom_prompt_renders_query_and_conversation() {
     assert!(stats.tokens_before > 0);
 
     // Verify the compaction client received the custom prompt with query and conversation.
-    let captured = compaction_client.captured_requests.lock().unwrap();
+    let captured = compaction_client.captured_requests.lock();
     assert!(!captured.is_empty(), "compaction LLM must have been called");
     let req = &captured[0];
     let user_content = format!("{:?}", req.messages().get(1).expect("has user message"));
@@ -1249,7 +1249,7 @@ async fn keep_entry_content_preserved_in_summary_end_to_end() {
 
     // The LLM request must contain the <no-compact> tag wrapping the Keep
     // entry's content in the {conversation} placeholder.
-    let captured = compaction_client.captured_requests.lock().unwrap();
+    let captured = compaction_client.captured_requests.lock();
     let req = &captured[0];
     let user_content = format!("{:?}", req.messages().get(1).expect("has user message"));
     assert!(

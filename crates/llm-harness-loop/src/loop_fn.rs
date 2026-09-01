@@ -227,12 +227,12 @@ fn run_loop(
         use llm_adapter::types::{ChatRequest, Message as AMsg, ToolChoice};
         use tokio::sync::mpsc;
 
-        yield AgentEvent::AgentStart;
-
         // Drain stale steer messages for agent_loop_continue
         if drain_steer_first && let Some(ref mut rx) = config.steer_rx {
             while rx.try_recv().is_ok() {}
         }
+
+        yield AgentEvent::AgentStart;
 
         let mut turn_index: u32 = 0;
         let mut new_messages: Vec<AgentMessage> = vec![];
@@ -390,6 +390,24 @@ fn run_loop(
                         continue;
                     }
                     Err(e) => {
+                        // Non-transient (or retries-exhausted) provider error:
+                        // give the mounted `ProviderErrorHook` a chance to
+                        // repair history and retry the same turn. Unmounted →
+                        // the error surfaces unchanged (default behavior).
+                        if let Some(h) = &config.provider_error {
+                            let directive = h
+                                .on_provider_error(ProviderErrorCtx {
+                                    run: &config.run,
+                                    turn_index,
+                                    error: &e,
+                                    context: &mut ctx,
+                                    new_messages: &mut new_messages,
+                                })
+                                .await;
+                            if matches!(directive, ErrorDirective::Retry) {
+                                continue 'main;
+                            }
+                        }
                         yield AgentEvent::Error(llm_error_to_agent_error(e));
                         break 'main;
                     }
@@ -1042,6 +1060,7 @@ mod tests {
             before_provider_request: None,
             after_provider_response: None,
             final_answer_validator: None,
+            provider_error: None,
             steer_rx: None,
             follow_up_rx: None,
             retry: None,
@@ -1358,7 +1377,7 @@ mod tests {
         use llm_adapter::types::{
             StopReason as AdapterStopReason, StreamEvent as AdapterEvent, Usage as AdapterUsage,
         };
-        use std::sync::Mutex;
+        use parking_lot::Mutex;
 
         struct CaptureUsage(Arc<Mutex<Vec<TokenUsage>>>);
 
@@ -1369,7 +1388,7 @@ mod tests {
             ) -> BoxFuture<'a, ()> {
                 Box::pin(async move {
                     if let Some(usage) = &ctx.info.usage {
-                        self.0.lock().unwrap().push(usage.clone());
+                        self.0.lock().push(usage.clone());
                     }
                 })
             }
@@ -1404,7 +1423,7 @@ mod tests {
                 .collect()
                 .await;
 
-        let captured = captured.lock().unwrap();
+        let captured = captured.lock();
         assert_eq!(captured.len(), 1);
         assert_eq!(
             captured[0].provenance,
@@ -1501,7 +1520,7 @@ mod tests {
         .collect()
         .await;
 
-        let captured = client_raw.captured_requests.lock().unwrap();
+        let captured = client_raw.captured_requests.lock();
         assert_eq!(captured.len(), 1);
         assert!(
             captured[0]
@@ -2179,7 +2198,7 @@ mod tests {
                 .collect()
                 .await;
 
-        let captured = client.captured_requests.lock().unwrap();
+        let captured = client.captured_requests.lock();
         assert_eq!(captured.len(), 1, "provider should be called exactly once");
         let messages = captured[0].messages();
         assert!(
@@ -2730,7 +2749,7 @@ mod tests {
                 .collect()
                 .await;
 
-        let captured = client.captured_requests.lock().unwrap();
+        let captured = client.captured_requests.lock();
         assert_eq!(captured.len(), 1, "provider should be called exactly once");
         assert_eq!(
             captured[0].response_format(),
@@ -2786,7 +2805,7 @@ mod tests {
         // Trajectory invariant: every ToolUse id in the second request's history
         // must have a paired ToolResult. This directly verifies the core goal
         // of the design — no orphan ToolUse reaches the provider.
-        let captured = client_raw.captured_requests.lock().unwrap();
+        let captured = client_raw.captured_requests.lock();
         assert_eq!(captured.len(), 2, "two provider calls expected");
         use llm_adapter::types::{Message, ResponseContent};
         let second_request_msgs = captured[1].messages();
@@ -2883,7 +2902,7 @@ mod tests {
 
         // Trajectory invariant: the ToolUse id must have a paired ToolResult
         // in the second request's history — no orphan ToolUse reaches the provider.
-        let captured = client_raw.captured_requests.lock().unwrap();
+        let captured = client_raw.captured_requests.lock();
         assert_eq!(captured.len(), 2, "two provider calls expected");
         use llm_adapter::types::{Message, ResponseContent};
         let second_request_msgs = captured[1].messages();
@@ -3053,5 +3072,323 @@ mod tests {
             assert!(!message.is_empty());
             assert!(err.to_string().contains(message));
         }
+    }
+
+    // ── Vision degradation (issue #145 gaps 2+3) ────────────────────────────
+
+    use llm_adapter::LlmError;
+    use llm_harness_types::{
+        ImageSource, PersistedToolProjection, ProjectionMetadata, ToolProjectionKind,
+        ToolResultMessage,
+    };
+
+    fn image_user_message() -> AgentMessage {
+        AgentMessage::User(UserMessage {
+            content: vec![
+                ContentBlock::Text {
+                    text: "what is in this picture?".into(),
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Url {
+                        url: "https://example.com/pic.png".into(),
+                    },
+                },
+            ],
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    fn tool_result_with_image() -> AgentMessage {
+        AgentMessage::ToolResult(ToolResultMessage {
+            tool_use_id: "call_1".into(),
+            content: vec![
+                DataBlock::Text {
+                    text: "screenshot".into(),
+                    mime_type: None,
+                },
+                DataBlock::Image {
+                    source: ImageSource::Url {
+                        url: "https://example.com/shot.png".into(),
+                    },
+                },
+            ],
+            is_error: false,
+            projection: PersistedToolProjection {
+                kind: ToolProjectionKind::Full,
+                metadata: ProjectionMetadata::default(),
+            },
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    fn image_block_count(req: &llm_adapter::types::ChatRequest) -> usize {
+        req.messages()
+            .iter()
+            .map(|m| match m {
+                llm_adapter::types::Message::User(content) => content
+                    .iter()
+                    .filter(|c| matches!(c, llm_adapter::types::RequestContent::Image(_)))
+                    .count(),
+                llm_adapter::types::Message::Tool { content, .. } => content
+                    .iter()
+                    .filter(|c| matches!(c, llm_adapter::types::RequestContent::Image(_)))
+                    .count(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Test hook: strips every Image/Document block from both disjoint views
+    /// (mirroring the strategy crate's `VisionDegradeHook`), retries once,
+    /// then surfaces. Stand-in so loop tests don't depend on llm-harness-strategy.
+    struct StripVisionHook {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StripVisionHook {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl ProviderErrorHook for StripVisionHook {
+        fn on_provider_error<'a>(
+            &'a self,
+            ctx: ProviderErrorCtx<'a>,
+        ) -> BoxFuture<'a, ErrorDirective> {
+            Box::pin(async move {
+                let attempt = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt > 0 {
+                    return ErrorDirective::Surface;
+                }
+                assert!(matches!(ctx.error, LlmError::InvalidRequest(_)));
+                assert_eq!(ctx.turn_index, 0);
+                let stripped = strip_test_visual_blocks(ctx.context.messages.as_mut_slice())
+                    + strip_test_visual_blocks(ctx.new_messages);
+                if stripped == 0 {
+                    // Nothing repairable (no visual blocks) — surface unchanged.
+                    return ErrorDirective::Surface;
+                }
+                ErrorDirective::Retry
+            })
+        }
+    }
+
+    /// Strips Image/Document blocks from test messages, returning the count.
+    fn strip_test_visual_blocks(messages: &mut [AgentMessage]) -> usize {
+        let mut stripped = 0usize;
+        for msg in messages.iter_mut() {
+            match msg {
+                AgentMessage::ToolResult(t) => {
+                    let before = t.content.len();
+                    t.content.retain(|b| {
+                        !matches!(b, DataBlock::Image { .. } | DataBlock::Document { .. })
+                    });
+                    stripped += before - t.content.len();
+                }
+                AgentMessage::User(u) => {
+                    let before = u.content.len();
+                    u.content.retain(|b| {
+                        !matches!(
+                            b,
+                            ContentBlock::Image { .. } | ContentBlock::Document { .. }
+                        )
+                    });
+                    stripped += before - u.content.len();
+                }
+                _ => {}
+            }
+        }
+        stripped
+    }
+
+    #[tokio::test]
+    async fn provider_error_hook_repairs_history_and_retries_same_turn() {
+        // Turn 1: provider rejects the image-carrying request; the mounted
+        // hook strips both views and returns Retry (same `turn_index`).
+        // Turn 2: normal completion.
+        let (client, mut cfg) = make_config(vec![
+            MockResponse {
+                events: vec![],
+                model: String::new(),
+                stream_error: Some(LlmError::InvalidRequest(
+                    "model does not support image input".into(),
+                )),
+                stream_impl: None,
+            },
+            MockResponse::text("I cannot see images."),
+        ]);
+        let hook = StripVisionHook::new();
+        cfg.provider_error = Some(hook.clone());
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![image_user_message(), tool_result_with_image()],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        // Run ended normally, not in error.
+        assert!(
+            events.iter().all(|e| !matches!(e, AgentEvent::Error(_))),
+            "repaired run must not surface as a terminal Error"
+        );
+        assert!(
+            events.iter().any(|e| e
+                .as_final_answer()
+                .map(|(_, _, t)| t == "I cannot see images.")
+                .unwrap_or(false)),
+            "run should complete after repair"
+        );
+
+        // Two provider calls: first with images, second without.
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        let captured = client.captured_requests.lock();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            image_block_count(&captured[0]),
+            2,
+            "first request must still carry both image blocks"
+        );
+        assert_eq!(
+            image_block_count(&captured[1]),
+            0,
+            "retried request must be image-free"
+        );
+        assert_eq!(
+            hook.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "hook fires exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn unmounted_provider_error_hook_surfaces_invalid_request_unchanged() {
+        // Default behavior (no hook): the InvalidRequest surfaces as a
+        // terminal Error after a single provider call — no hidden retry.
+        let (client, cfg) = make_config(vec![MockResponse {
+            events: vec![],
+            model: String::new(),
+            stream_error: Some(LlmError::InvalidRequest(
+                "model does not support image input".into(),
+            )),
+            stream_impl: None,
+        }]);
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![image_user_message(), tool_result_with_image()],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "unmounted hook must surface the error unchanged"
+        );
+        assert!(
+            events.iter().all(|e| e.as_final_answer().is_none()),
+            "no final answer when the run errors out"
+        );
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one provider call — no silent retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_error_hook_one_shot_guard_surfaces_second_failure() {
+        // Provider keeps rejecting; the hook's own one-shot guard must not
+        // loop — the second failure surfaces as a terminal Error.
+        let (client, mut cfg) = make_config(vec![
+            MockResponse {
+                events: vec![],
+                model: String::new(),
+                stream_error: Some(LlmError::InvalidRequest("no vision".into())),
+                stream_impl: None,
+            },
+            MockResponse {
+                events: vec![],
+                model: String::new(),
+                stream_error: Some(LlmError::InvalidRequest(
+                    "still failing for another reason".into(),
+                )),
+                stream_impl: None,
+            },
+        ]);
+        let hook = StripVisionHook::new();
+        cfg.provider_error = Some(hook.clone());
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![image_user_message()],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "second failure must surface as terminal Error"
+        );
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly one repair retry"
+        );
+        assert_eq!(
+            hook.calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "hook re-consulted on the second failure, then surfaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_only_invalid_request_does_not_invoke_provider_error_hook() {
+        // An InvalidRequest with no visual blocks in history: a Surface-only
+        // hook must still be consulted (the loop cannot know what a hook
+        // considers repairable), and the error surfaces when it declines.
+        let (client, mut cfg) = make_config(vec![MockResponse {
+            events: vec![],
+            model: String::new(),
+            stream_error: Some(LlmError::InvalidRequest("bad parameter".into())),
+            stream_impl: None,
+        }]);
+        let hook = StripVisionHook::new();
+        cfg.provider_error = Some(hook.clone());
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "hook cannot repair (no visual blocks) → error surfaces"
+        );
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no retry when the hook declines"
+        );
+        assert_eq!(
+            hook.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "hook consulted once"
+        );
     }
 }

@@ -303,7 +303,7 @@ impl AgentTeam {
         // task) resolve their request context.
         let (knowledge_plugin, memory_plugin) =
             build_team_plugins(&self.config.memory_root).await?;
-        let pending: Vec<IndividualSpec> = self.members.drain(..).collect();
+        let pending: Vec<IndividualSpec> = std::mem::take(&mut self.members);
         let mut runner_handles = RunnerVec::default();
         for spec in pending {
             let agent_id = spec.id().clone();

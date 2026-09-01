@@ -7,9 +7,9 @@ use llm_harness_types::{
     AgentError, BeforeCompactCtx, BeforeCompactDecision, BeforeCompactHook,
     BeforeProviderRequestCtx, BeforeProviderRequestHook, BeforeRunCtx, BeforeRunHook,
     BeforeRunResult, BeforeToolCallCtx, BeforeToolCallDecision, BeforeToolCallHook, BeforeTurnCtx,
-    BeforeTurnHook, FinalAnswerValidationCtx, FinalAnswerValidationError, FinalAnswerValidator,
-    PrepareNextTurnCtx, PrepareNextTurnHook, ShouldStopCtx, ShouldStopHook, TransformContextCtx,
-    TransformContextHook,
+    BeforeTurnHook, ErrorDirective, FinalAnswerValidationCtx, FinalAnswerValidationError,
+    FinalAnswerValidator, PrepareNextTurnCtx, PrepareNextTurnHook, ProviderErrorCtx,
+    ProviderErrorHook, ShouldStopCtx, ShouldStopHook, TransformContextCtx, TransformContextHook,
 };
 
 /// Chains final-answer validators in registration order.
@@ -515,6 +515,48 @@ impl AfterRunHook for CompositeAfterRunHook {
     }
 }
 
+/// Chains multiple `ProviderErrorHook` implementations (first-`Retry` wins).
+///
+/// Hooks execute in registration order; the first hook returning `Retry`
+/// short-circuits the chain and the loop retries the turn. Every hook sees
+/// the same `&mut` views of the context, so a `Surface` after an earlier
+/// `Retry`-mutating hook would surface an already-repaired context — in
+/// practice callers register repairing hooks only.
+pub struct CompositeProviderErrorHook {
+    hooks: Vec<Arc<dyn ProviderErrorHook>>,
+}
+
+impl CompositeProviderErrorHook {
+    /// Create a composite from a list of hooks.
+    pub fn new(hooks: Vec<Arc<dyn ProviderErrorHook>>) -> Self {
+        Self { hooks }
+    }
+}
+
+impl ProviderErrorHook for CompositeProviderErrorHook {
+    fn on_provider_error<'a>(&'a self, ctx: ProviderErrorCtx<'a>) -> BoxFuture<'a, ErrorDirective> {
+        Box::pin(async move {
+            for hook in &self.hooks {
+                let directive = hook
+                    .on_provider_error(ProviderErrorCtx {
+                        run: ctx.run,
+                        turn_index: ctx.turn_index,
+                        error: ctx.error,
+                        // Each hook gets the same disjoint views; reborrowed
+                        // sequentially through the original `&mut`s.
+                        context: ctx.context,
+                        new_messages: ctx.new_messages,
+                    })
+                    .await;
+                if matches!(directive, ErrorDirective::Retry) {
+                    return directive;
+                }
+            }
+            ErrorDirective::Surface
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,6 +568,12 @@ mod tests {
         _accept(&composite);
     }
 
+    #[test]
+    fn composite_provider_error_hook_is_object_safe() {
+        fn _accept(_: &dyn ProviderErrorHook) {}
+        let composite = CompositeProviderErrorHook::new(vec![]);
+        _accept(&composite);
+    }
     #[test]
     fn composite_after_tool_call_hook_is_object_safe() {
         fn _accept(_: &dyn AfterToolCallHook) {}

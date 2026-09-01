@@ -130,6 +130,11 @@ pub struct LoopConfig {
     pub after_provider_response: Option<Arc<dyn AfterProviderResponseHook>>,
     /// Candidate final-answer validation before committed `MessageEnd`.
     pub final_answer_validator: Option<Arc<dyn FinalAnswerValidator>>,
+    /// Provider 非瞬态错误（重试耗尽后仍失败）的修复 hook；`None` 时错误原样上抛。
+    ///
+    /// 典型用途见 strategy crate 的 `VisionDegradeHook`：文本-only provider
+    /// 拒绝携带 image/document 块的请求时剥离视觉块并同轮重试。
+    pub provider_error: Option<Arc<dyn ProviderErrorHook>>,
 
     // === Reactive injection ===
     /// 在 turn 间注入的消息（转向）。turn 边界与自然停止时都会 drain；
@@ -179,6 +184,7 @@ mod tests {
             before_provider_request: None,
             after_provider_response: None,
             final_answer_validator: None,
+            provider_error: None,
             steer_rx: None,
             follow_up_rx: None,
             retry: None,
@@ -216,6 +222,7 @@ mod tests {
             before_provider_request: None,
             after_provider_response: None,
             final_answer_validator: None,
+            provider_error: None,
             steer_rx: None,
             follow_up_rx: None,
             retry: None,

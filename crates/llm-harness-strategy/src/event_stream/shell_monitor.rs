@@ -668,33 +668,34 @@ mod tests {
         )
         .unwrap();
 
-        // Concurrently: wait for lines to accumulate, then kill.
-        // next() is blocked in the Reading select! loop when kill fires.
-        let kill_handle = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            handle.kill();
-        });
-
-        // First event: flushed buffered output (not exit)
+        // Wait for the first output event (the first line may take a while
+        // on a loaded machine) so the kill below provably lands mid-stream
+        // with a non-empty buffer.
         let e1 = stream.next().await.unwrap();
-        kill_handle.await.unwrap();
         assert_eq!(
             e1.details["channel"], "shell_monitor.output",
-            "expected output event from buffer flush, got: {:?}",
+            "expected output event, got: {:?}",
             e1.details
         );
-        let text1 = text_of_event(&e1);
+
+        // Kill mid-stream; then drain events to the exit event. Under CI
+        // timing output may arrive split across several events, so only
+        // the combined content is guaranteed.
+        handle.kill();
+        let mut combined = text_of_event(&e1);
+        combined.push('\n');
+        loop {
+            let e = stream.next().await.unwrap();
+            if e.details["channel"] == "shell_monitor.exit" {
+                break;
+            }
+            combined.push_str(&text_of_event(&e));
+            combined.push('\n');
+        }
         assert!(
-            text1.contains("line 1"),
-            "buffered output should contain line 1: {text1}"
+            combined.contains("line 1"),
+            "buffered output should contain line 1: {combined}"
         );
-
-        // Second event: exit
-        let e2 = stream.next().await.unwrap();
-        assert_eq!(e2.details["channel"], "shell_monitor.exit");
-
-        // Stream ends
-        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

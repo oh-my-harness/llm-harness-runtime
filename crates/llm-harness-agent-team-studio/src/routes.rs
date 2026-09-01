@@ -1910,12 +1910,15 @@ mod tests {
         .await;
         assert_eq!(status, 200, "{json}");
 
-        // secrets 文件 0600
+        // secrets 文件 0600 (unix; Windows has no POSIX mode bits)
         let secrets = pm.read().await.data_root().join("teams/p1/secrets/coder");
         assert!(secrets.exists());
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&secrets).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "secrets file must be 0600");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&secrets).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "secrets file must be 0600");
+        }
 
         let spec_text =
             std::fs::read_to_string(pm.read().await.data_root().join("teams/p1/team.json"))

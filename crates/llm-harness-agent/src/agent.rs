@@ -464,6 +464,7 @@ impl Agent {
                 before_provider_request: None,
                 after_provider_response: None,
                 final_answer_validator: None,
+                provider_error: None,
                 steer_rx: Some(steer_rx),
                 follow_up_rx: Some(follow_up_rx),
                 retry: None,

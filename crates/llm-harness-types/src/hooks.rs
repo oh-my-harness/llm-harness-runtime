@@ -8,6 +8,7 @@ use crate::{
     CompactionResult, EntryId, RunContext, StopReason, StreamOptions, Tool, ToolFailure,
     ToolResult, TurnSnapshot,
 };
+use llm_adapter::LlmError;
 
 // ── FinalAnswerValidator ──────────────────────────────────────────────────────
 
@@ -266,6 +267,56 @@ pub struct AfterProviderResponseCtx<'a> {
 pub trait AfterProviderResponseHook: Send + Sync {
     /// 在收到 provider 响应后调用（纯观测，无返回值）。
     fn after_response<'a>(&'a self, ctx: AfterProviderResponseCtx<'a>) -> BoxFuture<'a, ()>;
+}
+
+// ── ProviderErrorHook ─────────────────────────────────────────────────────────
+
+/// 传递给 `ProviderErrorHook::on_provider_error` 的上下文。
+///
+/// 提供双视图：`context` 是 loop 持有的完整对话历史，`new_messages` 是本次
+/// run 新增消息的镜像（随 `AgentEnd` 返回给调用方）。修复动作必须同时作用于
+/// 两者，否则 provider 请求与 `AgentEnd` 载荷会不一致。二者是**不相交**的
+/// 可变借用，可在一次调用中并行修改。
+pub struct ProviderErrorCtx<'a> {
+    /// 当前 run 上下文。
+    pub run: &'a RunContext,
+    /// 出错请求对应的 turn 编号（从 0 开始）。
+    pub turn_index: u32,
+    /// 触发本 hook 的 provider 错误（非瞬态重试耗尽后的原值）。
+    pub error: &'a LlmError,
+    /// loop 持有的完整对话历史（可原地修复）。
+    pub context: &'a mut AgentContext,
+    /// 本次 run 新增消息的镜像（随 `AgentEnd` 返回；与 `context.messages`
+    /// 不相交）。
+    pub new_messages: &'a mut [AgentMessage],
+}
+
+/// `ProviderErrorHook::on_provider_error` 的返回决策。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorDirective {
+    /// 修复完成后同轮重试（`turn_index` 不变）。
+    Retry,
+    /// 修复完成后原样上抛错误，loop 结束。
+    Surface,
+}
+
+/// Provider 非瞬态错误（重试耗尽后仍失败）的修复 hook。
+///
+/// 典型用途：文本-only provider 拒绝携带 image/document 块的请求时，剥离
+/// 历史中的视觉块并重试（见 `llm-harness-strategy` 的 `VisionDegradeHook`）。
+/// 未挂载时错误原样上抛，行为与未引入本 hook 前一致。
+///
+/// # 终止责任
+///
+/// loop 对 `Retry` **不设重试上限**：hook 返回多少次 `Retry`，loop 就同轮
+/// 重试多少次。终止策略完全归 hook 作者负责——修复型 hook 应自持状态
+/// （如按 `run.id()` 记录“已修复过一次”），确保同一错误反复出现时最终返回
+/// `Surface`，否则 run 将永久停在该 turn（livelock）。
+pub trait ProviderErrorHook: Send + Sync {
+    /// 在 provider 错误即将上抛前调用；返回 `Retry` 则同轮重试。
+    ///
+    /// 实现方必须保证终止性：见 trait 文档的“终止责任”一节。
+    fn on_provider_error<'a>(&'a self, ctx: ProviderErrorCtx<'a>) -> BoxFuture<'a, ErrorDirective>;
 }
 
 // ── Turn 边界 Hooks ───────────────────────────────────────────────────────────

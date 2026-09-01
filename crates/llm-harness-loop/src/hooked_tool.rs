@@ -543,7 +543,7 @@ mod tests {
 
     #[tokio::test]
     async fn before_modify_changes_args() {
-        use std::sync::Mutex;
+        use parking_lot::Mutex;
         let received_args = Arc::new(Mutex::new(serde_json::Value::Null));
 
         struct ModifyHook;
@@ -577,7 +577,7 @@ mod tests {
                 args: serde_json::Value,
                 _: &'a ToolContext,
             ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
-                *self.received.lock().unwrap() = args;
+                *self.received.lock() = args;
                 Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
             }
         }
@@ -593,10 +593,7 @@ mod tests {
             .execute(serde_json::json!({"original": true}), &make_ctx())
             .await
             .unwrap();
-        assert_eq!(
-            *received_args.lock().unwrap(),
-            serde_json::json!({"modified": true})
-        );
+        assert_eq!(*received_args.lock(), serde_json::json!({"modified": true}));
     }
 
     #[tokio::test]

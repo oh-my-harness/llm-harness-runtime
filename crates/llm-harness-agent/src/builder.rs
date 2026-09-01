@@ -30,8 +30,8 @@ use llm_harness_loop::{ConvertToLlmHook, FinalAnswerMode, LlmClient, RetryConfig
 use llm_harness_types::{
     AfterProviderResponseHook, AfterRunHook, AfterToolCallHook, AfterTurnHook, BeforeCompactHook,
     BeforeProviderRequestHook, BeforeRunHook, BeforeToolCallHook, BeforeTurnHook, ExecutionEnv,
-    FinalAnswerValidator, OnAbortHook, PrepareNextTurnHook, PricingProvider, ShouldStopHook,
-    StreamOptions, ThinkingLevel, Tool, ToolExecutionMode, TransformContextHook,
+    FinalAnswerValidator, OnAbortHook, PrepareNextTurnHook, PricingProvider, ProviderErrorHook,
+    ShouldStopHook, StreamOptions, ThinkingLevel, Tool, ToolExecutionMode, TransformContextHook,
 };
 
 use crate::harness::{UsageLedger, cost_hook::CostAccumulatorHook};
@@ -384,6 +384,14 @@ impl HarnessBuilder {
         self
     }
 
+    /// Register a `ProviderErrorHook` without wrapping it in a Plugin.
+    ///
+    /// Push semantics: appended to `hooks.provider_error`.
+    pub fn provider_error_hook(mut self, hook: Arc<dyn ProviderErrorHook>) -> Self {
+        self.hooks.provider_error.push(hook);
+        self
+    }
+
     /// Register a `BeforeCompactHook` without wrapping it in a Plugin.
     ///
     /// Push semantics: appended to `hooks.before_compact`.
@@ -413,6 +421,7 @@ impl HarnessBuilder {
         self.hooks
             .final_answer_validator
             .extend(hooks.final_answer_validator);
+        self.hooks.provider_error.extend(hooks.provider_error);
         self.hooks.before_compact.extend(hooks.before_compact);
         self.hooks.after_run.extend(hooks.after_run);
         self.hooks.on_abort.extend(hooks.on_abort);

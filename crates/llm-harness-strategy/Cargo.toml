@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+llm_adapter.workspace = true
 llm-harness-types.workspace = true
 llm-harness-agent.workspace = true
 futures.workspace = true

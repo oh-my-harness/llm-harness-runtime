@@ -1558,7 +1558,7 @@ async fn harness_uses_recall_context_without_persisting_it_to_current_session() 
         .unwrap();
 
     {
-        let requests = client.captured_requests.lock().unwrap();
+        let requests = client.captured_requests.lock();
         assert!(requests[0].messages().iter().any(|message| {
             matches!(
                 message,

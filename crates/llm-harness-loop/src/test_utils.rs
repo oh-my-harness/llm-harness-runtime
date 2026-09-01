@@ -1,9 +1,9 @@
 //! Test utilities — only available with the `test-utils` feature.
 
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use async_trait::async_trait;
 use futures::{stream, stream::BoxStream};
@@ -479,9 +479,9 @@ impl Provider for MockLlmClient {
     async fn chat_stream(&self, req: &ChatRequest) -> Result<StreamHandle, LlmError> {
         self.call_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.captured_requests.lock().unwrap().push(req.clone());
+        self.captured_requests.lock().push(req.clone());
         let response = {
-            let mut guard = self.responses.lock().unwrap();
+            let mut guard = self.responses.lock();
             if guard.is_empty() {
                 MockResponse::text("(no more mock responses)")
             } else {
