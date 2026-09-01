@@ -121,7 +121,7 @@ pub enum WorkflowError {
     #[error("step '{id}' failed: {source}")]
     StepFailed { id: String, source: anyhow::Error },
 
-    #[error("executor outcome recovery failed for '{execution_id}': {source}")]
+    #[error("executor outcome recovery failed for '{execution_id}': {source:#}")]
     ExecutorRecoveryFailed {
         execution_id: String,
         source: anyhow::Error,
