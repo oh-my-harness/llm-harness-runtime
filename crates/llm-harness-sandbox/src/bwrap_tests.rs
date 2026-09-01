@@ -59,6 +59,7 @@ fn shell_opts() -> ShellOptions<'static> {
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
+        max_output_bytes: None,
     }
 }
 
@@ -734,6 +735,7 @@ async fn shell_cannot_read_host_file_outside_allowlist() {
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
+        max_output_bytes: None,
     };
     let result = env.execute_shell(&cmd, opts).await.unwrap();
     assert!(
@@ -765,6 +767,7 @@ async fn shell_cannot_read_etc_passwd() {
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
+        max_output_bytes: None,
     };
     let result = env.execute_shell(cmd, opts).await.unwrap();
     assert!(
@@ -820,6 +823,7 @@ async fn empty_net_allowlist_blocks_network() {
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
+        max_output_bytes: None,
     };
     let result = env.execute_shell(cmd, opts).await.unwrap();
     assert!(
@@ -850,6 +854,7 @@ async fn host_credentials_not_inherited() {
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
+        max_output_bytes: None,
     };
     let result = env.execute_shell("env | sort", opts).await.unwrap();
 
@@ -891,6 +896,7 @@ async fn injected_env_vars_are_visible_in_sandbox() {
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
+        max_output_bytes: None,
     };
     let result = env
         .execute_shell("echo $MY_CUSTOM_VAR", opts)
@@ -925,6 +931,7 @@ async fn timeout_terminates_entire_process_tree() {
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
+        max_output_bytes: None,
     };
     let start = std::time::Instant::now();
     let result = env.execute_shell(cmd, opts).await;
@@ -968,6 +975,7 @@ async fn abort_cancels_running_command() {
             abort: abort_clone,
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
         env.execute_shell("sleep 30", opts).await
     });
@@ -1021,6 +1029,7 @@ async fn config_timeout_enforced_as_upper_bound() {
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
+        max_output_bytes: None,
     };
     let start = std::time::Instant::now();
     let result = env.execute_shell("sleep 10", opts).await;
@@ -1039,6 +1048,7 @@ async fn config_timeout_enforced_as_upper_bound() {
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
+        max_output_bytes: None,
     };
     let start2 = std::time::Instant::now();
     let result2 = env.execute_shell("sleep 10", opts2).await;
@@ -1131,6 +1141,7 @@ async fn shutdown_completes_with_unbounded_command() {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
         // This will be killed by shutdown; the result doesn't matter.
         let _ = env_clone.execute_shell("sleep 30", opts).await;
@@ -1191,6 +1202,7 @@ async fn cancellation_observed_while_queued() {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
         let _ = env_clone.execute_shell("sleep 5", opts).await;
     });
@@ -1315,6 +1327,7 @@ async fn shutdown_race_with_command_start() {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
         let _ = env_clone.execute_shell("sleep 30", opts).await;
     });
@@ -1373,6 +1386,7 @@ async fn dropped_future_kills_child() {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
         let _ = env_clone
             .execute_shell("sleep 3 && touch sentinel.txt", opts)
@@ -1429,6 +1443,7 @@ async fn reset_interrupts_running_command() {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
         let _ = env_clone.execute_shell("sleep 30", opts).await;
     });
@@ -1485,6 +1500,7 @@ async fn no_orphan_after_shutdown() {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
         let _ = env_clone
             .execute_shell("sleep 3 && touch sentinel_survivor.txt", opts)
@@ -1550,6 +1566,7 @@ async fn reset_linearizes_with_running_command() {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
         let _ = env_clone.execute_shell("sleep 60", opts).await;
     });
@@ -1608,6 +1625,7 @@ async fn dropped_future_guarantees_reap() {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
         let _ = env_clone
             .execute_shell("sleep 3 && touch sentinel_dropped.txt", opts)

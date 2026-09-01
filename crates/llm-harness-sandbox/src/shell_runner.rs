@@ -61,6 +61,163 @@ fn utf8_safe_boundary(bytes: &[u8]) -> usize {
     0
 }
 
+/// 保留 head/tail 的有界输出收集器。
+#[derive(Debug)]
+struct BoundedPipeCollector {
+    max_output_bytes: usize,
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    truncated_bytes: u64,
+}
+
+impl BoundedPipeCollector {
+    fn new(max_output_bytes: usize) -> Self {
+        let head_capacity = max_output_bytes / 2;
+        let tail_capacity = max_output_bytes - head_capacity;
+        Self {
+            head: Vec::with_capacity(head_capacity.min(4096)),
+            tail: Vec::with_capacity(tail_capacity.min(4096)),
+            max_output_bytes,
+            truncated_bytes: 0,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if self.max_output_bytes == 0 {
+            self.truncated_bytes = self.truncated_bytes.saturating_add(bytes.len() as u64);
+            return;
+        }
+
+        let head_capacity = self.max_output_bytes / 2;
+        let head_room = head_capacity.saturating_sub(self.head.len());
+        let head_len = head_room.min(bytes.len());
+        self.head.extend_from_slice(&bytes[..head_len]);
+        let bytes = &bytes[head_len..];
+        if bytes.is_empty() {
+            return;
+        }
+
+        let tail_capacity = self.max_output_bytes - head_capacity;
+        self.tail.extend_from_slice(bytes);
+        let overflow = self.tail.len().saturating_sub(tail_capacity);
+        if overflow > 0 {
+            self.truncated_bytes = self.truncated_bytes.saturating_add(overflow as u64);
+            self.tail.drain(..overflow);
+        }
+    }
+
+    fn snapshot(&self) -> (String, u64) {
+        let mut bytes = Vec::with_capacity(self.head.len() + self.tail.len());
+        bytes.extend_from_slice(&self.head);
+        bytes.extend_from_slice(&self.tail);
+        (
+            String::from_utf8_lossy(&bytes).into_owned(),
+            self.truncated_bytes,
+        )
+    }
+}
+
+#[cfg(test)]
+mod bounded_collector_tests {
+    use super::*;
+
+    #[test]
+    fn collector_keeps_head_and_tail_with_accurate_drop_count() {
+        let mut collector = BoundedPipeCollector::new(6);
+        collector.push(b"01234567");
+        let (output, truncated) = collector.snapshot();
+
+        assert_eq!(output, "012567");
+        assert_eq!(truncated, 2);
+    }
+
+    #[test]
+    fn zero_limit_discards_all_output() {
+        let mut collector = BoundedPipeCollector::new(0);
+        collector.push(b"abc");
+        let (output, truncated) = collector.snapshot();
+
+        assert_eq!(output, "");
+        assert_eq!(truncated, 3);
+    }
+
+    #[tokio::test]
+    async fn stream_callback_receives_unbounded_stream() {
+        let collector: SharedPipeCollector =
+            std::sync::Arc::new(std::sync::Mutex::new(BoundedPipeCollector::new(4)));
+        let chunks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback_chunks = std::sync::Arc::clone(&chunks);
+        let callback = Box::new(move |chunk: &str| {
+            callback_chunks.lock().unwrap().push(chunk.to_string());
+        });
+
+        drain_pipe(Some(&mut &b"0123456789"[..]), collector, Some(callback))
+            .await
+            .unwrap();
+
+        assert_eq!(chunks.lock().unwrap().join(""), "0123456789");
+    }
+}
+
+type SharedPipeCollector = std::sync::Arc<std::sync::Mutex<BoundedPipeCollector>>;
+type ShellCallback<'a> = Box<dyn FnMut(&str) + Send + 'a>;
+
+fn snapshot_pipe(collector: &SharedPipeCollector) -> (String, u64) {
+    collector
+        .lock()
+        .expect("shell output collector mutex poisoned")
+        .snapshot()
+}
+
+async fn drain_pipe<'a, R>(
+    stream: Option<&mut R>,
+    collector: SharedPipeCollector,
+    callback: Option<ShellCallback<'a>>,
+) -> Result<(), EnvError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut carry = Vec::new();
+    let Some(stream) = stream else {
+        return Ok(());
+    };
+    let mut callback = callback;
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read_len = stream.read(&mut chunk).await.map_err(EnvError::Io)?;
+        if read_len == 0 {
+            break;
+        }
+
+        let bytes = &chunk[..read_len];
+        collector
+            .lock()
+            .expect("shell output collector mutex poisoned")
+            .push(bytes);
+
+        if let Some(callback) = callback.as_deref_mut() {
+            carry.extend_from_slice(bytes);
+            let split = utf8_safe_boundary(&carry);
+            if split > 0 {
+                callback(&String::from_utf8_lossy(&carry[..split]));
+                carry.drain(..split);
+            } else if carry.len() >= 4 {
+                callback(&String::from_utf8_lossy(&carry));
+                carry.clear();
+            }
+        }
+    }
+
+    if let Some(mut callback) = callback
+        && !carry.is_empty()
+    {
+        callback(&String::from_utf8_lossy(&carry));
+    }
+    Ok(())
+}
+
 /// Drain stdout/stderr from an already-spawned child process, applying
 /// timeout and abort semantics.
 ///
@@ -72,97 +229,106 @@ pub async fn drain_child_output(
 ) -> Result<ShellOutput, EnvError> {
     let mut stdout_handle = child.stdout.take();
     let mut stderr_handle = child.stderr.take();
+    let max_output_bytes = opts
+        .max_output_bytes
+        .unwrap_or(ShellOptions::DEFAULT_MAX_OUTPUT_BYTES);
+    let stdout_collector: SharedPipeCollector = std::sync::Arc::new(std::sync::Mutex::new(
+        BoundedPipeCollector::new(max_output_bytes),
+    ));
+    let stderr_collector: SharedPipeCollector = std::sync::Arc::new(std::sync::Mutex::new(
+        BoundedPipeCollector::new(max_output_bytes),
+    ));
 
-    macro_rules! drain_pipe {
-        ($handle:expr, $cb:expr) => {
-            async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::with_capacity(4096);
-                let mut carry = Vec::new();
-                if let Some(h) = $handle.as_mut() {
-                    let mut chunk = [0u8; 4096];
-                    loop {
-                        let n = h.read(&mut chunk).await.map_err(EnvError::Io)?;
-                        if n == 0 {
-                            break;
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                        if let Some(cb) = $cb.as_deref_mut() {
-                            carry.extend_from_slice(&chunk[..n]);
-                            let split = utf8_safe_boundary(&carry);
-                            let s = String::from_utf8_lossy(&carry[..split]);
-                            cb(&s);
-                            carry = carry[split..].to_vec();
-                        }
-                    }
-                }
-                if let Some(cb) = $cb.as_deref_mut() {
-                    if !carry.is_empty() {
-                        let s = String::from_utf8_lossy(&carry);
-                        cb(&s);
-                    }
-                }
-                Ok::<String, EnvError>(String::from_utf8_lossy(&buf).into_owned())
-            }
-        };
-    }
-
-    let mut on_stdout = opts.on_stdout;
-    let mut on_stderr = opts.on_stderr;
+    let on_stdout = opts.on_stdout;
+    let on_stderr = opts.on_stderr;
     let drain = async {
-        let stdout_task = drain_pipe!(stdout_handle, on_stdout);
-        let stderr_task = drain_pipe!(stderr_handle, on_stderr);
+        let stdout_task = drain_pipe(
+            stdout_handle.as_mut(),
+            std::sync::Arc::clone(&stdout_collector),
+            on_stdout,
+        );
+        let stderr_task = drain_pipe(
+            stderr_handle.as_mut(),
+            std::sync::Arc::clone(&stderr_collector),
+            on_stderr,
+        );
         let (stdout_res, stderr_res) = tokio::join!(stdout_task, stderr_task);
-        let stdout = stdout_res?;
-        let stderr = stderr_res?;
+        stdout_res?;
+        stderr_res?;
         let status = child.wait().await.map_err(EnvError::Io)?;
-        Ok::<_, EnvError>((stdout, stderr, status))
+        let (stdout, stdout_truncated_bytes) = snapshot_pipe(&stdout_collector);
+        let (stderr, stderr_truncated_bytes) = snapshot_pipe(&stderr_collector);
+        Ok::<_, EnvError>((
+            stdout,
+            stderr,
+            stdout_truncated_bytes,
+            stderr_truncated_bytes,
+            status,
+        ))
     };
 
-    let (stdout, stderr, status) = if let Some(timeout) = opts.timeout {
-        tokio::select! {
-            biased;
-            _ = opts.abort.cancelled() => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                return Err(EnvError::Aborted);
-            }
-            res = tokio::time::timeout(timeout, drain) => match res {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
+    let (stdout, stderr, stdout_truncated_bytes, stderr_truncated_bytes, status) =
+        if let Some(timeout) = opts.timeout {
+            tokio::select! {
+                biased;
+                _ = opts.abort.cancelled() => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    return Err(e);
-                }
-                Err(_) => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    return Err(EnvError::ShellFailed {
-                        exit_code: -1,
-                        stdout: String::new(),
-                        stderr: "timeout".into(),
+                    let (stdout, stdout_truncated_bytes) = snapshot_pipe(&stdout_collector);
+                    let (stderr, stderr_truncated_bytes) = snapshot_pipe(&stderr_collector);
+                    return Err(EnvError::ShellAborted {
+                        stdout,
+                        stderr,
+                        stdout_truncated_bytes,
+                        stderr_truncated_bytes,
                     });
                 }
-            },
-        }
-    } else {
-        tokio::select! {
-            biased;
-            _ = opts.abort.cancelled() => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                return Err(EnvError::Aborted);
+                res = tokio::time::timeout(timeout, drain) => match res {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        let (stdout, stdout_truncated_bytes) = snapshot_pipe(&stdout_collector);
+                        let (stderr, stderr_truncated_bytes) = snapshot_pipe(&stderr_collector);
+                        return Err(EnvError::ShellTimeout {
+                            stdout,
+                            stderr,
+                            stdout_truncated_bytes,
+                            stderr_truncated_bytes,
+                        });
+                    }
+                },
             }
-            res = drain => match res {
-                Ok(v) => v,
-                Err(e) => {
+        } else {
+            tokio::select! {
+                biased;
+                _ = opts.abort.cancelled() => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    return Err(e);
+                    let (stdout, stdout_truncated_bytes) = snapshot_pipe(&stdout_collector);
+                    let (stderr, stderr_truncated_bytes) = snapshot_pipe(&stderr_collector);
+                    return Err(EnvError::ShellAborted {
+                        stdout,
+                        stderr,
+                        stdout_truncated_bytes,
+                        stderr_truncated_bytes,
+                    });
                 }
-            },
-        }
-    };
+                res = drain => match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        return Err(e);
+                    }
+                },
+            }
+        };
 
     #[cfg(target_os = "windows")]
     let (stdout, stderr) = (stdout.replace("\r\n", "\n"), stderr.replace("\r\n", "\n"));
@@ -172,15 +338,172 @@ pub async fn drain_child_output(
             exit_code: status.code().unwrap_or(-1),
             stdout,
             stderr,
+            stdout_truncated_bytes,
+            stderr_truncated_bytes,
         })
     } else {
         Ok(ShellOutput {
             stdout,
             stderr,
             exit_code: status.code().unwrap_or(0),
+            stdout_truncated_bytes,
+            stderr_truncated_bytes,
         })
     }
 }
+
+#[cfg(all(test, unix))]
+mod bounded_drain_tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn spawn_shell(script: &str) -> tokio::process::Child {
+        tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    fn bounded_opts(
+        max_output_bytes: usize,
+        timeout: Option<Duration>,
+        abort: CancellationToken,
+    ) -> ShellOptions<'static> {
+        ShellOptions {
+            cwd: None,
+            env: vec![],
+            timeout,
+            abort,
+            on_stdout: None,
+            on_stderr: None,
+            max_output_bytes: Some(max_output_bytes),
+        }
+    }
+
+    fn expect_error(result: Result<ShellOutput, EnvError>) -> EnvError {
+        match result {
+            Ok(output) => panic!("expected shell error, got exit code {}", output.exit_code),
+            Err(error) => error,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_command_returns_bounded_head_and_tail() {
+        let child = spawn_shell("printf 0123456789; exit 3").await;
+        let error = expect_error(
+            drain_child_output(child, bounded_opts(10, None, CancellationToken::new())).await,
+        );
+
+        match error {
+            EnvError::ShellFailed {
+                exit_code,
+                stdout,
+                stdout_truncated_bytes,
+                ..
+            } => {
+                assert_eq!(exit_code, 3);
+                assert_eq!(stdout, "0123456789");
+                assert_eq!(stdout_truncated_bytes, 0);
+            }
+            other => panic!("expected ShellFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_output_is_bounded_without_blocking_child() {
+        let child = spawn_shell("printf 0123456789; exit 3").await;
+        let error = expect_error(
+            drain_child_output(child, bounded_opts(4, None, CancellationToken::new())).await,
+        );
+
+        match error {
+            EnvError::ShellFailed {
+                stdout,
+                stdout_truncated_bytes,
+                ..
+            } => {
+                assert_eq!(stdout, "0189");
+                assert_eq!(stdout_truncated_bytes, 6);
+            }
+            other => panic!("expected ShellFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_bounded_partial_output() {
+        let child = spawn_shell("echo early; sleep 30").await;
+        let result = drain_child_output(
+            child,
+            bounded_opts(
+                1024,
+                Some(Duration::from_millis(50)),
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+        let error = expect_error(result);
+
+        match error {
+            EnvError::ShellTimeout { stdout, stderr, .. } => {
+                assert_eq!(stdout.trim_end(), "early");
+                assert_eq!(stderr, "");
+            }
+            other => panic!("expected ShellTimeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_returns_bounded_partial_output() {
+        let abort = CancellationToken::new();
+        let child = spawn_shell("echo early; sleep 30").await;
+        let abort_callback = abort.clone();
+        let mut opts = bounded_opts(1024, None, abort);
+        opts.on_stdout = Some(Box::new(move |_chunk: &str| {
+            abort_callback.cancel();
+        }));
+        let result = drain_child_output(child, opts).await;
+
+        match expect_error(result) {
+            EnvError::ShellAborted { stdout, stderr, .. } => {
+                assert_eq!(stdout.trim_end(), "early");
+                assert_eq!(stderr, "");
+            }
+            other => panic!("expected ShellAborted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn guarded_path_bounds_output() {
+        let child = spawn_shell("printf 0123456789; exit 3").await;
+        let reaper = init_reaper(&default_spawner).unwrap();
+        reaper.core.set_scanner_interval(Duration::from_millis(10));
+        let admission = reaper.try_admit().unwrap();
+        let lease = admission.into_lease(child);
+        let result = drain_child_output_guarded(
+            lease,
+            bounded_opts(4, None, CancellationToken::new()),
+            CancellationToken::new(),
+        )
+        .await;
+        let error = expect_error(result);
+
+        match error {
+            EnvError::ShellFailed {
+                stdout,
+                stdout_truncated_bytes,
+                ..
+            } => {
+                assert_eq!(stdout, "0189");
+                assert_eq!(stdout_truncated_bytes, 6);
+            }
+            other => panic!("expected ShellFailed, got {other:?}"),
+        }
+    }
+}
+
 // ── Guarded drain with shutdown token + guaranteed reap ────────────────────
 
 /// Bounded capacity of the reaper queue.  Also bounds total in-flight
@@ -1653,100 +1976,115 @@ pub fn drain_child_output_guarded(
     let mut stdout_handle = lease.take_stdout();
     let mut stderr_handle = lease.take_stderr();
 
-    macro_rules! drain_pipe {
-        ($handle:expr, $cb:expr) => {
-            async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::with_capacity(4096);
-                let mut carry = Vec::new();
-                if let Some(h) = $handle.as_mut() {
-                    let mut chunk = [0u8; 4096];
-                    loop {
-                        let n = h.read(&mut chunk).await.map_err(EnvError::Io)?;
-                        if n == 0 {
-                            break;
-                        }
-                        buf.extend_from_slice(&chunk[..n]);
-                        if let Some(cb) = $cb.as_deref_mut() {
-                            carry.extend_from_slice(&chunk[..n]);
-                            let split = utf8_safe_boundary(&carry);
-                            let s = String::from_utf8_lossy(&carry[..split]);
-                            cb(&s);
-                            carry = carry[split..].to_vec();
-                        }
-                    }
-                }
-                if let Some(cb) = $cb.as_deref_mut() {
-                    if !carry.is_empty() {
-                        let s = String::from_utf8_lossy(&carry);
-                        cb(&s);
-                    }
-                }
-                Ok::<String, EnvError>(String::from_utf8_lossy(&buf).into_owned())
-            }
-        };
-    }
-
     async move {
-        let mut on_stdout = opts.on_stdout;
-        let mut on_stderr = opts.on_stderr;
+        let max_output_bytes = opts
+            .max_output_bytes
+            .unwrap_or(ShellOptions::DEFAULT_MAX_OUTPUT_BYTES);
+        let stdout_collector: SharedPipeCollector = std::sync::Arc::new(std::sync::Mutex::new(
+            BoundedPipeCollector::new(max_output_bytes),
+        ));
+        let stderr_collector: SharedPipeCollector = std::sync::Arc::new(std::sync::Mutex::new(
+            BoundedPipeCollector::new(max_output_bytes),
+        ));
+        let on_stdout = opts.on_stdout;
+        let on_stderr = opts.on_stderr;
         let drain = async {
-            let stdout_task = drain_pipe!(stdout_handle, on_stdout);
-            let stderr_task = drain_pipe!(stderr_handle, on_stderr);
+            let stdout_task = drain_pipe(
+                stdout_handle.as_mut(),
+                std::sync::Arc::clone(&stdout_collector),
+                on_stdout,
+            );
+            let stderr_task = drain_pipe(
+                stderr_handle.as_mut(),
+                std::sync::Arc::clone(&stderr_collector),
+                on_stderr,
+            );
             let (stdout_res, stderr_res) = tokio::join!(stdout_task, stderr_task);
-            let stdout = stdout_res?;
-            let stderr = stderr_res?;
+            stdout_res?;
+            stderr_res?;
             let status = lease.wait().await.map_err(EnvError::Io)?;
-            Ok::<_, EnvError>((stdout, stderr, status))
+            let (stdout, stdout_truncated_bytes) = snapshot_pipe(&stdout_collector);
+            let (stderr, stderr_truncated_bytes) = snapshot_pipe(&stderr_collector);
+            Ok::<_, EnvError>((
+                stdout,
+                stderr,
+                stdout_truncated_bytes,
+                stderr_truncated_bytes,
+                status,
+            ))
         };
 
-        let (stdout, stderr, status) = if let Some(timeout) = opts.timeout {
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => {
-                    lease.kill_and_wait().await;
-                    return Err(EnvError::Other("sandbox is shutting down".into()));
-                }
-                _ = opts.abort.cancelled() => {
-                    lease.kill_and_wait().await;
-                    return Err(EnvError::Aborted);
-                }
-                res = tokio::time::timeout(timeout, drain) => match res {
-                    Ok(Ok(v)) => v,
-                    Ok(Err(e)) => {
+        let (stdout, stderr, stdout_truncated_bytes, stderr_truncated_bytes, status) =
+            if let Some(timeout) = opts.timeout {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
                         lease.kill_and_wait().await;
-                        return Err(e);
+                        return Err(EnvError::Other("sandbox is shutting down".into()));
                     }
-                    Err(_) => {
+                    _ = opts.abort.cancelled() => {
                         lease.kill_and_wait().await;
-                        return Err(EnvError::ShellFailed {
-                            exit_code: -1,
-                            stdout: String::new(),
-                            stderr: "timeout".into(),
+                        let (partial_stdout, partial_stdout_truncated) =
+                            snapshot_pipe(&stdout_collector);
+                        let (partial_stderr, partial_stderr_truncated) =
+                            snapshot_pipe(&stderr_collector);
+                        return Err(EnvError::ShellAborted {
+                            stdout: partial_stdout,
+                            stderr: partial_stderr,
+                            stdout_truncated_bytes: partial_stdout_truncated,
+                            stderr_truncated_bytes: partial_stderr_truncated,
                         });
                     }
-                },
-            }
-        } else {
-            tokio::select! {
-                biased;
-                _ = shutdown.cancelled() => {
-                    lease.kill_and_wait().await;
-                    return Err(EnvError::Other("sandbox is shutting down".into()));
+                    res = tokio::time::timeout(timeout, drain) => match res {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(e)) => {
+                            lease.kill_and_wait().await;
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            lease.kill_and_wait().await;
+                            let (partial_stdout, partial_stdout_truncated) =
+                                snapshot_pipe(&stdout_collector);
+                            let (partial_stderr, partial_stderr_truncated) =
+                                snapshot_pipe(&stderr_collector);
+                            return Err(EnvError::ShellTimeout {
+                                stdout: partial_stdout,
+                                stderr: partial_stderr,
+                                stdout_truncated_bytes: partial_stdout_truncated,
+                                stderr_truncated_bytes: partial_stderr_truncated,
+                            });
+                        }
+                    },
                 }
-                _ = opts.abort.cancelled() => {
-                    lease.kill_and_wait().await;
-                    return Err(EnvError::Aborted);
-                }
-                res = drain => match res {
-                    Ok(v) => v,
-                    Err(e) => {
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
                         lease.kill_and_wait().await;
-                        return Err(e);
+                        return Err(EnvError::Other("sandbox is shutting down".into()));
                     }
-                },
-            }
-        };
+                    _ = opts.abort.cancelled() => {
+                        lease.kill_and_wait().await;
+                        let (partial_stdout, partial_stdout_truncated) =
+                            snapshot_pipe(&stdout_collector);
+                        let (partial_stderr, partial_stderr_truncated) =
+                            snapshot_pipe(&stderr_collector);
+                        return Err(EnvError::ShellAborted {
+                            stdout: partial_stdout,
+                            stderr: partial_stderr,
+                            stdout_truncated_bytes: partial_stdout_truncated,
+                            stderr_truncated_bytes: partial_stderr_truncated,
+                        });
+                    }
+                    res = drain => match res {
+                        Ok(v) => v,
+                        Err(e) => {
+                            lease.kill_and_wait().await;
+                            return Err(e);
+                        }
+                    },
+                }
+            };
 
         // Child was reaped via wait() in the drain future.
         lease.confirm_exit();
@@ -1759,12 +2097,16 @@ pub fn drain_child_output_guarded(
                 exit_code: status.code().unwrap_or(-1),
                 stdout,
                 stderr,
+                stdout_truncated_bytes,
+                stderr_truncated_bytes,
             })
         } else {
             Ok(ShellOutput {
                 stdout,
                 stderr,
                 exit_code: status.code().unwrap_or(0),
+                stdout_truncated_bytes,
+                stderr_truncated_bytes,
             })
         }
     }
@@ -1827,6 +2169,7 @@ mod reap_tests {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         }
     }
 
@@ -2835,7 +3178,7 @@ mod reap_tests {
     #[test]
     #[cfg(unix)]
     fn cancellation_storm_stays_bounded() {
-        let reaper = ChildReaper::global().expect("global reaper");
+        let reaper = init_reaper(&default_spawner).unwrap();
 
         let mut pids = Vec::new();
         for _ in 0..32 {

@@ -416,6 +416,8 @@ impl ExecutionEnv for MockExecutionEnv {
                     stdout,
                     stderr: String::new(),
                     exit_code: 1,
+                    stdout_truncated_bytes: 0,
+                    stderr_truncated_bytes: 0,
                 })
             } else if let Some(rest) = trimmed.strip_prefix("__seq:") {
                 let n: usize = rest.parse().unwrap_or(0);
@@ -427,39 +429,49 @@ impl ExecutionEnv for MockExecutionEnv {
                     stdout,
                     stderr: String::new(),
                     exit_code: 0,
+                    stdout_truncated_bytes: 0,
+                    stderr_truncated_bytes: 0,
                 })
             } else if let Some(rest) = trimmed.strip_prefix("echo ") {
                 Ok(ShellOutput {
                     stdout: rest.to_string(),
                     stderr: String::new(),
                     exit_code: 0,
+                    stdout_truncated_bytes: 0,
+                    stderr_truncated_bytes: 0,
                 })
             } else if trimmed == "echo" {
                 Ok(ShellOutput {
                     stdout: String::new(),
                     stderr: String::new(),
                     exit_code: 0,
+                    stdout_truncated_bytes: 0,
+                    stderr_truncated_bytes: 0,
                 })
             } else if trimmed == "false" {
                 Err(EnvError::ShellFailed {
                     exit_code: 1,
                     stdout: String::new(),
                     stderr: String::new(),
+                    stdout_truncated_bytes: 0,
+                    stderr_truncated_bytes: 0,
                 })
             } else if trimmed == "__timeout__" {
-                // Simulate the OsEnv timeout contract: partial stdout + the
-                // "timeout" stderr sentinel. Used to verify BashTool routes
-                // timeouts to a sanitized tool failure.
-                Err(EnvError::ShellFailed {
-                    exit_code: -1,
+                // Simulate the drain-layer timeout contract: return the
+                // partial output captured before the child was killed.
+                Err(EnvError::ShellTimeout {
                     stdout: "partial output".to_string(),
                     stderr: "timeout".to_string(),
+                    stdout_truncated_bytes: 0,
+                    stderr_truncated_bytes: 0,
                 })
             } else {
                 Ok(ShellOutput {
                     stdout: String::new(),
                     stderr: String::new(),
                     exit_code: 0,
+                    stdout_truncated_bytes: 0,
+                    stderr_truncated_bytes: 0,
                 })
             }
         })

@@ -272,6 +272,7 @@ impl StepExecutor for ShellExecutor {
                         abort: ctx.abort.clone(),
                         on_stdout: None,
                         on_stderr: None,
+                        max_output_bytes: Some(self.max_output_bytes),
                     },
                 )
                 .await?;
@@ -1639,6 +1640,8 @@ mod tests {
                     stdout,
                     stderr: String::new(),
                     exit_code: 0,
+                    stdout_truncated_bytes: 0,
+                    stderr_truncated_bytes: 0,
                 })
             })
         }

@@ -148,24 +148,13 @@ impl Tool for BashTool {
                 abort: ctx.abort.clone(),
                 on_stdout: None,
                 on_stderr: None,
+                max_output_bytes: None,
             };
 
             let output = match ctx.env.execute_shell(command, opts).await {
                 Ok(o) => o,
                 Err(EnvError::Aborted) => return Err(ToolFailure::aborted()),
-                // The real `OsEnv` signals a command timeout as
-                // `EnvError::ShellFailed { exit_code: -1, stderr: "timeout" }`
-                // (env.rs:458-464; asserted by `execute_shell_timeout_returns_shell_failed`).
-                // Per spec (design.md line 157) a timeout must surface as a
-                // `ToolFailure` carrying no captured output — not as a normal
-                // `ToolResult`. We detect the timeout via the `stderr ==
-                // "timeout"` sentinel (OsEnv's documented contract) and route
-                // it to a sanitized execution failure.
-                Err(EnvError::ShellFailed {
-                    exit_code: _,
-                    stdout,
-                    stderr,
-                }) if stderr == "timeout" => {
+                Err(EnvError::ShellTimeout { stdout, stderr, .. }) => {
                     let mut msg = String::from("command timed out");
                     if !stdout.is_empty() {
                         msg.push_str("; stdout: ");
@@ -186,10 +175,14 @@ impl Tool for BashTool {
                     exit_code,
                     stdout,
                     stderr,
+                    stdout_truncated_bytes,
+                    stderr_truncated_bytes,
                 }) => ShellOutput {
                     stdout,
                     stderr,
                     exit_code,
+                    stdout_truncated_bytes,
+                    stderr_truncated_bytes,
                 },
                 Err(e) => return Err(ToolError::Execution(e.to_string()).into()),
             };

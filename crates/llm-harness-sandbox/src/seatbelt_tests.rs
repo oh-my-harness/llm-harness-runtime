@@ -52,6 +52,7 @@ fn shell_opts() -> ShellOptions<'static> {
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
+        max_output_bytes: None,
     }
 }
 
@@ -269,6 +270,7 @@ async fn shell_env_vars_injected() {
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
+        max_output_bytes: None,
     };
     let output = env.execute_shell("echo $TEST_VAR", opts).await.unwrap();
     assert_eq!(output.stdout.trim(), "injected");

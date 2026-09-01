@@ -117,12 +117,13 @@ impl Tool for CodeExecTool {
                 abort: ctx.abort.clone(),
                 on_stdout: None,
                 on_stderr: None,
+                max_output_bytes: None,
             };
 
             let output = match ctx.env.execute_shell(&shell_cmd, opts).await {
                 Ok(o) => o,
                 Err(EnvError::Aborted) => return Err(ToolFailure::aborted()),
-                Err(EnvError::ShellFailed { stderr, .. }) if stderr == "timeout" => {
+                Err(EnvError::ShellTimeout { .. }) => {
                     return Err(ToolFailure::new(
                         "execution_timeout",
                         "Code execution timed out.",
@@ -132,10 +133,14 @@ impl Tool for CodeExecTool {
                     exit_code,
                     stdout,
                     stderr,
+                    stdout_truncated_bytes,
+                    stderr_truncated_bytes,
                 }) => ShellOutput {
                     stdout,
                     stderr,
                     exit_code,
+                    stdout_truncated_bytes,
+                    stderr_truncated_bytes,
                 },
                 Err(e) => {
                     return Err(ToolFailure::new("execution_failed", e.to_string()));

@@ -159,11 +159,27 @@ pub enum EnvError {
     Aborted,
     #[error("invalid utf-8 in {0}")]
     InvalidUtf8(PathBuf),
+    #[error("shell command timed out")]
+    ShellTimeout {
+        stdout: String,
+        stderr: String,
+        stdout_truncated_bytes: u64,
+        stderr_truncated_bytes: u64,
+    },
+    #[error("shell command aborted")]
+    ShellAborted {
+        stdout: String,
+        stderr: String,
+        stdout_truncated_bytes: u64,
+        stderr_truncated_bytes: u64,
+    },
     #[error("shell command failed: exit {exit_code}")]
     ShellFailed {
         exit_code: i32,
         stdout: String,
         stderr: String,
+        stdout_truncated_bytes: u64,
+        stderr_truncated_bytes: u64,
     },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
