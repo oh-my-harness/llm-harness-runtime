@@ -278,6 +278,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn shutdown_cleans_restored_timer_journal_row() {
+        let temp = tempfile::tempdir().unwrap();
+        let timer_journal = TimeoutJournal::open(temp.path().join("timers.sqlite3")).unwrap();
+        let fire_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 60_000;
+        timer_journal
+            .schedule(&TimeoutRequest {
+                agent_id: AgentId::new("alice"),
+                key: Some("reminder:restart".into()),
+                task_id: None,
+                peer_id: None,
+                body: "check results".into(),
+                kind: TimeoutKind::SelfReminder,
+                fire_at_ms,
+            })
+            .unwrap();
+
+        let context = crate::social_context::SocialContext::with_journal(
+            10,
+            None,
+            Some(Arc::new(timer_journal.clone())),
+        )
+        .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(timer_journal.pending_count().unwrap(), 1);
+
+        context.cancel_all_timeouts();
+        assert_eq!(timer_journal.pending_count().unwrap(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn cancelled_timer_removes_journal_row() {
         let temp = tempfile::tempdir().unwrap();
         let journal = TimeoutJournal::open(temp.path().join("timers.sqlite3")).unwrap();

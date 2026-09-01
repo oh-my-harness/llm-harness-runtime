@@ -6,7 +6,7 @@
 //! activity tab. No task-state-machine modeling: the projection only
 //! reports facts the team itself produces.
 
-use llm_harness_agent_team::{AgentId, AgentTeam};
+use llm_harness_agent_team::{AgentId, AgentTeam, SocialContext};
 
 use crate::roles::ROLE_IDS;
 
@@ -144,12 +144,21 @@ pub fn pending_traffic(team: &AgentTeam) -> serde_json::Value {
     serde_json::json!({ "pending": pending })
 }
 
+/// Number of live timer tasks owned by the team's social context.
+pub fn pending_timers(team: &AgentTeam) -> usize {
+    team.social_context()
+        .map(SocialContext::pending_timer_count)
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::roles::ModelTier;
+    use llm_harness_agent_team::TimeoutManager;
     use llm_harness_loop::test_utils::MockLlmClient;
     use std::sync::Arc;
+    use std::time::Duration;
 
     async fn built_team() -> AgentTeam {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -210,5 +219,36 @@ mod tests {
         assert_eq!(pending[0]["to"], "planner");
         assert!(pending[0]["body"].as_str().unwrap().contains("fix the bug"));
         team.shutdown();
+    }
+
+    #[tokio::test]
+    async fn pending_timer_count_tracks_active_timers() {
+        let mut team = built_team().await;
+        let ctx = team.social_context().unwrap().clone();
+        let timer = TimeoutManager::new(ctx.clone());
+        timer
+            .set_self_reminder_durably(
+                AgentId::new("planner"),
+                "check review results",
+                Duration::from_millis(10),
+                Some("review-check".into()),
+            )
+            .unwrap();
+
+        assert_eq!(pending_timers(&team), 1);
+        timer
+            .set_self_reminder_durably(
+                AgentId::new("planner"),
+                "check again",
+                Duration::from_millis(10),
+                Some("review-check".into()),
+            )
+            .unwrap();
+        assert_eq!(pending_timers(&team), 1, "same key replaces the timer");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pending_timers(&team), 0, "fired timers are removed");
+        team.shutdown();
+        assert_eq!(pending_timers(&team), 0, "shutdown aborts pending timers");
     }
 }

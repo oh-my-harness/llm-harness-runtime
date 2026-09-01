@@ -16,6 +16,7 @@
   .project:hover { border-color: var(--accent); }
   .project.selected { background: color-mix(in srgb, var(--accent) 12%, transparent); border-color: var(--accent); }
   .project .repo { font-size: .7rem; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .project .restart-btn { margin-top: .35rem; margin-right: .35rem; padding: .15rem .55rem; font-size: .68rem; background: var(--accent); }
   form { margin-top: auto; display: flex; flex-direction: column; gap: .4rem; border-top: 1px solid var(--border); padding-top: .75rem; }
   input { padding: .4rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); font-size: .8rem; }
   button { padding: .4rem .8rem; border: none; border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; font-size: .8rem; }
@@ -156,6 +157,7 @@
       <div class="pulse-card">
         <h3>Issue 概况</h3>
         <div id="pulse-issues"><p class="empty">—</p></div>
+        <div id="pulse-timers"><p class="empty">—</p></div>
       </div>
     </div>
   </section>
@@ -224,6 +226,18 @@ function renderProjects() {
     repo.textContent = pr.repo_path;
     repo.title = pr.repo_path;
     div.appendChild(repo);
+    const restart = document.createElement('button');
+    restart.textContent = '重启';
+    restart.className = 'restart-btn';
+    restart.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`重启项目 ${pr.id}？未完成的 inbox/timer 会被保留或清理到一致状态。`)) return;
+      const { status, json } = await api(`/api/team/projects/restart?id=${encodeURIComponent(pr.id)}`, { method: 'POST' });
+      if (status !== 200) alert('重启失败: ' + (json.error || status));
+      await loadProjects();
+      await loadPulse();
+    };
+    div.appendChild(restart);
     const del = document.createElement('button');
     del.textContent = '删除';
     del.className = 'del-btn';
@@ -462,6 +476,7 @@ async function loadPulse() {
     $('col-config').innerHTML = '';
     $('pulse-pending').innerHTML = '<p class="empty">—</p>';
     $('pulse-issues').innerHTML = '<p class="empty">—</p>';
+    $('pulse-timers').innerHTML = '<p class="empty">—</p>';
     return;
   }
   const { status, json } = await api(`/api/team/pulse?project=${encodeURIComponent(current)}`);
@@ -486,6 +501,9 @@ async function loadPulse() {
   const iss = json.issues || {};
   $('pulse-issues').innerHTML =
     `<div class="item"><span class="meta">待确认 ${iss.pending ?? 0} · 已确认 ${iss.confirmed ?? 0}</span></div>`;
+  const timers = json.timers || {};
+  $('pulse-timers').innerHTML =
+    `<div class="item"><span class="meta">活跃定时器 ${timers.pending ?? 0}</span></div>`;
 }
 
 // ── 左列：成员卡片 ──

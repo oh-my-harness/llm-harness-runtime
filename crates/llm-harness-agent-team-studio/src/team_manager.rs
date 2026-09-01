@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use llm_harness_agent_team::{AgentTeam, IndividualSpec, TeamError};
+use llm_harness_agent_team::{
+    AgentTeam, IndividualSpec, TeamError, TimeoutJournal, TimerJournalError,
+};
 use llm_harness_sandbox::OsEnv;
 use llm_harness_types::ExecutionEnv;
 
@@ -24,6 +26,8 @@ pub enum TeamManagerError {
     NotAGitRepo(PathBuf),
     #[error("unknown team: {0}")]
     UnknownTeam(String),
+    #[error("timer journal: {0}")]
+    TimerJournal(#[from] TimerJournalError),
     #[error("team already registered: {0}")]
     AlreadyRegistered(String),
     #[error(transparent)]
@@ -199,6 +203,33 @@ impl TeamManager {
         for (_, entry) in self.teams.drain() {
             shutdown_entry(entry);
         }
+    }
+
+    /// Cleanly stop and immediately rebuild one team from its persisted spec.
+    /// Pending timer rows are captured and rewritten so a deliberate restart
+    /// does not lose scheduled work.
+    pub async fn restart(
+        &mut self,
+        id: &str,
+        settings: &crate::settings::Settings,
+        api_key: &str,
+    ) -> Result<(), TeamManagerError> {
+        let entry = self
+            .teams
+            .get(id)
+            .ok_or_else(|| TeamManagerError::UnknownTeam(id.to_string()))?;
+        let spec = entry.spec.clone();
+        let repo_path = entry.repo_path.clone();
+        let timer_path = entry.data_dir().join("timers.sqlite3");
+        let pending_timers = TimeoutJournal::open(&timer_path)?.restore()?;
+
+        self.shutdown(id).await?;
+        let journal = TimeoutJournal::open(&timer_path)?;
+        for timer in pending_timers {
+            journal.schedule(&timer.request)?;
+        }
+        self.create(spec, repo_path, settings, api_key).await?;
+        Ok(())
     }
 
     /// Update one member: persona + role_label always hot-apply
@@ -952,6 +983,43 @@ mod tests {
             .clone();
         assert!(ctx.has_contact(&agent_a, &operator));
         assert!(!ctx.drain_inbox(&agent_a).is_empty());
+    }
+
+    #[tokio::test]
+    async fn restored_team_owns_pending_timer_journal_row() {
+        let _factory = install_mock_factory();
+        let root = unique_dir("ct-tm-timer-recovery");
+        let mut tm = TeamManager::new(&root);
+        tm.create(blank_spec(), Some(make_repo()), &settings(), "")
+            .await
+            .unwrap();
+        tm.shutdown_all().await;
+
+        let timer_path = root.join("teams/t/timers.sqlite3");
+        let timer_journal = llm_harness_agent_team::TimeoutJournal::open(&timer_path).unwrap();
+        timer_journal
+            .schedule(&llm_harness_agent_team::TimeoutRequest {
+                agent_id: llm_harness_agent_team::AgentId::new("a"),
+                key: Some("reminder:restart".into()),
+                task_id: None,
+                peer_id: None,
+                body: "check results".into(),
+                kind: llm_harness_agent_team::TimeoutKind::SelfReminder,
+                fire_at_ms: i64::MAX,
+            })
+            .unwrap();
+
+        let specs = list_persisted(&root);
+        let mut restored = TeamManager::new(&root);
+        let spec = specs.into_iter().next().unwrap();
+        restored
+            .create(spec.clone(), spec.repo_hint(), &settings(), "")
+            .await
+            .unwrap();
+
+        assert_eq!(timer_journal.pending_count().unwrap(), 1);
+        restored.shutdown_all().await;
+        assert_eq!(timer_journal.pending_count().unwrap(), 0);
     }
 
     #[test]
