@@ -944,11 +944,13 @@ pub fn spawn_operator_pump(
         loop {
             ctx.wait_for_message(&operator).await;
             for msg in ctx.drain_inbox(&operator) {
+                let message = msg.clone();
                 events.publish(crate::events::operator_event(
                     &pump_team_id,
                     msg.from.as_str(),
                     &msg.body,
                 ));
+                ctx.ack_inbox_messages(&[message]);
             }
         }
     });
