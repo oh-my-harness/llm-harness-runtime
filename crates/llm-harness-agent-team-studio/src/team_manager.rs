@@ -1064,6 +1064,97 @@ mod tests {
         tm.shutdown_all().await;
     }
 
+    #[tokio::test]
+    async fn operator_pump_acks_messages_after_publishing() {
+        let _factory = env_cfg::install_test_provider_factory(std::sync::Arc::new(|| {
+            vec![(
+                "m".into(),
+                std::sync::Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![
+                    llm_harness_loop::test_utils::MockResponse::tool_use_end_turn(
+                        "operator-1",
+                        "send_message",
+                        r#"{"to": "operator", "body": "operator ack test"}"#,
+                    ),
+                ])) as std::sync::Arc<dyn llm_harness_loop::LlmClient>,
+            )]
+        }));
+        let root = unique_dir("ct-tm-operator-ack");
+        let mut tm = TeamManager::new(&root);
+        tm.create(blank_spec(), Some(make_repo()), &settings(), "")
+            .await
+            .unwrap();
+
+        let ctx = tm.get("t").unwrap().team.social_context().unwrap().clone();
+        let events = crate::events::EventBus::new();
+        let mut event_rx = events.subscribe();
+        crate::routes::spawn_operator_pump(
+            Arc::new(events.clone()),
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            "t".into(),
+            ctx.clone(),
+        );
+
+        tm.get("t")
+            .unwrap()
+            .team
+            .submit("a", "produce operator ack test")
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match event_rx.try_recv() {
+                Ok(event)
+                    if event.contains("\"operator_msg\"")
+                        && event.contains("operator ack test") =>
+                {
+                    break;
+                }
+                _ => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "operator pump did not publish the message"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+
+        let journal_path = root.join("teams").join("t").join("inbox.sqlite3");
+        loop {
+            let journal = llm_harness_agent_team::InboxJournal::open(&journal_path).unwrap();
+            if journal.pending_count().unwrap() == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "operator pump did not ack the published message"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        tm.shutdown_all().await;
+        let specs = list_persisted(&root);
+        let mut restored = TeamManager::new(&root);
+        let spec = specs.into_iter().next().unwrap();
+        let repo_hint = spec.repo_hint();
+        restored
+            .create(spec, repo_hint, &settings(), "")
+            .await
+            .unwrap();
+        let restored_ctx = restored
+            .get("t")
+            .unwrap()
+            .team
+            .social_context()
+            .unwrap()
+            .clone();
+        assert!(
+            restored_ctx
+                .drain_inbox(&llm_harness_agent_team::AgentId::new("operator"))
+                .is_empty()
+        );
+    }
+
     #[test]
     fn list_persisted_reads_specs() {
         let root = unique_dir("ct-tm-list");

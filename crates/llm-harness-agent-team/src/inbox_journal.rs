@@ -125,6 +125,15 @@ impl InboxJournal {
         .collect()
     }
 
+    /// Number of messages that would be recovered on the next store build.
+    pub fn pending_count(&self) -> Result<usize, InboxJournalError> {
+        let connection = connect(&self.path)?;
+        let count = connection.query_row("SELECT count(*) FROM pending_messages", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
     pub fn ack(&self, id: i64) -> Result<bool, InboxJournalError> {
         let connection = connect(&self.path)?;
         let changed = connection.execute("DELETE FROM pending_messages WHERE id = ?1", [id])?;
