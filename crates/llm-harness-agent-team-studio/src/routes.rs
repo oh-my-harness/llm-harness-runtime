@@ -12,9 +12,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::task::AbortHandle;
+
+use parking_lot::Mutex;
 
 use crate::issue::IssueStatus;
 use crate::team_manager::{TeamManager, TeamManagerError, unpersist_spec};
@@ -35,6 +39,9 @@ pub struct AppState {
     /// Inspector harness registry — kept in sync so teams created /
     /// replaced at runtime are visible in the observation UI (I2).
     pub registry: Arc<llm_harness_inspector::state::HarnessRegistry>,
+    /// Live operator pump tasks, keyed by project id. Restarting a project
+    /// must abort the pump bound to the old `SocialContext`.
+    pub operator_pumps: Arc<Mutex<HashMap<String, AbortHandle>>>,
 }
 
 /// Shared handle to the manager (kept for direct consumers/tests).
@@ -209,6 +216,7 @@ async fn delete_project(State(state): State<AppState>, Query(q): Query<DeleteQue
     match pm.shutdown(&q.id).await {
         Ok(_) => {
             remove_team_from_registry(&state.registry, &q.id);
+            stop_operator_pump(&state.operator_pumps, &q.id);
             unpersist_spec(&state.data_root, &q.id);
             Json(serde_json::json!({ "ok": true })).into_response()
         }
@@ -926,22 +934,42 @@ async fn put_agent_config(
 /// spawned for teams created at runtime, not just startup teams).
 pub fn spawn_operator_pump(
     events: Arc<crate::events::EventBus>,
+    pumps: Arc<Mutex<HashMap<String, AbortHandle>>>,
     team_id: String,
     ctx: llm_harness_agent_team::SocialContext,
 ) {
-    tokio::spawn(async move {
+    let pump_team_id = team_id.clone();
+    let handle = tokio::spawn(async move {
         let operator = llm_harness_agent_team::AgentId::new("operator");
         loop {
             ctx.wait_for_message(&operator).await;
             for msg in ctx.drain_inbox(&operator) {
                 events.publish(crate::events::operator_event(
-                    &team_id,
+                    &pump_team_id,
                     msg.from.as_str(),
                     &msg.body,
                 ));
             }
         }
     });
+    register_operator_pump(&pumps, team_id, handle.abort_handle());
+}
+
+fn register_operator_pump(
+    pumps: &Arc<Mutex<HashMap<String, AbortHandle>>>,
+    team_id: String,
+    handle: AbortHandle,
+) {
+    let mut pumps = pumps.lock();
+    if let Some(old) = pumps.insert(team_id, handle) {
+        old.abort();
+    }
+}
+
+fn stop_operator_pump(pumps: &Arc<Mutex<HashMap<String, AbortHandle>>>, team_id: &str) {
+    if let Some(handle) = pumps.lock().remove(team_id) {
+        handle.abort();
+    }
 }
 
 /// Project one AgentMessage to a display line (kind + text).
@@ -1214,6 +1242,7 @@ async fn restart_project(State(state): State<AppState>, Query(q): Query<DeleteQu
 
     let mut pm = state.pm.write().await;
     remove_team_from_registry(&state.registry, &q.id);
+    stop_operator_pump(&state.operator_pumps, &q.id);
     let result = pm.restart(&q.id, &settings, &api_key).await;
     register_team_side_effects(&state, &pm, &q.id);
     match result {
@@ -1267,7 +1296,12 @@ fn register_team_side_effects(state: &AppState, pm: &TeamManager, team_id: &str)
         .get(team_id)
         .and_then(|entry| entry.team.social_context().cloned())
     {
-        spawn_operator_pump(state.events.clone(), team_id.to_string(), ctx);
+        spawn_operator_pump(
+            state.events.clone(),
+            state.operator_pumps.clone(),
+            team_id.to_string(),
+            ctx,
+        );
     }
 }
 
@@ -1362,6 +1396,7 @@ mod tests {
             scout_interval_secs: Arc::new(RwLock::new(0)),
             events: Arc::new(crate::events::EventBus::new()),
             registry: llm_harness_inspector::state::HarnessRegistry::new("default"),
+            operator_pumps: Arc::new(Mutex::new(HashMap::new())),
         };
         let router = team_router(state);
         (router, pm, make_repo(), _factory)
@@ -1427,6 +1462,39 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::json!(null));
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn restarting_replaces_registered_operator_pump() {
+        let events = Arc::new(crate::events::EventBus::new());
+        let mut rx = events.subscribe();
+        let pumps = Arc::new(Mutex::new(HashMap::new()));
+        let old_ctx = llm_harness_agent_team::SocialContext::new(10);
+        super::spawn_operator_pump(events.clone(), pumps.clone(), "p1".into(), old_ctx.clone());
+
+        let message = |body: &'static str| llm_harness_agent_team::InboxMessage {
+            journal_id: None,
+            from: AgentId::new("scout"),
+            to: AgentId::new("operator"),
+            body: body.into(),
+            message_type: llm_harness_agent_team::MessageType::Direct,
+            priority: 0,
+            task_id: None,
+            broadcast_id: None,
+        };
+        old_ctx.push_message(message("before restart")).unwrap();
+        assert!(rx.recv().await.unwrap().contains("before restart"));
+
+        super::spawn_operator_pump(
+            events,
+            pumps.clone(),
+            "p1".into(),
+            llm_harness_agent_team::SocialContext::new(10),
+        );
+        old_ctx.push_message(message("after restart")).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rx.try_recv().is_err(), "old pump must be aborted");
+        assert_eq!(pumps.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -1693,6 +1761,7 @@ mod tests {
             scout_interval_secs: Arc::new(RwLock::new(0)),
             events: bus,
             registry: llm_harness_inspector::state::HarnessRegistry::new("default"),
+            operator_pumps: Arc::new(Mutex::new(HashMap::new())),
         };
         let router2 = team_router(state);
         json_post(
