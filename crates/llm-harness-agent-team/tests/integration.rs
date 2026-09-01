@@ -371,7 +371,7 @@ async fn full_message_flow_through_team() {
     // Content integrity: a2's first LLM call must carry the delegated task
     // text — the operator → a1 → a2 body path, not just the wake-up.
     let a2_saw_task = {
-        let requests = a2_client.captured_requests.lock().unwrap();
+        let requests = a2_client.captured_requests.lock();
         requests.iter().any(|req| {
             req.messages().iter().any(|m| {
                 matches!(m, llm_harness_loop::LlmMessage::User(content) if content
@@ -385,7 +385,7 @@ async fn full_message_flow_through_team() {
     // a1 actually consumed the delegated acknowledgement: its second LLM
     // call ran after the delegation tool result.
     wait_until(
-        || a1_client.captured_requests.lock().unwrap().len() >= 2,
+        || a1_client.captured_requests.lock().len() >= 2,
         Duration::from_secs(5),
         "a1's follow-up run after delegation",
     )
@@ -425,7 +425,7 @@ async fn shutdown_cleans_pending_state() {
     // Two LLM calls: the tool-use turn plus the closing text turn — the
     // reminder is registered by the time the second completes.
     wait_until(
-        || a1_client.captured_requests.lock().unwrap().len() >= 2,
+        || a1_client.captured_requests.lock().len() >= 2,
         Duration::from_secs(10),
         "a1 to register the reminder and finish the run",
     )
@@ -435,9 +435,9 @@ async fn shutdown_cleans_pending_state() {
 
     // Quiet window straddling the 1s deadline: post-shutdown nothing may
     // fire into the dead inbox (the reminder would have fired ~1s in).
-    let before = a1_client.captured_requests.lock().unwrap().len();
+    let before = a1_client.captured_requests.lock().len();
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    let after = a1_client.captured_requests.lock().unwrap().len();
+    let after = a1_client.captured_requests.lock().len();
     assert_eq!(before, after, "no LLM activity may occur after shutdown");
 }
 
@@ -526,7 +526,6 @@ async fn broadcast_two_phase_aggregation() {
             let seen = a1_client
                 .captured_requests
                 .lock()
-                .unwrap()
                 .iter()
                 .flat_map(|req| req.messages().iter())
                 .any(|m| {

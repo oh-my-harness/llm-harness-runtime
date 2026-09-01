@@ -1503,7 +1503,7 @@ mod tests {
         .unwrap();
 
         let _ = result;
-        let captured = client.captured_requests.lock().unwrap();
+        let captured = client.captured_requests.lock();
         let req = &captured[0];
         // System prompt should be the custom one.
         let sys = req.messages().first().expect("has system message");
@@ -1578,7 +1578,7 @@ mod tests {
             .await
             .unwrap();
 
-        let captured = client.captured_requests.lock().unwrap();
+        let captured = client.captured_requests.lock();
         let req = &captured[0];
         let user_content = format!("{:?}", req.messages().get(1).expect("has user message"));
         assert!(
@@ -1683,7 +1683,7 @@ mod tests {
             .unwrap();
 
         // The LLM must have seen file operations in the user content.
-        let captured = client.captured_requests.lock().unwrap();
+        let captured = client.captured_requests.lock();
         let req = &captured[0];
         let user_content = format!("{:?}", req.messages().get(1).expect("has user message"));
         assert!(

@@ -2209,7 +2209,7 @@ async fn per_step_builder_overrides_shared_max_tokens() {
     // Priority is structurally guaranteed: shared closure (4096) → per-step
     // closure (8192). Last write wins on builder.
     // Verify the per-step override (8192) actually reached the ChatRequest.
-    let captured = client.captured_requests.lock().unwrap();
+    let captured = client.captured_requests.lock();
     assert_eq!(
         captured.len(),
         1,
@@ -3105,7 +3105,7 @@ async fn structured_step_upgrades_after_first_failure() {
         "upgrade path should consume two LLM calls"
     );
     // 验证第二轮请求确实注入了 JsonObject response_format（Layer 2 生效）。
-    let captured = client.captured_requests.lock().unwrap();
+    let captured = client.captured_requests.lock();
     assert_eq!(captured.len(), 2);
     assert!(
         captured[1].response_format().is_some(),
@@ -3254,7 +3254,7 @@ async fn structured_step_fails_when_provider_lacks_json_schema() {
         2,
         "supports=false: 1 failure turn + 1 Failed-confirmation turn"
     );
-    let captured = client.captured_requests.lock().unwrap();
+    let captured = client.captured_requests.lock();
     assert!(
         captured.iter().all(|r| r.response_format().is_none()),
         "supports=false: no turn should carry response_format"

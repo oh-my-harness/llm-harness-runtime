@@ -27,6 +27,7 @@ pub use memory_defense::{
     MemoryFileSet,
 };
 pub mod loop_safety;
+pub use loop_safety::vision_degrade::VisionDegradeHook;
 pub use loop_safety::{
     DeathSpiralGuardConfig, FailureCircuitBreakerConfig, LoopSafetyConfig, LoopSafetyPlugin,
     MaxTurnsConfig, RepetitionGuardConfig, TruncationContinuationConfig,

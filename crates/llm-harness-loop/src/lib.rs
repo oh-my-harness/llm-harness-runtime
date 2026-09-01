@@ -39,6 +39,7 @@
 //!     before_provider_request: None,
 //!     after_provider_response: None,
 //!     final_answer_validator: None,
+//!     provider_error: None,
 //!     steer_rx: None,
 //!     follow_up_rx: None,
 //!     retry: None,
@@ -102,6 +103,16 @@
 //! doubled per attempt). `stream_opts.max_retries` overrides
 //! `RetryConfig.max_retries` at runtime.
 //!
+//! ### Provider error repair (`provider_error: Option<Arc<dyn ProviderErrorHook>>`)
+//!
+//! `None` (default) = non-transient provider errors surface unchanged, exactly
+//! as before this hook existed. When set, the hook runs after transient-retry
+//! is exhausted (or the error was never retryable, e.g. `InvalidRequest`) and
+//! may repair history in place (both `ctx.context` and `ctx.new_messages`,
+//! which are disjoint `&mut` views) before returning `Retry` (same-turn retry,
+//! `turn_index` unchanged) or `Surface` (error propagates). See
+//! `llm-harness-strategy`'s `VisionDegradeHook` for the canonical use.
+//!
 //! ### Reactive injection
 //!
 //! | Field | Type | Notes |
@@ -160,6 +171,15 @@
 //! └─ ShouldStopHook (only on non-tool natural stop; return true to stop)
 //! ```
 //!
+//! Provider errors that survive transient retry invoke
+//! `ProviderErrorHook` (before surfacing the terminal `Error` event):
+//!
+//! ```text
+//! ┌─ [LLM call fails with non-transient error]
+//! ├─ ProviderErrorHook (repair history; Retry = same-turn retry, Surface = propagate)
+//! └─ [If Surface or unmounted] → AgentEvent::Error → AgentEnd
+//! ```
+//!
 //! `BeforeRunHook` fires once before the first turn (can inject messages and
 //! override system prompt). `BeforeCompactHook` fires when context compaction
 //! is triggered (harness layer, not bare loop).
@@ -180,6 +200,7 @@
 //! | `ShouldStopHook` | Decision | `true` = stop, `false` = force another turn |
 //! | `FinalAnswerValidator` | Decision | `Ok` = commit, `Err` = reject (loop breaks) |
 //! | `BeforeCompactHook` | Decision | `Proceed` / `Skip` / `Compact` / `Override(result)` |
+//! | `ProviderErrorHook` | Decision | Repair `AgentContext` in place; `Retry` / `Surface` |
 //!
 //! ### Composite hooks
 //!
@@ -262,9 +283,9 @@ pub mod test_utils;
 // Top-level re-exports
 pub use composite::{
     CompositeAfterProviderResponseHook, CompositeAfterRunHook, CompositeAfterToolCallHook,
-    CompositeAfterTurnHook, CompositeBeforeCompactHook, CompositeBeforeProviderRequestHook,
-    CompositeBeforeRunHook, CompositeBeforeToolCallHook, CompositeBeforeTurnHook,
-    CompositeFinalAnswerValidator, CompositePrepareNextTurnHook, CompositeShouldStopHook,
+    CompositeAfterTurnHook, CompositeBeforeProviderRequestHook, CompositeBeforeRunHook,
+    CompositeBeforeToolCallHook, CompositeBeforeTurnHook, CompositeFinalAnswerValidator,
+    CompositePrepareNextTurnHook, CompositeProviderErrorHook, CompositeShouldStopHook,
     CompositeTransformContextHook,
 };
 pub use config::{LoopConfig, RetryConfig};

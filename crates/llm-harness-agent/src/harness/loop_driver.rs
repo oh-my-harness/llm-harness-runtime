@@ -7,8 +7,8 @@ use llm_harness_loop::CompositePrepareNextTurnHook;
 use llm_harness_loop::{
     CompositeAfterProviderResponseHook, CompositeAfterToolCallHook, CompositeAfterTurnHook,
     CompositeBeforeProviderRequestHook, CompositeBeforeRunHook, CompositeBeforeToolCallHook,
-    CompositeBeforeTurnHook, CompositeFinalAnswerValidator, CompositeShouldStopHook,
-    CompositeTransformContextHook, HookedTool, LoopConfig, agent_loop,
+    CompositeBeforeTurnHook, CompositeFinalAnswerValidator, CompositeProviderErrorHook,
+    CompositeShouldStopHook, CompositeTransformContextHook, HookedTool, LoopConfig, agent_loop,
 };
 use llm_harness_types::*;
 use tokio::sync::mpsc;
@@ -254,6 +254,11 @@ impl AgentHarness {
                 Arc::new(CompositeFinalAnswerValidator::new(
                     self.hooks.final_answer_validator.clone(),
                 )) as Arc<dyn FinalAnswerValidator>
+            }),
+            provider_error: (!self.hooks.provider_error.is_empty()).then(|| {
+                Arc::new(CompositeProviderErrorHook::new(
+                    self.hooks.provider_error.clone(),
+                )) as Arc<dyn ProviderErrorHook>
             }),
             steer_rx: Some(steer_rx),
             follow_up_rx: Some(follow_up_rx),

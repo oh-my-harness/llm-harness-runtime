@@ -90,6 +90,9 @@ pub struct HarnessHooks {
     pub after_run: Vec<Arc<dyn AfterRunHook>>,
     /// Called when harness.abort() is invoked, before AfterRunHook.
     pub on_abort: Vec<Arc<dyn OnAbortHook>>,
+    /// Called when a non-transient provider error is about to surface;
+    /// may repair history and request a same-turn retry.
+    pub provider_error: Vec<Arc<dyn ProviderErrorHook>>,
 }
 impl HarnessHooks {
     /// All hooks absent (default state).
@@ -109,6 +112,7 @@ impl HarnessHooks {
             before_compact: vec![],
             after_run: vec![],
             on_abort: vec![],
+            provider_error: vec![],
         }
     }
 }

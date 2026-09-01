@@ -16,11 +16,15 @@ tokio-stream.workspace      = true
 tokio-util.workspace        = true
 uuid.workspace              = true
 chrono.workspace            = true
+parking_lot = { workspace = true, optional = true }
 fastrand.workspace            = true
 tracing.workspace             = true
 
 [features]
-test-utils = []
+test-utils = ["dep:parking_lot"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[dev-dependencies.parking_lot]
+workspace = true

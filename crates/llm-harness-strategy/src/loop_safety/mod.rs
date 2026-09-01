@@ -1,6 +1,6 @@
 //! Loop safety plugin — guards against pathological agent loops.
 //!
-//! This module hosts five loop-safety hooks (items 15–19):
+//! This module hosts six loop-safety hooks (items 15–20):
 //! - **Repetition guard** (15): detects repeated tool calls with identical args.
 //! - **Failure circuit breaker** (16): trips after N consecutive failures of the
 //!   same tool.
@@ -8,9 +8,11 @@
 //!   times using a continuation prompt.
 //! - **Death spiral guard** (18): stops the loop after N consecutive error turns.
 //! - **Max turns** (19): hard cap on total turn count.
+//! - **Vision degrade** (20): repairs text-only-provider rejections of
+//!   multimodal history (issue #145 gap 2) via the `ProviderErrorHook`.
 //!
 //! `mod.rs` provides the configuration types and the `LoopSafetyPlugin`
-//! entry point. All five hooks are registered by `register_hooks`.
+//! entry point. All hooks are registered by `register_hooks`.
 
 pub(crate) mod death_spiral;
 pub(crate) mod failure_breaker;
@@ -18,6 +20,7 @@ pub(crate) mod max_turns;
 pub(crate) mod repetition;
 pub(crate) mod state;
 pub(crate) mod truncation;
+pub(crate) mod vision_degrade;
 
 use death_spiral::DeathSpiralGuardHook;
 use failure_breaker::FailureCircuitBreakerHook;
@@ -25,6 +28,7 @@ use max_turns::MaxTurnsHook;
 use repetition::RepetitionGuardHook;
 pub(crate) use state::LoopSafetyState;
 use truncation::TruncationContinuationHook;
+use vision_degrade::VisionDegradeHook;
 
 use std::sync::Arc;
 
@@ -138,6 +142,8 @@ pub struct LoopSafetyConfig {
     pub death_spiral_guard: Option<DeathSpiralGuardConfig>,
     /// Item 19 — max turns. `None` = disabled.
     pub max_turns: Option<MaxTurnsConfig>,
+    /// Item 20 — vision degradation repair. `None` = disabled.
+    pub vision_degrade: Option<VisionDegradeConfig>,
 }
 
 impl LoopSafetyConfig {
@@ -149,6 +155,7 @@ impl LoopSafetyConfig {
             truncation_continuation: Some(TruncationContinuationConfig::default()),
             death_spiral_guard: Some(DeathSpiralGuardConfig::default()),
             max_turns: Some(MaxTurnsConfig::default()),
+            vision_degrade: Some(VisionDegradeConfig),
         }
     }
 
@@ -158,9 +165,26 @@ impl LoopSafetyConfig {
     }
 }
 
+/// Item 20 — vision degradation repair.
+///
+/// The strategy is fixed (strip visual blocks on `InvalidRequest`, retry once
+/// per run), so the config currently carries no tunables; it exists so the
+/// `LoopSafetyConfig` surface stays uniform and can grow knobs without a
+/// breaking change.
+#[derive(Clone, Debug, Default)]
+pub struct VisionDegradeConfig;
+
+impl VisionDegradeConfig {
+    /// Fresh hook instance. The hook keeps per-run one-shot state keyed by
+    /// `RunId` internally, so a new instance per plugin is correct.
+    fn hook(&self) -> Arc<VisionDegradeHook> {
+        Arc::new(VisionDegradeHook::new())
+    }
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
-/// Loop safety plugin: bundles the five loop-safety hooks behind a single
+/// Loop safety plugin: bundles the six loop-safety hooks behind a single
 /// configuration surface.
 ///
 /// Shared mutable state lives in `Arc<Mutex<LoopSafetyState>>` so that all
@@ -218,6 +242,9 @@ impl Plugin for LoopSafetyPlugin {
             hooks.should_stop.push(hook.clone());
             hooks.prepare_next_turn.push(hook);
         }
+        if let Some(cfg) = &self.config.vision_degrade {
+            hooks.provider_error.push(cfg.hook());
+        }
     }
 }
 
@@ -233,6 +260,7 @@ mod tests {
         assert!(cfg.truncation_continuation.is_some());
         assert!(cfg.death_spiral_guard.is_some());
         assert!(cfg.max_turns.is_some());
+        assert!(cfg.vision_degrade.is_some());
 
         // Spot-check a couple of defaults to guard against silent drift.
         assert_eq!(
@@ -256,6 +284,7 @@ mod tests {
         assert!(hooks.should_stop.is_empty());
         assert!(hooks.transform_context.is_empty());
         assert!(hooks.prepare_next_turn.is_empty());
+        assert!(hooks.provider_error.is_empty());
     }
 
     #[test]

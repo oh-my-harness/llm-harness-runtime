@@ -481,13 +481,17 @@ async fn scout_patrol_writes_issue_and_renews() {
     std::fs::create_dir_all(&issues_root).unwrap();
 
     let sequence = vec![
-        // Scout writes the issue with an absolute path...
+        // Scout writes the issue with an absolute path... Forward slashes
+        // only: a Windows temp path contains backslashes, which would be
+        // invalid JSON escapes inside the mock's raw args string (serde_json
+        // then degrades the whole input to {"_parse_error", "raw"} and the
+        // write never runs). Windows accepts forward slashes in paths.
         MockResponse::tool_use(
             "t1",
             "write",
             &format!(
                 r#"{{"path": "{}/I-009-todo-debt.md", "content": "---\nid: I-009\nstatus: pending\nsource: scout\ncreated: 2026-08-30T00:00:00Z\ntitle: TODO debt in executor\n---\n五处 TODO 未跟踪"}}"#,
-                issues_root.display()
+                issues_root.display().to_string().replace('\\', "/")
             ),
         ),
         // ...then schedules its own next patrol (self-renewal contract).
