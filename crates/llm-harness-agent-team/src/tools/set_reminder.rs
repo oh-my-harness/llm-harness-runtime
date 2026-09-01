@@ -77,12 +77,19 @@ impl SetReminderTool {
             .map(str::to_owned);
 
         let timer = TimeoutManager::new((*self.ctx).clone());
-        let replaced = timer.set_self_reminder(
-            self.agent_id.clone(),
-            reminder.to_string(),
-            Duration::from_secs(delay_secs),
-            task_id,
-        );
+        let replaced = timer
+            .set_self_reminder_durably(
+                self.agent_id.clone(),
+                reminder.to_string(),
+                Duration::from_secs(delay_secs),
+                task_id,
+            )
+            .map_err(|error| {
+                ToolFailure::new(
+                    "timer_journal_persistence_failed",
+                    format!("failed to persist reminder: {error}"),
+                )
+            })?;
 
         let mut msg = format!(
             "Self-reminder scheduled: in {}s you will be reminded: \"{reminder}\"",
@@ -175,6 +182,25 @@ mod tests {
             ctx.drain_inbox(&alice).is_empty(),
             "cancelled reminder must not fire"
         );
+    }
+
+    #[tokio::test]
+    async fn timer_journal_failure_is_explicit() {
+        let temp = tempfile::tempdir().unwrap();
+        let timer_path = temp.path().join("timers.sqlite3");
+        let timer_journal = crate::timer_journal::TimeoutJournal::open(&timer_path).unwrap();
+        let ctx = SocialContext::with_journal(10, None, Some(Arc::new(timer_journal))).unwrap();
+        let alice = AgentId::new("alice");
+        ctx.register_agent(alice.clone(), "rust");
+
+        std::fs::write(&timer_path, b"not a sqlite database").unwrap();
+        let tool = SetReminderTool::new(alice, Arc::new(ctx));
+        let error = tool
+            .call_inner(&serde_json::json!({"reminder":"check results","delay_secs":60}))
+            .unwrap_err();
+
+        assert_eq!(error.code, "timer_journal_persistence_failed");
+        assert!(error.to_string().contains("failed to persist reminder"));
     }
 
     #[tokio::test(start_paused = true)]

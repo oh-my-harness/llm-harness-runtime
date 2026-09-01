@@ -145,18 +145,25 @@ impl DelegateTaskTool {
             .and_then(super::parse_timeout_secs)
             .unwrap_or(self.timeout);
         let timer = TimeoutManager::new((*self.ctx).clone());
-        timer.set_timeout(
-            self.agent_id.clone(),
-            format!(
-                "Delegated task '{task_id_str}' to {to_str} has not received a reply \
-                 within {} seconds. Follow up: send a message to {to_str} to ask for a \
-                 status update, re-delegate, do it yourself, or proceed.",
-                timeout.as_secs()
-            ),
-            timeout,
-            Some(task_id_str.clone()),
-            Some(target_id.clone()),
-        );
+        timer
+            .set_timeout_durably(
+                self.agent_id.clone(),
+                format!(
+                    "Delegated task '{task_id_str}' to {to_str} has not received a reply \
+                     within {} seconds. Follow up: send a message to {to_str} to ask for a \
+                     status update, re-delegate, do it yourself, or proceed.",
+                    timeout.as_secs()
+                ),
+                timeout,
+                Some(task_id_str.clone()),
+                Some(target_id.clone()),
+            )
+            .map_err(|error| {
+                ToolFailure::new(
+                    "timer_journal_persistence_failed",
+                    format!("failed to persist delegation timeout: {error}"),
+                )
+            })?;
         let timeout_note = format!(" A {}s follow-up timer is set.", timeout.as_secs());
 
         Ok(format!(

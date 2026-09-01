@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use crate::AgentId;
+
 use crate::inbox::InboxMessage;
 
 const SCHEMA_VERSION: i64 = 1;
@@ -88,6 +90,22 @@ impl InboxJournal {
             [payload],
         )?;
         Ok(connection.last_insert_rowid())
+    }
+
+    pub(crate) fn has_timer_notification(
+        &self,
+        recipient: &AgentId,
+        task_id: Option<&str>,
+        body: &str,
+        message_type: crate::inbox::MessageType,
+    ) -> Result<bool, InboxJournalError> {
+        Ok(self.recover()?.into_iter().any(|pending| {
+            let message = pending.message;
+            &message.to == recipient
+                && message.body == body
+                && message.message_type == message_type
+                && message.task_id.as_deref() == task_id
+        }))
     }
 
     pub(crate) fn recover(&self) -> Result<Vec<PendingMessage>, InboxJournalError> {

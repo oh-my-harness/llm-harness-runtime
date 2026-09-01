@@ -19,6 +19,7 @@ mod relation;
 mod social_context;
 mod team;
 mod timeout_manager;
+mod timer_journal;
 pub mod tools;
 pub use agent_id::AgentId;
 
@@ -39,4 +40,5 @@ pub use social_context::{
 };
 pub use team::{AgentTeam, OperatorMessage, TeamConfig};
 pub use timeout_manager::TimeoutManager;
+pub use timer_journal::{TimeoutJournal, TimeoutRequest, TimerJournalError};
 pub use tools::SocialToolPlugin;

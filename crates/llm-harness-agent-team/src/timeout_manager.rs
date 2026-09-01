@@ -6,7 +6,7 @@
 //! queue as all other messages, so it's handled by the same injection paths
 //! (idle wake or monitor task → steer).
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -14,6 +14,7 @@ use tracing::debug;
 use crate::AgentId;
 use crate::inbox::{InboxMessage, MessageType};
 use crate::social_context::SocialContext;
+use crate::timer_journal::{TimeoutKind, TimeoutRequest};
 
 /// Manages timeout messages for agents.
 ///
@@ -30,6 +31,150 @@ impl TimeoutManager {
     /// Create a new timeout manager backed by the given social context.
     pub fn new(ctx: SocialContext) -> Self {
         Self { ctx }
+    }
+
+    fn request_for_timeout(
+        agent_id: AgentId,
+        body: String,
+        after: Duration,
+        task_id: Option<String>,
+        peer_id: Option<AgentId>,
+        kind: TimeoutKind,
+    ) -> TimeoutRequest {
+        TimeoutRequest {
+            agent_id,
+            key: task_id.clone(),
+            task_id,
+            peer_id,
+            body,
+            kind,
+            fire_at_ms: Self::now_ms()
+                .saturating_add(after.as_millis().try_into().unwrap_or(i64::MAX)),
+        }
+    }
+
+    /// Schedule a timeout, failing when its durable row cannot be written.
+    pub fn set_timeout_durably(
+        &self,
+        agent_id: AgentId,
+        body: impl Into<String>,
+        after: Duration,
+        task_id: Option<String>,
+        peer: Option<AgentId>,
+    ) -> Result<JoinHandle<()>, crate::timer_journal::TimerJournalError> {
+        let request = Self::request_for_timeout(
+            agent_id.clone(),
+            body.into(),
+            after,
+            task_id.clone(),
+            peer.clone(),
+            TimeoutKind::Timeout,
+        );
+        let timer_id = self.ctx.schedule_timer(&request)?;
+        let handle = self.spawn_timer(request, after, timer_id);
+        if let Some(k) = task_id {
+            self.ctx
+                .register_timeout(&agent_id, k, peer, handle.abort_handle());
+        }
+        Ok(handle)
+    }
+
+    /// Schedule a self-reminder, failing when its durable row cannot be written.
+    pub fn set_self_reminder_durably(
+        &self,
+        agent_id: AgentId,
+        body: impl Into<String>,
+        after: Duration,
+        task_id: Option<String>,
+    ) -> Result<bool, crate::timer_journal::TimerJournalError> {
+        let register_key = task_id
+            .as_ref()
+            .map(|k| format!("{}{k}", reserved::REMINDER_KEY_PREFIX));
+        let request = Self::request_for_timeout(
+            agent_id.clone(),
+            body.into(),
+            after,
+            task_id,
+            None,
+            TimeoutKind::SelfReminder,
+        );
+        let timer_id = self.ctx.schedule_timer(&request)?;
+        let handle = self.spawn_timer(request, after, timer_id);
+        Ok(match register_key {
+            Some(k) => self
+                .ctx
+                .register_timeout(&agent_id, k, None, handle.abort_handle()),
+            None => false,
+        })
+    }
+
+    fn now_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .try_into()
+            .unwrap_or(i64::MAX)
+    }
+
+    fn spawn_timer(
+        &self,
+        request: TimeoutRequest,
+        after: Duration,
+        timer_id: Option<i64>,
+    ) -> JoinHandle<()> {
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let message_type = match request.kind {
+                TimeoutKind::Timeout => MessageType::Timeout,
+                TimeoutKind::SelfReminder => MessageType::SelfReminder,
+            };
+            if let Err(error) = ctx.push_message(InboxMessage {
+                journal_id: None,
+                from: AgentId::new(match request.kind {
+                    TimeoutKind::Timeout => reserved::TIMER,
+                    TimeoutKind::SelfReminder => reserved::SELF,
+                }),
+                to: request.agent_id.clone(),
+                body: request.body,
+                message_type,
+                priority: match request.kind {
+                    TimeoutKind::Timeout => crate::inbox::priority::TIMEOUT,
+                    TimeoutKind::SelfReminder => crate::inbox::priority::SELF_REMINDER,
+                },
+                task_id: request.task_id.clone(),
+                broadcast_id: None,
+            }) {
+                tracing::error!(agent = %request.agent_id, error = %error, "failed to journal timer message");
+                return;
+            }
+            if let Some(timer_id) = timer_id {
+                ctx.ack_timer(timer_id);
+            }
+            match request.kind {
+                TimeoutKind::Timeout => {
+                    if let Some(k) = request.task_id
+                        && let Some(peer) = ctx.mark_timeout_fired(&request.agent_id, &k)
+                    {
+                        ctx.apply_relation_event(
+                            &request.agent_id,
+                            &peer,
+                            crate::relation::RelationEvent::FailedCollaboration,
+                        );
+                    }
+                }
+                TimeoutKind::SelfReminder => {
+                    if let Some(k) = request
+                        .task_id
+                        .map(|id| format!("{}{id}", reserved::REMINDER_KEY_PREFIX))
+                    {
+                        ctx.remove_timeout(&request.agent_id, &k);
+                    }
+                }
+            }
+            debug!(agent = %request.agent_id, kind = ?request.kind, "timer message pushed to inbox");
+        })
     }
 
     /// Schedule a timeout message.
@@ -53,54 +198,33 @@ impl TimeoutManager {
         task_id: Option<String>,
         peer: Option<AgentId>,
     ) -> JoinHandle<()> {
-        let ctx = self.ctx.clone();
-        let register_ctx = self.ctx.clone();
         let body = body.into();
-        let register_key = task_id.clone();
-        let cleanup_key = task_id.clone();
-        let register_agent = agent_id.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(after).await;
-            if let Err(error) = ctx.push_message(InboxMessage {
-                journal_id: None,
-                from: AgentId::new(reserved::TIMER),
-                to: agent_id.clone(),
-                body,
-                message_type: MessageType::Timeout,
-                priority: crate::inbox::priority::TIMEOUT,
-                task_id,
-                broadcast_id: None,
-            }) {
-                tracing::error!(agent = %agent_id, error = %error, "failed to journal timeout");
-                return;
-            }
-            if let Some(k) = cleanup_key {
-                // Some(peer) ⇒ a delegation timed out: the collaboration
-                // failed, weakening the bond toward the delegate. If the
-                // timeout was cancelled before fire, mark_fired returns
-                // None and no relation event is emitted.
-                if let Some(peer) = ctx.mark_timeout_fired(&agent_id, &k) {
-                    ctx.apply_relation_event(
-                        &agent_id,
-                        &peer,
-                        crate::relation::RelationEvent::FailedCollaboration,
-                    );
+        match self.set_timeout_durably(
+            agent_id.clone(),
+            body.clone(),
+            after,
+            task_id.clone(),
+            peer.clone(),
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::error!(error = %error, "failed to journal timer");
+                let request = Self::request_for_timeout(
+                    agent_id.clone(),
+                    body,
+                    after,
+                    task_id.clone(),
+                    peer.clone(),
+                    TimeoutKind::Timeout,
+                );
+                let handle = self.spawn_timer(request, after, None);
+                if let Some(k) = task_id {
+                    self.ctx
+                        .register_timeout(&agent_id, k, peer, handle.abort_handle());
                 }
+                handle
             }
-            debug!(agent = %agent_id, "timeout message pushed to inbox");
-        });
-
-        // Register the timeout so a timely reply can cancel it. `peer` is
-        // returned by cancel/mark_fired for relation events (delegation
-        // only; broadcast/self-reminder timeouts are peer-less).
-        if let Some(k) = register_key {
-            // The replacement flag is a self-reminder concern: a delegation
-            // timeout re-registered under its own correlation id is bookkeeping
-            // internal to one request, never an LLM-visible replacement, so the
-            // bool is deliberately discarded here.
-            let _ = register_ctx.register_timeout(&register_agent, k, peer, handle.abort_handle());
         }
-        handle
     }
 
     /// Schedule a self-reminder message.
@@ -123,49 +247,41 @@ impl TimeoutManager {
         after: Duration,
         task_id: Option<String>,
     ) -> bool {
-        let ctx = self.ctx.clone();
-        let register_ctx = self.ctx.clone();
         let body = body.into();
-        // Register under a namespaced key: self-reminders share the
-        // TimeoutRegistry with delegate/broadcast timeouts, and a bare
-        // task_id here would overwrite (and orphan) a pending delegation
-        // timeout with the same key — the reminder handle would then be
-        // aborted by the reply cancellation while the real timeout leaks
-        // and fires spuriously.
-        let register_key = task_id
-            .as_ref()
-            .map(|k| format!("{}{k}", reserved::REMINDER_KEY_PREFIX));
-        let cleanup_key = register_key.clone();
-        let register_agent = agent_id.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(after).await;
-            if let Err(error) = ctx.push_message(InboxMessage {
-                journal_id: None,
-                from: AgentId::new(reserved::SELF),
-                to: agent_id.clone(),
-                body,
-                message_type: MessageType::SelfReminder,
-                priority: crate::inbox::priority::SELF_REMINDER,
-                task_id,
-                broadcast_id: None,
-            }) {
-                tracing::error!(
-                    agent = %agent_id,
-                    error = %error,
-                    "failed to journal self-reminder"
+        match self.set_self_reminder_durably(agent_id.clone(), body.clone(), after, task_id.clone())
+        {
+            Ok(replaced) => replaced,
+            Err(error) => {
+                tracing::error!(error = %error, "failed to journal self-reminder timer");
+                let request = Self::request_for_timeout(
+                    agent_id.clone(),
+                    body,
+                    after,
+                    task_id.clone(),
+                    None,
+                    TimeoutKind::SelfReminder,
                 );
-                return;
+                let handle = self.spawn_timer(request, after, None);
+                match task_id.map(|id| format!("{}{id}", reserved::REMINDER_KEY_PREFIX)) {
+                    Some(k) => self
+                        .ctx
+                        .register_timeout(&agent_id, k, None, handle.abort_handle()),
+                    None => false,
+                }
             }
-            if let Some(k) = cleanup_key {
-                ctx.remove_timeout(&agent_id, &k);
-            }
-            debug!(agent = %agent_id, "self-reminder pushed to inbox");
-        });
-        if let Some(k) = register_key {
-            register_ctx.register_timeout(&register_agent, k, None, handle.abort_handle())
-        } else {
-            false
         }
+    }
+
+    /// Restore a timer journal row without creating another row.
+    pub fn restore_timer(&self, timer: crate::timer_journal::JournaledTimer) -> JoinHandle<()> {
+        let request = timer.request;
+        let now_ms = Self::now_ms();
+        let after = if request.fire_at_ms <= now_ms {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(u64::try_from(request.fire_at_ms - now_ms).unwrap_or(u64::MAX))
+        };
+        self.spawn_timer(request, after, Some(timer.id))
     }
 }
 

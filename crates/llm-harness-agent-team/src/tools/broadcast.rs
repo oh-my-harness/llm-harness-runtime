@@ -75,18 +75,25 @@ impl BroadcastTool {
             .and_then(super::parse_timeout_secs)
             .unwrap_or(self.timeout);
         let timer = TimeoutManager::new((*self.ctx).clone());
-        timer.set_timeout(
-            self.agent_id.clone(),
-            format!(
-                "Your broadcast ({broadcast_id}) timed out — no one replied within {} \
-                 seconds. Consider re-broadcasting, delegating directly, or proceeding \
-                 without help.",
-                timeout.as_secs()
-            ),
-            timeout,
-            Some(broadcast_id.clone()),
-            None,
-        );
+        timer
+            .set_timeout_durably(
+                self.agent_id.clone(),
+                format!(
+                    "Your broadcast ({broadcast_id}) timed out — no one replied within {} \
+                     seconds. Consider re-broadcasting, delegating directly, or proceeding \
+                     without help.",
+                    timeout.as_secs()
+                ),
+                timeout,
+                Some(broadcast_id.clone()),
+                None,
+            )
+            .map_err(|error| {
+                ToolFailure::new(
+                    "timer_journal_persistence_failed",
+                    format!("failed to persist broadcast timeout: {error}"),
+                )
+            })?;
         let timeout_msg = format!(
             " A {}s timeout is set — you'll be nudged if no one replies.",
             timeout.as_secs()
