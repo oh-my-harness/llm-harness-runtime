@@ -168,7 +168,11 @@ impl StepExecutor for FailingRecoveryExecutor {
     ) -> BoxFuture<'a, Result<Option<StepResult>>> {
         Box::pin(async move {
             self.recover_calls.fetch_add(1, Ordering::SeqCst);
-            anyhow::bail!("recovery store unavailable")
+            Err(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "payload was purged at 2026-08-29T00:00:00Z",
+            ))
+            .context("cannot recover review audit record"))
         })
     }
 
@@ -523,6 +527,7 @@ async fn restored_executor_recovers_stable_attempt_without_reexecution() {
 #[tokio::test]
 async fn executor_recovery_failure_is_not_retried_or_executed() {
     let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(JsonlTaskStore::new(dir.path().join("tasks")));
     let executor = Arc::new(FailingRecoveryExecutor {
         recover_calls: AtomicUsize::new(0),
         execute_calls: AtomicUsize::new(0),
@@ -552,18 +557,50 @@ async fn executor_recovery_failure_is_not_retried_or_executed() {
     };
     let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
         .unwrap()
+        .with_task_store(store.clone())
         .with_executor("failing-recovery", executor.clone());
+    let mut events = engine.subscribe();
 
     let error = engine.run().await.unwrap_err();
 
+    let expected_outer = "cannot recover review audit record";
+    let expected_inner = "payload was purged at 2026-08-29T00:00:00Z";
     assert!(
         error
             .to_string()
             .contains("executor outcome recovery failed"),
-        "unexpected error: {error}",
+        "unexpected error: {error}"
     );
+    assert!(error.to_string().contains(expected_outer), "{error}");
+    assert!(error.to_string().contains(expected_inner), "{error}");
     assert_eq!(executor.recover_calls.load(Ordering::SeqCst), 1);
     assert_eq!(executor.execute_calls.load(Ordering::SeqCst), 0);
+
+    let failed_event = loop {
+        let event = events.try_recv().unwrap();
+        if let WorkflowEvent::Failed { error } = event {
+            break error;
+        }
+    };
+    assert!(failed_event.contains(expected_outer), "{failed_event}");
+    assert!(failed_event.contains(expected_inner), "{failed_event}");
+
+    let persisted = store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    let TaskError::Internal(persisted_error) = persisted.error.unwrap() else {
+        panic!("expected internal task error");
+    };
+    assert!(
+        persisted_error.contains(expected_outer),
+        "{persisted_error}"
+    );
+    assert!(
+        persisted_error.contains(expected_inner),
+        "{persisted_error}"
+    );
 }
 
 #[tokio::test]
