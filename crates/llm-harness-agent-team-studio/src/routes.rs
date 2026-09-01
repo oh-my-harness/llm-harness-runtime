@@ -49,6 +49,7 @@ pub fn team_router(state: AppState) -> Router {
                 .post(register_project)
                 .delete(delete_project),
         )
+        .route("/api/team/projects/restart", post(restart_project))
         .route("/api/team/chat", post(chat))
         .route("/api/team/issues", get(list_issues))
         .route("/api/team/issue/{id}/confirm", post(confirm_issue))
@@ -180,22 +181,7 @@ async fn register_project(
     let mut pm = state.pm.write().await;
     match pm.create(spec, repo, &settings, &api_key).await {
         Ok(_) => {
-            // I2: sync inspector registry for the new team's members.
-            {
-                let entry = pm.get(&body.id).expect("just inserted");
-                for m in &entry.spec.members {
-                    if let Some(h) = entry.team.harness(&llm_harness_agent_team::AgentId::new(&m.id)) {
-                        state.registry.register(format!("{}/{}", body.id, m.id), h);
-                    }
-                }
-            }
-            // I2: operator pump for the new team (WS live feed).
-            if let Some(ctx) = pm
-                .get(&body.id)
-                .and_then(|e| e.team.social_context().cloned())
-            {
-                spawn_operator_pump(state.events.clone(), body.id.clone(), ctx);
-            }
+            register_team_side_effects(&state, &pm, &body.id);
             (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
         }
         Err(TeamManagerError::NotAGitRepo(p)) => (
@@ -221,17 +207,8 @@ struct DeleteQuery {
 async fn delete_project(State(state): State<AppState>, Query(q): Query<DeleteQuery>) -> Response {
     let mut pm = state.pm.write().await;
     match pm.shutdown(&q.id).await {
-        Ok(()) => {
-            // I2: drop the team's harness entries from the observation UI.
-            let keys: Vec<String> = state
-                .registry
-                .keys()
-                .into_iter()
-                .filter(|k| k.starts_with(&format!("{}/", q.id)))
-                .collect();
-            for k in keys {
-                state.registry.remove(&k);
-            }
+        Ok(_) => {
+            remove_team_from_registry(&state.registry, &q.id);
             unpersist_spec(&state.data_root, &q.id);
             Json(serde_json::json!({ "ok": true })).into_response()
         }
@@ -440,6 +417,7 @@ async fn pulse(State(state): State<AppState>, Query(q): Query<PulseQuery>) -> Re
     };
     let mut snap = crate::pulse::snapshot(&project.team).await;
     snap["pending"] = crate::pulse::pending_traffic(&project.team)["pending"].clone();
+    snap["timers"] = serde_json::json!({ "pending": crate::pulse::pending_timers(&project.team) });
     snap["issues"] = {
         let list = project.issues.list().unwrap_or_default();
         serde_json::json!({
@@ -1218,6 +1196,81 @@ async fn events_ws_loop(socket: axum::extract::ws::WebSocket, state: AppState) {
     }
 }
 
+/// POST /api/team/projects/restart?id= — cleanly stop a project, then rebuild
+/// it from its persisted spec. Issues, memory, inbox and timer journals stay.
+async fn restart_project(State(state): State<AppState>, Query(q): Query<DeleteQuery>) -> Response {
+    let tier = state.tier.read().await.clone();
+    let base_url = crate::settings::Settings::load(&state.data_root)
+        .ok()
+        .flatten()
+        .map(|s| s.base_url)
+        .unwrap_or_default();
+    let settings = crate::settings::Settings {
+        models: tier,
+        scout_interval_secs: *state.scout_interval_secs.read().await,
+        base_url,
+    };
+    let api_key = crate::settings::load_api_key(&state.data_root).unwrap_or_default();
+
+    let mut pm = state.pm.write().await;
+    remove_team_from_registry(&state.registry, &q.id);
+    let result = pm.restart(&q.id, &settings, &api_key).await;
+    register_team_side_effects(&state, &pm, &q.id);
+    match result {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(TeamManagerError::UnknownTeam(id)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": format!("unknown project: {id}") })),
+        )
+            .into_response(),
+        Err(TeamManagerError::NotAGitRepo(path)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": format!("not a git repo: {}", path.display()) })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+fn remove_team_from_registry(
+    registry: &Arc<llm_harness_inspector::state::HarnessRegistry>,
+    team_id: &str,
+) {
+    let prefix = format!("{team_id}/");
+    for key in registry
+        .keys()
+        .into_iter()
+        .filter(|k| k.starts_with(&prefix))
+    {
+        registry.remove(&key);
+    }
+}
+
+fn register_team_side_effects(state: &AppState, pm: &TeamManager, team_id: &str) {
+    if let Some(entry) = pm.get(team_id) {
+        for member in &entry.spec.members {
+            if let Some(harness) = entry
+                .team
+                .harness(&llm_harness_agent_team::AgentId::new(&member.id))
+            {
+                state
+                    .registry
+                    .register(format!("{team_id}/{}", member.id), harness);
+            }
+        }
+    }
+    if let Some(ctx) = pm
+        .get(team_id)
+        .and_then(|entry| entry.team.social_context().cloned())
+    {
+        spawn_operator_pump(state.events.clone(), team_id.to_string(), ctx);
+    }
+}
+
 fn not_found(message: String) -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -1249,7 +1302,9 @@ mod tests {
     use crate::team_manager::TeamManager;
     use axum::body::Body;
     use http_body_util::BodyExt;
+    use llm_harness_agent_team::{AgentId, TimeoutManager};
     use llm_harness_loop::test_utils::MockLlmClient;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     fn tier() -> ModelTier {
@@ -1400,6 +1455,10 @@ mod tests {
         let (status, json) = get_json(&router, "/api/team/projects").await;
         assert_eq!(status, 200);
         assert_eq!(json["projects"][0]["id"], "p1");
+
+        let (status, pulse) = get_json(&router, "/api/team/pulse?project=p1").await;
+        assert_eq!(status, 200, "{pulse}");
+        assert_eq!(pulse["timers"]["pending"], 0, "{pulse}");
     }
 
     #[tokio::test]
@@ -1801,6 +1860,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 404);
+    }
+
+    #[tokio::test]
+    async fn restart_project_restores_persisted_team_and_pending_timer() {
+        let (router, pm, repo, _factory) = setup().await;
+        json_post(
+            &router,
+            "/api/team/projects",
+            serde_json::json!({ "id": "p1", "repo_path": repo.to_string_lossy() }),
+        )
+        .await;
+        let member_count = pm.read().await.get("p1").unwrap().spec.members.len();
+
+        let ctx = pm
+            .read()
+            .await
+            .get("p1")
+            .unwrap()
+            .team
+            .social_context()
+            .unwrap()
+            .clone();
+        let timer = TimeoutManager::new(ctx);
+        timer
+            .set_self_reminder_durably(
+                AgentId::new("a"),
+                "check after restart",
+                Duration::from_secs(60),
+                Some("restart-check".into()),
+            )
+            .unwrap();
+
+        let (status, json) = json_post(
+            &router,
+            "/api/team/projects/restart?id=p1",
+            serde_json::json!(null),
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+        assert!(pm.read().await.get("p1").is_some());
+        assert_eq!(
+            pm.read().await.get("p1").unwrap().spec.members.len(),
+            member_count
+        );
+        assert_eq!(
+            pm.read()
+                .await
+                .get("p1")
+                .unwrap()
+                .team
+                .social_context()
+                .unwrap()
+                .pending_timer_count(),
+            1
+        );
+
+        pm.write().await.shutdown("p1").await.unwrap();
+        assert!(
+            pm.read().await.get("p1").is_none(),
+            "restart test should clean up the rebuilt team"
+        );
     }
 
     // ── per-agent config PUT ─────────────────────────────────────────────

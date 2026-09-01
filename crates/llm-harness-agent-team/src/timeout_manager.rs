@@ -62,7 +62,8 @@ impl TimeoutManager {
         task_id: Option<String>,
         peer: Option<AgentId>,
     ) -> Result<JoinHandle<()>, crate::timer_journal::TimerJournalError> {
-        let request = Self::request_for_timeout(
+        let registry_key = Self::timeout_registry_key(&task_id);
+        let mut request = Self::request_for_timeout(
             agent_id.clone(),
             body.into(),
             after,
@@ -70,9 +71,10 @@ impl TimeoutManager {
             peer.clone(),
             TimeoutKind::Timeout,
         );
+        request.key = registry_key.clone();
         let timer_id = self.ctx.schedule_timer(&request)?;
         let handle = self.spawn_timer(request, after, timer_id);
-        if let Some(k) = task_id {
+        if let Some(k) = registry_key {
             self.ctx
                 .register_timeout(&agent_id, k, peer, handle.abort_handle());
         }
@@ -87,10 +89,8 @@ impl TimeoutManager {
         after: Duration,
         task_id: Option<String>,
     ) -> Result<bool, crate::timer_journal::TimerJournalError> {
-        let register_key = task_id
-            .as_ref()
-            .map(|k| format!("{}{k}", reserved::REMINDER_KEY_PREFIX));
-        let request = Self::request_for_timeout(
+        let register_key = Self::reminder_registry_key(task_id.as_deref());
+        let mut request = Self::request_for_timeout(
             agent_id.clone(),
             body.into(),
             after,
@@ -98,14 +98,15 @@ impl TimeoutManager {
             None,
             TimeoutKind::SelfReminder,
         );
+        request.key = register_key.clone();
         let timer_id = self.ctx.schedule_timer(&request)?;
         let handle = self.spawn_timer(request, after, timer_id);
-        Ok(match register_key {
-            Some(k) => self
-                .ctx
-                .register_timeout(&agent_id, k, None, handle.abort_handle()),
-            None => false,
-        })
+        Ok(register_key
+            .map(|k| {
+                self.ctx
+                    .register_timeout(&agent_id, k, None, handle.abort_handle())
+            })
+            .unwrap_or(false))
     }
 
     fn now_ms() -> i64 {
@@ -115,6 +116,20 @@ impl TimeoutManager {
             .as_millis()
             .try_into()
             .unwrap_or(i64::MAX)
+    }
+
+    fn reminder_registry_key(task_id: Option<&str>) -> Option<String> {
+        Some(match task_id {
+            Some(id) => format!("{}{id}", reserved::REMINDER_KEY_PREFIX),
+            None => format!("{}{}", reserved::REMINDER_KEY_PREFIX, AgentId::generate()),
+        })
+    }
+
+    fn timeout_registry_key(task_id: &Option<String>) -> Option<String> {
+        Some(match task_id {
+            Some(id) => id.clone(),
+            None => format!("timeout:{}", AgentId::generate()),
+        })
     }
 
     fn spawn_timer(
@@ -154,21 +169,20 @@ impl TimeoutManager {
             }
             match request.kind {
                 TimeoutKind::Timeout => {
-                    if let Some(k) = request.task_id
-                        && let Some(peer) = ctx.mark_timeout_fired(&request.agent_id, &k)
-                    {
-                        ctx.apply_relation_event(
-                            &request.agent_id,
-                            &peer,
-                            crate::relation::RelationEvent::FailedCollaboration,
-                        );
+                    if let Some(k) = request.task_id {
+                        if let Some(peer) = ctx.mark_timeout_fired(&request.agent_id, &k) {
+                            ctx.apply_relation_event(
+                                &request.agent_id,
+                                &peer,
+                                crate::relation::RelationEvent::FailedCollaboration,
+                            );
+                        }
+                    } else if let Some(k) = request.key {
+                        ctx.remove_timeout(&request.agent_id, &k);
                     }
                 }
                 TimeoutKind::SelfReminder => {
-                    if let Some(k) = request
-                        .task_id
-                        .map(|id| format!("{}{id}", reserved::REMINDER_KEY_PREFIX))
-                    {
+                    if let Some(k) = request.key {
                         ctx.remove_timeout(&request.agent_id, &k);
                     }
                 }
@@ -209,7 +223,8 @@ impl TimeoutManager {
             Ok(handle) => handle,
             Err(error) => {
                 tracing::error!(error = %error, "failed to journal timer");
-                let request = Self::request_for_timeout(
+                let registry_key = Self::timeout_registry_key(&task_id);
+                let mut request = Self::request_for_timeout(
                     agent_id.clone(),
                     body,
                     after,
@@ -217,8 +232,9 @@ impl TimeoutManager {
                     peer.clone(),
                     TimeoutKind::Timeout,
                 );
+                request.key = registry_key.clone();
                 let handle = self.spawn_timer(request, after, None);
-                if let Some(k) = task_id {
+                if let Some(k) = registry_key {
                     self.ctx
                         .register_timeout(&agent_id, k, peer, handle.abort_handle());
                 }
@@ -262,12 +278,13 @@ impl TimeoutManager {
                     TimeoutKind::SelfReminder,
                 );
                 let handle = self.spawn_timer(request, after, None);
-                match task_id.map(|id| format!("{}{id}", reserved::REMINDER_KEY_PREFIX)) {
-                    Some(k) => self
-                        .ctx
-                        .register_timeout(&agent_id, k, None, handle.abort_handle()),
-                    None => false,
-                }
+                let register_key = Self::reminder_registry_key(task_id.as_deref());
+                register_key
+                    .map(|k| {
+                        self.ctx
+                            .register_timeout(&agent_id, k, None, handle.abort_handle())
+                    })
+                    .unwrap_or(false)
             }
         }
     }
@@ -281,7 +298,16 @@ impl TimeoutManager {
         } else {
             Duration::from_millis(u64::try_from(request.fire_at_ms - now_ms).unwrap_or(u64::MAX))
         };
-        self.spawn_timer(request, after, Some(timer.id))
+        let handle = self.spawn_timer(request.clone(), after, Some(timer.id));
+        if let Some(key) = request.key {
+            self.ctx.register_timeout(
+                &request.agent_id,
+                key,
+                request.peer_id,
+                handle.abort_handle(),
+            );
+        }
+        handle
     }
 }
 

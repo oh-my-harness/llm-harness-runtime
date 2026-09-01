@@ -209,6 +209,15 @@ impl TimeoutRegistry {
             .is_some_and(|bucket| bucket.iter().any(|k| k == key))
     }
 
+    /// Number of timer tasks currently tracked for shutdown/cancellation.
+    pub fn pending_count(&self) -> usize {
+        self.pending
+            .lock()
+            .values()
+            .map(|bucket| bucket.len())
+            .sum()
+    }
+
     /// Returns the peer recorded at registration for `(agent, key)`, if a
     /// pending entry exists.
     ///
@@ -252,8 +261,12 @@ impl TimeoutRegistry {
     /// dead inboxes and could emit spurious relation events against
     /// stopped members. The `fired` set is cleared too — no reply can
     /// arrive after shutdown, so late-reply filtering is moot.
-    pub fn cancel_all(&self) {
+    pub fn cancel_all(&self) -> Vec<(AgentId, String)> {
         let mut pending = self.pending.lock();
+        let cancelled = pending
+            .iter()
+            .flat_map(|(agent, bucket)| bucket.keys().map(move |key| (agent.clone(), key.clone())))
+            .collect();
         for bucket in pending.values_mut() {
             for (handle, _) in bucket.values() {
                 handle.abort();
@@ -261,6 +274,7 @@ impl TimeoutRegistry {
         }
         pending.clear();
         self.fired.lock().clear();
+        cancelled
     }
     /// Restore a previously cancelled (or fired) deadline under
     /// `(agent, key)` with a live timer's abort handle.
@@ -845,7 +859,15 @@ impl SocialContext {
 
     /// Abort every pending timeout in the registry (team shutdown).
     pub(crate) fn cancel_all_timeouts(&self) {
-        self.timeouts.cancel_all();
+        let cancelled = self.timeouts.cancel_all();
+        for (agent, key) in cancelled {
+            self.cancel_timer(&agent, &key);
+        }
+    }
+
+    /// Number of timer tasks still owned by the shared context.
+    pub fn pending_timer_count(&self) -> usize {
+        self.timeouts.pending_count()
     }
 
     pub(crate) fn schedule_timer(
