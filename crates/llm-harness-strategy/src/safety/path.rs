@@ -454,6 +454,8 @@ mod tests {
                     stdout: String::new(),
                     stderr: String::new(),
                     exit_code: 0,
+                    stdout_truncated_bytes: 0,
+                    stderr_truncated_bytes: 0,
                 })
             })
         }

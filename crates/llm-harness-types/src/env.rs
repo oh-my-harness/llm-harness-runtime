@@ -17,6 +17,10 @@ pub struct ShellOutput {
     pub stderr: String,
     /// 进程退出码。
     pub exit_code: i32,
+    /// 因 per-command 上限被丢弃的 stdout 字节数。
+    pub stdout_truncated_bytes: u64,
+    /// 因 per-command 上限被丢弃的 stderr 字节数。
+    pub stderr_truncated_bytes: u64,
 }
 
 /// 文件或目录的元数据。
@@ -42,10 +46,17 @@ pub struct ShellOptions<'a> {
     pub timeout: Option<Duration>,
     /// 取消信号。
     pub abort: CancellationToken,
-    /// 流式 stdout 回调；`None` 时仅在最终 Output 中返回完整内容。
+    /// 流式 stdout 回调；`None` 时最终 Output 只保留有界 head/tail。
     pub on_stdout: Option<Box<dyn FnMut(&str) + Send + 'a>>,
-    /// 流式 stderr 回调；`None` 时仅在最终 Output 中返回完整内容。
+    /// 流式 stderr 回调；`None` 时最终 Output 只保留有界 head/tail。
     pub on_stderr: Option<Box<dyn FnMut(&str) + Send + 'a>>,
+    /// Host 侧每个流保留的 head/tail 上限；`None` 使用默认安全上限。
+    pub max_output_bytes: Option<usize>,
+}
+
+impl ShellOptions<'_> {
+    /// Host 侧默认输出上限，与 workflow shell executor 的默认值一致。
+    pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 }
 
 /// 执行环境抽象——将文件系统和 shell 操作与具体平台解耦。
@@ -302,6 +313,8 @@ mod tests {
             stdout: "hello".into(),
             stderr: "".into(),
             exit_code: 0,
+            stdout_truncated_bytes: 0,
+            stderr_truncated_bytes: 0,
         };
         assert_eq!(o.exit_code, 0);
     }

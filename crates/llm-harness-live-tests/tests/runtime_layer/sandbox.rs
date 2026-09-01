@@ -51,6 +51,7 @@ fn default_opts() -> ShellOptions<'static> {
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
+        max_output_bytes: None,
     }
 }
 

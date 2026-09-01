@@ -405,6 +405,7 @@ mod tests {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
 
         #[cfg(not(target_os = "windows"))]
@@ -437,6 +438,7 @@ mod tests {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
 
         let cmd = "echo \"hello world\"";
@@ -461,6 +463,7 @@ mod tests {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
 
         #[cfg(not(target_os = "windows"))]
@@ -528,6 +531,7 @@ mod tests {
                 collected_clone.lock().unwrap().push(chunk.to_string());
             })),
             on_stderr: None,
+            max_output_bytes: None,
         };
 
         // 分多行输出，制造多个 chunk 的机会
@@ -568,6 +572,7 @@ mod tests {
             on_stderr: Some(Box::new(move |chunk: &str| {
                 collected_clone.lock().unwrap().push(chunk.to_string());
             })),
+            max_output_bytes: None,
         };
 
         // 写到 stderr
@@ -617,20 +622,24 @@ mod tests {
             abort,
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
 
         let start = std::time::Instant::now();
         let result = env.execute_shell(cmd, opts).await;
         let elapsed = start.elapsed();
 
-        assert!(matches!(result, Err(EnvError::Aborted)), "expected Aborted");
+        assert!(
+            matches!(result, Err(EnvError::ShellAborted { .. })),
+            "expected ShellAborted"
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "abort took too long: {elapsed:?}"
         );
     }
     #[tokio::test]
-    async fn execute_shell_timeout_returns_shell_failed() {
+    async fn execute_shell_timeout_returns_shell_timeout() {
         let tmp = tempfile::tempdir().unwrap();
         let env = OsEnv::new(tmp.path());
 
@@ -648,6 +657,7 @@ mod tests {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
 
         let start = std::time::Instant::now();
@@ -655,8 +665,8 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(
-            matches!(result, Err(EnvError::ShellFailed { stderr, .. }) if stderr == "timeout"),
-            "expected ShellFailed with stderr \"timeout\""
+            matches!(result, Err(EnvError::ShellTimeout { .. })),
+            "expected ShellTimeout"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(5),
@@ -681,6 +691,7 @@ mod tests {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
 
         let out = env.execute_shell(cmd, opts).await.unwrap();
@@ -716,6 +727,7 @@ mod tests {
                 collected_clone.lock().unwrap().push(chunk.to_string());
             })),
             on_stderr: None,
+            max_output_bytes: None,
         };
 
         // 输出 5000 字节 ASCII（超出 4096 chunk 边界），末尾跟一个 3 字节 UTF-8 中文字符
@@ -764,6 +776,7 @@ mod tests {
             abort: CancellationToken::new(),
             on_stdout: None,
             on_stderr: None,
+            max_output_bytes: None,
         };
 
         #[cfg(not(target_os = "windows"))]
