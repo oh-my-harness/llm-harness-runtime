@@ -83,6 +83,7 @@ async fn main() {
 
     let tm_shared = Arc::new(tokio::sync::RwLock::new(tm));
     let events = Arc::new(llm_harness_agent_team_studio::events::EventBus::new());
+    let operator_pumps = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
     // Pump every team's operator stream into the event bus so the
     // panel's WS clients see agent→operator traffic live.
@@ -95,21 +96,12 @@ async fn main() {
             let Some(ctx) = entry.team.social_context().cloned() else {
                 continue;
             };
-            let bus = events.clone();
-            let team_id = id.clone();
-            tokio::spawn(async move {
-                let operator = AgentId::new("operator");
-                loop {
-                    ctx.wait_for_message(&operator).await;
-                    for msg in ctx.drain_inbox(&operator) {
-                        bus.publish(llm_harness_agent_team_studio::events::operator_event(
-                            &team_id,
-                            msg.from.as_str(),
-                            &msg.body,
-                        ));
-                    }
-                }
-            });
+            llm_harness_agent_team_studio::routes::spawn_operator_pump(
+                events.clone(),
+                operator_pumps.clone(),
+                id.clone(),
+                ctx,
+            );
         }
     }
 
@@ -121,6 +113,7 @@ async fn main() {
         scout_interval_secs: Arc::new(tokio::sync::RwLock::new(settings.scout_interval_secs)),
         events: events.clone(),
         registry: registry.clone(),
+        operator_pumps,
     };
     let inspector = match Inspector::registry(registry)
         .extra_routes(team_router(state))

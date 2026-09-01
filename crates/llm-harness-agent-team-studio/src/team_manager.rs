@@ -1022,6 +1022,48 @@ mod tests {
         assert_eq!(timer_journal.pending_count().unwrap(), 0);
     }
 
+    #[tokio::test]
+    async fn restart_preserves_pending_inbox_and_timer() {
+        let _factory = install_mock_factory();
+        let root = unique_dir("ct-tm-restart-recovery");
+        let mut tm = TeamManager::new(&root);
+        tm.create(blank_spec(), Some(make_repo()), &settings(), "")
+            .await
+            .unwrap();
+
+        let agent_a = llm_harness_agent_team::AgentId::new("a");
+        let ctx = tm.get("t").unwrap().team.social_context().unwrap().clone();
+        let timer = llm_harness_agent_team::TimeoutManager::new(ctx.clone());
+        timer
+            .set_self_reminder_durably(
+                agent_a.clone(),
+                "check after restart",
+                std::time::Duration::from_secs(60),
+                Some("restart-check".into()),
+            )
+            .unwrap();
+        tm.get("t")
+            .unwrap()
+            .team
+            .submit("a", "recover this task")
+            .unwrap();
+
+        tm.restart("t", &settings(), "").await.unwrap();
+
+        let ctx = tm.get("t").unwrap().team.social_context().unwrap().clone();
+        assert!(
+            !ctx.drain_inbox(&agent_a).is_empty(),
+            "pending inbox must survive a deliberate restart"
+        );
+        assert_eq!(
+            ctx.pending_timer_count(),
+            1,
+            "pending timer must survive a deliberate restart"
+        );
+
+        tm.shutdown_all().await;
+    }
+
     #[test]
     fn list_persisted_reads_specs() {
         let root = unique_dir("ct-tm-list");
