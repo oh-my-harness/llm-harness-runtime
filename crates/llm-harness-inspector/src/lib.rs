@@ -9,7 +9,7 @@ pub mod server;
 #[cfg(feature = "inspect")]
 pub mod state;
 #[cfg(feature = "inspect")]
-mod ui;
+mod static_files;
 
 #[cfg(feature = "inspect")]
 pub use server::{Inspector, InspectorBuilder, InspectorError};

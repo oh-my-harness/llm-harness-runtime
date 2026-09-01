@@ -695,6 +695,81 @@ impl WsMessage {
             data,
         }
     }
+
+    /// Build the history-replay message: the session's active path projected
+    /// into the same event shapes the live stream uses, so the UI renders
+    /// it with the existing handleMessage pipeline.
+    ///
+    /// Only `Message` payloads are replayed — config-change entries
+    /// (model/thinking/tools) are already reflected in the snapshot state.
+    pub fn history(entries: &[llm_harness_agent::session::types::SessionEntry]) -> Self {
+        use llm_harness_agent::session::types::SessionEntryPayload;
+        use llm_harness_types::{AgentMessage, ContentBlock};
+
+        let mut events: Vec<serde_json::Value> = Vec::new();
+        let mut history_text = String::new();
+        for entry in entries {
+            let SessionEntryPayload::Message(msg) = &entry.payload else {
+                continue;
+            };
+            match msg {
+                AgentMessage::User(u) => {
+                    for block in &u.content {
+                        if let ContentBlock::Text { text } = block {
+                            history_text.push_str("[user] ");
+                            history_text.push_str(text.trim());
+                            history_text.push('\n');
+                        }
+                    }
+                }
+                AgentMessage::Assistant(a) => {
+                    for block in &a.content {
+                        match block {
+                            ContentBlock::Text { text } => {
+                                history_text.push_str("[assistant] ");
+                                history_text.push_str(text.trim());
+                                history_text.push('\n');
+                            }
+                            ContentBlock::ToolUse { name, input, .. } => {
+                                history_text.push_str(&format!(
+                                    "[tool-call] {name} {}\n",
+                                    serde_json::to_string(input).unwrap_or_else(|_| "{}".into())
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                AgentMessage::ToolResult(t) => {
+                    let texts: Vec<String> = t
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            llm_harness_types::DataBlock::Text { text, .. } => {
+                                Some(text.trim().to_string())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if !texts.is_empty() {
+                        history_text.push_str(&format!(
+                            "[tool-result{}] {}\n",
+                            if t.is_error { " ERROR" } else { "" },
+                            texts.join(" ")
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        events.push(serde_json::json!({ "history_text": history_text }));
+        Self {
+            r#type: "History",
+            inner_type: None,
+            timestamp: Utc::now(),
+            data: serde_json::json!({ "messages": events }),
+        }
+    }
 }
 
 /// Extract the variant name (the `kind` tag value) from a `SerializableAgentEvent`.

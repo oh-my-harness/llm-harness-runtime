@@ -5,6 +5,8 @@
 //! correctly between agents, contacts are ranked, relationships update, and
 //! decay/forget logic works.
 
+#![allow(unused_must_use)]
+
 use std::sync::Arc;
 use std::time::Duration;
 

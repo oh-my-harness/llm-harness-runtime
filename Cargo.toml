@@ -23,6 +23,7 @@ members = [
     "crates/session-viewer",
     "crates/llm-harness-live-tests",
     "crates/llm-harness-inspector",
+    "crates/llm-harness-agent-team-studio",
     # examples
     # coding-agent is now a separate repo: https://github.com/oh-my-harness/coding-agent.git
     # It depends on this workspace's crates via git rev.
@@ -55,6 +56,7 @@ llm-harness-trace-otel = { path = "crates/llm-harness-trace-otel" }
 llm-harness-live-tests = { path = "crates/llm-harness-live-tests" }
 llm-harness-inspector = { path = "crates/llm-harness-inspector" }
 llm-harness-sandbox = { path = "crates/llm-harness-sandbox" }
+llm-harness-agent-team-studio = { path = "crates/llm-harness-agent-team-studio" }
 llm-harness-agent-team = { path = "crates/llm-harness-agent-team" }
 # API adapter — separate repo
 llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "9111ea5ee0d45af1737c06875573cb3a715c27fe" }

@@ -39,6 +39,9 @@ pub enum TeamError {
     /// A harness runtime error surfaced through a tool or runner.
     #[error("harness error: {0}")]
     Harness(#[from] llm_harness_types::HarnessError),
+    /// The durable inbox journal could not be opened or recovered.
+    #[error(transparent)]
+    InboxJournal(#[from] crate::inbox_journal::InboxJournalError),
 }
 
 /// Crate-wide result alias with [`TeamError`] as the default error type.
