@@ -33,6 +33,7 @@ pub use loop_safety::{
     MaxTurnsConfig, RepetitionGuardConfig, TruncationContinuationConfig,
 };
 pub mod notify;
+pub mod observation_shielding;
 pub mod resource;
 pub mod safety;
 pub use safety::SafetyDefaultsPlugin;
@@ -43,6 +44,9 @@ pub mod status_panel;
 pub use notify::{
     NotificationChannel, NotificationError, NotificationMessage, NotifyPlugin, NotifyUserTool,
     Urgency,
+};
+pub use observation_shielding::{
+    ObservationShieldingConfig, ObservationShieldingHook, ObservationShieldingPlugin,
 };
 pub use project_instruction::{
     ProjectInstructionConfig, ProjectInstructionHook, ProjectInstructionPlugin,
