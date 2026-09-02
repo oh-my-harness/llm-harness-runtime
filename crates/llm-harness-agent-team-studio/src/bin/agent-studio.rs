@@ -31,7 +31,7 @@ async fn main() {
         .or_else(|_| std::env::var("CT_PORT"))
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(8080);
+        .unwrap_or(0);
 
     std::fs::create_dir_all(&data_root).expect("data root must be creatable");
 
@@ -119,6 +119,7 @@ async fn main() {
         .extra_routes(team_router(state))
         .extra_static("app", static_dir)
         .port(port)
+        .require_auth()
         .mount()
         .await
     {
@@ -129,8 +130,8 @@ async fn main() {
         }
     };
 
-    if let Some(addr) = inspector.bound_addr() {
-        tracing::info!("agent-team-studio panel: http://{addr}/app/team.html");
+    if let (Some(addr), Some(token)) = (inspector.bound_addr(), inspector.auth_token()) {
+        println!("STUDIO_PANEL_URL=http://{addr}/app/team.html#token={token}");
     }
 
     // Hold until Ctrl+C, then shut everything down.

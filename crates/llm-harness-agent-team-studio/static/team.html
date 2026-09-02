@@ -198,8 +198,17 @@
 let projects = [];
 let current = null;
 const $ = (id) => document.getElementById(id);
+const authToken = (() => {
+  if (!location.hash.includes('token=')) return sessionStorage.getItem('studio-token') || '';
+  const token = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+  sessionStorage.setItem('studio-token', token);
+  history.replaceState(null, '', location.pathname + location.search);
+  return token;
+})();
 
 async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({ Authorization: `Bearer ${authToken}` }, opts.headers || {});
   const resp = await fetch(path, opts);
   const json = await resp.json().catch(() => ({}));
   return { status: resp.status, json };
@@ -740,7 +749,7 @@ setInterval(() => {
 // ── WS event stream: live operator messages + issue changes ──
 function connectEvents() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/api/team/events`);
+  const ws = new WebSocket(`${proto}://${location.host}/api/team/events?token=${encodeURIComponent(authToken)}`);
   ws.onmessage = (e) => {
     let ev;
     try { ev = JSON.parse(e.data); } catch { return; }
