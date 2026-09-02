@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 fn no_limits() -> ResourceLimits {
     ResourceLimits {
         max_cpus: None,
+        max_processes: None,
         max_memory_mb: None,
         max_disk_mb: None,
         timeout: None,
@@ -147,6 +148,7 @@ async fn timeout_kills_long_command() {
     let tmp = tempfile::tempdir().expect("tempdir failed");
     let limits = ResourceLimits {
         max_cpus: None,
+        max_processes: None,
         max_memory_mb: None,
         max_disk_mb: None,
         timeout: Some(Duration::from_millis(100)),

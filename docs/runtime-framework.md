@@ -111,7 +111,7 @@ src/
 
 | 模块（在 `llm-harness-platform` 中） | 职责 |
 |---|---|
-| `sandbox.rs` | `Sandbox` trait（start/env/reset/shutdown）+ `SandboxConfig`/`NetRule`/`ResourceLimits`。 |
+| `sandbox.rs` | `Sandbox` trait（start/env/reset/shutdown）+ `SandboxConfig`/`NetRule`/`ResourceLimits`。Bwrap 后端通过 cgroup v2 fail-closed 地执行 CPU/进程/内存上限；磁盘容量上限仍拒绝。 |
 | `audit.rs` | `AuditSink` trait + `AuditEntry`（含 SHA-256 hash chain）+ `AuditEventType`/`AuditDecision`/`CostDelta`。 |
 | `tracer.rs` | `TraceExporter` trait + `SpanEvent`/`SpanId`/`TraceId`/`SpanKind`/`SpanStatus`/`AttributeValue`。 |
 | `tracing_adapter.rs` | 把 core hooks（BeforeProviderRequest/AfterProviderResponse/AfterToolCall/AfterTurn）桥接成 span 事件，写入 `TraceExporter`。 |

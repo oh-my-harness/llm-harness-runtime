@@ -27,6 +27,7 @@ fn default_config(work_dir: PathBuf) -> SandboxConfig {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
@@ -43,6 +44,7 @@ fn owned_config() -> SandboxConfig {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
@@ -106,6 +108,15 @@ fn require_bwrap() -> bool {
     true
 }
 
+fn cgroup_v2_pids_available() -> bool {
+    let controllers =
+        std::fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").unwrap_or_default();
+    let subtree =
+        std::fs::read_to_string("/sys/fs/cgroup/cgroup.subtree_control").unwrap_or_default();
+    controllers.split_whitespace().any(|c| c == "pids")
+        && subtree.split_whitespace().any(|c| c == "pids")
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Config validation (fail-closed) — no bwrap required
 // ═══════════════════════════════════════════════════════════════════════════
@@ -119,6 +130,7 @@ fn config_with_fs_denylist_is_rejected() {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
@@ -142,6 +154,7 @@ fn config_with_net_allowlist_rules_is_rejected() {
         }],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
@@ -154,22 +167,23 @@ fn config_with_net_allowlist_rules_is_rejected() {
 }
 
 #[test]
-fn config_with_resource_limits_is_rejected() {
+fn config_with_disk_limit_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let config = SandboxConfig {
         fs_allowlist: vec![],
         fs_denylist: vec![],
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
-            max_cpus: Some(2),
+            max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
-            max_disk_mb: None,
+            max_disk_mb: Some(1),
             timeout: None,
         },
         work_dir: Some(dir.path().to_path_buf()),
     };
     let result = BwrapSandbox::new(config);
-    assert!(result.is_err(), "max_cpus must be rejected");
+    assert!(result.is_err(), "max_disk_mb must be rejected");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -258,6 +272,7 @@ async fn file_api_allows_fs_allowlist_paths() {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
@@ -471,6 +486,7 @@ async fn reset_refuses_root_path() {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
@@ -494,6 +510,7 @@ async fn reset_refuses_var_lib() {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
@@ -518,6 +535,7 @@ async fn reset_refuses_tmp_directory() {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
@@ -538,6 +556,7 @@ async fn reset_refuses_dot_path() {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
@@ -743,6 +762,24 @@ async fn shell_cannot_read_host_file_outside_allowlist() {
         "sandbox must prevent reading host files; got: {}",
         result.stdout
     );
+}
+
+#[tokio::test]
+#[ignore = "requires bwrap and delegated cgroup v2 pids controller"]
+async fn shell_enforces_cgroup_process_limit() {
+    if !require_bwrap() || !cgroup_v2_pids_available() {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = default_config(dir.path().to_path_buf());
+    config.resource_limits.max_processes = Some(1);
+    let sandbox = BwrapSandbox::new(config).unwrap();
+    let env = sandbox.env.clone();
+
+    let result = env.execute_shell("sleep 0.2 & wait", shell_opts()).await;
+    assert!(result.is_err(), "pids.max=1 must reject descendant fork");
+    Box::new(sandbox).shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -1011,6 +1048,7 @@ async fn config_timeout_enforced_as_upper_bound() {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: Some(Duration::from_secs(1)),
