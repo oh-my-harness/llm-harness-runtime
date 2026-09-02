@@ -13,6 +13,7 @@ pub mod issue;
 pub mod pulse;
 pub mod roles;
 pub mod routes;
+pub mod runtime;
 pub mod scout;
 pub mod settings;
 pub mod team_manager;
