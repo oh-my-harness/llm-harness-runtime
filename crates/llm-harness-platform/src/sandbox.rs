@@ -21,6 +21,9 @@ pub struct NetRule {
 pub struct ResourceLimits {
     /// Maximum CPU count. `None` means no limit.
     pub max_cpus: Option<usize>,
+    /// Maximum number of concurrent processes in the sandbox. `None` means
+    /// no limit.
+    pub max_processes: Option<usize>,
     /// Maximum memory in MB. `None` means no limit.
     pub max_memory_mb: Option<usize>,
     /// Maximum disk usage in MB. `None` means no limit.

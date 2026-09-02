@@ -111,6 +111,7 @@ async fn make_sandbox_and_env() -> (tempfile::TempDir, Arc<dyn ExecutionEnv>) {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,

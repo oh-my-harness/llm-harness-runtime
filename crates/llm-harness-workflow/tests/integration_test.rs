@@ -38,6 +38,7 @@ async fn infrastructure_assembly_smoke_test() {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
@@ -127,6 +128,7 @@ async fn dev_configuration_smoke_test() {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,

@@ -285,6 +285,7 @@ async fn jsonl_session_survives_reload() {
             net_allowlist: vec![],
             resource_limits: ResourceLimits {
                 max_cpus: None,
+                max_processes: None,
                 max_memory_mb: None,
                 max_disk_mb: None,
                 timeout: None,

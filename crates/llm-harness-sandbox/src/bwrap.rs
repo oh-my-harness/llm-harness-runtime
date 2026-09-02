@@ -17,6 +17,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::cgroup::CgroupV2;
 use crate::shell_runner::{ChildReaper, drain_child_output_guarded};
 use anyhow::Result;
 use cap_std::ambient_authority;
@@ -27,6 +28,8 @@ use futures::future::BoxFuture;
 use llm_harness_platform::sandbox::{Sandbox, SandboxConfig};
 use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
+
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 // ── Path helpers ───────────────────────────────────────────────────────────
 
@@ -893,9 +896,15 @@ impl ExecutionEnv for BwrapEnv {
                 .map(|c| c.to_path_buf())
                 .unwrap_or_else(|| self.work_dir_canon.clone());
             let bwrap_args = self.build_bwrap_args(&cwd);
+            let cgroup = CgroupV2::create(Path::new(CGROUP_ROOT), &self.config.resource_limits)
+                .map_err(|error| EnvError::Other(format!("cgroup resource limits: {error}")))?;
+            let (program, command_args) = match &cgroup {
+                Some(cgroup) => cgroup.wrap_bwrap(&bwrap_args),
+                None => ("bwrap".to_string(), bwrap_args),
+            };
 
-            let mut shell_cmd = tokio::process::Command::new("bwrap");
-            shell_cmd.args(&bwrap_args);
+            let mut shell_cmd = tokio::process::Command::new(program);
+            shell_cmd.args(&command_args);
             shell_cmd.arg("--");
             shell_cmd.arg("/usr/bin/env");
             shell_cmd.arg("-i");
@@ -909,6 +918,11 @@ impl ExecutionEnv for BwrapEnv {
             // Re-check lifecycle: shutdown may have begun between
             // acquire_op_lock and here.  If so, refuse to spawn.
             if self.lifecycle() != LifecycleState::Running || shutdown_token.is_cancelled() {
+                if let Some(cgroup) = &cgroup
+                    && let Err(error) = cgroup.kill_and_remove().await
+                {
+                    eprintln!("cgroup cleanup failed: {error}");
+                }
                 return Err(EnvError::Other("sandbox is shutting down".into()));
             }
 
@@ -919,9 +933,19 @@ impl ExecutionEnv for BwrapEnv {
             // to spawn (fail-closed).
             let reaper = ChildReaper::global()
                 .ok_or_else(|| EnvError::Other("child reaper unavailable".into()))?;
-            let admission = reaper
-                .try_admit()
-                .ok_or_else(|| EnvError::Other("sandbox at capacity or reaper unhealthy".into()))?;
+            let admission = match reaper.try_admit() {
+                Some(admission) => admission,
+                None => {
+                    if let Some(cgroup) = &cgroup
+                        && let Err(error) = cgroup.kill_and_remove().await
+                    {
+                        eprintln!("cgroup cleanup failed: {error}");
+                    }
+                    return Err(EnvError::Other(
+                        "sandbox at capacity or reaper unhealthy".into(),
+                    ));
+                }
+            };
 
             let child = match shell_cmd
                 .stdout(Stdio::piped())
@@ -931,6 +955,11 @@ impl ExecutionEnv for BwrapEnv {
                 Ok(child) => child,
                 Err(e) => {
                     // admission is dropped here (released) when we return Err.
+                    if let Some(cgroup) = &cgroup
+                        && let Err(error) = cgroup.kill_and_remove().await
+                    {
+                        eprintln!("cgroup cleanup failed: {error}");
+                    }
                     return Err(if e.kind() == std::io::ErrorKind::NotFound {
                         EnvError::Other("bwrap not available — install bubblewrap".into())
                     } else {
@@ -949,7 +978,14 @@ impl ExecutionEnv for BwrapEnv {
             // kills the child and routes it for reaping.  The admission slot
             // is released only after the child is confirmed exited.
             let lease = admission.into_lease(child);
-            drain_child_output_guarded(lease, opts, shutdown_token).await
+            let result = drain_child_output_guarded(lease, opts, shutdown_token).await;
+            if let Some(cgroup) = &cgroup
+                && let Err(error) = cgroup.kill_and_remove().await
+                && result.is_ok()
+            {
+                return Err(EnvError::Other(format!("cgroup cleanup failed: {error}")));
+            }
+            result
         }
         .boxed()
     }
@@ -972,12 +1008,14 @@ impl ExecutionEnv for BwrapEnv {
 ///   caller-specified variables are injected.
 /// - Enforces `resource_limits.timeout` as an upper bound on all shell
 ///   command timeouts.
+/// - Enforces `max_cpus`, `max_processes`, and `max_memory_mb` through Linux
+///   cgroup v2 when configured. Missing cgroup v2 or controllers fail closed.
 ///
 /// **Unimplemented policies** (fail-closed in `new()`):
 /// - `fs_denylist` — not enforced by bwrap; rejected at construction.
 /// - `net_allowlist` rules — bwrap only supports all-or-nothing network;
 ///   non-empty allowlist opens the entire host network, so it is rejected.
-/// - `max_cpus`, `max_memory_mb`, `max_disk_mb` — not enforced; rejected.
+/// - `max_disk_mb` — no real capacity quota mechanism; rejected.
 #[derive(Debug)]
 pub struct BwrapSandbox {
     env: Arc<BwrapEnv>,
@@ -1018,15 +1056,11 @@ impl BwrapSandbox {
             );
         }
         let limits = &config.resource_limits;
-        if limits.max_cpus.is_some() {
-            anyhow::bail!("max_cpus is not supported by BwrapSandbox");
-        }
-        if limits.max_memory_mb.is_some() {
-            anyhow::bail!("max_memory_mb is not supported by BwrapSandbox");
-        }
         if limits.max_disk_mb.is_some() {
             anyhow::bail!("max_disk_mb is not supported by BwrapSandbox");
         }
+        CgroupV2::validate(Path::new(CGROUP_ROOT), limits)
+            .map_err(|error| anyhow::anyhow!("cgroup resource limits: {error}"))?;
         Ok(())
     }
 

@@ -25,6 +25,9 @@ pub mod shell_runner;
 pub mod os;
 
 #[cfg(all(feature = "bwrap", target_os = "linux"))]
+mod cgroup;
+
+#[cfg(all(feature = "bwrap", target_os = "linux"))]
 pub mod bwrap;
 
 #[cfg(all(feature = "seatbelt", target_os = "macos"))]

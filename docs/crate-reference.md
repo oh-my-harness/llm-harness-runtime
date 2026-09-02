@@ -47,7 +47,7 @@
 
 | 模块 | 关键导出 | 说明 |
 |------|---------|------|
-| `sandbox` | `Sandbox` trait、`SandboxConfig`、`NetRule`、`ResourceLimits` | 沙箱抽象：start/env/reset/shutdown |
+| `sandbox` | `Sandbox` trait、`SandboxConfig`、`NetRule`、`ResourceLimits` | 沙箱抽象：start/env/reset/shutdown；Bwrap 后端支持 cgroup v2 CPU/进程/内存上限 |
 | `audit` | re-export from `types` | 审计 trait |
 | `tracer` | `TraceExporter` trait、`SpanEvent`、`SpanId`、`TraceId`、`SpanKind`、`SpanStatus` | 追踪导出抽象 |
 | `tracing_adapter` | `SpanContextMap` | 把 core hooks 桥接为 span 事件 |

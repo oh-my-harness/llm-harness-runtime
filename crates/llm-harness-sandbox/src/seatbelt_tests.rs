@@ -21,6 +21,7 @@ fn default_config(work_dir: PathBuf) -> SandboxConfig {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
@@ -36,6 +37,7 @@ fn owned_config() -> SandboxConfig {
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
@@ -362,6 +364,7 @@ async fn sandbox_validate_config_rejects_resource_limits() {
     let config = SandboxConfig {
         resource_limits: ResourceLimits {
             max_cpus: Some(2),
+            max_processes: None,
             max_memory_mb: None,
             max_disk_mb: None,
             timeout: None,
