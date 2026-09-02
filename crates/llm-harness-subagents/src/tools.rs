@@ -992,9 +992,16 @@ mod tests {
             DataBlock::Text { text, .. } => assert!(text.contains("Spawned agent")),
             _ => panic!("expected text"),
         }
-        // Let the track task finish.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(bus.in_flight_count(), 0);
+        // Wait for the tracking task rather than assuming a fixed delay is
+        // sufficient on slower CI runners (especially Windows).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while bus.in_flight_count() != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "subagent tracking task did not release in-flight state"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
