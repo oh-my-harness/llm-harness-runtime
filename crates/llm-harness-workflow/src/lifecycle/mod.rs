@@ -9,5 +9,6 @@
 //! in `llm-harness-strategy`.
 
 pub mod event;
+pub mod human;
 pub mod task;
 pub mod task_store;

@@ -368,6 +368,8 @@ pub const WAIT_FOR_EXTERNAL_EVENT_TOOL_NAME: &str = "wait_for_external_event";
 pub const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
 pub const SUBMIT_WORKFLOW_TOOL_NAME: &str = "submit_workflow";
 pub const SKILL_READ_TOOL_NAME: &str = "skill_read";
+pub const REQUEST_HUMAN_APPROVAL_TOOL_NAME: &str = "request_human_approval";
+pub const REQUEST_HUMAN_INPUT_TOOL_NAME: &str = "request_human_input";
 
 // Main↔subagent communication tools
 pub const MESSAGE_SUBAGENT_TOOL_NAME: &str = "message_subagent";
@@ -383,6 +385,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     SPAWN_AGENT_TOOL_NAME,
     SUBMIT_WORKFLOW_TOOL_NAME,
     SKILL_READ_TOOL_NAME,
+    REQUEST_HUMAN_APPROVAL_TOOL_NAME,
+    REQUEST_HUMAN_INPUT_TOOL_NAME,
     MESSAGE_SUBAGENT_TOOL_NAME,
     AWAIT_SUBAGENT_REPLY_TOOL_NAME,
     QUERY_SUBAGENT_TOOL_NAME,

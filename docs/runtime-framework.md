@@ -45,7 +45,8 @@ src/
 ├── lifecycle/          # task 持久化 + 事件
 │   ├── task.rs         # TaskId/TaskError/TaskResult/Checkpoint 纯数据
 │   ├── task_store.rs   # TaskStore trait + JsonlTaskStore 参考实现
-│   └── event.rs        # EventStream trait + WaitForExternalEventTool
+│   ├── event.rs        # EventStream trait + WaitForExternalEventTool
+│   └── human.rs        # request_human_approval / request_human_input
 └── workflow/           # 流程编排引擎
     ├── model.rs        # 纯数据模型（Workflow/Step/Edge/WorkflowState/Transition/...）
     ├── engine/         # WorkflowEngine——唯一执行引擎（拆为子模块）
@@ -96,6 +97,7 @@ src/
 | `task.rs` | `TaskId`/`TaskError`/`TaskResult`/`Checkpoint` 纯数据。 |
 | `task_store.rs` | `TaskStore` trait：workflow_state / workflow / checkpoints / event_wait 四类持久化。`JsonlTaskStore` 参考实现。单进程独占（`tokio::Mutex`），崩溃恢复=旧进程确认死后新进程 load。 |
 | `event.rs` | 通用事件唤醒：`EventStream` trait + `WaitForExternalEventTool`（阻塞等事件，落盘 descriptor 供恢复）。 |
+| `human.rs` | HITL 内置工具：`RequestHumanApprovalTool` / `RequestHumanInputTool` 监听注入的 `EventStream`，通过 `ToolExecutionUpdate` 暴露请求，支持超时 fail-closed/默认值。 |
 
 ### 2.4 规则匹配（`rules/`）
 | 模块 | 职责 |
