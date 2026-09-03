@@ -19,3 +19,4 @@ pub mod settings;
 pub mod team_manager;
 pub mod team_spec;
 pub mod template_store;
+pub mod workspace;

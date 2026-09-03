@@ -18,6 +18,8 @@ pub enum StudioError {
     AlreadyRunning { root: PathBuf },
     #[error("settings load failed: {0}")]
     Settings(#[from] crate::settings::SettingsError),
+    #[error("workspace grants load failed: {0}")]
+    Workspace(#[from] crate::workspace::WorkspaceError),
     #[error("inspector mount failed: {0}")]
     Inspector(#[from] llm_harness_inspector::InspectorError),
 }
@@ -75,6 +77,9 @@ impl StudioRuntime {
         let injected_provider_factory = config.provider_factory;
 
         let settings = Settings::load(&data_root)?.unwrap_or_default();
+        let grants = Arc::new(RwLock::new(crate::workspace::WorkspaceGrants::load(
+            &data_root,
+        )?));
         let api_key = crate::settings::load_api_key(&data_root).unwrap_or_default();
         let base_url = std::env::var("OPENAI_API_BASE").unwrap_or_default();
         let models = settings.models.clone();
@@ -90,6 +95,28 @@ impl StudioRuntime {
         let mut tm = TeamManager::new(&data_root);
         for spec in list_persisted(&data_root) {
             let repo_path = spec.repo_hint();
+            if let Some(repo_path) = &repo_path {
+                let grants = grants.read().await;
+                match grants.contains(repo_path) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(
+                            "team `{}` restore skipped: workspace {} is not authorized",
+                            spec.id,
+                            repo_path.display()
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            "team `{}` restore failed to check workspace {}: {error}",
+                            spec.id,
+                            repo_path.display()
+                        );
+                        continue;
+                    }
+                }
+            }
             match tm
                 .create(spec.clone(), repo_path, &settings, &api_key)
                 .await
@@ -140,6 +167,7 @@ impl StudioRuntime {
             events,
             registry: registry.clone(),
             operator_pumps,
+            grants,
         };
         let static_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
         let inspector = Inspector::registry(registry)
@@ -276,6 +304,65 @@ mod tests {
         assert!(!token.is_empty());
         let url = runtime.panel_url().unwrap();
         assert!(url.starts_with(&format!("http://{addr}/app/team.html#token=")));
+        runtime.shutdown().await;
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_authorizes_restored_workspaces() {
+        let root = temp_root("startup-grants");
+        let repo = root.join("workspace/repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let spec = crate::team_spec::TeamSpec {
+            id: "startup-grants".into(),
+            name: "Startup Grants".into(),
+            repo_path: Some(repo.to_string_lossy().into_owned()),
+            members: vec![crate::team_spec::MemberSpec {
+                id: "planner".into(),
+                persona: "test".into(),
+                role_label: "Planner".into(),
+                model: crate::team_spec::ModelRef::Explicit("default".into()),
+                toolkits: vec!["fs".into()],
+                behaviors: vec![],
+                provider_override: None,
+                persona_file: None,
+            }],
+            template: None,
+            template_baseline: None,
+        };
+        crate::team_manager::persist_spec(&root, &spec);
+        let provider_factory = Arc::new(move || {
+            vec![(
+                "default".to_string(),
+                Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]))
+                    as Arc<dyn llm_harness_loop::LlmClient>,
+            )]
+        }) as crate::env_cfg::ProviderFactory;
+        let _factory_guard =
+            crate::env_cfg::install_test_provider_factory(provider_factory.clone());
+
+        let runtime = StudioRuntime::start(
+            StudioConfig::from_env()
+                .with_data_root(&root)
+                .with_provider_factory(Some(provider_factory.clone())),
+        )
+        .await
+        .unwrap();
+        assert!(runtime.pm.read().await.ids().is_empty());
+        runtime.shutdown().await;
+
+        crate::workspace::WorkspaceGrants::load(&root)
+            .unwrap()
+            .add(&repo, None)
+            .unwrap();
+        let runtime = StudioRuntime::start(
+            StudioConfig::from_env()
+                .with_data_root(&root)
+                .with_provider_factory(Some(provider_factory)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime.pm.read().await.ids(), vec!["startup-grants"]);
         runtime.shutdown().await;
         std::fs::remove_dir_all(&root).unwrap();
     }
