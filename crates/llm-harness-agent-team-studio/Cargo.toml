@@ -24,10 +24,12 @@ tracing-subscriber.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
-fd-lock = "4"
 
 [dev-dependencies]
 llm-harness-loop = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
