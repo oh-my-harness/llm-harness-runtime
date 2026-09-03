@@ -992,8 +992,15 @@ mod tests {
             DataBlock::Text { text, .. } => assert!(text.contains("Spawned agent")),
             _ => panic!("expected text"),
         }
-        // Let the track task finish.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Let the track task finish. Polling avoids depending on a fixed
+        // scheduling delay, which can be materially slower on Windows CI.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while bus.in_flight_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sub-agent tracking task should complete");
         assert_eq!(bus.in_flight_count(), 0);
     }
 
