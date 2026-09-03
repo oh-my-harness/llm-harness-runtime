@@ -127,9 +127,14 @@ team.shutdown();
 planner / coder / 5×reviewer / judge / debugger / scout）是第一个官方模板。
 
 ```bash
-./scripts/studio.sh            # 构建 → 起服务 → 打开面板
-# 面板：http://127.0.0.1:<port>/app/team.html（数据目录 ~/.harness/agent-team-studio）
+./scripts/studio.sh            # 构建 → 随机本机端口 → 打开面板
 ```
+
+服务只绑定 loopback，并对所有 `/api/*` 请求启用 per-process bearer token；
+launcher 输出的 URL 通过 URL fragment 携带 token，只用于本机会话，不要转发。
+Studio 主进程会在退出前把 panic 事件追加到数据根目录的
+`logs/crash.jsonl`（Unix 权限 `0600`）；该报告包含时间、线程、panic 消息和
+backtrace，便于桌面宿主或运维在进程退出后定位原因。
 
 面板三列工作区：左列成员卡片（状态/插话/停止）、中列选中成员 session
 历史、右列 per-agent 配置（persona 热应用；model/api key/base url/工具包

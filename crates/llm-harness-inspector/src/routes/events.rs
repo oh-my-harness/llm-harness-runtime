@@ -17,39 +17,18 @@ use tokio::sync::broadcast::error::RecvError;
 /// Upgrade the HTTP request to a WebSocket connection.
 ///
 /// Requires a `token` query parameter matching the shared secret generated
-/// when the inspector server was mounted. This prevents other local processes
-/// from connecting to the event stream and reading agent state.
-///
-/// Also rejects connections from non-localhost origins to prevent WebSocket
-/// CSRF (a malicious page opened in the same browser could otherwise connect
-/// to `ws://127.0.0.1:PORT/api/events` and exfiltrate agent state).
+/// when the inspector server was mounted. WebSocket requests cannot always
+/// carry headers, and browser origin checks are not sufficient to prevent a
+/// malicious same-host page from using a live local session.
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<InspectorState>,
     headers: axum::http::HeaderMap,
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // Token check: required for non-browser clients (no Origin header).
-    // Browser connections from localhost are authenticated by the Origin
-    // check below — this prevents CSRF without breaking the Inspector UI,
-    // which has no way to obtain the token.
-    let has_localhost_origin = headers
-        .get("origin")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            let l = s.to_ascii_lowercase();
-            l.starts_with("http://localhost")
-                || l.starts_with("http://127.0.0.1")
-                || l.starts_with("https://localhost")
-                || l.starts_with("https://127.0.0.1")
-        })
-        .unwrap_or(false);
-
-    if !has_localhost_origin {
-        let token = query.get("token").map(|s| s.as_str()).unwrap_or("");
-        if token.is_empty() || !state.token.matches(token) {
-            return axum::http::StatusCode::UNAUTHORIZED.into_response();
-        }
+    let token = query.get("token").map(String::as_str).unwrap_or("");
+    if token.is_empty() || !state.token.matches(token) {
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
     }
 
     // Reject non-localhost browser origins to prevent WebSocket CSRF.

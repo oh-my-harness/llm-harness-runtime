@@ -69,6 +69,13 @@
   .dir-item .repo-tag { font-size: .65rem; color: var(--ok); font-weight: 600; }
   .dir-actions { display: flex; justify-content: space-between; margin-top: .75rem; gap: .5rem; }
   .dir-actions .cancel { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
+  .grant-row { display: flex; gap: .4rem; margin-bottom: .5rem; }
+  .grant-row input { flex: 1; }
+  .grant-row button, .grant-remove { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
+  .grant-list { max-height: 84px; overflow-y: auto; margin-bottom: .5rem; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+  .grant-item { display: flex; justify-content: space-between; align-items: center; gap: .5rem; padding: .3rem .5rem; font-size: .72rem; }
+  .grant-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .grant-remove { font-size: .65rem; padding: .1rem .35rem; }
   /* pulse — per-agent cards */
   .agent-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: .6rem .9rem; margin-bottom: .5rem; display: flex; align-items: center; gap: .7rem; }
   .agent-card.busy { border-color: var(--warn); }
@@ -185,6 +192,11 @@
 <div id="dir-modal">
   <div class="dir-dialog">
     <h3>选择仓库目录</h3>
+    <div class="grant-row">
+      <input id="grant-path" placeholder="输入可授权的工作区绝对路径">
+      <button id="grant-add">授权</button>
+    </div>
+    <div class="grant-list" id="grant-list"></div>
     <div class="dir-crumbs" id="dir-crumbs"></div>
     <div class="dir-list" id="dir-list"></div>
     <div class="dir-actions">
@@ -198,8 +210,17 @@
 let projects = [];
 let current = null;
 const $ = (id) => document.getElementById(id);
+const authToken = (() => {
+  if (!location.hash.includes('token=')) return sessionStorage.getItem('studio-token') || '';
+  const token = new URLSearchParams(location.hash.slice(1)).get('token') || '';
+  sessionStorage.setItem('studio-token', token);
+  history.replaceState(null, '', location.pathname + location.search);
+  return token;
+})();
 
 async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({ Authorization: `Bearer ${authToken}` }, opts.headers || {});
   const resp = await fetch(path, opts);
   const json = await resp.json().catch(() => ({}));
   return { status: resp.status, json };
@@ -398,11 +419,61 @@ $('register-form').onsubmit = async (e) => {
 let dirCursor = '';
 async function openDirPicker() {
   $('dir-modal').classList.add('open');
-  await browseDir(''); // home
+  await loadWorkspaceGrants();
 }
 function closeDirPicker() {
   $('dir-modal').classList.remove('open');
 }
+
+async function loadWorkspaceGrants() {
+  const { json } = await api('/api/team/fs/grants');
+  const list = $('grant-list');
+  list.textContent = '';
+  for (const grant of (json.grants || [])) {
+    const item = document.createElement('div');
+    item.className = 'grant-item';
+    const label = document.createElement('span');
+    label.textContent = grant.path;
+    label.title = grant.path;
+    const remove = document.createElement('button');
+    remove.className = 'grant-remove';
+    remove.textContent = '撤销';
+    remove.onclick = async () => {
+      const { status } = await api(`/api/team/fs/grants?id=${encodeURIComponent(grant.id)}`, { method: 'DELETE' });
+      if (status === 200) await loadWorkspaceGrants();
+    };
+    item.append(label, remove);
+    list.appendChild(item);
+  }
+  if (json.grants?.length) await browseDir(json.grants[0].path);
+  else {
+    dirCursor = '';
+    $('dir-crumbs').textContent = '尚无授权工作区';
+    const list = $('dir-list');
+    list.textContent = '';
+    const empty = document.createElement('p');
+    empty.className = 'empty';
+    empty.style.padding = '.5rem .75rem';
+    empty.textContent = '输入一个绝对路径并点击“授权”后才能浏览。';
+    list.appendChild(empty);
+  }
+}
+
+$('grant-add').onclick = async () => {
+  const path = $('grant-path').value.trim();
+  if (!path) return;
+  const { status, json } = await api('/api/team/fs/grants', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  if (status !== 201) {
+    alert(`授权失败: ${json.error || status}`);
+    return;
+  }
+  $('grant-path').value = '';
+  await loadWorkspaceGrants();
+};
 async function browseDir(path) {
   const { status, json } = await api(`/api/team/fs?path=${encodeURIComponent(path)}`);
   if (status !== 200) {
@@ -740,7 +811,7 @@ setInterval(() => {
 // ── WS event stream: live operator messages + issue changes ──
 function connectEvents() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/api/team/events`);
+  const ws = new WebSocket(`${proto}://${location.host}/api/team/events?token=${encodeURIComponent(authToken)}`);
   ws.onmessage = (e) => {
     let ev;
     try { ev = JSON.parse(e.data); } catch { return; }
