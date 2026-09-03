@@ -8,6 +8,22 @@
 use llm_harness_agent_team_studio::diagnostics::install_panic_reporter;
 use llm_harness_agent_team_studio::runtime::{StudioConfig, StudioRuntime, default_data_root};
 
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 #[tokio::main]
 async fn main() {
     install_panic_reporter(default_data_root());
@@ -27,12 +43,12 @@ async fn main() {
         }
     };
 
-    if let Some(url) = runtime.panel_url() {
-        println!("STUDIO_PANEL_URL={url}");
-    }
+    println!(
+        "STUDIO_PANEL_DESCRIPTOR={}",
+        runtime.panel_descriptor_path().display()
+    );
 
-    // Hold until Ctrl+C, then shut everything down.
-    let _ = tokio::signal::ctrl_c().await;
+    wait_for_shutdown().await;
     tracing::info!("shutting down");
     runtime.shutdown().await;
 }

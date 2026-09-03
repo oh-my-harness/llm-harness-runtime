@@ -6,6 +6,7 @@ use crate::team_manager::TeamManager;
 use llm_harness_agent_team::AgentId;
 use llm_harness_inspector::Inspector;
 use llm_harness_inspector::state::HarnessRegistry;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -56,6 +57,8 @@ impl Default for StartupRecovery {
 pub enum StudioError {
     #[error("data root preparation failed: {0}")]
     DataRoot(#[source] std::io::Error),
+    #[error("panel descriptor preparation failed: {0}")]
+    PanelDescriptor(#[source] std::io::Error),
     #[error("studio singleton is already running for data root {root}")]
     AlreadyRunning { root: PathBuf },
     #[error("settings load failed: {0}")]
@@ -106,9 +109,11 @@ impl StudioConfig {
 }
 
 pub struct StudioRuntime {
+    data_root: PathBuf,
     inspector: Inspector,
     pm: Arc<RwLock<TeamManager>>,
     recovery: StartupRecovery,
+    _panel_descriptor: PanelDescriptorGuard,
     _singleton: StudioSingleton,
 }
 
@@ -116,6 +121,7 @@ impl StudioRuntime {
     pub async fn start(config: StudioConfig) -> Result<Self, StudioError> {
         prepare_data_root(&config.data_root).map_err(StudioError::DataRoot)?;
         let singleton = StudioSingleton::acquire(&config.data_root)?;
+        clear_panel_descriptor(&config.data_root).map_err(StudioError::PanelDescriptor)?;
         let data_root = config.data_root;
         let injected_provider_factory = config.provider_factory;
 
@@ -254,12 +260,27 @@ impl StudioRuntime {
             .mount()
             .await?;
 
-        Ok(Self {
+        let runtime = Self {
+            data_root: data_root.clone(),
             inspector,
             pm: tm_shared,
             recovery,
+            _panel_descriptor: PanelDescriptorGuard {
+                path: panel_descriptor_path(&data_root),
+            },
             _singleton: singleton,
-        })
+        };
+        if let Some(url) = runtime.panel_url()
+            && let Err(error) = write_panel_descriptor(&data_root, &url)
+        {
+            runtime.shutdown().await;
+            return Err(StudioError::PanelDescriptor(error));
+        }
+        Ok(runtime)
+    }
+
+    pub fn panel_descriptor_path(&self) -> PathBuf {
+        panel_descriptor_path(&self.data_root)
     }
 
     pub fn bound_addr(&self) -> Option<std::net::SocketAddr> {
@@ -284,6 +305,86 @@ impl StudioRuntime {
         self.inspector.shutdown().await;
         self.pm.write().await.shutdown_all().await;
     }
+}
+
+struct PanelDescriptorGuard {
+    path: PathBuf,
+}
+
+impl Drop for PanelDescriptorGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let mut temporary = self.path.clone().into_os_string();
+        temporary.push(".tmp");
+        let _ = std::fs::remove_file(std::path::PathBuf::from(temporary));
+    }
+}
+
+const PANEL_DESCRIPTOR_SCHEMA: &str = "llm-harness.studio.panel-descriptor.v1";
+
+fn panel_descriptor_path(data_root: &Path) -> PathBuf {
+    data_root.join("panel.json")
+}
+
+fn panel_descriptor_temp_path(data_root: &Path) -> PathBuf {
+    data_root.join("panel.json.tmp")
+}
+
+fn clear_panel_descriptor(data_root: &Path) -> std::io::Result<()> {
+    for path in [
+        panel_descriptor_path(data_root),
+        panel_descriptor_temp_path(data_root),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_panel_descriptor(data_root: &Path, panel_url: &str) -> std::io::Result<()> {
+    clear_panel_descriptor(data_root)?;
+    let temporary = panel_descriptor_temp_path(data_root);
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(unix)]
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    #[cfg(not(unix))]
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    serde_json::to_writer(
+        &mut file,
+        &serde_json::json!({
+            "schema": PANEL_DESCRIPTOR_SCHEMA,
+            "url": panel_url,
+        }),
+    )?;
+    file.flush()?;
+    file.sync_all()?;
+    set_private_file_permissions(&temporary)?;
+    std::fs::rename(&temporary, panel_descriptor_path(data_root))?;
+    Ok(())
+}
+
+fn set_private_file_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 struct StudioSingleton {
@@ -417,6 +518,9 @@ mod tests {
     #[tokio::test]
     async fn start_binds_loopback_with_auth_and_panel_url() {
         let root = temp_root("start");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("panel.json"), "{\"url\":\"stale\"}").unwrap();
+        std::fs::write(root.join("panel.json.tmp"), "stale").unwrap();
         let _factory = crate::env_cfg::install_test_provider_factory(Arc::new(|| {
             vec![(
                 "default".to_string(),
@@ -433,7 +537,26 @@ mod tests {
         assert!(!token.is_empty());
         let url = runtime.panel_url().unwrap();
         assert!(url.starts_with(&format!("http://{addr}/app/team.html#token=")));
+        let descriptor_path = runtime.panel_descriptor_path();
+        let descriptor: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&descriptor_path).unwrap()).unwrap();
+        assert_eq!(
+            descriptor["schema"],
+            "llm-harness.studio.panel-descriptor.v1"
+        );
+        assert_eq!(descriptor["url"], url);
+        assert!(!root.join("panel.json.tmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&descriptor_path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         runtime.shutdown().await;
+        assert!(!descriptor_path.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -130,8 +130,11 @@ planner / coder / 5×reviewer / judge / debugger / scout）是第一个官方模
 ./scripts/studio.sh            # 构建 → 随机本机端口 → 打开面板
 ```
 
-服务只绑定 loopback，并对所有 `/api/*` 请求启用 per-process bearer token；
-launcher 输出的 URL 通过 URL fragment 携带 token，只用于本机会话，不要转发。
+服务只绑定 loopback，并对所有 `/api/*` 请求启用 per-process bearer token。
+`StudioRuntime` 就绪后会把 panel URL 写入 data root 的 `panel.json`（Unix 权限
+`0600`），并采用同目录临时文件 + rename 原子替换。桌面宿主和 launcher 只接收
+descriptor 路径；后端不会把含 token 的 URL 打进 stdout。干净退出或 runtime drop
+时会删除该文件。
 Studio 数据根目录使用进程级独占锁，避免同一份团队数据被多个桌面实例并发修改。
 Studio 主进程会在退出前把 panic 事件追加到数据根目录的
 `logs/crash.jsonl`（Unix 权限 `0600`）；该报告包含时间、线程、panic 消息和
