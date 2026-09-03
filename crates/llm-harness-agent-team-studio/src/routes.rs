@@ -45,6 +45,8 @@ pub struct AppState {
     pub operator_pumps: Arc<Mutex<HashMap<String, AbortHandle>>>,
     /// Explicitly authorized workspace roots for host filesystem browsing.
     pub grants: Arc<RwLock<WorkspaceGrants>>,
+    /// Startup restoration outcome so clients can distinguish healthy and degraded launches.
+    pub startup_recovery: Arc<RwLock<crate::runtime::StartupRecovery>>,
 }
 
 /// Shared handle to the manager (kept for direct consumers/tests).
@@ -54,6 +56,7 @@ pub type SharedPm = Arc<RwLock<TeamManager>>;
 pub fn team_router(state: AppState) -> Router {
     Router::new()
         .route("/app/team.html", get(team_panel))
+        .route("/api/team/startup", get(startup_recovery))
         .route(
             "/api/team/projects",
             get(list_projects)
@@ -91,6 +94,11 @@ pub fn team_router(state: AppState) -> Router {
 
 async fn team_panel() -> Html<&'static str> {
     Html(include_str!("../static/team.html"))
+}
+
+async fn startup_recovery(State(state): State<AppState>) -> Response {
+    let recovery = state.startup_recovery.read().await.clone();
+    Json(serde_json::json!({ "recovery": recovery })).into_response()
 }
 
 // ── GET /api/team/projects ───────────────────────────────────────────────────
@@ -1529,6 +1537,45 @@ mod tests {
         assert!(std::str::from_utf8(&body).unwrap().contains("Coding Team"));
     }
 
+    #[tokio::test]
+    async fn startup_recovery_is_exposed_to_panel() {
+        let _factory = install_mock_factory();
+        let data_root = unique_dir("ct-routes-recovery");
+        let recovery = crate::runtime::StartupRecovery {
+            status: crate::runtime::StartupStatus::Degraded,
+            persisted_teams: 2,
+            restored_teams: 1,
+            failed_teams: vec![crate::runtime::RecoveryFailure {
+                team_id: "blocked".into(),
+                reason: crate::runtime::RecoveryFailureReason::WorkspaceUnauthorized,
+                detail: "/repo".into(),
+            }],
+        };
+        let state = AppState {
+            pm: Arc::new(RwLock::new(TeamManager::new(&data_root))),
+            data_root,
+            tier: Arc::new(RwLock::new(tier())),
+            scout_interval_secs: Arc::new(RwLock::new(0)),
+            events: Arc::new(crate::events::EventBus::new()),
+            registry: llm_harness_inspector::state::HarnessRegistry::new("default"),
+            operator_pumps: Arc::new(Mutex::new(HashMap::new())),
+            grants: Arc::new(RwLock::new(
+                crate::workspace::WorkspaceGrants::load("unused-for-recovery").unwrap(),
+            )),
+            startup_recovery: Arc::new(RwLock::new(recovery)),
+        };
+        let router = team_router(state);
+        let (status, json) = get_json(&router, "/api/team/startup").await;
+        assert_eq!(status, 200);
+        assert_eq!(json["recovery"]["status"], "degraded");
+        assert_eq!(json["recovery"]["persisted_teams"], 2);
+        assert_eq!(json["recovery"]["restored_teams"], 1);
+        assert_eq!(
+            json["recovery"]["failed_teams"][0]["reason"],
+            "workspace_unauthorized"
+        );
+    }
+
     /// Tests install a mock factory returning one "m" client and build the
     /// state directly (no env vars — the AppState carries tier/interval).
     #[must_use]
@@ -1562,6 +1609,7 @@ mod tests {
             registry: llm_harness_inspector::state::HarnessRegistry::new("default"),
             operator_pumps: Arc::new(Mutex::new(HashMap::new())),
             grants: Arc::new(RwLock::new(grants)),
+            startup_recovery: Arc::new(RwLock::new(crate::runtime::StartupRecovery::default())),
         };
         let router = team_router(state);
         (router, pm, repo, _factory)
@@ -1939,6 +1987,7 @@ mod tests {
             registry: llm_harness_inspector::state::HarnessRegistry::new("default"),
             operator_pumps: Arc::new(Mutex::new(HashMap::new())),
             grants: Arc::new(RwLock::new(grants)),
+            startup_recovery: Arc::new(RwLock::new(crate::runtime::StartupRecovery::default())),
         };
         let router2 = team_router(state);
         json_post(
