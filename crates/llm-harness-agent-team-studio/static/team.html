@@ -100,6 +100,8 @@
   .pulse-card .meta { color: var(--dim); font-size: .68rem; }
 
   #error-banner { display: none; background: rgba(220,80,80,.12); border-bottom: 1px solid var(--err); color: var(--err); padding: .45rem 1rem; font-size: .82rem; }
+  #recovery-banner { display: none; background: rgba(255,159,10,.12); border-bottom: 1px solid var(--warn); color: var(--warn); padding: .45rem 1rem; font-size: .82rem; }
+  #recovery-banner ul { margin: .25rem 0 0; padding-left: 1.2rem; }
   .msg.sys-error { border-left: 3px solid var(--err); background: rgba(220,80,80,.08); }
   .member-card .err-line { color: var(--err); font-size: .74rem; margin-top: .2rem; word-break: break-all; }
   /* ── studio three-column workspace ── */
@@ -149,6 +151,7 @@
     <button id="global-settings" title="全局设置">⚙</button>
   </nav>
   <div id="error-banner" style="display:none"></div>
+  <div id="recovery-banner" style="display:none"></div>
   <section id="tab-pulse" class="active">
     <div class="studio-grid">
       <div id="col-members" class="studio-col"></div>
@@ -352,6 +355,41 @@ function showErrorBanner(agent, text) {
     b.textContent = agent + ' 出错：';
     banner.appendChild(b);
     banner.appendChild(document.createTextNode(text));
+  }
+}
+
+const RECOVERY_REASONS = {
+  invalid_spec: '配置无效',
+  workspace_unauthorized: '工作区未授权',
+  workspace_check: '工作区检查失败',
+  team_create: '团队创建失败',
+};
+
+async function loadStartupRecovery() {
+  const banner = $('recovery-banner');
+  if (!banner) return;
+  const { status, json } = await api('/api/team/startup');
+  const recovery = json?.recovery;
+  if (status !== 200 || !recovery || recovery.status !== 'degraded') {
+    banner.style.display = 'none';
+    banner.innerHTML = '';
+    return;
+  }
+
+  banner.style.display = 'block';
+  banner.innerHTML = '';
+  const title = document.createElement('strong');
+  title.textContent = `启动降级：已恢复 ${recovery.restored_teams}/${recovery.persisted_teams} 个团队。`;
+  banner.appendChild(title);
+  if (recovery.failed_teams?.length) {
+    const list = document.createElement('ul');
+    for (const failure of recovery.failed_teams) {
+      const item = document.createElement('li');
+      const reason = RECOVERY_REASONS[failure.reason] || '恢复失败';
+      item.textContent = `${failure.team_id}: ${reason} — ${failure.detail}`;
+      list.appendChild(item);
+    }
+    banner.appendChild(list);
   }
 }
 
@@ -828,6 +866,7 @@ function connectEvents() {
 connectEvents();
 
 loadProjects();
+loadStartupRecovery();
 setInterval(loadProjects, 15000);
 </script>
 </body>

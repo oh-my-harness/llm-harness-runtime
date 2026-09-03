@@ -2,13 +2,55 @@
 
 use crate::routes::{AppState, team_router};
 use crate::settings::Settings;
-use crate::team_manager::{TeamManager, list_persisted};
+use crate::team_manager::TeamManager;
 use llm_harness_agent_team::AgentId;
 use llm_harness_inspector::Inspector;
 use llm_harness_inspector::state::HarnessRegistry;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupStatus {
+    Healthy,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryFailureReason {
+    InvalidSpec,
+    WorkspaceUnauthorized,
+    WorkspaceCheck,
+    TeamCreate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RecoveryFailure {
+    pub team_id: String,
+    pub reason: RecoveryFailureReason,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StartupRecovery {
+    pub status: StartupStatus,
+    pub persisted_teams: usize,
+    pub restored_teams: usize,
+    pub failed_teams: Vec<RecoveryFailure>,
+}
+
+impl Default for StartupRecovery {
+    fn default() -> Self {
+        Self {
+            status: StartupStatus::Healthy,
+            persisted_teams: 0,
+            restored_teams: 0,
+            failed_teams: Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StudioError {
@@ -66,6 +108,7 @@ impl StudioConfig {
 pub struct StudioRuntime {
     inspector: Inspector,
     pm: Arc<RwLock<TeamManager>>,
+    recovery: StartupRecovery,
     _singleton: StudioSingleton,
 }
 
@@ -92,8 +135,11 @@ impl StudioRuntime {
             })),
         }
 
+        let (specs, mut failures) = load_persisted_specs(&data_root);
+        let persisted_teams = specs.len() + failures.len();
+        let mut restored_teams = 0;
         let mut tm = TeamManager::new(&data_root);
-        for spec in list_persisted(&data_root) {
+        for spec in specs {
             let repo_path = spec.repo_hint();
             if let Some(repo_path) = &repo_path {
                 let grants = grants.read().await;
@@ -105,6 +151,11 @@ impl StudioRuntime {
                             spec.id,
                             repo_path.display()
                         );
+                        failures.push(RecoveryFailure {
+                            team_id: spec.id,
+                            reason: RecoveryFailureReason::WorkspaceUnauthorized,
+                            detail: repo_path.display().to_string(),
+                        });
                         continue;
                     }
                     Err(error) => {
@@ -113,6 +164,11 @@ impl StudioRuntime {
                             spec.id,
                             repo_path.display()
                         );
+                        failures.push(RecoveryFailure {
+                            team_id: spec.id,
+                            reason: RecoveryFailureReason::WorkspaceCheck,
+                            detail: error.to_string(),
+                        });
                         continue;
                     }
                 }
@@ -121,10 +177,31 @@ impl StudioRuntime {
                 .create(spec.clone(), repo_path, &settings, &api_key)
                 .await
             {
-                Ok(_) => tracing::info!("team `{}` restored", spec.id),
-                Err(e) => tracing::error!("team `{}` restore failed: {e}", spec.id),
+                Ok(_) => {
+                    tracing::info!("team `{}` restored", spec.id);
+                    restored_teams += 1;
+                }
+                Err(e) => {
+                    tracing::error!("team `{}` restore failed: {e}", spec.id);
+                    failures.push(RecoveryFailure {
+                        team_id: spec.id,
+                        reason: RecoveryFailureReason::TeamCreate,
+                        detail: e.to_string(),
+                    });
+                }
             }
         }
+
+        let recovery = StartupRecovery {
+            status: if failures.is_empty() {
+                StartupStatus::Healthy
+            } else {
+                StartupStatus::Degraded
+            },
+            persisted_teams,
+            restored_teams,
+            failed_teams: failures,
+        };
 
         let registry = HarnessRegistry::new("default");
         for id in tm.ids() {
@@ -168,6 +245,7 @@ impl StudioRuntime {
             registry: registry.clone(),
             operator_pumps,
             grants,
+            startup_recovery: Arc::new(RwLock::new(recovery.clone())),
         };
         let inspector = Inspector::registry(registry)
             .extra_routes(team_router(state))
@@ -179,6 +257,7 @@ impl StudioRuntime {
         Ok(Self {
             inspector,
             pm: tm_shared,
+            recovery,
             _singleton: singleton,
         })
     }
@@ -189,6 +268,10 @@ impl StudioRuntime {
 
     pub fn auth_token(&self) -> Option<&str> {
         self.inspector.auth_token()
+    }
+
+    pub fn recovery(&self) -> StartupRecovery {
+        self.recovery.clone()
     }
 
     pub fn panel_url(&self) -> Option<String> {
@@ -204,30 +287,78 @@ impl StudioRuntime {
 }
 
 struct StudioSingleton {
-    _guard: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
+    _file: std::fs::File,
 }
 
 impl StudioSingleton {
     fn acquire(data_root: &Path) -> Result<Self, StudioError> {
         let path = data_root.join("studio.lock");
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .map_err(StudioError::DataRoot)?;
-        let lock: &'static mut fd_lock::RwLock<std::fs::File> =
-            Box::leak(Box::new(fd_lock::RwLock::new(file)));
-        match lock.try_write() {
-            Ok(guard) => Ok(Self { _guard: guard }),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(StudioError::AlreadyRunning {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        let file = options.open(path).map_err(|error| {
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(32) {
+                return StudioError::AlreadyRunning {
                     root: data_root.to_path_buf(),
-                })
+                };
             }
-            Err(error) => Err(StudioError::DataRoot(error)),
+            StudioError::DataRoot(error)
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    return Err(StudioError::AlreadyRunning {
+                        root: data_root.to_path_buf(),
+                    });
+                }
+                return Err(StudioError::DataRoot(error));
+            }
+        }
+
+        #[cfg(not(unix))]
+        let _ = &file;
+        Ok(Self { _file: file })
+    }
+}
+
+fn load_persisted_specs(
+    data_root: &Path,
+) -> (Vec<crate::team_spec::TeamSpec>, Vec<RecoveryFailure>) {
+    let mut specs = Vec::new();
+    let mut failures = Vec::new();
+    let Ok(entries) = std::fs::read_dir(data_root.join("teams")) else {
+        return (specs, failures);
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let team_id = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path().join("team.json");
+        match std::fs::read_to_string(&path).and_then(|text| {
+            serde_json::from_str::<crate::team_spec::TeamSpec>(&text).map_err(Into::into)
+        }) {
+            Ok(spec) => specs.push(spec),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => failures.push(RecoveryFailure {
+                team_id,
+                reason: RecoveryFailureReason::InvalidSpec,
+                detail: error.to_string(),
+            }),
         }
     }
+    specs.sort_by(|a, b| a.id.cmp(&b.id));
+    failures.sort_by(|a, b| a.team_id.cmp(&b.team_id));
+    (specs, failures)
 }
 
 fn prepare_data_root(data_root: &Path) -> std::io::Result<()> {
@@ -361,6 +492,108 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(runtime.pm.read().await.ids(), vec!["startup-grants"]);
+        runtime.shutdown().await;
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn recovery_spec(id: &str, repo_path: Option<&Path>) -> crate::team_spec::TeamSpec {
+        crate::team_spec::TeamSpec {
+            id: id.into(),
+            name: "Startup Recovery".into(),
+            repo_path: repo_path.map(|path| path.to_string_lossy().into_owned()),
+            members: vec![crate::team_spec::MemberSpec {
+                id: "planner".into(),
+                persona: "test".into(),
+                role_label: "Planner".into(),
+                model: crate::team_spec::ModelRef::Explicit("default".into()),
+                toolkits: vec![],
+                behaviors: vec![],
+                provider_override: None,
+                persona_file: None,
+            }],
+            template: None,
+            template_baseline: None,
+        }
+    }
+
+    fn write_spec(root: &Path, id: &str, value: &str) {
+        let team_dir = root.join("teams").join(id);
+        std::fs::create_dir_all(&team_dir).unwrap();
+        std::fs::write(team_dir.join("team.json"), value).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_reports_degraded_recovery() {
+        let root = temp_root("startup-degraded");
+        let repo = root.join("unauthorized");
+        let spec = recovery_spec("unauthorized", Some(&repo));
+        write_spec(
+            &root,
+            "unauthorized",
+            &serde_json::to_string(&spec).unwrap(),
+        );
+        write_spec(&root, "invalid", "{\"id\":\"invalid\"}");
+        let provider_factory = Arc::new(|| {
+            vec![(
+                "default".to_string(),
+                Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]))
+                    as Arc<dyn llm_harness_loop::LlmClient>,
+            )]
+        }) as crate::env_cfg::ProviderFactory;
+        let _factory = crate::env_cfg::install_test_provider_factory(provider_factory.clone());
+
+        let runtime = StudioRuntime::start(
+            StudioConfig::from_env()
+                .with_data_root(&root)
+                .with_provider_factory(Some(provider_factory)),
+        )
+        .await
+        .unwrap();
+        let recovery = runtime.recovery();
+        assert_eq!(recovery.status, StartupStatus::Degraded);
+        assert_eq!(recovery.persisted_teams, 2);
+        assert_eq!(recovery.restored_teams, 0);
+        assert_eq!(
+            recovery
+                .failed_teams
+                .iter()
+                .map(|failure| (failure.team_id.as_str(), failure.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                ("invalid", RecoveryFailureReason::InvalidSpec),
+                ("unauthorized", RecoveryFailureReason::WorkspaceUnauthorized),
+            ]
+        );
+        runtime.shutdown().await;
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_reports_healthy_recovery() {
+        let root = temp_root("startup-healthy");
+        let spec = recovery_spec("healthy", None);
+        write_spec(&root, "healthy", &serde_json::to_string(&spec).unwrap());
+        let provider_factory = Arc::new(|| {
+            vec![(
+                "default".to_string(),
+                Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]))
+                    as Arc<dyn llm_harness_loop::LlmClient>,
+            )]
+        }) as crate::env_cfg::ProviderFactory;
+        let _factory = crate::env_cfg::install_test_provider_factory(provider_factory.clone());
+
+        let runtime = StudioRuntime::start(
+            StudioConfig::from_env()
+                .with_data_root(&root)
+                .with_provider_factory(Some(provider_factory)),
+        )
+        .await
+        .unwrap();
+        let recovery = runtime.recovery();
+        assert_eq!(recovery.status, StartupStatus::Healthy);
+        assert_eq!(recovery.persisted_teams, 1);
+        assert_eq!(recovery.restored_teams, 1);
+        assert!(recovery.failed_teams.is_empty());
         runtime.shutdown().await;
         std::fs::remove_dir_all(&root).unwrap();
     }

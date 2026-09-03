@@ -132,9 +132,16 @@ planner / coder / 5×reviewer / judge / debugger / scout）是第一个官方模
 
 服务只绑定 loopback，并对所有 `/api/*` 请求启用 per-process bearer token；
 launcher 输出的 URL 通过 URL fragment 携带 token，只用于本机会话，不要转发。
+Studio 数据根目录使用进程级独占锁，避免同一份团队数据被多个桌面实例并发修改。
 Studio 主进程会在退出前把 panic 事件追加到数据根目录的
 `logs/crash.jsonl`（Unix 权限 `0600`）；该报告包含时间、线程、panic 消息和
 backtrace，便于桌面宿主或运维在进程退出后定位原因。
+
+启动时会恢复 `teams/*/team.json` 中持久化的团队。任一团队无法恢复时服务仍会启动，
+但面板会显示降级横幅；后端通过 `GET /api/team/startup` 暴露恢复结果，包含
+`persisted_teams`、`restored_teams` 和逐项 `failed_teams`（`invalid_spec`、
+`workspace_unauthorized`、`workspace_check`、`team_create`）。这样可以先处理已恢复
+的团队，同时定位未恢复团队的数据或授权问题，而不是把失败静默吞掉。
 
 面板三列工作区：左列成员卡片（状态/插话/停止）、中列选中成员 session
 历史、右列 per-agent 配置（persona 热应用；model/api key/base url/工具包
@@ -148,6 +155,7 @@ backtrace，便于桌面宿主或运维在进程退出后定位原因。
   model/key/url 重建）
 - `POST /api/team/upgrade-check` — 升级检查（逐字段相等判定哪些成员会跟随
   模板升级、哪些是本地覆写）
+- `GET /api/team/startup` — 启动恢复报告
 
 
 设计：`docs/design/2026-08-30-agent-team-studio-design.md`（含 inspector 两层定位
