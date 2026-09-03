@@ -14,6 +14,52 @@ use crate::team_spec::TeamSpec;
 
 /// 内置模板：coding-team（roles.rs 的数据化形态）。
 const BUILTIN_CODING_TEAM: &str = include_str!("../templates/coding-team/team.json");
+const CODING_TEAM_PERSONAS: &[(&str, &str)] = &[
+    (
+        "prompts/brainstormer.md",
+        include_str!("../templates/coding-team/prompts/brainstormer.md"),
+    ),
+    (
+        "prompts/coder.md",
+        include_str!("../templates/coding-team/prompts/coder.md"),
+    ),
+    (
+        "prompts/debugger.md",
+        include_str!("../templates/coding-team/prompts/debugger.md"),
+    ),
+    (
+        "prompts/judge.md",
+        include_str!("../templates/coding-team/prompts/judge.md"),
+    ),
+    (
+        "prompts/planner.md",
+        include_str!("../templates/coding-team/prompts/planner.md"),
+    ),
+    (
+        "prompts/reviewer-magical-prompt.md",
+        include_str!("../templates/coding-team/prompts/reviewer-magical-prompt.md"),
+    ),
+    (
+        "prompts/reviewer-performance.md",
+        include_str!("../templates/coding-team/prompts/reviewer-performance.md"),
+    ),
+    (
+        "prompts/reviewer-robustness.md",
+        include_str!("../templates/coding-team/prompts/reviewer-robustness.md"),
+    ),
+    (
+        "prompts/reviewer-spec-compliance.md",
+        include_str!("../templates/coding-team/prompts/reviewer-spec-compliance.md"),
+    ),
+    (
+        "prompts/reviewer-standards.md",
+        include_str!("../templates/coding-team/prompts/reviewer-standards.md"),
+    ),
+    (
+        "prompts/scout.md",
+        include_str!("../templates/coding-team/prompts/scout.md"),
+    ),
+];
 
 /// persona 展开时追加的统一协作约定。
 const COOPERATION_FOOTNOTE: &str = "\n\n---\n## 团队协作约定（引擎附加）\n\
@@ -131,12 +177,12 @@ impl TemplateStore {
                     tpl: id.into(),
                     source: Box::new(e),
                 })?;
-                return self.parse(id, &raw, Some(dir.join(id)));
+                return self.parse(id, &raw, Some(dir.join(id)), None);
             }
         }
         // 2. 内置
         if id == BUILTIN_CODING_TEAM_ID {
-            return self.parse(id, BUILTIN_CODING_TEAM, None);
+            return self.parse(id, BUILTIN_CODING_TEAM, None, Some(CODING_TEAM_PERSONAS));
         }
         Err(TemplateError::NotFound(id.into()))
     }
@@ -146,6 +192,7 @@ impl TemplateStore {
         id: &str,
         raw: &str,
         base_dir: Option<PathBuf>,
+        embedded_personas: Option<&[(&str, &str)]>,
     ) -> Result<LoadedTemplate, TemplateError> {
         let tf: TemplateFile = serde_json::from_str(raw).map_err(|e| TemplateError::Parse {
             tpl: id.into(),
@@ -163,20 +210,41 @@ impl TemplateStore {
         })?;
         spec.template = None; // 模板本身没有 template 引用
         // persona 展开：persona_file → 全文 + 协作尾注
-        let base = base_dir.unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("templates")
-                .join(id)
-        });
         for m in &mut spec.members {
             if let Some(file) = m.persona_file.take() {
-                let text = std::fs::read_to_string(base.join(&file)).map_err(|e| {
-                    TemplateError::PersonaFile {
-                        tpl: id.into(),
-                        file,
-                        source: e,
+                let text = match embedded_personas {
+                    Some(personas) => personas
+                        .iter()
+                        .find(|(embedded_file, _)| *embedded_file == file)
+                        .map(|(_, text)| (*text).to_owned())
+                        .ok_or_else(|| TemplateError::PersonaFile {
+                            tpl: id.into(),
+                            file: file.clone(),
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "embedded persona is missing",
+                            ),
+                        })?,
+                    None => {
+                        let base = base_dir
+                            .as_ref()
+                            .ok_or_else(|| TemplateError::PersonaFile {
+                                tpl: id.into(),
+                                file: file.clone(),
+                                source: std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    "persona base directory is unavailable",
+                                ),
+                            })?;
+                        std::fs::read_to_string(base.join(&file)).map_err(|e| {
+                            TemplateError::PersonaFile {
+                                tpl: id.into(),
+                                file: file.clone(),
+                                source: e,
+                            }
+                        })?
                     }
-                })?;
+                };
                 m.persona = format!("{}{}", text.trim(), COOPERATION_FOOTNOTE);
             }
         }

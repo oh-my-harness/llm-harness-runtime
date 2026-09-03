@@ -9,7 +9,7 @@
 use axum::Router;
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json, Response};
+use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -53,6 +53,7 @@ pub type SharedPm = Arc<RwLock<TeamManager>>;
 /// Build the domain router. Mount with `InspectorBuilder::extra_routes`.
 pub fn team_router(state: AppState) -> Router {
     Router::new()
+        .route("/app/team.html", get(team_panel))
         .route(
             "/api/team/projects",
             get(list_projects)
@@ -86,6 +87,10 @@ pub fn team_router(state: AppState) -> Router {
         .route("/api/team/upgrade-check", post(upgrade_check))
         .route("/api/team/upgrade-apply", post(upgrade_apply))
         .with_state(state)
+}
+
+async fn team_panel() -> Html<&'static str> {
+    Html(include_str!("../static/team.html"))
 }
 
 // ── GET /api/team/projects ───────────────────────────────────────────────────
@@ -416,22 +421,17 @@ async fn list_dir(State(state): State<AppState>, Query(q): Query<FsQuery>) -> Re
         },
         Some(p) => p.into(),
     };
-    if dir.as_os_str().is_empty() {
-        return err_resp(
-            "cannot determine home directory".into(),
-            StatusCode::BAD_REQUEST,
-        );
-    }
-    match grants.contains(&dir) {
-        Ok(true) => {}
-        Ok(false) => {
+    let dir = match grants.resolve_if_authorized(&dir) {
+        Ok(Some(dir)) => dir,
+        Ok(None) => {
             return err_resp(
                 "directory is outside authorized workspace roots".into(),
                 StatusCode::FORBIDDEN,
-            );
+            )
+            .into_response();
         }
         Err(error) => return err_resp(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
-    }
+    };
     let meta = match std::fs::metadata(&dir) {
         Ok(m) => m,
         Err(e) => return err_resp(format!("{}: {e}", dir.display()), StatusCode::NOT_FOUND),
@@ -1508,6 +1508,25 @@ mod tests {
         let dir = unique_dir("ct-routes-repo");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn team_panel_is_embedded() {
+        let (router, _pm, _repo, _factory) = setup().await;
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/app/team.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(std::str::from_utf8(&body).unwrap().contains("Coding Team"));
     }
 
     /// Tests install a mock factory returning one "m" client and build the
