@@ -244,3 +244,72 @@ async fn extra_static_serves_files() {
     assert_eq!(resp.text().await.unwrap(), "static-ok");
     inspector.shutdown().await;
 }
+
+#[tokio::test]
+async fn required_auth_protects_api_but_not_static_assets() {
+    let harness = make_test_harness().await;
+    let inspector = llm_harness_inspector::Inspector::builder(harness)
+        .require_auth()
+        .port(0)
+        .mount()
+        .await
+        .unwrap();
+    let addr = inspector.bound_addr().unwrap();
+    let token = inspector.auth_token().expect("auth token").to_owned();
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    let resp = client
+        .get(format!("{base}/api/agents"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let resp = client
+        .get(format!("{base}/api/agents"))
+        .bearer_auth("not-the-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let resp = client
+        .get(format!("{base}/api/agents"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let resp = client
+        .get(format!("{base}/api/agents?token={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let resp = client
+        .get(format!("{base}/api/agents"))
+        .header("origin", "http://127.0.0.1.evil")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+    inspector.shutdown().await;
+}
+
+#[tokio::test]
+async fn auth_token_is_available_without_logging() {
+    let harness = make_test_harness().await;
+    let inspector = llm_harness_inspector::Inspector::builder(harness)
+        .port(0)
+        .mount()
+        .await
+        .unwrap();
+    let token = inspector.auth_token().expect("event auth token");
+    assert!(!token.is_empty());
+    inspector.shutdown().await;
+}

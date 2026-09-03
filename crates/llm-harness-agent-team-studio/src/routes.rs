@@ -22,6 +22,7 @@ use parking_lot::Mutex;
 
 use crate::issue::IssueStatus;
 use crate::team_manager::{TeamManager, TeamManagerError, unpersist_spec};
+use crate::workspace::WorkspaceGrants;
 
 /// Router state: the shared manager plus the process-wide model tier and
 /// scout interval (config-driven, injected once when the router is built).
@@ -42,6 +43,8 @@ pub struct AppState {
     /// Live operator pump tasks, keyed by project id. Restarting a project
     /// must abort the pump bound to the old `SocialContext`.
     pub operator_pumps: Arc<Mutex<HashMap<String, AbortHandle>>>,
+    /// Explicitly authorized workspace roots for host filesystem browsing.
+    pub grants: Arc<RwLock<WorkspaceGrants>>,
 }
 
 /// Shared handle to the manager (kept for direct consumers/tests).
@@ -65,6 +68,12 @@ pub fn team_router(state: AppState) -> Router {
         .route("/api/team/settings", get(get_settings).post(put_settings))
         .route("/api/team/apikey", post(post_apikey))
         .route("/api/team/fs", get(list_dir))
+        .route(
+            "/api/team/fs/grants",
+            get(list_workspace_grants)
+                .post(add_workspace_grant)
+                .delete(remove_workspace_grant),
+        )
         .route("/api/team/pulse", get(pulse))
         .route("/api/team/agent/inject", post(agent_inject))
         .route("/api/team/agent/abort", post(agent_abort))
@@ -185,6 +194,39 @@ async fn register_project(
         .repo_path
         .as_ref()
         .and_then(|p| (!p.is_empty()).then(|| std::path::PathBuf::from(p)));
+    let repo = match repo {
+        Some(path) => match std::fs::canonicalize(&path) {
+            Ok(path) => Some(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return err_resp(
+                    "workspace is not authorized; grant it before registering".into(),
+                    StatusCode::FORBIDDEN,
+                );
+            }
+            Err(error) => {
+                return err_resp(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        },
+        None => None,
+    };
+    if let Some(repo) = &repo {
+        match state.grants.read().await.contains(repo) {
+            Ok(true) => {}
+            Ok(false) => {
+                return err_resp(
+                    "workspace is not authorized; grant it before registering".into(),
+                    StatusCode::FORBIDDEN,
+                );
+            }
+            Err(error) => {
+                return err_resp(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+    if let Some(repo) = &repo {
+        spec.repo_path = Some(repo.to_string_lossy().into_owned());
+    }
+    let _grants = state.grants.read().await;
     let mut pm = state.pm.write().await;
     match pm.create(spec, repo, &settings, &api_key).await {
         Ok(_) => {
@@ -351,19 +393,27 @@ async fn post_apikey(State(state): State<AppState>, Json(body): Json<ApiKeyBody>
 
 #[derive(Deserialize)]
 struct FsQuery {
-    /// Directory to list. Empty = the caller's home directory.
+    /// Directory to list. Empty = the first authorized workspace root.
     path: Option<String>,
 }
 
 /// List subdirectories of `path` for the panel's folder picker.
 ///
-/// Read-only, directories only, hidden entries skipped. This endpoint
-/// exists so the browser can fill in an absolute repo path (the File
-/// System Access API cannot expose absolute paths); it rides the same
-/// loopback-bind security model as every other route.
-async fn list_dir(Query(q): Query<FsQuery>) -> Response {
+/// Read-only, directories only, hidden entries skipped. Only canonical
+/// descendants of explicitly granted roots are exposed; symlink escapes are
+/// resolved before access.
+async fn list_dir(State(state): State<AppState>, Query(q): Query<FsQuery>) -> Response {
+    let grants = state.grants.read().await;
     let dir: PathBuf = match q.path.as_deref() {
-        None | Some("") => std::env::var("HOME").unwrap_or_default().into(),
+        None | Some("") => match grants.grants().first() {
+            Some(grant) => grant.path.clone(),
+            None => {
+                return err_resp(
+                    "no workspace grants; authorize a directory first".into(),
+                    StatusCode::FORBIDDEN,
+                );
+            }
+        },
         Some(p) => p.into(),
     };
     if dir.as_os_str().is_empty() {
@@ -371,6 +421,16 @@ async fn list_dir(Query(q): Query<FsQuery>) -> Response {
             "cannot determine home directory".into(),
             StatusCode::BAD_REQUEST,
         );
+    }
+    match grants.contains(&dir) {
+        Ok(true) => {}
+        Ok(false) => {
+            return err_resp(
+                "directory is outside authorized workspace roots".into(),
+                StatusCode::FORBIDDEN,
+            );
+        }
+        Err(error) => return err_resp(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
     let meta = match std::fs::metadata(&dir) {
         Ok(m) => m,
@@ -398,8 +458,88 @@ async fn list_dir(Query(q): Query<FsQuery>) -> Response {
         "path": dir.to_string_lossy(),
         "is_repo": dir.join(".git").exists(),
         "dirs": dirs,
+        "grant_roots": grants.grants().iter().map(|g| g.path.to_string_lossy()).collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct WorkspaceGrantBody {
+    path: String,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceGrantQuery {
+    id: String,
+}
+
+async fn list_workspace_grants(State(state): State<AppState>) -> Response {
+    let grants = state.grants.read().await;
+    Json(serde_json::json!({ "grants": grants.grants() })).into_response()
+}
+
+async fn add_workspace_grant(
+    State(state): State<AppState>,
+    Json(body): Json<WorkspaceGrantBody>,
+) -> Response {
+    let mut grants = state.grants.write().await;
+    match grants.add(&body.path, body.label) {
+        Ok(grant) => (StatusCode::CREATED, Json(serde_json::json!(grant))).into_response(),
+        Err(crate::workspace::WorkspaceError::InvalidPath(path)) => err_resp(
+            format!("invalid workspace grant: {}", path.display()),
+            StatusCode::BAD_REQUEST,
+        ),
+        Err(error) => err_resp(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn remove_workspace_grant(
+    State(state): State<AppState>,
+    Query(query): Query<WorkspaceGrantQuery>,
+) -> Response {
+    let mut grants = state.grants.write().await;
+    let Some(pending_removal) = grants
+        .grants()
+        .iter()
+        .find(|grant| grant.id == query.id)
+        .cloned()
+    else {
+        return err_resp("unknown workspace grant".into(), StatusCode::NOT_FOUND);
+    };
+    let active = {
+        let pm = state.pm.read().await;
+        pm.ids().into_iter().any(|id| {
+            pm.get(&id)
+                .and_then(|entry| entry.repo_path.as_deref())
+                .map(|repo| {
+                    crate::workspace::WorkspaceGrants::contains_path_with_root(
+                        repo,
+                        &pending_removal.path,
+                    )
+                    .unwrap_or(true)
+                })
+                .unwrap_or(false)
+        })
+    };
+    if active {
+        return err_resp(
+            "revoke the project before revoking its active workspace grant".into(),
+            StatusCode::CONFLICT,
+        );
+    }
+    let removed = grants.remove(&query.id).map_err(|error| match error {
+        crate::workspace::WorkspaceError::UnknownGrant(_) => {
+            err_resp("unknown workspace grant".into(), StatusCode::NOT_FOUND)
+        }
+        error => err_resp(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    });
+    let _removed = match removed {
+        Ok(grant) => grant,
+        Err(response) => return response,
+    };
+    Json(serde_json::json!({ "ok": true })).into_response()
 }
 
 // ── GET /api/team/pulse?project= — situation snapshot ────────────────────────
@@ -1389,6 +1529,9 @@ mod tests {
         let _factory = install_mock_factory();
         let data_root = unique_dir("ct-routes");
         let pm = Arc::new(RwLock::new(TeamManager::new(&data_root)));
+        let repo = make_repo();
+        let mut grants = crate::workspace::WorkspaceGrants::load(&data_root).unwrap();
+        grants.add(&repo, None).unwrap();
         let state = AppState {
             pm: pm.clone(),
             data_root: data_root.clone(),
@@ -1397,9 +1540,10 @@ mod tests {
             events: Arc::new(crate::events::EventBus::new()),
             registry: llm_harness_inspector::state::HarnessRegistry::new("default"),
             operator_pumps: Arc::new(Mutex::new(HashMap::new())),
+            grants: Arc::new(RwLock::new(grants)),
         };
         let router = team_router(state);
-        (router, pm, make_repo(), _factory)
+        (router, pm, repo, _factory)
     }
 
     async fn json_put(
@@ -1499,11 +1643,20 @@ mod tests {
 
     #[tokio::test]
     async fn register_via_http_validates_repo() {
-        let (router, _pm, _repo, _factory) = setup().await;
+        let (router, _pm, repo, _factory) = setup().await;
+        let bad_repo = repo.parent().unwrap().join("not-a-git-repo");
+        std::fs::create_dir_all(&bad_repo).unwrap();
+        let (status, json) = json_post(
+            &router,
+            "/api/team/fs/grants",
+            serde_json::json!({ "path": bad_repo.to_string_lossy() }),
+        )
+        .await;
+        assert_eq!(status, 201, "{json}");
         let (status, json) = json_post(
             &router,
             "/api/team/projects",
-            serde_json::json!({ "id": "bad", "repo_path": "/no/such/repo" }),
+            serde_json::json!({ "id": "bad", "repo_path": bad_repo.to_string_lossy() }),
         )
         .await;
         assert_eq!(status, 400, "{json}");
@@ -1754,14 +1907,17 @@ mod tests {
         // Rebuild the router with a bus we can inspect directly.
         let bus = Arc::new(crate::events::EventBus::new());
         let mut rx = bus.subscribe();
+        let data_root = pm.read().await.data_root().to_path_buf();
+        let grants = crate::workspace::WorkspaceGrants::load(&data_root).unwrap();
         let state = AppState {
             pm: pm.clone(),
-            data_root: unique_dir("ct-routes-bus"),
+            data_root: data_root.clone(),
             tier: Arc::new(RwLock::new(tier())),
             scout_interval_secs: Arc::new(RwLock::new(0)),
             events: bus,
             registry: llm_harness_inspector::state::HarnessRegistry::new("default"),
             operator_pumps: Arc::new(Mutex::new(HashMap::new())),
+            grants: Arc::new(RwLock::new(grants)),
         };
         let router2 = team_router(state);
         json_post(
@@ -1888,7 +2044,88 @@ mod tests {
     async fn fs_listing_rejects_missing_path() {
         let (router, _pm, _repo, _factory) = setup().await;
         let (status, _) = get_json(&router, "/api/team/fs?path=/no/such/dir").await;
-        assert_eq!(status, 404);
+        assert_eq!(status, 403);
+    }
+
+    #[tokio::test]
+    async fn workspace_grant_lifecycle_controls_browsing() {
+        let (router, _pm, repo, _factory) = setup().await;
+        let outside = repo.parent().unwrap().join("outside-workspace");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let (status, json) = get_json(&router, "/api/team/fs/grants").await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(json["grants"].as_array().unwrap().len(), 1);
+
+        let (status, json) = json_post(
+            &router,
+            "/api/team/fs/grants",
+            serde_json::json!({ "path": outside.to_string_lossy(), "label": "outside" }),
+        )
+        .await;
+        assert_eq!(status, 201, "{json}");
+        let grant_id = json["id"].as_str().unwrap();
+
+        let (status, json) =
+            get_json(&router, &format!("/api/team/fs?path={}", enc(&outside))).await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(json["path"], outside.to_string_lossy().to_string());
+
+        let (status, json) = json_method(
+            &router,
+            "DELETE",
+            &format!("/api/team/fs/grants?id={grant_id}"),
+            serde_json::json!(null),
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+        let (status, _) = get_json(&router, &format!("/api/team/fs?path={}", enc(&outside))).await;
+        assert_eq!(status, 403);
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ungranted_paths_and_projects_are_rejected() {
+        let (router, _pm, repo, _factory) = setup().await;
+        let outside = repo.parent().unwrap().join("outside-workspace");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let (status, json) =
+            get_json(&router, &format!("/api/team/fs?path={}", enc(&outside))).await;
+        assert_eq!(status, 403, "{json}");
+        let (status, json) = json_post(
+            &router,
+            "/api/team/projects",
+            serde_json::json!({ "id": "outside", "repo_path": outside.to_string_lossy() }),
+        )
+        .await;
+        assert_eq!(status, 403, "{json}");
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_escape_is_rejected() {
+        let (router, _pm, repo, _factory) = setup().await;
+        let outside = repo.parent().unwrap().join("outside-symlink-target");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("escape")).unwrap();
+
+        let (status, _) = get_json(
+            &router,
+            &format!("/api/team/fs?path={}", enc(&repo.join("escape"))),
+        )
+        .await;
+        assert_eq!(status, 403);
+        let (status, _) = json_post(
+            &router,
+            "/api/team/projects",
+            serde_json::json!({ "id": "escape", "repo_path": repo.join("escape").to_string_lossy() }),
+        )
+        .await;
+        assert_eq!(status, 403);
+        std::fs::remove_file(repo.join("escape")).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
     }
 
     #[tokio::test]

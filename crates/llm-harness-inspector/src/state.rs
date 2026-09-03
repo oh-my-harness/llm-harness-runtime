@@ -19,16 +19,7 @@ impl AuthToken {
 
     /// Generate a random token.
     pub fn generate() -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        // Simple random token from system entropy — not crypto-grade, but
-        // sufficient for local-only inspector auth.
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let pid = std::process::id();
-        let secret = format!("{pid:x}-{nanos:x}");
-        Self::new(secret)
+        Self::new(uuid::Uuid::new_v4().to_string())
     }
 
     /// Check a provided token matches in constant time.
