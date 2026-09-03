@@ -300,3 +300,16 @@ async fn required_auth_protects_api_but_not_static_assets() {
 
     inspector.shutdown().await;
 }
+
+#[tokio::test]
+async fn auth_token_is_available_without_logging() {
+    let harness = make_test_harness().await;
+    let inspector = llm_harness_inspector::Inspector::builder(harness)
+        .port(0)
+        .mount()
+        .await
+        .unwrap();
+    let token = inspector.auth_token().expect("event auth token");
+    assert!(!token.is_empty());
+    inspector.shutdown().await;
+}

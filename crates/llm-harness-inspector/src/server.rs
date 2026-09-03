@@ -16,6 +16,11 @@ impl Inspector {
         self.bound_addr
     }
 
+    /// Return the token accepted by WebSocket event requests.
+    ///
+    /// `require_auth` also accepts this token for all `/api/*` requests. The
+    /// token is intentionally not written to logs; hosts that need to hand it
+    /// to a local UI should pass it through this accessor instead.
     pub fn auth_token(&self) -> Option<&str> {
         self.auth_token.as_deref()
     }
@@ -164,15 +169,14 @@ impl InspectorBuilder {
                 .ok();
         });
         tracing::info!(
-            "Inspector (headless) ready: http://127.0.0.1:{}  — token: {} (API auth; no bundled UI)",
-            self.port,
-            token_str,
+            "Inspector (headless) ready: http://127.0.0.1:{} (auth token available via Inspector::auth_token; no bundled UI)",
+            self.port
         );
         Ok(Inspector {
             shutdown: Some(shutdown_tx),
             handle: Some(handle),
             bound_addr: addr,
-            auth_token: self.require_auth.then_some(token_str),
+            auth_token: Some(token_str),
         })
     }
 }
