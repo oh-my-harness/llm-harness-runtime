@@ -101,6 +101,27 @@ impl WorkspaceGrants {
             .any(|grant| canonical_path.starts_with(&grant.path)))
     }
 
+    /// Resolve to the canonical path that will actually be used by host I/O.
+    ///
+    /// Returning the canonical path avoids the check/use race where a caller
+    /// authorizes one spelling of a directory and then opens a symlinked
+    /// spelling of that same location.
+    pub fn resolve_if_authorized(
+        &self,
+        requested_path: impl AsRef<Path>,
+    ) -> Result<Option<PathBuf>, WorkspaceError> {
+        let canonical_path = match std::fs::canonicalize(requested_path.as_ref()) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let authorized = self
+            .grants
+            .iter()
+            .any(|grant| canonical_path.starts_with(&grant.path));
+        Ok(authorized.then_some(canonical_path))
+    }
+
     pub fn contains_path_with_root(
         requested_path: impl AsRef<Path>,
         root: impl AsRef<Path>,
@@ -191,6 +212,18 @@ mod tests {
 
         assert!(grants.contains(root.join("workspace/sub")).unwrap());
         assert!(!grants.contains(root.join("workspace/escape")).unwrap());
+        assert!(
+            grants
+                .resolve_if_authorized(root.join("workspace/sub"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            grants
+                .resolve_if_authorized(root.join("workspace/escape"))
+                .unwrap()
+                .is_none()
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

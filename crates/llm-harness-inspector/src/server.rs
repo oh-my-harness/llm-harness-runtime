@@ -168,9 +168,11 @@ impl InspectorBuilder {
                 .await
                 .ok();
         });
+        let bound_addr = addr.ok_or(InspectorError::Bind(
+            "listener did not expose its bound address".to_string(),
+        ))?;
         tracing::info!(
-            "Inspector (headless) ready: http://127.0.0.1:{} (auth token available via Inspector::auth_token; no bundled UI)",
-            self.port
+            "Inspector (headless) ready: http://{bound_addr} (auth token available via Inspector::auth_token; no bundled UI)"
         );
         Ok(Inspector {
             shutdown: Some(shutdown_tx),

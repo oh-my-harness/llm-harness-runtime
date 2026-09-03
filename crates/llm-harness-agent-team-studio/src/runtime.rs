@@ -169,10 +169,8 @@ impl StudioRuntime {
             operator_pumps,
             grants,
         };
-        let static_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("static");
         let inspector = Inspector::registry(registry)
             .extra_routes(team_router(state))
-            .extra_static("app", static_dir)
             .port(config.port)
             .require_auth()
             .mount()
