@@ -5,10 +5,13 @@
 //! (`~/.harness/agent-team-studio` by default). Startup restores
 //! persisted team specs and rebuilds every team; a fresh install just shows the setup page.
 
-use llm_harness_agent_team_studio::runtime::{StudioConfig, StudioRuntime};
+use llm_harness_agent_team_studio::diagnostics::install_panic_reporter;
+use llm_harness_agent_team_studio::runtime::{StudioConfig, StudioRuntime, default_data_root};
 
 #[tokio::main]
 async fn main() {
+    install_panic_reporter(default_data_root());
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

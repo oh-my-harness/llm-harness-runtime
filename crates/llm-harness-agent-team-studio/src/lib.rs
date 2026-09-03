@@ -6,6 +6,7 @@
 //! inspector server via its `extra_routes` / `extra_static` extension
 //! points. See `docs/design/2026-08-30-agent-team-studio-design.md`.
 pub mod config;
+pub mod diagnostics;
 pub mod engine;
 pub mod env_cfg;
 pub mod events;
