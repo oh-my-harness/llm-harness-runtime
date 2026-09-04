@@ -193,6 +193,7 @@ fn apply_next_turn_directive(
 }
 
 /// Start an agent loop from a new context.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn agent_loop(
     client: Arc<dyn Provider>,
     ctx: AgentContext,
@@ -201,9 +202,22 @@ pub fn agent_loop(
     run_loop(client, ctx, config, false)
 }
 
+/// wasm32: provider futures are `!Send` (JS promises under reqwest's wasm
+/// backend), so the generated stream cannot carry a `Send` bound. Consume
+/// it from the JS task that created it.
+#[cfg(target_arch = "wasm32")]
+pub fn agent_loop(
+    client: Arc<dyn Provider>,
+    ctx: AgentContext,
+    config: LoopConfig,
+) -> impl Stream<Item = AgentEvent> {
+    run_loop(client, ctx, config, false)
+}
+
 /// Continue an agent loop without injecting new initial messages.
 ///
 /// Drains stale steer messages (already queued before this call) before the first LLM call.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn agent_loop_continue(
     client: Arc<dyn Provider>,
     ctx: AgentContext,
@@ -212,12 +226,24 @@ pub fn agent_loop_continue(
     run_loop(client, ctx, config, true)
 }
 
+/// Continue an agent loop without injecting new initial messages.
+///
+/// Drains stale steer messages (already queued before this call) before the first LLM call.
+#[cfg(target_arch = "wasm32")]
+pub fn agent_loop_continue(
+    client: Arc<dyn Provider>,
+    ctx: AgentContext,
+    config: LoopConfig,
+) -> impl Stream<Item = AgentEvent> {
+    run_loop(client, ctx, config, true)
+}
+
 fn run_loop(
     client: Arc<dyn Provider>,
     mut ctx: AgentContext,
     mut config: LoopConfig,
     drain_steer_first: bool,
-) -> impl Stream<Item = AgentEvent> + Send {
+) -> impl Stream<Item = AgentEvent> {
     async_stream::stream! {
         use crate::{
             dispatch::execute_tool_batch,
@@ -346,7 +372,7 @@ fn run_loop(
                 // === Connection establishment ===
                 let call = client.chat_stream(&req);
                 let response = if let Some(timeout_ms) = stream_opts.timeout_ms {
-                    match tokio::time::timeout(
+                    match crate::time::timeout(
                         std::time::Duration::from_millis(timeout_ms),
                         call,
                     )
@@ -384,7 +410,7 @@ fn run_loop(
                                 yield AgentEvent::Error(AgentError::Aborted);
                                 break 'main;
                             }
-                            _ = tokio::time::sleep(delay) => {}
+                            _ = crate::time::sleep(delay) => {}
                         }
                         attempt += 1;
                         continue;
@@ -434,7 +460,7 @@ fn run_loop(
                 // Some(0) is treated as disabled (avoid busy-retry spin).
                 let idle_timeout = stream_opts.stream_idle_timeout_ms.filter(|&ms| ms > 0);
                 // Always use a Sleep; when disabled, deadline is far future (never fires).
-                let idle_sleep = tokio::time::sleep(match idle_timeout {
+                let idle_sleep = crate::time::sleep(match idle_timeout {
                     Some(ms) => std::time::Duration::from_millis(ms),
                     None => std::time::Duration::MAX,
                 });
@@ -476,8 +502,10 @@ fn run_loop(
                                     }
                                     // Re-arm idle watchdog on every event.
                                     if let Some(ms) = idle_timeout {
-                                        idle_sleep.as_mut().reset(tokio::time::Instant::now()
-                                            + std::time::Duration::from_millis(ms));
+                                        use crate::time::SleepExt;
+                                        idle_sleep
+                                            .as_mut()
+                                            .reset_for(std::time::Duration::from_millis(ms));
                                     }
                                     if is_terminal {
                                         break Ok(final_message);
@@ -540,7 +568,7 @@ fn run_loop(
                                     yield AgentEvent::Error(AgentError::Aborted);
                                     break 'main;
                                 }
-                                _ = tokio::time::sleep(delay) => {}
+                                _ = crate::time::sleep(delay) => {}
                             }
                             attempt += 1;
                             continue;
