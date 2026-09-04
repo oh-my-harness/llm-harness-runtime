@@ -57,6 +57,8 @@ impl Default for StartupRecovery {
 pub enum StudioError {
     #[error("data root preparation failed: {0}")]
     DataRoot(#[source] std::io::Error),
+    #[error("lifecycle journal write failed: {0}")]
+    LifecycleLog(#[from] std::io::Error),
     #[error("panel descriptor preparation failed: {0}")]
     PanelDescriptor(#[source] std::io::Error),
     #[error("studio singleton is already running for data root {root}")]
@@ -264,7 +266,7 @@ impl StudioRuntime {
             data_root: data_root.clone(),
             inspector,
             pm: tm_shared,
-            recovery,
+            recovery: recovery.clone(),
             _panel_descriptor: PanelDescriptorGuard {
                 path: panel_descriptor_path(&data_root),
             },
@@ -275,6 +277,17 @@ impl StudioRuntime {
         {
             runtime.shutdown().await;
             return Err(StudioError::PanelDescriptor(error));
+        }
+        if let Err(error) = crate::diagnostics::append_lifecycle_event(
+            &data_root,
+            serde_json::json!({
+                "event": "startup",
+                "recovery": recovery,
+                "bound_address": runtime.bound_addr().map(|addr| addr.to_string()),
+            }),
+        ) {
+            runtime.shutdown().await;
+            return Err(StudioError::LifecycleLog(error));
         }
         Ok(runtime)
     }
@@ -304,6 +317,15 @@ impl StudioRuntime {
     pub async fn shutdown(self) {
         self.inspector.shutdown().await;
         self.pm.write().await.shutdown_all().await;
+        if let Err(error) = crate::diagnostics::append_lifecycle_event(
+            &self.data_root,
+            serde_json::json!({
+                "event": "shutdown",
+                "reason": "normal",
+            }),
+        ) {
+            eprintln!("agent-team-studio: failed to persist shutdown event: {error}");
+        }
     }
 }
 
@@ -533,7 +555,7 @@ mod tests {
             .unwrap();
         let addr = runtime.bound_addr().unwrap();
         assert!(addr.ip().is_loopback());
-        let token = runtime.auth_token().unwrap();
+        let token = runtime.auth_token().unwrap().to_owned();
         assert!(!token.is_empty());
         let url = runtime.panel_url().unwrap();
         assert!(url.starts_with(&format!("http://{addr}/app/team.html#token=")));
@@ -558,6 +580,92 @@ mod tests {
         runtime.shutdown().await;
         assert!(!descriptor_path.exists());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_and_shutdown_are_recorded_without_secrets() {
+        let root = temp_root("lifecycle");
+        std::fs::create_dir_all(&root).unwrap();
+        let _factory = crate::env_cfg::install_test_provider_factory(Arc::new(|| {
+            vec![(
+                "default".to_string(),
+                Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]))
+                    as Arc<dyn llm_harness_loop::LlmClient>,
+            )]
+        }));
+        let runtime = StudioRuntime::start(StudioConfig::from_env().with_data_root(&root))
+            .await
+            .unwrap();
+        let token = runtime.auth_token().unwrap().to_owned();
+
+        let lifecycle = read_lifecycle_event(&root, "startup");
+        assert_eq!(lifecycle["schema"], "llm-harness.studio.lifecycle-event.v1");
+        assert_eq!(lifecycle["data"]["event"], "startup");
+        assert_eq!(lifecycle["data"]["recovery"]["status"], "healthy");
+        assert_eq!(
+            lifecycle["data"]["bound_address"],
+            runtime.bound_addr().unwrap().to_string()
+        );
+        assert!(!serde_json::to_string(&lifecycle).unwrap().contains(&token));
+        runtime.shutdown().await;
+
+        let lifecycle = read_lifecycle_event(&root, "shutdown");
+        assert_eq!(lifecycle["data"]["event"], "shutdown");
+        assert_eq!(lifecycle["data"]["reason"], "normal");
+        assert!(!serde_json::to_string(&lifecycle).unwrap().contains(&token));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn degraded_recovery_reasons_are_recorded() {
+        let root = temp_root("lifecycle-degraded");
+        let repo = root.join("unauthorized");
+        let spec = recovery_spec("unauthorized", Some(&repo));
+        write_spec(
+            &root,
+            "unauthorized",
+            &serde_json::to_string(&spec).unwrap(),
+        );
+        write_spec(&root, "invalid", "{\"id\":\"invalid\"}");
+        let provider_factory = Arc::new(|| {
+            vec![(
+                "default".to_string(),
+                Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]))
+                    as Arc<dyn llm_harness_loop::LlmClient>,
+            )]
+        }) as crate::env_cfg::ProviderFactory;
+        let _factory = crate::env_cfg::install_test_provider_factory(provider_factory.clone());
+
+        let runtime = StudioRuntime::start(
+            StudioConfig::from_env()
+                .with_data_root(&root)
+                .with_provider_factory(Some(provider_factory)),
+        )
+        .await
+        .unwrap();
+        let recovery = runtime.recovery();
+        runtime.shutdown().await;
+
+        let lifecycle = read_lifecycle_event(&root, "startup");
+        assert_eq!(lifecycle["data"]["event"], "startup");
+        assert_eq!(lifecycle["data"]["recovery"]["status"], "degraded");
+        assert_eq!(
+            lifecycle["data"]["recovery"]["failed_teams"],
+            serde_json::to_value(recovery.failed_teams).unwrap()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn read_lifecycle_event(root: &Path, event: &str) -> serde_json::Value {
+        std::fs::read_to_string(root.join("logs/runtime.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let value: serde_json::Value = line.parse().unwrap();
+                value
+            })
+            .find(|value| value["data"]["event"] == event)
+            .unwrap()
     }
 
     #[tokio::test]
