@@ -193,6 +193,7 @@ fn apply_next_turn_directive(
 }
 
 /// Start an agent loop from a new context.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn agent_loop(
     client: Arc<dyn Provider>,
     ctx: AgentContext,
@@ -201,9 +202,22 @@ pub fn agent_loop(
     run_loop(client, ctx, config, false)
 }
 
+/// wasm32: provider futures are `!Send` (JS promises under reqwest's wasm
+/// backend), so the generated stream cannot carry a `Send` bound. Consume
+/// it from the JS task that created it.
+#[cfg(target_arch = "wasm32")]
+pub fn agent_loop(
+    client: Arc<dyn Provider>,
+    ctx: AgentContext,
+    config: LoopConfig,
+) -> impl Stream<Item = AgentEvent> {
+    run_loop(client, ctx, config, false)
+}
+
 /// Continue an agent loop without injecting new initial messages.
 ///
 /// Drains stale steer messages (already queued before this call) before the first LLM call.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn agent_loop_continue(
     client: Arc<dyn Provider>,
     ctx: AgentContext,
@@ -212,12 +226,24 @@ pub fn agent_loop_continue(
     run_loop(client, ctx, config, true)
 }
 
+/// Continue an agent loop without injecting new initial messages.
+///
+/// Drains stale steer messages (already queued before this call) before the first LLM call.
+#[cfg(target_arch = "wasm32")]
+pub fn agent_loop_continue(
+    client: Arc<dyn Provider>,
+    ctx: AgentContext,
+    config: LoopConfig,
+) -> impl Stream<Item = AgentEvent> {
+    run_loop(client, ctx, config, true)
+}
+
 fn run_loop(
     client: Arc<dyn Provider>,
     mut ctx: AgentContext,
     mut config: LoopConfig,
     drain_steer_first: bool,
-) -> impl Stream<Item = AgentEvent> + Send {
+) -> impl Stream<Item = AgentEvent> {
     async_stream::stream! {
         use crate::{
             dispatch::execute_tool_batch,

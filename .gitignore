@@ -14,3 +14,4 @@ __pycache__
 .worktrees/
 /AGENTS.md
 .mcp-lock.json
+tests/wasm-smoke/target/

@@ -2105,8 +2105,12 @@ mod tests {
     #[tokio::test]
     async fn workspace_grant_lifecycle_controls_browsing() {
         let (router, _pm, repo, _factory) = setup().await;
+        // canonicalize before comparing: the API returns canonical paths and on
+        // macOS /var is a symlink to /private/var, so the raw temp path never
+        // compares equal.
         let outside = repo.parent().unwrap().join("outside-workspace");
         std::fs::create_dir_all(&outside).unwrap();
+        let outside = std::fs::canonicalize(&outside).unwrap();
 
         let (status, json) = get_json(&router, "/api/team/fs/grants").await;
         assert_eq!(status, 200, "{json}");
