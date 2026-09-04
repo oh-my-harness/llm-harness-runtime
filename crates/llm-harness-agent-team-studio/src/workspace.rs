@@ -131,24 +131,12 @@ impl WorkspaceGrants {
     }
 
     fn save(&self) -> Result<(), WorkspaceError> {
-        let temporary = self.path.with_extension("json.tmp");
-        std::fs::write(&temporary, serde_json::to_vec_pretty(&self.grants)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(&temporary, &self.path)?;
-        #[cfg(unix)]
-        restrict_file(&self.path)?;
+        crate::settings::write_private_file(
+            &self.path,
+            serde_json::to_vec_pretty(&self.grants)?.as_slice(),
+        )?;
         Ok(())
     }
-}
-
-#[cfg(unix)]
-fn restrict_file(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(test)]
@@ -184,6 +172,23 @@ mod tests {
         let removed = reloaded.remove(&grant.id).unwrap();
         assert_eq!(removed.id, grant.id);
         assert!(WorkspaceGrants::load(&root).unwrap().grants().is_empty());
+        assert!(!root.read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(root.join("workspace-grants.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 

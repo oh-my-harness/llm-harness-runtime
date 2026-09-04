@@ -985,31 +985,16 @@ async fn put_agent_config(
         }
     };
 
-    // Member-scoped api key → 0600 file. This happens only after both IDs
-    // are known-good, so they can never construct a secrets path.
-    if let Some(key) = &body.api_key {
-        let secrets = state
-            .data_root
-            .join("teams")
-            .join(&body.project)
-            .join("secrets");
-        if std::fs::create_dir_all(&secrets).is_ok() {
-            let path = secrets.join(&body.agent);
-            #[cfg(unix)]
-            {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                let _ = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&path)
-                    .and_then(|mut f| f.write_all(key.as_bytes()));
-            }
-            #[cfg(not(unix))]
-            let _ = std::fs::write(&path, key);
-        }
+    // Member-scoped api key → private file created atomically with 0600.
+    // IDs are known-good above, and the storage helper rejects traversal.
+    if let Some(key) = &body.api_key
+        && let Err(error) =
+            crate::settings::save_member_api_key(&state.data_root, &body.project, &body.agent, key)
+    {
+        return err_resp(
+            format!("failed to store member API key: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
     }
 
     let mut member = current;

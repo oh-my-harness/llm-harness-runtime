@@ -952,3 +952,92 @@ async fn live_llm_full_coding_team_template_completes_task() {
     assert_eq!(branch.trim(), "team/e2e");
     pm.shutdown("coding-team").await.unwrap();
 }
+#[cfg(unix)]
+mod binary_lifecycle_tests {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn agent_studio_reports_private_descriptor_and_cleanly_stops() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let data_root = std::env::temp_dir().join(format!(
+            "agent-studio-binary-{}-{sequence}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_root);
+        std::fs::create_dir_all(&data_root).unwrap();
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agent-studio"))
+            .env("STUDIO_DATA_ROOT", &data_root)
+            .env("STUDIO_PORT", "0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stdout = child.stdout.take().unwrap();
+        let mut stdout_reader = BufReader::new(stdout);
+        let mut descriptor_line = String::new();
+        let started = Instant::now();
+        loop {
+            descriptor_line.clear();
+            match stdout_reader.read_line(&mut descriptor_line) {
+                Ok(0) => panic!("agent-studio exited before reporting its panel descriptor"),
+                Ok(_) => {}
+                Err(error) => panic!("failed to read agent-studio stdout: {error}"),
+            }
+            if descriptor_line.starts_with("STUDIO_PANEL_DESCRIPTOR=") {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(30));
+        }
+        let descriptor_path: std::path::PathBuf = descriptor_line
+            .strip_prefix("STUDIO_PANEL_DESCRIPTOR=")
+            .unwrap()
+            .trim_end_matches(['\n', '\r'])
+            .into();
+        assert_eq!(descriptor_path, data_root.join("panel.json"));
+
+        let descriptor: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&descriptor_path).unwrap()).unwrap();
+        assert_eq!(
+            descriptor["schema"],
+            "llm-harness.studio.panel-descriptor.v1"
+        );
+        let panel_url = descriptor["url"].as_str().unwrap();
+        assert!(panel_url.starts_with("http://127.0.0.1:"));
+        assert!(panel_url.contains("/app/team.html#token="));
+        let token = panel_url.rsplit("#token=").next().unwrap();
+        assert!(!token.is_empty());
+        assert!(!descriptor_line.contains("#token="));
+        assert!(!data_root.join("panel.json.tmp").exists());
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&descriptor_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        let pid = child.id();
+        let sent = unsafe { libc::kill(pid.try_into().unwrap(), libc::SIGTERM) };
+        assert_eq!(sent, 0, "failed to send SIGTERM to agent-studio");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "agent-studio exited with {status}");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "agent-studio did not stop within 10s"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!descriptor_path.exists());
+        assert!(!data_root.join("panel.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+}
