@@ -1041,3 +1041,88 @@ mod binary_lifecycle_tests {
         let _ = std::fs::remove_dir_all(&data_root);
     }
 }
+
+#[cfg(unix)]
+mod desktop_host_tests {
+    use llm_harness_agent_team_studio::host::{StudioBackendHost, StudioHostConfig};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_root(test: &str) -> PathBuf {
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::env::temp_dir().join(format!(
+            "agent-studio-desktop-host-{test}-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    #[tokio::test]
+    async fn host_supervises_ready_backend_and_clean_shutdown() {
+        let root = temp_root("ready");
+        std::fs::create_dir_all(&root).unwrap();
+        let host = StudioBackendHost::spawn(StudioHostConfig::new(
+            env!("CARGO_BIN_EXE_agent-studio"),
+            &root,
+        ))
+        .unwrap();
+        let backend = host.wait_ready().await.unwrap();
+        assert_eq!(backend.descriptor_path(), root.join("panel.json"));
+        assert!(backend.backend_pid().is_some());
+
+        let shutdown = backend.shutdown().await.unwrap();
+        assert!(shutdown.status.success());
+        assert!(!shutdown.forced);
+        assert!(!root.join("panel.json").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_surfaces_duplicate_data_root_instance() {
+        let root = temp_root("duplicate");
+        std::fs::create_dir_all(&root).unwrap();
+        let first = StudioBackendHost::spawn(StudioHostConfig::new(
+            env!("CARGO_BIN_EXE_agent-studio"),
+            &root,
+        ))
+        .unwrap()
+        .wait_ready()
+        .await
+        .unwrap();
+
+        let duplicate = StudioBackendHost::spawn(StudioHostConfig::new(
+            env!("CARGO_BIN_EXE_agent-studio"),
+            &root,
+        ))
+        .unwrap()
+        .wait_ready()
+        .await;
+        assert!(matches!(
+            duplicate,
+            Err(llm_harness_agent_team_studio::host::HostError::BackendExit(
+                status,
+            )) if !status.success()
+        ));
+
+        first.shutdown().await.unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_surfaces_backend_exit_before_readiness() {
+        let root = temp_root("unexpected-exit");
+        std::fs::create_dir_all(&root).unwrap();
+        let result = StudioBackendHost::spawn(StudioHostConfig::new("/bin/false", &root))
+            .unwrap()
+            .wait_ready()
+            .await;
+        assert!(matches!(
+            result,
+            Err(llm_harness_agent_team_studio::host::HostError::BackendExit(
+                status,
+            )) if !status.success()
+        ));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
