@@ -372,7 +372,7 @@ fn run_loop(
                 // === Connection establishment ===
                 let call = client.chat_stream(&req);
                 let response = if let Some(timeout_ms) = stream_opts.timeout_ms {
-                    match tokio::time::timeout(
+                    match crate::time::timeout(
                         std::time::Duration::from_millis(timeout_ms),
                         call,
                     )
@@ -410,7 +410,7 @@ fn run_loop(
                                 yield AgentEvent::Error(AgentError::Aborted);
                                 break 'main;
                             }
-                            _ = tokio::time::sleep(delay) => {}
+                            _ = crate::time::sleep(delay) => {}
                         }
                         attempt += 1;
                         continue;
@@ -460,7 +460,7 @@ fn run_loop(
                 // Some(0) is treated as disabled (avoid busy-retry spin).
                 let idle_timeout = stream_opts.stream_idle_timeout_ms.filter(|&ms| ms > 0);
                 // Always use a Sleep; when disabled, deadline is far future (never fires).
-                let idle_sleep = tokio::time::sleep(match idle_timeout {
+                let idle_sleep = crate::time::sleep(match idle_timeout {
                     Some(ms) => std::time::Duration::from_millis(ms),
                     None => std::time::Duration::MAX,
                 });
@@ -502,8 +502,10 @@ fn run_loop(
                                     }
                                     // Re-arm idle watchdog on every event.
                                     if let Some(ms) = idle_timeout {
-                                        idle_sleep.as_mut().reset(tokio::time::Instant::now()
-                                            + std::time::Duration::from_millis(ms));
+                                        use crate::time::SleepExt;
+                                        idle_sleep
+                                            .as_mut()
+                                            .reset_for(std::time::Duration::from_millis(ms));
                                     }
                                     if is_terminal {
                                         break Ok(final_message);
@@ -566,7 +568,7 @@ fn run_loop(
                                     yield AgentEvent::Error(AgentError::Aborted);
                                     break 'main;
                                 }
-                                _ = tokio::time::sleep(delay) => {}
+                                _ = crate::time::sleep(delay) => {}
                             }
                             attempt += 1;
                             continue;

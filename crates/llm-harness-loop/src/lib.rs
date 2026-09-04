@@ -274,6 +274,7 @@ pub mod final_answer;
 pub mod hooked_tool;
 pub mod loop_fn;
 pub(crate) mod stream_state;
+pub(crate) mod time;
 
 mod type_bridge;
 

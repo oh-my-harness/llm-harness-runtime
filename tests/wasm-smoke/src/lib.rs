@@ -1,12 +1,13 @@
-//! wasm32 compile gate for `llm-harness-loop` (issue #180).
+//! wasm32 gate for `llm-harness-loop` (issue #180): compile + runtime.
 //!
-//! Exercises the surface senza-wasm consumes: `agent_loop` bound through the
-//! `MockLlmClient` path (test-utils feature). Compile-only acceptance:
-//! `cargo check --target wasm32-unknown-unknown` must pass with no `Send`
-//! bound errors. Runtime wiring (wasm-bindgen / JS event loop) belongs to
-//! the senza-wasm repo — tokio has no time driver on wasm32-unknown-unknown
-//! (`Instant::now` panics), so `run_loop` cannot complete a turn there until
-//! senza-wasm supplies a time-substitution layer.
+//! Exercises the surface senza-wasm consumes: `agent_loop` driven by the
+//! `MockLlmClient` path (test-utils feature). Acceptance:
+//! 1. `cargo check --target wasm32-unknown-unknown` passes with no `Send`
+//!    bound errors (compile gate)
+//! 2. the exported `run_mock_turn_wasm` completes a full agent turn under
+//!    wasm-bindgen + Node (runtime gate) — this exercises the crate::time
+//!    bridge (futures-timer / gloo-timers) that replaces tokio's missing
+//!    wasm time driver, including the idle-watchdog re-arm path.
 
 use std::sync::Arc;
 
@@ -16,6 +17,8 @@ use llm_harness_loop::{DefaultConvertToLlm, LoopConfig};
 use llm_harness_types::{AgentContext, RunContext, RunRequest, StreamOptions};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
 
 fn mock_config() -> LoopConfig {
     LoopConfig {
@@ -72,3 +75,39 @@ fn build_deps() {
     run_mock_turn(client, ctx, mock_config());
 }
 
+/// Runtime gate: drive one full agent turn on wasm (gloo-timers clock).
+///
+/// `stream_idle_timeout_ms = Some(5000)` arms the idle watchdog so the
+/// hoisted-sleep + `reset_for` path runs against the futures-timer bridge,
+/// not just the plain `sleep` path.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn run_mock_turn_wasm() -> Result<(), wasm_bindgen::JsValue> {
+    let stream_opts = StreamOptions {
+        stream_idle_timeout_ms: Some(5000),
+        ..StreamOptions::default()
+    };
+    let mut config = mock_config();
+    config.stream_options = stream_opts;
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")]));
+    let ctx = AgentContext {
+        system_prompt: None,
+        messages: vec![],
+    };
+    let stream = agent_loop(client, ctx, config);
+    futures::pin_mut!(stream);
+    use futures::StreamExt;
+    let mut events = 0;
+    while let Some(event) = stream.next().await {
+        if matches!(event, llm_harness_types::AgentEvent::Error(_)) {
+            return Err(
+                js_sys::Error::new("agent_loop emitted AgentEvent::Error").into(),
+            );
+        }
+        events += 1;
+    }
+    if events == 0 {
+        return Err(js_sys::Error::new("agent_loop emitted no events").into());
+    }
+    Ok(())
+}
