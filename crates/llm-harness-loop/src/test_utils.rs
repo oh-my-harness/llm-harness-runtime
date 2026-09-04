@@ -6,7 +6,12 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use async_trait::async_trait;
-use futures::{stream, stream::BoxStream};
+use futures::stream;
+/// Mock stream storage is always Send-boxed: `MockResponse` values live in
+/// `MockLlmClient` which must satisfy `Provider: Send + Sync` on every
+/// target. `chat_stream` re-boxes to the target's flavor on the way out.
+type BoxStream = futures::stream::BoxStream<'static, Result<StreamEvent, LlmError>>;
+
 use llm_adapter::{
     LlmError,
     provider::{Provider, ProviderCapabilities},
@@ -156,7 +161,7 @@ pub struct MockResponse {
     /// If set, `chat_stream` returns this error instead of a `StreamHandle`.
     pub stream_error: Option<LlmError>,
     /// Custom stream implementation; when set, takes precedence over `events`.
-    pub stream_impl: Option<BoxStream<'static, Result<StreamEvent, LlmError>>>,
+    pub stream_impl: Option<BoxStream>,
 }
 
 impl MockResponse {
@@ -394,8 +399,7 @@ impl MockResponse {
             // Do not close tx — receiver blocks forever, simulating stream stall.
             std::future::pending::<()>().await;
         });
-        let inner: BoxStream<'static, Result<StreamEvent, LlmError>> =
-            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+        let inner: BoxStream = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
         Self {
             events: vec![],
             model: "mock-model".into(),
@@ -416,8 +420,7 @@ impl MockResponse {
                 }
             }
         });
-        let inner: BoxStream<'static, Result<StreamEvent, LlmError>> =
-            Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+        let inner: BoxStream = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
         Self {
             events: vec![],
             model: "mock-model".into(),
@@ -466,7 +469,8 @@ impl MockLlmClient {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl Provider for MockLlmClient {
     fn capabilities(&self) -> ProviderCapabilities {
         self.capabilities.clone()
@@ -492,12 +496,15 @@ impl Provider for MockLlmClient {
         if let Some(e) = response.stream_error {
             return Err(e);
         }
-        let inner: BoxStream<'static, Result<StreamEvent, LlmError>> =
-            if let Some(stream) = response.stream_impl {
-                stream
-            } else {
-                Box::pin(stream::iter(response.events))
-            };
+        let inner: BoxStream = if let Some(stream) = response.stream_impl {
+            stream
+        } else {
+            Box::pin(stream::iter(response.events))
+        };
+        // wasm: `StreamHandle` boxes locally (`LocalBoxStream`); a Send-boxed
+        // stream coerces into it (auto-trait-dropping unsize coercion).
+        #[cfg(target_arch = "wasm32")]
+        let inner: futures::stream::LocalBoxStream<'static, Result<StreamEvent, LlmError>> = inner;
         Ok(StreamHandle::from_raw_stream(response.model, inner))
     }
 }

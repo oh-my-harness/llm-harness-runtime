@@ -1,5 +1,11 @@
 use std::sync::Arc;
+/// Monotonic clock for latency measurement: `std::time::Instant` on native,
+/// `web_time::Instant` on wasm32 (std's panics there — no clock source in
+/// wasm32-unknown-unknown).
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 use futures::future::BoxFuture;
 use llm_harness_types::*;

@@ -59,7 +59,7 @@ llm-harness-sandbox = { path = "crates/llm-harness-sandbox" }
 llm-harness-agent-team-studio = { path = "crates/llm-harness-agent-team-studio" }
 llm-harness-agent-team = { path = "crates/llm-harness-agent-team" }
 # API adapter — separate repo
-llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "9111ea5ee0d45af1737c06875573cb3a715c27fe" }
+llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "33d34033cbc999667309f533bec198ce411efdc7" }
 
 # Infrastructure
 anyhow             = "1"
@@ -87,6 +87,7 @@ encoding_rs         = "0.8"
 fastrand          = "2.4"
 zeroize            = "1"
 tracing            = "0.1"
+web-time           = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 opentelemetry          = "0.32"
 axum = { version = "0.8", features = ["ws"] }
