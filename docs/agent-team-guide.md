@@ -136,6 +136,8 @@ planner / coder / 5×reviewer / judge / debugger / scout）是第一个官方模
 descriptor 路径；后端不会把含 token 的 URL 打进 stdout。干净退出或 runtime drop
 时会删除该文件。
 Studio 数据根目录使用进程级独占锁，避免同一份团队数据被多个桌面实例并发修改。
+全局/成员级 API key 和 workspace grant 持久化采用“创建即私有 + 唯一临时文件原子
+替换”，失败路径不会留下可读取的临时秘密；成员 ID 会在构造秘密路径前再次校验。
 Studio 主进程会在退出前把 panic 事件追加到数据根目录的
 `logs/crash.jsonl`（Unix 权限 `0600`）；该报告包含时间、线程、panic 消息和
 backtrace，便于桌面宿主或运维在进程退出后定位原因。

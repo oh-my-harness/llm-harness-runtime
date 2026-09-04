@@ -6,6 +6,7 @@
 //! The API key is stored in a separate 0600 file, never in settings.json
 //! and never echoed back over the API.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::roles::ModelTier;
@@ -36,6 +37,8 @@ impl Default for Settings {
 pub enum SettingsError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("invalid secret component: {0}")]
+    InvalidComponent(String),
     #[error("parse: {0}")]
     Parse(String),
     #[error("serialize: {0}")]
@@ -115,14 +118,24 @@ pub fn api_key_path(data_root: &Path) -> PathBuf {
 }
 
 pub fn save_api_key(data_root: &Path, key: &str) -> Result<(), SettingsError> {
-    std::fs::create_dir_all(data_root)?;
-    let path = api_key_path(data_root);
-    std::fs::write(&path, key)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_private_file(&api_key_path(data_root), key.as_bytes())?;
+    Ok(())
+}
+
+pub fn save_member_api_key(
+    data_root: &Path,
+    team_id: &str,
+    agent_id: &str,
+    key: &str,
+) -> Result<(), SettingsError> {
+    validate_secret_component(team_id)?;
+    validate_secret_component(agent_id)?;
+    let path = data_root
+        .join("teams")
+        .join(team_id)
+        .join("secrets")
+        .join(agent_id);
+    write_private_file(&path, key.as_bytes())?;
     Ok(())
 }
 
@@ -131,6 +144,92 @@ pub fn load_api_key(data_root: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn validate_secret_component(component: &str) -> Result<(), SettingsError> {
+    if component.is_empty()
+        || component == "."
+        || component == ".."
+        || component.contains('/')
+        || component.contains('\\')
+        || component.contains(':')
+        || component.contains('\0')
+    {
+        return Err(SettingsError::InvalidComponent(component.to_owned()));
+    }
+    Ok(())
+}
+
+pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "secret path has no parent",
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "secret path has no file name",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    let mut temporary_name = file_name.to_os_string();
+    temporary_name.push(".tmp-");
+    temporary_name.push(uuid::Uuid::now_v7().simple().to_string());
+    let temporary = parent.join(temporary_name);
+    std::fs::remove_file(&temporary).or_else(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })?;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(unix)]
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(contents)?;
+            file.flush()?;
+            file.sync_all()
+        });
+    #[cfg(not(unix))]
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(contents)?;
+            file.flush()?;
+            file.sync_all()
+        });
+
+    match result {
+        Ok(()) => {
+            if let Err(error) = std::fs::rename(&temporary, path) {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(error);
+            }
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -193,5 +292,89 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_key_save_replaces_atomically_with_private_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_root();
+        let path = api_key_path(&root);
+        save_api_key(&root, "first-key").unwrap();
+        assert_eq!(load_api_key(&root).as_deref(), Some("first-key"));
+
+        save_api_key(&root, "second-key").unwrap();
+        assert_eq!(load_api_key(&root).as_deref(), Some("second-key"));
+        assert!(!root.read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_private_file_removes_temporary_on_rename_failure() {
+        let root = temp_root();
+        let target = root.join("api-key");
+        std::fs::create_dir_all(&target).unwrap();
+
+        assert!(write_private_file(&target, b"secret").is_err());
+        assert!(!root.read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn member_api_key_rejects_path_components() {
+        let root = temp_root();
+        for component in ["", ".", "..", "a/b", "a\\b", "C:", "a:b", "a\0b"] {
+            assert!(matches!(
+                save_member_api_key(&root, component, "planner", "key"),
+                Err(SettingsError::InvalidComponent(_))
+            ));
+            assert!(matches!(
+                save_member_api_key(&root, "project", component, "key"),
+                Err(SettingsError::InvalidComponent(_))
+            ));
+        }
+        assert!(!root.join("teams").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn member_api_key_is_stored_privately() {
+        let root = temp_root();
+        save_member_api_key(&root, "project", "planner", "member-key").unwrap();
+        let path = root.join("teams/project/secrets/planner");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "member-key");
+        assert!(
+            !root
+                .join("teams/project/secrets")
+                .read_dir()
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp-"))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
