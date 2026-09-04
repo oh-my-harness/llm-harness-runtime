@@ -14,7 +14,7 @@ llm-harness-mcp.workspace = true
 llm-harness-sandbox.workspace = true
 llm-harness-inspector = { workspace = true, features = ["inspect"] }
 axum.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "signal"] }
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true

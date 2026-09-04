@@ -10,6 +10,8 @@ pub mod diagnostics;
 pub mod engine;
 pub mod env_cfg;
 pub mod events;
+#[cfg(unix)]
+pub mod host;
 pub mod issue;
 pub mod pulse;
 pub mod roles;
