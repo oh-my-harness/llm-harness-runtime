@@ -5,7 +5,15 @@ use std::{
     sync::Arc,
 };
 
-use futures::future::BoxFuture;
+/// Tool future type: `BoxFuture` (+ Send) on native, `LocalBoxFuture`
+/// (!Send) on wasm32 — JS promise futures (reqwest wasm backend,
+/// wasm-bindgen JsFuture) are `!Send`, mirroring the `Provider` trait's
+/// wasm fork in llm-api-adapter#16. Native codegen is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+pub type ToolFuture<'a> = futures::future::BoxFuture<'a, Result<ToolResult, ToolFailure>>;
+#[cfg(target_arch = "wasm32")]
+pub type ToolFuture<'a> = futures::future::LocalBoxFuture<'a, Result<ToolResult, ToolFailure>>;
+
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -615,11 +623,7 @@ pub trait Tool: Send + Sync {
     }
 
     /// 执行工具；返回结果或错误。
-    fn execute<'a>(
-        &'a self,
-        args: serde_json::Value,
-        ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>>;
+    fn execute<'a>(&'a self, args: serde_json::Value, ctx: &'a ToolContext) -> ToolFuture<'a>;
 }
 
 #[cfg(test)]
@@ -669,7 +673,7 @@ mod tests {
                 &'a self,
                 _args: serde_json::Value,
                 _ctx: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+            ) -> ToolFuture<'a> {
                 Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
             }
         }
@@ -714,11 +718,7 @@ mod tests {
             fn parameters_schema(&self) -> &serde_json::Value {
                 &serde_json::Value::Null
             }
-            fn execute<'a>(
-                &'a self,
-                _: serde_json::Value,
-                _: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+            fn execute<'a>(&'a self, _: serde_json::Value, _: &'a ToolContext) -> ToolFuture<'a> {
                 Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
             }
         }
