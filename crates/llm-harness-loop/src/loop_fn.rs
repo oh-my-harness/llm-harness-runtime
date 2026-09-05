@@ -699,7 +699,24 @@ fn run_loop(
                                 mpsc::channel::<ToolProgress>(16);
                             let aggregate_tx = update_tx.clone();
                             let update_tool_use_id = tool_use_id.clone();
+                            // Forward per-tool progress to the aggregate
+                            // channel. tokio::spawn requires a reactor, which
+                            // does not exist on wasm32 — spawn_local on the
+                            // current (single-threaded) JS event loop instead.
+                            #[cfg(not(target_arch = "wasm32"))]
                             tokio::spawn(async move {
+                                while let Some(partial) = tool_update_rx.recv().await {
+                                    if aggregate_tx
+                                        .send((update_tool_use_id.clone(), partial))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            });
+                            #[cfg(target_arch = "wasm32")]
+                            wasm_bindgen_futures::spawn_local(async move {
                                 while let Some(partial) = tool_update_rx.recv().await {
                                     if aggregate_tx
                                         .send((update_tool_use_id.clone(), partial))
