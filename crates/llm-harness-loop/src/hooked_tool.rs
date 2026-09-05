@@ -166,6 +166,7 @@ fn mirror_duration(projection: &mut ToolSessionProjection, suffix: &str) {
 #[cfg(feature = "test-utils")]
 mod tests {
     use super::*;
+    use futures::future::BoxFuture;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
