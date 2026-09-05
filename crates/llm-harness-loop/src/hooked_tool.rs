@@ -7,7 +7,6 @@ use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
-use futures::future::BoxFuture;
 use llm_harness_types::*;
 
 /// Decorates a `Tool` with optional before/after hooks. Stateless.
@@ -45,11 +44,7 @@ impl Tool for HookedTool {
         self.inner.report_duration()
     }
 
-    fn execute<'a>(
-        &'a self,
-        args: serde_json::Value,
-        ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+    fn execute<'a>(&'a self, args: serde_json::Value, ctx: &'a ToolContext) -> ToolFuture<'a> {
         Box::pin(async move {
             // Apply before-hook. `denied` carries the Deny failure: the call
             // is rejected, but still flows through the after-hook below so
@@ -190,11 +185,7 @@ mod tests {
             static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
             S.get_or_init(|| serde_json::json!({}))
         }
-        fn execute<'a>(
-            &'a self,
-            _: serde_json::Value,
-            _: &'a ToolContext,
-        ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+        fn execute<'a>(&'a self, _: serde_json::Value, _: &'a ToolContext) -> ToolFuture<'a> {
             self.called.store(true, Ordering::SeqCst);
             let terminate = self.terminate;
             Box::pin(async move {
@@ -238,11 +229,7 @@ mod tests {
         fn report_duration(&self) -> bool {
             true
         }
-        fn execute<'a>(
-            &'a self,
-            _: serde_json::Value,
-            _: &'a ToolContext,
-        ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+        fn execute<'a>(&'a self, _: serde_json::Value, _: &'a ToolContext) -> ToolFuture<'a> {
             let fail = self.fail;
             let sleep_ms = self.sleep_ms;
             Box::pin(async move {
@@ -413,11 +400,7 @@ mod tests {
             fn report_duration(&self) -> bool {
                 true
             }
-            fn execute<'a>(
-                &'a self,
-                _: serde_json::Value,
-                _: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+            fn execute<'a>(&'a self, _: serde_json::Value, _: &'a ToolContext) -> ToolFuture<'a> {
                 Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
             }
         }
@@ -453,11 +436,7 @@ mod tests {
             fn report_duration(&self) -> bool {
                 true
             }
-            fn execute<'a>(
-                &'a self,
-                _: serde_json::Value,
-                _: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+            fn execute<'a>(&'a self, _: serde_json::Value, _: &'a ToolContext) -> ToolFuture<'a> {
                 Box::pin(async {
                     Ok(ToolResult::projected(
                         vec![DataBlock::text("body")],
@@ -483,11 +462,7 @@ mod tests {
             fn report_duration(&self) -> bool {
                 true
             }
-            fn execute<'a>(
-                &'a self,
-                _: serde_json::Value,
-                _: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+            fn execute<'a>(&'a self, _: serde_json::Value, _: &'a ToolContext) -> ToolFuture<'a> {
                 Box::pin(async {
                     Ok(ToolResult::ephemeral(
                         vec![DataBlock::text("body")],
@@ -596,7 +571,7 @@ mod tests {
                 &'a self,
                 args: serde_json::Value,
                 _: &'a ToolContext,
-            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+            ) -> ToolFuture<'a> {
                 *self.received.lock() = args;
                 Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
             }

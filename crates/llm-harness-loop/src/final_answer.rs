@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
 use llm_harness_types::{
-    DataBlock, Tool, ToolContext, ToolError, ToolFailure, ToolLevel, ToolResult,
+    DataBlock, Tool, ToolContext, ToolError, ToolFuture, ToolLevel, ToolResult,
 };
-
-use futures::future::BoxFuture;
 
 /// Default built-in tool name for opt-in final-answer delivery.
 pub const DEFAULT_FINAL_ANSWER_TOOL_NAME: &str = llm_harness_types::FINAL_ANSWER_TOOL_NAME;
@@ -111,11 +109,7 @@ impl Tool for BuiltinFinalAnswerTool {
         self.schema
     }
 
-    fn execute<'a>(
-        &'a self,
-        args: serde_json::Value,
-        _ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+    fn execute<'a>(&'a self, args: serde_json::Value, _ctx: &'a ToolContext) -> ToolFuture<'a> {
         Box::pin(async move {
             let text = args
                 .get("text")
