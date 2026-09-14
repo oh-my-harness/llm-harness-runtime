@@ -27,6 +27,9 @@ uuid.workspace = true
 tracing.workspace = true
 rusqlite.workspace = true
 
+[features]
+sqlite-bundled = ["rusqlite/bundled"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 llm-harness-loop = { workspace = true, features = ["test-utils"] }
