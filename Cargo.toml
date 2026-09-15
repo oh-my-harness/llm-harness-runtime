@@ -9,6 +9,7 @@ members = [
     "crates/llm-harness-subagents",
     "crates/llm-harness-workflow",
     "crates/llm-harness-sandbox",
+    "crates/llm-harness-sandbox-remote",
     "crates/llm-harness-mcp",
     "crates/llm-harness-tools",
     "crates/llm-harness-strategy",

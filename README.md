@@ -102,6 +102,7 @@ graph TD
 | `llm-harness-memory` | 长期记忆系统（读写分离 + 变更网关） | [crate-reference.md](docs/crate-reference.md) |
 | `llm-harness-session-recall` | 跨 Session 历史召回（in-memory + SQLite FTS5） | [session-recall-integration.md](docs/session-recall-integration.md) |
 | `llm-harness-sandbox` | 沙箱后端：bwrap（Linux）、seatbelt（macOS）、os | crate 内 lib.rs |
+| `llm-harness-sandbox-remote` | 远程沙箱协议客户端：HTTPS/Bearer、文件操作、流式 shell、abort/timeout | **[remote-sandbox-backend.md](docs/design/2026-09-15-remote-sandbox-backend.md)** |
 | `llm-harness-audit-jsonl` | JSONL 审计后端（SHA-256 hash chain） | [crate-reference.md](docs/crate-reference.md) |
 | `llm-harness-trace-otel` | OpenTelemetry 追踪导出（OTLP → Jaeger/Tempo） | [crate-reference.md](docs/crate-reference.md) |
 | `llm-harness-live-tests` | 真实 LLM 集成测试（27 examples + 97 tests） | 见下方快速上手 |
