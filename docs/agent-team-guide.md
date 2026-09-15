@@ -37,6 +37,36 @@ team.shutdown();
 
 运行完整示例：`cargo run -p llm-harness-live-tests --example 26_agent_team`。
 
+### GLM-5.3-Flash live E2E
+
+`crates/llm-harness-live-tests/tests/agent_team.rs` 提供默认 ignored 的
+真实模型 E2E，用于验证完整三跳协作链：
+
+```text
+operator → planner(delegate_task) → coder(delegate_task)
+         → reviewer(send_message) → operator
+```
+
+运行命令：
+
+```bash
+OPENAI_API_KEY=<key> \
+OPENAI_API_BASE=https://api.hyper-op.com \
+OPENAI_MODEL=GLM-5.3-Flash \
+cargo test -p llm-harness-live-tests --features live-llm --test agent_team \
+  glm_5_3_flash_agent_team_delegates_coding_review_to_operator -- --ignored --nocapture
+```
+
+测试不仅等待 reviewer 的 operator 回复，还会读取三个成员的 session
+transcript，并断言 `planner → coder`、`coder → reviewer`、
+`reviewer → operator` 各发生一次正确的目标工具调用。这样可以防止测试把
+“planner 直接联系 reviewer”或“成员只输出文本”误判为三跳闭环。
+
+Hyperop 网关使用内网 CA 时，rustls 默认 WebPKI root 无法完成 TLS 校验；
+workspace 的 `reqwest` 依赖启用 `rustls-tls-native-roots`，使 provider
+请求可同时加载系统 native roots。reflection 持久化不在该 E2E 的通过条件内，
+`26_agent_team` 中的合法弃权仍不能被宣传为 reflection 已持久化验证。
+
 ---
 
 ## 核心概念
