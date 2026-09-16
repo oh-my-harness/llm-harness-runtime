@@ -570,6 +570,11 @@ pub struct WorkflowState {
     /// 已完成的步骤历史（审计链）。
     #[serde(default)]
     pub step_history: Vec<StepRecord>,
+    /// 每 LoopConfig 步的声明式循环计数（step_id → 已完成迭代数）。
+    /// 跨节点跳转后仍保留（区别于 step_history 的连续 Retry 扫描），
+    /// 循环真正退出时清零。`#[serde(default)]` 兼容旧快照（缺键 → 空表）。
+    #[serde(default)]
+    pub loop_iterations: std::collections::HashMap<StepId, u32>,
     /// 规划此 workflow 的 task ID（review-9）。LLM 两阶段场景下记录 plan_task_id，
     /// 业务层恢复时不用自己维护两张 ID 表。人类规划场景为 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -591,6 +596,7 @@ impl WorkflowState {
             ended_at: None,
             current_step: entry_step,
             step_history: vec![],
+            loop_iterations: std::collections::HashMap::new(),
             planned_by: None,
             context: WorkflowContext::new(),
         }

@@ -2,6 +2,7 @@ use super::*;
 use crate::workflow::engine::structured::{
     DEFAULT_MAX_UPGRADE_ATTEMPTS, StructuredOutputCoordinator,
 };
+use crate::workflow::model::LoopConfig;
 
 // ── 自由函数 ─────────────────────────────────────────────────────────────
 
@@ -745,16 +746,27 @@ impl super::WorkflowEngine {
                     self.persist_state(&snapshot).await?;
                     return Ok(result);
                 }
-                (Transition::To(next), _) => {
+                (Transition::To(next), override_next) => {
+                    // LoopConfig 续环/退出（apply_transition 返回的 next_step）
+                    // 优先于 judge 的原始 next：耗尽时 exit_route 覆盖 judge 路由。
+                    let target = override_next.unwrap_or(next);
                     let mut state = self.workflow_state.lock().await;
-                    state.current_step = next;
+                    state.current_step = target;
                     let snapshot = state.clone();
                     drop(state);
                     self.persist_state(&snapshot).await?;
                     self.pause_if_requested().await?;
                 }
-                (Transition::Retry, _) => {
-                    // current_step 不变，重跑。
+                (Transition::Retry, next) => {
+                    // current_step 不变，重跑。LoopConfig 在场时 apply_transition
+                    // 可能返回目标 stage（循环跳转/退出路由），需跟随。
+                    if let Some(target) = next {
+                        let mut state = self.workflow_state.lock().await;
+                        state.current_step = target;
+                        let snapshot = state.clone();
+                        drop(state);
+                        self.persist_state(&snapshot).await?;
+                    }
                     self.pause_if_requested().await?;
                 }
                 (Transition::Pause { reason }, _) => {
@@ -1570,6 +1582,93 @@ impl super::WorkflowEngine {
         Ok(())
     }
 
+    /// 声明式循环（LoopConfig）续环判定 — Retry 与 To 两条路径共用。
+    ///
+    /// 调用前置条件：调用方已确认这是"续环"转换（Retry，或
+    /// To(target_stage) 且 target != 当前步）。持 `workflow_state` 锁进入。
+    async fn step_loop_continuation(
+        &self,
+        state: &mut WorkflowState,
+        step: &Step,
+        loop_cfg: &LoopConfig,
+    ) -> Result<Option<StepId>, WorkflowError> {
+        // 声明式循环计数：持久化在 WorkflowState.loop_iterations，
+        // 跨节点跳转（check→Retry→target→To(check)）后仍保留。
+        // 语义：max_iterations=N 允许 N 次循环继续（跳转），
+        // 第 N+1 次续环超限（count > max_iterations）。
+        let entry = state
+            .loop_iterations
+            .entry(step.id().clone())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        let loop_count = *entry;
+        if loop_count > loop_cfg.max_iterations {
+            // Loop exhausted: the episode ends — clear the counter so a
+            // later re-entry of the same loop starts fresh.
+            state.loop_iterations.remove(step.id());
+
+            // Follow exit_route edge (a declarative Label edge).
+            if let Some(exit_label) = &loop_cfg.exit_route {
+                // Strip "next_on_" prefix if present to get the raw route
+                // key, then find a matching edge.
+                let label = exit_label.strip_prefix("next_on_").unwrap_or(exit_label);
+                if let Some(edge) = self.workflow.edges.iter().find(|e| {
+                    e.from.as_str() == step.id().as_str()
+                        && matches!(
+                            &e.condition,
+                            Some(EdgeCondition::Label(l)) if l == label
+                        )
+                }) {
+                    let next = edge.to.clone();
+                    let snapshot = state.clone();
+                    self.persist_state(&snapshot).await?;
+                    return Ok(Some(next));
+                }
+                // exit_route set but no matching edge → explicit failure.
+                let msg = format!(
+                    "LoopConfig for step '{}' exhausted ({} iterations); \
+                     exit_route '{}' has no matching edge",
+                    step.id(),
+                    loop_cfg.max_iterations,
+                    label
+                );
+                state.status = WorkflowStatus::Failed;
+                state.error = Some(TaskError::Internal(msg.clone()));
+                state.ended_at = Some(chrono::Utc::now());
+                let snapshot = state.clone();
+                self.persist_state(&snapshot).await?;
+                return Err(WorkflowError::TaskFailed(msg));
+            }
+            // exit_route missing: To-based loops have no Retry records, so
+            // falling through to max_retries can never bound them. Fail
+            // explicitly. (The Retry caller treats Err the same way.)
+            let msg = format!(
+                "LoopConfig for step '{}' exhausted ({} iterations); no exit_route configured",
+                step.id(),
+                loop_cfg.max_iterations
+            );
+            state.status = WorkflowStatus::Failed;
+            state.error = Some(TaskError::Internal(msg.clone()));
+            state.ended_at = Some(chrono::Utc::now());
+            let snapshot = state.clone();
+            self.persist_state(&snapshot).await?;
+            return Err(WorkflowError::TaskFailed(msg));
+        }
+
+        // Loop continues: jump to target_stage or re-run current.
+        if let Some(target) = &loop_cfg.target_stage
+            && target != step.id()
+        {
+            let snapshot = state.clone();
+            self.persist_state(&snapshot).await?;
+            return Ok(Some(target.clone()));
+        }
+        // target_stage is None or same as current: re-run in place.
+        let snapshot = state.clone();
+        self.persist_state(&snapshot).await?;
+        Ok(None)
+    }
+
     /// 据 Transition 更新 state + 记录 step_history。返回 next_step（Retry/Abort 时为 None）。
     ///
     async fn apply_transition(
@@ -1631,6 +1730,19 @@ impl super::WorkflowEngine {
                     self.persist_state(&snapshot).await?;
                     return Err(WorkflowError::TaskFailed(msg));
                 }
+
+                // 声明式续环：仅当"LoopConfig 持有步自身"路由到其
+                // target_stage（且 target != 当前步）时才计一次循环迭代；
+                // 其他步骤的 To(target) 是普通跳转，绝不计入别人的循环。
+                if let Some(loop_cfg) = step.policy().and_then(|p| p.r#loop.as_ref())
+                    && let Some(target) = &loop_cfg.target_stage
+                    && target == &next
+                    && target != step.id()
+                {
+                    return self
+                        .step_loop_continuation(&mut state, step, loop_cfg)
+                        .await;
+                }
                 let snapshot = state.clone();
                 drop(state);
                 self.persist_state(&snapshot).await?;
@@ -1641,55 +1753,12 @@ impl super::WorkflowEngine {
                 // If present, the loop has its own counter and exit semantics
                 // that supersede the generic max_retries safety valve.
                 if let Some(loop_cfg) = step.policy().and_then(|p| p.r#loop.as_ref()) {
-                    // Count loop iterations for this step (consecutive Retry
-                    // records, including the one just pushed).
-                    let loop_count = state
-                        .step_history
-                        .iter()
-                        .rev()
-                        .take_while(|r| {
-                            r.step_id.as_str() == step.id().as_str()
-                                && matches!(r.transition, Transition::Retry)
-                        })
-                        .count() as u32;
-
-                    if loop_count > loop_cfg.max_iterations {
-                        // Loop exhausted: follow exit_route edge.
-                        if let Some(exit_label) = &loop_cfg.exit_route {
-                            // Strip "next_on_" prefix if present to get the
-                            // raw route key, then find a matching edge.
-                            let label = exit_label.strip_prefix("next_on_").unwrap_or(exit_label);
-                            if let Some(edge) = self.workflow.edges.iter().find(|e| {
-                                e.from.as_str() == step.id().as_str()
-                                    && matches!(
-                                        &e.condition,
-                                        Some(EdgeCondition::Label(l)) if l == label
-                                    )
-                            }) {
-                                let next = edge.to.clone();
-                                let snapshot = state.clone();
-                                drop(state);
-                                self.persist_state(&snapshot).await?;
-                                return Ok(Some(next));
-                            }
-                        }
-                        // No exit_route edge found: fall through to max_retries.
-                    } else {
-                        // Loop continues: jump to target_stage or re-run current.
-                        if let Some(target) = &loop_cfg.target_stage
-                            && target != step.id()
-                        {
-                            let snapshot = state.clone();
-                            drop(state);
-                            self.persist_state(&snapshot).await?;
-                            return Ok(Some(target.clone()));
-                        }
-                        // target_stage is None or same as current: re-run in place.
-                        let snapshot = state.clone();
-                        drop(state);
-                        self.persist_state(&snapshot).await?;
-                        return Ok(None);
-                    }
+                    // 续环计数/耗尽/退出共用判定（To 路径亦走此函数）。
+                    // 注意：exit_route 缺失或无法解析时显式失败（原 fall-through
+                    // 到 max_retries 只对纯 Retry 循环有界；两者现已合一）。
+                    return self
+                        .step_loop_continuation(&mut state, step, loop_cfg)
+                        .await;
                 }
 
                 // max_retries 安全阀。统计当前步连续 Retry 次数。
