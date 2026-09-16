@@ -43,7 +43,7 @@ async fn free_task_smoke_succeeds() {
     assert!(result.final_message.as_deref().unwrap_or("").contains("42"));
 }
 
-use crate::lifecycle::task_store::JsonlTaskStore;
+use crate::lifecycle::task_store::{EventWaitRecord, JsonlTaskStore, TaskSummary};
 use crate::workflow::judge::NoopJudge;
 use crate::workflow::model::StepCache;
 use crate::workflow::model::{ConditionExpr, Edge, EdgeCondition};
@@ -5057,6 +5057,463 @@ async fn to_based_cross_node_loop_reaches_max_iterations_and_exits() {
         "exhausted To-loop must exit via exit_route to the terminal step"
     );
     assert_eq!(result.final_message.as_deref(), Some("done"));
+}
+
+#[tokio::test]
+async fn to_self_target_stage_counts_as_loop_continuation() {
+    struct AlwaysToSelfJudge {
+        visits: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+    impl StepTransitionJudge for AlwaysToSelfJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            self.visits.lock().push(step_id.clone());
+            Box::pin(async move { Transition::To(step_id) })
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let visits = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let workflow = Workflow {
+        entry_step: "check".into(),
+        steps: vec![
+            Step::llm("check", "Check", "validate", vec![]).with_policy(StepExecutionPolicy {
+                timeout_ms: None,
+                max_attempts: None,
+                retry_backoff_ms: None,
+                cache: None,
+                r#loop: Some(LoopConfig {
+                    max_iterations: 1,
+                    target_stage: Some("check".into()),
+                    exit_route: Some("done".into()),
+                }),
+            }),
+            Step::Terminal {
+                id: "done".into(),
+                name: "Done".into(),
+                exit_code: 0,
+                message: Some("done".into()),
+            },
+        ],
+        edges: vec![
+            Edge {
+                from: "check".into(),
+                to: "check".into(),
+                condition: None,
+            },
+            Edge {
+                from: "check".into(),
+                to: "done".into(),
+                condition: Some(EdgeCondition::Label("done".into())),
+            },
+        ],
+    };
+    let config = WorkflowEngineConfig {
+        client: Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("check 1"),
+            MockResponse::text("check 2"),
+        ])),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(AlwaysToSelfJudge {
+            visits: visits.clone(),
+        }),
+    )
+    .unwrap()
+    .with_max_steps(3);
+
+    let result = engine.run().await.unwrap();
+    assert_eq!(result.final_message.as_deref(), Some("done"));
+    assert_eq!(visits.lock().len(), 2);
+}
+
+struct CrashAfterStateSaveStore {
+    inner: Arc<JsonlTaskStore>,
+    should_crash: Arc<dyn Fn(&WorkflowState) -> bool + Send + Sync>,
+}
+
+impl TaskStore for CrashAfterStateSaveStore {
+    fn load_workflow_state(
+        &self,
+        task_id: &TaskId,
+    ) -> BoxFuture<'_, Result<Option<WorkflowState>>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.load_workflow_state(&task_id).await })
+    }
+
+    fn save_workflow_state(
+        &self,
+        task_id: &TaskId,
+        state: &WorkflowState,
+    ) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let should_crash = self.should_crash.clone();
+        let task_id = task_id.clone();
+        let state = state.clone();
+        Box::pin(async move {
+            inner.save_workflow_state(&task_id, &state).await?;
+            if should_crash(&state) {
+                anyhow::bail!("simulated crash after state save");
+            }
+            Ok(())
+        })
+    }
+
+    fn load_workflow(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Option<Workflow>>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.load_workflow(&task_id).await })
+    }
+
+    fn save_workflow(&self, task_id: &TaskId, workflow: &Workflow) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        let workflow = workflow.clone();
+        Box::pin(async move { inner.save_workflow(&task_id, &workflow).await })
+    }
+
+    fn list_checkpoints(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Vec<Checkpoint>>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.list_checkpoints(&task_id).await })
+    }
+
+    fn save_checkpoint(
+        &self,
+        task_id: &TaskId,
+        checkpoint: &Checkpoint,
+    ) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        let checkpoint = checkpoint.clone();
+        Box::pin(async move { inner.save_checkpoint(&task_id, &checkpoint).await })
+    }
+
+    fn load_event_wait(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Option<EventWaitRecord>>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.load_event_wait(&task_id).await })
+    }
+
+    fn save_event_wait(
+        &self,
+        task_id: &TaskId,
+        descriptor: &serde_json::Value,
+    ) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        let descriptor = descriptor.clone();
+        Box::pin(async move { inner.save_event_wait(&task_id, &descriptor).await })
+    }
+
+    fn clear_event_wait(&self, task_id: &TaskId) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.clear_event_wait(&task_id).await })
+    }
+
+    fn delete(&self, task_id: &TaskId) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.delete(&task_id).await })
+    }
+
+    fn list_tasks(&self) -> BoxFuture<'_, Result<Vec<TaskSummary>>> {
+        let inner = self.inner.clone();
+        Box::pin(async move { inner.list_tasks().await })
+    }
+}
+
+#[tokio::test]
+async fn to_loop_exit_route_survives_crash_after_transition_persist() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let workflow = Workflow {
+        entry_step: "search".into(),
+        steps: vec![
+            Step::llm("search", "Search", "find sources", vec![]),
+            Step::llm("vet", "Vet", "vet sources", vec![]).with_policy(StepExecutionPolicy {
+                timeout_ms: None,
+                max_attempts: None,
+                retry_backoff_ms: None,
+                cache: None,
+                r#loop: Some(LoopConfig {
+                    max_iterations: 1,
+                    target_stage: Some("search".into()),
+                    exit_route: Some("done".into()),
+                }),
+            }),
+            Step::Terminal {
+                id: "done".into(),
+                name: "Done".into(),
+                exit_code: 0,
+                message: Some("done".into()),
+            },
+        ],
+        edges: vec![
+            Edge {
+                from: "search".into(),
+                to: "vet".into(),
+                condition: None,
+            },
+            Edge {
+                from: "vet".into(),
+                to: "search".into(),
+                condition: Some(EdgeCondition::Label("research".into())),
+            },
+            Edge {
+                from: "vet".into(),
+                to: "done".into(),
+                condition: Some(EdgeCondition::Label("done".into())),
+            },
+        ],
+    };
+
+    struct ResearchRouteJudge;
+    impl StepTransitionJudge for ResearchRouteJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            Box::pin(async move {
+                match step_id.as_str() {
+                    "search" => Transition::To("vet".into()),
+                    "vet" => Transition::To("search".into()),
+                    _ => Transition::Abort {
+                        reason: "done".into(),
+                    },
+                }
+            })
+        }
+    }
+
+    struct SearchAbortJudge;
+    impl StepTransitionJudge for SearchAbortJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            Box::pin(async move {
+                if step_id == "search" {
+                    Transition::Abort {
+                        reason: "unexpected search after restore".into(),
+                    }
+                } else {
+                    Transition::Abort {
+                        reason: "done".into(),
+                    }
+                }
+            })
+        }
+    }
+
+    let inner_store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let crash_store = Arc::new(CrashAfterStateSaveStore {
+        inner: inner_store.clone(),
+        should_crash: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Running
+                && state.current_step == "done"
+                && state
+                    .step_history
+                    .last()
+                    .is_some_and(|record| record.step_id == "vet")
+        }),
+    });
+    let config = WorkflowEngineConfig {
+        client: Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("search 1"),
+            MockResponse::text("vet 1"),
+            MockResponse::text("search 2"),
+            MockResponse::text("vet 2"),
+            MockResponse::text("unexpected search after restore"),
+        ])),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(ResearchRouteJudge))
+        .unwrap()
+        .with_task_store(crash_store);
+    let task_id = engine.task_id().clone();
+    assert!(engine.run().await.is_err());
+    let saved_state = inner_store
+        .load_workflow_state(&task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved_state.current_step, "done");
+    assert_eq!(saved_state.status, WorkflowStatus::Running);
+    assert!(matches!(
+        saved_state.step_history.last().unwrap().transition,
+        Transition::To(ref target) if target == "done"
+    ));
+
+    let restored = WorkflowEngine::restore(
+        inner_store,
+        task_id,
+        WorkflowEngineConfig {
+            client: Arc::new(MockLlmClient::new(vec![MockResponse::text(
+                "unexpected search after restore",
+            )])),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+            customize_builder: None,
+        },
+        Arc::new(SearchAbortJudge),
+    )
+    .await
+    .unwrap();
+    let result = restored.run().await.unwrap();
+
+    assert_eq!(result.final_message.as_deref(), Some("done"));
+    assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+    let history = restored.step_history().await;
+    assert_eq!(history.last().unwrap().step_id, "done");
+}
+
+#[tokio::test]
+async fn retry_loop_target_survives_crash_after_continuation_persist() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let workflow = Workflow {
+        entry_step: "check".into(),
+        steps: vec![
+            Step::llm("check", "Check", "validate", vec![]).with_policy(StepExecutionPolicy {
+                timeout_ms: None,
+                max_attempts: None,
+                retry_backoff_ms: None,
+                cache: None,
+                r#loop: Some(LoopConfig {
+                    max_iterations: 2,
+                    target_stage: Some("run".into()),
+                    exit_route: Some("done".into()),
+                }),
+            }),
+            Step::llm("run", "Run", "do work", vec![]),
+            Step::Terminal {
+                id: "done".into(),
+                name: "Done".into(),
+                exit_code: 0,
+                message: Some("done".into()),
+            },
+        ],
+        edges: vec![
+            Edge {
+                from: "check".into(),
+                to: "run".into(),
+                condition: None,
+            },
+            Edge {
+                from: "run".into(),
+                to: "check".into(),
+                condition: None,
+            },
+            Edge {
+                from: "check".into(),
+                to: "done".into(),
+                condition: Some(EdgeCondition::Label("done".into())),
+            },
+        ],
+    };
+
+    struct RetryThenDoneJudge;
+    impl StepTransitionJudge for RetryThenDoneJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            let last_step = ctx.step_history.last().map(|record| record.step_id.clone());
+            let check_count = ctx
+                .step_history
+                .iter()
+                .filter(|record| record.step_id == "check")
+                .count();
+            Box::pin(async move {
+                match step_id.as_str() {
+                    "check" if last_step.as_deref() == Some("run") => Transition::To("done".into()),
+                    "check" if check_count == 0 => Transition::Retry,
+                    "run" => Transition::To("check".into()),
+                    _ => Transition::Abort {
+                        reason: "unexpected check after restore".into(),
+                    },
+                }
+            })
+        }
+    }
+
+    let inner_store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let crash_store = Arc::new(CrashAfterStateSaveStore {
+        inner: inner_store.clone(),
+        should_crash: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Running
+                && state.current_step == "check"
+                && state.loop_iterations.get("check") == Some(&1)
+                && state
+                    .step_history
+                    .last()
+                    .is_some_and(|record| record.step_id == "check")
+        }),
+    });
+    let config = WorkflowEngineConfig {
+        client: Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("check 1"),
+            MockResponse::text("run 1"),
+            MockResponse::text("check 2"),
+        ])),
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(RetryThenDoneJudge))
+        .unwrap()
+        .with_task_store(crash_store);
+    let task_id = engine.task_id().clone();
+    assert!(engine.run().await.is_err());
+
+    let saved_state = inner_store
+        .load_workflow_state(&task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved_state.current_step, "check");
+    assert_eq!(saved_state.status, WorkflowStatus::Running);
+    assert!(matches!(
+        saved_state.step_history.last().unwrap().transition,
+        Transition::To(ref target) if target == "run"
+    ));
+
+    let restored = WorkflowEngine::restore(
+        inner_store,
+        task_id,
+        WorkflowEngineConfig {
+            client: Arc::new(MockLlmClient::new(vec![
+                MockResponse::text("run 1"),
+                MockResponse::text("check 2"),
+            ])),
+            model: "mock-model".into(),
+            env_factory: Arc::new(TestEnvFactory),
+            session_factory: Arc::new(JsonlSessionFactory),
+            session_base_dir: dir.path().join("sessions"),
+            customize_builder: None,
+        },
+        Arc::new(RetryThenDoneJudge),
+    )
+    .await
+    .unwrap();
+    let result = restored.run().await.unwrap();
+
+    assert_eq!(result.final_message.as_deref(), Some("done"));
+    assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(
+        restored.step_history().await.last().unwrap().step_id,
+        "done"
+    );
 }
 
 /// Counter isolation: an unrelated step's To transition to the same target

@@ -1625,6 +1625,11 @@ impl super::WorkflowEngine {
                         )
                 }) {
                     let next = edge.to.clone();
+                    // Persist the effective transition so Running-state crash
+                    // recovery resumes at the exit target, not the loop head.
+                    if let Some(record) = state.step_history.last_mut() {
+                        record.transition = Transition::To(next.clone());
+                    }
                     let snapshot = state.clone();
                     self.persist_state(&snapshot).await?;
                     return Ok(Some(next));
@@ -1664,6 +1669,9 @@ impl super::WorkflowEngine {
         if let Some(target) = &loop_cfg.target_stage
             && target != step.id()
         {
+            if let Some(record) = state.step_history.last_mut() {
+                record.transition = Transition::To(target.clone());
+            }
             let snapshot = state.clone();
             self.persist_state(&snapshot).await?;
             return Ok(Some(target.clone()));
@@ -1742,7 +1750,7 @@ impl super::WorkflowEngine {
                 if let Some(loop_cfg) = step.policy().and_then(|p| p.r#loop.as_ref()) {
                     let is_loop_continuation = matches!(
                         loop_cfg.target_stage.as_ref(),
-                        Some(target) if target == &next && target != step.id()
+                        Some(target) if target == &next
                     );
                     if is_loop_continuation {
                         return self
