@@ -85,7 +85,7 @@ async fn manual_compact_reduces_tokens() {
 }
 
 /// With `auto_compact(true)` and a small context window, at least one
-/// `CompactionEnd` event is emitted during 10 turns of conversation.
+/// `CompactionEnd` event is emitted during 5 turns of conversation.
 #[tokio::test]
 async fn auto_compact_triggers_on_threshold() {
     let provider = LiveProvider::from_env();
@@ -120,13 +120,18 @@ async fn auto_compact_triggers_on_threshold() {
     })
     .await;
 
+    // Each padded user message contributes roughly 400 estimated tokens.
+    // Three such messages exceed the 1150-token threshold by themselves, so
+    // this test does not depend on provider-reported output-token variance.
+    let deterministic_padding = "padding ".repeat(200);
     let mut compaction_count = 0usize;
     for i in 1..=5 {
         let cap = EventCapture::subscribe(&harness);
         match with_timeout(
             MULTI_TURN,
             harness.prompt(format!(
-                "Tell me fact #{i} about oceans. One sentence only."
+                "Tell me fact #{i} about oceans. One sentence only.\n\n\
+                 Ignore this deterministic context-size padding: {deterministic_padding}"
             )),
         )
         .await
