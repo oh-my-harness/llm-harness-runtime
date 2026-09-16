@@ -22,7 +22,7 @@ runtime process
                  └─ Firecracker / Kata / gVisor / container isolation
 ```
 
-`RemoteSandbox::connect` 创建远端 sandbox 并保存 gateway 返回的 `sandbox_id`、`work_dir` 和 backend 标识。如果 create 响应未通过协议校验，客户端会用响应中的有效 sandbox id 尽力删除远端实例，再返回协议错误。远端资源存在与 `Running` 状态分开记录：`Creating` 时 `is_running()` 为 false，但 Drop 仍会清理远端实例；`shutdown()` 成功后只删除一次。`RemoteEnv` 实现 `ExecutionEnv`，所有路径均使用 guest 坐标系，不泄漏 gateway 宿主机路径。
+`RemoteSandbox::connect` 创建远端 sandbox 并保存 gateway 返回的 `sandbox_id`、`work_dir` 和 backend 标识。如果 create 响应未通过协议校验，客户端会用响应中的有效 sandbox id 尽力删除远端实例，再返回协议错误。远端资源存在与 `Running` 状态分开记录：`Creating` 时 `is_running()` 为 false。`RemoteEnv` 与 sandbox handle 共享远端资源所有权，因此仅 drop handle 不会清理实例；最后一个引用 drop 时会在独立 cleanup 线程中尽力删除远端实例，`shutdown()` 成功后只删除一次。进程退出时仍依赖 gateway 的孤儿回收。`RemoteEnv` 实现 `ExecutionEnv`，所有路径均使用 guest 坐标系，不泄漏 gateway 宿主机路径。
 
 ## HTTP 协议
 
@@ -32,6 +32,8 @@ runtime process
 - `Accept: application/json` 或 `text/event-stream`
 - `Content-Type: application/json`（有请求体时）
 - `x-request-id: <uuid>`，便于网关侧关联日志
+
+HTTPS 客户端使用 rustls，并启用 native root store；因此企业私有 CA 可通过平台证书库（Unix 上包括 `SSL_CERT_FILE`）注入，而不要求把 CA 打包进应用。
 
 JSON 响应必须是 `application/json`（忽略参数并按大小写不敏感比较 media type），且客户端会检查精确成功状态码：创建 sandbox 为 `201 Created`，其他 JSON 操作为 `200 OK`。无返回值的操作必须返回 `204 No Content` 且响应体为空；客户端会拒绝 `200` 加空 body、`204` 加 body、`202 Accepted` 或其他成功状态。
 
@@ -86,11 +88,11 @@ JSON 响应必须是 `application/json`（忽略参数并按大小写不敏感�
 
 响应可同时通过 `x-execution-id` header 提前返回执行 ID；如果 header 与 `started` 不一致，客户端会报协议错误。收到任何输出或终止事件前必须已知 execution id，否则客户端拒绝该流，避免取消时无法 kill 远端进程。
 
-SSE 行结束符支持 `LF`、`CRLF` 和 `CR`。每个事件的 `event` 字段必须与 JSON payload 的 `type` 一致，否则客户端拒绝该流。SSE 事件大小受 `max_output_bytes` 推导出的上限约束，最终 `stdout` / `stderr` 也不得超过请求上限。gateway 仍必须自己执行输出截断；客户端限制只是防御协议错误，不是替代。
+SSE 行结束符支持 `LF`、`CRLF` 和 `CR`，且 `CRLF` 允许跨网络 chunk 分割。每个事件的 `event` 字段必须与 JSON payload 的 `type` 一致，否则客户端拒绝该流。SSE 事件大小受 `max_output_bytes` 推导出的上限约束，最终 `stdout` / `stderr` 也不得超过请求上限。gateway 仍必须自己执行输出截断；客户端限制只是防御协议错误，不是替代。
 
 ## 超时与取消
 
-- `ShellOptions.timeout` 会被限制在客户端配置的 `max_exec_timeout` 内；未请求超时时使用该上限。gateway 收到有效超时后 kill 进程并发送 `timeout` 事件。
+- `ShellOptions.timeout` 会被限制在客户端配置的 `max_exec_timeout` 内；未请求超时时使用该上限。协议超时精度为毫秒，低于 1ms 的请求会被拒绝。gateway 收到有效超时后 kill 进程并发送 `timeout` 事件。
 - 客户端额外设置有效 shell timeout + 5s 的 HTTP 请求超时，防止 gateway 永不终止 SSE。
 - `ExecutionEnv` 的文件和元数据请求会响应取消 token；请求仍在途时取消会返回 `EnvError::Aborted`。
 - 取消 token 触发后，一旦知道 execution id 就调用 kill endpoint；如果取消发生在 `started` 前，会在收到 execution id 后补发 kill。
@@ -138,8 +140,8 @@ SSE 行结束符支持 `LF`、`CRLF` 和 `CR`。每个事件的 `event` 字段�
 ## 当前状态
 
 - 已实现 `Sandbox` / `ExecutionEnv` 适配、文件操作、流式 shell、abort、timeout、删除和协议防护。
-- 单元测试覆盖 SSE 解码、事件大小限制、配置校验、IPv6 loopback HTTP 和 gateway 返回路径校验。
-- 集成测试通过本地 HTTP/SSE 网关覆盖文件系统、allowlist、denylist、流式输出、最终输出上限、timeout、客户端 timeout 上限、shell abort、文件请求取消、错误成功状态码拒绝、无效 create 响应后的远端清理和删除。
+- 单元测试覆盖 SSE 解码（含跨 chunk CRLF）、事件大小限制、配置校验、IPv6 loopback HTTP 和 gateway 返回路径校验。
+- 集成测试通过本地 HTTP/SSE 网关覆盖文件系统、allowlist、denylist、流式输出、最终输出上限、timeout、客户端 timeout 上限、shell abort、文件请求取消、错误成功状态码拒绝、无效 create 响应后的远端清理、env 生命周期和删除。
 - 尚未提供具体 Firecracker/Kata/gVisor gateway 实现。
 
 结论：协议客户端可以合入并被上层集成测试使用；不能宣称“远程沙箱整体生产可用”，直到真实隔离 gateway 满足上述生产要求并通过部署级验证。

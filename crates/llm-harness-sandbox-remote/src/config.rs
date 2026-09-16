@@ -175,6 +175,11 @@ impl RemoteSandboxClientConfig {
                 "remote sandbox max execution timeout must be positive",
             ));
         }
+        if max_exec_timeout.as_millis() == 0 {
+            return Err(RemoteSandboxError::invalid_config(
+                "remote sandbox max execution timeout must be at least one millisecond",
+            ));
+        }
         if u64::try_from(max_exec_timeout.as_millis()).is_err() {
             return Err(RemoteSandboxError::invalid_config(
                 "remote sandbox max execution timeout is too large",
@@ -433,6 +438,18 @@ mod tests {
             1,
         )
         .expect_err("timeout should not fit the wire format");
+        assert!(matches!(error, RemoteSandboxError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn rejects_max_execution_timeout_below_the_wire_format_resolution() {
+        let error = RemoteSandboxClientConfig::validate_runtime_options(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_micros(999),
+            1,
+        )
+        .expect_err("sub-millisecond timeout should be rejected");
         assert!(matches!(error, RemoteSandboxError::InvalidConfig(_)));
     }
 }

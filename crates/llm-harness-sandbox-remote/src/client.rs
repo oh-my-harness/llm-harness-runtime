@@ -765,6 +765,11 @@ pub(crate) fn validate_path_string(path: &str) -> Result<(), RemoteSandboxError>
 }
 
 fn validate_shell_request(request: &ShellExecRequest) -> Result<(), RemoteSandboxError> {
+    if request.timeout_ms == Some(0) {
+        return Err(RemoteSandboxError::protocol(
+            "shell timeout must be at least one millisecond",
+        ));
+    }
     if let Some(cwd) = request.cwd.as_deref() {
         validate_path_string(cwd)
             .map_err(|_| RemoteSandboxError::protocol("invalid shell working directory"))?;
@@ -935,6 +940,28 @@ mod tests {
         };
         let result = client.parse_exec_event(event, &mut None, &mut None, &mut None, false, 1024);
         assert!(matches!(result, Err(RemoteSandboxError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn rejects_sub_millisecond_shell_timeout_before_sending_request() {
+        let config =
+            RemoteSandboxClientConfig::new("http://127.0.0.1:8080", "token").expect("valid config");
+        let client = RemoteSandboxClient::new(config).expect("build client");
+        let request = ShellExecRequest {
+            command: "true".to_owned(),
+            cwd: None,
+            env: std::collections::BTreeMap::new(),
+            timeout_ms: Some(0),
+            max_output_bytes: 1024,
+        };
+        let result = client
+            .execute_shell("sandbox", request, None, None, CancellationToken::new())
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("sub-millisecond timeout should be rejected"),
+        };
+        assert!(matches!(error, RemoteSandboxError::Protocol(_)));
     }
 
     #[test]

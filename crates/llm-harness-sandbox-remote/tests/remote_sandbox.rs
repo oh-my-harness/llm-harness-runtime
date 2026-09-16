@@ -1,7 +1,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use llm_harness_platform::sandbox::Sandbox;
 use llm_harness_sandbox_remote::{RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig};
@@ -139,6 +139,35 @@ async fn remote_sandbox_supports_filesystem_and_streaming_shell() {
     env.cleanup().await.expect("cleanup environment");
     sandbox.reset().await.expect("reset sandbox");
     assert!(!env.exists(&file, CancellationToken::new()).await.unwrap());
+}
+
+#[tokio::test]
+async fn remote_environment_keeps_sandbox_alive_after_owner_drops() {
+    let (gateway, client, sandbox) = setup().await;
+    sandbox.start().await.expect("start sandbox");
+    let env = sandbox.env();
+    let sandbox_id = sandbox.sandbox_id().to_owned();
+    drop(sandbox);
+
+    let file = env.working_dir().join("alive.txt");
+    env.write_file(&file, b"alive", CancellationToken::new())
+        .await
+        .expect("write file after owner drops");
+    assert!(
+        client
+            .get_sandbox(&sandbox_id)
+            .await
+            .expect("remote sandbox should remain active")
+            .state
+            == llm_harness_sandbox_remote::protocol::RemoteSandboxState::Running
+    );
+
+    drop(env);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while gateway.delete_count() == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(gateway.delete_count(), 1);
 }
 
 #[tokio::test]

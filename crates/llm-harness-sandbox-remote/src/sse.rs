@@ -9,6 +9,7 @@ pub(crate) struct SseEvent {
 #[derive(Default)]
 pub(crate) struct SseDecoder {
     buffer: Vec<u8>,
+    pending_carriage_return: bool,
     current_event: Option<String>,
     current_data: String,
 }
@@ -22,6 +23,13 @@ impl SseDecoder {
         let mut events = Vec::new();
         let mut offset = 0;
 
+        if self.pending_carriage_return && !bytes.is_empty() {
+            self.pending_carriage_return = false;
+            if bytes.first() == Some(&b'\n') {
+                offset = 1;
+            }
+        }
+
         while let Some(relative_terminator) = bytes[offset..]
             .iter()
             .position(|byte| *byte == b'\n' || *byte == b'\r')
@@ -34,6 +42,19 @@ impl SseDecoder {
                 } else {
                     1
                 };
+            if bytes[terminator] == b'\r' && terminator + 1 == bytes.len() {
+                if self.buffer.len() + self.current_data.len() + line.len() > max_event_bytes {
+                    return Err(format!("SSE event exceeds {max_event_bytes} bytes"));
+                }
+                self.buffer.extend_from_slice(line);
+                let line_bytes = std::mem::take(&mut self.buffer);
+                if let Some(event) = self.process_line_bytes(line_bytes)? {
+                    events.push(event);
+                }
+                self.pending_carriage_return = true;
+                offset = bytes.len();
+                break;
+            }
             if self.buffer.len() + self.current_data.len() + line.len() > max_event_bytes {
                 return Err(format!("SSE event exceeds {max_event_bytes} bytes"));
             }
@@ -57,6 +78,7 @@ impl SseDecoder {
     }
 
     pub(crate) fn finish(&mut self) -> Result<Option<SseEvent>, String> {
+        self.pending_carriage_return = false;
         if self.buffer.is_empty() {
             return Ok(self.dispatch());
         }
@@ -144,6 +166,40 @@ mod tests {
         let mut final_decoder = SseDecoder::default();
         assert!(final_decoder.push(b"data: tail", 1024).unwrap().is_empty());
         assert_eq!(final_decoder.finish().unwrap().unwrap().data, "tail");
+    }
+
+    #[test]
+    fn decodes_crlf_split_across_chunks() {
+        let mut decoder = SseDecoder::default();
+        assert!(decoder.push(b"event: exit\r", 1024).unwrap().is_empty());
+        let events = decoder.push(b"\ndata: result\r\n\r\n", 1024).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.as_deref(), Some("exit"));
+        assert_eq!(events[0].data, "result");
+    }
+
+    #[test]
+    fn decodes_standalone_carriage_return_at_chunk_boundary() {
+        let mut decoder = SseDecoder::default();
+        assert!(decoder.push(b"event: exit\r", 1024).unwrap().is_empty());
+        let events = decoder.push(b"data: result\r\r", 1024).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.as_deref(), Some("exit"));
+        assert_eq!(events[0].data, "result");
+    }
+
+    #[test]
+    fn finishes_an_event_ending_with_carriage_return() {
+        let mut decoder = SseDecoder::default();
+        assert!(
+            decoder
+                .push(b"event: exit\rdata: result\r", 1024)
+                .unwrap()
+                .is_empty()
+        );
+        let event = decoder.finish().unwrap().unwrap();
+        assert_eq!(event.event.as_deref(), Some("exit"));
+        assert_eq!(event.data, "result");
     }
 
     #[test]

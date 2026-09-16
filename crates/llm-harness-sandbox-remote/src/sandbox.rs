@@ -244,33 +244,51 @@ impl Sandbox for RemoteSandbox {
     }
 }
 
-impl Drop for RemoteSandbox {
+impl Drop for RemoteSandboxInner {
     fn drop(&mut self) {
-        if !self.inner.remote_active.load(Ordering::SeqCst) {
+        if !self.remote_active.load(Ordering::SeqCst) {
             return;
         }
 
-        let inner = Arc::clone(&self.inner);
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    if let Err(error) = inner.client.delete_sandbox(&inner.sandbox_id).await {
-                        tracing::warn!(
-                            sandbox_id = %inner.sandbox_id,
-                            error = %error,
-                            "failed to delete remote sandbox on drop"
-                        );
-                    }
-                });
-            }
-            Err(error) => {
+        let client = Arc::clone(&self.client);
+        let sandbox_id = self.sandbox_id.clone();
+        spawn_remote_cleanup(client, sandbox_id);
+    }
+}
+
+fn spawn_remote_cleanup(client: Arc<RemoteSandboxClient>, sandbox_id: String) {
+    let sandbox_id_for_error = sandbox_id.clone();
+    let cleanup = std::thread::Builder::new()
+        .name("llm-harness-remote-sandbox-cleanup".to_owned())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %error,
+                        "failed to build remote sandbox cleanup runtime"
+                    );
+                    return;
+                }
+            };
+            if let Err(error) = runtime.block_on(client.delete_sandbox(&sandbox_id)) {
                 tracing::warn!(
-                    sandbox_id = %inner.sandbox_id,
+                    sandbox_id = %sandbox_id,
                     error = %error,
-                    "remote sandbox dropped outside a Tokio runtime; gateway cleanup was skipped"
+                    "failed to delete remote sandbox on drop"
                 );
             }
-        }
+        });
+    if let Err(error) = cleanup {
+        tracing::warn!(
+            sandbox_id = %sandbox_id_for_error,
+            error = %error,
+            "failed to spawn remote sandbox cleanup thread"
+        );
     }
 }
 
