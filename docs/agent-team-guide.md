@@ -184,6 +184,9 @@ backtrace，便于桌面宿主或运维在进程退出后定位原因。
 
 关键 API：
 
+`/api/agent-team/*` 是 runtime 应用中的 feature API 前缀；`/api/team/*`
+保留为兼容别名，两者绑定同一组 handler，便于现有面板和外部消费者平滑迁移。
+
 - `GET /api/team/templates` — 模板列表
 - `POST /api/team/projects {id, template_id, repo_path}` — 从模板创建团队
 - `GET/PUT /api/team/agent/config` — per-agent 配置（PUT persona 热应用，
