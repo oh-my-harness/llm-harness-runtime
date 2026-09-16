@@ -691,7 +691,8 @@ pub struct StepRecord {
     /// determine cache hits on subsequent visits (e.g., backjumps).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_key: Option<serde_json::Value>,
-    /// 该步结束时的跳转决策。
+    /// 该步结束后引擎实际采用的跳转决策。配置了 LoopConfig 时，
+    /// 这可能是原始 judge 决策解析出的最终跳转目标。
     pub transition: Transition,
 }
 

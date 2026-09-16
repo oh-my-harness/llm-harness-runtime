@@ -1585,7 +1585,8 @@ impl super::WorkflowEngine {
     /// 声明式循环（LoopConfig）续环判定 — Retry 与 To 两条路径共用。
     ///
     /// 调用前置条件：调用方已确认这是"续环"转换（Retry，或
-    /// To(target_stage) 且 target != 当前步）。持 `workflow_state` 锁进入。
+    /// To(target_stage)，包括 target 等于当前步）。函数消费
+    /// `workflow_state` 锁，并在持久化前释放，避免持锁 await I/O。
     ///
     /// 计数/耗尽语义见 `LoopConfig`（`max_iterations=N` 允许 N 次续环，
     /// 第 N+1 次耗尽）。耗尽时：清零该步计数，跟随 `exit_route` 标签边
@@ -1593,7 +1594,7 @@ impl super::WorkflowEngine {
     /// `Err(TaskFailed)` —— 调用方（run_loop）无需再兜底。
     async fn step_loop_continuation(
         &self,
-        state: &mut WorkflowState,
+        mut state: tokio::sync::MutexGuard<'_, WorkflowState>,
         step: &Step,
         loop_cfg: &LoopConfig,
     ) -> Result<Option<StepId>, WorkflowError> {
@@ -1631,6 +1632,7 @@ impl super::WorkflowEngine {
                         record.transition = Transition::To(next.clone());
                     }
                     let snapshot = state.clone();
+                    drop(state);
                     self.persist_state(&snapshot).await?;
                     return Ok(Some(next));
                 }
@@ -1646,6 +1648,7 @@ impl super::WorkflowEngine {
                 state.error = Some(TaskError::Internal(msg.clone()));
                 state.ended_at = Some(chrono::Utc::now());
                 let snapshot = state.clone();
+                drop(state);
                 self.persist_state(&snapshot).await?;
                 return Err(WorkflowError::TaskFailed(msg));
             }
@@ -1661,6 +1664,7 @@ impl super::WorkflowEngine {
             state.error = Some(TaskError::Internal(msg.clone()));
             state.ended_at = Some(chrono::Utc::now());
             let snapshot = state.clone();
+            drop(state);
             self.persist_state(&snapshot).await?;
             return Err(WorkflowError::TaskFailed(msg));
         }
@@ -1673,11 +1677,13 @@ impl super::WorkflowEngine {
                 record.transition = Transition::To(target.clone());
             }
             let snapshot = state.clone();
+            drop(state);
             self.persist_state(&snapshot).await?;
             return Ok(Some(target.clone()));
         }
         // target_stage is None or same as current: re-run in place.
         let snapshot = state.clone();
+        drop(state);
         self.persist_state(&snapshot).await?;
         Ok(None)
     }
@@ -1745,7 +1751,7 @@ impl super::WorkflowEngine {
                 }
 
                 // 声明式续环：仅当"LoopConfig 持有步自身"路由到其
-                // target_stage（且 target != 当前步）时才计一次循环迭代；
+                // target_stage（包括自环）时才计一次循环迭代；
                 // 其他步骤的 To(target) 是普通跳转，绝不计入别人的循环。
                 if let Some(loop_cfg) = step.policy().and_then(|p| p.r#loop.as_ref()) {
                     let is_loop_continuation = matches!(
@@ -1753,9 +1759,7 @@ impl super::WorkflowEngine {
                         Some(target) if target == &next
                     );
                     if is_loop_continuation {
-                        return self
-                            .step_loop_continuation(&mut state, step, loop_cfg)
-                            .await;
+                        return self.step_loop_continuation(state, step, loop_cfg).await;
                     }
                     state.loop_iterations.remove(step.id());
                 }
@@ -1772,9 +1776,7 @@ impl super::WorkflowEngine {
                     // 续环计数/耗尽/退出共用判定（To 路径亦走此函数）。
                     // 注意：exit_route 缺失或无法解析时显式失败（原 fall-through
                     // 到 max_retries 只对纯 Retry 循环有界；两者现已合一）。
-                    return self
-                        .step_loop_continuation(&mut state, step, loop_cfg)
-                        .await;
+                    return self.step_loop_continuation(state, step, loop_cfg).await;
                 }
 
                 // max_retries 安全阀。统计当前步连续 Retry 次数。
