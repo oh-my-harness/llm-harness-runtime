@@ -60,6 +60,12 @@
 
 ## llm-harness-sandbox-remote
 
+远程沙箱协议客户端，负责 HTTPS/Bearer、文件操作、SSE shell 流、abort、timeout 和响应校验。
+
+## llm-harness-sandbox-gateway
+
+Linux Bwrap 远程沙箱网关。复用 `BwrapSandbox` 的 namespace/capability 隔离，提供 Bearer 认证、principal 到 sandbox 的租户绑定、默认断网、执行超时与输出上限、reset/delete 生命周期，以及对当前 Bwrap 后端无法执行的策略做失败关闭。该实现仍需部署级 TLS 终止、cgroup v2 环境验证、崩溃恢复和运维审计闭环，不能替代 Firecracker/Kata/gVisor 级别的 VM 隔离。
+
 远程沙箱协议客户端，实现 `Sandbox` / `ExecutionEnv` 到远程 gateway 的适配。它负责 HTTPS/Bearer 认证、guest path 校验、JSON 控制面、文件操作、SSE 流式 shell、abort/timeout 上限和错误映射。
 
 ### 关键类型

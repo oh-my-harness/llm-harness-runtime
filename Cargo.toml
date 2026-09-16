@@ -10,6 +10,7 @@ members = [
     "crates/llm-harness-workflow",
     "crates/llm-harness-sandbox",
     "crates/llm-harness-sandbox-remote",
+    "crates/llm-harness-sandbox-gateway",
     "crates/llm-harness-mcp",
     "crates/llm-harness-tools",
     "crates/llm-harness-strategy",
@@ -57,6 +58,7 @@ llm-harness-trace-otel = { path = "crates/llm-harness-trace-otel" }
 llm-harness-live-tests = { path = "crates/llm-harness-live-tests" }
 llm-harness-inspector = { path = "crates/llm-harness-inspector" }
 llm-harness-sandbox = { path = "crates/llm-harness-sandbox" }
+llm-harness-sandbox-remote = { path = "crates/llm-harness-sandbox-remote" }
 llm-harness-agent-team-studio = { path = "crates/llm-harness-agent-team-studio" }
 llm-harness-agent-team = { path = "crates/llm-harness-agent-team" }
 # API adapter — separate repo
