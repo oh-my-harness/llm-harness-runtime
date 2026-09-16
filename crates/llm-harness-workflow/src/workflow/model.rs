@@ -113,6 +113,10 @@ pub enum Step {
 /// The counter survives the cross-node jump (other steps' transitions do not
 /// reset it), so a multi-node loop still accumulates iterations.
 ///
+/// If the LoopConfig-owning step exits the loop early through a normal
+/// `Transition::To` to a stage other than `target_stage`, the engine clears
+/// that step's counter so a later re-entry starts a fresh episode.
+///
 /// `max_iterations = N` permits N continuations; the next continuation
 /// attempt exhausts the loop. On exhaustion the counter is cleared and the
 /// engine follows `exit_route` (a declarative edge label, matched against

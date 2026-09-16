@@ -102,6 +102,7 @@ engine.run()
 - **声明式循环（LoopConfig）**：`StepExecutionPolicy.loop` 声明跨节点循环 ——
   循环持有步返回 `Retry`，或路由 `To(target_stage)` 时，引擎在
   `WorkflowState.loop_iterations` 中按步计数（跨节点跳转保留）；
+  循环持有步通过普通 `To` 早退时清零自身计数，后续重新进入从新 episode 开始；
   `max_iterations=N` 允许 N 次续环，第 N+1 次耗尽后跟随 `exit_route`
   标签边退出（缺失/无法解析则显式 Failed）。无 LoopConfig 时回跳/重试
   仍由 `max_retries` + `max_steps` 兜底。

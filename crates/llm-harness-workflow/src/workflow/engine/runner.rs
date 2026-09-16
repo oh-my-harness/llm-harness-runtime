@@ -1739,14 +1739,17 @@ impl super::WorkflowEngine {
                 // 声明式续环：仅当"LoopConfig 持有步自身"路由到其
                 // target_stage（且 target != 当前步）时才计一次循环迭代；
                 // 其他步骤的 To(target) 是普通跳转，绝不计入别人的循环。
-                if let Some(loop_cfg) = step.policy().and_then(|p| p.r#loop.as_ref())
-                    && let Some(target) = &loop_cfg.target_stage
-                    && target == &next
-                    && target != step.id()
-                {
-                    return self
-                        .step_loop_continuation(&mut state, step, loop_cfg)
-                        .await;
+                if let Some(loop_cfg) = step.policy().and_then(|p| p.r#loop.as_ref()) {
+                    let is_loop_continuation = matches!(
+                        loop_cfg.target_stage.as_ref(),
+                        Some(target) if target == &next && target != step.id()
+                    );
+                    if is_loop_continuation {
+                        return self
+                            .step_loop_continuation(&mut state, step, loop_cfg)
+                            .await;
+                    }
+                    state.loop_iterations.remove(step.id());
                 }
                 let snapshot = state.clone();
                 drop(state);

@@ -4531,6 +4531,124 @@ async fn retry_with_loop_config_jumps_to_target_stage() {
     );
 }
 
+#[tokio::test]
+async fn loop_config_early_exit_clears_counter_before_reentry() {
+    use parking_lot::Mutex;
+
+    let visited: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    struct LoopJudge {
+        visited: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl StepTransitionJudge for LoopJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            let mut visits = self.visited.lock();
+            visits.push(step_id.clone());
+            let check_visits = visits.iter().filter(|s| s.as_str() == "check").count();
+            let run_visits = visits.iter().filter(|s| s.as_str() == "run").count();
+            drop(visits);
+
+            Box::pin(async move {
+                match step_id.as_str() {
+                    "check" if check_visits == 1 => Transition::Retry,
+                    "check" if check_visits == 2 => Transition::To("outside".into()),
+                    "check" => Transition::Retry,
+                    "run" if run_visits == 1 => Transition::To("check".into()),
+                    "run" => Transition::To("done".into()),
+                    "outside" => Transition::To("check".into()),
+                    _ => Transition::Abort {
+                        reason: "end".into(),
+                    },
+                }
+            })
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("check 1"),
+        MockResponse::text("run 1"),
+        MockResponse::text("check 2"),
+        MockResponse::text("outside 2"),
+        MockResponse::text("check 3"),
+        MockResponse::text("run 3"),
+    ]));
+
+    let workflow = Workflow {
+        entry_step: "check".into(),
+        steps: vec![
+            Step::llm("check", "Check", "validate", vec![]).with_policy(StepExecutionPolicy {
+                timeout_ms: None,
+                max_attempts: None,
+                retry_backoff_ms: None,
+                cache: None,
+                r#loop: Some(LoopConfig {
+                    max_iterations: 1,
+                    target_stage: Some("run".into()),
+                    exit_route: None,
+                }),
+            }),
+            Step::llm("run", "Run", "do work", vec![]),
+            Step::llm("outside", "Outside", "leave loop", vec![]),
+            Step::Terminal {
+                id: "done".into(),
+                name: "Done".into(),
+                exit_code: 0,
+                message: Some("done".into()),
+            },
+        ],
+        edges: vec![
+            Edge {
+                from: "check".into(),
+                to: "run".into(),
+                condition: None,
+            },
+            Edge {
+                from: "run".into(),
+                to: "check".into(),
+                condition: None,
+            },
+            Edge {
+                from: "check".into(),
+                to: "outside".into(),
+                condition: None,
+            },
+            Edge {
+                from: "run".into(),
+                to: "done".into(),
+                condition: None,
+            },
+        ],
+    };
+
+    let config = WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    };
+
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(LoopJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap();
+
+    let result = engine.run().await;
+    assert!(
+        result.is_ok(),
+        "each loop episode must start with a fresh counter, got {:?}",
+        result
+    );
+}
+
 /// LoopConfig iteration counting must survive cross-node iterations. The
 /// counter is per LoopConfig-carrying step (persisted in WorkflowState), so
 /// `check --Retry/target_stage=run--> To(check) --> check` still accumulates.
