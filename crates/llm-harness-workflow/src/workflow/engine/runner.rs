@@ -1586,6 +1586,11 @@ impl super::WorkflowEngine {
     ///
     /// 调用前置条件：调用方已确认这是"续环"转换（Retry，或
     /// To(target_stage) 且 target != 当前步）。持 `workflow_state` 锁进入。
+    ///
+    /// 计数/耗尽语义见 `LoopConfig`（`max_iterations=N` 允许 N 次续环，
+    /// 第 N+1 次耗尽）。耗尽时：清零该步计数，跟随 `exit_route` 标签边
+    /// 返回其目标；`exit_route` 缺失或无法解析则置 Failed 并返回
+    /// `Err(TaskFailed)` —— 调用方（run_loop）无需再兜底。
     async fn step_loop_continuation(
         &self,
         state: &mut WorkflowState,

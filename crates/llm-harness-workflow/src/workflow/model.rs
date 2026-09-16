@@ -98,26 +98,51 @@ pub enum Step {
     },
 }
 
-/// Declarative loop configuration for iterative workflows.
+/// Declarative loop configuration for iterative (including cross-node) workflows.
 ///
 /// When attached to a step's `StepExecutionPolicy`, the engine tracks a
-/// per-step loop counter. When the judge returns `Transition::Retry` (or a
-/// route key that maps to a loop continuation), the engine increments the
-/// counter and jumps to `target_stage` (or re-runs the current step if
-/// `target_stage` is `None`). After `max_iterations` is reached, the engine
-/// follows `exit_route` (a declarative edge label) instead of looping.
+/// per-step iteration counter for that step in
+/// `WorkflowState.loop_iterations`. A *loop continuation* occurs when the
+/// LoopConfig-owning step:
+///
+/// - returns `Transition::Retry` (re-run the loop body), **or**
+/// - routes `Transition::To(next)` where `next` equals this step's
+///   `target_stage` (a declarative route back to the loop head, typically
+///   matched from a `structured.route_key` by `EdgeConditionJudge`).
+///
+/// The counter survives the cross-node jump (other steps' transitions do not
+/// reset it), so a multi-node loop still accumulates iterations.
+///
+/// `max_iterations = N` permits N continuations; the next continuation
+/// attempt exhausts the loop. On exhaustion the counter is cleared and the
+/// engine follows `exit_route` (a declarative edge label, matched against
+/// this step's outgoing `EdgeCondition::Label` edges; an optional
+/// `next_on_` prefix is stripped before matching). If `exit_route` is
+/// missing or does not resolve to an outgoing labeled edge, the workflow
+/// **fails explicitly** — it does not silently fall through to `max_retries`.
+///
+/// Without a `LoopConfig`, ordinary `Transition::Retry` behavior is governed
+/// by the engine's `max_retries` safety valve as before.
 ///
 /// This is the generic equivalent of EDA Agent's `LoopConfig`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopConfig {
-    /// Maximum loop iterations before forcing exit.
+    /// Maximum number of loop continuations the engine will honor. After
+    /// N continuations, the next continuation attempt exhausts the loop:
+    /// the counter is cleared and the engine follows `exit_route` (or fails
+    /// if no exit route is configured/resolvable).
     pub max_iterations: u32,
-    /// Target step to jump to on each loop iteration.
-    /// `None` = re-run the current step (same as `Transition::Retry`).
+    /// Stage the workflow jumps to when continuing the loop (the loop head).
+    /// `None` (or equal to the LoopConfig-owning step itself) = re-run the
+    /// current step on continuation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_stage: Option<String>,
-    /// Route key to follow when the loop is exhausted (e.g. "next_on_success").
-    /// The engine looks up this label in the outgoing edges of the current step.
+    /// Route key naming the edge to follow when the loop is exhausted
+    /// (e.g. `"next_on_success"` or the bare label `"success"` — an optional
+    /// `next_on_` prefix is stripped before matching). The engine looks up
+    /// this label among the outgoing `Label` edges of the LoopConfig-owning
+    /// step. When the loop is exhausted with no resolvable `exit_route`, the
+    /// task fails explicitly instead of continuing to loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_route: Option<String>,
 }
@@ -143,9 +168,10 @@ pub struct StepExecutionPolicy {
     /// successful execution and the TTL hasn't expired, execution is skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<StepCache>,
-    /// Declarative loop configuration. When set, the engine tracks a loop
-    /// counter for this step and follows `target_stage` on loop continuation
-    /// instead of re-running in-place.
+    /// Declarative loop configuration. When set, the engine counts this
+    /// step's loop iterations in `WorkflowState.loop_iterations` (surviving
+    /// cross-node jumps), honors `max_iterations` continuations, and follows
+    /// `exit_route` on exhaustion. See `LoopConfig`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub r#loop: Option<LoopConfig>,
 }
@@ -570,9 +596,11 @@ pub struct WorkflowState {
     /// 已完成的步骤历史（审计链）。
     #[serde(default)]
     pub step_history: Vec<StepRecord>,
-    /// 每 LoopConfig 步的声明式循环计数（step_id → 已完成迭代数）。
-    /// 跨节点跳转后仍保留（区别于 step_history 的连续 Retry 扫描），
-    /// 循环真正退出时清零。`#[serde(default)]` 兼容旧快照（缺键 → 空表）。
+    /// Per-`LoopConfig`-step declarative loop iteration counters
+    /// (step_id → number of continuations consumed). The counter survives
+    /// transitions through other steps in the same cross-node loop and is
+    /// cleared only when that loop episode exhausts. `#[serde(default)]`
+    /// keeps old snapshots (without this key) deserializable as an empty map.
     #[serde(default)]
     pub loop_iterations: std::collections::HashMap<StepId, u32>,
     /// 规划此 workflow 的 task ID（review-9）。LLM 两阶段场景下记录 plan_task_id，

@@ -99,7 +99,12 @@ engine.run()
 `Transition::To(上游step)` 是回跳原语，等价于 LangGraph 的 conditional edge 指向上游节点。
 
 - **回跳合法性校验**：`To(next)` 要求存在 `edge(from=current, to=next)` 或 `next == entry_step`（入口无条件放行）。非法跳转直接 Failed。
-- **循环计数**：业务层在 `StepResult.structured` 里放 `loop_counter`，judge 读出来做条件路由（等价 LangGraph state 里的 iteration 字段）。
+- **声明式循环（LoopConfig）**：`StepExecutionPolicy.loop` 声明跨节点循环 ——
+  循环持有步返回 `Retry`，或路由 `To(target_stage)` 时，引擎在
+  `WorkflowState.loop_iterations` 中按步计数（跨节点跳转保留）；
+  `max_iterations=N` 允许 N 次续环，第 N+1 次耗尽后跟随 `exit_route`
+  标签边退出（缺失/无法解析则显式 Failed）。无 LoopConfig 时回跳/重试
+  仍由 `max_retries` + `max_steps` 兜底。
 - **重试上限**：`Transition::Retry` 受 `max_retries` 约束，超限 → Failed。
 - **防死循环**：`with_max_steps(N)` 总步数安全阀（默认 500）。
 
@@ -209,7 +214,7 @@ pub enum WorkflowEvent {
 | 路由 | conditional_edge 函数 | StepTransitionJudge trait | ✅ |
 | 回流 | edge 指向上游 | Transition::To(上游) | ✅ |
 | 重试 | 用户在 edge 里写 | Transition::Retry + max_retries | ✅ |
-| 循环计数 | state 字段 | structured.loop_counter | ✅ |
+| 循环计数 | state 字段 | `StepExecutionPolicy.loop`（`WorkflowState.loop_iterations` 计数，`max_iterations` + `exit_route`） | ✅ |
 | 状态模型 | immutable + reducer | mutable blackboard | ⚠️ 有意差异 |
 | 持久化 | checkpointer | TaskStore | ✅ |
 | 恢复 | get_state + invoke | restore() + resume() | ✅ |
