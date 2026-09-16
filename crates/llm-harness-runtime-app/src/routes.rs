@@ -32,6 +32,12 @@ async fn health(State(state): State<AppState>) -> Response {
             "app": APP_NAME,
             "version": env!("CARGO_PKG_VERSION"),
             "features": ["agent-team"],
+            "feature_health": {
+                "agent-team": {
+                    "status": if recovery.status == llm_harness_agent_team_studio::runtime::StartupStatus::Healthy { "ok" } else { "degraded" },
+                    "startup_recovery": recovery,
+                }
+            },
             "startup_recovery": recovery,
         }))
         .into_response(),

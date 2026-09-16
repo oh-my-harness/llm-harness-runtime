@@ -1,7 +1,7 @@
 # Runtime-first AgentTeam 应用计划
 
-> 日期：2026-09-16  
-> 状态：提案，待评审  
+> 日期：2026-09-16
+> 状态：已接受，实施中（M1 已合并；M2 API 别名与应用级健康摘要已实现）
 > 范围：`llm-harness-runtime` 的应用化演进，以及 AgentTeam 在 runtime 应用中的集成方式
 
 ## 1. 结论
@@ -336,6 +336,10 @@ Launcher 负责：
 - 新旧 API contract tests 通过。
 - 团队创建、恢复、issue、handoff、patrol 行为保持一致。
 - GLM-5.3-Flash live E2E 可选开启且不进入默认 CI。
+
+2026-09-16 实施记录：`/api/agent-team/*` 与旧 `/api/team/*` 共享同一组
+handler；`/api/app/health` 输出 `feature_health.agent-team` 与启动恢复摘要。
+后续仍需把 React 工作区切换到新前缀，并在 M4/M5 补齐数据迁移与打包。
 
 ### M3：React 工作区迁入 runtime
 

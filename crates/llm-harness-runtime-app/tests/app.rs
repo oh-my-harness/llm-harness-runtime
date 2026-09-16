@@ -55,6 +55,7 @@ async fn app_exposes_health_and_diagnostics_with_auth() {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["app"], "llm-harness-runtime-app");
     assert_eq!(body["startup_recovery"]["status"], "healthy");
+    assert_eq!(body["feature_health"]["agent-team"]["status"], "ok");
 
     let response = client
         .get(format!("http://{addr}/api/app/diagnostics"))

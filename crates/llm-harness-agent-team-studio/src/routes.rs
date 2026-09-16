@@ -54,41 +54,52 @@ pub type SharedPm = Arc<RwLock<TeamManager>>;
 
 /// Build the domain router. Mount with `InspectorBuilder::extra_routes`.
 pub fn team_router(state: AppState) -> Router {
-    Router::new()
+    team_routes("/api/team", state.clone())
         .route("/app/team.html", get(team_panel))
-        .route("/api/team/startup", get(startup_recovery))
+        .merge(team_routes("/api/agent-team", state))
+}
+
+fn team_routes(prefix: &'static str, state: AppState) -> Router {
+    Router::new()
+        .route(&format!("{prefix}/startup"), get(startup_recovery))
         .route(
-            "/api/team/projects",
+            &format!("{prefix}/projects"),
             get(list_projects)
                 .post(register_project)
                 .delete(delete_project),
         )
-        .route("/api/team/projects/restart", post(restart_project))
-        .route("/api/team/chat", post(chat))
-        .route("/api/team/issues", get(list_issues))
-        .route("/api/team/issue/{id}/confirm", post(confirm_issue))
-        .route("/api/team/issue/{id}/reject", post(reject_issue))
-        .route("/api/team/events", get(events_ws))
-        .route("/api/team/settings", get(get_settings).post(put_settings))
-        .route("/api/team/apikey", post(post_apikey))
-        .route("/api/team/fs", get(list_dir))
+        .route(&format!("{prefix}/projects/restart"), post(restart_project))
+        .route(&format!("{prefix}/chat"), post(chat))
+        .route(&format!("{prefix}/issues"), get(list_issues))
         .route(
-            "/api/team/fs/grants",
+            &format!("{prefix}/issue/{{id}}/confirm"),
+            post(confirm_issue),
+        )
+        .route(&format!("{prefix}/issue/{{id}}/reject"), post(reject_issue))
+        .route(&format!("{prefix}/events"), get(events_ws))
+        .route(
+            &format!("{prefix}/settings"),
+            get(get_settings).post(put_settings),
+        )
+        .route(&format!("{prefix}/apikey"), post(post_apikey))
+        .route(&format!("{prefix}/fs"), get(list_dir))
+        .route(
+            &format!("{prefix}/fs/grants"),
             get(list_workspace_grants)
                 .post(add_workspace_grant)
                 .delete(remove_workspace_grant),
         )
-        .route("/api/team/pulse", get(pulse))
-        .route("/api/team/agent/inject", post(agent_inject))
-        .route("/api/team/agent/abort", post(agent_abort))
-        .route("/api/team/agent/session", get(agent_session))
+        .route(&format!("{prefix}/pulse"), get(pulse))
+        .route(&format!("{prefix}/agent/inject"), post(agent_inject))
+        .route(&format!("{prefix}/agent/abort"), post(agent_abort))
+        .route(&format!("{prefix}/agent/session"), get(agent_session))
         .route(
-            "/api/team/agent/config",
+            &format!("{prefix}/agent/config"),
             get(agent_config).put(put_agent_config),
         )
-        .route("/api/team/templates", get(list_templates))
-        .route("/api/team/upgrade-check", post(upgrade_check))
-        .route("/api/team/upgrade-apply", post(upgrade_apply))
+        .route(&format!("{prefix}/templates"), get(list_templates))
+        .route(&format!("{prefix}/upgrade-check"), post(upgrade_check))
+        .route(&format!("{prefix}/upgrade-apply"), post(upgrade_apply))
         .with_state(state)
 }
 
@@ -1559,6 +1570,42 @@ mod tests {
             json["recovery"]["failed_teams"][0]["reason"],
             "workspace_unauthorized"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_team_routes_are_exposed_under_app_prefix() {
+        let (router, _pm, repo, _factory) = setup().await;
+
+        let (legacy_status, legacy_json) = get_json(&router, "/api/team/startup").await;
+        let (app_status, app_json) = get_json(&router, "/api/agent-team/startup").await;
+        assert_eq!(legacy_status, 200);
+        assert_eq!(app_status, 200);
+        assert_eq!(legacy_json, app_json);
+
+        let (status, json) = get_json(&router, "/api/agent-team/templates").await;
+        assert_eq!(status, 200, "{json}");
+        assert!(
+            json["templates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|template| template["id"] == "coding-team")
+        );
+
+        let (status, json) = json_post(
+            &router,
+            "/api/agent-team/projects",
+            serde_json::json!({
+                "id": "p1",
+                "repo_path": repo.to_string_lossy(),
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{json}");
+
+        let (status, json) = get_json(&router, "/api/team/projects").await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(json["projects"][0]["id"], "p1");
     }
 
     /// Tests install a mock factory returning one "m" client and build the
