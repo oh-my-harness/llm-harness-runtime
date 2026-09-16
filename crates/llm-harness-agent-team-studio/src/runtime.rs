@@ -3,6 +3,7 @@
 use crate::routes::{AppState, team_router};
 use crate::settings::Settings;
 use crate::team_manager::TeamManager;
+use axum::Router;
 use llm_harness_agent_team::AgentId;
 use llm_harness_inspector::Inspector;
 use llm_harness_inspector::state::HarnessRegistry;
@@ -75,6 +76,7 @@ pub struct StudioConfig {
     pub data_root: PathBuf,
     pub port: u16,
     provider_factory: Option<crate::env_cfg::ProviderFactory>,
+    extra_routes: Option<Router>,
 }
 
 impl StudioConfig {
@@ -88,6 +90,7 @@ impl StudioConfig {
             data_root: default_data_root(),
             port,
             provider_factory: None,
+            extra_routes: None,
         }
     }
 
@@ -108,6 +111,11 @@ impl StudioConfig {
         self.provider_factory = provider_factory;
         self
     }
+
+    pub fn with_extra_routes(mut self, extra_routes: Router) -> Self {
+        self.extra_routes = Some(extra_routes);
+        self
+    }
 }
 
 pub struct StudioRuntime {
@@ -121,6 +129,8 @@ pub struct StudioRuntime {
 
 impl StudioRuntime {
     pub async fn start(config: StudioConfig) -> Result<Self, StudioError> {
+        let mut config = config;
+        let extra_routes = config.extra_routes.take();
         prepare_data_root(&config.data_root).map_err(StudioError::DataRoot)?;
         let singleton = StudioSingleton::acquire(&config.data_root)?;
         clear_panel_descriptor(&config.data_root).map_err(StudioError::PanelDescriptor)?;
@@ -255,8 +265,13 @@ impl StudioRuntime {
             grants,
             startup_recovery: Arc::new(RwLock::new(recovery.clone())),
         };
+        let mut routes = team_router(state);
+        if let Some(extra_routes) = extra_routes {
+            routes = routes.merge(extra_routes);
+        }
+
         let inspector = Inspector::registry(registry)
-            .extra_routes(team_router(state))
+            .extra_routes(routes)
             .port(config.port)
             .require_auth()
             .mount()

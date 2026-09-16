@@ -1,0 +1,24 @@
+[package]
+name = "llm-harness-runtime-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "llm-harness-app"
+path = "src/main.rs"
+
+[dependencies]
+llm-harness-agent-team-studio.workspace = true
+parking_lot.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+llm-harness-loop = { workspace = true, features = ["test-utils"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+reqwest.workspace = true
+libc = "0.2"

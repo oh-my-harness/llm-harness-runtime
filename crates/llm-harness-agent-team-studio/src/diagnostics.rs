@@ -92,6 +92,23 @@ pub fn append_lifecycle_event(
     append_private_jsonl(&log_dir(&data_root).join(LIFECYCLE_FILE), &event)
 }
 
+pub fn read_lifecycle_events(
+    data_root: impl AsRef<Path>,
+    limit: usize,
+) -> std::io::Result<Vec<serde_json::Value>> {
+    let path = log_dir(data_root.as_ref()).join(LIFECYCLE_FILE);
+    let contents = fs::read_to_string(path)?;
+    let mut events = Vec::new();
+    for line in contents.lines().rev().take(limit) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: serde_json::Value = serde_json::from_str(line)?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
 fn append_private_jsonl(path: &Path, event: &serde_json::Value) -> std::io::Result<()> {
     let _guard = LOG_LOCK.lock();
     rotate_if_needed(path)?;
