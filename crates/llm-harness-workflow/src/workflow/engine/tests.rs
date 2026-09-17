@@ -2281,15 +2281,6 @@ impl StepExecutor for RaceGateExecutor {
         })
     }
 }
-
-fn race_workflow() -> Workflow {
-    Workflow {
-        entry_step: "race".into(),
-        steps: vec![Step::executor("race", "Race Step", "race_gate", None)],
-        edges: vec![],
-    }
-}
-
 /// 方向一（确定顺序）：cancel 先拿到 workflow_state 锁 —— executor 尚在
 /// 等待 release，测试先 spawn cancel 并等它完成，然后才放行 executor。
 /// 终态写（Cancelled）先发生，run_loop 随后的 apply/cancel-guard 必须看到
@@ -2404,7 +2395,10 @@ async fn race_natural_completion_vs_cancel_is_always_consistent() {
                         .is_some_and(|r| matches!(r.transition, Transition::Abort { .. })),
                     "iteration {iteration}: Cancelled without abort record"
                 );
-                assert!(run_res.is_ok(), "iteration {iteration}: run must return the Cancelled result, not an error, when the cancel guard fires");
+                assert!(
+                    run_res.is_ok(),
+                    "iteration {iteration}: run must return the Cancelled result, not an error, when the cancel guard fires"
+                );
             }
             other => panic!("iteration {iteration}: unexpected terminal state {other:?}"),
         }
