@@ -29,8 +29,14 @@ pub enum StepProgress {
         ok: bool,
         error: Option<String>,
     },
+    /// 一次 turn 开始；请求即将发往 LLM——首 token 之前是"等待模型"窗口。
+    TurnStart { index: u32 },
     /// 一次 turn 结束。
     TurnEnd { index: u32 },
+    /// 上下文压缩开始——模型请求被压缩流程推迟。
+    CompactionStart,
+    /// 上下文压缩结束——压缩后回到 turn 流程（等待模型或继续执行）。
+    CompactionEnd,
     /// Assistant message 完整生成完毕。
     MessageEnd {
         message_id: String,
@@ -114,6 +120,7 @@ pub(super) fn step_progress_from(ev: &AgentEvent) -> Option<StepProgress> {
             ok: result.is_ok(),
             error: result.as_ref().err().map(|e| e.to_string()),
         },
+        AgentEvent::TurnStart { index } => StepProgress::TurnStart { index: *index },
         AgentEvent::TurnEnd { index, .. } => StepProgress::TurnEnd { index: *index },
         AgentEvent::MessageEnd {
             message_id,

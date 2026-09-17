@@ -1036,6 +1036,13 @@ fn step_progress_from_maps_coarse_events() {
         other => panic!("expected ToolExecutionEnd Err, got {other:?}"),
     }
 
+    // TurnStart
+    let ev = AgentEvent::TurnStart { index: 2 };
+    match step_progress_from(&ev) {
+        Some(StepProgress::TurnStart { index }) => assert_eq!(index, 2),
+        other => panic!("expected TurnStart, got {other:?}"),
+    }
+
     // TurnEnd
     let ev = AgentEvent::TurnEnd {
         index: 3,
@@ -1089,9 +1096,12 @@ fn step_progress_from_returns_none_for_filtered_events() {
     // AgentStart — filtered
     assert!(step_progress_from(&AgentEvent::AgentStart).is_none());
 
-    // TurnStart — filtered
+    // TurnStart — coarse turn-boundary signal (pre-tool "waiting for model" window)
     let ev = AgentEvent::TurnStart { index: 0 };
-    assert!(step_progress_from(&ev).is_none());
+    match step_progress_from(&ev) {
+        Some(StepProgress::TurnStart { index }) => assert_eq!(index, 0),
+        other => panic!("expected TurnStart, got {other:?}"),
+    }
 
     // MessageStart — filtered
     let ev = AgentEvent::MessageStart {
@@ -2404,7 +2414,10 @@ async fn race_natural_completion_vs_cancel_is_always_consistent() {
                         .is_some_and(|r| matches!(r.transition, Transition::Abort { .. })),
                     "iteration {iteration}: Cancelled without abort record"
                 );
-                assert!(run_res.is_ok(), "iteration {iteration}: run must return the Cancelled result, not an error, when the cancel guard fires");
+                assert!(
+                    run_res.is_ok(),
+                    "iteration {iteration}: run must return the Cancelled result, not an error, when the cancel guard fires"
+                );
             }
             other => panic!("iteration {iteration}: unexpected terminal state {other:?}"),
         }
