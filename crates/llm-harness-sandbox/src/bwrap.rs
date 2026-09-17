@@ -215,6 +215,20 @@ impl BwrapEnv {
     /// [`BwrapSandbox::new`], which calls `validate_config` first.
     pub(crate) fn new(config: SandboxConfig) -> Result<Self> {
         let owned = config.work_dir.is_none();
+        Self::new_with_ownership(config, owned)
+    }
+
+    pub(crate) fn new_owned(config: SandboxConfig, work_dir: PathBuf) -> Result<Self> {
+        if config.work_dir.is_some() {
+            anyhow::bail!("owned work_dir constructor requires config.work_dir to be None");
+        }
+        Self::validate_owned_work_dir(&work_dir)?;
+        let mut config = config;
+        config.work_dir = Some(work_dir);
+        Self::new_with_ownership(config, true)
+    }
+
+    fn new_with_ownership(config: SandboxConfig, owned: bool) -> Result<Self> {
         let work_dir = match &config.work_dir {
             Some(p) => p.clone(),
             None => {
@@ -239,6 +253,9 @@ impl BwrapEnv {
                         Err(e)
                     }
                 })?;
+            if config.work_dir.is_some() {
+                Self::validate_owned_work_dir(&work_dir)?;
+            }
         } else {
             std::fs::create_dir_all(&work_dir)?;
         }
@@ -289,6 +306,23 @@ impl BwrapEnv {
             #[cfg(test)]
             cleanup_hook: std::sync::OnceLock::new(),
         })
+    }
+
+    fn validate_owned_work_dir(work_dir: &Path) -> Result<()> {
+        if !work_dir.is_absolute() {
+            anyhow::bail!("owned work_dir must be absolute");
+        }
+        let metadata = std::fs::symlink_metadata(work_dir)?;
+        if !metadata.is_dir() {
+            anyhow::bail!(
+                "owned work_dir {work_dir:?} must be a directory and must not be a symlink"
+            );
+        }
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o700 {
+            anyhow::bail!("owned work_dir {work_dir:?} must have 0700 permissions");
+        }
+        Ok(())
     }
 
     /// Working directory path (canonicalized).
@@ -1032,6 +1066,16 @@ impl BwrapSandbox {
     pub fn new(config: SandboxConfig) -> Result<Self> {
         Self::validate_config(&config)?;
         let env = Arc::new(BwrapEnv::new(config.clone())?);
+        Ok(Self {
+            env,
+            config,
+            running: AtomicBool::new(false),
+        })
+    }
+
+    pub fn new_owned(config: SandboxConfig, work_dir: PathBuf) -> Result<Self> {
+        Self::validate_config(&config)?;
+        let env = Arc::new(BwrapEnv::new_owned(config.clone(), work_dir)?);
         Ok(Self {
             env,
             config,

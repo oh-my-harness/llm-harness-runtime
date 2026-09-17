@@ -10,6 +10,7 @@
 //!   `cargo test` reports them as ignored. Run with `--include-ignored`
 //!   on a host with bwrap installed.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -184,6 +185,31 @@ fn config_with_disk_limit_is_rejected() {
     };
     let result = BwrapSandbox::new(config);
     assert!(result.is_err(), "max_disk_mb must be rejected");
+}
+
+#[test]
+fn new_owned_rejects_symlink_work_dir() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let link = directory.path().join("work");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let result = BwrapSandbox::new_owned(owned_config(), link);
+    let error = result.expect_err("owned work_dir must not be a symlink");
+    assert!(error.to_string().contains("must not be a symlink"));
+}
+
+#[test]
+fn new_owned_rejects_work_dir_with_wrong_permissions() {
+    let directory = tempfile::tempdir().unwrap();
+    let work_dir = directory.path().join("work");
+    std::fs::create_dir(&work_dir).unwrap();
+    std::fs::set_permissions(&work_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let result = BwrapSandbox::new_owned(owned_config(), work_dir);
+    let error = result.expect_err("owned work_dir must have 0700 permissions");
+    assert!(error.to_string().contains("must have 0700 permissions"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
