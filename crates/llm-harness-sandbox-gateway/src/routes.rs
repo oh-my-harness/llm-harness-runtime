@@ -118,9 +118,7 @@ async fn create_sandbox(
         Err(error) => return state_error(error),
     };
     if let Err(error) = state.start_sandbox(&principal, &sandbox_id).await {
-        if let Ok(sandbox) = state.take_sandbox_for_shutdown(&sandbox_id) {
-            let _ = Box::new(sandbox).shutdown().await;
-        }
+        cleanup_failed_sandbox(&state, &sandbox_id, "sandbox startup failure").await;
         tracing::warn!(sandbox_id = %sandbox_id, error = %error, "sandbox start failed");
         return gateway_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -129,7 +127,10 @@ async fn create_sandbox(
             None,
         );
     }
-    state.mark_running(&sandbox_id);
+    if let Err(error) = state.mark_running(&sandbox_id) {
+        cleanup_failed_sandbox(&state, &sandbox_id, "sandbox state persistence failure").await;
+        return state_error(error);
+    }
     let work_dir = state
         .get_sandbox(&principal, &sandbox_id)
         .map(|sandbox| sandbox.work_dir.to_string_lossy().into_owned())
@@ -145,6 +146,20 @@ async fn create_sandbox(
         }),
     )
         .into_response()
+}
+
+async fn cleanup_failed_sandbox(state: &SharedState, sandbox_id: &str, stage: &str) {
+    if let Ok(sandbox) = state.take_sandbox_for_shutdown(sandbox_id)
+        && Box::new(sandbox).shutdown().await.is_ok()
+        && let Err(registry_error) = state.finish_shutdown(sandbox_id)
+    {
+        tracing::warn!(
+            sandbox_id = %sandbox_id,
+            stage,
+            error = %registry_error.detail(),
+            "failed to remove sandbox registry record after sandbox failure"
+        );
+    }
 }
 
 async fn get_sandbox(
@@ -184,6 +199,9 @@ async fn delete_sandbox(
             error.to_string(),
             None,
         );
+    }
+    if let Err(error) = state.finish_shutdown(&id) {
+        return state_error(error);
     }
     tracing::info!(sandbox_id = %id, principal = %principal.id, "sandbox deleted");
     StatusCode::NO_CONTENT.into_response()
@@ -729,6 +747,9 @@ fn gateway_error(
 fn state_error(error: GatewayStateError) -> Response {
     let (status, code) = match error {
         GatewayStateError::InvalidConfig(_) => (StatusCode::BAD_REQUEST, "invalid_config"),
+        GatewayStateError::Storage(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "sandbox_registry_error")
+        }
         GatewayStateError::Capacity => (StatusCode::SERVICE_UNAVAILABLE, "sandbox_limit_reached"),
         GatewayStateError::Busy => (StatusCode::CONFLICT, "sandbox_busy"),
         GatewayStateError::NotFound => (StatusCode::NOT_FOUND, "sandbox_not_found"),

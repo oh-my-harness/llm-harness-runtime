@@ -184,6 +184,22 @@ impl GatewayConfig {
                 fs_allowlist: Arc::from(principal.fs_allowlist.as_slice()),
             })
     }
+
+    pub(crate) fn principal(&self, principal_id: &str) -> Option<AuthenticatedPrincipal> {
+        self.principals
+            .iter()
+            .find(|principal| principal.id == principal_id)
+            .map(|principal| AuthenticatedPrincipal {
+                id: Arc::from(principal.id.as_str()),
+                fs_allowlist: Arc::from(principal.fs_allowlist.as_slice()),
+            })
+    }
+
+    pub(crate) fn work_root(&self) -> &std::path::Path {
+        self.work_root
+            .as_deref()
+            .expect("gateway work root is prepared")
+    }
 }
 
 impl std::fmt::Debug for GatewayConfig {
