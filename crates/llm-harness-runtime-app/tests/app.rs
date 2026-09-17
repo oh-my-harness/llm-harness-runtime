@@ -1,4 +1,4 @@
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use llm_harness_runtime_app::app::{RuntimeApp, RuntimeAppConfig};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -16,6 +16,90 @@ fn temp_root(test: &str) -> PathBuf {
             .unwrap()
             .as_nanos()
     ))
+}
+
+#[tokio::test]
+async fn app_serves_embedded_react_frontend_and_keeps_fallback() {
+    let root = temp_root("frontend");
+    std::fs::create_dir_all(&root).unwrap();
+    let app = RuntimeApp::start(
+        RuntimeAppConfig::from_env()
+            .with_data_root(&root)
+            .with_provider_factory(Some(provider_factory())),
+    )
+    .await
+    .unwrap();
+
+    let addr = app.bound_addr().unwrap();
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("http://{addr}/app/agent-team"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "no-store"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap(),
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    );
+    let index = response.text().await.unwrap();
+    assert!(index.contains("<div id=\"root\"></div>"));
+
+    let script_path = index
+        .split("src=\"/app/agent-team/")
+        .nth(1)
+        .and_then(|suffix| suffix.split('"').next())
+        .unwrap();
+    let response = client
+        .get(format!("http://{addr}/app/agent-team/{script_path}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/javascript; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+
+    let response = client
+        .get(format!(
+            "http://{addr}/app/agent-team/%2e%2e/%2e%2e/Cargo.toml"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = client
+        .get(format!("http://{addr}/app/team.html"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let expected_panel_url = app.panel_url().unwrap();
+    assert!(expected_panel_url.contains("/app/agent-team#token="));
+    let descriptor = std::fs::read_to_string(app.panel_descriptor_path()).unwrap();
+    let descriptor: serde_json::Value = serde_json::from_str(&descriptor).unwrap();
+    assert_eq!(descriptor["url"], expected_panel_url);
+
+    app.shutdown().await;
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 fn provider_factory() -> llm_harness_agent_team_studio::env_cfg::ProviderFactory {

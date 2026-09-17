@@ -60,6 +60,7 @@ impl RuntimeApp {
         let studio_config = StudioConfig::from_env()
             .with_data_root(&config.data_root)
             .with_port(config.port)
+            .with_panel_path("/app/agent-team")
             .with_provider_factory(config.provider_factory)
             .with_extra_routes(extra_routes);
         let runtime = StudioRuntime::start(studio_config).await?;

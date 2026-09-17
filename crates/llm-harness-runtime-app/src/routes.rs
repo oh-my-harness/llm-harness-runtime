@@ -21,6 +21,9 @@ pub fn app_router(state: AppState) -> Router {
     Router::new()
         .route("/api/app/health", get(health))
         .route("/api/app/diagnostics", get(diagnostics))
+        .route("/app/agent-team", get(crate::frontend::index))
+        .route("/app/agent-team/", get(crate::frontend::index))
+        .route("/app/agent-team/{*path}", get(crate::frontend::asset))
         .with_state(state)
 }
 

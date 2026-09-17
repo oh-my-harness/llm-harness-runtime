@@ -1,7 +1,7 @@
 # Runtime-first AgentTeam 应用计划
 
 > 日期：2026-09-16
-> 状态：已接受，实施中（M1 已合并；M2 API 别名与应用级健康摘要已实现）
+> 状态：已接受，实施中（M1/M2 已合并；M3 React 工作区已迁入 runtime app 并完成浏览器模式验证）
 > 范围：`llm-harness-runtime` 的应用化演进，以及 AgentTeam 在 runtime 应用中的集成方式
 
 ## 1. 结论
@@ -339,7 +339,6 @@ Launcher 负责：
 
 2026-09-16 实施记录：`/api/agent-team/*` 与旧 `/api/team/*` 共享同一组
 handler；`/api/app/health` 输出 `feature_health.agent-team` 与启动恢复摘要。
-后续仍需把 React 工作区切换到新前缀，并在 M4/M5 补齐数据迁移与打包。
 
 ### M3：React 工作区迁入 runtime
 
@@ -350,11 +349,27 @@ handler；`/api/app/health` 输出 `feature_health.agent-team` 与启动恢复�
 - 保留 `team.html` 作为 fallback。
 - 建立 frontend lint、typecheck、unit test 与 API contract test。
 
+2026-09-17 实施记录：
+
+- React 工作区已迁入 `crates/llm-harness-runtime-app/frontend`。
+- 前端使用 `/api/agent-team/*`，token 仅保存在 `sessionStorage`。
+- 生产构建产物嵌入 Rust binary，由 `/app/agent-team` 提供服务。
+- 静态服务拒绝路径穿越，并输出 CSP、`Cache-Control` 与 `nosniff` 等安全头。
+- `llm-harness-app` 的 panel descriptor 指向 React 工作区；`/app/team.html`
+  保留为 fallback。
+- CI 覆盖 frontend lint、unit test、typecheck/build 与提交产物一致性校验。
+
 验收：
 
 - 无前端 secret 访问。
 - UI 在 browser mode 与 desktop shell 中均能完成团队创建、配置、运行和诊断查看。
 - 构建产物可重复生成。
+
+当前边界：
+
+- 已完成 browser mode 的服务与 API 集成验证。
+- Desktop shell、数据迁移与安装包仍分别属于 M4/M5。
+- 团队创建、配置、运行和诊断的完整 UI E2E 尚待 M5 前补齐。
 
 ### M4：跨平台生命周期与数据迁移
 
