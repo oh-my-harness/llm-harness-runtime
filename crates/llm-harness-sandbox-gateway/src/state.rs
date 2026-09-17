@@ -1,4 +1,8 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,6 +19,8 @@ pub(crate) type SharedState = Arc<GatewayState>;
 
 pub(crate) struct GatewayState {
     config: crate::auth::GatewayConfig,
+    work_root: PathBuf,
+    _work_root_lock: File,
     sandboxes: std::sync::Mutex<HashMap<String, SandboxRecord>>,
     executions: std::sync::Mutex<HashMap<String, ExecutionRecord>>,
 }
@@ -53,9 +59,16 @@ pub(crate) struct ExecutionRecord {
 }
 
 impl GatewayState {
-    pub(crate) fn new(config: crate::auth::GatewayConfig) -> anyhow::Result<Self> {
+    pub(crate) fn new(mut config: crate::auth::GatewayConfig) -> anyhow::Result<Self> {
+        let work_root = config.prepare_work_root()?;
+        let sandbox_root = work_root.join("sandboxes");
+        create_private_directory(&sandbox_root)?;
+        let work_root_lock = lock_work_root(&work_root)?;
+        recover_orphan_work_roots(&sandbox_root)?;
         Ok(Self {
             config,
+            work_root,
+            _work_root_lock: work_root_lock,
             sandboxes: std::sync::Mutex::new(HashMap::new()),
             executions: std::sync::Mutex::new(HashMap::new()),
         })
@@ -82,6 +95,12 @@ impl GatewayState {
         let fs_allowlist = self
             .validate_fs_allowlist(principal, &request)
             .map_err(GatewayStateError::InvalidConfig)?;
+        let sandbox_id = uuid::Uuid::new_v4().to_string();
+        let work_dir = self.work_root.join("sandboxes").join(&sandbox_id);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&work_dir)
+            .map_err(|error| GatewayStateError::InvalidConfig(error.into()))?;
         let resource_limits = ResourceLimits {
             max_cpus: request.resource_limits.max_cpus,
             max_processes: request.resource_limits.max_processes,
@@ -107,9 +126,20 @@ impl GatewayState {
             work_dir: None,
         };
 
-        let sandbox =
-            BwrapSandbox::new(sandbox_config).map_err(GatewayStateError::InvalidConfig)?;
-        let sandbox_id = uuid::Uuid::new_v4().to_string();
+        let sandbox = match BwrapSandbox::new_owned(sandbox_config, work_dir) {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
+                if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %cleanup_error,
+                        "failed to remove work root after sandbox construction failure"
+                    );
+                }
+                return Err(GatewayStateError::InvalidConfig(error));
+            }
+        };
         let env = sandbox.env();
         let work_dir = env.working_dir().to_path_buf();
         let record = SandboxRecord {
@@ -309,6 +339,73 @@ impl GatewayState {
     fn lock_sandboxes(&self) -> std::sync::MutexGuard<'_, HashMap<String, SandboxRecord>> {
         self.sandboxes.lock().expect("sandbox registry poisoned")
     }
+}
+
+fn create_private_directory(path: &std::path::Path) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                anyhow::bail!("{path:?} must be a directory");
+            }
+            if metadata.permissions().mode() & 0o777 != 0o700 {
+                anyhow::bail!("{path:?} must have 0700 permissions");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::DirBuilder::new().mode(0o700).create(path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn lock_work_root(work_root: &std::path::Path) -> anyhow::Result<File> {
+    let lock_path = work_root.join(".gateway.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&lock_path)?;
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("gateway work_root lock must be a regular file");
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            anyhow::bail!("gateway work_root {work_root:?} is already in use");
+        }
+        return Err(error.into());
+    }
+    Ok(file)
+}
+
+fn recover_orphan_work_roots(sandbox_root: &std::path::Path) -> anyhow::Result<()> {
+    let mut recovered = 0;
+    for entry in std::fs::read_dir(sandbox_root)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let file_name = file_name
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid UTF-8 entry in gateway sandbox root"))?;
+        if !entry.file_type()?.is_dir() || uuid::Uuid::parse_str(file_name).is_err() {
+            anyhow::bail!("unexpected entry {file_name:?} in gateway sandbox root");
+        }
+        std::fs::remove_dir_all(entry.path())?;
+        recovered += 1;
+    }
+    if recovered > 0 {
+        tracing::info!(
+            recovered,
+            sandbox_root = %sandbox_root.display(),
+            "recovered orphan sandbox work roots"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) struct SandboxLease {

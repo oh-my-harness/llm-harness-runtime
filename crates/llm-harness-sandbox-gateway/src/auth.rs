@@ -24,6 +24,7 @@ pub struct GatewayConfig {
     pub max_exec_timeout_ms: u64,
     pub max_output_bytes: usize,
     pub max_request_bytes: usize,
+    work_root: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -82,6 +83,7 @@ impl GatewayConfig {
             max_exec_timeout_ms: 3_600_000,
             max_output_bytes: 1024 * 1024,
             max_request_bytes: 64 * 1024 * 1024,
+            work_root: None,
         };
         config.validate()?;
         Ok(config)
@@ -110,6 +112,47 @@ impl GatewayConfig {
     pub fn with_max_request_bytes(mut self, value: usize) -> Self {
         self.max_request_bytes = value;
         self
+    }
+
+    /// Set the gateway-owned root used for sandbox work directories.
+    pub fn with_work_root(mut self, root: PathBuf) -> Self {
+        self.work_root = Some(root);
+        self
+    }
+
+    pub(crate) fn prepare_work_root(&mut self) -> anyhow::Result<PathBuf> {
+        let candidate = self
+            .work_root
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/tmp/llm-harness-sandbox-gateway"));
+        if !candidate.is_absolute() {
+            anyhow::bail!("gateway work_root must be absolute");
+        }
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    anyhow::bail!("gateway work_root {candidate:?} must be a directory");
+                }
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o777 != 0o700 {
+                    anyhow::bail!("gateway work_root {candidate:?} must have 0700 permissions");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&candidate)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let canonical = std::fs::canonicalize(&candidate)?;
+        if canonical != candidate {
+            anyhow::bail!("gateway work_root must be an absolute canonical path");
+        }
+        self.work_root = Some(canonical.clone());
+        Ok(canonical)
     }
 
     fn validate(&self) -> anyhow::Result<()> {

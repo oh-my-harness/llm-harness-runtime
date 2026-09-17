@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,7 @@ const TOKEN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 struct TestGateway {
     base_url: String,
     _gateway: SandboxGateway,
+    _work_root: tempfile::TempDir,
 }
 
 async fn start_gateway(principals: Vec<GatewayPrincipalConfig>) -> TestGateway {
@@ -20,6 +22,8 @@ async fn start_gateway(principals: Vec<GatewayPrincipalConfig>) -> TestGateway {
 }
 
 async fn start_gateway_with_config(config: GatewayConfig) -> TestGateway {
+    let work_root = private_tempdir();
+    let config = config.with_work_root(work_root.path().to_path_buf());
     let gateway = SandboxGateway::new(config).expect("gateway");
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -34,6 +38,7 @@ async fn start_gateway_with_config(config: GatewayConfig) -> TestGateway {
     TestGateway {
         base_url: format!("http://{address}"),
         _gateway: gateway,
+        _work_root: work_root,
     }
 }
 
@@ -43,6 +48,14 @@ fn principal(id: &str, token: &str) -> GatewayPrincipalConfig {
         bearer_token: token.to_owned(),
         fs_allowlist: Vec::new(),
     }
+}
+
+fn private_tempdir() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("gateway work root");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("gateway work root permissions");
+    directory
 }
 
 fn remote_client(base_url: &str, token: &str) -> Arc<RemoteSandboxClient> {
@@ -141,6 +154,32 @@ async fn gateway_rejects_unsupported_denylists() {
 }
 
 #[tokio::test]
+async fn gateway_invalid_allowlist_does_not_leave_a_work_root() {
+    let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
+    let mut config = sandbox_config();
+    config.fs_allowlist = vec![std::path::PathBuf::from("/etc")];
+    let error =
+        match RemoteSandbox::connect(config, remote_client(&gateway.base_url, TOKEN_A)).await {
+            Ok(_) => panic!("gateway must reject paths outside the principal allowlist"),
+            Err(error) => error,
+        };
+    assert!(
+        error
+            .to_string()
+            .contains("not permitted for this principal")
+    );
+
+    let sandbox_root = gateway._work_root.path().join("sandboxes");
+    let entries = std::fs::read_dir(&sandbox_root)
+        .expect("read gateway sandbox root")
+        .count();
+    assert_eq!(
+        entries, 0,
+        "invalid sandbox creation must not leave a work root"
+    );
+}
+
+#[tokio::test]
 async fn bwrap_gateway_supports_files_shell_reset_and_delete() {
     if !bwrap_available() {
         return;
@@ -150,6 +189,7 @@ async fn bwrap_gateway_supports_files_shell_reset_and_delete() {
     let work_dir = sandbox.env().working_dir().to_path_buf();
     assert!(work_dir.is_absolute());
     assert!(work_dir.exists());
+    assert!(work_dir.starts_with(gateway._work_root.path().join("sandboxes")));
 
     let file = work_dir.join("hello.txt");
     sandbox
@@ -201,6 +241,126 @@ async fn bwrap_gateway_supports_files_shell_reset_and_delete() {
         .await
         .expect("shutdown sandbox");
     assert!(!work_dir.exists());
+}
+
+#[test]
+fn gateway_rejects_concurrent_work_root_owners() {
+    let work_root = private_tempdir();
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf());
+    let first = SandboxGateway::new(config.clone()).expect("first gateway");
+    let error = match SandboxGateway::new(config) {
+        Ok(_) => panic!("second gateway must not share a work root"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("already in use"));
+    drop(first);
+}
+
+#[test]
+fn gateway_recovers_orphan_work_roots_on_startup() {
+    let work_root = private_tempdir();
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf());
+    let first = SandboxGateway::new(config.clone()).expect("first gateway");
+    drop(first);
+
+    let sandbox_root = work_root.path().join("sandboxes");
+    let orphan = sandbox_root.join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir(&orphan).expect("orphan root");
+    std::fs::write(orphan.join("data.txt"), "orphan").expect("orphan file");
+    let sentinel = work_root.path().join("sentinel");
+    std::fs::write(&sentinel, "preserved").expect("sentinel file");
+    std::os::unix::fs::symlink("../sentinel", orphan.join("escape")).expect("orphan symlink");
+
+    let second = SandboxGateway::new(config).expect("second gateway");
+    assert!(!orphan.exists());
+    assert!(sentinel.exists(), "orphan cleanup must not follow symlinks");
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).expect("read sentinel"),
+        "preserved"
+    );
+    drop(second);
+}
+
+#[test]
+fn gateway_rejects_non_regular_work_root_lock_files() {
+    let work_root = private_tempdir();
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf());
+    let first = SandboxGateway::new(config.clone()).expect("first gateway");
+    drop(first);
+
+    let lock_path = work_root.path().join(".gateway.lock");
+    std::fs::remove_file(&lock_path).expect("remove regular lock file");
+    let path = std::ffi::CString::new(lock_path.as_os_str().as_encoded_bytes())
+        .expect("lock path CString");
+    let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+    assert_eq!(result, 0, "create FIFO lock file");
+
+    let error = match SandboxGateway::new(config) {
+        Ok(_) => panic!("gateway must reject a non-regular lock file"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("regular file"));
+}
+
+#[test]
+fn gateway_rejects_unexpected_sandbox_root_entries() {
+    let work_root = private_tempdir();
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf());
+    let first = SandboxGateway::new(config.clone()).expect("first gateway");
+    drop(first);
+
+    let unexpected = work_root.path().join("sandboxes").join("unexpected");
+    std::fs::create_dir(&unexpected).expect("unexpected entry");
+    let error = match SandboxGateway::new(config) {
+        Ok(_) => panic!("gateway must reject unexpected sandbox-root entries"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("unexpected entry"));
+    assert!(
+        unexpected.exists(),
+        "invalid entry must be preserved for operator review"
+    );
+}
+
+#[test]
+fn gateway_rejects_work_root_with_wrong_permissions() {
+    let work_root = private_tempdir();
+    std::fs::set_permissions(work_root.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("work root permissions");
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf());
+    let error = match SandboxGateway::new(config) {
+        Ok(_) => panic!("gateway must reject a work root with wrong permissions"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("must have 0700 permissions"));
+    std::fs::set_permissions(work_root.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("restore work root permissions");
+}
+
+#[test]
+fn gateway_rejects_symlink_work_root() {
+    let work_root = private_tempdir();
+    let link_parent = private_tempdir();
+    let link = link_parent.path().join("gateway");
+    std::os::unix::fs::symlink(work_root.path(), &link).expect("work root symlink");
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(link);
+    let error = match SandboxGateway::new(config) {
+        Ok(_) => panic!("gateway must reject a symlink work root"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("must be a directory"));
 }
 
 #[tokio::test]
