@@ -6855,3 +6855,136 @@ async fn two_independent_loop_configs_maintain_separate_budgets() {
         );
     }
 }
+
+async fn restart_loop_fixture(base: &std::path::Path) -> (Arc<JsonlTaskStore>, TaskId) {
+    let mut workflow = research_loop_workflow(1);
+    workflow.steps.push(loop_step(
+        "independent",
+        "Independent",
+        "other work",
+        3,
+        "independent",
+        None,
+    ));
+    workflow.edges.push(Edge {
+        from: "search".into(),
+        to: "independent".into(),
+        condition: Some(EdgeCondition::Label("independent".into())),
+    });
+    let store = Arc::new(JsonlTaskStore::new(base.to_path_buf()));
+    let crash_store = Arc::new(CrashAfterStateSaveStore {
+        inner: store.clone(),
+        should_crash: Arc::new(|state: &WorkflowState| {
+            state.loop_iterations.get("vet") == Some(&1)
+                && state
+                    .step_history
+                    .last()
+                    .is_some_and(|r| r.step_id == "search")
+        }),
+    });
+    let engine = WorkflowEngine::new(
+        workflow,
+        engine_config(
+            base,
+            Arc::new(MockLlmClient::new(vec![
+                MockResponse::text("search 1"),
+                MockResponse::text("vet 1"),
+                MockResponse::text("search 2"),
+            ])),
+        ),
+        Arc::new(ResearchRouteJudge {
+            visited: visit_log(),
+        }),
+    )
+    .unwrap()
+    .with_task_store(crash_store);
+    let task_id = engine.task_id().clone();
+    assert!(engine.run().await.is_err());
+    let mut state = store.load_workflow_state(&task_id).await.unwrap().unwrap();
+    assert_eq!(state.loop_iterations.get("vet"), Some(&1));
+    assert_eq!(
+        state
+            .step_history
+            .iter()
+            .map(|r| r.step_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["search", "vet", "search"]
+    );
+    // Seed an independent episode to detect accidental clearing of the entire map.
+    state.loop_iterations.insert("independent".into(), 2);
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+    (store, task_id)
+}
+
+async fn assert_restart_loop_budget(target: &str) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (store, task_id) = restart_loop_fixture(dir.path()).await;
+    let visited = visit_log();
+    let restored = WorkflowEngine::restore_from_step(
+        store.clone(),
+        task_id.clone(),
+        target,
+        engine_config(
+            dir.path(),
+            Arc::new(MockLlmClient::new(vec![
+                MockResponse::text("restart 1"),
+                MockResponse::text("restart 2"),
+                MockResponse::text("restart 3"),
+                MockResponse::text("restart 4"),
+            ])),
+        ),
+        Arc::new(ResearchRouteJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .await
+    .unwrap();
+    let state = store.load_workflow_state(&task_id).await.unwrap().unwrap();
+    assert_eq!(
+        state.loop_iterations.get("vet"),
+        None,
+        "restart must reset the consumed loop budget"
+    );
+    assert_eq!(state.loop_iterations.get("independent"), Some(&2));
+    restored.run().await.unwrap();
+    assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+    let expected = if target == "vet" {
+        vec!["vet", "search", "vet"]
+    } else {
+        vec!["search", "vet", "search", "vet"]
+    };
+    assert_eq!(
+        *visited.lock(),
+        expected,
+        "one full continuation must be available after restart"
+    );
+}
+
+#[tokio::test]
+async fn restore_from_step_loop_owner_resets_budget() {
+    assert_restart_loop_budget("vet").await;
+}
+
+#[tokio::test]
+async fn restore_from_step_loop_target_resets_budget() {
+    assert_restart_loop_budget("search").await;
+}
+
+#[tokio::test]
+async fn restore_from_step_loop_preserves_independent_counter() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (store, task_id) = restart_loop_fixture(dir.path()).await;
+    WorkflowEngine::restore_from_step(
+        store.clone(),
+        task_id.clone(),
+        "search",
+        engine_config(dir.path(), Arc::new(MockLlmClient::new(vec![]))),
+        Arc::new(ResearchRouteJudge {
+            visited: visit_log(),
+        }),
+    )
+    .await
+    .unwrap();
+    let state = store.load_workflow_state(&task_id).await.unwrap().unwrap();
+    assert_eq!(state.loop_iterations.get("independent"), Some(&2));
+}

@@ -166,6 +166,7 @@ impl super::WorkflowEngine {
     ///
     /// # 语义
     /// - step_history：保留目标 step 之前的上游 record，截断目标 step 及下游。
+    /// - LoopConfig：restart-from 重置受截断历史影响的循环 episode，保留无关计数。
     /// - context 黑板：不回滚，保留当前累积值（无法恢复到 step 执行前快照）。
     /// - task_id / planned_by / checkpoints：全部从 store 恢复。
     /// - status 置 Paused，run() 不会用历史末尾 transition 覆写 current_step。
@@ -197,6 +198,17 @@ impl super::WorkflowEngine {
         let pos = truncate_pos.ok_or_else(|| WorkflowError::StepNotInHistory {
             step_id: target.clone(),
         })?;
+        for owner in &engine.workflow.steps {
+            if let Some(loop_cfg) = owner.policy().and_then(|policy| policy.r#loop.as_ref()) {
+                let loop_target = loop_cfg.target_stage.as_ref().unwrap_or(owner.id());
+                if state.step_history[pos..]
+                    .iter()
+                    .any(|record| &record.step_id == owner.id() || &record.step_id == loop_target)
+                {
+                    state.loop_iterations.remove(owner.id());
+                }
+            }
+        }
         state.step_history.truncate(pos);
 
         // 改写 current_step + status 置 Paused。
