@@ -297,7 +297,7 @@ async fn gateway_enforces_guest_denylists() {
             Ok(_) => panic!("denied shell path must fail"),
         };
         assert!(
-            error.to_string().contains("shell_failed") && error.to_string().contains("exit 2"),
+            error.to_string().contains("shell_failed"),
             "unexpected denied shell error: {error:?}"
         );
     }

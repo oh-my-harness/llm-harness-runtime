@@ -328,7 +328,16 @@ impl BwrapEnv {
             config.fs_denylist =
                 map_guest_policy_paths(&config.fs_denylist, guest_root, &work_dir_canon)?;
             for path in &config.fs_allowlist {
+                validate_mapped_policy_path(path, &work_dir_canon, true)?;
                 std::fs::create_dir_all(path)?;
+                let metadata = std::fs::symlink_metadata(path)?;
+                anyhow::ensure!(
+                    metadata.is_dir(),
+                    "fs_allowlist entry {path:?} must be a directory"
+                );
+            }
+            for path in &config.fs_denylist {
+                validate_mapped_policy_path(path, &work_dir_canon, false)?;
             }
             if let Some(policy_root) = policy_root.as_ref() {
                 let policy_root_path = policy_root.path();
@@ -358,6 +367,12 @@ impl BwrapEnv {
                     entry
                 )
             })?;
+            if guest_work_dir.is_some() {
+                anyhow::ensure!(
+                    canon.starts_with(&work_dir_canon),
+                    "fs_allowlist entry {entry:?} resolves outside host work directory"
+                );
+            }
             let cap = Dir::open_ambient_dir(&canon, ambient_authority()).map_err(|e| {
                 anyhow::anyhow!("failed to open fs_allowlist capability {:?}: {e}", canon)
             })?;
@@ -1254,6 +1269,55 @@ fn map_guest_policy_paths(
         .iter()
         .map(|path| map_guest_policy_path(path, guest_root, host_root))
         .collect()
+}
+
+fn validate_mapped_policy_path(
+    path: &Path,
+    host_root: &Path,
+    require_directory: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        path.starts_with(host_root),
+        "mapped policy path {path:?} is outside host work directory {host_root:?}"
+    );
+    let relative = path
+        .strip_prefix(host_root)
+        .map_err(|error| anyhow::anyhow!("invalid mapped policy path: {error}"))?;
+    let components = relative.components().collect::<Vec<_>>();
+    let mut current = host_root.to_path_buf();
+
+    for (index, component) in components.iter().enumerate() {
+        current.push(component);
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            !metadata.file_type().is_symlink(),
+            "mapped policy path {path:?} contains a symlink"
+        );
+        if index == components.len() - 1 {
+            if require_directory {
+                anyhow::ensure!(
+                    metadata.is_dir(),
+                    "mapped policy path {path:?} must be a directory"
+                );
+            } else {
+                anyhow::ensure!(
+                    metadata.is_dir() || metadata.is_file(),
+                    "mapped policy path {path:?} must be a directory or regular file"
+                );
+            }
+        } else {
+            anyhow::ensure!(
+                metadata.is_dir(),
+                "mapped policy path component {current:?} must be a directory"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 impl BwrapSandbox {

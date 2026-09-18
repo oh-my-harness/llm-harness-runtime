@@ -84,9 +84,23 @@ fn bwrap_available() -> bool {
     {
         return false;
     }
-    // 实际运行最小 sandbox,验证 namespace 能力可用
-    std::process::Command::new("bwrap")
-        .args(["--unshare-all", "--share-net", "--", "true"])
+    let mut command = std::process::Command::new("bwrap");
+    command.args(["--unshare-all", "--die-with-parent", "--new-session"]);
+    for (source, destination) in BwrapEnv::system_ro_binds() {
+        command.arg("--ro-bind-try").arg(source).arg(destination);
+    }
+    command
+        .arg("--proc")
+        .arg("/proc")
+        .arg("--dev")
+        .arg("/dev")
+        .arg("--tmpfs")
+        .arg("/tmp")
+        .arg("--")
+        .arg("/usr/bin/env")
+        .arg("-i")
+        .arg("PATH=/usr/bin:/bin")
+        .arg("true")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -795,6 +809,35 @@ async fn shell_cannot_read_host_file_outside_allowlist() {
         "sandbox must prevent reading host files; got: {}",
         result.stdout
     );
+}
+
+#[test]
+fn mapped_policy_paths_reject_symlink_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "host_secret_value").unwrap();
+    let work_dir = dir.path().join("workspace");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    std::fs::set_permissions(&work_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::os::unix::fs::symlink(&outside, work_dir.join("allowed")).unwrap();
+
+    let config = SandboxConfig {
+        fs_allowlist: vec![PathBuf::from("/workspace/allowed")],
+        fs_denylist: vec![],
+        net_allowlist: vec![],
+        resource_limits: ResourceLimits {
+            max_cpus: None,
+            max_processes: None,
+            max_memory_mb: None,
+            max_disk_mb: None,
+            timeout: None,
+        },
+        work_dir: None,
+    };
+    let error = BwrapSandbox::new_mapped(config, work_dir, PathBuf::from("/workspace"))
+        .expect_err("mapped policy paths must reject symlinks");
+    assert!(error.to_string().contains("contains a symlink"));
 }
 
 #[tokio::test]
