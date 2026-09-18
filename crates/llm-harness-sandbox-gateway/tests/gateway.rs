@@ -1,11 +1,17 @@
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use llm_harness_platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_sandbox_gateway::{GatewayConfig, GatewayPrincipalConfig, SandboxGateway};
-use llm_harness_sandbox_remote::{RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig};
+use llm_harness_sandbox_remote::protocol::RemoteSandboxState;
+use llm_harness_sandbox_remote::{
+    RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig, RemoteSandboxConfig,
+    ResourceLimitsWire,
+};
 use llm_harness_types::{EnvError, ShellOptions};
+use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 
 const TOKEN_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -13,8 +19,10 @@ const TOKEN_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 struct TestGateway {
     base_url: String,
+    work_root: PathBuf,
     _gateway: SandboxGateway,
-    _work_root: tempfile::TempDir,
+    _work_root: Option<tempfile::TempDir>,
+    server: tokio::task::JoinHandle<()>,
 }
 
 async fn start_gateway(principals: Vec<GatewayPrincipalConfig>) -> TestGateway {
@@ -23,22 +31,54 @@ async fn start_gateway(principals: Vec<GatewayPrincipalConfig>) -> TestGateway {
 
 async fn start_gateway_with_config(config: GatewayConfig) -> TestGateway {
     let work_root = private_tempdir();
-    let config = config.with_work_root(work_root.path().to_path_buf());
+    let path = work_root.path().to_path_buf();
+    let mut gateway = start_gateway_at(config, path).await;
+    gateway._work_root = Some(work_root);
+    gateway
+}
+
+async fn start_gateway_at(config: GatewayConfig, work_root: PathBuf) -> TestGateway {
+    let config = config.with_work_root(work_root.clone());
     let gateway = SandboxGateway::new(config).expect("gateway");
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("bind gateway");
     let address = listener.local_addr().expect("gateway address");
     let server_gateway = gateway.clone();
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         axum::serve(listener, server_gateway.router())
             .await
             .expect("gateway server");
     });
     TestGateway {
         base_url: format!("http://{address}"),
+        work_root,
         _gateway: gateway,
-        _work_root: work_root,
+        _work_root: None,
+        server,
+    }
+}
+
+impl TestGateway {
+    fn work_root(&self) -> &Path {
+        &self.work_root
+    }
+
+    async fn stop(self) -> PathBuf {
+        let TestGateway {
+            base_url: _,
+            work_root,
+            _gateway,
+            _work_root,
+            server,
+        } = self;
+        server.abort();
+        let _ = server.await;
+        drop(_gateway);
+        match _work_root {
+            Some(work_root) => work_root.keep(),
+            None => work_root,
+        }
     }
 }
 
@@ -77,6 +117,54 @@ fn sandbox_config() -> SandboxConfig {
         },
         work_dir: None,
     }
+}
+
+fn persisted_sandbox_config_json() -> String {
+    serde_json::to_string(&RemoteSandboxConfig {
+        fs_allowlist: Vec::new(),
+        fs_denylist: Vec::new(),
+        net_allowlist: Vec::new(),
+        resource_limits: ResourceLimitsWire {
+            max_cpus: None,
+            max_processes: None,
+            max_memory_mb: None,
+            max_disk_mb: None,
+            timeout_ms: None,
+        },
+        work_dir: None,
+    })
+    .expect("serialize persisted sandbox config")
+}
+
+fn insert_test_registry_record(
+    work_root: &Path,
+    sandbox_id: &str,
+    owner: &str,
+    config_json: &str,
+    state: &str,
+) {
+    let connection =
+        Connection::open(work_root.join("registry.sqlite")).expect("open test registry");
+    connection
+        .execute(
+            "INSERT INTO sandboxes
+                 (sandbox_id, owner, config_json, state, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, 0, 0)",
+            rusqlite::params![sandbox_id, owner, config_json, state],
+        )
+        .expect("insert test registry record");
+}
+
+fn registry_record_count(work_root: &Path) -> usize {
+    let connection =
+        Connection::open(work_root.join("registry.sqlite")).expect("open test registry");
+    connection
+        .query_row("SELECT count(*) FROM sandboxes", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count test registry records")
+        .try_into()
+        .expect("registry count fits usize")
 }
 
 fn bwrap_available() -> bool {
@@ -169,7 +257,7 @@ async fn gateway_invalid_allowlist_does_not_leave_a_work_root() {
             .contains("not permitted for this principal")
     );
 
-    let sandbox_root = gateway._work_root.path().join("sandboxes");
+    let sandbox_root = gateway.work_root().join("sandboxes");
     let entries = std::fs::read_dir(&sandbox_root)
         .expect("read gateway sandbox root")
         .count();
@@ -189,7 +277,7 @@ async fn bwrap_gateway_supports_files_shell_reset_and_delete() {
     let work_dir = sandbox.env().working_dir().to_path_buf();
     assert!(work_dir.is_absolute());
     assert!(work_dir.exists());
-    assert!(work_dir.starts_with(gateway._work_root.path().join("sandboxes")));
+    assert!(work_dir.starts_with(gateway.work_root().join("sandboxes")));
 
     let file = work_dir.join("hello.txt");
     sandbox
@@ -243,6 +331,80 @@ async fn bwrap_gateway_supports_files_shell_reset_and_delete() {
     assert!(!work_dir.exists());
 }
 
+#[tokio::test]
+async fn gateway_restores_sandbox_work_roots_and_ownership_after_restart() {
+    if !bwrap_available() {
+        return;
+    }
+    let first = start_gateway(vec![
+        principal("tenant-a", TOKEN_A),
+        principal("tenant-b", TOKEN_B),
+    ])
+    .await;
+    let client = remote_client(&first.base_url, TOKEN_A);
+    let response = client
+        .create_sandbox(sandbox_config())
+        .await
+        .expect("create sandbox");
+    let file = PathBuf::from(&response.work_dir).join("restart.txt");
+    client
+        .write_file(&response.sandbox_id, &file, b"persisted\n", false)
+        .await
+        .expect("write file before restart");
+    assert!(file.exists());
+
+    let work_root = first.stop().await;
+    assert!(file.exists());
+
+    let second = start_gateway_at(
+        GatewayConfig::new(vec![
+            principal("tenant-a", TOKEN_A),
+            principal("tenant-b", TOKEN_B),
+        ])
+        .expect("gateway config"),
+        work_root.clone(),
+    )
+    .await;
+    let client_a = remote_client(&second.base_url, TOKEN_A);
+    let status = client_a
+        .get_sandbox(&response.sandbox_id)
+        .await
+        .expect("get restored sandbox");
+    assert_eq!(status.state, RemoteSandboxState::Running);
+    assert_eq!(status.work_dir, response.work_dir);
+    assert_eq!(
+        client_a
+            .read_file(&response.sandbox_id, &file, false)
+            .await
+            .expect("read file after restart"),
+        b"persisted\n"
+    );
+
+    let cross_tenant_response = reqwest::Client::new()
+        .get(format!(
+            "{}/v1/sandboxes/{}",
+            second.base_url, response.sandbox_id
+        ))
+        .header("Authorization", format!("Bearer {TOKEN_B}"))
+        .send()
+        .await
+        .expect("cross-tenant status request");
+    assert_eq!(
+        cross_tenant_response.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    client_a
+        .delete_sandbox(&response.sandbox_id)
+        .await
+        .expect("delete restored sandbox");
+    assert!(!file.exists());
+    assert_eq!(registry_record_count(&work_root), 0);
+
+    let work_root = second.stop().await;
+    std::fs::remove_dir_all(work_root).expect("remove restart work root");
+}
+
 #[test]
 fn gateway_rejects_concurrent_work_root_owners() {
     let work_root = private_tempdir();
@@ -283,6 +445,118 @@ fn gateway_recovers_orphan_work_roots_on_startup() {
         "preserved"
     );
     drop(second);
+}
+
+#[test]
+fn gateway_resumes_deleting_registry_records_on_startup() {
+    let work_root = private_tempdir();
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf());
+    let first = SandboxGateway::new(config.clone()).expect("first gateway");
+    drop(first);
+
+    let sandbox_id = uuid::Uuid::new_v4().to_string();
+    let sandbox_root = work_root.path().join("sandboxes");
+    let sandbox_path = sandbox_root.join(&sandbox_id);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&sandbox_path)
+        .expect("deleting sandbox work root");
+    insert_test_registry_record(
+        work_root.path(),
+        &sandbox_id,
+        "tenant-a",
+        &persisted_sandbox_config_json(),
+        "deleting",
+    );
+
+    let second = SandboxGateway::new(config).expect("second gateway");
+    assert!(!sandbox_path.exists());
+    assert_eq!(registry_record_count(work_root.path()), 0);
+    drop(second);
+}
+
+#[test]
+fn gateway_fails_closed_on_invalid_persisted_registry_entries() {
+    let work_root = private_tempdir();
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf());
+    let first = SandboxGateway::new(config.clone()).expect("first gateway");
+    drop(first);
+
+    let sandbox_id = uuid::Uuid::new_v4().to_string();
+    let sandbox_path = work_root.path().join("sandboxes").join(&sandbox_id);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&sandbox_path)
+        .expect("invalid sandbox work root");
+    insert_test_registry_record(
+        work_root.path(),
+        &sandbox_id,
+        "missing-owner",
+        &persisted_sandbox_config_json(),
+        "running",
+    );
+
+    let error = match SandboxGateway::new(config) {
+        Ok(_) => panic!("gateway must reject an invalid persisted registry entry"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("unconfigured owner"));
+    assert!(sandbox_path.exists());
+}
+
+#[test]
+fn gateway_fails_closed_on_missing_persisted_work_root() {
+    let work_root = private_tempdir();
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf());
+    let first = SandboxGateway::new(config.clone()).expect("first gateway");
+    drop(first);
+
+    let sandbox_id = uuid::Uuid::new_v4().to_string();
+    insert_test_registry_record(
+        work_root.path(),
+        &sandbox_id,
+        "tenant-a",
+        &persisted_sandbox_config_json(),
+        "running",
+    );
+
+    let error = match SandboxGateway::new(config) {
+        Ok(_) => panic!("gateway must reject a persisted sandbox without a work root"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("missing its work root"));
+}
+
+#[test]
+fn gateway_fails_closed_on_corrupt_registry() {
+    let work_root = private_tempdir();
+    std::fs::write(
+        work_root.path().join("registry.sqlite"),
+        b"not a sqlite database",
+    )
+    .expect("write corrupt registry");
+    std::fs::set_permissions(
+        work_root.path().join("registry.sqlite"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("corrupt registry permissions");
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf());
+    let error = match SandboxGateway::new(config) {
+        Ok(_) => panic!("gateway must reject a corrupt registry"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().to_lowercase().contains("database"),
+        "unexpected corrupt registry error: {error}"
+    );
 }
 
 #[test]
