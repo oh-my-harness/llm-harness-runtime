@@ -2000,6 +2000,452 @@ async fn cancel_llm_step_discards_partial_result() {
     assert!(matches!(history[0].transition, Transition::Abort { .. }));
 }
 
+// ── cancel() 终态保护测试（cancel 对 Succeeded/Failed/Cancelled 是 no-op）──
+
+fn noop_test_config(
+    dir: &tempfile::TempDir,
+    client: Arc<dyn llm_harness_loop::LlmClient>,
+) -> WorkflowEngineConfig {
+    WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: dir.path().join("sessions"),
+        customize_builder: None,
+    }
+}
+
+/// 两步 LLM workflow（s1 → s2），FailingJudge 首步执行后即 Fail —— 产出
+/// 真实 Failed 状态（自由 task 会短路 judge，必须带 edge）。
+#[tokio::test]
+async fn cancel_after_failed_is_noop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step1 done")]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: None,
+        }],
+    };
+    struct FailingJudge;
+    impl StepTransitionJudge for FailingJudge {
+        fn decide<'a>(&'a self, _ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            Box::pin(async {
+                Transition::Fail {
+                    reason: "route failed".into(),
+                }
+            })
+        }
+    }
+    let engine = WorkflowEngine::new(
+        workflow,
+        noop_test_config(&dir, client),
+        Arc::new(FailingJudge),
+    )
+    .unwrap();
+    engine.run().await.unwrap_err();
+    assert_eq!(engine.state().await, WorkflowStatus::Failed);
+    let history_before = engine.step_history().await;
+    let len_before = history_before.len();
+
+    engine.cancel("late timeout").await.unwrap();
+
+    // 状态、error、history 全部保持不变 —— cancel 是严格 no-op。
+    assert_eq!(engine.state().await, WorkflowStatus::Failed);
+    let history = engine.step_history().await;
+    assert_eq!(history.len(), len_before);
+    assert!(matches!(history[0].transition, Transition::Fail { .. }));
+}
+
+/// cancel 在 Cancelled 后是严格 no-op：不追加 record、不改写 reason、
+/// 不重复发 Cancelled 事件。
+#[tokio::test]
+async fn cancel_after_cancelled_is_strict_noop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+        edges: vec![],
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            noop_test_config(&dir, client),
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_executor("blocking", Arc::new(BlockingExecutor)),
+    );
+    let mut rx = engine.subscribe();
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    engine.cancel("first cancel").await.unwrap();
+    let history_after_first = engine.step_history().await;
+    let first_abort_reason = history_after_first
+        .iter()
+        .rev()
+        .find_map(|r| match &r.transition {
+            Transition::Abort { reason } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("first cancel pushes an Abort record");
+
+    engine.cancel("second cancel").await.unwrap();
+
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    let history = engine.step_history().await;
+    assert_eq!(
+        history.len(),
+        history_after_first.len(),
+        "no duplicate record"
+    );
+    let reason_after = history
+        .iter()
+        .rev()
+        .find_map(|r| match &r.transition {
+            Transition::Abort { reason } => Some(reason.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(reason_after, first_abort_reason, "reason not rewritten");
+    // 事件流：正好一条 Cancelled（首 cancel 发的），第二条 cancel 不发。
+    let mut cancelled_events = 0;
+    while let Ok(ev) = rx.try_recv() {
+        if matches!(ev, WorkflowEvent::Cancelled { .. }) {
+            cancelled_events += 1;
+        }
+    }
+    assert_eq!(cancelled_events, 1, "no duplicate Cancelled event");
+    runner.await.unwrap().unwrap();
+}
+
+/// cancel 在 Idle（未 run）仍可用 —— 终态守卫只拦终态。
+#[tokio::test]
+async fn cancel_idle_still_cancellable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let engine =
+        WorkflowEngine::new_free_task("never runs".into(), vec![], noop_test_config(&dir, client))
+            .unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Idle);
+    engine.cancel("idle cancel").await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+}
+
+/// cancel 在 Paused 仍可用 —— restore 一个 Paused 状态的引擎再 cancel。
+#[tokio::test]
+async fn cancel_paused_still_cancellable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store: Arc<dyn TaskStore> = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let task_id = TaskId("cancel-paused".into());
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![Step::llm("s1", "Step 1", "do step 1", vec![])],
+        edges: vec![],
+    };
+    let mut state = WorkflowState::new("s1".into());
+    state.status = WorkflowStatus::Paused;
+    state.started_at = Some(chrono::Utc::now());
+    store.save_workflow(&task_id, &workflow).await.unwrap();
+    store.save_workflow_state(&task_id, &state).await.unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let engine = WorkflowEngine::restore(
+        store,
+        task_id,
+        noop_test_config(&dir, client),
+        Arc::new(NoopJudge),
+    )
+    .await
+    .unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Paused);
+    engine.cancel("paused cancel").await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+}
+
+/// 成功完成后迟到的 cancel 是 no-op：状态保持 Succeeded，result 不丢，
+/// history 不追加 Abort record。
+#[tokio::test]
+async fn cancel_after_succeeded_is_noop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("42")]));
+    let engine = WorkflowEngine::new_free_task(
+        "what is 6*7?".into(),
+        vec![],
+        noop_test_config(&dir, client),
+    )
+    .unwrap();
+    engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    let history_len_before = engine.step_history().await.len();
+
+    engine.cancel("late timeout").await.unwrap();
+
+    // 终态守卫：状态保持 Succeeded，不追加 record。
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(
+        engine.step_history().await.len(),
+        history_len_before,
+        "history not extended"
+    );
+}
+
+/// 回归核心：成功完成后迟到的 cancel 不得把 Succeeded 改写成 Cancelled。
+/// 直接复刻 Studio 超时计时器与自然完成竞争的交错：run() 先到达终态，
+/// cancel 随后才执行 —— 终态必须原样保留。
+#[tokio::test]
+async fn cancel_after_succeeded_preserves_result() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "s1".into(),
+            to: "s2".into(),
+            condition: None,
+        }],
+    };
+    struct SucceedJudge;
+    impl StepTransitionJudge for SucceedJudge {
+        fn decide<'a>(&'a self, _ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            Box::pin(async {
+                Transition::Abort {
+                    reason: "done".into(),
+                }
+            })
+        }
+    }
+    let engine = WorkflowEngine::new(
+        workflow,
+        noop_test_config(&dir, client),
+        Arc::new(SucceedJudge),
+    )
+    .unwrap();
+    engine.run().await.unwrap();
+    let history_before = engine.step_history().await;
+
+    engine.cancel("late timeout").await.unwrap();
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(engine.step_history().await.len(), history_before.len());
+}
+
+// ── cancel() vs 自然完成的并发竞争（终态保护回归核心）────────────────────
+//
+// 真实竞态形态：工作流自然完成（run_loop 在 workflow_state 锁内写
+// Succeeded/Failed）与外部 cancel()（同一把锁内做终态检查 + 写 Cancelled）
+// 并发争锁。旧实现中 cancel 无条件覆盖终态；修复后终态写与 cancel 的检查
+// 在同一把锁的同一临界区里，谁先拿锁谁生效，另一个看到终态后静默退出。
+
+/// 受控 executor：execute() 先 notify started，再等 release 信号，然后返回
+/// Ok —— 让测试精确控制"executor 何时把结果交回 run_loop"，也就是自然
+/// 完成的终态写（apply_transition → Succeeded）何时与 cancel() 争锁。
+struct RaceGateExecutor {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl StepExecutor for RaceGateExecutor {
+    fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+        let started = self.started.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            started.notify_one();
+            // 不传 abort token 依赖：executor 只等 release；测试用 release
+            // 的时机决定 cancel 与终态写的先后，不需要真实取消传播。
+            let _ = release.notified().await;
+            Ok(StepResult {
+                output: "race gate released".into(),
+                structured: Some(serde_json::json!({ "released": true })),
+                structured_status: StructuredStatus::NotRequired,
+                tool_calls_count: 0,
+                session_id: String::new(),
+                cost: CostAggregate::default(),
+                started_at: None,
+                ended_at: None,
+            })
+        })
+    }
+}
+/// 方向一（确定顺序）：cancel 先拿到 workflow_state 锁 —— executor 尚在
+/// 等待 release，测试先 spawn cancel 并等它完成，然后才放行 executor。
+/// 终态写（Cancelled）先发生，run_loop 随后的 apply/cancel-guard 必须看到
+/// Cancelled 并返回，不得把结果改成 Succeeded。修复前后该方向都成立，
+/// 但它锁定了竞争的确切交汇点：cancel 与 run_loop 的终态写真的在同一把
+/// workflow_state 锁上先后执行。
+#[tokio::test]
+async fn race_cancel_writes_terminal_before_natural_completion() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let workflow = Workflow {
+        entry_step: "race".into(),
+        steps: vec![Step::executor("race", "Race Step", "race_gate", None)],
+        edges: vec![],
+    };
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            noop_test_config(&dir, client),
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_executor(
+            "race_gate",
+            Arc::new(RaceGateExecutor {
+                started: started.clone(),
+                release: release.clone(),
+            }),
+        ),
+    );
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+
+    started.notified().await;
+    // spawn cancel —— 它会拿 workflow_state 锁写 Cancelled。await 它，
+    // 保证 cancel 的状态写在 executor 放行之前完成。
+    let cancel_engine = engine.clone();
+    tokio::spawn(async move { cancel_engine.cancel("race cancel").await })
+        .await
+        .unwrap()
+        .unwrap();
+
+    // 放行 executor：run_loop 收到 Ok 结果，apply_transition 的 Cancelled
+    // 守卫生效 —— 不得改写为 Succeeded。
+    release.notify_one();
+    let outcome = runner.await.unwrap().unwrap();
+
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(outcome.turns, 0);
+    let history = engine.step_history().await;
+    assert_eq!(history.len(), 1);
+    assert!(matches!(history[0].transition, Transition::Abort { .. }));
+}
+
+/// 方向二（竞争窗口）：自然完成与 cancel 并发 —— join! 同时驱动两个 future，
+/// 两者在 workflow_state 锁上真实争锁。修复后的不变量：终态一旦确立
+/// （无论谁先），后续的 cancel 都不能改写它。final state ∈ {Succeeded,
+/// Cancelled} 且与 history 一致（Succeeded ⇒ 无注入 Abort；Cancelled ⇒
+/// 有）。重复多轮以覆盖两种锁序。
+#[tokio::test]
+async fn race_natural_completion_vs_cancel_is_always_consistent() {
+    for iteration in 0..40u32 {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
+        let workflow = Workflow {
+            entry_step: "race".into(),
+            steps: vec![Step::executor("race", "Race Step", "race_gate", None)],
+            edges: vec![],
+        };
+        let engine = Arc::new(
+            WorkflowEngine::new(
+                workflow,
+                noop_test_config(&dir, client),
+                Arc::new(NoopJudge),
+            )
+            .unwrap()
+            .with_executor(
+                "race_gate",
+                Arc::new(RaceGateExecutor {
+                    started: Arc::new(Notify::new()),
+                    release: Arc::new(Notify::new()),
+                }),
+            ),
+        );
+        // join! 并发驱动 run() 与 cancel()：两者真实争 workflow_state 锁。
+        let (run_res, cancel_res) = tokio::join!(engine.run(), engine.cancel("concurrent"));
+        cancel_res.unwrap();
+
+        let state = engine.state().await;
+        let history = engine.step_history().await;
+        match state {
+            WorkflowStatus::Succeeded => {
+                // 完成先拿到锁 → 迟到的 cancel 必须是 no-op：
+                // history 保持 run() 自己的 record，无注入的 Cancelled Abort。
+                assert!(
+                    history.iter().all(|r| match &r.transition {
+                        Transition::Abort { reason } => reason == "free task complete",
+                        _ => true,
+                    }),
+                    "iteration {iteration}: injected Cancelled abort after Succeeded"
+                );
+            }
+            WorkflowStatus::Cancelled => {
+                // cancel 先拿到锁 → run_loop 的 cancel 守卫放弃终态写。
+                assert!(
+                    history
+                        .last()
+                        .is_some_and(|r| matches!(r.transition, Transition::Abort { .. })),
+                    "iteration {iteration}: Cancelled without abort record"
+                );
+                assert!(
+                    run_res.is_ok(),
+                    "iteration {iteration}: run must return the Cancelled result, not an error, when the cancel guard fires"
+                );
+            }
+            other => panic!("iteration {iteration}: unexpected terminal state {other:?}"),
+        }
+        let _ = run_res;
+    }
+}
+
+/// 方向三：cancel() 与 run() 同时启动（join! 并发），executor 立即完成 ——
+/// cancel 与 run_loop 的终态写在锁上直接竞争；修复后两条路径收敛到的
+/// 终态必须一致且互斥，绝不出现 Cancelled 覆盖已建立的 Succeeded。
+#[tokio::test]
+async fn race_cancel_and_run_started_together_reach_consistent_terminal() {
+    for iteration in 0..40u32 {
+        let dir = tempfile::TempDir::new().unwrap();
+        let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
+        let engine = Arc::new(
+            WorkflowEngine::new_free_task(
+                "finish fast".into(),
+                vec![],
+                noop_test_config(&dir, client),
+            )
+            .unwrap(),
+        );
+        let run_engine = engine.clone();
+        let run_task = tokio::spawn(async move { run_engine.run().await });
+        let cancel_engine = engine.clone();
+        let cancel_task = tokio::spawn(async move { cancel_engine.cancel("concurrent").await });
+
+        let _run_res = run_task.await.unwrap();
+        cancel_task.await.unwrap().unwrap();
+
+        // 不变量：终态只能是 Succeeded 或 Cancelled；一旦是 Succeeded，
+        // history 保持自然完成的原样（无注入 Cancelled Abort）。
+        let state = engine.state().await;
+        let history = engine.step_history().await;
+        match state {
+            WorkflowStatus::Succeeded => {
+                assert!(history.iter().all(|r| match &r.transition {
+                    Transition::Abort { reason } => reason == "free task complete",
+                    _ => true,
+                }));
+            }
+            WorkflowStatus::Cancelled => {}
+            other => panic!("iteration {iteration}: unexpected terminal state {other:?}"),
+        }
+    }
+}
 // ── WorkflowContext 共享状态测试 ──────────────────────────────
 
 /// executor 写 context，后续 executor 读到写入的值。
