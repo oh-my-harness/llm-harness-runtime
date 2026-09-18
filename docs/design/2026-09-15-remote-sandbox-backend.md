@@ -172,6 +172,7 @@ SSE 行结束符支持 `LF`、`CRLF` 和 `CR`，且 `CRLF` 允许跨网络 chunk
 
 - 已实现 `Sandbox` / `ExecutionEnv` 适配、文件操作、流式 shell、abort、timeout、删除和协议防护。
 - 已实现 Linux Bwrap gateway 第一阶段：认证、租户绑定、独立 work root、稳定 guest `/workspace`、协议级文件 allow/deny、默认断网、timeout/output 上限、reset/delete、失败关闭策略、持久化 registry，以及 work root 独占锁与启动恢复。
+- mapped `fs_allowlist` / `fs_denylist` 路径会逐组件拒绝 symlink，并在 canonicalize 后强制落在 host work root 内，避免 Bwrap bind 跟随策略路径造成宿主逃逸。
 - 单元测试覆盖 SSE 解码（含跨 chunk CRLF）、事件大小限制、配置校验、IPv6 loopback HTTP 和 gateway 返回路径校验。
 - 集成测试通过本地 HTTP/SSE 网关覆盖文件系统、allowlist、denylist、流式输出、最终输出上限、timeout、客户端 timeout 上限、shell abort、文件请求取消、错误成功状态码拒绝、无效 create 响应后的远端清理、env 生命周期和删除。
 - 尚未提供 Firecracker/Kata/gVisor gateway，也未完成 cgroup v2 部署验证和不可变审计。
