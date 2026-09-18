@@ -398,13 +398,33 @@ handler；`/api/app/health` 输出 `feature_health.agent-team` 与启动恢复�
 - Windows `CtrlClose` 在系统默认 5 秒强杀窗口内预留日志与退出余量，将有效超时上限压到 4 秒。
 - 二进制集成测试覆盖 `SIGTERM` 后的 `shutdown_signal` 与 normal
   `shutdown` 事件，以及非法 shutdown timeout 配置。
+- 同日完成数据根目录迁移控制面：
+  - `llm-harness-app migrate-data --from SOURCE --to DESTINATION [--backup BACKUP]`
+    先完整复制到私有 staging，写入 `migration-report.json` 与事务 journal，
+    再将原目录原子改名为备份、staging 改名为目标目录。
+  - `llm-harness-app rollback-data --from SOURCE --to DESTINATION --backup BACKUP`
+    恢复原数据根，并把迁移后产生变更的目标目录保留到独立 sibling 目录，
+    同时生成私有 `migration-rollback-report.json`。
+  - journal 覆盖 Prepared、source renamed、destination renamed、completed、
+    rolled back 等中断点；重复执行同一命令可恢复提交、补写回滚报告、
+    清理 rolled-back 残留并移除 journal。
+  - 迁移与回滚分别持有源/目标 `studio.lock`，拒绝操作正在运行的数据根；
+    journal 与目标 sibling lock 防止同一路径并发迁移。
+  - 复制保留普通文件、目录与 Unix 权限，报告和 journal 以 `0600` 写入；
+    源、目标、备份路径嵌套与 symlink 均被拒绝，运行时 `studio.lock`
+    不会被复制为目标数据。
+  - 文件复制、报告/journal 写入和关键 rename 后执行 fsync/目录同步，
+    降低进程中断与主机掉电后的元数据丢失风险。
+  - 单元测试覆盖设置、团队、备份、回滚保留、运行锁、symlink、
+    preparation 失败清理和多个 journal 恢复点；二进制集成测试覆盖
+    migrate/rollback CLI。
 
 当前边界：
 
-- 这是 M4 的第一个 lifecycle 片段，数据根目录迁移、迁移报告、备份与
-  回滚仍未实现。
-- Windows 信号路径仍需真实 Windows 环境验证；本仓库当前本地验证只覆盖
-  Linux。
+- Windows 信号路径、数据根目录 rename/锁行为与目录元数据落盘仍需真实
+  Windows 环境验证；本仓库当前本地验证只覆盖 Linux。
+- 迁移工具尚未接入桌面 UI，当前提供 CLI 控制面；M5 打包时需提供
+  显式的数据迁移/回滚入口和失败恢复指引。
 
 ### M5：桌面打包与发布
 
