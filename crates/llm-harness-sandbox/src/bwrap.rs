@@ -176,6 +176,7 @@ pub struct BwrapEnv {
     work_dir: PathBuf,
     /// The canonicalized working directory (used for cap-std and bwrap).
     work_dir_canon: PathBuf,
+    guest_work_dir: Option<PathBuf>,
     caps: Vec<AllowedRoot>,
     config: SandboxConfig,
     /// Whether the sandbox created the work_dir itself (`work_dir=None`).
@@ -223,9 +224,28 @@ impl BwrapEnv {
             anyhow::bail!("owned work_dir constructor requires config.work_dir to be None");
         }
         Self::validate_owned_work_dir(&work_dir)?;
-        let mut config = config;
-        config.work_dir = Some(work_dir);
-        Self::new_with_ownership(config, true)
+        Self::new_with_parts(config, true, work_dir, None)
+    }
+
+    pub(crate) fn new_mapped(
+        config: SandboxConfig,
+        host_work_dir: PathBuf,
+        guest_work_dir: PathBuf,
+    ) -> Result<Self> {
+        if config.work_dir.is_some() {
+            anyhow::bail!("mapped work_dir constructor requires config.work_dir to be None");
+        }
+        if !guest_work_dir.is_absolute() {
+            anyhow::bail!("guest work_dir must be absolute");
+        }
+        if guest_work_dir
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("guest work_dir must not contain '..'");
+        }
+        Self::validate_owned_work_dir(&host_work_dir)?;
+        Self::new_with_parts(config, true, host_work_dir, Some(guest_work_dir))
     }
 
     fn new_with_ownership(config: SandboxConfig, owned: bool) -> Result<Self> {
@@ -237,7 +257,15 @@ impl BwrapEnv {
                 PathBuf::from(format!("/tmp/sandbox-bwrap-{id}"))
             }
         };
+        Self::new_with_parts(config, owned, work_dir, None)
+    }
 
+    fn new_with_parts(
+        config: SandboxConfig,
+        owned: bool,
+        host_work_dir: PathBuf,
+        guest_work_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         if owned {
             // Create with 0700 permissions, bypassing umask, so other Unix
             // users on the same host cannot read agent files.
@@ -245,7 +273,7 @@ impl BwrapEnv {
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
-                .create(&work_dir)
+                .create(&host_work_dir)
                 .or_else(|e| {
                     if e.kind() == std::io::ErrorKind::AlreadyExists {
                         Ok(())
@@ -254,14 +282,17 @@ impl BwrapEnv {
                     }
                 })?;
             if config.work_dir.is_some() {
-                Self::validate_owned_work_dir(&work_dir)?;
+                Self::validate_owned_work_dir(&host_work_dir)?;
             }
         } else {
-            std::fs::create_dir_all(&work_dir)?;
+            std::fs::create_dir_all(&host_work_dir)?;
         }
 
-        let work_dir_canon = std::fs::canonicalize(&work_dir)
+        let work_dir_canon = std::fs::canonicalize(&host_work_dir)
             .map_err(|e| anyhow::anyhow!("failed to canonicalize work_dir: {e}"))?;
+        let work_dir = guest_work_dir
+            .clone()
+            .unwrap_or_else(|| work_dir_canon.clone());
 
         let mut caps = Vec::new();
 
@@ -297,6 +328,7 @@ impl BwrapEnv {
         Ok(Self {
             work_dir,
             work_dir_canon,
+            guest_work_dir,
             caps,
             config,
             owned,
@@ -479,6 +511,34 @@ impl BwrapEnv {
     /// The lexical check is only for *routing* — the actual security is
     /// enforced by `cap-std` when the `Dir` opens the relative path.
     fn resolve_to_cap(&self, path: &Path) -> Result<(Dir, PathBuf, PathBuf), EnvError> {
+        if let Some(guest_work_dir) = &self.guest_work_dir {
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                guest_work_dir.join(path)
+            };
+            let normalized = lexical_normalize(&resolved);
+            let norm_root = lexical_normalize(guest_work_dir);
+            if normalized == norm_root {
+                return Ok((
+                    self.caps[0].dir.try_clone().map_err(EnvError::Io)?,
+                    PathBuf::from("."),
+                    normalized,
+                ));
+            }
+            if normalized.starts_with(&norm_root) {
+                let relative = normalized
+                    .strip_prefix(&norm_root)
+                    .expect("path starts with normalized guest root");
+                return Ok((
+                    self.caps[0].dir.try_clone().map_err(EnvError::Io)?,
+                    relative.to_path_buf(),
+                    normalized,
+                ));
+            }
+            return Err(EnvError::PermissionDenied(normalized));
+        }
+
         let resolved = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -543,11 +603,12 @@ impl BwrapEnv {
         args.push("--tmpfs".to_string());
         args.push("/tmp".to_string());
 
-        // Bind the working directory (read-write).
-        let work_dir = self.work_dir_canon.to_string_lossy().to_string();
+        // Bind the host working directory to its stable guest location.
+        let host_work_dir = self.work_dir_canon.to_string_lossy().to_string();
+        let guest_work_dir = self.work_dir.to_string_lossy().to_string();
         args.push("--bind".to_string());
-        args.push(work_dir.clone());
-        args.push(work_dir.clone());
+        args.push(host_work_dir);
+        args.push(guest_work_dir);
 
         // Bind additional fs_allowlist entries (read-write).
         for path in &self.config.fs_allowlist {
@@ -881,7 +942,7 @@ impl ExecutionEnv for BwrapEnv {
 
     fn create_temp_dir<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<PathBuf, EnvError>> {
         let dir_result = self.caps[0].dir.try_clone();
-        let work_dir = self.work_dir_canon.clone();
+        let work_dir = self.work_dir.clone();
         Box::pin(async move {
             let abort = CancellationToken::new();
             let (_guard, _token) = self.acquire_op_lock(&abort).await?;
@@ -928,7 +989,7 @@ impl ExecutionEnv for BwrapEnv {
             let cwd = opts
                 .cwd
                 .map(|c| c.to_path_buf())
-                .unwrap_or_else(|| self.work_dir_canon.clone());
+                .unwrap_or_else(|| self.work_dir.clone());
             let bwrap_args = self.build_bwrap_args(&cwd);
             let cgroup = CgroupV2::create(Path::new(CGROUP_ROOT), &self.config.resource_limits)
                 .map_err(|error| EnvError::Other(format!("cgroup resource limits: {error}")))?;
@@ -1076,6 +1137,24 @@ impl BwrapSandbox {
     pub fn new_owned(config: SandboxConfig, work_dir: PathBuf) -> Result<Self> {
         Self::validate_config(&config)?;
         let env = Arc::new(BwrapEnv::new_owned(config.clone(), work_dir)?);
+        Ok(Self {
+            env,
+            config,
+            running: AtomicBool::new(false),
+        })
+    }
+
+    pub fn new_mapped(
+        config: SandboxConfig,
+        host_work_dir: PathBuf,
+        guest_work_dir: PathBuf,
+    ) -> Result<Self> {
+        Self::validate_config(&config)?;
+        let env = Arc::new(BwrapEnv::new_mapped(
+            config.clone(),
+            host_work_dir,
+            guest_work_dir,
+        )?);
         Ok(Self {
             env,
             config,

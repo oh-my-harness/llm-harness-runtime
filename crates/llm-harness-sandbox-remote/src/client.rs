@@ -732,14 +732,15 @@ impl RemoteSandboxClient {
 }
 
 pub(crate) fn path_string(path: &Path) -> Result<String, RemoteSandboxError> {
-    let path = path.to_str().ok_or_else(|| {
+    let raw_path = path.to_str().ok_or_else(|| {
         RemoteSandboxError::invalid_config(format!(
             "remote sandbox path must be valid UTF-8: {}",
             path.display()
         ))
     })?;
-    validate_path_string(path)?;
-    Ok(path.to_owned())
+    let path = raw_path.replace('\\', "/");
+    validate_path_string(&path)?;
+    Ok(path)
 }
 
 pub(crate) fn validate_path_string(path: &str) -> Result<(), RemoteSandboxError> {
@@ -759,6 +760,11 @@ pub(crate) fn validate_path_string(path: &str) -> Result<(), RemoteSandboxError>
     if path.contains('\0') {
         return Err(RemoteSandboxError::invalid_config(
             "remote sandbox path must not contain NUL".to_owned(),
+        ));
+    }
+    if path.contains('\\') {
+        return Err(RemoteSandboxError::invalid_config(
+            "remote sandbox path must not contain backslashes".to_owned(),
         ));
     }
     Ok(())

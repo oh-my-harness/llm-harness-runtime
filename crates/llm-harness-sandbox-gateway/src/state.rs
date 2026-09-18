@@ -18,6 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::AuthenticatedPrincipal;
 
+pub(crate) const GUEST_WORK_DIR: &str = "/workspace";
+
 pub(crate) type SharedState = Arc<GatewayState>;
 
 pub(crate) struct GatewayState {
@@ -150,33 +152,32 @@ impl GatewayState {
         if sandboxes.len() >= self.config.max_sandboxes {
             return Err(GatewayStateError::Capacity);
         }
-        if request.work_dir.is_some() {
-            return Err(GatewayStateError::InvalidConfig(anyhow::anyhow!(
-                "work_dir must be omitted; this gateway creates an isolated per-sandbox root"
-            )));
-        }
+        let request = normalize_request_config(principal, request)
+            .map_err(GatewayStateError::InvalidConfig)?;
         let sandbox_config =
-            build_sandbox_config(principal, &request).map_err(GatewayStateError::InvalidConfig)?;
+            build_sandbox_config(&request).map_err(GatewayStateError::InvalidConfig)?;
         let sandbox_id = uuid::Uuid::new_v4().to_string();
         let work_dir = self.work_root.join("sandboxes").join(&sandbox_id);
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&work_dir)
             .map_err(|error| GatewayStateError::InvalidConfig(error.into()))?;
-        let sandbox = match BwrapSandbox::new_owned(sandbox_config, work_dir) {
-            Ok(sandbox) => sandbox,
-            Err(error) => {
-                let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
-                if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
-                    tracing::warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %cleanup_error,
-                        "failed to remove work root after sandbox construction failure"
-                    );
+        let sandbox =
+            match BwrapSandbox::new_mapped(sandbox_config, work_dir, PathBuf::from(GUEST_WORK_DIR))
+            {
+                Ok(sandbox) => sandbox,
+                Err(error) => {
+                    let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
+                    if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id,
+                            error = %cleanup_error,
+                            "failed to remove work root after sandbox construction failure"
+                        );
+                    }
+                    return Err(GatewayStateError::InvalidConfig(error));
                 }
-                return Err(GatewayStateError::InvalidConfig(error));
-            }
-        };
+            };
         let config_json = serde_json::to_string(&request)
             .map_err(|error| GatewayStateError::Storage(error.into()))?;
         let now_ms = unix_now_ms().map_err(GatewayStateError::Storage)?;
@@ -199,12 +200,11 @@ impl GatewayState {
             GatewayStateError::Storage(error)
         })?;
         let env = sandbox.env();
-        let work_dir = env.working_dir().to_path_buf();
         let record = SandboxRecord {
             owner: Arc::clone(&principal.id),
             sandbox: Arc::new(sandbox),
             env,
-            work_dir,
+            work_dir: PathBuf::from(GUEST_WORK_DIR),
             config: request,
             state: RemoteSandboxState::Creating,
         };
@@ -389,16 +389,41 @@ impl GatewayState {
     }
 }
 
-fn build_sandbox_config(
+fn normalize_request_config(
     principal: &AuthenticatedPrincipal,
-    request: &RemoteSandboxConfig,
-) -> anyhow::Result<SandboxConfig> {
-    if request.work_dir.is_some() {
-        anyhow::bail!(
-            "work_dir must be omitted; this gateway creates an isolated per-sandbox root"
-        );
+    mut request: RemoteSandboxConfig,
+) -> anyhow::Result<RemoteSandboxConfig> {
+    if let Some(work_dir) = &request.work_dir
+        && work_dir != GUEST_WORK_DIR
+    {
+        anyhow::bail!("work_dir must be omitted or /workspace");
     }
-    let fs_allowlist = validate_fs_allowlist(principal, request)?;
+    if request.fs_allowlist.is_empty() {
+        request.fs_allowlist = principal
+            .fs_allowlist
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+    } else {
+        validate_fs_paths(&request.fs_allowlist, "fs_allowlist")?;
+        if !principal.fs_allowlist.is_empty() {
+            for path in &request.fs_allowlist {
+                if !principal.fs_allowlist.iter().any(|allowed| {
+                    let allowed = allowed.to_string_lossy();
+                    path == allowed.as_ref() || path.starts_with(allowed.as_ref())
+                }) {
+                    anyhow::bail!(
+                        "fs_allowlist entry {path:?} is not permitted for this principal"
+                    );
+                }
+            }
+        }
+    }
+    validate_fs_paths(&request.fs_denylist, "fs_denylist")?;
+    Ok(request)
+}
+
+fn build_sandbox_config(request: &RemoteSandboxConfig) -> anyhow::Result<SandboxConfig> {
     let resource_limits = ResourceLimits {
         max_cpus: request.resource_limits.max_cpus,
         max_processes: request.resource_limits.max_processes,
@@ -410,8 +435,8 @@ fn build_sandbox_config(
             .map(std::time::Duration::from_millis),
     };
     Ok(SandboxConfig {
-        fs_allowlist,
-        fs_denylist: request.fs_denylist.iter().map(PathBuf::from).collect(),
+        fs_allowlist: Vec::new(),
+        fs_denylist: Vec::new(),
         net_allowlist: request
             .net_allowlist
             .iter()
@@ -425,28 +450,20 @@ fn build_sandbox_config(
     })
 }
 
-fn validate_fs_allowlist(
-    principal: &AuthenticatedPrincipal,
-    request: &RemoteSandboxConfig,
-) -> anyhow::Result<Vec<PathBuf>> {
-    let mut paths = Vec::with_capacity(request.fs_allowlist.len());
-    for path in &request.fs_allowlist {
-        let path = PathBuf::from(path);
-        if !path.is_absolute() {
-            anyhow::bail!("fs_allowlist entries must be absolute canonical paths");
-        }
-        let canonical = std::fs::canonicalize(&path)
-            .map_err(|error| anyhow::anyhow!("canonicalize {path:?}: {error}"))?;
-        if !principal
-            .fs_allowlist
-            .iter()
-            .any(|allowed| canonical == *allowed || canonical.starts_with(allowed))
+fn validate_fs_paths(paths: &[String], field: &str) -> anyhow::Result<()> {
+    for path in paths {
+        if path != GUEST_WORK_DIR
+            && (!path.starts_with("/workspace/")
+                || path.contains('\0')
+                || path.contains('\\')
+                || path
+                    .split('/')
+                    .any(|component| component == "." || component == ".."))
         {
-            anyhow::bail!("fs_allowlist entry {canonical:?} is not permitted for this principal");
+            anyhow::bail!("{field} entries must be /workspace or a subpath");
         }
-        paths.push(canonical);
     }
-    Ok(paths)
+    Ok(())
 }
 
 fn restore_sandbox(
@@ -456,19 +473,21 @@ fn restore_sandbox(
     let principal = config
         .principal(&persisted.owner)
         .ok_or_else(|| anyhow::anyhow!("persisted sandbox owner is not configured"))?;
-    let sandbox_config = build_sandbox_config(&principal, &persisted.config)?;
+    let persisted_config = normalize_request_config(&principal, persisted.config)?;
+    let sandbox_config = build_sandbox_config(&persisted_config)?;
     let work_dir = config
         .work_root()
         .join("sandboxes")
         .join(&persisted.sandbox_id);
-    let sandbox = BwrapSandbox::new_owned(sandbox_config, work_dir)?;
+    let sandbox =
+        BwrapSandbox::new_mapped(sandbox_config, work_dir, PathBuf::from(GUEST_WORK_DIR))?;
     let env = sandbox.env();
     Ok(SandboxRecord {
         owner: Arc::clone(&principal.id),
         sandbox: Arc::new(sandbox),
         env: Arc::clone(&env),
-        work_dir: env.working_dir().to_path_buf(),
-        config: persisted.config,
+        work_dir: PathBuf::from(GUEST_WORK_DIR),
+        config: persisted_config,
         state: RemoteSandboxState::Running,
     })
 }

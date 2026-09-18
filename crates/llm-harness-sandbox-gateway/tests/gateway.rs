@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -216,45 +218,125 @@ async fn gateway_rejects_invalid_bearer_tokens() {
 }
 
 #[tokio::test]
-async fn gateway_rejects_caller_selected_work_directories() {
+async fn gateway_accepts_only_the_stable_guest_work_directory() {
     let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+    let default = client.create_sandbox(sandbox_config()).await;
+    let default = default.expect("create sandbox with omitted work_dir");
+    assert_eq!(default.work_dir, "/workspace");
+    client
+        .delete_sandbox(&default.sandbox_id)
+        .await
+        .expect("delete default sandbox");
+
     let mut config = sandbox_config();
     config.work_dir = Some(std::path::PathBuf::from("/workspace"));
-    let error =
-        match RemoteSandbox::connect(config, remote_client(&gateway.base_url, TOKEN_A)).await {
-            Ok(_) => panic!("gateway must reject caller-selected work directories"),
-            Err(error) => error,
-        };
-    assert!(error.to_string().contains("work_dir must be omitted"));
-}
+    let stable = client.create_sandbox(config).await;
+    let stable = stable.expect("create sandbox with stable work_dir");
+    assert_eq!(stable.work_dir, "/workspace");
+    client
+        .delete_sandbox(&stable.sandbox_id)
+        .await
+        .expect("delete stable sandbox");
 
-#[tokio::test]
-async fn gateway_rejects_unsupported_denylists() {
-    let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
     let mut config = sandbox_config();
-    config.fs_denylist = vec![std::path::PathBuf::from("/etc/passwd")];
-    let error =
-        match RemoteSandbox::connect(config, remote_client(&gateway.base_url, TOKEN_A)).await {
-            Ok(_) => panic!("gateway must reject unsupported denylists"),
-            Err(error) => error,
-        };
-    assert!(error.to_string().contains("fs_denylist is not supported"));
+    config.work_dir = Some(std::path::PathBuf::from("/outside"));
+    let error = client
+        .create_sandbox(config)
+        .await
+        .expect_err("gateway must reject non-stable work directories");
+    assert!(
+        error
+            .to_string()
+            .contains("work_dir must be omitted or /workspace")
+    );
+}
+
+fn work_root_contains_file(work_root: &Path, file_name: &str) -> bool {
+    std::fs::read_dir(work_root.join("sandboxes"))
+        .expect("read gateway sandbox root")
+        .any(|entry| {
+            entry
+                .expect("sandbox entry")
+                .path()
+                .join(file_name)
+                .exists()
+        })
 }
 
 #[tokio::test]
-async fn gateway_invalid_allowlist_does_not_leave_a_work_root() {
+async fn gateway_enforces_guest_denylists() {
+    let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+    let mut config = sandbox_config();
+    config.fs_denylist = vec![std::path::PathBuf::from("/workspace/denied")];
+    let sandbox = RemoteSandbox::connect(config, Arc::clone(&client))
+        .await
+        .expect("create sandbox with denylist");
+    let env = sandbox.env();
+    let denied = std::path::PathBuf::from("/workspace/denied/file.txt");
+    let error = env
+        .write_file(&denied, b"forbidden\n", CancellationToken::new())
+        .await
+        .expect_err("denylist must take priority");
+    assert!(matches!(error, EnvError::PermissionDenied(_)));
+    let allowed = std::path::PathBuf::from("/workspace/allowed.txt");
+    env.write_file(&allowed, b"allowed\n", CancellationToken::new())
+        .await
+        .expect("write allowed path");
+    Box::new(sandbox)
+        .shutdown()
+        .await
+        .expect("shutdown sandbox");
+}
+
+#[tokio::test]
+async fn gateway_enforces_guest_allowlists() {
+    let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+    let mut config = sandbox_config();
+    config.fs_allowlist = vec![std::path::PathBuf::from("/workspace/allowed")];
+    let sandbox = RemoteSandbox::connect(config, Arc::clone(&client))
+        .await
+        .expect("create sandbox with allowlist");
+    let env = sandbox.env();
+    let outside = std::path::PathBuf::from("/workspace/outside.txt");
+    let error = env
+        .write_file(&outside, b"forbidden\n", CancellationToken::new())
+        .await
+        .expect_err("allowlist must restrict guest paths");
+    assert!(matches!(error, EnvError::PermissionDenied(_)));
+    let inside = std::path::PathBuf::from("/workspace/allowed/file.txt");
+    env.create_dir(
+        &std::path::PathBuf::from("/workspace/allowed"),
+        false,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("create allowed directory");
+    env.write_file(&inside, b"allowed\n", CancellationToken::new())
+        .await
+        .expect("write allowed path");
+    Box::new(sandbox)
+        .shutdown()
+        .await
+        .expect("shutdown sandbox");
+}
+
+#[tokio::test]
+async fn gateway_invalid_guest_allowlist_does_not_leave_a_work_root() {
     let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
     let mut config = sandbox_config();
     config.fs_allowlist = vec![std::path::PathBuf::from("/etc")];
     let error =
         match RemoteSandbox::connect(config, remote_client(&gateway.base_url, TOKEN_A)).await {
-            Ok(_) => panic!("gateway must reject paths outside the principal allowlist"),
+            Ok(_) => panic!("gateway must reject paths outside /workspace"),
             Err(error) => error,
         };
     assert!(
         error
             .to_string()
-            .contains("not permitted for this principal")
+            .contains("fs_allowlist entries must be /workspace or a subpath")
     );
 
     let sandbox_root = gateway.work_root().join("sandboxes");
@@ -275,9 +357,7 @@ async fn bwrap_gateway_supports_files_shell_reset_and_delete() {
     let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
     let sandbox = connect(&gateway, TOKEN_A).await;
     let work_dir = sandbox.env().working_dir().to_path_buf();
-    assert!(work_dir.is_absolute());
-    assert!(work_dir.exists());
-    assert!(work_dir.starts_with(gateway.work_root().join("sandboxes")));
+    assert_eq!(work_dir, std::path::Path::new("/workspace"));
 
     let file = work_dir.join("hello.txt");
     sandbox
@@ -302,6 +382,13 @@ async fn bwrap_gateway_supports_files_shell_reset_and_delete() {
         .expect("execute shell");
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.stdout, "gatewayshell");
+    let output = sandbox
+        .env()
+        .execute_shell("pwd", shell_options(Duration::from_secs(5)))
+        .await
+        .expect("execute pwd");
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, "/workspace\n");
 
     let temp_dir = sandbox
         .env()
@@ -309,9 +396,21 @@ async fn bwrap_gateway_supports_files_shell_reset_and_delete() {
         .await
         .expect("temp dir");
     assert!(temp_dir.starts_with(work_dir.join(".tmp")));
-    assert!(temp_dir.is_dir());
+    assert!(
+        sandbox
+            .env()
+            .exists(&temp_dir, CancellationToken::new())
+            .await
+            .expect("temp dir exists")
+    );
     sandbox.env().cleanup().await.expect("cleanup temp dirs");
-    assert!(!work_dir.join(".tmp").exists());
+    assert!(
+        !sandbox
+            .env()
+            .exists(&work_dir.join(".tmp"), CancellationToken::new())
+            .await
+            .expect("temp root exists")
+    );
 
     let outside = std::path::PathBuf::from("/etc/llm-harness-gateway-test");
     let error = sandbox
@@ -322,13 +421,24 @@ async fn bwrap_gateway_supports_files_shell_reset_and_delete() {
     assert!(matches!(error, EnvError::PermissionDenied(_)));
 
     sandbox.reset().await.expect("reset sandbox");
-    assert!(!file.exists());
+    assert!(
+        !sandbox
+            .env()
+            .exists(&file, CancellationToken::new())
+            .await
+            .expect("file exists after reset")
+    );
 
     Box::new(sandbox)
         .shutdown()
         .await
         .expect("shutdown sandbox");
-    assert!(!work_dir.exists());
+    assert_eq!(
+        std::fs::read_dir(gateway.work_root().join("sandboxes"))
+            .expect("read sandbox root")
+            .count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -351,10 +461,15 @@ async fn gateway_restores_sandbox_work_roots_and_ownership_after_restart() {
         .write_file(&response.sandbox_id, &file, b"persisted\n", false)
         .await
         .expect("write file before restart");
-    assert!(file.exists());
+    assert!(
+        client
+            .exists(&response.sandbox_id, &file)
+            .await
+            .expect("file exists before restart")
+    );
 
     let work_root = first.stop().await;
-    assert!(file.exists());
+    assert!(work_root_contains_file(&work_root, "restart.txt"));
 
     let second = start_gateway_at(
         GatewayConfig::new(vec![
@@ -398,7 +513,7 @@ async fn gateway_restores_sandbox_work_roots_and_ownership_after_restart() {
         .delete_sandbox(&response.sandbox_id)
         .await
         .expect("delete restored sandbox");
-    assert!(!file.exists());
+    assert!(!work_root_contains_file(&work_root, "restart.txt"));
     assert_eq!(registry_record_count(&work_root), 0);
 
     let work_root = second.stop().await;

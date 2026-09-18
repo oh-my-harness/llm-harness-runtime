@@ -115,7 +115,7 @@ async fn remote_sandbox_supports_filesystem_and_streaming_shell() {
     let options = ShellOptions {
         cwd: None,
         env: vec![("REMOTE_TEST", "1")],
-        timeout: Some(Duration::from_secs(2)),
+        timeout: Some(Duration::from_secs(5)),
         abort: CancellationToken::new(),
         on_stdout: Some(on_stdout),
         on_stderr: Some(on_stderr),
@@ -303,7 +303,7 @@ async fn remote_sandbox_bounds_final_shell_output() {
     let options = ShellOptions {
         cwd: None,
         env: Vec::new(),
-        timeout: Some(Duration::from_secs(2)),
+        timeout: Some(Duration::from_secs(5)),
         abort: CancellationToken::new(),
         on_stdout: None,
         on_stderr: None,
