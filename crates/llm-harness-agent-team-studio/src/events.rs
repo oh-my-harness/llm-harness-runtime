@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// How many recent events a new WS client sees on connect.
-const REPLAY_LEN: usize = 50;
+const REPLAY_LEN: usize = 500;
 
 #[derive(Clone)]
 pub struct EventBus {
@@ -78,6 +78,45 @@ pub fn operator_event(project: &str, from: &str, text: &str) -> serde_json::Valu
     })
 }
 
+/// Build one team-message event. This includes user→agent, agent→agent,
+/// and agent→operator traffic observed at inbox delivery time.
+pub fn team_message_event(
+    project: &str,
+    from: &str,
+    to: &str,
+    message_type: &str,
+    body: &str,
+    broadcast_id: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "team_message",
+        "project": project,
+        "from": from,
+        "to": to,
+        "message_type": message_type,
+        "text": body,
+        "broadcast_id": broadcast_id,
+        "ts": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build one live thinking-delta event for the shared process stream.
+pub fn agent_thought_event(
+    project: &str,
+    agent: &str,
+    message_id: &str,
+    thinking: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "agent_thought",
+        "project": project,
+        "agent": agent,
+        "message_id": message_id,
+        "text": thinking,
+        "ts": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
 /// Build one issue-changed event.
 pub fn issue_event(project: &str, id: &str, status: &str) -> serde_json::Value {
     serde_json::json!({
@@ -104,13 +143,13 @@ mod tests {
     }
 
     #[test]
-    fn replay_caps_at_50() {
+    fn replay_caps_at_500() {
         let bus = EventBus::new();
-        for i in 0..60 {
+        for i in 0..510 {
             bus.publish(operator_event("p", "a", &i.to_string()));
         }
         let replay = bus.replay();
-        assert_eq!(replay.len(), 50);
+        assert_eq!(replay.len(), 500);
         assert!(
             replay[0].contains("\"10\""),
             "oldest evicted: {:?}",
