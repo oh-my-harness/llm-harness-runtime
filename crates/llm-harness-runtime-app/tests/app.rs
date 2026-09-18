@@ -1,9 +1,13 @@
 use axum::http::{StatusCode, header};
 use llm_harness_runtime_app::app::{RuntimeApp, RuntimeAppConfig};
+#[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -213,6 +217,35 @@ async fn app_binary_starts_and_shuts_down_cleanly() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+
+    let lifecycle_log = root.join("logs").join("runtime.jsonl");
+    let lifecycle_log = std::fs::read_to_string(lifecycle_log).unwrap();
+    let events: Vec<serde_json::Value> = lifecycle_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let shutdown_signal = events
+        .iter()
+        .find(|event| event["data"]["event"] == "shutdown_signal")
+        .unwrap();
+    assert_eq!(shutdown_signal["data"]["source"], "sigterm");
+    let shutdown = events.last().unwrap();
+    assert_eq!(shutdown["data"]["event"], "shutdown");
+    assert_eq!(shutdown["data"]["reason"], "normal");
+
     assert!(!descriptor_path.exists());
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn app_binary_rejects_invalid_shutdown_timeout() {
+    let output = Command::new(env!("CARGO_BIN_EXE_llm-harness-app"))
+        .env("RUNTIME_APP_SHUTDOWN_TIMEOUT_SECS", "0")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("invalid lifecycle configuration"));
+    assert!(stderr.contains("expected between 1s and 3600s"));
 }
