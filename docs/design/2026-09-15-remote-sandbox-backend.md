@@ -149,12 +149,12 @@ SSE 行结束符支持 `LF`、`CRLF` 和 `CR`，且 `CRLF` 允许跨网络 chunk
 - gateway 启动时用 `flock(LOCK_EX | LOCK_NB)` 独占 work root，拒绝第二个 gateway 共用同一 root；随后只删除 `sandboxes` 下名字可解析为 UUID 的直接子目录。
 - 每个 sandbox 由 gateway 生成独立 0700 host work root，并将其映射为稳定 guest 坐标 `/workspace`；create 请求中的 `work_dir` 只能为空或 `/workspace`，远程调用方不能选择宿主机路径，invalid create 请求不会遗留 work root。
 - sandbox 记录绑定创建 principal；其他有效 token 访问时返回 `404`，避免跨租户枚举。
-- 文件操作通过 `cap-std` capability root 执行，并在协议层统一校验 guest 路径、`fs_allowlist` 与 `fs_denylist`；principal 的 `fs_allowlist` 使用 guest `/workspace` 前缀，作为请求 allowlist 的默认值和上限。shell 通过 `bwrap --unshare-all` 执行，默认网络为 deny。
+- 文件操作通过 `cap-std` capability root 执行，并在协议层统一校验 guest 路径、`fs_allowlist` 与 `fs_denylist`；principal 的 `fs_allowlist` 使用 guest `/workspace` 前缀，作为请求 allowlist 的默认值和上限。shell 通过 `bwrap --unshare-all` 执行：allowlist 先用空目录覆盖 `/workspace`，再挂载允许的 host 子路径；denylist 在最终挂载点用空目录或 `/dev/null` 覆盖。默认网络为 deny。
 - shell 执行有 gateway 级 timeout/output 上限，SSE 通道使用有界队列，JSON 请求体有上限。
 - reset 清空 owned work root，delete 取消执行并释放 work root；删除时若有活跃请求会返回 `409` 而不是半途移除状态。
 - 启动恢复对 `sandboxes` 下的非 UUID 名称、symlink 或非目录条目失败关闭，并保留异常条目供运维检查。
 - registry 使用 work root 下 0600 regular-file SQLite WAL 数据库持久化 sandbox id、owner、配置和状态；重启时 fail-closed 地 reconcile registry 与 work root，删除孤儿和 `Deleting` 记录，并恢复仍有效的 sandbox。
-- `fs_denylist` 在协议层拒绝匹配路径；非空 `net_allowlist`、`max_disk_mb` 以及本机无法执行的 cgroup v2 限额都会失败关闭。
+- `fs_allowlist` / `fs_denylist` 在协议层、`BwrapEnv` 文件 API 和 shell mount namespace 三处使用组件级路径匹配保持一致；非空 `net_allowlist`、`max_disk_mb` 以及本机无法执行的 cgroup v2 限额都会失败关闭。
 - 请求日志保留 `x-request-id`、方法、路径、状态和耗时，不记录 bearer token。
 
 该 gateway 的 `serve` 只提供 HTTP listener；生产部署必须由 sidecar、ingress 或服务网格终止 TLS，并以最小权限 OS 用户运行。

@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -410,7 +410,7 @@ fn normalize_request_config(
             for path in &request.fs_allowlist {
                 if !principal.fs_allowlist.iter().any(|allowed| {
                     let allowed = allowed.to_string_lossy();
-                    path == allowed.as_ref() || path.starts_with(allowed.as_ref())
+                    Path::new(path).starts_with(Path::new(allowed.as_ref()))
                 }) {
                     anyhow::bail!(
                         "fs_allowlist entry {path:?} is not permitted for this principal"
@@ -435,8 +435,8 @@ fn build_sandbox_config(request: &RemoteSandboxConfig) -> anyhow::Result<Sandbox
             .map(std::time::Duration::from_millis),
     };
     Ok(SandboxConfig {
-        fs_allowlist: Vec::new(),
-        fs_denylist: Vec::new(),
+        fs_allowlist: request.fs_allowlist.iter().map(PathBuf::from).collect(),
+        fs_denylist: request.fs_denylist.iter().map(PathBuf::from).collect(),
         net_allowlist: request
             .net_allowlist
             .iter()

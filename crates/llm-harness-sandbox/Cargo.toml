@@ -12,6 +12,7 @@ chrono.workspace              = true
 futures.workspace             = true
 serde_json.workspace          = true
 uuid.workspace                = true
+tempfile.workspace            = true
 tokio      = { workspace = true, features = ["process", "fs", "io-util", "time"] }
 tokio-util.workspace          = true
 cap-std = { version = "3", optional = true }

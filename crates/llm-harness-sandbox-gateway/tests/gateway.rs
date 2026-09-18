@@ -10,7 +10,7 @@ use llm_harness_sandbox_gateway::{GatewayConfig, GatewayPrincipalConfig, Sandbox
 use llm_harness_sandbox_remote::protocol::RemoteSandboxState;
 use llm_harness_sandbox_remote::{
     RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig, RemoteSandboxConfig,
-    ResourceLimitsWire,
+    RemoteSandboxError, ResourceLimitsWire,
 };
 use llm_harness_types::{EnvError, ShellOptions};
 use rusqlite::Connection;
@@ -284,6 +284,27 @@ async fn gateway_enforces_guest_denylists() {
     env.write_file(&allowed, b"allowed\n", CancellationToken::new())
         .await
         .expect("write allowed path");
+    if bwrap_available() {
+        let error = match sandbox
+            .env()
+            .execute_shell(
+                "mkdir -p /workspace/denied && printf pwned > /workspace/denied/file",
+                shell_options(Duration::from_secs(5)),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("denied shell path must fail"),
+        };
+        assert!(
+            error.to_string().contains("shell_failed") && error.to_string().contains("exit 2"),
+            "unexpected denied shell error: {error:?}"
+        );
+    }
+    let sibling = std::path::PathBuf::from("/workspace/denied-sibling/file.txt");
+    env.write_file(&sibling, b"sibling\n", CancellationToken::new())
+        .await
+        .expect("write sibling outside denied prefix");
     Box::new(sandbox)
         .shutdown()
         .await
@@ -307,20 +328,62 @@ async fn gateway_enforces_guest_allowlists() {
         .expect_err("allowlist must restrict guest paths");
     assert!(matches!(error, EnvError::PermissionDenied(_)));
     let inside = std::path::PathBuf::from("/workspace/allowed/file.txt");
-    env.create_dir(
-        &std::path::PathBuf::from("/workspace/allowed"),
-        false,
-        CancellationToken::new(),
-    )
-    .await
-    .expect("create allowed directory");
     env.write_file(&inside, b"allowed\n", CancellationToken::new())
         .await
         .expect("write allowed path");
+    if bwrap_available() {
+        let error = match sandbox
+            .env()
+            .execute_shell(
+                "touch /workspace/outside.txt",
+                shell_options(Duration::from_secs(5)),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("shell allowlist must restrict workspace root"),
+        };
+        assert!(
+            error.to_string().contains("shell_failed"),
+            "unexpected shell allowlist error: {error:?}"
+        );
+        sandbox
+            .env()
+            .execute_shell(
+                "printf shell > /workspace/allowed/shell.txt",
+                shell_options(Duration::from_secs(5)),
+            )
+            .await
+            .expect("write allowed path from shell");
+        let text = sandbox
+            .env()
+            .read_text_file(
+                &std::path::PathBuf::from("/workspace/allowed/shell.txt"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("read shell-created file");
+        assert_eq!(text, "shell");
+    }
     Box::new(sandbox)
         .shutdown()
         .await
         .expect("shutdown sandbox");
+}
+
+#[tokio::test]
+async fn gateway_principal_allowlist_uses_path_components() {
+    let mut restricted = principal("tenant-a", TOKEN_A);
+    restricted.fs_allowlist = vec![std::path::PathBuf::from("/workspace/allow")];
+    let gateway = start_gateway(vec![restricted]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+    let mut config = sandbox_config();
+    config.fs_allowlist = vec![std::path::PathBuf::from("/workspace/allowed")];
+    let error = match RemoteSandbox::connect(config, client).await {
+        Err(error) => error,
+        Ok(_) => panic!("sibling prefix must not be authorized"),
+    };
+    assert!(matches!(error, RemoteSandboxError::Gateway { .. }));
 }
 
 #[tokio::test]

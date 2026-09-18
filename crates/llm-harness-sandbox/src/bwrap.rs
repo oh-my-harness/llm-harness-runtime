@@ -178,6 +178,9 @@ pub struct BwrapEnv {
     work_dir_canon: PathBuf,
     guest_work_dir: Option<PathBuf>,
     caps: Vec<AllowedRoot>,
+    policy_allowlist: Vec<PathBuf>,
+    policy_denylist: Vec<PathBuf>,
+    policy_root: Option<tempfile::TempDir>,
     config: SandboxConfig,
     /// Whether the sandbox created the work_dir itself (`work_dir=None`).
     /// Only owned directories can be `reset()` or deleted by `shutdown()`.
@@ -261,7 +264,7 @@ impl BwrapEnv {
     }
 
     fn new_with_parts(
-        config: SandboxConfig,
+        mut config: SandboxConfig,
         owned: bool,
         host_work_dir: PathBuf,
         guest_work_dir: Option<PathBuf>,
@@ -292,7 +295,7 @@ impl BwrapEnv {
             .map_err(|e| anyhow::anyhow!("failed to canonicalize work_dir: {e}"))?;
         let work_dir = guest_work_dir
             .clone()
-            .unwrap_or_else(|| work_dir_canon.clone());
+            .unwrap_or_else(|| host_work_dir.clone());
 
         let mut caps = Vec::new();
 
@@ -304,6 +307,49 @@ impl BwrapEnv {
             dir: work_dir_cap,
         });
 
+        let policy_root = if config.fs_allowlist.is_empty() && config.fs_denylist.is_empty() {
+            None
+        } else {
+            Some(tempfile::tempdir()?)
+        };
+        let policy_allowlist = config
+            .fs_allowlist
+            .iter()
+            .map(|path| lexical_normalize(path))
+            .collect();
+        let policy_denylist = config
+            .fs_denylist
+            .iter()
+            .map(|path| lexical_normalize(path))
+            .collect();
+        if let Some(guest_root) = &guest_work_dir {
+            config.fs_allowlist =
+                map_guest_policy_paths(&config.fs_allowlist, guest_root, &work_dir_canon)?;
+            config.fs_denylist =
+                map_guest_policy_paths(&config.fs_denylist, guest_root, &work_dir_canon)?;
+            for path in &config.fs_allowlist {
+                std::fs::create_dir_all(path)?;
+            }
+            if let Some(policy_root) = policy_root.as_ref() {
+                let policy_root_path = policy_root.path();
+                for path in &config.fs_denylist {
+                    let relative = path.strip_prefix(&work_dir_canon).unwrap_or(Path::new(""));
+                    let mountpoint = policy_root_path.join(relative);
+                    if path.is_file() {
+                        std::fs::File::create(mountpoint)?;
+                    } else {
+                        std::fs::create_dir_all(mountpoint)?;
+                    }
+                }
+                for path in &config.fs_allowlist {
+                    let relative = path.strip_prefix(&work_dir_canon).unwrap_or(Path::new(""));
+                    let mountpoint = policy_root_path.join(relative);
+                    if !mountpoint.exists() {
+                        std::fs::create_dir_all(mountpoint)?;
+                    }
+                }
+            }
+        }
         // Open each fs_allowlist entry as an additional capability root.
         for entry in &config.fs_allowlist {
             let canon = std::fs::canonicalize(entry).map_err(|e| {
@@ -330,6 +376,9 @@ impl BwrapEnv {
             work_dir_canon,
             guest_work_dir,
             caps,
+            policy_allowlist,
+            policy_denylist,
+            policy_root,
             config,
             owned,
             lifecycle: LifecycleAtomic::new(),
@@ -519,6 +568,9 @@ impl BwrapEnv {
             };
             let normalized = lexical_normalize(&resolved);
             let norm_root = lexical_normalize(guest_work_dir);
+            if !self.fs_policy_permits(&normalized) {
+                return Err(EnvError::PermissionDenied(normalized));
+            }
             if normalized == norm_root {
                 return Ok((
                     self.caps[0].dir.try_clone().map_err(EnvError::Io)?,
@@ -545,6 +597,9 @@ impl BwrapEnv {
             self.work_dir_canon.join(path)
         };
         let normalized = lexical_normalize(&resolved);
+        if !self.fs_policy_permits(&normalized) {
+            return Err(EnvError::PermissionDenied(normalized));
+        }
 
         for root in &self.caps {
             let norm_root = lexical_normalize(&root.path);
@@ -562,6 +617,21 @@ impl BwrapEnv {
         Err(EnvError::PermissionDenied(normalized))
     }
 
+    fn fs_policy_permits(&self, path: &Path) -> bool {
+        let mapped = self.guest_work_dir.is_some();
+        let allowed = self.policy_allowlist.is_empty()
+            || (!mapped && path.starts_with(&self.work_dir_canon))
+            || self
+                .policy_allowlist
+                .iter()
+                .any(|root| path.starts_with(root));
+        allowed
+            && !self
+                .policy_denylist
+                .iter()
+                .any(|root| path.starts_with(root))
+    }
+
     /// System directories bind-mounted read-only so that commands inside the
     /// sandbox can find executables and shared libraries.
     ///
@@ -575,6 +645,38 @@ impl BwrapEnv {
             ("/lib64", "/lib64"),
             ("/sbin", "/sbin"),
         ]
+    }
+
+    fn push_policy_deny(&self, args: &mut Vec<String>, path: &Path) {
+        let source = if path.is_file() {
+            Path::new("/dev/null")
+        } else {
+            self.policy_root.as_ref().unwrap().path()
+        };
+        let destination = self.policy_destination(path);
+        BwrapEnv::push_ro_bind(args, source, &destination);
+    }
+
+    fn policy_destination(&self, path: &Path) -> PathBuf {
+        let Some(guest_root) = &self.guest_work_dir else {
+            return path.to_path_buf();
+        };
+        let relative = path
+            .strip_prefix(&self.work_dir_canon)
+            .unwrap_or(Path::new(""));
+        guest_root.join(relative)
+    }
+
+    fn push_bind(args: &mut Vec<String>, source: &Path, destination: &Path) {
+        args.push("--bind".to_string());
+        args.push(source.to_string_lossy().to_string());
+        args.push(destination.to_string_lossy().to_string());
+    }
+
+    fn push_ro_bind(args: &mut Vec<String>, source: &Path, destination: &Path) {
+        args.push("--ro-bind".to_string());
+        args.push(source.to_string_lossy().to_string());
+        args.push(destination.to_string_lossy().to_string());
     }
 
     /// Build the bwrap argument vector for a shell command invocation.
@@ -606,16 +708,27 @@ impl BwrapEnv {
         // Bind the host working directory to its stable guest location.
         let host_work_dir = self.work_dir_canon.to_string_lossy().to_string();
         let guest_work_dir = self.work_dir.to_string_lossy().to_string();
-        args.push("--bind".to_string());
-        args.push(host_work_dir);
-        args.push(guest_work_dir);
+        let enforce_allowlist_root =
+            self.guest_work_dir.is_some() && !self.config.fs_allowlist.is_empty();
+        let source = if enforce_allowlist_root {
+            self.policy_root.as_ref().unwrap().path()
+        } else {
+            Path::new(&host_work_dir)
+        };
+        if enforce_allowlist_root {
+            BwrapEnv::push_ro_bind(&mut args, source, Path::new(&guest_work_dir));
+        } else {
+            BwrapEnv::push_bind(&mut args, source, Path::new(&guest_work_dir));
+        }
 
         // Bind additional fs_allowlist entries (read-write).
         for path in &self.config.fs_allowlist {
-            let s = path.to_string_lossy().to_string();
-            args.push("--bind".to_string());
-            args.push(s.clone());
-            args.push(s);
+            let destination = self.policy_destination(path);
+            BwrapEnv::push_bind(&mut args, path, &destination);
+        }
+
+        for path in &self.config.fs_denylist {
+            self.push_policy_deny(&mut args, path);
         }
 
         // Change directory to the requested cwd (or work dir).
@@ -1107,7 +1220,6 @@ impl ExecutionEnv for BwrapEnv {
 ///   cgroup v2 when configured. Missing cgroup v2 or controllers fail closed.
 ///
 /// **Unimplemented policies** (fail-closed in `new()`):
-/// - `fs_denylist` — not enforced by bwrap; rejected at construction.
 /// - `net_allowlist` rules — bwrap only supports all-or-nothing network;
 ///   non-empty allowlist opens the entire host network, so it is rejected.
 /// - `max_disk_mb` — no real capacity quota mechanism; rejected.
@@ -1116,6 +1228,32 @@ pub struct BwrapSandbox {
     env: Arc<BwrapEnv>,
     config: SandboxConfig,
     running: AtomicBool,
+}
+
+fn check_policy_path(path: &Path, guest_root: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.starts_with(guest_root),
+        "policy path {path:?} is outside guest work directory {guest_root:?}"
+    );
+    Ok(())
+}
+
+fn map_guest_policy_path(path: &Path, guest_root: &Path, host_root: &Path) -> Result<PathBuf> {
+    let normalized = lexical_normalize(path);
+    check_policy_path(&normalized, guest_root)?;
+    let relative = normalized.strip_prefix(guest_root).unwrap_or(Path::new(""));
+    anyhow::Ok(host_root.join(relative))
+}
+
+fn map_guest_policy_paths(
+    paths: &[PathBuf],
+    guest_root: &Path,
+    host_root: &Path,
+) -> Result<Vec<PathBuf>> {
+    paths
+        .iter()
+        .map(|path| map_guest_policy_path(path, guest_root, host_root))
+        .collect()
 }
 
 impl BwrapSandbox {
@@ -1165,12 +1303,6 @@ impl BwrapSandbox {
     /// Reject configurations with unimplemented policies instead of silently
     /// downgrading them.
     fn validate_config(config: &SandboxConfig) -> Result<()> {
-        if !config.fs_denylist.is_empty() {
-            anyhow::bail!(
-                "fs_denylist is not supported by BwrapSandbox; \
-                 remove denylist entries or use a backend that enforces them"
-            );
-        }
         if !config.net_allowlist.is_empty() {
             anyhow::bail!(
                 "net_allowlist rules are not supported by BwrapSandbox; \

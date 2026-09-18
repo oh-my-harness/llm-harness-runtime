@@ -751,11 +751,11 @@ fn validate_guest_fs_path(
         || config
             .fs_allowlist
             .iter()
-            .any(|allowed| value == allowed || value.starts_with(allowed.as_str()));
+            .any(|allowed| Path::new(value).starts_with(Path::new(allowed.as_str())));
     let denied = config
         .fs_denylist
         .iter()
-        .any(|denied| value == denied || value.starts_with(denied.as_str()));
+        .any(|denied| Path::new(value).starts_with(Path::new(denied.as_str())));
     if !allowed || denied {
         return Err(Box::new(gateway_error(
             StatusCode::FORBIDDEN,

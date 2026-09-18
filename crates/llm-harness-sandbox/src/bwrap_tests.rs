@@ -16,7 +16,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use llm_harness_platform::sandbox::{NetRule, ResourceLimits, SandboxConfig};
-use llm_harness_types::ShellOptions;
+use llm_harness_types::{EnvError, ShellOptions};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -122,12 +122,15 @@ fn cgroup_v2_pids_available() -> bool {
 // Config validation (fail-closed) — no bwrap required
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[test]
-fn config_with_fs_denylist_is_rejected() {
+#[tokio::test]
+async fn file_api_enforces_fs_denylist() {
     let dir = tempfile::tempdir().unwrap();
+    let work_dir = dir.path().join("workspace");
+    tokio::fs::create_dir_all(&work_dir).await.unwrap();
+    let denied = work_dir.join("denied");
     let config = SandboxConfig {
         fs_allowlist: vec![],
-        fs_denylist: vec![PathBuf::from("/secret")],
+        fs_denylist: vec![denied.clone()],
         net_allowlist: vec![],
         resource_limits: ResourceLimits {
             max_cpus: None,
@@ -138,9 +141,13 @@ fn config_with_fs_denylist_is_rejected() {
         },
         work_dir: Some(dir.path().to_path_buf()),
     };
-    let result = BwrapSandbox::new(config);
-    assert!(result.is_err(), "fs_denylist must be rejected");
-    assert!(result.unwrap_err().to_string().contains("fs_denylist"));
+    let sandbox = BwrapSandbox::new(config).unwrap();
+    let error = sandbox
+        .env
+        .write_file(&denied, b"forbidden\n", CancellationToken::new())
+        .await
+        .expect_err("fs_denylist must be enforced");
+    assert!(matches!(error, EnvError::PermissionDenied(_)));
 }
 
 #[test]
