@@ -249,3 +249,61 @@ fn app_binary_rejects_invalid_shutdown_timeout() {
     assert!(stderr.contains("invalid lifecycle configuration"));
     assert!(stderr.contains("expected between 1s and 3600s"));
 }
+
+#[test]
+fn app_binary_migrates_and_rolls_back_data_root() {
+    let parent = temp_root("migration");
+    std::fs::create_dir_all(&parent).unwrap();
+    let source = parent.join("source");
+    std::fs::create_dir_all(source.join("teams/demo")).unwrap();
+    std::fs::write(source.join("settings.json"), "{\"scout_interval_secs\":17}").unwrap();
+    std::fs::write(
+        source.join("teams/demo/team.json"),
+        "{\"id\":\"demo\",\"name\":\"Demo\",\"members\":[]}",
+    )
+    .unwrap();
+    let destination = parent.join("runtime-app-migration-destination");
+    let backup = parent.join("runtime-app-migration-backup");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_llm-harness-app"))
+        .args([
+            "migrate-data",
+            "--from",
+            source.to_str().unwrap(),
+            "--to",
+            destination.to_str().unwrap(),
+            "--backup",
+            backup.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "migration failed: {output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["operation"], "migrate");
+    assert!(destination.join("settings.json").exists());
+    assert!(destination.join("teams/demo/team.json").exists());
+    assert!(backup.join("settings.json").exists());
+    assert!(!source.exists());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_llm-harness-app"))
+        .args([
+            "rollback-data",
+            "--from",
+            source.to_str().unwrap(),
+            "--to",
+            destination.to_str().unwrap(),
+            "--backup",
+            backup.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "rollback failed: {output:?}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["operation"], "rollback");
+    assert!(source.join("settings.json").exists());
+    assert!(source.join("teams/demo/team.json").exists());
+    assert!(!destination.exists());
+    assert!(!backup.exists());
+
+    std::fs::remove_dir_all(parent).unwrap();
+}

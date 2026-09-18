@@ -4,6 +4,7 @@ use llm_harness_runtime_app::app::{RuntimeApp, RuntimeAppConfig};
 use llm_harness_runtime_app::lifecycle::{
     LifecycleConfig, ShutdownOutcome, ShutdownSignalHandler, shutdown_with_timeout,
 };
+use llm_harness_runtime_app::migration::{parse_data_command, run_data_command};
 use std::path::Path;
 
 fn record_lifecycle_event(data_root: &Path, data: serde_json::Value) {
@@ -23,6 +24,23 @@ fn record_lifecycle_event(data_root: &Path, data: serde_json::Value) {
 
 #[tokio::main]
 async fn main() {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(command) = parse_data_command(&arguments).unwrap_or_else(|error| {
+        eprintln!("llm-harness-app: {error}");
+        std::process::exit(2);
+    }) {
+        match run_data_command(command) {
+            Ok(result) => {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            }
+            Err(error) => {
+                eprintln!("llm-harness-app: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let lifecycle_config = match LifecycleConfig::from_env() {
         Ok(lifecycle_config) => lifecycle_config,
         Err(error) => {
