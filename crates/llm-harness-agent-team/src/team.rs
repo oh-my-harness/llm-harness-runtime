@@ -1114,6 +1114,68 @@ mod tests {
         team.shutdown();
     }
 
+    #[tokio::test]
+    async fn persona_configures_member_specific_system_prompt() {
+        let mut team = test_team()
+            .member(
+                IndividualSpec::new("researcher", "information retrieval", "test-model")
+                    .with_persona("cautious and evidence-driven"),
+            )
+            .member(
+                IndividualSpec::new("writer", "report writing", "test-model")
+                    .with_persona("direct and decision-oriented"),
+            );
+        let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
+        team.build(env, mock_providers(&["test-model"]))
+            .await
+            .unwrap();
+
+        let researcher_prompt = team
+            .harness(&AgentId::new("researcher"))
+            .unwrap()
+            .state()
+            .system_prompt
+            .clone()
+            .unwrap();
+        let writer_prompt = team
+            .harness(&AgentId::new("writer"))
+            .unwrap()
+            .state()
+            .system_prompt
+            .clone()
+            .unwrap();
+
+        assert!(researcher_prompt.contains("researcher"));
+        assert!(researcher_prompt.contains("cautious and evidence-driven"));
+        assert!(writer_prompt.contains("writer"));
+        assert!(writer_prompt.contains("direct and decision-oriented"));
+        assert_ne!(researcher_prompt, writer_prompt);
+        team.shutdown();
+    }
+
+    #[tokio::test]
+    async fn explicit_prompt_survives_configure() {
+        let mut team = test_team().member(
+            IndividualSpec::new("a1", "analysis", "test-model")
+                .with_prompt("custom full prompt")
+                .configure(|b| b.system_prompt(Some("configure prompt".to_string()))),
+        );
+        let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
+        team.build(env, mock_providers(&["test-model"]))
+            .await
+            .unwrap();
+
+        let prompt = team
+            .harness(&AgentId::new("a1"))
+            .unwrap()
+            .state()
+            .system_prompt
+            .clone()
+            .unwrap();
+        assert_eq!(prompt, "custom full prompt");
+        team.shutdown();
+    }
+
     // ── replace_member ────────────────────────────────────────────────────
 
     fn mock_providers(models: &[&str]) -> Vec<(String, Arc<dyn LlmClient>)> {

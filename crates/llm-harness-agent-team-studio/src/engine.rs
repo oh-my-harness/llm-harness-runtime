@@ -488,31 +488,32 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
             .and_then(|o| o.model.clone())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| m.model.resolve(&inputs.settings.models));
-        let spec = IndividualSpec::new(&m.id, &m.role_label, model).configure(|b| {
-            let b = b.max_tokens(16384);
-            let b = b.system_prompt(Some(m.persona.clone()));
-            // 成员级 toolkit：社交/memory/knowledge 由 team.build 统一装；
-            // fs/web 是显式 opt-in 的成员级插件。
-            let mut b = b;
-            for tk in &m.toolkits {
-                if let Some(server) = tk.strip_prefix("mcp:") {
-                    if let Some(tools) = mcp_by_server.get(server) {
-                        for tool in tools.iter() {
-                            b = b.tool(Arc::clone(tool));
+        let spec = IndividualSpec::new(&m.id, &m.role_label, model)
+            .with_prompt(m.persona.clone())
+            .configure(|b| {
+                let b = b.max_tokens(16384);
+                // 成员级 toolkit：社交/memory/knowledge 由 team.build 统一装；
+                // fs/web 是显式 opt-in 的成员级插件。
+                let mut b = b;
+                for tk in &m.toolkits {
+                    if let Some(server) = tk.strip_prefix("mcp:") {
+                        if let Some(tools) = mcp_by_server.get(server) {
+                            for tool in tools.iter() {
+                                b = b.tool(Arc::clone(tool));
+                            }
                         }
-                    }
-                } else {
-                    b = match tk.as_str() {
-                        "fs" => b.install(&llm_harness_tools::FsToolsPlugin::new(None)),
-                        "web" => b.install(&llm_harness_tools::WebToolsPlugin::default()),
-                        // memory/knowledge 团队级已装；此处 no-op。
-                        "memory" | "knowledge" => b,
-                        _ => b, // validate_toolkits 已拦截未知包
+                    } else {
+                        b = match tk.as_str() {
+                            "fs" => b.install(&llm_harness_tools::FsToolsPlugin::new(None)),
+                            "web" => b.install(&llm_harness_tools::WebToolsPlugin::default()),
+                            // memory/knowledge 团队级已装；此处 no-op。
+                            "memory" | "knowledge" => b,
+                            _ => b, // validate_toolkits 已拦截未知包
+                        };
                     };
-                };
-            }
-            b
-        });
+                }
+                b
+            });
         team = team.member(spec);
         for bh in &m.behaviors {
             if let Behavior::Handoff {

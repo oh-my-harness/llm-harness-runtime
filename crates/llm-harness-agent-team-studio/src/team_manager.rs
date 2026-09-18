@@ -307,18 +307,19 @@ impl TeamManager {
                 let client = providers[0].1.clone();
                 providers.push((model.clone(), client));
             }
-            let spec = IndividualSpec::new(&member.id, &member.role_label, model).configure(|b| {
-                let b = b.system_prompt(Some(member.persona.clone()));
-                let mut b = b;
-                for tk in &member.toolkits {
-                    b = match tk.as_str() {
-                        "fs" => b.install(&llm_harness_tools::FsToolsPlugin::new(None)),
-                        "web" => b.install(&llm_harness_tools::WebToolsPlugin::default()),
-                        _ => b,
-                    };
-                }
-                b
-            });
+            let spec = IndividualSpec::new(&member.id, &member.role_label, model)
+                .with_prompt(member.persona.clone())
+                .configure(|b| {
+                    let mut b = b;
+                    for tk in &member.toolkits {
+                        b = match tk.as_str() {
+                            "fs" => b.install(&llm_harness_tools::FsToolsPlugin::new(None)),
+                            "web" => b.install(&llm_harness_tools::WebToolsPlugin::default()),
+                            _ => b,
+                        };
+                    }
+                    b
+                });
             entry
                 .team
                 .replace_member(&member.id, spec, providers)

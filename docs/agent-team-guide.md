@@ -78,9 +78,19 @@ workspace 的 `reqwest` 依赖启用 `rustls-tls-native-roots`，使 provider
 | 方法 | 说明 |
 |------|------|
 | `new(id, expertise, model)` | 成员 id、专长描述（进入其 system prompt 与通讯录）、模型 |
+| `with_persona(persona)` | 设置成员性格/协作风格；在没有显式 prompt 时自动生成包含 id、专长和 persona 的成员专属 system prompt |
+| `with_prompt(prompt)` | 设置该成员的完整 system prompt；显式完整 prompt 优先于 `configure(system_prompt)` 和 persona 生成 prompt |
 | `configure(\|b\| b.system_prompt(...))` | 定制内部 `HarnessBuilder`（工具、hooks 等全部可用） |
+| `prompt()` | 读取当前生效 prompt；优先级为 `with_prompt` > `configure(system_prompt)` > persona 生成 prompt |
 | `reflection_interval(n)` | 每 n 次 run 触发一次反思（见下文反思循环） |
 | `allow_subagents(true)` | 允许该成员派生自己的子 agent（默认关闭——spawn 会放大 LLM 流量与失控半径） |
+
+```rust
+let researcher = IndividualSpec::new("researcher", "信息检索与事实核查", "claude-sonnet-4")
+    .with_persona("严谨、保守、只基于证据下结论");
+let writer = IndividualSpec::new("writer", "把研究结论写成报告", "claude-sonnet-4")
+    .with_persona("直接、面向决策者、避免术语堆砌");
+```
 
 ### AgentTeam（组队与生命周期）
 
