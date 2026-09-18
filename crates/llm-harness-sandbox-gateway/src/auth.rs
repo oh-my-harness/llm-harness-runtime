@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use llm_harness_sandbox_remote::protocol::GatewayErrorResponse;
 use sha2::{Digest, Sha256};
 
-/// One authenticated principal and its permitted host filesystem roots.
+/// One authenticated principal and its permitted guest filesystem roots.
 #[derive(Clone)]
 pub struct GatewayPrincipalConfig {
     pub principal: String,
@@ -61,13 +61,15 @@ impl GatewayConfig {
             }
             let mut allowlist = Vec::with_capacity(principal.fs_allowlist.len());
             for root in principal.fs_allowlist {
-                let canonical = std::fs::canonicalize(&root).map_err(|error| {
-                    anyhow::anyhow!("canonicalize fs_allowlist {root:?}: {error}")
+                let root = root.to_str().ok_or_else(|| {
+                    anyhow::anyhow!("gateway principal fs_allowlist must be valid UTF-8")
                 })?;
-                if !canonical.is_dir() {
-                    anyhow::bail!("fs_allowlist entry {canonical:?} is not a directory");
+                if !is_guest_workspace_path(root) {
+                    anyhow::bail!(
+                        "gateway principal fs_allowlist entry must be /workspace or a subpath"
+                    );
                 }
-                allowlist.push(canonical);
+                allowlist.push(std::path::PathBuf::from(root));
             }
             secrets.push(PrincipalSecret {
                 id: principal.principal,
@@ -200,6 +202,16 @@ impl GatewayConfig {
             .as_deref()
             .expect("gateway work root is prepared")
     }
+}
+
+fn is_guest_workspace_path(value: &str) -> bool {
+    value == "/workspace"
+        || (value.starts_with("/workspace/")
+            && !value.contains('\0')
+            && !value.contains('\\')
+            && !value
+                .split('/')
+                .any(|component| component == "." || component == ".."))
 }
 
 impl std::fmt::Debug for GatewayConfig {

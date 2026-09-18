@@ -168,16 +168,6 @@ fn validate_create_response(
             "gateway returned a work directory different from the requested directory",
         ));
     }
-    if !config.fs_allowlist.is_empty()
-        && !config
-            .fs_allowlist
-            .iter()
-            .any(|allow| work_dir == *allow || work_dir.starts_with(allow))
-    {
-        return Err(RemoteSandboxError::protocol(
-            "gateway returned a work directory outside the filesystem allowlist",
-        ));
-    }
     if config
         .fs_denylist
         .iter()

@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::auth::{AuthenticatedPrincipal, bearer_token, unauthorized};
-use crate::state::{GatewayStateError, SharedState};
+use crate::state::{GUEST_WORK_DIR, GatewayStateError, SharedState};
 
 pub async fn serve(
     gateway: crate::SandboxGateway,
@@ -234,8 +234,11 @@ async fn cleanup_sandbox(
     let Some(sandbox) = state.get_sandbox(&principal, &id) else {
         return not_found(&id);
     };
-    let temp_root = sandbox.work_dir.join(".tmp");
-    let temp_root_string = temp_root.to_string_lossy().into_owned();
+    let temp_root_string = format!("{GUEST_WORK_DIR}/.tmp");
+    let temp_root = match validate_guest_fs_path(&sandbox.config, &temp_root_string) {
+        Ok(path) => path,
+        Err(response) => return *response,
+    };
     match sandbox
         .env
         .remove(&temp_root, true, true, CancellationToken::new())
@@ -255,7 +258,10 @@ async fn read_file(
     let Some(sandbox) = state.get_sandbox(&principal, &id) else {
         return not_found(&id);
     };
-    let path = PathBuf::from(&request.path);
+    let path = match validate_guest_fs_path(&sandbox.config, &request.path) {
+        Ok(path) => path,
+        Err(response) => return *response,
+    };
     let abort = CancellationToken::new();
     let content = if request.binary {
         sandbox
@@ -298,7 +304,10 @@ async fn write_file(
             );
         }
     };
-    let path = PathBuf::from(&request.path);
+    let path = match validate_guest_fs_path(&sandbox.config, &request.path) {
+        Ok(path) => path,
+        Err(response) => return *response,
+    };
     let abort = CancellationToken::new();
     let result = if request.append {
         sandbox.env.append_file(&path, &bytes, abort).await
@@ -320,7 +329,10 @@ async fn file_info(
     let Some(sandbox) = state.get_sandbox(&principal, &id) else {
         return not_found(&id);
     };
-    let path = PathBuf::from(&request.path);
+    let path = match validate_guest_fs_path(&sandbox.config, &request.path) {
+        Ok(path) => path,
+        Err(response) => return *response,
+    };
     match sandbox.env.file_info(&path, CancellationToken::new()).await {
         Ok(info) => Json(FileInfoResponseValue {
             info: wire_file_info(info),
@@ -339,7 +351,10 @@ async fn list_dir(
     let Some(sandbox) = state.get_sandbox(&principal, &id) else {
         return not_found(&id);
     };
-    let path = PathBuf::from(&request.path);
+    let path = match validate_guest_fs_path(&sandbox.config, &request.path) {
+        Ok(path) => path,
+        Err(response) => return *response,
+    };
     match sandbox.env.list_dir(&path, CancellationToken::new()).await {
         Ok(entries) => Json(ListDirResponse {
             entries: entries.into_iter().map(wire_file_info).collect(),
@@ -358,7 +373,10 @@ async fn exists(
     let Some(sandbox) = state.get_sandbox(&principal, &id) else {
         return not_found(&id);
     };
-    let path = PathBuf::from(&request.path);
+    let path = match validate_guest_fs_path(&sandbox.config, &request.path) {
+        Ok(path) => path,
+        Err(response) => return *response,
+    };
     match sandbox.env.exists(&path, CancellationToken::new()).await {
         Ok(exists) => {
             Json(llm_harness_sandbox_remote::protocol::ExistsResponse { exists }).into_response()
@@ -376,7 +394,10 @@ async fn create_dir(
     let Some(sandbox) = state.get_sandbox(&principal, &id) else {
         return not_found(&id);
     };
-    let path = PathBuf::from(&request.path);
+    let path = match validate_guest_fs_path(&sandbox.config, &request.path) {
+        Ok(path) => path,
+        Err(response) => return *response,
+    };
     match sandbox
         .env
         .create_dir(&path, request.recursive, CancellationToken::new())
@@ -396,7 +417,10 @@ async fn remove(
     let Some(sandbox) = state.get_sandbox(&principal, &id) else {
         return not_found(&id);
     };
-    let path = PathBuf::from(&request.path);
+    let path = match validate_guest_fs_path(&sandbox.config, &request.path) {
+        Ok(path) => path,
+        Err(response) => return *response,
+    };
     match sandbox
         .env
         .remove(
@@ -433,6 +457,9 @@ async fn create_temp_dir(
         .work_dir
         .join(".tmp")
         .join(format!("{}-{}", request.prefix, Uuid::new_v4()));
+    if let Err(response) = validate_guest_fs_path(&sandbox.config, &path.to_string_lossy()) {
+        return *response;
+    }
     match sandbox
         .env
         .create_dir(&path, true, CancellationToken::new())
@@ -457,6 +484,11 @@ async fn exec_shell(
     };
     if let Some(response) = validate_shell_request(&state, &request) {
         return response;
+    }
+    if let Some(cwd) = &request.cwd
+        && let Err(response) = validate_guest_fs_path(&sandbox.config, cwd)
+    {
+        return *response;
     }
 
     let execution_id = Uuid::new_v4().to_string();
@@ -686,6 +718,53 @@ fn validate_shell_request(state: &SharedState, request: &ShellExecRequest) -> Op
         }
     }
     None
+}
+
+fn validate_guest_fs_path(
+    config: &llm_harness_sandbox_remote::RemoteSandboxConfig,
+    value: &str,
+) -> Result<PathBuf, Box<Response>> {
+    let valid_guest_path = value.starts_with('/')
+        && !value.contains('\0')
+        && !value.contains('\\')
+        && !value
+            .split('/')
+            .any(|component| component == "." || component == "..");
+    if !valid_guest_path {
+        return Err(Box::new(gateway_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_path",
+            "path must be an absolute guest path without '.', '..', backslashes, or NUL".to_owned(),
+            Some(value.to_owned()),
+        )));
+    }
+    if value != GUEST_WORK_DIR && !value.starts_with("/workspace/") {
+        return Err(Box::new(gateway_error(
+            StatusCode::FORBIDDEN,
+            "path_outside_workspace",
+            "path must be /workspace or a subpath".to_owned(),
+            Some(value.to_owned()),
+        )));
+    }
+    let allowed = config.fs_allowlist.is_empty()
+        || value == GUEST_WORK_DIR
+        || config
+            .fs_allowlist
+            .iter()
+            .any(|allowed| Path::new(value).starts_with(Path::new(allowed.as_str())));
+    let denied = config
+        .fs_denylist
+        .iter()
+        .any(|denied| Path::new(value).starts_with(Path::new(denied.as_str())));
+    if !allowed || denied {
+        return Err(Box::new(gateway_error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "path is not permitted by the sandbox filesystem policy".to_owned(),
+            Some(value.to_owned()),
+        )));
+    }
+    Ok(PathBuf::from(value))
 }
 
 fn decode_content(content: &FileContent) -> Result<Vec<u8>, String> {

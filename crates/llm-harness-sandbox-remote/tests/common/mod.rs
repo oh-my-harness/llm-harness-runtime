@@ -578,15 +578,32 @@ async fn exec_shell(
     };
 
     let execution_id = uuid::Uuid::new_v4().to_string();
-    let mut command = Command::new("sh");
-    command
-        .arg("-c")
-        .arg(&request.command)
-        .current_dir(&host_work_dir)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("bash");
+        command.arg("-c");
+        command
+    } else {
+        let mut command = Command::new("sh");
+        command.arg("-c");
+        command
+    };
+    command.arg(&request.command).current_dir(&host_work_dir);
+    if !cfg!(windows) {
+        command.env_clear().env("PATH", "/usr/bin:/bin");
+    }
+    if cfg!(windows) && !request.env.is_empty() {
+        let wslenv = request
+            .env
+            .keys()
+            .map(|key| format!("{key}/u"))
+            .collect::<Vec<_>>()
+            .join(":");
+        command.env("WSLENV", wslenv);
+    }
+    if cfg!(windows) {
+        command.env("WSL_UTF8", "1");
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     for (key, value) in request.env {
         command.env(key, value);
     }
@@ -750,8 +767,24 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read_len) => {
-                    let chunk = String::from_utf8_lossy(&buffer[..read_len]).into_owned();
-                    collector.lock().unwrap().push(&buffer[..read_len]);
+                    let mut bytes = buffer[..read_len].to_vec();
+                    if cfg!(windows)
+                        && is_stderr
+                        && let Ok(text) = std::str::from_utf8(&bytes)
+                    {
+                        let mut filtered = text
+                            .lines()
+                            .filter(|line| !line.starts_with("wsl: "))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if text.ends_with('\n') {
+                            filtered.push('\n');
+                        }
+                        let filtered = filtered.trim_start_matches('\n').to_owned();
+                        bytes = filtered.into_bytes();
+                    }
+                    let chunk = String::from_utf8_lossy(&bytes).into_owned();
+                    collector.lock().unwrap().push(&bytes);
                     let event = if is_stderr {
                         RemoteExecEvent::Stderr { chunk }
                     } else {
@@ -777,8 +810,7 @@ fn sse_event<T: serde::Serialize>(
 }
 
 fn guest_to_host(root: &Path, guest_path: &str) -> GatewayPathResult {
-    let path = Path::new(guest_path);
-    if !path.is_absolute() {
+    if !guest_path.starts_with('/') {
         return Err(Box::new(gateway_error(
             StatusCode::BAD_REQUEST,
             "invalid_path",
@@ -786,12 +818,10 @@ fn guest_to_host(root: &Path, guest_path: &str) -> GatewayPathResult {
             Some(guest_path.to_owned()),
         )));
     }
-    if path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::CurDir
-        )
-    }) {
+    if guest_path
+        .split('/')
+        .any(|component| component == "." || component == "..")
+    {
         return Err(Box::new(gateway_error(
             StatusCode::BAD_REQUEST,
             "invalid_path",
@@ -799,7 +829,7 @@ fn guest_to_host(root: &Path, guest_path: &str) -> GatewayPathResult {
             Some(guest_path.to_owned()),
         )));
     }
-    let relative = path.strip_prefix("/").expect("absolute path");
+    let relative = guest_path.strip_prefix('/').expect("guest path is rooted");
     Ok(root.join(relative))
 }
 

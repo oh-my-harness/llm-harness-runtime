@@ -9,7 +9,7 @@
 非目标：
 
 - 不在本 crate 内实现 Firecracker、Kata、gVisor 或容器隔离。
-- 不承担网关侧多租户调度、镜像管理、网络策略执行和资源限额执行；也不承诺跨进程的持久 sandbox registry 或实例恢复。
+- 不承担网关侧多租户调度、镜像管理、网络策略执行和资源限额执行；registry 只提供单个 work root 内的持久化恢复，不是分布式控制面。
 - 不提供 UI 或运维控制面。
 
 因此，本 crate 的生产边界是“协议客户端 + runtime 适配器”。只有部署了符合本协议并真实执行隔离策略的 gateway 后，整个远程沙箱才是生产可用。
@@ -25,7 +25,7 @@ runtime process
                       └─ BwrapSandbox: namespace + capability isolation
 ```
 
-`RemoteSandbox::connect` 创建远端 sandbox 并保存 gateway 返回的 `sandbox_id`、`work_dir` 和 backend 标识。如果 create 响应未通过协议校验，客户端会用响应中的有效 sandbox id 尽力删除远端实例，再返回协议错误。远端资源存在与 `Running` 状态分开记录：`Creating` 时 `is_running()` 为 false。`RemoteEnv` 与 sandbox handle 共享远端资源所有权，因此仅 drop handle 不会清理实例；最后一个引用 drop 时会在独立 cleanup 线程中尽力删除远端实例，`shutdown()` 成功后只删除一次。gateway 崩溃后，活动 bwrap 命令通过 `--die-with-parent` 终止，下一次启动会独占并清理其 work root；但原 sandbox id 与内存状态不会恢复。`RemoteEnv` 实现 `ExecutionEnv`，所有路径均使用 guest 坐标系，不泄漏 gateway 宿主机路径。
+`RemoteSandbox::connect` 创建远端 sandbox 并保存 gateway 返回的 `sandbox_id`、`work_dir` 和 backend 标识。如果 create 响应未通过协议校验，客户端会用响应中的有效 sandbox id 尽力删除远端实例，再返回协议错误。远端资源存在与 `Running` 状态分开记录：`Creating` 时 `is_running()` 为 false。`RemoteEnv` 与 sandbox handle 共享远端资源所有权，因此仅 drop handle 不会清理实例；最后一个引用 drop 时会在独立 cleanup 线程中尽力删除远端实例，`shutdown()` 成功后只删除一次。gateway 崩溃后，活动 bwrap 命令通过 `--die-with-parent` 终止；重启时基于持久化 registry 恢复 sandbox id、owner、配置和 work root，并把记录标记为 `Running`，但活动 execution id 不会恢复。`RemoteEnv` 实现 `ExecutionEnv`，所有路径均使用 guest 坐标系，不泄漏 gateway 宿主机路径。
 
 ## HTTP 协议
 
@@ -72,9 +72,9 @@ JSON 响应必须是 `application/json`（忽略参数并按大小写不敏感�
 ## 文件语义
 
 - guest path 必须是合法 UTF-8，并以 `/` 开头；不允许包含 `.`、`..` 组件或 NUL。
-- `fs_allowlist` 是允许访问的前缀集合；`fs_denylist` 是其例外。gateway 必须同时执行两者，且 deny 优先。
+- 所有协议路径和 `fs_allowlist` / `fs_denylist` 均使用 guest 坐标系。合法路径必须是 `/workspace` 或其子路径，且不得包含反斜杠、NUL、`.` 或 `..` 路径段。`fs_allowlist` 是允许访问的前缀集合；`fs_denylist` 是其例外，deny 优先。
 - 文本内容使用 UTF-8 JSON；二进制内容使用 standard Base64。
-- `create_temp_dir` 必须把结果放在 sandbox 的 `work_dir` 下，不允许映射到 gateway 宿主机 `/tmp`。
+- `create_temp_dir` 必须把结果放在稳定 guest `work_dir`（`/workspace`）下，不允许映射到 gateway 宿主机 `/tmp`。
 
 客户端会验证 read 返回的内容类型与请求的 `binary` 匹配，并拒绝非法 Base64。
 文件元数据和目录列表中的 guest path 必须通过同一规则校验；`file_info` 返回的路径必须与请求一致，目录列表条目必须是请求目录的直接子路径，`create_temp_dir` 返回的路径必须位于 sandbox `work_dir` 下。
@@ -147,13 +147,14 @@ SSE 行结束符支持 `LF`、`CRLF` 和 `CR`，且 `CRLF` 允许跨网络 chunk
 - 使用 SHA-256 token digest 和常数时间比较做 Bearer 认证；同一 principal 可配置多个 token，供轮换使用。
 - gateway 使用绝对、canonical、0700 且非 symlink 的 work root（默认 `/tmp/llm-harness-sandbox-gateway`），并在其下创建 0700 `sandboxes` 目录与 0600 regular-file `.gateway.lock`。
 - gateway 启动时用 `flock(LOCK_EX | LOCK_NB)` 独占 work root，拒绝第二个 gateway 共用同一 root；随后只删除 `sandboxes` 下名字可解析为 UUID 的直接子目录。
-- 每个 sandbox 由 gateway 生成独立 0700 work root，拒绝调用方传入 `work_dir`，避免远程调用方选择宿主机路径；invalid create 请求不会遗留 work root。
+- 每个 sandbox 由 gateway 生成独立 0700 host work root，并将其映射为稳定 guest 坐标 `/workspace`；create 请求中的 `work_dir` 只能为空或 `/workspace`，远程调用方不能选择宿主机路径，invalid create 请求不会遗留 work root。
 - sandbox 记录绑定创建 principal；其他有效 token 访问时返回 `404`，避免跨租户枚举。
-- 文件操作通过 `cap-std` capability root 执行，shell 通过 `bwrap --unshare-all` 执行；默认网络为 deny。
+- 文件操作通过 `cap-std` capability root 执行，并在协议层统一校验 guest 路径、`fs_allowlist` 与 `fs_denylist`；principal 的 `fs_allowlist` 使用 guest `/workspace` 前缀，作为请求 allowlist 的默认值和上限。shell 通过 `bwrap --unshare-all` 执行：allowlist 先用空目录覆盖 `/workspace`，再挂载允许的 host 子路径；denylist 在最终挂载点用空目录或 `/dev/null` 覆盖。默认网络为 deny。
 - shell 执行有 gateway 级 timeout/output 上限，SSE 通道使用有界队列，JSON 请求体有上限。
 - reset 清空 owned work root，delete 取消执行并释放 work root；删除时若有活跃请求会返回 `409` 而不是半途移除状态。
 - 启动恢复对 `sandboxes` 下的非 UUID 名称、symlink 或非目录条目失败关闭，并保留异常条目供运维检查。
-- `fs_denylist`、非空 `net_allowlist`、`max_disk_mb` 以及本机无法执行的 cgroup v2 限额都会失败关闭。
+- registry 使用 work root 下 0600 regular-file SQLite WAL 数据库持久化 sandbox id、owner、配置和状态；重启时 fail-closed 地 reconcile registry 与 work root，删除孤儿和 `Deleting` 记录，并恢复仍有效的 sandbox。
+- `fs_allowlist` / `fs_denylist` 在协议层、`BwrapEnv` 文件 API 和 shell mount namespace 三处使用组件级路径匹配保持一致；非空 `net_allowlist`、`max_disk_mb` 以及本机无法执行的 cgroup v2 限额都会失败关闭。
 - 请求日志保留 `x-request-id`、方法、路径、状态和耗时，不记录 bearer token。
 
 该 gateway 的 `serve` 只提供 HTTP listener；生产部署必须由 sidecar、ingress 或服务网格终止 TLS，并以最小权限 OS 用户运行。
@@ -161,8 +162,8 @@ SSE 行结束符支持 `LF`、`CRLF` 和 `CR`，且 `CRLF` 允许跨网络 chunk
 ### 仍不满足的完整生产要求
 
 - 本机是 cgroup v1，`max_cpus` / `max_processes` / `max_memory_mb` 的 cgroup v2 执行路径无法在本环境完成部署级验证。
-- 磁盘 quota、denylist 和网络 allowlist 尚未实现，当前按失败关闭处理。
-- registry 在进程内存中，没有持久化 sandbox 状态；重启后只删除孤儿 work root，不能恢复原 sandbox id、租户绑定或文件内容。
+- 磁盘 quota 和网络 allowlist 尚未实现，当前按失败关闭处理。
+- registry 只覆盖单 gateway work root，不提供跨节点高可用或调度。
 - token 轮换通过重建配置支持，尚无动态撤销 API。
 - 审计输出目前是结构化 request/lifecycle 日志，还不是不可变审计后端。
 - Bwrap 是 namespace/container 级隔离；如果威胁模型要求 VM 级隔离，仍需 Firecracker/Kata/gVisor 后端。
@@ -170,9 +171,9 @@ SSE 行结束符支持 `LF`、`CRLF` 和 `CR`，且 `CRLF` 允许跨网络 chunk
 ## 当前状态
 
 - 已实现 `Sandbox` / `ExecutionEnv` 适配、文件操作、流式 shell、abort、timeout、删除和协议防护。
-- 已实现 Linux Bwrap gateway 第一阶段：认证、租户绑定、独立 work root、文件边界、默认断网、timeout/output 上限、reset/delete、失败关闭策略，以及 work root 独占锁与启动孤儿恢复。
+- 已实现 Linux Bwrap gateway 第一阶段：认证、租户绑定、独立 work root、稳定 guest `/workspace`、协议级文件 allow/deny、默认断网、timeout/output 上限、reset/delete、失败关闭策略、持久化 registry，以及 work root 独占锁与启动恢复。
 - 单元测试覆盖 SSE 解码（含跨 chunk CRLF）、事件大小限制、配置校验、IPv6 loopback HTTP 和 gateway 返回路径校验。
 - 集成测试通过本地 HTTP/SSE 网关覆盖文件系统、allowlist、denylist、流式输出、最终输出上限、timeout、客户端 timeout 上限、shell abort、文件请求取消、错误成功状态码拒绝、无效 create 响应后的远端清理、env 生命周期和删除。
-- 尚未提供 Firecracker/Kata/gVisor gateway，也未完成 cgroup v2 部署验证、持久化重启连续性和不可变审计。
+- 尚未提供 Firecracker/Kata/gVisor gateway，也未完成 cgroup v2 部署验证和不可变审计。
 
 结论：协议客户端与 Linux Bwrap gateway 第一阶段可以合入并被集成测试使用；不能宣称“远程沙箱整体生产可用”，直到上述生产要求全部满足并通过部署级验证。

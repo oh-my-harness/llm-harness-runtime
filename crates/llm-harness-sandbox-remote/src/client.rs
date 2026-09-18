@@ -732,14 +732,18 @@ impl RemoteSandboxClient {
 }
 
 pub(crate) fn path_string(path: &Path) -> Result<String, RemoteSandboxError> {
-    let path = path.to_str().ok_or_else(|| {
+    let raw_path = path.to_str().ok_or_else(|| {
         RemoteSandboxError::invalid_config(format!(
             "remote sandbox path must be valid UTF-8: {}",
             path.display()
         ))
     })?;
-    validate_path_string(path)?;
-    Ok(path.to_owned())
+    #[cfg(windows)]
+    let path = raw_path.replace('\\', "/");
+    #[cfg(not(windows))]
+    let path = raw_path.to_string();
+    validate_path_string(&path)?;
+    Ok(path)
 }
 
 pub(crate) fn validate_path_string(path: &str) -> Result<(), RemoteSandboxError> {
@@ -759,6 +763,11 @@ pub(crate) fn validate_path_string(path: &str) -> Result<(), RemoteSandboxError>
     if path.contains('\0') {
         return Err(RemoteSandboxError::invalid_config(
             "remote sandbox path must not contain NUL".to_owned(),
+        ));
+    }
+    if path.contains('\\') {
+        return Err(RemoteSandboxError::invalid_config(
+            "remote sandbox path must not contain backslashes".to_owned(),
         ));
     }
     Ok(())
@@ -893,6 +902,22 @@ fn remote_exec_event_name(event: &RemoteExecEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn path_string_rejects_posix_literal_backslash_without_rewriting() {
+        let error = path_string(std::path::Path::new("/workspace/file\\name"))
+            .expect_err("literal POSIX backslash must remain invalid");
+        assert!(matches!(error, RemoteSandboxError::InvalidConfig(_)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_string_converts_windows_separators() {
+        let path =
+            path_string(std::path::Path::new("\\workspace\\file.txt")).expect("Windows guest path");
+        assert_eq!(path, "/workspace/file.txt");
+    }
 
     #[tokio::test]
     async fn rejects_invalid_shell_cwd_before_sending_request() {
