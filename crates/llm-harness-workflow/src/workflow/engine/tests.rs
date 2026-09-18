@@ -1,6 +1,7 @@
 use super::*;
 use anyhow::Result; // StepExecutor::execute returns anyhow::Result
 use futures::future::BoxFuture;
+use llm_harness_loop::LlmClient;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_platform::env::EnvFactory;
 use llm_harness_subagents::spawner::JsonlSessionFactory;
@@ -28,14 +29,7 @@ async fn free_task_smoke_succeeds() {
     let client = Arc::new(MockLlmClient::new(vec![MockResponse::text(
         "The answer is 42.",
     )]));
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new_free_task("what is 6*7?".into(), vec![], config).unwrap();
     assert_eq!(engine.state().await, WorkflowStatus::Idle);
     let result = engine.run().await.unwrap();
@@ -880,14 +874,7 @@ async fn multi_step_linear_workflow() {
             })
         }
     }
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge)).unwrap();
     let result = engine.run().await.unwrap();
     assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
@@ -1572,14 +1559,7 @@ async fn transition_fail_marks_task_failed() {
             })
         }
     }
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(workflow, config, Arc::new(FailingJudge)).unwrap();
 
     let err = engine.run().await.unwrap_err();
@@ -1728,14 +1708,7 @@ async fn step_policy_retries_executor_failure() {
         )],
         edges: vec![],
     };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
         .unwrap()
         .with_executor(
@@ -1777,14 +1750,7 @@ async fn step_policy_times_out_blocking_executor() {
         ],
         edges: vec![],
     };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
         .unwrap()
         .with_executor("blocking", Arc::new(BlockingExecutor));
@@ -1804,14 +1770,7 @@ async fn unregistered_executor_fails_task() {
         steps: vec![Step::executor("exec", "Executor Step", "missing", None)],
         edges: vec![],
     };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
 
     let err = engine.run().await.unwrap_err();
@@ -1832,14 +1791,7 @@ async fn cancel_executor_step_marks_task_cancelled() {
         steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
         edges: vec![],
     };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = Arc::new(
         WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
             .unwrap()
@@ -1953,14 +1905,7 @@ async fn cancel_llm_step_discards_partial_result() {
     );
     let client = Arc::new(MockLlmClient::new(vec![response]));
     let call_count = client.call_count.clone();
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = Arc::new(
         WorkflowEngine::new_free_task(
             "stream partial then block".into(),
@@ -2086,14 +2031,7 @@ async fn executor_writes_context_and_downstream_reads_it() {
             })
         }
     }
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge))
         .unwrap()
         .with_executor("ctx_writer", Arc::new(ContextWriter))
@@ -2147,14 +2085,7 @@ async fn context_survives_crash_recovery() {
             })
         }
     }
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(workflow, config, Arc::new(LinearJudge))
         .unwrap()
         .with_executor("ctx_writer", Arc::new(ContextWriter))
@@ -2566,14 +2497,7 @@ async fn restore_from_step_target_not_in_workflow() {
     store.save_workflow_state(&task_id, &state).await.unwrap();
 
     let client = Arc::new(MockLlmClient::new(vec![]));
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let result = WorkflowEngine::restore_from_step(
         store,
         task_id,
@@ -2634,14 +2558,7 @@ async fn restore_from_step_target_not_in_history() {
     // 设计变更后：target step 不在 step_history 返回 StepNotInHistory，
     // 构造器本身失败，不执行 run()。使用 NoopJudge 和空 MockLlmClient。
     let client = Arc::new(MockLlmClient::new(vec![]));
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let result =
         WorkflowEngine::restore_from_step(store, task_id, "s3", config, Arc::new(NoopJudge)).await;
     let err = match result {
@@ -2714,14 +2631,7 @@ async fn restore_from_step_context_not_rolled_back() {
         }
     }
     let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("s2 redo")]));
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::restore_from_step(
         store,
         task_id,
@@ -2777,14 +2687,7 @@ async fn restore_from_step_persists_truncated_state() {
     store.save_workflow_state(&task_id, &state).await.unwrap();
 
     let client = Arc::new(MockLlmClient::new(vec![]));
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let _engine = WorkflowEngine::restore_from_step(
         store.clone(),
         task_id.clone(),
@@ -2854,14 +2757,7 @@ async fn restore_from_step_rposition_truncates_last_occurrence() {
     store.save_workflow_state(&task_id, &state).await.unwrap();
 
     let client = Arc::new(MockLlmClient::new(vec![]));
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine =
         WorkflowEngine::restore_from_step(store, task_id, "s2", config, Arc::new(NoopJudge))
             .await
@@ -2932,14 +2828,7 @@ async fn restore_from_step_from_running_status_sets_paused() {
     store.save_workflow_state(&task_id, &state).await.unwrap();
 
     let client = Arc::new(MockLlmClient::new(vec![]));
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine =
         WorkflowEngine::restore_from_step(store, task_id, "s2", config, Arc::new(NoopJudge))
             .await
@@ -2991,14 +2880,7 @@ async fn restore_from_step_to_entry_step_clears_history() {
     store.save_workflow_state(&task_id, &state).await.unwrap();
 
     let client = Arc::new(MockLlmClient::new(vec![]));
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine =
         WorkflowEngine::restore_from_step(store, task_id, "s1", config, Arc::new(NoopJudge))
             .await
@@ -3304,14 +3186,7 @@ async fn structured_step_fails_when_provider_lacks_json_schema() {
 async fn llm_step_session_lands_in_task_step_attempt_dir() {
     let dir = tempfile::TempDir::new().unwrap();
     let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("done")]));
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new_free_task("do work".into(), vec![], config).unwrap();
     let _ = engine.run().await.unwrap();
 
@@ -3395,14 +3270,7 @@ async fn retry_creates_separate_attempt_dirs() {
             condition: None,
         }],
     };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(workflow, config, Arc::new(RetryOnceJudge)).unwrap();
     let _ = engine.run().await.unwrap();
 
@@ -3459,14 +3327,7 @@ async fn policy_retry_creates_separate_attempt_dirs() {
         ],
         edges: vec![],
     };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge)).unwrap();
     let _ = engine.run().await.unwrap();
 
@@ -3525,14 +3386,7 @@ async fn executor_step_creates_no_session_dir() {
         steps: vec![Step::executor("exec", "Exec", "noop", None)],
         edges: vec![],
     };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(workflow, config, Arc::new(NoopJudge))
         .unwrap()
         .with_executor("noop", Arc::new(NoopExecutor));
@@ -4265,14 +4119,7 @@ async fn finalizing_executor_completes_after_step_timeout() {
 async fn text_delta_events_forwarded_to_subscribers() {
     let dir = tempfile::TempDir::new().unwrap();
     let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("Hello world!")]));
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine =
         Arc::new(WorkflowEngine::new_free_task("say hello".into(), vec![], config).unwrap());
     let mut rx = engine.subscribe();
@@ -4331,14 +4178,7 @@ async fn thinking_delta_events_forwarded_to_subscribers() {
         "Let me think...",
         "The answer.",
     )]));
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine =
         Arc::new(WorkflowEngine::new_free_task("think and answer".into(), vec![], config).unwrap());
     let mut rx = engine.subscribe();
@@ -4390,14 +4230,7 @@ async fn thinking_delta_events_forwarded_to_subscribers() {
 async fn text_delta_channel_full_does_not_block_step() {
     let dir = tempfile::TempDir::new().unwrap();
     let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("Done.")]));
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new_free_task("just respond".into(), vec![], config).unwrap();
     // Intentionally do NOT subscribe — broadcast send with 0 receivers returns Ok(0).
     let result = engine.run().await.unwrap();
@@ -4421,7 +4254,7 @@ async fn text_delta_channel_full_does_not_block_step() {
 async fn retry_with_loop_config_jumps_to_target_stage() {
     use parking_lot::Mutex;
 
-    let visited: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let visited = visit_log();
 
     /// Judge: records each decision. `check` returns Retry (activating its
     /// LoopConfig); the loop head `run` advances to `check` on success;
@@ -4466,17 +4299,7 @@ async fn retry_with_loop_config_jumps_to_target_stage() {
         entry_step: "run".into(),
         steps: vec![
             Step::llm("run", "Run", "do work", vec![]),
-            Step::llm("check", "Check", "validate", vec![]).with_policy(StepExecutionPolicy {
-                timeout_ms: None,
-                max_attempts: None,
-                retry_backoff_ms: None,
-                cache: None,
-                r#loop: Some(LoopConfig {
-                    max_iterations: 5,
-                    target_stage: Some("run".into()),
-                    exit_route: None,
-                }),
-            }),
+            loop_step("check", "Check", "validate", 5, "run", None),
             Step::Terminal {
                 id: "done".into(),
                 name: "Done".into(),
@@ -4497,14 +4320,7 @@ async fn retry_with_loop_config_jumps_to_target_stage() {
             },
         ],
     };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(
         workflow,
         config,
@@ -4535,7 +4351,7 @@ async fn retry_with_loop_config_jumps_to_target_stage() {
 async fn loop_config_early_exit_clears_counter_before_reentry() {
     use parking_lot::Mutex;
 
-    let visited: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let visited = visit_log();
 
     struct LoopJudge {
         visited: Arc<Mutex<Vec<String>>>,
@@ -4579,17 +4395,7 @@ async fn loop_config_early_exit_clears_counter_before_reentry() {
     let workflow = Workflow {
         entry_step: "check".into(),
         steps: vec![
-            Step::llm("check", "Check", "validate", vec![]).with_policy(StepExecutionPolicy {
-                timeout_ms: None,
-                max_attempts: None,
-                retry_backoff_ms: None,
-                cache: None,
-                r#loop: Some(LoopConfig {
-                    max_iterations: 1,
-                    target_stage: Some("run".into()),
-                    exit_route: None,
-                }),
-            }),
+            loop_step("check", "Check", "validate", 1, "run", None),
             Step::llm("run", "Run", "do work", vec![]),
             Step::llm("outside", "Outside", "leave loop", vec![]),
             Step::Terminal {
@@ -4623,14 +4429,7 @@ async fn loop_config_early_exit_clears_counter_before_reentry() {
         ],
     };
 
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
 
     let engine = WorkflowEngine::new(
         workflow,
@@ -4649,6 +4448,209 @@ async fn loop_config_early_exit_clears_counter_before_reentry() {
     );
 }
 
+/// Shared judge used by LoopConfig exhaustion tests: `check` ALWAYS returns
+/// Retry (the loop never exits through the judge), `run` routes back to
+/// `check`. Termination must come from LoopConfig exhaustion alone — via
+/// exit_route where one is configured, or via an explicit failure where it
+/// is not.
+struct AlwaysRetryJudge {
+    visited: Arc<parking_lot::Mutex<Vec<String>>>,
+}
+
+impl StepTransitionJudge for AlwaysRetryJudge {
+    fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+        let step_id = ctx.current_step.id().clone();
+        self.visited.lock().push(step_id.clone());
+        Box::pin(async move {
+            match step_id.as_str() {
+                "check" => Transition::Retry,
+                "run" => Transition::To("check".into()),
+                _ => Transition::Abort {
+                    reason: "end".into(),
+                },
+            }
+        })
+    }
+}
+
+/// Shared judge for To-based (route-key) loop tests: `vet` ALWAYS routes
+/// To(search) via the declarative label edge (route_key "research");
+/// `search` routes forward to vet. Termination must come from LoopConfig
+/// exhaustion alone.
+struct ResearchRouteJudge {
+    visited: Arc<parking_lot::Mutex<Vec<String>>>,
+}
+
+impl StepTransitionJudge for ResearchRouteJudge {
+    fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+        let step_id = ctx.current_step.id().clone();
+        self.visited.lock().push(step_id.clone());
+        Box::pin(async move {
+            match step_id.as_str() {
+                "vet" => Transition::To("search".into()),
+                "search" => Transition::To("vet".into()),
+                _ => Transition::Abort {
+                    reason: "end".into(),
+                },
+            }
+        })
+    }
+}
+
+/// Workflow shared by the two re-entry regression tests: run -> check
+/// --Retry--> run (cross-node loop, max_iterations=2), whose exhaustion
+/// exit_route "done" matches the Label edge to a `bridge` step that
+/// re-enters the loop; a second bridge visit routes to the terminal. The
+/// two tests pin different judge semantics over this same graph.
+fn reentry_loop_workflow() -> Workflow {
+    Workflow {
+        entry_step: "run".into(),
+        steps: vec![
+            Step::llm("run", "Run", "do work", vec![]),
+            Step::llm("check", "Check", "validate", vec![]).with_policy(StepExecutionPolicy {
+                timeout_ms: None,
+                max_attempts: None,
+                retry_backoff_ms: None,
+                cache: None,
+                r#loop: Some(LoopConfig {
+                    max_iterations: 2,
+                    target_stage: Some("run".into()),
+                    // Route key "done"; its labeled edge points at the
+                    // re-entry bridge, not the terminal — exit_route is
+                    // matched by label, not by target id.
+                    exit_route: Some("done".into()),
+                }),
+            }),
+            Step::llm("bridge", "Bridge", "re-enter loop", vec![]),
+            Step::Terminal {
+                id: "done".into(),
+                name: "Done".into(),
+                exit_code: 0,
+                message: Some("done".into()),
+            },
+        ],
+        edges: vec![
+            Edge {
+                from: "run".into(),
+                to: "check".into(),
+                condition: None,
+            },
+            // The declarative exit edge (next_on_done): check -> bridge.
+            Edge {
+                from: "check".into(),
+                to: "bridge".into(),
+                condition: Some(EdgeCondition::Label("done".into())),
+            },
+            // Normal execution path from the bridge back into the loop.
+            Edge {
+                from: "bridge".into(),
+                to: "run".into(),
+                condition: None,
+            },
+            // Bridge's second visit routes here via the judge's To("done")
+            // (labeled edge: a step may not have two unconditional edges).
+            Edge {
+                from: "bridge".into(),
+                to: "done".into(),
+                condition: Some(EdgeCondition::Label("done".into())),
+            },
+        ],
+    }
+}
+
+/// Standard WorkflowEngineConfig shared by the LoopConfig tests: every
+/// field except the mock client is identical across these tests.
+fn engine_config(base: &std::path::Path, client: Arc<dyn LlmClient>) -> WorkflowEngineConfig {
+    WorkflowEngineConfig {
+        client,
+        model: "mock-model".into(),
+        env_factory: Arc::new(TestEnvFactory),
+        session_factory: Arc::new(JsonlSessionFactory),
+        session_base_dir: base.join("sessions"),
+        customize_builder: None,
+    }
+}
+
+/// Fresh judge-visit log shared by the LoopConfig tests.
+fn visit_log() -> Arc<parking_lot::Mutex<Vec<String>>> {
+    Arc::new(parking_lot::Mutex::new(Vec::new()))
+}
+
+/// Number of times `step` appears in a visit log (observational only).
+fn visit_count(log: &Arc<parking_lot::Mutex<Vec<String>>>, step: &str) -> usize {
+    log.lock().iter().filter(|s| s.as_str() == step).count()
+}
+
+/// LLM step carrying a LoopConfig with the standard test policy (the four
+/// policy fields the engine tests never vary are `None`). The LoopConfig
+/// semantics stay visible at every call site.
+fn loop_step(
+    id: &str,
+    name: &str,
+    prompt: &str,
+    max_iterations: u32,
+    target_stage: &str,
+    exit_route: Option<&str>,
+) -> Step {
+    Step::llm(id, name, prompt, vec![]).with_policy(StepExecutionPolicy {
+        timeout_ms: None,
+        max_attempts: None,
+        retry_backoff_ms: None,
+        cache: None,
+        r#loop: Some(LoopConfig {
+            max_iterations,
+            target_stage: Some(target_stage.into()),
+            exit_route: exit_route.map(|r| r.into()),
+        }),
+    })
+}
+
+/// Search-Agent loop shape shared by the To-based LoopConfig tests:
+/// search -> vet --research--> search, vet --done--> terminal. The owner
+/// `vet` carries target_stage = "search" and exit_route = "done"; the
+/// caller supplies max_iterations explicitly.
+fn research_loop_workflow(max_iterations: u32) -> Workflow {
+    Workflow {
+        entry_step: "search".into(),
+        steps: vec![
+            Step::llm("search", "Search", "find sources", vec![]),
+            loop_step(
+                "vet",
+                "Vet",
+                "vet sources",
+                max_iterations,
+                "search",
+                Some("done"),
+            ),
+            Step::Terminal {
+                id: "done".into(),
+                name: "Done".into(),
+                exit_code: 0,
+                message: Some("done".into()),
+            },
+        ],
+        edges: vec![
+            Edge {
+                from: "search".into(),
+                to: "vet".into(),
+                condition: None,
+            },
+            // The declarative continuation edge (next_on_research -> search).
+            Edge {
+                from: "vet".into(),
+                to: "search".into(),
+                condition: Some(EdgeCondition::Label("research".into())),
+            },
+            // The declarative exit edge (next_on_done -> done terminal).
+            Edge {
+                from: "vet".into(),
+                to: "done".into(),
+                condition: Some(EdgeCondition::Label("done".into())),
+            },
+        ],
+    }
+}
+
 /// LoopConfig iteration counting must survive cross-node iterations. The
 /// counter is per LoopConfig-carrying step (persisted in WorkflowState), so
 /// `check --Retry/target_stage=run--> To(check) --> check` still accumulates.
@@ -4657,32 +4659,7 @@ async fn loop_config_early_exit_clears_counter_before_reentry() {
 /// never fired and the loop ran until max_steps (500) or the mock ran out.
 #[tokio::test]
 async fn loop_config_max_iterations_reached_across_cross_node_iterations() {
-    use parking_lot::Mutex;
-
-    let visited: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-    /// Judge: `check` ALWAYS returns Retry (the loop never exits through the
-    /// judge); `run` routes back to `check`. Exhaustion must come from
-    /// max_iterations; after it is exhausted, a LoopConfig with no
-    /// exit_route fails explicitly.
-    struct AlwaysRetryJudge {
-        visited: Arc<Mutex<Vec<String>>>,
-    }
-    impl StepTransitionJudge for AlwaysRetryJudge {
-        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
-            let step_id = ctx.current_step.id().clone();
-            self.visited.lock().push(step_id.clone());
-            Box::pin(async move {
-                match step_id.as_str() {
-                    "check" => Transition::Retry,
-                    "run" => Transition::To("check".into()),
-                    _ => Transition::Abort {
-                        reason: "end".into(),
-                    },
-                }
-            })
-        }
-    }
+    let visited = visit_log();
 
     let dir = tempfile::TempDir::new().unwrap();
     // Exactly enough responses for the expected bound: run + 3 check visits.
@@ -4698,17 +4675,7 @@ async fn loop_config_max_iterations_reached_across_cross_node_iterations() {
         entry_step: "run".into(),
         steps: vec![
             Step::llm("run", "Run", "do work", vec![]),
-            Step::llm("check", "Check", "validate", vec![]).with_policy(StepExecutionPolicy {
-                timeout_ms: None,
-                max_attempts: None,
-                retry_backoff_ms: None,
-                cache: None,
-                r#loop: Some(LoopConfig {
-                    max_iterations: 2,
-                    target_stage: Some("run".into()),
-                    exit_route: None,
-                }),
-            }),
+            loop_step("check", "Check", "validate", 2, "run", None),
         ],
         edges: vec![Edge {
             from: "run".into(),
@@ -4716,14 +4683,7 @@ async fn loop_config_max_iterations_reached_across_cross_node_iterations() {
             condition: None,
         }],
     };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(
         workflow,
         config,
@@ -4741,11 +4701,7 @@ async fn loop_config_max_iterations_reached_across_cross_node_iterations() {
     // visits 1..3 increment it, visit 3 (counter=3 > max_iterations=2)
     // exhausts the loop. With no exit_route configured the engine now
     // fails explicitly (Task 4) instead of falling through to max_retries.
-    let check_visits = visited
-        .lock()
-        .iter()
-        .filter(|s| s.as_str() == "check")
-        .count();
+    let check_visits = visit_count(&visited, "check");
     assert_eq!(
         check_visits, 3,
         "cross-node loop must reach max_iterations=2 and stop at the 3rd check visit"
@@ -4831,30 +4787,7 @@ fn workflow_state_without_loop_iterations_key_deserializes() {
 /// LoopConfig.exit_route = "done" (or "next_on_done") matches it.
 #[tokio::test]
 async fn loop_config_exit_route_terminates_after_max_iterations() {
-    use parking_lot::Mutex;
-
-    let visited: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-    /// Judge: `check` ALWAYS returns Retry; `run` routes back to `check`.
-    /// Termination must come from LoopConfig exhaustion → exit_route.
-    struct AlwaysRetryJudge {
-        visited: Arc<Mutex<Vec<String>>>,
-    }
-    impl StepTransitionJudge for AlwaysRetryJudge {
-        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
-            let step_id = ctx.current_step.id().clone();
-            self.visited.lock().push(step_id.clone());
-            Box::pin(async move {
-                match step_id.as_str() {
-                    "check" => Transition::Retry,
-                    "run" => Transition::To("check".into()),
-                    _ => Transition::Abort {
-                        reason: "end".into(),
-                    },
-                }
-            })
-        }
-    }
+    let visited = visit_log();
 
     let dir = tempfile::TempDir::new().unwrap();
     // Exactly enough responses for 3 run + 3 check visits.
@@ -4870,19 +4803,9 @@ async fn loop_config_exit_route_terminates_after_max_iterations() {
         entry_step: "run".into(),
         steps: vec![
             Step::llm("run", "Run", "do work", vec![]),
-            Step::llm("check", "Check", "validate", vec![]).with_policy(StepExecutionPolicy {
-                timeout_ms: None,
-                max_attempts: None,
-                retry_backoff_ms: None,
-                cache: None,
-                r#loop: Some(LoopConfig {
-                    max_iterations: 2,
-                    target_stage: Some("run".into()),
-                    // What Senza's stages_to_workflow produces from
-                    // "exit_route": "done" + "next_on_done": "done".
-                    exit_route: Some("done".into()),
-                }),
-            }),
+            // What Senza's stages_to_workflow produces from
+            // "exit_route": "done" + "next_on_done": "done".
+            loop_step("check", "Check", "validate", 2, "run", Some("done")),
             Step::Terminal {
                 id: "done".into(),
                 name: "Done".into(),
@@ -4904,14 +4827,7 @@ async fn loop_config_exit_route_terminates_after_max_iterations() {
             },
         ],
     };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(
         workflow,
         config,
@@ -4923,11 +4839,7 @@ async fn loop_config_exit_route_terminates_after_max_iterations() {
     .with_max_retries(0);
     let result = engine.run().await.unwrap();
 
-    let check_visits = visited
-        .lock()
-        .iter()
-        .filter(|s| s.as_str() == "check")
-        .count();
+    let check_visits = visit_count(&visited, "check");
     assert_eq!(
         check_visits, 3,
         "loop must run exactly max_iterations=2 iterations plus the final exhausting visit"
@@ -4948,30 +4860,7 @@ async fn loop_config_exit_route_terminates_after_max_iterations() {
 /// where vet's structured route_key matches the Label edge to the loop head.
 #[tokio::test]
 async fn to_based_cross_node_loop_reaches_max_iterations_and_exits() {
-    use parking_lot::Mutex;
-
-    let visited: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-    /// Judge: `vet` ALWAYS routes To(search_sources) via the declarative
-    /// label edge (route_key "research"); `search` routes forward to vet.
-    struct ResearchRouteJudge {
-        visited: Arc<Mutex<Vec<String>>>,
-    }
-    impl StepTransitionJudge for ResearchRouteJudge {
-        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
-            let step_id = ctx.current_step.id().clone();
-            self.visited.lock().push(step_id.clone());
-            Box::pin(async move {
-                match step_id.as_str() {
-                    "vet" => Transition::To("search".into()),
-                    "search" => Transition::To("vet".into()),
-                    _ => Transition::Abort {
-                        reason: "end".into(),
-                    },
-                }
-            })
-        }
-    }
+    let visited = visit_log();
 
     let dir = tempfile::TempDir::new().unwrap();
     let client = Arc::new(MockLlmClient::new(vec![
@@ -4982,56 +4871,8 @@ async fn to_based_cross_node_loop_reaches_max_iterations_and_exits() {
         MockResponse::text("search 3"),
         MockResponse::text("vet 3"),
     ]));
-    let workflow = Workflow {
-        entry_step: "search".into(),
-        steps: vec![
-            Step::llm("search", "Search", "find sources", vec![]),
-            Step::llm("vet", "Vet", "vet sources", vec![]).with_policy(StepExecutionPolicy {
-                timeout_ms: None,
-                max_attempts: None,
-                retry_backoff_ms: None,
-                cache: None,
-                r#loop: Some(LoopConfig {
-                    max_iterations: 2,
-                    target_stage: Some("search".into()),
-                    exit_route: Some("done".into()),
-                }),
-            }),
-            Step::Terminal {
-                id: "done".into(),
-                name: "Done".into(),
-                exit_code: 0,
-                message: Some("done".into()),
-            },
-        ],
-        edges: vec![
-            Edge {
-                from: "search".into(),
-                to: "vet".into(),
-                condition: None,
-            },
-            // The declarative continuation edge (next_on_research -> search).
-            Edge {
-                from: "vet".into(),
-                to: "search".into(),
-                condition: Some(EdgeCondition::Label("research".into())),
-            },
-            // The declarative exit edge (next_on_done -> done terminal).
-            Edge {
-                from: "vet".into(),
-                to: "done".into(),
-                condition: Some(EdgeCondition::Label("done".into())),
-            },
-        ],
-    };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let workflow = research_loop_workflow(2);
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(
         workflow,
         config,
@@ -5042,11 +4883,7 @@ async fn to_based_cross_node_loop_reaches_max_iterations_and_exits() {
     .unwrap();
     let result = engine.run().await.unwrap();
 
-    let vet_visits = visited
-        .lock()
-        .iter()
-        .filter(|s| s.as_str() == "vet")
-        .count();
+    let vet_visits = visit_count(&visited, "vet");
     assert_eq!(
         vet_visits, 3,
         "To-based loop must run max_iterations=2 continuations plus the exhausting visit"
@@ -5073,21 +4910,11 @@ async fn to_self_target_stage_counts_as_loop_continuation() {
     }
 
     let dir = tempfile::TempDir::new().unwrap();
-    let visits = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let visits = visit_log();
     let workflow = Workflow {
         entry_step: "check".into(),
         steps: vec![
-            Step::llm("check", "Check", "validate", vec![]).with_policy(StepExecutionPolicy {
-                timeout_ms: None,
-                max_attempts: None,
-                retry_backoff_ms: None,
-                cache: None,
-                r#loop: Some(LoopConfig {
-                    max_iterations: 1,
-                    target_stage: Some("check".into()),
-                    exit_route: Some("done".into()),
-                }),
-            }),
+            loop_step("check", "Check", "validate", 1, "check", Some("done")),
             Step::Terminal {
                 id: "done".into(),
                 name: "Done".into(),
@@ -5108,17 +4935,13 @@ async fn to_self_target_stage_counts_as_loop_continuation() {
             },
         ],
     };
-    let config = WorkflowEngineConfig {
-        client: Arc::new(MockLlmClient::new(vec![
+    let config = engine_config(
+        dir.path(),
+        Arc::new(MockLlmClient::new(vec![
             MockResponse::text("check 1"),
             MockResponse::text("check 2"),
         ])),
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    );
     let engine = WorkflowEngine::new(
         workflow,
         config,
@@ -5132,6 +4955,590 @@ async fn to_self_target_stage_counts_as_loop_continuation() {
     let result = engine.run().await.unwrap();
     assert_eq!(result.final_message.as_deref(), Some("done"));
     assert_eq!(visits.lock().len(), 2);
+}
+/// max_iterations = 0 regression (off-by-one guard): zero continuations are
+/// permitted, so the FIRST continuation attempt — `check`'s very first
+/// Retry — must immediately exhaust the loop and follow `exit_route` to the
+/// terminal. A buggy engine that grants one continuation for
+/// max_iterations=0 (e.g. counter seeded at 0 instead of 1) would re-run
+/// `run` + `check` before exiting; the exact visit-order assertion below
+/// pins the correct behavior: each step executes exactly once.
+#[tokio::test]
+async fn loop_config_max_iterations_zero_exits_on_first_continuation() {
+    let visited = visit_log();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    // Exactly enough responses for ONE run + ONE check visit: any extra
+    // loop continuation runs the mock dry and fails the test.
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("run 1"),
+        MockResponse::text("check 1"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "run".into(),
+        steps: vec![
+            Step::llm("run", "Run", "do work", vec![]),
+            // What Senza's stages_to_workflow produces from
+            // "exit_route": "done" + "next_on_done": "done".
+            loop_step("check", "Check", "validate", 0, "run", Some("done")),
+            Step::Terminal {
+                id: "done".into(),
+                name: "Done".into(),
+                exit_code: 0,
+                message: Some("done".into()),
+            },
+        ],
+        edges: vec![
+            Edge {
+                from: "run".into(),
+                to: "check".into(),
+                condition: None,
+            },
+            // The declarative exit edge (from next_on_done in Senza).
+            Edge {
+                from: "check".into(),
+                to: "done".into(),
+                condition: Some(EdgeCondition::Label("done".into())),
+            },
+        ],
+    };
+    let config = engine_config(dir.path(), client);
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(AlwaysRetryJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_max_retries(0);
+    let result = engine.run().await.unwrap();
+
+    // Off-by-one guard: the first continuation attempt (the Retry) must
+    // exhaust immediately — no second run/check pass may happen.
+    let order = visited.lock().clone();
+    assert_eq!(
+        order,
+        vec!["run".to_string(), "check".to_string()],
+        "max_iterations=0 allows zero continuations: first Retry attempt must exhaust; got {order:?}"
+    );
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Succeeded,
+        "with a valid exit_route, exhaustion must take that route immediately"
+    );
+    // TaskResult comes from the Terminal short-circuit (exit_code 0).
+    assert_eq!(result.final_message.as_deref(), Some("done"));
+    // Counter cleanup: exhaustion must clear `check`'s persisted counter.
+    let state = engine.workflow_state.lock().await.clone();
+    assert!(
+        state.loop_iterations.is_empty(),
+        "exhaustion must clear the step's loop counter; got {:?}",
+        state.loop_iterations
+    );
+    // Crash-recovery contract: the exhausting visit persists the exit jump
+    // (the terminal appends its own record afterwards, so look at `check`'s).
+    let history = engine.step_history().await;
+    assert_eq!(history.last().unwrap().step_id, "done");
+    let check_record = history
+        .iter()
+        .rev()
+        .find(|r| r.step_id.as_str() == "check")
+        .unwrap();
+    assert!(matches!(
+        &check_record.transition,
+        Transition::To(target) if target == "done"
+    ));
+}
+
+/// max_iterations = 0 with NO exit_route: the first continuation attempt
+/// must exhaust and fail explicitly (TaskFailed naming the missing
+/// exit_route) — never fall through to max_retries (0 here) and never loop
+/// unbounded.
+#[tokio::test]
+async fn loop_config_max_iterations_zero_without_exit_route_fails_explicitly() {
+    let visited = visit_log();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    // Exactly 2 responses: one run + one check. An unbounded loop would
+    // run the mock dry; a max_retries fall-through would show the
+    // "max_retries (0) exceeded" message instead.
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("run 1"),
+        MockResponse::text("check 1"),
+    ]));
+    // No Terminal step: with exit_route = None nothing may reach one, and
+    // the workflow legitimately ends in Failed status after exhaustion.
+    let workflow = Workflow {
+        entry_step: "run".into(),
+        steps: vec![
+            Step::llm("run", "Run", "do work", vec![]),
+            loop_step("check", "Check", "validate", 0, "run", None),
+        ],
+        edges: vec![Edge {
+            from: "run".into(),
+            to: "check".into(),
+            condition: None,
+        }],
+    };
+    let config = engine_config(dir.path(), client);
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(AlwaysRetryJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_max_retries(0);
+    let run = engine.run().await;
+
+    // The loop must exhaust explicitly on the FIRST continuation attempt.
+    let check_visits = visit_count(&visited, "check");
+    assert_eq!(
+        check_visits, 1,
+        "first continuation attempt must exhaust: check must execute exactly once"
+    );
+    match &run {
+        Err(WorkflowError::TaskFailed(msg)) => {
+            assert!(
+                msg.contains("no exit_route configured"),
+                "exhaustion without exit_route must fail explicitly; got: {msg}"
+            );
+            assert!(
+                msg.contains("exhausted (0 iterations)"),
+                "error must name the exhausted max_iterations=0 config; got: {msg}"
+            );
+        }
+        other => panic!("expected TaskFailed from loop exhaustion, got {other:?}"),
+    }
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Failed,
+        "exhaustion without exit_route must fail the workflow"
+    );
+    // Counter cleanup: even the failing exhaustion clears the counter.
+    let state = engine.workflow_state.lock().await.clone();
+    assert!(
+        state.loop_iterations.is_empty(),
+        "failing exhaustion must still clear the step's loop counter; got {:?}",
+        state.loop_iterations
+    );
+}
+
+/// To-based (route-key) max_iterations = 0: `vet`'s first To(search)
+/// continuation attempt is also its FIRST, so it must exhaust immediately
+/// and follow exit_route — mirroring the Retry path. Search Agent shape:
+/// search_sources -> vet_sources --route_key=research--> search_sources ...
+#[tokio::test]
+async fn to_based_loop_max_iterations_zero_exits_on_first_continuation() {
+    let visited = visit_log();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    // Exactly 2 responses: one search + one vet. Any To-loop continuation
+    // would run the mock dry and fail the test.
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("search 1"),
+        MockResponse::text("vet 1"),
+    ]));
+    let workflow = research_loop_workflow(0);
+    let config = engine_config(dir.path(), client);
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(ResearchRouteJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap();
+    let result = engine.run().await.unwrap();
+
+    // First To(search) continuation attempt must exhaust immediately.
+    let order = visited.lock().clone();
+    assert_eq!(
+        order,
+        vec!["search".to_string(), "vet".to_string()],
+        "To-based max_iterations=0 allows zero continuations: first To attempt must exhaust; got {order:?}"
+    );
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Succeeded,
+        "with a valid exit_route, exhaustion must take that route immediately"
+    );
+    assert_eq!(result.final_message.as_deref(), Some("done"));
+    // Counter cleanup + persisted exit jump on the exhausting vet record.
+    let state = engine.workflow_state.lock().await.clone();
+    assert!(
+        state.loop_iterations.is_empty(),
+        "exhaustion must clear the step's loop counter; got {:?}",
+        state.loop_iterations
+    );
+    let history = engine.step_history().await;
+    assert_eq!(history.last().unwrap().step_id, "done");
+    let vet_record = history
+        .iter()
+        .rev()
+        .find(|r| r.step_id.as_str() == "vet")
+        .unwrap();
+    assert!(matches!(
+        &vet_record.transition,
+        Transition::To(target) if target == "done"
+    ));
+}
+
+/// Exhaustion → exit → re-entry: after a LoopConfig episode fully exhausts
+/// (max_iterations=2 consumed) and leaves via `exit_route`, a later
+/// re-entry of the SAME owner step through normal workflow execution must
+/// receive a completely fresh budget — the exhausting exit cleared the
+/// persisted counter (`WorkflowState.loop_iterations`). A leaked counter
+/// would make episode 2 exhaust on its FIRST continuation attempt; the
+/// exact per-episode visit counts and persisted transitions below pin the
+/// fresh-budget behavior.
+#[tokio::test]
+async fn exhausted_loop_reentry_gets_fresh_budget() {
+    let visited = visit_log();
+
+    /// Judge: `check` ALWAYS returns Retry (exhaustion must come from the
+    /// LoopConfig, not the judge); `run` advances to `check`; `bridge`
+    /// re-enters the loop on its first visit and terminates on its second —
+    /// this is what drives the two episodes through ordinary execution.
+    struct ReentryJudge {
+        visited: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+    impl StepTransitionJudge for ReentryJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            let mut guard = self.visited.lock();
+            guard.push(step_id.clone());
+            let bridge_visits = guard.iter().filter(|s| s.as_str() == "bridge").count();
+            drop(guard);
+            Box::pin(async move {
+                match step_id.as_str() {
+                    "run" => Transition::To("check".into()),
+                    "check" => Transition::Retry,
+                    "bridge" if bridge_visits >= 2 => Transition::To("done".into()),
+                    "bridge" => Transition::To("run".into()),
+                    _ => Transition::Abort {
+                        reason: "end".into(),
+                    },
+                }
+            })
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    // Exactly enough responses for both episodes: per episode 3× run +
+    // 3× check (2 continuations + the exhausting attempt) + 1× bridge.
+    // Any extra continuation runs the mock dry and fails the test.
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("run 1"),
+        MockResponse::text("check 1"),
+        MockResponse::text("run 2"),
+        MockResponse::text("check 2"),
+        MockResponse::text("run 3"),
+        MockResponse::text("check 3"),
+        MockResponse::text("bridge 1"),
+        MockResponse::text("run 4"),
+        MockResponse::text("check 4"),
+        MockResponse::text("run 5"),
+        MockResponse::text("check 5"),
+        MockResponse::text("run 6"),
+        MockResponse::text("check 6"),
+        MockResponse::text("bridge 2"),
+    ]));
+    let workflow = reentry_loop_workflow();
+    let config = engine_config(dir.path(), client);
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(ReentryJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap();
+    let result = engine.run().await.unwrap();
+
+    // Exact visit order: per episode [run, check] ×3 (2 continuations +
+    // the exhausting attempt), then the exit bridge. Episode 2 repeating
+    // the full shape is the fresh-budget proof — a leaked counter would
+    // exhaust it after a single [run, check].
+    let order = visited.lock().clone();
+    let mut expected: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        for _ in 0..3 {
+            expected.push("run".into());
+            expected.push("check".into());
+        }
+        expected.push("bridge".into());
+    }
+    assert_eq!(
+        order, expected,
+        "each episode must consume the FULL max_iterations=2 budget before exiting; got {order:?}"
+    );
+
+    // Per-episode budget: 3 check visits in BOTH episodes.
+    let first_bridge = order.iter().position(|s| s == "bridge").unwrap();
+    let ep1_checks = order[..first_bridge]
+        .iter()
+        .filter(|s| s.as_str() == "check")
+        .count();
+    let ep2_checks = order[first_bridge..]
+        .iter()
+        .filter(|s| s.as_str() == "check")
+        .count();
+    assert_eq!(
+        ep1_checks, 3,
+        "episode 1 must exhaust: 2 continuations + the exhausting attempt"
+    );
+    assert_eq!(
+        ep2_checks, 3,
+        "episode 2 must receive a completely fresh budget of 2 continuations"
+    );
+
+    // Final workflow state: exit_route led both episodes to the bridge and
+    // the second bridge visit routed to the terminal.
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Succeeded,
+        "both exhausted episodes must leave via exit_route and finish at the terminal"
+    );
+    assert_eq!(result.final_message.as_deref(), Some("done"));
+
+    // Counter cleanup: after the final exit no stale counter may remain.
+    let state = engine.workflow_state.lock().await.clone();
+    assert!(
+        state.loop_iterations.is_empty(),
+        "final exhaustion must clear the persisted counter; got {:?}",
+        state.loop_iterations
+    );
+
+    // Persisted transitions: per episode the check records must read
+    // [To("run"), To("run"), To("bridge")] — continuations jump to
+    // target_stage, the exhausting visit persists the exit jump (its route
+    // LABEL is "done" but the matched edge's target is "bridge").
+    let expected_transitions = ["run", "run", "bridge", "run", "run", "bridge"];
+    for (record, expected_target) in state
+        .step_history
+        .iter()
+        .filter(|r| r.step_id.as_str() == "check")
+        .zip(expected_transitions)
+    {
+        assert!(
+            matches!(
+                &record.transition,
+                Transition::To(t) if t == expected_target
+            ),
+            "check record must persist To({expected_target:?}), got {:?}",
+            record.transition
+        );
+    }
+}
+
+#[tokio::test]
+async fn immediate_exit_loop_reentry_gets_fresh_budget() {
+    let visited = visit_log();
+
+    /// Judge: `check` exits NORMALLY on its very first visit (To the bridge,
+    /// no Retry) — a normal exit must never create a loop_iterations counter.
+    /// On re-entry (episode 2) `check` always Retries; exhaustion must come
+    /// from the LoopConfig counter alone, proving the re-entry got a fresh
+    /// full budget. `run` advances to `check`; `bridge` re-enters the loop on
+    /// its first visit and terminates on its second — this drives both
+    /// episodes through ordinary execution.
+    struct ImmediateExitJudge {
+        visited: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+    impl StepTransitionJudge for ImmediateExitJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            let mut guard = self.visited.lock();
+            guard.push(step_id.clone());
+            let check_visits = guard.iter().filter(|s| s.as_str() == "check").count();
+            let bridge_visits = guard.iter().filter(|s| s.as_str() == "bridge").count();
+            drop(guard);
+            Box::pin(async move {
+                match step_id.as_str() {
+                    "run" => Transition::To("check".into()),
+                    // Immediate normal exit: bridge is NOT target_stage, so
+                    // this To() must be treated as a plain exit — no counter.
+                    "check" if check_visits == 1 => Transition::To("bridge".into()),
+                    // Episode 2: full budget must be available again.
+                    "check" => Transition::Retry,
+                    "bridge" if bridge_visits >= 2 => Transition::To("done".into()),
+                    "bridge" => Transition::To("run".into()),
+                    _ => Transition::Abort {
+                        reason: "end".into(),
+                    },
+                }
+            })
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    // Exactly enough responses for both episodes: episode 1 = run + check +
+    // bridge (immediate exit), episode 2 = (run + check) ×3 (2 continuations
+    // + the exhausting attempt) + bridge. Any extra continuation runs the
+    // mock dry and fails the test.
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("run 1"),
+        MockResponse::text("check 1"),
+        MockResponse::text("bridge 1"),
+        MockResponse::text("run 2"),
+        MockResponse::text("check 2"),
+        MockResponse::text("run 3"),
+        MockResponse::text("check 3"),
+        MockResponse::text("run 4"),
+        MockResponse::text("check 4"),
+        MockResponse::text("bridge 2"),
+    ]));
+    let workflow = reentry_loop_workflow();
+    let config = engine_config(dir.path(), client);
+    let recorder = LoopCounterRecorder {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        gate_step: "bridge",
+        snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
+    };
+    let store: Arc<dyn TaskStore> = Arc::new(recorder.clone());
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(ImmediateExitJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_task_store(store);
+    let result = engine.run().await.unwrap();
+
+    // Exact visit order: episode 1 exits immediately (run, check, bridge —
+    // no continuation); episode 2 repeats [run, check] ×3 (2 continuations +
+    // the exhausting attempt), then the exit bridge. The full episode-2
+    // shape is the fresh-budget proof — a leaked counter would exhaust it
+    // after a single [run, check].
+    let order = visited.lock().clone();
+    let expected: Vec<String> = [
+        "run", "check", "bridge", "run", "check", "run", "check", "run", "check", "bridge",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        order, expected,
+        "episode 1 must exit with zero continuations; episode 2 must consume \
+         the FULL max_iterations=2 budget; got {order:?}"
+    );
+
+    // Per-episode budget: 1 check visit in episode 1 (immediate normal
+    // exit), 3 in episode 2.
+    let first_bridge = order.iter().position(|s| s == "bridge").unwrap();
+    let ep1_checks = order[..first_bridge]
+        .iter()
+        .filter(|s| s.as_str() == "check")
+        .count();
+    let ep2_checks = order[first_bridge..]
+        .iter()
+        .filter(|s| s.as_str() == "check")
+        .count();
+    assert_eq!(
+        ep1_checks, 1,
+        "episode 1 must exit on the very first check visit, with zero loop iterations"
+    );
+    assert_eq!(
+        ep2_checks, 3,
+        "episode 2 must receive a completely fresh budget of 2 continuations"
+    );
+
+    // Mid-run counter observation: no non-empty loop_iterations map may ever
+    // be persisted during episode 1 — the normal To() exit must not create
+    // a counter.
+    // (recorder snapshots: gate == false means no bridge record yet, i.e.
+    // still inside episode 1)
+    assert!(
+        recorder
+            .snapshots
+            .lock()
+            .iter()
+            .all(|(gate, counters)| *gate || counters.is_empty()),
+        "a loop_iterations counter was persisted during episode 1 despite the \
+         immediate normal exit"
+    );
+
+    // Final workflow state: the immediate exit led episode 1 to the bridge,
+    // the bridge re-entered the loop, and the second bridge visit routed to
+    // the terminal after episode 2 exhausted its fresh budget.
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Succeeded,
+        "the immediate-exit episode must leave via exit_route and the re-entry \
+         episode must finish at the terminal"
+    );
+    assert_eq!(result.final_message.as_deref(), Some("done"));
+
+    // Counter cleanup: after the final exit no stale counter may remain.
+    let state = engine.workflow_state.lock().await.clone();
+    assert!(
+        state.loop_iterations.is_empty(),
+        "final exhaustion must clear the persisted counter; got {:?}",
+        state.loop_iterations
+    );
+
+    // Persisted transitions: the four check records must read
+    // [To("bridge"), To("run"), To("run"), To("bridge")] — episode 1's
+    // normal exit persists the judge's plain jump; episode 2's two
+    // continuations overwrite to target_stage; the exhausting visit
+    // persists the exit jump (its route LABEL is "done" but the matched
+    // edge's target is "bridge").
+    let expected_transitions = ["bridge", "run", "run", "bridge"];
+    for (record, expected_target) in state
+        .step_history
+        .iter()
+        .filter(|r| r.step_id.as_str() == "check")
+        .zip(expected_transitions)
+    {
+        assert!(
+            matches!(
+                &record.transition,
+                Transition::To(t) if t == expected_target
+            ),
+            "check record must persist To({expected_target:?}), got {:?}",
+            record.transition
+        );
+    }
+}
+
+/// Shared handle for the recorded `loop_iterations` snapshots: each entry
+/// is `(gate_fired, sorted counter map)` observed at one persisted save.
+type LoopCounterSnapshots = Arc<parking_lot::Mutex<Vec<(bool, Vec<(String, u32)>)>>>;
+
+/// TaskStore wrapper that snapshots the `loop_iterations` map at every
+/// persisted state save as `(gate_fired, sorted counters)`: `gate_fired`
+/// records whether a completed record for `gate_step` already exists in
+/// `step_history` at save time. Tests assert over these mid-run snapshots
+/// to observe transient counter state that final-state assertions cannot
+/// distinguish (a counter seeded and later overwritten, or a counter
+/// leaked into a later loop episode).
+#[derive(Clone)]
+struct LoopCounterRecorder {
+    inner: Arc<JsonlTaskStore>,
+    gate_step: &'static str,
+    snapshots: LoopCounterSnapshots,
+}
+
+impl LoopCounterRecorder {
+    /// Delegating `save_workflow_state` that records the snapshot.
+    fn observe(&self, state: &WorkflowState) {
+        let gate_fired = state
+            .step_history
+            .iter()
+            .any(|r| r.step_id.as_str() == self.gate_step);
+        let mut counters = state
+            .loop_iterations
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect::<Vec<_>>();
+        counters.sort();
+        self.snapshots.lock().push((gate_fired, counters));
+    }
 }
 
 struct CrashAfterStateSaveStore {
@@ -5232,49 +5639,101 @@ impl TaskStore for CrashAfterStateSaveStore {
     }
 }
 
+impl TaskStore for LoopCounterRecorder {
+    fn load_workflow_state(
+        &self,
+        task_id: &TaskId,
+    ) -> BoxFuture<'_, Result<Option<WorkflowState>>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.load_workflow_state(&task_id).await })
+    }
+
+    fn save_workflow_state(
+        &self,
+        task_id: &TaskId,
+        state: &WorkflowState,
+    ) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        let state = state.clone();
+        let recorder = self.clone();
+        Box::pin(async move {
+            inner.save_workflow_state(&task_id, &state).await?;
+            recorder.observe(&state);
+            Ok(())
+        })
+    }
+
+    fn load_workflow(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Option<Workflow>>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.load_workflow(&task_id).await })
+    }
+
+    fn save_workflow(&self, task_id: &TaskId, workflow: &Workflow) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        let workflow = workflow.clone();
+        Box::pin(async move { inner.save_workflow(&task_id, &workflow).await })
+    }
+
+    fn list_checkpoints(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Vec<Checkpoint>>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.list_checkpoints(&task_id).await })
+    }
+
+    fn save_checkpoint(
+        &self,
+        task_id: &TaskId,
+        checkpoint: &Checkpoint,
+    ) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        let checkpoint = checkpoint.clone();
+        Box::pin(async move { inner.save_checkpoint(&task_id, &checkpoint).await })
+    }
+
+    fn load_event_wait(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Option<EventWaitRecord>>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.load_event_wait(&task_id).await })
+    }
+
+    fn save_event_wait(
+        &self,
+        task_id: &TaskId,
+        descriptor: &serde_json::Value,
+    ) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        let descriptor = descriptor.clone();
+        Box::pin(async move { inner.save_event_wait(&task_id, &descriptor).await })
+    }
+
+    fn clear_event_wait(&self, task_id: &TaskId) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.clear_event_wait(&task_id).await })
+    }
+
+    fn delete(&self, task_id: &TaskId) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.delete(&task_id).await })
+    }
+
+    fn list_tasks(&self) -> BoxFuture<'_, Result<Vec<TaskSummary>>> {
+        let inner = self.inner.clone();
+        Box::pin(async move { inner.list_tasks().await })
+    }
+}
+
 #[tokio::test]
 async fn to_loop_exit_route_survives_crash_after_transition_persist() {
     let dir = tempfile::TempDir::new().unwrap();
-    let workflow = Workflow {
-        entry_step: "search".into(),
-        steps: vec![
-            Step::llm("search", "Search", "find sources", vec![]),
-            Step::llm("vet", "Vet", "vet sources", vec![]).with_policy(StepExecutionPolicy {
-                timeout_ms: None,
-                max_attempts: None,
-                retry_backoff_ms: None,
-                cache: None,
-                r#loop: Some(LoopConfig {
-                    max_iterations: 1,
-                    target_stage: Some("search".into()),
-                    exit_route: Some("done".into()),
-                }),
-            }),
-            Step::Terminal {
-                id: "done".into(),
-                name: "Done".into(),
-                exit_code: 0,
-                message: Some("done".into()),
-            },
-        ],
-        edges: vec![
-            Edge {
-                from: "search".into(),
-                to: "vet".into(),
-                condition: None,
-            },
-            Edge {
-                from: "vet".into(),
-                to: "search".into(),
-                condition: Some(EdgeCondition::Label("research".into())),
-            },
-            Edge {
-                from: "vet".into(),
-                to: "done".into(),
-                condition: Some(EdgeCondition::Label("done".into())),
-            },
-        ],
-    };
+    let workflow = research_loop_workflow(1);
 
     struct ResearchRouteJudge;
     impl StepTransitionJudge for ResearchRouteJudge {
@@ -5322,20 +5781,16 @@ async fn to_loop_exit_route_survives_crash_after_transition_persist() {
                     .is_some_and(|record| record.step_id == "vet")
         }),
     });
-    let config = WorkflowEngineConfig {
-        client: Arc::new(MockLlmClient::new(vec![
+    let config = engine_config(
+        dir.path(),
+        Arc::new(MockLlmClient::new(vec![
             MockResponse::text("search 1"),
             MockResponse::text("vet 1"),
             MockResponse::text("search 2"),
             MockResponse::text("vet 2"),
             MockResponse::text("unexpected search after restore"),
         ])),
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    );
     let engine = WorkflowEngine::new(workflow, config, Arc::new(ResearchRouteJudge))
         .unwrap()
         .with_task_store(crash_store);
@@ -5356,16 +5811,12 @@ async fn to_loop_exit_route_survives_crash_after_transition_persist() {
     let restored = WorkflowEngine::restore(
         inner_store,
         task_id,
-        WorkflowEngineConfig {
-            client: Arc::new(MockLlmClient::new(vec![MockResponse::text(
+        engine_config(
+            dir.path(),
+            Arc::new(MockLlmClient::new(vec![MockResponse::text(
                 "unexpected search after restore",
             )])),
-            model: "mock-model".into(),
-            env_factory: Arc::new(TestEnvFactory),
-            session_factory: Arc::new(JsonlSessionFactory),
-            session_base_dir: dir.path().join("sessions"),
-            customize_builder: None,
-        },
+        ),
         Arc::new(SearchAbortJudge),
     )
     .await
@@ -5384,17 +5835,7 @@ async fn retry_loop_target_survives_crash_after_continuation_persist() {
     let workflow = Workflow {
         entry_step: "check".into(),
         steps: vec![
-            Step::llm("check", "Check", "validate", vec![]).with_policy(StepExecutionPolicy {
-                timeout_ms: None,
-                max_attempts: None,
-                retry_backoff_ms: None,
-                cache: None,
-                r#loop: Some(LoopConfig {
-                    max_iterations: 2,
-                    target_stage: Some("run".into()),
-                    exit_route: Some("done".into()),
-                }),
-            }),
+            loop_step("check", "Check", "validate", 2, "run", Some("done")),
             Step::llm("run", "Run", "do work", vec![]),
             Step::Terminal {
                 id: "done".into(),
@@ -5458,18 +5899,14 @@ async fn retry_loop_target_survives_crash_after_continuation_persist() {
                     .is_some_and(|record| record.step_id == "check")
         }),
     });
-    let config = WorkflowEngineConfig {
-        client: Arc::new(MockLlmClient::new(vec![
+    let config = engine_config(
+        dir.path(),
+        Arc::new(MockLlmClient::new(vec![
             MockResponse::text("check 1"),
             MockResponse::text("run 1"),
             MockResponse::text("check 2"),
         ])),
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    );
     let engine = WorkflowEngine::new(workflow, config, Arc::new(RetryThenDoneJudge))
         .unwrap()
         .with_task_store(crash_store);
@@ -5491,17 +5928,13 @@ async fn retry_loop_target_survives_crash_after_continuation_persist() {
     let restored = WorkflowEngine::restore(
         inner_store,
         task_id,
-        WorkflowEngineConfig {
-            client: Arc::new(MockLlmClient::new(vec![
+        engine_config(
+            dir.path(),
+            Arc::new(MockLlmClient::new(vec![
                 MockResponse::text("run 1"),
                 MockResponse::text("check 2"),
             ])),
-            model: "mock-model".into(),
-            env_factory: Arc::new(TestEnvFactory),
-            session_factory: Arc::new(JsonlSessionFactory),
-            session_base_dir: dir.path().join("sessions"),
-            customize_builder: None,
-        },
+        ),
         Arc::new(RetryThenDoneJudge),
     )
     .await
@@ -5545,7 +5978,7 @@ fn unrelated_to_to_same_target_does_not_count_as_loop_iteration() {
 async fn mixed_retry_and_to_continuation_share_one_counter() {
     use parking_lot::Mutex;
 
-    let visited: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let visited = visit_log();
 
     /// Judge: alternates Retry / To(search) on `vet` by visit count.
     struct AlternatingJudge {
@@ -5581,54 +6014,8 @@ async fn mixed_retry_and_to_continuation_share_one_counter() {
         MockResponse::text("search 3"),
         MockResponse::text("vet 3"),
     ]));
-    let workflow = Workflow {
-        entry_step: "search".into(),
-        steps: vec![
-            Step::llm("search", "Search", "find sources", vec![]),
-            Step::llm("vet", "Vet", "vet sources", vec![]).with_policy(StepExecutionPolicy {
-                timeout_ms: None,
-                max_attempts: None,
-                retry_backoff_ms: None,
-                cache: None,
-                r#loop: Some(LoopConfig {
-                    max_iterations: 2,
-                    target_stage: Some("search".into()),
-                    exit_route: Some("done".into()),
-                }),
-            }),
-            Step::Terminal {
-                id: "done".into(),
-                name: "Done".into(),
-                exit_code: 0,
-                message: Some("done".into()),
-            },
-        ],
-        edges: vec![
-            Edge {
-                from: "search".into(),
-                to: "vet".into(),
-                condition: None,
-            },
-            Edge {
-                from: "vet".into(),
-                to: "search".into(),
-                condition: Some(EdgeCondition::Label("research".into())),
-            },
-            Edge {
-                from: "vet".into(),
-                to: "done".into(),
-                condition: Some(EdgeCondition::Label("done".into())),
-            },
-        ],
-    };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let workflow = research_loop_workflow(2);
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(
         workflow,
         config,
@@ -5642,11 +6029,7 @@ async fn mixed_retry_and_to_continuation_share_one_counter() {
     // Visits: vet(1) Retry → vet(2) To→search → vet(3) To → exhausted
     // (counter 3 > 2) → exit_route done. All three vet iterations share one
     // counter despite the mixed transition kinds.
-    let vet_visits = visited
-        .lock()
-        .iter()
-        .filter(|s| s.as_str() == "vet")
-        .count();
+    let vet_visits = visit_count(&visited, "vet");
     assert_eq!(
         vet_visits, 3,
         "Retry and To continuations must share one counter"
@@ -5662,7 +6045,7 @@ async fn mixed_retry_and_to_continuation_share_one_counter() {
 async fn exhausted_to_loop_without_resolvable_exit_route_fails_explicitly() {
     use parking_lot::Mutex;
 
-    let visited: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let visited = visit_log();
 
     struct ToLoopJudge {
         visited: Arc<Mutex<Vec<String>>>,
@@ -5696,18 +6079,8 @@ async fn exhausted_to_loop_without_resolvable_exit_route_fails_explicitly() {
         entry_step: "search".into(),
         steps: vec![
             Step::llm("search", "Search", "find sources", vec![]),
-            Step::llm("vet", "Vet", "vet sources", vec![]).with_policy(StepExecutionPolicy {
-                timeout_ms: None,
-                max_attempts: None,
-                retry_backoff_ms: None,
-                cache: None,
-                r#loop: Some(LoopConfig {
-                    max_iterations: 2,
-                    target_stage: Some("search".into()),
-                    // Points at a label with no matching edge — unresolvable.
-                    exit_route: Some("typo".into()),
-                }),
-            }),
+            // Points at a label with no matching edge — unresolvable.
+            loop_step("vet", "Vet", "vet sources", 2, "search", Some("typo")),
         ],
         edges: vec![
             Edge {
@@ -5722,14 +6095,7 @@ async fn exhausted_to_loop_without_resolvable_exit_route_fails_explicitly() {
             },
         ],
     };
-    let config = WorkflowEngineConfig {
-        client,
-        model: "mock-model".into(),
-        env_factory: Arc::new(TestEnvFactory),
-        session_factory: Arc::new(JsonlSessionFactory),
-        session_base_dir: dir.path().join("sessions"),
-        customize_builder: None,
-    };
+    let config = engine_config(dir.path(), client);
     let engine = WorkflowEngine::new(
         workflow,
         config,
@@ -5739,11 +6105,7 @@ async fn exhausted_to_loop_without_resolvable_exit_route_fails_explicitly() {
     )
     .unwrap();
     let run = engine.run().await;
-    let vet_visits = visited
-        .lock()
-        .iter()
-        .filter(|s| s.as_str() == "vet")
-        .count();
+    let vet_visits = visit_count(&visited, "vet");
     assert_eq!(
         vet_visits, 3,
         "To-loop must run max_iterations=2 continuations plus the exhausting visit"
@@ -5756,5 +6118,294 @@ async fn exhausted_to_loop_without_resolvable_exit_route_fails_explicitly() {
             );
         }
         other => panic!("expected explicit TaskFailed for unresolvable exit_route, got {other:?}"),
+    }
+}
+
+/// Two independent LoopConfig owner steps, executed sequentially (not
+/// interleaved), must each maintain and exhaust their OWN iteration budget.
+/// Loop A (`checkA`, max_iterations=1) runs to exhaustion first and exits
+/// via its route to `prepB`; loop B (`checkB`, max_iterations=2) then
+/// receives a completely fresh budget. A shared/colliding counter key would
+/// corrupt one of the two episodes: episode A's exhausting count would
+/// exhaust episode B early (breaking the visit order), or episode A's key
+/// would leak into episode B's persisted counters (breaking the snapshot
+/// assertions).
+#[tokio::test]
+async fn two_independent_loop_configs_maintain_separate_budgets() {
+    let visited = visit_log();
+
+    /// Judge: `prepA`/`prepB` are plain advance steps; both loop owners
+    /// always Retry so exhaustion comes from the LoopConfig counters alone.
+    /// `checkA` has max_iterations=1 (one continuation + exhausting visit =
+    /// 2 judge visits), `checkB` has max_iterations=2 (2 continuations +
+    /// exhausting visit = 3 judge visits). The terminal is short-circuited
+    /// by the engine and never reaches the judge.
+    struct TwoIndependentLoopsJudge {
+        visited: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+    impl StepTransitionJudge for TwoIndependentLoopsJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            self.visited.lock().push(step_id.clone());
+            Box::pin(async move {
+                match step_id.as_str() {
+                    "prepA" => Transition::To("checkA".into()),
+                    "checkA" => Transition::Retry,
+                    "prepB" => Transition::To("checkB".into()),
+                    "checkB" => Transition::Retry,
+                    _ => Transition::Abort {
+                        reason: "unreachable".into(),
+                    },
+                }
+            })
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    // Exactly 10 responses for 10 judge visits: episode A = prepA+checkA ×2
+    // (1 continuation + the exhausting attempt), episode B = prepB+checkB ×3
+    // (2 continuations + the exhausting attempt). Any extra LLM call runs
+    // the mock dry and fails the test.
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("prepA 1"),
+        MockResponse::text("checkA 1"),
+        MockResponse::text("prepA 2"),
+        MockResponse::text("checkA 2"),
+        MockResponse::text("prepB 1"),
+        MockResponse::text("checkB 1"),
+        MockResponse::text("prepB 2"),
+        MockResponse::text("checkB 2"),
+        MockResponse::text("prepB 3"),
+        MockResponse::text("checkB 3"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "prepA".into(),
+        steps: vec![
+            Step::llm("prepA", "Prep A", "prepare A", vec![]),
+            loop_step("checkA", "Check A", "check A", 1, "prepA", Some("nextA")),
+            Step::llm("prepB", "Prep B", "prepare B", vec![]),
+            loop_step("checkB", "Check B", "check B", 2, "prepB", Some("nextB")),
+            Step::Terminal {
+                id: "done".into(),
+                name: "Done".into(),
+                exit_code: 0,
+                message: Some("done".into()),
+            },
+        ],
+        edges: vec![
+            Edge {
+                from: "prepA".into(),
+                to: "checkA".into(),
+                condition: None,
+            },
+            // Episode A's exhaustion exits via route LABEL "nextA"; this
+            // labeled edge points at episode B's prep step.
+            Edge {
+                from: "checkA".into(),
+                to: "prepB".into(),
+                condition: Some(EdgeCondition::Label("nextA".into())),
+            },
+            Edge {
+                from: "prepB".into(),
+                to: "checkB".into(),
+                condition: None,
+            },
+            // Episode B's exhaustion exits via route LABEL "nextB" to the
+            // terminal.
+            Edge {
+                from: "checkB".into(),
+                to: "done".into(),
+                condition: Some(EdgeCondition::Label("nextB".into())),
+            },
+        ],
+    };
+    let config = engine_config(dir.path(), client);
+    let recorder = LoopCounterRecorder {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        gate_step: "prepB",
+        snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
+    };
+    let store: Arc<dyn TaskStore> = Arc::new(recorder.clone());
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(TwoIndependentLoopsJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_task_store(store);
+    let result = engine.run().await.unwrap();
+
+    // Exact visit order: episode A consumes its tiny budget (2 checkA
+    // visits), exits to prepB; episode B consumes its larger budget
+    // (3 checkB visits), exits to the terminal. No interleaving — `done`
+    // never reaches the judge (engine short-circuits terminals).
+    let order = visited.lock().clone();
+    let expected: Vec<String> = [
+        "prepA", "checkA", "prepA", "checkA", "prepB", "checkB", "prepB", "checkB", "prepB",
+        "checkB",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        order, expected,
+        "loop A must exhaust max_iterations=1, exit to prepB, then loop B must \
+         exhaust max_iterations=2 with a fresh budget; got {order:?}"
+    );
+    let check_a_visits = order.iter().filter(|s| s.as_str() == "checkA").count();
+    let check_b_visits = order.iter().filter(|s| s.as_str() == "checkB").count();
+    assert_eq!(
+        check_a_visits, 2,
+        "loop A (max_iterations=1) must visit its owner exactly twice"
+    );
+    assert_eq!(
+        check_b_visits, 3,
+        "loop B (max_iterations=2) must visit its owner exactly three times"
+    );
+
+    // Final workflow state: both episodes ran to exhaustion and the second
+    // exit routed to the terminal.
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Succeeded,
+        "both loops must exhaust their own budgets and leave via their exit \
+         routes"
+    );
+    assert_eq!(result.final_message.as_deref(), Some("done"));
+
+    // Counter cleanup: after episode B's final exhaustion no stale counter
+    // may remain.
+    let state = engine.workflow_state.lock().await.clone();
+    assert!(
+        state.loop_iterations.is_empty(),
+        "final exhaustion must clear all persisted counters; got {:?}",
+        state.loop_iterations
+    );
+
+    // Mid-run counter snapshots, recorded at every persisted state save:
+    // 1. some snapshot must observe loop A's counter (budget consumed);
+    // 2. every observed key must belong to exactly one loop — never both
+    //    keys in one snapshot (episodes are strictly sequential);
+    // 3. loop A's counter is only ever observed as 1 (its budget is 1);
+    //    loop B's at 1 or 2 (its budget is 2) — a shared counter would
+    //    surface other values;
+    // 4. after episode B starts persisting (a prepB record exists), no
+    //    snapshot may contain checkA — episode A's counter was removed at
+    //    its exhaustion before episode B began;
+    // 5. the gate must actually fire (prepB records do get persisted).
+    let snapshots = recorder.snapshots.lock().clone();
+    assert!(
+        !snapshots.is_empty(),
+        "the wrapper must observe at least one persisted state save"
+    );
+    assert!(
+        snapshots
+            .iter()
+            .any(|(_, counters)| counters.iter().any(|(k, _)| k == "checkA")),
+        "episode A's counter must be observed while episode A is running"
+    );
+    for (_, counters) in &snapshots {
+        assert!(
+            counters.iter().all(|(k, _)| k == "checkA" || k == "checkB"),
+            "only the two loop owners may hold counters; got {counters:?}"
+        );
+        assert!(
+            !(counters.iter().any(|(k, _)| k == "checkA")
+                && counters.iter().any(|(k, _)| k == "checkB")),
+            "the two loops' counters must never coexist in one snapshot; got {counters:?}"
+        );
+        for (key, value) in counters {
+            if key == "checkA" {
+                assert_eq!(
+                    *value, 1,
+                    "checkA's counter must reflect its own budget of 1; got {value}"
+                );
+            } else {
+                assert!(
+                    *value == 1 || *value == 2,
+                    "checkB's counter must stay within its own budget of 2; got {value}"
+                );
+            }
+        }
+    }
+    assert!(
+        snapshots
+            .iter()
+            .filter(|(has_prep_b, _)| *has_prep_b)
+            .all(|(_, counters)| !counters.iter().any(|(k, _)| k == "checkA")),
+        "once episode B has started, checkA's counter must never reappear; \
+         snapshots: {:?}",
+        snapshots
+    );
+    assert!(
+        snapshots.iter().any(|(has_prep_b, _)| *has_prep_b),
+        "episode B's records must be observed persisting"
+    );
+
+    // Persisted transitions: checkA reads [To("prepA") (continuation),
+    // To("prepB") (exhausting exit)]; checkB reads
+    // [To("prepB"), To("prepB"), To("done")]; the plain steps always
+    // advance to their loop owners.
+    let expected_check_a = ["prepA", "prepB"];
+    for (record, expected_target) in state
+        .step_history
+        .iter()
+        .filter(|r| r.step_id.as_str() == "checkA")
+        .zip(expected_check_a)
+    {
+        assert!(
+            matches!(
+                &record.transition,
+                Transition::To(t) if t == expected_target
+            ),
+            "checkA record must persist To({expected_target:?}), got {:?}",
+            record.transition
+        );
+    }
+    let expected_check_b = ["prepB", "prepB", "done"];
+    for (record, expected_target) in state
+        .step_history
+        .iter()
+        .filter(|r| r.step_id.as_str() == "checkB")
+        .zip(expected_check_b)
+    {
+        assert!(
+            matches!(
+                &record.transition,
+                Transition::To(t) if t == expected_target
+            ),
+            "checkB record must persist To({expected_target:?}), got {:?}",
+            record.transition
+        );
+    }
+    for record in state
+        .step_history
+        .iter()
+        .filter(|r| r.step_id.as_str() == "prepA")
+    {
+        assert!(
+            matches!(
+                &record.transition,
+                Transition::To(t) if t == "checkA"
+            ),
+            "prepA record must persist To(checkA), got {:?}",
+            record.transition
+        );
+    }
+    for record in state
+        .step_history
+        .iter()
+        .filter(|r| r.step_id.as_str() == "prepB")
+    {
+        assert!(
+            matches!(
+                &record.transition,
+                Transition::To(t) if t == "checkB"
+            ),
+            "prepB record must persist To(checkB), got {:?}",
+            record.transition
+        );
     }
 }
