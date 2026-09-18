@@ -522,6 +522,82 @@ impl AgentTeam {
         Ok(())
     }
 
+    /// Add one member to an already-built team.
+    ///
+    /// The new member joins the existing social context and shares its
+    /// memory, knowledge, inbox journal, and execution environment. On a
+    /// build failure the social registration is rolled back.
+    pub async fn add_member(
+        &mut self,
+        spec: IndividualSpec,
+        providers: Vec<(String, Arc<dyn LlmClient>)>,
+    ) -> Result<()> {
+        if !self.built {
+            return Err(TeamError::NotBuilt);
+        }
+        let ctx = self.ctx.as_ref().ok_or(TeamError::NotBuilt)?.clone();
+        let agent_id = spec.id().clone();
+        if reserved::is_reserved_id(agent_id.as_str()) {
+            return Err(TeamError::ReservedAgentId(agent_id.as_str().to_string()));
+        }
+        if ctx.get_agent_info(&agent_id).is_some() {
+            return Err(TeamError::DuplicateMember(agent_id.as_str().to_string()));
+        }
+
+        let (knowledge_plugin, memory_plugin) =
+            build_team_plugins(&self.config.memory_root).await?;
+        let env = self.build_env.clone().ok_or(TeamError::NotBuilt)?;
+        match self
+            .build_one(
+                &ctx,
+                spec,
+                &providers,
+                &env,
+                &memory_plugin,
+                &knowledge_plugin,
+            )
+            .await
+        {
+            Ok(runner) => {
+                self.runners.insert(agent_id, runner);
+                Ok(())
+            }
+            Err(error) => {
+                ctx.remove_agent(&agent_id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Remove one member from a built team.
+    ///
+    /// The member's runner and harness are stopped first, then its social
+    /// registration and pending inbox messages are removed. The declarative
+    /// member list (if still present) is kept in sync.
+    pub async fn remove_member(&mut self, id: &str) -> Result<()> {
+        if !self.built {
+            return Err(TeamError::NotBuilt);
+        }
+        if reserved::is_reserved_id(id) {
+            return Err(TeamError::ReservedAgentId(id.to_string()));
+        }
+        let ctx = self.ctx.as_ref().ok_or(TeamError::NotBuilt)?.clone();
+        let agent_id = AgentId::new(id);
+        if ctx.get_agent_info(&agent_id).is_none() {
+            return Err(TeamError::AgentNotFound(id.to_string()));
+        }
+        if let Some(mut runner) = self.runners.remove(&agent_id) {
+            runner.abort();
+            let _ = tokio::time::timeout(Duration::from_millis(50), &mut runner).await;
+        }
+        if let Some(harness) = self.harnesses.remove(&agent_id) {
+            harness.abort();
+        }
+        self.members.retain(|member| member.id() != &agent_id);
+        ctx.remove_agent(&agent_id);
+        Ok(())
+    }
+
     /// Submit a task to a specific agent (non-blocking).
     ///
     /// Sends the task text to `target_agent_id`'s inbox as a direct message
@@ -1198,6 +1274,56 @@ mod tests {
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
         team.build(env, mock_providers(&["m-old"])).await.unwrap();
         team
+    }
+
+    #[tokio::test]
+    async fn add_member_registers_runner_and_rejects_duplicate() {
+        let mut team = built_two_member_team().await;
+
+        team.add_member(
+            IndividualSpec::new("a3", "review", "m-old"),
+            mock_providers(&["m-old"]),
+        )
+        .await
+        .unwrap();
+
+        let ctx = team.social_context().unwrap();
+        assert!(team.harness(&AgentId::new("a3")).is_some());
+        assert!(ctx.get_agent_info(&AgentId::new("a3")).is_some());
+        team.submit("a3", "new member task").unwrap();
+        assert!(
+            ctx.drain_inbox(&AgentId::new("a3"))
+                .iter()
+                .any(|message| message.body.contains("new member task"))
+        );
+
+        let result = team
+            .add_member(
+                IndividualSpec::new("a3", "duplicate", "m-old"),
+                mock_providers(&["m-old"]),
+            )
+            .await;
+        assert!(matches!(result.unwrap_err(), TeamError::DuplicateMember(_)));
+        team.shutdown();
+    }
+
+    #[tokio::test]
+    async fn remove_member_stops_and_unregisters_agent() {
+        let mut team = built_two_member_team().await;
+        team.submit("a1", "pending task").unwrap();
+
+        team.remove_member("a1").await.unwrap();
+
+        assert!(team.harness(&AgentId::new("a1")).is_none());
+        let ctx = team.social_context().unwrap();
+        assert!(ctx.get_agent_info(&AgentId::new("a1")).is_none());
+        assert!(!ctx.has_messages(&AgentId::new("a1")));
+        assert!(matches!(
+            team.submit("a1", "after removal").unwrap_err(),
+            TeamError::AgentNotFound(_)
+        ));
+        assert!(team.harness(&AgentId::new("a2")).is_some());
+        team.shutdown();
     }
 
     #[tokio::test]

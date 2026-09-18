@@ -97,6 +97,10 @@ fn team_routes(prefix: &'static str, state: AppState) -> Router {
             &format!("{prefix}/agent/config"),
             get(agent_config).put(put_agent_config),
         )
+        .route(
+            &format!("{prefix}/members"),
+            get(list_members).post(add_member).delete(remove_member),
+        )
         .route(&format!("{prefix}/templates"), get(list_templates))
         .route(&format!("{prefix}/upgrade-check"), post(upgrade_check))
         .route(&format!("{prefix}/upgrade-apply"), post(upgrade_apply))
@@ -947,6 +951,8 @@ struct AgentConfigBody {
     #[serde(default)]
     persona: Option<String>,
     #[serde(default)]
+    role_label: Option<String>,
+    #[serde(default)]
     toolkits: Option<Vec<String>>,
     /// "strong"/"main"/"cheap" → tier ref; anything else → explicit model.
     #[serde(default)]
@@ -1012,6 +1018,9 @@ async fn put_agent_config(
     if let Some(persona) = body.persona {
         member.persona = persona;
     }
+    if let Some(role_label) = body.role_label {
+        member.role_label = role_label;
+    }
     if let Some(toolkits) = body.toolkits {
         member.toolkits = toolkits;
     }
@@ -1071,6 +1080,149 @@ async fn put_agent_config(
             .into_response()
         }
         Err(e) => err_resp(e.to_string(), StatusCode::CONFLICT),
+    }
+}
+
+#[derive(Deserialize)]
+struct MembersQuery {
+    project: String,
+}
+
+/// GET /api/team/members?project= — declarative member specs for editing.
+async fn list_members(
+    State(state): State<AppState>,
+    Query(query): Query<MembersQuery>,
+) -> Response {
+    let pm = state.pm.read().await;
+    let Some(project) = pm.get(&query.project) else {
+        return err_resp(
+            format!("unknown project: {}", query.project),
+            StatusCode::NOT_FOUND,
+        );
+    };
+    let members: Vec<serde_json::Value> = project
+        .spec
+        .members
+        .iter()
+        .map(|member| {
+            let model = match &member.model {
+                crate::team_spec::ModelRef::Tier(tier) => tier.clone(),
+                crate::team_spec::ModelRef::Explicit(model) => model.clone(),
+            };
+            serde_json::json!({
+                "id": member.id,
+                "persona": member.persona,
+                "role_label": member.role_label,
+                "model": model,
+                "toolkits": member.toolkits,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "members": members })).into_response()
+}
+
+#[derive(Deserialize)]
+struct AddMemberBody {
+    project: String,
+    id: String,
+    #[serde(default)]
+    persona: String,
+    #[serde(default)]
+    role_label: Option<String>,
+    #[serde(default = "default_member_model")]
+    model: String,
+    #[serde(default)]
+    toolkits: Vec<String>,
+}
+
+fn default_member_model() -> String {
+    "main".to_string()
+}
+
+/// POST /api/team/members — add and immediately start one member.
+async fn add_member(State(state): State<AppState>, Json(body): Json<AddMemberBody>) -> Response {
+    let tier = state.tier.read().await.clone();
+    let base_url = crate::settings::Settings::load(&state.data_root)
+        .ok()
+        .flatten()
+        .map(|settings| settings.base_url)
+        .unwrap_or_default();
+    let settings = crate::settings::Settings {
+        models: tier,
+        scout_interval_secs: *state.scout_interval_secs.read().await,
+        base_url,
+    };
+    let api_key = crate::settings::load_api_key(&state.data_root).unwrap_or_default();
+    let persona = if body.persona.trim().is_empty() {
+        format!("你是团队的 {}，负责完成操作员和队友交给你的任务。", body.id)
+    } else {
+        body.persona
+    };
+    let model = match body.model.as_str() {
+        "strong" | "main" | "cheap" => crate::team_spec::ModelRef::Tier(body.model.clone()),
+        explicit => crate::team_spec::ModelRef::Explicit(explicit.to_string()),
+    };
+    let member = crate::team_spec::MemberSpec {
+        id: body.id.clone(),
+        persona,
+        role_label: body.role_label.unwrap_or_else(|| body.id.clone()),
+        model,
+        toolkits: body.toolkits,
+        behaviors: Vec::new(),
+        provider_override: None,
+        persona_file: None,
+    };
+
+    let mut pm = state.pm.write().await;
+    match pm
+        .add_member(&body.project, member, &settings, &api_key)
+        .await
+    {
+        Ok(()) => {
+            if let Some(harness) = pm.get(&body.project).and_then(|entry| {
+                entry
+                    .team
+                    .harness(&llm_harness_agent_team::AgentId::new(&body.id))
+            }) {
+                state
+                    .registry
+                    .register(format!("{}/{}", body.project, body.id), harness);
+            }
+            (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
+        }
+        Err(TeamManagerError::UnknownTeam(project)) => {
+            err_resp(format!("unknown project: {project}"), StatusCode::NOT_FOUND)
+        }
+        Err(error) => err_resp(error.to_string(), StatusCode::CONFLICT),
+    }
+}
+
+#[derive(Deserialize)]
+struct RemoveMemberQuery {
+    project: String,
+    agent: String,
+}
+
+/// DELETE /api/team/members?project=&agent= — stop and remove one member.
+async fn remove_member(
+    State(state): State<AppState>,
+    Query(query): Query<RemoveMemberQuery>,
+) -> Response {
+    let mut pm = state.pm.write().await;
+    match pm.remove_member(&query.project, &query.agent).await {
+        Ok(()) => {
+            state
+                .registry
+                .remove(&format!("{}/{}", query.project, query.agent));
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(TeamManagerError::UnknownTeam(project)) => {
+            err_resp(format!("unknown project: {project}"), StatusCode::NOT_FOUND)
+        }
+        Err(TeamManagerError::UnknownMember(agent)) => {
+            err_resp(format!("unknown member: {agent}"), StatusCode::NOT_FOUND)
+        }
+        Err(error) => err_resp(error.to_string(), StatusCode::CONFLICT),
     }
 }
 
@@ -2382,6 +2534,156 @@ mod tests {
             std::fs::read_to_string(pm.read().await.data_root().join("teams/p1/team.json"))
                 .unwrap();
         assert!(spec_text.contains("new persona text"));
+    }
+
+    #[tokio::test]
+    async fn member_routes_add_delete_and_persist() {
+        let (router, pm, repo, _factory) = setup().await;
+        register_template_team(&router, &repo).await;
+
+        let (status, json) = json_post(
+            &router,
+            "/api/team/members",
+            serde_json::json!({
+                "project": "p1",
+                "id": "docs-writer",
+                "persona": "Write concise documentation.",
+                "role_label": "Documentation Writer",
+                "model": "main",
+                "toolkits": ["fs"],
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{json}");
+
+        let (status, json) = get_json(&router, "/api/team/members?project=p1").await;
+        assert_eq!(status, 200, "{json}");
+        let member = json["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["id"] == "docs-writer")
+            .unwrap();
+        assert_eq!(member["persona"], "Write concise documentation.");
+        assert_eq!(member["role_label"], "Documentation Writer");
+        assert_eq!(member["model"], "main");
+        assert_eq!(member["toolkits"][0], "fs");
+
+        {
+            let manager = pm.read().await;
+            let entry = manager.get("p1").unwrap();
+            assert!(
+                entry
+                    .team
+                    .harness(&llm_harness_agent_team::AgentId::new("docs-writer"))
+                    .is_some()
+            );
+            let context = entry.team.social_context().unwrap();
+            let new_agent = llm_harness_agent_team::AgentId::new("docs-writer");
+            let peer = llm_harness_agent_team::AgentId::new("planner");
+            assert!(context.has_contact(&new_agent, &peer));
+            assert!(context.has_contact(&peer, &new_agent));
+        }
+
+        let spec_text =
+            std::fs::read_to_string(pm.read().await.data_root().join("teams/p1/team.json"))
+                .unwrap();
+        assert!(spec_text.contains("docs-writer"));
+        assert!(spec_text.contains("Write concise documentation."));
+
+        let (status, json) = json_method(
+            &router,
+            "DELETE",
+            "/api/team/members?project=p1&agent=docs-writer",
+            serde_json::json!(null),
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+
+        let (status, json) = get_json(&router, "/api/team/members?project=p1").await;
+        assert_eq!(status, 200, "{json}");
+        assert!(
+            !json["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|member| member["id"] == "docs-writer")
+        );
+        {
+            let manager = pm.read().await;
+            let entry = manager.get("p1").unwrap();
+            assert!(
+                entry
+                    .team
+                    .harness(&llm_harness_agent_team::AgentId::new("docs-writer"))
+                    .is_none()
+            );
+        }
+
+        let spec_text =
+            std::fs::read_to_string(pm.read().await.data_root().join("teams/p1/team.json"))
+                .unwrap();
+        assert!(!spec_text.contains("docs-writer"));
+    }
+
+    #[tokio::test]
+    async fn member_routes_return_404_for_unknown_team_and_member() {
+        let (router, _pm, repo, _factory) = setup().await;
+        register_template_team(&router, &repo).await;
+
+        let (status, _) = get_json(&router, "/api/team/members?project=ghost").await;
+        assert_eq!(status, 404);
+        let (status, _) = json_post(
+            &router,
+            "/api/team/members",
+            serde_json::json!({ "project": "ghost", "id": "new-agent" }),
+        )
+        .await;
+        assert_eq!(status, 404);
+        let (status, _) = json_method(
+            &router,
+            "DELETE",
+            "/api/team/members?project=p1&agent=ghost",
+            serde_json::json!(null),
+        )
+        .await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn agent_config_updates_role_label_and_persists() {
+        let (router, pm, repo, _factory) = setup().await;
+        register_template_team(&router, &repo).await;
+
+        let (status, json) = json_put(
+            &router,
+            "/api/team/agent/config",
+            serde_json::json!({
+                "project": "p1",
+                "agent": "coder",
+                "role_label": "Implementation Lead",
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(
+            json["rebuilt"], true,
+            "role label is a social identity field"
+        );
+
+        let (_, json) = get_json(&router, "/api/team/members?project=p1").await;
+        let member = json["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["id"] == "coder")
+            .unwrap();
+        assert_eq!(member["role_label"], "Implementation Lead");
+
+        let spec_text =
+            std::fs::read_to_string(pm.read().await.data_root().join("teams/p1/team.json"))
+                .unwrap();
+        assert!(spec_text.contains("Implementation Lead"));
     }
 
     #[tokio::test]

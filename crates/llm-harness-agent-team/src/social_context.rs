@@ -510,6 +510,22 @@ impl SocialContext {
     pub fn get_agent_info(&self, id: &AgentId) -> Option<AgentInfo> {
         self.registry.get(id)
     }
+
+    /// Remove an agent from social participation.
+    ///
+    /// This aborts the agent's monitor, acknowledges any durable inbox rows
+    /// that are discarded with the member, and unregisters it. Contact edges
+    /// are retained as historical social state; they do not make the removed
+    /// agent addressable again.
+    pub fn remove_agent(&self, id: &AgentId) {
+        if let Some(handle) = self.monitor_registry.lock().remove(id) {
+            handle.abort();
+        }
+        let messages = self.drain_inbox(id);
+        self.ack_inbox_messages(&messages);
+        self.registry.remove(id);
+    }
+
     /// Mark every registered agent as [`AgentStatus::Stopped`].
     ///
     /// Called at team shutdown: statuses left Idle/Busy would misreport
