@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures::future::BoxFuture;
 use llm_harness_platform::sandbox::{NetRule, ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_sandbox::BwrapSandbox;
 use llm_harness_sandbox_remote::RemoteSandboxConfig;
@@ -61,11 +62,53 @@ impl GatewayStateError {
 
 pub(crate) struct SandboxRecord {
     pub(crate) owner: Arc<str>,
-    pub(crate) sandbox: Arc<BwrapSandbox>,
+    pub(crate) sandbox: Arc<GatewaySandbox>,
     pub(crate) env: Arc<dyn ExecutionEnv>,
     pub(crate) work_dir: PathBuf,
     pub(crate) config: RemoteSandboxConfig,
     pub(crate) state: RemoteSandboxState,
+}
+
+pub(crate) enum GatewaySandbox {
+    Bwrap(BwrapSandbox),
+}
+
+impl Sandbox for GatewaySandbox {
+    fn start(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        match self {
+            Self::Bwrap(sandbox) => sandbox.start(),
+        }
+    }
+
+    fn env(&self) -> Arc<dyn ExecutionEnv> {
+        match self {
+            Self::Bwrap(sandbox) => sandbox.env(),
+        }
+    }
+
+    fn reset(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        match self {
+            Self::Bwrap(sandbox) => sandbox.reset(),
+        }
+    }
+
+    fn shutdown(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
+        match *self {
+            Self::Bwrap(sandbox) => Box::new(sandbox).shutdown(),
+        }
+    }
+
+    fn config(&self) -> &SandboxConfig {
+        match self {
+            Self::Bwrap(sandbox) => sandbox.config(),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        match self {
+            Self::Bwrap(sandbox) => sandbox.is_running(),
+        }
+    }
 }
 
 pub(crate) struct ExecutionRecord {
@@ -165,7 +208,7 @@ impl GatewayState {
         let sandbox =
             match BwrapSandbox::new_mapped(sandbox_config, work_dir, PathBuf::from(GUEST_WORK_DIR))
             {
-                Ok(sandbox) => sandbox,
+                Ok(sandbox) => GatewaySandbox::Bwrap(sandbox),
                 Err(error) => {
                     let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
                     if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
@@ -265,7 +308,7 @@ impl GatewayState {
     pub(crate) fn take_sandbox_for_shutdown(
         &self,
         sandbox_id: &str,
-    ) -> Result<BwrapSandbox, GatewayStateError> {
+    ) -> Result<GatewaySandbox, GatewayStateError> {
         let mut sandboxes = self.lock_sandboxes();
         let record = sandboxes
             .get(sandbox_id)
@@ -280,7 +323,7 @@ impl GatewayState {
             .expect("sandbox record was present");
         drop(sandboxes);
         self.cancel_sandbox_executions(sandbox_id);
-        Ok(Arc::try_unwrap(record.sandbox).expect("sandbox handle was uniquely owned"))
+        Arc::try_unwrap(record.sandbox).map_err(|_| GatewayStateError::Busy)
     }
 
     pub(crate) async fn shutdown_all(&self) -> anyhow::Result<()> {
@@ -288,7 +331,7 @@ impl GatewayState {
             .lock_sandboxes()
             .drain()
             .map(
-                |(id, record)| -> anyhow::Result<(String, Arc<BwrapSandbox>)> {
+                |(id, record)| -> anyhow::Result<(String, Arc<GatewaySandbox>)> {
                     set_registry_state(&self.registry, &id, RegistryState::Deleting)?;
                     self.cancel_sandbox_executions(&id);
                     Ok((id, record.sandbox))
@@ -479,8 +522,11 @@ fn restore_sandbox(
         .work_root()
         .join("sandboxes")
         .join(&persisted.sandbox_id);
-    let sandbox =
-        BwrapSandbox::new_mapped(sandbox_config, work_dir, PathBuf::from(GUEST_WORK_DIR))?;
+    let sandbox = GatewaySandbox::Bwrap(BwrapSandbox::new_mapped(
+        sandbox_config,
+        work_dir,
+        PathBuf::from(GUEST_WORK_DIR),
+    )?);
     let env = sandbox.env();
     Ok(SandboxRecord {
         owner: Arc::clone(&principal.id),
@@ -790,7 +836,7 @@ fn remove_work_root(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 pub(crate) struct SandboxLease {
-    pub(crate) sandbox: Arc<BwrapSandbox>,
+    pub(crate) sandbox: Arc<GatewaySandbox>,
     pub(crate) env: Arc<dyn ExecutionEnv>,
     pub(crate) work_dir: PathBuf,
     pub(crate) config: RemoteSandboxConfig,

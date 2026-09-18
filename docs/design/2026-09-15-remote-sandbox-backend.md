@@ -142,6 +142,9 @@ SSE 行结束符支持 `LF`、`CRLF` 和 `CR`，且 `CRLF` 允许跨网络 chunk
 
 ## Linux Bwrap gateway
 
+VM-level backend selection and threat model are defined separately in
+[`2026-09-18-vm-sandbox-backend.md`](2026-09-18-vm-sandbox-backend.md).
+
 `llm-harness-sandbox-gateway` 使用 `BwrapSandbox` 实现远程协议：
 
 - 使用 SHA-256 token digest 和常数时间比较做 Bearer 认证；同一 principal 可配置多个 token，供轮换使用。
