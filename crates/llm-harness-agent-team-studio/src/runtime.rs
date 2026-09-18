@@ -75,6 +75,7 @@ pub enum StudioError {
 pub struct StudioConfig {
     pub data_root: PathBuf,
     pub port: u16,
+    panel_path: &'static str,
     provider_factory: Option<crate::env_cfg::ProviderFactory>,
     extra_routes: Option<Router>,
 }
@@ -89,6 +90,7 @@ impl StudioConfig {
         Self {
             data_root: default_data_root(),
             port,
+            panel_path: "/app/team.html",
             provider_factory: None,
             extra_routes: None,
         }
@@ -101,6 +103,11 @@ impl StudioConfig {
 
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    pub fn with_panel_path(mut self, panel_path: &'static str) -> Self {
+        self.panel_path = panel_path;
         self
     }
 
@@ -123,6 +130,7 @@ pub struct StudioRuntime {
     inspector: Inspector,
     pm: Arc<RwLock<TeamManager>>,
     recovery: StartupRecovery,
+    panel_path: &'static str,
     _panel_descriptor: PanelDescriptorGuard,
     _singleton: StudioSingleton,
 }
@@ -282,6 +290,7 @@ impl StudioRuntime {
             inspector,
             pm: tm_shared,
             recovery: recovery.clone(),
+            panel_path: config.panel_path,
             _panel_descriptor: PanelDescriptorGuard {
                 path: panel_descriptor_path(&data_root),
             },
@@ -326,7 +335,7 @@ impl StudioRuntime {
     pub fn panel_url(&self) -> Option<String> {
         let addr = self.bound_addr()?;
         let token = self.auth_token()?;
-        Some(format!("http://{addr}/app/team.html#token={token}"))
+        Some(format!("http://{addr}{}#token={token}", self.panel_path))
     }
 
     pub async fn shutdown(self) {
