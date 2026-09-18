@@ -13,7 +13,7 @@ llm-harness-agent-team-studio.workspace = true
 parking_lot.workspace = true
 axum.workspace = true
 include_dir = "0.7.4"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

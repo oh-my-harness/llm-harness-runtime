@@ -386,6 +386,26 @@ handler；`/api/app/health` 输出 `feature_health.agent-team` 与启动恢复�
 - 迁移失败时不破坏原数据。
 - 重启后团队与设置完整恢复。
 
+2026-09-18 实施记录：
+
+- 已加入进程级 lifecycle 配置，`RUNTIME_APP_SHUTDOWN_TIMEOUT_SECS` 支持
+  1–3600 秒，默认 30 秒，非法值以退出码 `2` 拒绝。
+- Linux 处理 `CtrlC` 与 `SIGTERM`；Windows 处理 `CtrlC`、`CtrlBreak`
+  与 `CtrlClose`。
+- 信号处理在应用启动前安装，并在启动过程中与 `RuntimeApp::start` 并发等待；
+  启动期间收到信号会记录 `shutdown_signal` 并以退出码 `130` 中止启动。
+- 优雅退出统一带超时；超时记录 `shutdown_timeout` 并以退出码 `124` 退出。
+- Windows `CtrlClose` 在系统默认 5 秒强杀窗口内预留日志与退出余量，将有效超时上限压到 4 秒。
+- 二进制集成测试覆盖 `SIGTERM` 后的 `shutdown_signal` 与 normal
+  `shutdown` 事件，以及非法 shutdown timeout 配置。
+
+当前边界：
+
+- 这是 M4 的第一个 lifecycle 片段，数据根目录迁移、迁移报告、备份与
+  回滚仍未实现。
+- Windows 信号路径仍需真实 Windows 环境验证；本仓库当前本地验证只覆盖
+  Linux。
+
 ### M5：桌面打包与发布
 
 交付：
