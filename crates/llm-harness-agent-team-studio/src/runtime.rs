@@ -3,6 +3,7 @@
 use crate::routes::{AppState, team_router};
 use crate::settings::Settings;
 use crate::team_manager::TeamManager;
+use axum::Router;
 use llm_harness_agent_team::AgentId;
 use llm_harness_inspector::Inspector;
 use llm_harness_inspector::state::HarnessRegistry;
@@ -74,7 +75,9 @@ pub enum StudioError {
 pub struct StudioConfig {
     pub data_root: PathBuf,
     pub port: u16,
+    panel_path: &'static str,
     provider_factory: Option<crate::env_cfg::ProviderFactory>,
+    extra_routes: Option<Router>,
 }
 
 impl StudioConfig {
@@ -87,7 +90,9 @@ impl StudioConfig {
         Self {
             data_root: default_data_root(),
             port,
+            panel_path: "/app/team.html",
             provider_factory: None,
+            extra_routes: None,
         }
     }
 
@@ -101,11 +106,21 @@ impl StudioConfig {
         self
     }
 
+    pub fn with_panel_path(mut self, panel_path: &'static str) -> Self {
+        self.panel_path = panel_path;
+        self
+    }
+
     pub fn with_provider_factory(
         mut self,
         provider_factory: Option<crate::env_cfg::ProviderFactory>,
     ) -> Self {
         self.provider_factory = provider_factory;
+        self
+    }
+
+    pub fn with_extra_routes(mut self, extra_routes: Router) -> Self {
+        self.extra_routes = Some(extra_routes);
         self
     }
 }
@@ -115,12 +130,15 @@ pub struct StudioRuntime {
     inspector: Inspector,
     pm: Arc<RwLock<TeamManager>>,
     recovery: StartupRecovery,
+    panel_path: &'static str,
     _panel_descriptor: PanelDescriptorGuard,
     _singleton: StudioSingleton,
 }
 
 impl StudioRuntime {
     pub async fn start(config: StudioConfig) -> Result<Self, StudioError> {
+        let mut config = config;
+        let extra_routes = config.extra_routes.take();
         prepare_data_root(&config.data_root).map_err(StudioError::DataRoot)?;
         let singleton = StudioSingleton::acquire(&config.data_root)?;
         clear_panel_descriptor(&config.data_root).map_err(StudioError::PanelDescriptor)?;
@@ -255,8 +273,13 @@ impl StudioRuntime {
             grants,
             startup_recovery: Arc::new(RwLock::new(recovery.clone())),
         };
+        let mut routes = team_router(state);
+        if let Some(extra_routes) = extra_routes {
+            routes = routes.merge(extra_routes);
+        }
+
         let inspector = Inspector::registry(registry)
-            .extra_routes(team_router(state))
+            .extra_routes(routes)
             .port(config.port)
             .require_auth()
             .mount()
@@ -267,6 +290,7 @@ impl StudioRuntime {
             inspector,
             pm: tm_shared,
             recovery: recovery.clone(),
+            panel_path: config.panel_path,
             _panel_descriptor: PanelDescriptorGuard {
                 path: panel_descriptor_path(&data_root),
             },
@@ -311,7 +335,7 @@ impl StudioRuntime {
     pub fn panel_url(&self) -> Option<String> {
         let addr = self.bound_addr()?;
         let token = self.auth_token()?;
-        Some(format!("http://{addr}/app/team.html#token={token}"))
+        Some(format!("http://{addr}{}#token={token}", self.panel_path))
     }
 
     pub async fn shutdown(self) {

@@ -1,0 +1,29 @@
+[package]
+name = "llm-harness-sandbox-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+llm-harness-platform.workspace = true
+llm-harness-sandbox.workspace = true
+llm-harness-sandbox-remote.workspace = true
+llm-harness-types.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+libc.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+tempfile.workspace = true

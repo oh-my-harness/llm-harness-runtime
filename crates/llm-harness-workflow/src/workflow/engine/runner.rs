@@ -1915,11 +1915,28 @@ impl super::WorkflowEngine {
     /// cancel 只需置 Cancelled 状态 + reason，避免双记录导致 cost 双计。
     /// 若 apply_transition 尚未执行（record 最后一条不是 current_step），
     /// cancel 推入 { result: None, transition: Abort } 记录保证审计链完整。
+    ///
+    /// 终态保护：workflow 已到达 Succeeded / Failed / Cancelled 时 cancel 是
+    /// no-op——不覆盖结果/错误、不改写 reason、不追加 record、不发事件。
+    /// 终态判断与状态写入同在 workflow_state 锁内，与 run_loop 的终态写
+    /// （Succeeded / fail_task）天然串行：run() 恰好在 cancel 拿到锁之前
+    /// 完成 → cancel 看到终态直接返回，不会把真实结果改写成 Cancelled。
+    /// Idle / Paused / Running 的取消行为不变。
     pub async fn cancel(&self, reason: &str) -> Result<(), WorkflowError> {
         // 与 run_loop 注册 step token 使用同一锁顺序并保持两个 guard，确保
         // "注册 token" 与 "置 Cancelled" 之间不存在丢失取消信号的窗口。
         let mut current_abort = self.current_abort.lock().await;
         let mut state = self.workflow_state.lock().await;
+        if matches!(
+            state.status,
+            WorkflowStatus::Succeeded | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+        ) {
+            // 终态不可变：run()/resume() 都拒绝从终态重启（run() 对终态返回
+            // InvalidStatus，resume() 拒绝 Cancelled），因此这里不能丢掉已
+            // 落盘的真实结果。迟到的 cancel（例如外部调用方的超时计时器在
+            // 工作流刚自然完成时触发）静默返回。
+            return Ok(());
+        }
         if let Some(token) = current_abort.take() {
             token.cancel();
         }

@@ -160,6 +160,12 @@ planner / coder / 5×reviewer / judge / debugger / scout）是第一个官方模
 ./scripts/studio.sh            # 构建 → 随机本机端口 → 打开面板
 ```
 
+`llm-harness-app` 是 runtime first-party 应用入口。它会托管 React 版
+AgentTeam 工作区，并把 descriptor 中的 panel URL 指向
+`/app/agent-team#token=...`；旧的 `/app/team.html` 保留为 fallback。
+React 构建产物嵌入二进制，静态资源仅从本地 API 获取数据，不直接读写文件
+或秘密。
+
 服务只绑定 loopback，并对所有 `/api/*` 请求启用 per-process bearer token。
 `StudioRuntime` 就绪后会把 panel URL 写入 data root 的 `panel.json`（Unix 权限
 `0600`），并采用同目录临时文件 + rename 原子替换。桌面宿主和 launcher 只接收
@@ -183,6 +189,9 @@ backtrace，便于桌面宿主或运维在进程退出后定位原因。
 改动重建该成员 harness）；右上角 ⚙ 是全局设置模态框。
 
 关键 API：
+
+`/api/agent-team/*` 是 runtime 应用中的 feature API 前缀；`/api/team/*`
+保留为兼容别名，两者绑定同一组 handler，便于现有面板和外部消费者平滑迁移。
 
 - `GET /api/team/templates` — 模板列表
 - `POST /api/team/projects {id, template_id, repo_path}` — 从模板创建团队
