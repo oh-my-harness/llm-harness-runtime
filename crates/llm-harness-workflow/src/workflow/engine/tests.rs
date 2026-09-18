@@ -6988,3 +6988,235 @@ async fn restore_from_step_loop_preserves_independent_counter() {
     let state = store.load_workflow_state(&task_id).await.unwrap().unwrap();
     assert_eq!(state.loop_iterations.get("independent"), Some(&2));
 }
+
+#[tokio::test]
+async fn loop_config_edge_interleaved_episodes_preserve_each_other() {
+    struct InterleavedJudge {
+        visited: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+    impl StepTransitionJudge for InterleavedJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let id = ctx.current_step.id().clone();
+            self.visited.lock().push(id.clone());
+            Box::pin(async move {
+                match id.as_str() {
+                    "a" | "b" => Transition::Retry,
+                    "bridge" => Transition::To("a".into()),
+                    _ => panic!("unexpected step {id}"),
+                }
+            })
+        }
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let workflow = Workflow {
+        entry_step: "a".into(),
+        steps: vec![
+            loop_step("a", "A", "A", 2, "b", Some("done")),
+            loop_step("b", "B", "B", 1, "bridge", Some("return")),
+            Step::llm("bridge", "Bridge", "return to A", vec![]),
+            Step::Terminal {
+                id: "done".into(),
+                name: "Done".into(),
+                exit_code: 0,
+                message: None,
+            },
+        ],
+        edges: vec![
+            Edge {
+                from: "a".into(),
+                to: "b".into(),
+                condition: None,
+            },
+            Edge {
+                from: "b".into(),
+                to: "bridge".into(),
+                condition: None,
+            },
+            Edge {
+                from: "bridge".into(),
+                to: "a".into(),
+                condition: None,
+            },
+            Edge {
+                from: "b".into(),
+                to: "a".into(),
+                condition: Some(EdgeCondition::Label("return".into())),
+            },
+            Edge {
+                from: "a".into(),
+                to: "done".into(),
+                condition: Some(EdgeCondition::Label("done".into())),
+            },
+        ],
+    };
+    let recorder = LoopCounterRecorder {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        gate_step: "bridge",
+        snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
+    };
+    let visited = visit_log();
+    let engine = WorkflowEngine::new(
+        workflow,
+        engine_config(
+            dir.path(),
+            Arc::new(MockLlmClient::new(
+                (0..6).map(|_| MockResponse::text("ok")).collect(),
+            )),
+        ),
+        Arc::new(InterleavedJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_task_store(Arc::new(recorder.clone()));
+    engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(*visited.lock(), vec!["a", "b", "bridge", "a", "b", "a"]);
+    // Collapse repeated saves, retaining every actual counter change.
+    let mut counters: Vec<_> = recorder
+        .snapshots
+        .lock()
+        .iter()
+        .map(|(_, c)| c.clone())
+        .collect();
+    counters.dedup();
+    assert_eq!(
+        counters,
+        vec![
+            vec![],
+            vec![("a".into(), 1)],
+            vec![("a".into(), 1), ("b".into(), 1)],
+            vec![("a".into(), 2), ("b".into(), 1)],
+            vec![("a".into(), 2)],
+            vec![],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn loop_config_edge_pause_resume_preserves_remaining_budget() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut workflow = research_loop_workflow(2);
+    workflow.entry_step = "vet".into();
+    let store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let visited = visit_log();
+    let engine = WorkflowEngine::new(
+        workflow,
+        engine_config(
+            dir.path(),
+            Arc::new(MockLlmClient::new(
+                (0..5).map(|_| MockResponse::text("ok")).collect(),
+            )),
+        ),
+        Arc::new(ResearchRouteJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_task_store(store.clone());
+    // The public pause request is consumed at the boundary after vet continues.
+    engine.pause("active loop checkpoint").unwrap();
+    assert!(matches!(engine.run().await, Err(WorkflowError::Paused(_))));
+    let paused = store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(paused.status, WorkflowStatus::Paused);
+    assert_eq!(paused.current_step, "search");
+    assert_eq!(paused.loop_iterations.get("vet"), Some(&1));
+    assert_eq!(*visited.lock(), vec!["vet"]);
+    engine.resume().await.unwrap();
+    let resumed = store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed.loop_iterations, paused.loop_iterations);
+    assert_eq!(resumed.step_history.len(), paused.step_history.len());
+    assert_eq!(resumed.current_step, "search");
+    assert_eq!(
+        engine.workflow_state.lock().await.loop_iterations,
+        paused.loop_iterations
+    );
+    engine.run().await.unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(
+        *visited.lock(),
+        vec!["vet", "search", "vet", "search", "vet"]
+    );
+    let finished = store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(finished.loop_iterations.is_empty());
+}
+
+#[tokio::test]
+async fn loop_config_edge_invalid_target_reports_existing_runtime_errors() {
+    struct MissingTargetJudge {
+        retry: bool,
+    }
+    impl StepTransitionJudge for MissingTargetJudge {
+        fn decide<'a>(&'a self, _: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            Box::pin(async move {
+                if self.retry {
+                    Transition::Retry
+                } else {
+                    Transition::To("missing".into())
+                }
+            })
+        }
+    }
+    for retry in [true, false] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        // Policy validation currently accepts an absent target; runtime rejects it.
+        let engine = WorkflowEngine::new(
+            Workflow {
+                entry_step: "owner".into(),
+                steps: vec![loop_step("owner", "Owner", "work", 1, "missing", None)],
+                // Unconditional self-edge defeats the single-step free-task
+                // shortcut (decide_transition: edges.is_empty() && len()==1
+                // aborts without consulting the judge), so the LoopConfig
+                // error paths below are actually exercised.
+                edges: vec![Edge {
+                    from: "owner".into(),
+                    to: "owner".into(),
+                    condition: None,
+                }],
+            },
+            engine_config(
+                dir.path(),
+                Arc::new(MockLlmClient::new(vec![MockResponse::text("ok")])),
+            ),
+            Arc::new(MissingTargetJudge { retry }),
+        )
+        .unwrap()
+        .with_task_store(store.clone());
+        let error = engine.run().await.unwrap_err();
+        let state = store
+            .load_workflow_state(engine.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.step_history.len(), 1);
+        if retry {
+            assert!(
+                matches!(error, WorkflowError::CurrentStepNotFound { step_id } if step_id == "missing")
+            );
+            assert_eq!(state.loop_iterations.get("owner"), Some(&1));
+            assert_eq!(state.current_step, "missing");
+            assert!(
+                matches!(&state.step_history[0].transition, Transition::To(target) if target == "missing")
+            );
+        } else {
+            assert!(
+                matches!(error, WorkflowError::TaskFailed(message) if message == "InvalidTransition: step 'missing' not in workflow")
+            );
+            assert_eq!(state.status, WorkflowStatus::Failed);
+            assert!(state.loop_iterations.is_empty());
+        }
+    }
+}
