@@ -11,6 +11,7 @@ members = [
     "crates/llm-harness-sandbox",
     "crates/llm-harness-sandbox-remote",
     "crates/llm-harness-sandbox-gateway",
+    "crates/llm-harness-vm-agent-protocol",
     "crates/llm-harness-mcp",
     "crates/llm-harness-tools",
     "crates/llm-harness-strategy",
@@ -60,6 +61,7 @@ llm-harness-live-tests = { path = "crates/llm-harness-live-tests" }
 llm-harness-inspector = { path = "crates/llm-harness-inspector" }
 llm-harness-sandbox = { path = "crates/llm-harness-sandbox" }
 llm-harness-sandbox-remote = { path = "crates/llm-harness-sandbox-remote" }
+llm-harness-vm-agent-protocol = { path = "crates/llm-harness-vm-agent-protocol" }
 llm-harness-agent-team-studio = { path = "crates/llm-harness-agent-team-studio" }
 llm-harness-runtime-app = { path = "crates/llm-harness-runtime-app" }
 llm-harness-agent-team = { path = "crates/llm-harness-agent-team" }
