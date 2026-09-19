@@ -194,9 +194,9 @@ backtrace，便于桌面宿主或运维在进程退出后定位原因。
 `workspace_unauthorized`、`workspace_check`、`team_create`）。这样可以先处理已恢复
 的团队，同时定位未恢复团队的数据或授权问题，而不是把失败静默吞掉。
 
-面板三列工作区：左列成员卡片（状态/插话/停止）、中列选中成员 session
-历史、右列 per-agent 配置（persona 热应用；model/api key/base url/工具包
-改动重建该成员 harness）；右上角 ⚙ 是全局设置模态框。
+面板三列工作区：左列成员卡片（状态/插话/停止/动态增删）、中列共享聊天与
+思考过程流、右列 per-agent 配置（persona 热应用；model/api key/base url/
+工具包改动重建该成员 harness）；右上角 ⚙ 是全局设置模态框。
 
 关键 API：
 
@@ -205,11 +205,20 @@ backtrace，便于桌面宿主或运维在进程退出后定位原因。
 
 - `GET /api/team/templates` — 模板列表
 - `POST /api/team/projects {id, template_id, repo_path}` — 从模板创建团队
+- `GET/POST/DELETE /api/team/members` — 声明式成员列表、动态新增/删除；
+  新成员会与既有成员建立双向 contact，删除会停止 runner 并更新 `team.json`
+- `POST /api/team/chat {project, target, text}` — 操作员发给指定成员；
+  `target="team"` 会广播给全部成员
 - `GET/PUT /api/team/agent/config` — per-agent 配置（PUT persona 热应用，
   model/key/url 重建）
 - `POST /api/team/upgrade-check` — 升级检查（逐字段相等判定哪些成员会跟随
   模板升级、哪些是本地覆写）
 - `GET /api/team/startup` — 启动恢复报告
+
+`/api/team/events` WebSocket 会回放并直播 `team_message` 与
+`agent_thought`。`team_message` 覆盖 operator→member、operator→team、
+member→member 的落库投递；团队广播对同一 `broadcast_id` 去重后显示一次。
+`agent_thought` 只用于操作员可见的过程流，不注入其它成员的模型上下文。
 
 
 设计：`docs/design/2026-08-30-agent-team-studio-design.md`（含 inspector 两层定位
