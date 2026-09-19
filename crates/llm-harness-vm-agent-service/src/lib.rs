@@ -171,11 +171,11 @@ fn sanitize_error_message(message: String) -> String {
         return "operation failed".to_owned();
     }
     if message.len() > MAX_ERROR_MESSAGE_BYTES {
-        let truncate_to = MAX_ERROR_MESSAGE_BYTES - ELLIPSIS_BYTES;
-        message.truncate(truncate_to);
-        while !message.is_char_boundary(message.len()) {
-            message.pop();
+        let mut truncate_to = MAX_ERROR_MESSAGE_BYTES - ELLIPSIS_BYTES;
+        while !message.is_char_boundary(truncate_to) {
+            truncate_to -= 1;
         }
+        message.truncate(truncate_to);
         message.push('…');
     }
     message
@@ -220,6 +220,14 @@ mod tests {
         let error = HandlerError::operation("", format!("bad\0{}", "x".repeat(8192)));
         assert_eq!(error.code(), HANDLER_ERROR_CODE);
         assert!(!error.message().contains('\0'));
+        assert!(error.message().len() <= MAX_ERROR_MESSAGE_BYTES);
+        assert!(error.message().ends_with('…'));
+    }
+
+    #[test]
+    fn handler_error_truncation_is_utf8_safe() {
+        let error =
+            HandlerError::operation("filesystem_error", "失败".repeat(MAX_ERROR_MESSAGE_BYTES));
         assert!(error.message().len() <= MAX_ERROR_MESSAGE_BYTES);
         assert!(error.message().ends_with('…'));
     }
