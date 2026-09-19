@@ -30,7 +30,10 @@ coupling protocol correctness to a Linux-only transport API.
 Decoding follows the protocol's fail-close policy. Once the wire stream is
 malformed, oversized, or directionally invalid, `recv` returns an error and the
 connection must be discarded. A clean remote close reports all already decoded
-pending frames first and then returns `TransportError::Closed`.
+pending frames first and then returns `TransportError::Closed`. If EOF arrives
+while a header or payload is incomplete, `recv` returns
+`TransportError::ClosedDuringPartialFrame`; the caller must treat that
+connection as failed rather than frame-aligned.
 
 `send` encodes the frame with the same payload limit used by the decoder. It
 rejects a frame before writing if its origin peer does not match the local
