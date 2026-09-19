@@ -162,7 +162,12 @@ fn open_regular_file(
     }
 
     flags |= OFlags::NONBLOCK | OFlags::NOCTTY;
-    let file_fd = open_workspace_at(parent, name, flags, Mode::RUSR | Mode::WUSR)
+    let mode = if flags.contains(OFlags::CREATE) {
+        Mode::RUSR | Mode::WUSR
+    } else {
+        Mode::empty()
+    };
+    let file_fd = open_workspace_at(parent, name, flags, mode)
         .map_err(|error| filesystem_error("open file", error))?;
     let stat = fs::fstat(&file_fd)
         .map_err(|error| filesystem_error("read opened file metadata", error))?;
