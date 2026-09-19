@@ -3,9 +3,9 @@
 ## Status
 
 Implemented as the transport-independent
-`llm-harness-vm-agent-transport` crate. It is not an AF_VSOCK adapter, guest
-agent, or Firecracker backend. Those integration slices will reuse this frame
-stream and can be tested independently.
+`llm-harness-vm-agent-transport` crate. The Linux AF_VSOCK adapter is available
+in `llm_harness_vm_agent_transport::vsock`. A guest agent and Firecracker
+backend are still separate integration slices.
 
 ## Scope
 
@@ -36,10 +36,9 @@ pending frames first and then returns `TransportError::Closed`.
 rejects a frame before writing if its origin peer does not match the local
 peer, preventing a host/guest role mix-up from being sent to the remote side.
 
-## Future vsock adapter boundary
+## Vsock adapter boundary
 
-A future Linux adapter should construct an AF_VSOCK stream with `socket2` and
-Tokio's async file-descriptor support, then pass that stream to
-`FrameStream::new`. The adapter should own only connection setup, shutdown,
-and platform error mapping. It must not duplicate frame decoding, direction
-validation, or payload-limit checks.
+The Linux adapter constructs an AF_VSOCK stream with `socket2` and Tokio's
+async file-descriptor support, then passes that stream to `FrameStream::new`.
+It owns only connection setup, shutdown, and platform error mapping. It does
+not duplicate frame decoding, direction validation, or payload-limit checks.

@@ -9,5 +9,11 @@ llm-harness-vm-agent-protocol.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+socket2.workspace = true
+tokio = { workspace = true, features = ["net"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+tempfile.workspace = true
