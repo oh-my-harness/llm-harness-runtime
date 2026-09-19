@@ -183,7 +183,10 @@ the gateway.
 
 ## Current status
 
-This document selects Firecracker and defines the required threat model. No
-Firecracker backend implementation exists yet. The Bwrap gateway remains the only
-implemented remote execution backend, and #193 remains open until VM-level
-isolation, production policy enforcement, and deployment validation are complete.
+This document selects Firecracker and defines the required threat model. The
+transport-independent guest-agent wire protocol is implemented in
+`llm-harness-vm-agent-protocol`; it has not yet been connected to a guest agent
+or Firecracker lifecycle. No Firecracker backend implementation exists yet. The
+Bwrap gateway remains the only implemented remote execution backend, and #193
+remains open until VM-level isolation, production policy enforcement, and
+deployment validation are complete.
