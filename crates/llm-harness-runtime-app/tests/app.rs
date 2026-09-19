@@ -320,3 +320,59 @@ fn app_binary_migrates_and_rolls_back_data_root() {
 
     std::fs::remove_dir_all(parent).unwrap();
 }
+
+#[test]
+fn app_binary_collects_redacted_diagnostics_bundle() {
+    let root = temp_root("diagnostics");
+    std::fs::create_dir_all(root.join("logs")).unwrap();
+    std::fs::write(
+        root.join("logs/runtime.jsonl"),
+        "{\"schema\":\"llm-harness.studio.lifecycle-event.v1\",\"event_id\":\"event\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"process_id\":123,\"data_root\":\"/secret-root\",\"data\":{\"event\":\"startup\",\"error\":\"secret-error\",\"bound_address\":\"127.0.0.1:12345\"}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("logs/crash.jsonl"),
+        "{\"schema\":\"llm-harness.studio.crash-report.v1\",\"event_id\":\"crash\",\"timestamp\":\"2026-01-02T00:00:00Z\",\"process_id\":123,\"payload\":\"secret-panic\",\"backtrace\":\"secret-frame\"}\n",
+    )
+    .unwrap();
+    let parent = temp_root("diagnostics-output");
+    std::fs::create_dir_all(&parent).unwrap();
+    let output = parent.join("bundle.json");
+
+    let command = Command::new(env!("CARGO_BIN_EXE_llm-harness-app"))
+        .args([
+            "collect-diagnostics",
+            "--data-root",
+            root.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(command.status.success(), "diagnostics failed: {command:?}");
+    let result: serde_json::Value = serde_json::from_slice(&command.stdout).unwrap();
+    assert_eq!(result["operation"], "collect-diagnostics");
+    assert_eq!(
+        result["schema"],
+        "llm-harness.runtime-app.diagnostics-bundle.v1"
+    );
+
+    let bundle = std::fs::read_to_string(&output).unwrap();
+    assert!(!bundle.contains("/secret-root"));
+    assert!(!bundle.contains("secret-error"));
+    assert!(!bundle.contains("secret-panic"));
+    assert!(!bundle.contains("secret-frame"));
+    assert!(!bundle.contains("127.0.0.1:12345"));
+    let bundle: serde_json::Value = serde_json::from_str(&bundle).unwrap();
+    assert_eq!(bundle["lifecycle"]["events"][0]["data"]["event"], "startup");
+    assert_eq!(bundle["crash"]["events"][0]["payload"]["redacted"], true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&output).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::remove_dir_all(&parent).unwrap();
+}

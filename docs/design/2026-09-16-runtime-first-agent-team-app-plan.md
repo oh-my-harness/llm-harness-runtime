@@ -450,6 +450,14 @@ handler；`/api/app/health` 输出 `feature_health.agent-team` 与启动恢复�
 - Windows release shell 冒烟已验证：关闭 `Tauri Window` 主窗口后记录
   `ctrl_break` 与 normal shutdown，`panel.json` 被清理且 core 进程无残留；
   本机已生成 MSI 与 NSIS 两种安装包。
+- 新增离线诊断收集命令
+  `llm-harness-app collect-diagnostics --data-root PATH --output PATH`，
+  输出结构化 JSON bundle；只保留 lifecycle/crash 白名单字段，
+  对 data root、错误详情、绑定地址、panic payload、backtrace 与源码路径
+  做 hash/length 摘要，避免导出本机路径、token 或 panic 原文。
+- 收集器拒绝 symlink 与异常日志文件，限制单文件读取大小和事件数量；
+  输出使用 `create_new`、Unix `0600`、`O_NOFOLLOW`，写入后 fsync，
+  并拒绝输出到 data root 内，降低误写和敏感数据落盘风险。
 
 当前边界：
 

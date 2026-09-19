@@ -1,6 +1,9 @@
 use llm_harness_agent_team_studio::diagnostics::append_lifecycle_event;
 use llm_harness_agent_team_studio::diagnostics::install_panic_reporter;
 use llm_harness_runtime_app::app::{RuntimeApp, RuntimeAppConfig};
+use llm_harness_runtime_app::diagnostics_bundle::{
+    parse_diagnostics_command, run_diagnostics_command,
+};
 use llm_harness_runtime_app::lifecycle::{
     LifecycleConfig, ShutdownOutcome, ShutdownSignalHandler, shutdown_with_timeout,
 };
@@ -30,6 +33,22 @@ async fn main() {
         std::process::exit(2);
     }) {
         match run_data_command(command) {
+            Ok(result) => {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            }
+            Err(error) => {
+                eprintln!("llm-harness-app: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if let Some(command) = parse_diagnostics_command(&arguments).unwrap_or_else(|error| {
+        eprintln!("llm-harness-app: {error}");
+        std::process::exit(2);
+    }) {
+        match run_diagnostics_command(command) {
             Ok(result) => {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
             }
