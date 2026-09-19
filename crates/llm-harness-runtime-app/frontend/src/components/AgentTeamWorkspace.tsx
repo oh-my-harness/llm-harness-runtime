@@ -5,7 +5,12 @@ import {
   type AgentTeamEvent,
   type AgentTeamEventConnectionState,
 } from "../agentTeamEvents";
+import {
+  buildMigrateDataCommand,
+  buildRollbackDataCommand,
+} from "../migration";
 import type {
+  AppDataMigrationInfo,
   AgentTeamProject,
   AgentTeamPulse,
   AgentTeamStartupRecovery,
@@ -47,6 +52,10 @@ export default function AgentTeamWorkspace() {
   const [templates, setTemplates] = useState<AgentTeamTemplate[]>([]);
   const [recovery, setRecovery] = useState<AgentTeamStartupRecovery | null>(null);
   const [settings, setSettings] = useState<AgentTeamSettings | null>(null);
+  const [migrationInfo, setMigrationInfo] =
+    useState<AppDataMigrationInfo | null>(null);
+  const [migrationDestination, setMigrationDestination] = useState("");
+  const [migrationBackup, setMigrationBackup] = useState("");
   const [settingsReady, setSettingsReady] = useState(false);
   const [selectedTeamId, setSelectedTeamId] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
@@ -73,6 +82,35 @@ export default function AgentTeamWorkspace() {
     () => teams.find((team) => team.id === selectedTeamId) ?? null,
     [teams, selectedTeamId]
   );
+
+  const migrationCommands = useMemo(() => {
+    if (!migrationInfo || !migrationDestination.trim()) return null;
+    try {
+      return {
+        migrate: buildMigrateDataCommand({
+          binary: migrationInfo.binary,
+          source: migrationInfo.current_data_root,
+          destination: migrationDestination.trim(),
+          backup: migrationBackup.trim() || undefined,
+        }),
+        rollback: migrationBackup.trim()
+          ? buildRollbackDataCommand({
+              binary: migrationInfo.binary,
+              source: migrationInfo.current_data_root,
+              destination: migrationDestination.trim(),
+              backup: migrationBackup.trim(),
+            })
+          : null,
+        error: null,
+      };
+    } catch (error) {
+      return {
+        migrate: null,
+        rollback: null,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }, [migrationBackup, migrationDestination, migrationInfo]);
 
   const loadTeams = useCallback(async () => {
     try {
@@ -110,13 +148,15 @@ export default function AgentTeamWorkspace() {
     let cancelled = false;
 
     const loadInitialData = async () => {
-      const [teamResult, settingsResult] = await Promise.allSettled([
+      const [teamResult, settingsResult, migrationResult] =
+        await Promise.allSettled([
         Promise.all([
           api.listAgentTeams(),
           api.listAgentTeamTemplates(),
           api.getAgentTeamStartup(),
         ]),
         api.getAgentTeamSettings(),
+          api.getAppDataMigration(),
       ]);
       if (cancelled) return;
 
@@ -147,6 +187,15 @@ export default function AgentTeamWorkspace() {
           settingsResult.reason instanceof Error
             ? settingsResult.reason.message
             : String(settingsResult.reason)
+        );
+      }
+      if (migrationResult.status === "fulfilled") {
+        setMigrationInfo(migrationResult.value);
+      } else {
+        setLoadError(
+          migrationResult.reason instanceof Error
+            ? migrationResult.reason.message
+            : String(migrationResult.reason)
         );
       }
       setSettingsReady(true);
@@ -410,6 +459,66 @@ export default function AgentTeamWorkspace() {
               保存 Runtime 设置
             </button>
           </div>
+        </section>
+        <section
+          className="rounded-lg border border-gray-200 p-3"
+          data-testid="agent-team-data-migration"
+        >
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+            数据迁移
+          </h3>
+          <p
+            className="mt-2 truncate text-xs text-gray-600"
+            title={migrationInfo?.current_data_root ?? ""}
+          >
+            当前数据根：{migrationInfo?.current_data_root ?? "加载中"}
+          </p>
+          <p className="mt-2 text-xs text-amber-700">
+            迁移和回滚必须在应用退出后执行；运行中的数据根会被锁拒绝。
+          </p>
+          <div className="mt-2 space-y-2">
+            <input
+              value={migrationDestination}
+              onChange={(event) => setMigrationDestination(event.target.value)}
+              placeholder="新数据根绝对路径"
+              aria-label="数据迁移目标路径"
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+            />
+            <input
+              value={migrationBackup}
+              onChange={(event) => setMigrationBackup(event.target.value)}
+              placeholder="备份路径（可选）"
+              aria-label="数据迁移备份路径"
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+            />
+          </div>
+          {migrationCommands?.error && (
+            <p className="mt-2 text-xs text-red-600">{migrationCommands.error}</p>
+          )}
+          {migrationCommands?.migrate && (
+            <div className="mt-3 space-y-2">
+              <div>
+                <p className="text-xs font-medium text-gray-600">迁移命令</p>
+                <code className="mt-1 block break-all rounded-lg bg-gray-50 px-2 py-1 text-xs text-gray-700">
+                  {migrationCommands.migrate}
+                </code>
+              </div>
+              {migrationCommands.rollback && (
+                <div>
+                  <p className="text-xs font-medium text-gray-600">
+                    回滚命令
+                  </p>
+                  <code className="mt-1 block break-all rounded-lg bg-gray-50 px-2 py-1 text-xs text-gray-700">
+                    {migrationCommands.rollback}
+                  </code>
+                </div>
+              )}
+              <p className="text-xs text-gray-500">
+                备份路径留空时会自动选择 sibling 备份；请记录命令输出中的
+                backup 路径。迁移中断后重新执行同一条迁移命令可恢复事务。
+              </p>
+            </div>
+          )}
         </section>
         <div className="space-y-2">
           <input

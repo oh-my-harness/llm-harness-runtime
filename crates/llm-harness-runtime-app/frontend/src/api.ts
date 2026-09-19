@@ -1,4 +1,5 @@
 import type {
+  AppDataMigrationInfo,
   AgentTeamProject,
   AgentTeamPulse,
   AgentTeamSettings,
@@ -48,6 +49,8 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  getAppDataMigration: () =>
+    fetchJson<AppDataMigrationInfo>("/api/app/data-migration"),
   listAgentTeams: () =>
     fetchJson<{ projects: AgentTeamProject[] }>(`${API_BASE}/projects`),
   createAgentTeam: (input: {

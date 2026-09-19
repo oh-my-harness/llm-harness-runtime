@@ -156,6 +156,19 @@ async fn app_exposes_health_and_diagnostics_with_auth() {
     assert!(!body["lifecycle_events"].as_array().unwrap().is_empty());
 
     let response = client
+        .get(format!("http://{addr}/api/app/data-migration"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["current_data_root"], serde_json::json!(root));
+    assert_eq!(body["binary"], "llm-harness-app");
+    assert_eq!(body["requires_app_shutdown"], true);
+
+    let response = client
         .get(format!("http://{addr}/api/app/health"))
         .send()
         .await
