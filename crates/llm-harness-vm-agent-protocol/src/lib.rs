@@ -463,6 +463,11 @@ impl Frame {
         self.request_id
     }
 
+    /// Return the protocol peer that originated this frame.
+    pub fn peer(&self) -> ProtocolPeer {
+        self.message.origin()
+    }
+
     /// Return the validated message.
     pub fn message(&self) -> &AgentMessage {
         &self.message
