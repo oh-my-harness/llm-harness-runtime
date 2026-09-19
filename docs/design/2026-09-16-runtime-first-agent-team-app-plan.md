@@ -418,13 +418,16 @@ handler；`/api/app/health` 输出 `feature_health.agent-team` 与启动恢复�
   - 单元测试覆盖设置、团队、备份、回滚保留、运行锁、symlink、
     preparation 失败清理和多个 journal 恢复点；二进制集成测试覆盖
     migrate/rollback CLI。
+- 2026-09-19：React 面板加入数据迁移入口，通过认证的
+  `/api/app/data-migration` 读取当前数据根，生成 offline
+  migrate/rollback 命令与中断恢复指引；面板不在线迁移运行中的数据根。
 
 当前边界：
 
 - Windows 信号路径、数据根目录 rename/锁行为与目录元数据落盘仍需真实
   Windows 环境验证；本仓库当前本地验证只覆盖 Linux。
-- 迁移工具尚未接入桌面 UI，当前提供 CLI 控制面；M5 打包时需提供
-  显式的数据迁移/回滚入口和失败恢复指引。
+- 迁移入口目前是 browser panel 的命令生成与恢复指引；桌面壳仍需在
+  packaged app 中承担退出、执行迁移、重启与失败展示的编排。
 
 ### M5：桌面打包与发布
 

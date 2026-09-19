@@ -1,3 +1,9 @@
+export interface AppDataMigrationInfo {
+  current_data_root: string;
+  binary: string;
+  requires_app_shutdown: boolean;
+}
+
 export interface AgentTeamProject {
   id: string;
   repo_path?: string | null;

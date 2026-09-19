@@ -5,7 +5,7 @@ use axum::{Json, Router};
 use llm_harness_agent_team_studio::diagnostics::read_lifecycle_events;
 use llm_harness_agent_team_studio::runtime::StartupRecovery;
 use parking_lot::RwLock;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const APP_NAME: &str = "llm-harness-runtime-app";
@@ -21,6 +21,7 @@ pub fn app_router(state: AppState) -> Router {
     Router::new()
         .route("/api/app/health", get(health))
         .route("/api/app/diagnostics", get(diagnostics))
+        .route("/api/app/data-migration", get(data_migration))
         .route("/app/agent-team", get(crate::frontend::index))
         .route("/app/agent-team/", get(crate::frontend::index))
         .route("/app/agent-team/{*path}", get(crate::frontend::asset))
@@ -72,5 +73,24 @@ async fn diagnostics(State(state): State<AppState>) -> Response {
             })),
         )
             .into_response(),
+    }
+}
+
+async fn data_migration(State(state): State<AppState>) -> Response {
+    let current_data_root = absolute_data_root(&state.data_root);
+    Json(serde_json::json!({
+        "ok": true,
+        "current_data_root": current_data_root,
+        "binary": "llm-harness-app",
+        "requires_app_shutdown": true,
+    }))
+    .into_response()
+}
+
+fn absolute_data_root(data_root: &Path) -> PathBuf {
+    if data_root.is_absolute() {
+        data_root.to_owned()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(data_root)
     }
 }

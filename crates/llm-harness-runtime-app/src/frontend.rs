@@ -106,13 +106,13 @@ fn is_content_hashed_asset(path: &str) -> bool {
         return false;
     }
 
-    let Some(hash) = file_stem.rsplit_once('-').map(|(_, hash)| hash) else {
+    let Some(hash) = file_stem.split_once('-').map(|(_, hash)| hash) else {
         return false;
     };
     hash.len() >= 8
         && hash
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 #[cfg(test)]
@@ -162,6 +162,12 @@ mod tests {
             response.headers().get(header::CACHE_CONTROL).unwrap(),
             "public, max-age=31536000, immutable"
         );
+    }
+
+    #[test]
+    fn recognizes_vite_hashes_containing_hyphens() {
+        assert!(is_content_hashed_asset("assets/index-D-oXZWwZ.js"));
+        assert!(!is_content_hashed_asset("assets/index-short.js"));
     }
 
     #[test]
