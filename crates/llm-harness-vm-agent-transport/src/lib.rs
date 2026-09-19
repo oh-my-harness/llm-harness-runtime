@@ -4,6 +4,9 @@
 //! stream can be tested over an in-memory duplex stream and later adapted to
 //! AF_VSOCK, Unix sockets, or another byte-oriented transport.
 
+#[cfg(target_os = "linux")]
+pub mod vsock;
+
 use std::collections::VecDeque;
 
 use llm_harness_vm_agent_protocol::{

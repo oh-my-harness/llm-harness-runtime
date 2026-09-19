@@ -93,6 +93,7 @@ reqwest            = { version = "0.12", default-features = false, features = ["
 rusqlite            = { version = "0.40.1", default-features = false }
 base64             = "0.22"
 libc               = "0.2"
+socket2            = { version = "0.6", features = ["all"] }
 encoding_rs         = "0.8"
 fastrand          = "2.4"
 zeroize            = "1"
