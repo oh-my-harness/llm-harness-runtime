@@ -13,6 +13,7 @@ members = [
     "crates/llm-harness-sandbox-gateway",
     "crates/llm-harness-vm-agent-protocol",
     "crates/llm-harness-vm-agent-transport",
+    "crates/llm-harness-vm-agent-service",
     "crates/llm-harness-mcp",
     "crates/llm-harness-tools",
     "crates/llm-harness-strategy",
@@ -64,6 +65,7 @@ llm-harness-sandbox = { path = "crates/llm-harness-sandbox" }
 llm-harness-sandbox-remote = { path = "crates/llm-harness-sandbox-remote" }
 llm-harness-vm-agent-protocol = { path = "crates/llm-harness-vm-agent-protocol" }
 llm-harness-vm-agent-transport = { path = "crates/llm-harness-vm-agent-transport" }
+llm-harness-vm-agent-service = { path = "crates/llm-harness-vm-agent-service" }
 llm-harness-agent-team-studio = { path = "crates/llm-harness-agent-team-studio" }
 llm-harness-runtime-app = { path = "crates/llm-harness-runtime-app" }
 llm-harness-agent-team = { path = "crates/llm-harness-agent-team" }

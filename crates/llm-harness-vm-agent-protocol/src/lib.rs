@@ -473,6 +473,11 @@ impl Frame {
         &self.message
     }
 
+    /// Consume the frame and return its validated message.
+    pub fn into_message(self) -> AgentMessage {
+        self.message
+    }
+
     /// Encode a bounded frame using the protocol header and compact JSON body.
     pub fn encode(&self, max_payload_bytes: usize) -> Result<Vec<u8>, ProtocolError> {
         validate_payload_limit(max_payload_bytes)?;
@@ -563,6 +568,11 @@ impl FrameDecoder {
             }
         }
         Ok(())
+    }
+
+    /// Return whether a partial frame is waiting for more bytes.
+    pub fn has_partial_frame(&self) -> bool {
+        self.header_len != 0 || self.payload.is_some()
     }
 
     fn start_payload(&mut self) -> Result<(), ProtocolError> {

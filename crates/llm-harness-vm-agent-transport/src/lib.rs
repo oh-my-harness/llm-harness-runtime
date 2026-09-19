@@ -26,6 +26,9 @@ pub enum TransportError {
     /// The remote peer closed the stream before another frame arrived.
     #[error("guest agent transport stream closed")]
     Closed,
+    /// The remote peer closed the stream while a frame was incomplete.
+    #[error("guest agent transport closed during a partial frame")]
+    ClosedDuringPartialFrame,
 }
 
 /// A bounded, directional frame stream over any async duplex byte stream.
@@ -92,6 +95,9 @@ where
         loop {
             let read_len = self.stream.read(&mut chunk).await?;
             if read_len == 0 {
+                if self.decoder.has_partial_frame() {
+                    return Err(TransportError::ClosedDuringPartialFrame);
+                }
                 return Err(TransportError::Closed);
             }
 
@@ -146,7 +152,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use llm_harness_vm_agent_protocol::AgentMessage;
+    use llm_harness_vm_agent_protocol::{AgentMessage, FRAME_HEADER_LEN};
     use tokio::io::duplex;
 
     fn host_frame(request_id: u64, message: AgentMessage) -> Frame {
@@ -257,6 +263,31 @@ mod tests {
         assert!(matches!(
             guest_stream.recv().await,
             Err(TransportError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn frame_stream_reports_close_during_partial_frame() {
+        let (host_io, guest_io) = duplex(128);
+        let mut host_stream =
+            FrameStream::with_default_limit(host_io, ProtocolPeer::Host).expect("host stream");
+        let mut guest_stream =
+            FrameStream::with_default_limit(guest_io, ProtocolPeer::Guest).expect("guest stream");
+
+        let request = host_frame(1, AgentMessage::Ping);
+        let mut wire = request.encode(1024).expect("host bytes");
+        wire.truncate(FRAME_HEADER_LEN / 2);
+        host_stream
+            .get_mut()
+            .write_all(&wire)
+            .await
+            .expect("write partial header");
+        host_stream.close().await.expect("close host");
+        drop(host_stream);
+
+        assert!(matches!(
+            guest_stream.recv().await,
+            Err(TransportError::ClosedDuringPartialFrame)
         ));
     }
 
