@@ -431,6 +431,31 @@ handler；`/api/app/health` 输出 `feature_health.agent-team` 与启动恢复�
 
 ### M5：桌面打包与发布
 
+2026-09-19 实施记录：
+
+- 新增 `llm-harness-runtime-app-shell` Tauri 2 桌面壳；它以 `RUNTIME_APP_PORT=0`
+  启动 sibling `llm-harness-app`，解析 `RUNTIME_APP_PANEL_DESCRIPTOR` 与
+  `panel.json`，校验 descriptor 路径必须是 `<data-root>/panel.json`、URL 必须是
+  HTTP loopback IP 后用系统 WebView 打开现有 React 面板。
+- 未显式设置 `RUNTIME_APP_DATA_ROOT` 时，shell 会解析 Tauri 的平台级 AppData
+  目录并传给 core，避免 Windows 安装目录不可写或数据散落在工作目录。
+- 窗口关闭时先向 core 发送优雅退出信号：Unix 使用 `SIGTERM`，Windows 将
+  core 放入 new process group 并发送 `CTRL_BREAK_EVENT`；超时后强制 kill。
+  shell 无控制台时会在 Windows 创建并隐藏控制台，以保留信号路径。
+- Shell crate 同时产出 `llm-harness-app` binary，方便 `cargo run/test` 直接验证
+  同目录 core 启动协议；workspace SQLite 切换为 bundled，以支持 Windows 桌面打包。
+- 新增 Tauri bundle 配置与 `scripts/package-runtime-app-shell.ps1`，将 core
+  stage 为 target-triple sidecar 并生成 Windows MSI/NSIS 安装包；脚本固定
+  Tauri CLI 版本以保证打包可复现。
+- Windows release shell 冒烟已验证：关闭 `Tauri Window` 主窗口后记录
+  `ctrl_break` 与 normal shutdown，`panel.json` 被清理且 core 进程无残留；
+  本机已生成 MSI 与 NSIS 两种安装包。
+
+当前边界：
+
+- 安装包尚未在 clean Windows machine 上执行启动、面板、数据目录、卸载与
+  packaged E2E 验收；Linux artifact 与迁移编排仍待下一片完成。
+
 交付：
 
 - Tauri 2 或等价 Rust shell。

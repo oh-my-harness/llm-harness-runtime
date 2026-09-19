@@ -29,6 +29,7 @@ members = [
     "crates/llm-harness-inspector",
     "crates/llm-harness-agent-team-studio",
     "crates/llm-harness-runtime-app",
+    "crates/llm-harness-runtime-app-shell",
     # examples
     # coding-agent is now a separate repo: https://github.com/oh-my-harness/coding-agent.git
     # It depends on this workspace's crates via git rev.
@@ -90,7 +91,7 @@ tokio-util         = { version = "0.7" }
 uuid               = { version = "1", features = ["v4", "v7", "js"] }
 tempfile           = "3"
 reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
-rusqlite            = { version = "0.40.1", default-features = false }
+rusqlite            = { version = "0.40.1", default-features = false, features = ["bundled"] }
 base64             = "0.22"
 libc               = "0.2"
 socket2            = { version = "0.6", features = ["all"] }
