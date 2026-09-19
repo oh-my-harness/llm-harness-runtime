@@ -12,6 +12,11 @@ use async_trait::async_trait;
 use llm_harness_vm_agent_protocol::{AgentMessage, Frame, ProtocolPeer};
 use llm_harness_vm_agent_transport::{FrameStream, TransportError};
 
+#[cfg(target_os = "linux")]
+pub mod workspace;
+#[cfg(target_os = "linux")]
+pub use workspace::WorkspaceFileHandler;
+
 /// Stable error code returned when this dispatcher cannot safely handle an operation.
 pub const UNSUPPORTED_OPERATION_CODE: &str = "unsupported_operation";
 pub const HANDLER_ERROR_CODE: &str = "handler_error";
