@@ -6,10 +6,16 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
 llm-harness-vm-agent-protocol.workspace = true
 llm-harness-vm-agent-transport.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "rt"] }
+uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.5", features = ["fs"] }
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
