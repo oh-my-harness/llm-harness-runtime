@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -110,10 +112,20 @@ impl FirecrackerProcess {
         if let Some(parent) = config.api_socket_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&config.config_file_path, config_json)?;
+        #[cfg(target_os = "linux")]
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&config.config_file_path)?;
+            file.write_all(&config_json)?;
+        }
 
         let mut command = tokio::process::Command::new(&config.binary_path);
         command.args(config.command_args());
+        command.kill_on_drop(true);
         let child = command.spawn()?;
         Ok(Self {
             child,
