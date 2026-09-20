@@ -34,15 +34,19 @@ stdout/stderr are streamed through an incremental UTF-8 decoder.
 
 Each stream is independently capped by `max_output_bytes`; bytes beyond the
 cap are counted and discarded. `ProcessExit` and `ProcessTimeout` are terminal
-events and are emitted only after both output streams have been drained.
+events and are emitted after both output streams have been drained, or after a
+bounded one-second concurrent drain timeout. The timeout prevents a descendant
+that leaves the process group while retaining a pipe from delaying terminal
+event delivery.
 Timeouts and connection disconnects use `SIGKILL` on the process group.
 Graceful cancellation sends `SIGTERM`, waits a bounded interval, and then
 sends `SIGKILL`. The manager reaps the shell and cleans up background process
 group members after the shell exits.
 
 When the host cleanly closes the connection, the service disconnects every
-started process and waits for the write half to finish. This prevents guest
-workloads from outliving a disconnected control connection.
+started process and waits for the write half to finish. This terminates process
+group members; VM lifecycle shutdown remains responsible for descendants that
+deliberately leave the process group.
 
 Handler failures are converted to `AgentMessage::Error` with a stable handler
 code and a message capped at 4 KiB. Empty or NUL-containing handler input is
