@@ -24,6 +24,8 @@ pub use process::ProcessManager;
 pub mod workspace_agent;
 #[cfg(target_os = "linux")]
 pub use workspace_agent::WorkspaceAgentHandler;
+pub mod client;
+pub use client::{GuestAgentClient, GuestAgentClientError, GuestProcessHandle};
 
 /// Stable error code returned when this dispatcher cannot safely handle an operation.
 pub const UNSUPPORTED_OPERATION_CODE: &str = "unsupported_operation";
