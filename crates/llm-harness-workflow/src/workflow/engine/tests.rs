@@ -5027,6 +5027,17 @@ fn visit_count(log: &Arc<parking_lot::Mutex<Vec<String>>>, step: &str) -> usize 
     log.lock().iter().filter(|s| s.as_str() == step).count()
 }
 
+/// One loop owner's counter snapshot at `count` (observational only).
+fn c(n: u32) -> Vec<(String, u32)> {
+    vec![("check".into(), n)]
+}
+
+/// Record the two gated snapshots (apply_transition + run_loop saves) that
+/// every executed visit contributes to the persisted-save cadence.
+fn double(expected: &mut Vec<Vec<(String, u32)>>, counters: Vec<(String, u32)>) {
+    expected.extend([counters.clone(), counters]);
+}
+
 /// LLM step carrying a LoopConfig with the standard test policy (the four
 /// policy fields the engine tests never vary are `None`). The LoopConfig
 /// semantics stay visible at every call site.
@@ -5950,6 +5961,346 @@ async fn immediate_exit_loop_reentry_gets_fresh_budget() {
             record.transition
         );
     }
+}
+
+/// Exit-route regression #1: the exhausting visit's exit_route Label edge
+/// targets the loop's `target_stage` itself (`run`, the loop head). The
+/// counter must clear on exhaustion, the exit must land the workflow back
+/// on `run` (not wherever the judge pointed), and the re-entry episode must
+/// receive a completely fresh budget. Termination comes from
+/// `max_steps`, not from stale counter state: episode shapes repeat until
+/// the engine's `max_steps` safety valve fires with `TaskFailed`.
+///
+/// Trace (max_iterations=2, max_steps=13): [run, check] ×3 per episode
+/// (2 continuations + the exhausting attempt) — episode 1 exits directly
+/// to `run` and re-enters at 1, episode 2 repeats the full shape, and the
+/// 13th visit trips `history_len >= max_steps` before executing (the judge
+/// logs a visit before the engine's loop-top valve check, so exactly one
+/// extra visit appears in the log). Final `loop_iterations` is empty
+/// because the exhausting attempt (visit 12) cleared the counter.
+#[tokio::test]
+async fn loop_config_exit_route_to_target_stage_reentry_bounded_by_max_steps() {
+    let visited = visit_log();
+
+    // Exactly 13 responses: each executed step consumes one. Any extra
+    // continuation past the max_steps valve would run the mock dry (the
+    // mock serves a fallback text rather than panicking, so over-budget
+    // runs must be caught by the visit-order assertion below).
+    let client = Arc::new(MockLlmClient::new(
+        (1..=13)
+            .map(|i| {
+                MockResponse::text(
+                    &if i % 2 == 1 { "run N" } else { "check N" }.replace('N', &i.to_string()),
+                )
+            })
+            .collect(),
+    ));
+    let dir = tempfile::TempDir::new().unwrap();
+    let workflow = Workflow {
+        entry_step: "run".into(),
+        steps: vec![
+            Step::llm("run", "Run", "do work", vec![]),
+            loop_step("check", "Check", "validate", 2, "run", Some("back")),
+        ],
+        edges: vec![
+            Edge {
+                from: "run".into(),
+                to: "check".into(),
+                condition: None,
+            },
+            // Declarative exit edge: its target IS the loop head
+            // (target_stage), so exhaustion re-enters the loop directly.
+            Edge {
+                from: "check".into(),
+                to: "run".into(),
+                condition: Some(EdgeCondition::Label("back".into())),
+            },
+        ],
+    };
+    let config = engine_config(dir.path(), client);
+    let recorder = LoopCounterRecorder {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        gate_step: "run",
+        snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
+    };
+    let store: Arc<dyn TaskStore> = Arc::new(recorder.clone());
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(AlwaysRetryJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_max_steps(13)
+    .with_task_store(store);
+    let run = engine.run().await;
+
+    // Exact visit order: [run, check] ×3 per episode for 2 episodes = 12
+    // visits, then the 13th visit (episode 3's head) trips the max_steps
+    // valve before executing.
+    let order = visited.lock().clone();
+    let expected: Vec<String> = ["run", "check", "run", "check", "run", "check"]
+        .iter()
+        .cycle()
+        .take(13)
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        order, expected,
+        "each episode must consume the FULL max_iterations=2 budget before \
+         exiting via the target_stage edge; got {order:?}"
+    );
+
+    match &run {
+        Err(WorkflowError::TaskFailed(msg)) => {
+            assert!(
+                msg.contains("max_steps (13) exceeded"),
+                "repeated episodes must terminate via the max_steps valve; got: {msg}"
+            );
+        }
+        other => panic!("expected TaskFailed from max_steps, got {other:?}"),
+    }
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Failed,
+        "max_steps exhaustion must fail the workflow"
+    );
+
+    // Final state: the exhausting attempt (visit 12) cleared the counter
+    // and the exit edge re-entered the loop; nothing re-seeded it after.
+    let state = engine.workflow_state.lock().await.clone();
+    assert!(
+        state.loop_iterations.is_empty(),
+        "exhaustion must clear the persisted counter before the exit; got {:?}",
+        state.loop_iterations
+    );
+
+    // Persisted transitions: all six check records read To("run") — two
+    // continuations per episode jump to target_stage, and each exhausting
+    // visit persists the exit jump whose edge target IS target_stage.
+    let expected_transitions = ["run"; 6];
+    for (record, expected_target) in state
+        .step_history
+        .iter()
+        .filter(|r| r.step_id.as_str() == "check")
+        .zip(expected_transitions)
+    {
+        assert!(
+            matches!(
+                &record.transition,
+                Transition::To(t) if t == expected_target
+            ),
+            "check record must persist To({expected_target:?}), got {:?}",
+            record.transition
+        );
+    }
+
+    // Mid-run counter snapshots (saves after the gate step "run" first
+    // appeared in step_history): the exhausting visit must CLEAR the
+    // counter, and the re-episode must restart at 1 — a stale-counter bug
+    // (no clear on exhaustion) would show monotonically growing counts.
+    let observed: Vec<Vec<(String, u32)>> = recorder
+        .snapshots
+        .lock()
+        .iter()
+        .filter(|(gate, _)| *gate)
+        .map(|(_, counters)| counters.clone())
+        .collect();
+    // The engine persists twice per visit (apply_transition's save + the
+    // run_loop save after advancing current_step), so each visit below
+    // contributes two gated snapshots with identical counter state. Gate =
+    // any "run" record:  run#1 [[]],  per episode: check(c1), run(c1),
+    // check(c2), run(c2), check(exhausted → []), run(exit landing → []),
+    // then run#13 (episode 3's head) and the fail_task save.
+    let mut expected_snapshots: Vec<Vec<(String, u32)>> = Vec::new();
+    // Every visit — including the final landing, whose run_loop save fires
+    // before the next loop-top valve check — contributes exactly two gated
+    // snapshots; the valve's fail_task save appends one last empty.
+    double(&mut expected_snapshots, vec![]); // run#1: gate fires on run's own
+    // record; no loop owner yet
+    for _ in 0..2 {
+        double(&mut expected_snapshots, c(1)); // check continuation (count=1)
+        double(&mut expected_snapshots, c(1)); // run between continuations
+        double(&mut expected_snapshots, c(2)); // check continuation (count=2)
+        double(&mut expected_snapshots, c(2)); // run between continuations
+        double(&mut expected_snapshots, vec![]); // check exhausts → cleared
+        double(&mut expected_snapshots, vec![]); // run: exit landing (fresh
+        // episode head)
+    }
+    expected_snapshots.push(vec![]); // fail_task save after the valve fired
+    assert_eq!(
+        observed, expected_snapshots,
+        "counter must clear on every exhaustion and restart fresh on re-entry"
+    );
+}
+
+/// Exit-route regression #2: the exhausting visit's exit_route Label edge
+/// targets the loop's OWNER itself (`check`, the LoopConfig-carrying step),
+/// not its target_stage. Exhaustion clears the counter, the exit edge
+/// executes the owner again immediately (two consecutive `check` visits in
+/// the trace), and that next execution's continuation starts a fresh
+/// episode at count=1. Repeated fresh episodes are ultimately bounded by
+/// the engine's `max_steps` valve — generic `max_retries` does not bound
+/// LoopConfig episodes, and no validation rejects an exit_route returning
+/// to the owner.
+///
+/// Trace (max_iterations=2, max_steps=16): episode 1 = [run, check] ×3
+/// (2 continuations jump to target_stage, the exhausting visit exits via
+/// the self edge). Episodes 2+ = [check, run, check, run, check] (5 visits):
+/// the exit lands on `check` first (fresh episode, count=1 → continuation
+/// to target_stage), then the [run, check] rhythm resumes. 6+5+5 = 16
+/// visits complete 3 episodes; the valve fires before episode 4.
+#[tokio::test]
+async fn loop_config_exit_route_to_owner_reentry_bounded_by_max_steps() {
+    let visited = visit_log();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    // Exactly 16 responses: one per executed visit. The mock serves a
+    // fallback text when dry, so an over-budget shape must be caught by
+    // the visit-order assertion below.
+    let client = Arc::new(MockLlmClient::new(
+        (1..=16)
+            .map(|i| MockResponse::text(&format!("visit {i}")))
+            .collect(),
+    ));
+    let workflow = Workflow {
+        entry_step: "run".into(),
+        steps: vec![
+            Step::llm("run", "Run", "do work", vec![]),
+            loop_step("check", "Check", "validate", 2, "run", Some("reenter")),
+        ],
+        edges: vec![
+            Edge {
+                from: "run".into(),
+                to: "check".into(),
+                condition: None,
+            },
+            // Declarative exit edge: its target IS the loop owner, so
+            // exhaustion executes the LoopConfig step again directly.
+            Edge {
+                from: "check".into(),
+                to: "check".into(),
+                condition: Some(EdgeCondition::Label("reenter".into())),
+            },
+        ],
+    };
+    let config = engine_config(dir.path(), client);
+    let recorder = LoopCounterRecorder {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        gate_step: "run",
+        snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
+    };
+    let store: Arc<dyn TaskStore> = Arc::new(recorder.clone());
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(AlwaysRetryJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_max_steps(16)
+    .with_task_store(store);
+    let run = engine.run().await;
+
+    // Exact visit order: episode 1 = [run, check] ×3; episodes 2-3 = each
+    // [check, run, check, run, check] — the leading consecutive `check`s
+    // are the exit-to-owner proof: the exhausting visit lands on the owner
+    // itself, whose continuation restarts the episode at count=1.
+    let order = visited.lock().clone();
+    let mut expected: Vec<String> = ["run", "check", "run", "check", "run", "check"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for _ in 0..2 {
+        for s in ["check", "run", "check", "run", "check"] {
+            expected.push(s.into());
+        }
+    }
+    assert_eq!(
+        order, expected,
+        "each episode must consume the FULL max_iterations=2 budget and \
+         re-enter through the owner itself; got {order:?}"
+    );
+
+    // The max_steps safety valve, not loop logic, ends the run.
+    match &run {
+        Err(WorkflowError::TaskFailed(msg)) => {
+            assert!(
+                msg.contains("max_steps (16) exceeded"),
+                "repeated owner-reentry episodes must terminate via the \
+                 max_steps valve; got: {msg}"
+            );
+        }
+        other => panic!("expected TaskFailed from max_steps, got {other:?}"),
+    }
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Failed,
+        "max_steps exhaustion must fail the workflow"
+    );
+
+    // Final state: the last exhausting visit cleared the counter before
+    // following the exit edge; nothing re-seeded it afterwards.
+    let state = engine.workflow_state.lock().await.clone();
+    assert!(
+        state.loop_iterations.is_empty(),
+        "exhaustion must clear the persisted counter before the exit; got {:?}",
+        state.loop_iterations
+    );
+    // Persisted transitions, per episode: two continuation records jump to
+    // target_stage — To("run") — and the exhausting visit persists the exit
+    // jump onto the owner itself — To("check").
+    let expected_transitions: Vec<&str> = (0..3).flat_map(|_| ["run", "run", "check"]).collect();
+    for (record, expected_target) in state
+        .step_history
+        .iter()
+        .filter(|r| r.step_id.as_str() == "check")
+        .zip(expected_transitions)
+    {
+        assert!(
+            matches!(
+                &record.transition,
+                Transition::To(t) if t == expected_target
+            ),
+            "check record must persist To({expected_target:?}), got {:?}",
+            record.transition
+        );
+    }
+
+    // Mid-run counter snapshots (gate = any "run" record, same cadence as
+    // the target_stage test): every visit contributes two gated snapshots;
+    // exhaustion must CLEAR the counter and the owner re-entry must restart
+    // at 1 — a stale-counter bug would show monotonically growing counts.
+    let observed: Vec<Vec<(String, u32)>> = recorder
+        .snapshots
+        .lock()
+        .iter()
+        .filter(|(gate, _)| *gate)
+        .map(|(_, counters)| counters.clone())
+        .collect();
+    let mut expected_snapshots: Vec<Vec<(String, u32)>> = Vec::new();
+    // run#1: gate fires on run's own record; no loop owner yet.
+    double(&mut expected_snapshots, vec![]);
+    // All three episodes contribute the identical 10-snapshot block: the
+    // exit lands ON the owner, so the exhausting visit's two saves show the
+    // CLEARED counter and the very next visit (the same owner, fresh
+    // episode head) already shows count=1 — that adjacency is the
+    // exit-to-owner proof at the snapshot level.
+    for _ in 0..3 {
+        double(&mut expected_snapshots, c(1)); // check: continuation (count=1)
+        double(&mut expected_snapshots, c(1)); // run between continuations
+        double(&mut expected_snapshots, c(2)); // check continuation (count=2)
+        double(&mut expected_snapshots, c(2)); // run between continuations
+        double(&mut expected_snapshots, vec![]); // check exhausts → cleared
+    }
+    expected_snapshots.push(vec![]); // fail_task save after the valve fired
+    assert_eq!(
+        observed, expected_snapshots,
+        "counter must clear on every exhaustion and restart fresh on \
+         owner re-entry"
+    );
 }
 
 /// Shared handle for the recorded `loop_iterations` snapshots: each entry
