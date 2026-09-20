@@ -20,6 +20,10 @@ pub use workspace::WorkspaceFileHandler;
 pub mod process;
 #[cfg(target_os = "linux")]
 pub use process::ProcessManager;
+#[cfg(target_os = "linux")]
+pub mod workspace_agent;
+#[cfg(target_os = "linux")]
+pub use workspace_agent::WorkspaceAgentHandler;
 
 /// Stable error code returned when this dispatcher cannot safely handle an operation.
 pub const UNSUPPORTED_OPERATION_CODE: &str = "unsupported_operation";

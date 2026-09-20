@@ -48,6 +48,12 @@ started process and waits for the write half to finish. This terminates process
 group members; VM lifecycle shutdown remains responsible for descendants that
 deliberately leave the process group.
 
+`WorkspaceAgentHandler` composes the Linux filesystem and process handlers from
+one opened workspace root. Filesystem operations are routed to
+`WorkspaceFileHandler`; process, cancellation, and status operations are routed
+to `ProcessManager`. `Cleanup` first force-cancels live processes and then
+removes guest-owned temporary directories.
+
 Handler failures are converted to `AgentMessage::Error` with a stable handler
 code and a message capped at 4 KiB. Empty or NUL-containing handler input is
 sanitized before it reaches the wire. The connection stays open because an
@@ -65,8 +71,8 @@ force-stopping the affected VM as appropriate.
 
 - No filesystem operations are implemented here; handlers provide those
   semantics behind the dispatcher.
-- No combined filesystem/process handler is imposed by the dispatcher;
-  callers compose `WorkspaceFileHandler` and `ProcessManager` as appropriate.
+- No vsock listener or guest binary is added; callers can already compose the
+  complete `WorkspaceAgentHandler` with any suitable transport.
 - No vsock listener or guest binary is added; any `AsyncRead + AsyncWrite`
   transport can be wrapped with `FrameStream`.
 - No Firecracker lifecycle, policy enforcement, or deployment validation is
