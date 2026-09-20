@@ -14,6 +14,7 @@ members = [
     "crates/llm-harness-vm-agent-protocol",
     "crates/llm-harness-vm-agent-transport",
     "crates/llm-harness-vm-agent-service",
+    "crates/llm-harness-vm-firecracker",
     "crates/llm-harness-mcp",
     "crates/llm-harness-tools",
     "crates/llm-harness-strategy",
