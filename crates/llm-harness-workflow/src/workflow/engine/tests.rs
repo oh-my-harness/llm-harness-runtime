@@ -6436,6 +6436,103 @@ impl TaskStore for CrashAfterStateSaveStore {
     }
 }
 
+struct CrashBeforeStateSaveStore {
+    inner: Arc<JsonlTaskStore>,
+    should_crash: Arc<dyn Fn(&WorkflowState) -> bool + Send + Sync>,
+}
+
+impl TaskStore for CrashBeforeStateSaveStore {
+    fn load_workflow_state(
+        &self,
+        task_id: &TaskId,
+    ) -> BoxFuture<'_, Result<Option<WorkflowState>>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.load_workflow_state(&task_id).await })
+    }
+
+    fn save_workflow_state(
+        &self,
+        task_id: &TaskId,
+        state: &WorkflowState,
+    ) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let should_crash = self.should_crash.clone();
+        let task_id = task_id.clone();
+        let state = state.clone();
+        Box::pin(async move {
+            if should_crash(&state) {
+                anyhow::bail!("simulated crash before state save");
+            }
+            inner.save_workflow_state(&task_id, &state).await
+        })
+    }
+
+    fn load_workflow(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Option<Workflow>>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.load_workflow(&task_id).await })
+    }
+
+    fn save_workflow(&self, task_id: &TaskId, workflow: &Workflow) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        let workflow = workflow.clone();
+        Box::pin(async move { inner.save_workflow(&task_id, &workflow).await })
+    }
+
+    fn list_checkpoints(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Vec<Checkpoint>>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.list_checkpoints(&task_id).await })
+    }
+
+    fn save_checkpoint(
+        &self,
+        task_id: &TaskId,
+        checkpoint: &Checkpoint,
+    ) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        let checkpoint = checkpoint.clone();
+        Box::pin(async move { inner.save_checkpoint(&task_id, &checkpoint).await })
+    }
+
+    fn load_event_wait(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Option<EventWaitRecord>>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.load_event_wait(&task_id).await })
+    }
+
+    fn save_event_wait(
+        &self,
+        task_id: &TaskId,
+        descriptor: &serde_json::Value,
+    ) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        let descriptor = descriptor.clone();
+        Box::pin(async move { inner.save_event_wait(&task_id, &descriptor).await })
+    }
+
+    fn clear_event_wait(&self, task_id: &TaskId) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.clear_event_wait(&task_id).await })
+    }
+
+    fn delete(&self, task_id: &TaskId) -> BoxFuture<'_, Result<()>> {
+        let inner = self.inner.clone();
+        let task_id = task_id.clone();
+        Box::pin(async move { inner.delete(&task_id).await })
+    }
+
+    fn list_tasks(&self) -> BoxFuture<'_, Result<Vec<TaskSummary>>> {
+        let inner = self.inner.clone();
+        Box::pin(async move { inner.list_tasks().await })
+    }
+}
+
 impl TaskStore for LoopCounterRecorder {
     fn load_workflow_state(
         &self,
@@ -6733,6 +6830,119 @@ async fn retry_loop_target_survives_crash_after_continuation_persist() {
             ])),
         ),
         Arc::new(RetryThenDoneJudge),
+    )
+    .await
+    .unwrap();
+    let result = restored.run().await.unwrap();
+
+    assert_eq!(result.final_message.as_deref(), Some("done"));
+    assert_eq!(restored.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(
+        restored.step_history().await.last().unwrap().step_id,
+        "done"
+    );
+}
+
+/// Regression (crash BEFORE the LoopConfig continuation-state persist): the
+/// continuation save — including the incremented loop counter and the crashed
+/// attempt's own StepRecord — is applied to the engine's in-memory state only.
+/// If the store errors before delegating to the inner store, none of it reaches
+/// durable storage, so recovery must resume from the last DURABLE continuation
+/// snapshot (counter still at its pre-crash value) and re-execute the loop-owner
+/// step. The re-run re-increments the counter, and the loop still exhausts
+/// normally afterward instead of jumping the counter forward.
+#[tokio::test]
+async fn to_loop_continuation_survives_crash_before_persist() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let workflow = research_loop_workflow(2);
+
+    struct ResearchRouteJudge;
+    impl StepTransitionJudge for ResearchRouteJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            Box::pin(async move {
+                match step_id.as_str() {
+                    "search" => Transition::To("vet".into()),
+                    "vet" => Transition::To("search".into()),
+                    _ => Transition::Abort {
+                        reason: "done".into(),
+                    },
+                }
+            })
+        }
+    }
+
+    let inner_store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let crash_store = Arc::new(CrashBeforeStateSaveStore {
+        inner: inner_store.clone(),
+        should_crash: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Running
+                && state.current_step == "vet"
+                && state.loop_iterations.get("vet") == Some(&2)
+                && state
+                    .step_history
+                    .last()
+                    .is_some_and(|record| record.step_id == "vet")
+        }),
+    });
+    let config = engine_config(
+        dir.path(),
+        Arc::new(MockLlmClient::new(vec![
+            MockResponse::text("search 1"),
+            MockResponse::text("vet 1"),
+            MockResponse::text("search 2"),
+            MockResponse::text("vet 2 (crashes before persist)"),
+        ])),
+    );
+    let engine = WorkflowEngine::new(workflow, config, Arc::new(ResearchRouteJudge))
+        .unwrap()
+        .with_task_store(crash_store);
+    let task_id = engine.task_id().clone();
+    assert!(engine.run().await.is_err());
+
+    // Durable state must still be the previous continuation snapshot: the
+    // crashed attempt's in-memory record/counter never persisted.
+    let saved_state = inner_store
+        .load_workflow_state(&task_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved_state.current_step, "vet");
+    assert_eq!(saved_state.status, WorkflowStatus::Running);
+    assert_eq!(saved_state.loop_iterations.get("vet"), Some(&1));
+    assert!(matches!(
+        &saved_state.step_history.last().unwrap().transition,
+        Transition::To(target) if target == "vet"
+    ));
+    // vet1's completed record IS durable (its own earlier continuation save);
+    // vet2's crashed attempt record never persisted, so exactly one vet record
+    // exists and the last durable record is search.
+    assert_eq!(
+        saved_state
+            .step_history
+            .iter()
+            .filter(|record| record.step_id == "vet")
+            .count(),
+        1
+    );
+    assert_eq!(saved_state.step_history.last().unwrap().step_id, "search");
+
+    // Restore: durable current_step is "vet" with To("vet") on the last record,
+    // so the vet owner executes AGAIN (duplicate work). That replay increments
+    // the durable counter 1 -> 2, then the loop exhausts normally on the next
+    // continuation.
+    let restored = WorkflowEngine::restore(
+        inner_store,
+        task_id,
+        engine_config(
+            dir.path(),
+            Arc::new(MockLlmClient::new(vec![
+                MockResponse::text("vet 2 (replayed)"),
+                MockResponse::text("search 3"),
+                MockResponse::text("vet 3"),
+            ])),
+        ),
+        Arc::new(ResearchRouteJudge),
     )
     .await
     .unwrap();
