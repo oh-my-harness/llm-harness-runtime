@@ -34,6 +34,7 @@ const GRACEFUL_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_CHANNEL_CAPACITY: usize = 128;
 const COMMAND_CHANNEL_CAPACITY: usize = 8;
 const OUTPUT_CHUNK_BYTES: usize = 64 * 1024;
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_WORKSPACE_PATH_BYTES: usize = 4096;
 const MAX_WORKSPACE_PATH_COMPONENTS: usize = 256;
 
@@ -434,8 +435,10 @@ async fn run_process(
         }
     };
 
-    let stdout_truncated = join_output_reader(stdout_task).await;
-    let stderr_truncated = join_output_reader(stderr_task).await;
+    let (stdout_truncated, stderr_truncated) = tokio::join!(
+        join_output_reader(stdout_task),
+        join_output_reader(stderr_task)
+    );
     let output_error = if let Some(Err(error)) = stdout_truncated.as_ref() {
         Some(error.to_string())
     } else if let Some(Err(error)) = stderr_truncated.as_ref() {
@@ -620,9 +623,16 @@ async fn join_output_reader(
     task: Option<JoinHandle<std::io::Result<u64>>>,
 ) -> Option<std::io::Result<u64>> {
     match task {
-        Some(task) => match task.await {
-            Ok(result) => Some(result),
-            Err(error) => Some(Err(std::io::Error::other(error))),
+        Some(mut task) => match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut task).await {
+            Ok(Ok(result)) => Some(result),
+            Ok(Err(error)) => Some(Err(std::io::Error::other(error))),
+            Err(_) => {
+                task.abort();
+                match task.await {
+                    Ok(result) => Some(result),
+                    Err(error) => Some(Err(std::io::Error::other(error))),
+                }
+            }
         },
         None => None,
     }
@@ -1100,6 +1110,30 @@ mod tests {
                 active_processes: 0,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_events_do_not_wait_for_pipe_inheriting_session_leaders() {
+        if !std::path::Path::new("/usr/bin/setsid").exists() {
+            return;
+        }
+        let root = tempfile::tempdir().expect("workspace root");
+        let manager = manager(root.path());
+        let outcome = manager
+            .handle(start_request(
+                "setsid sh -c 'sleep 5' & sleep 1",
+                None,
+                Some(50),
+                1024,
+            ))
+            .await
+            .expect("start process");
+        let (_execution_id, mut events, _disconnect) = started(outcome);
+
+        let event = tokio::time::timeout(Duration::from_secs(2), next_message(&mut events))
+            .await
+            .expect("terminal event must not wait for an escaped pipe holder");
+        assert!(matches!(event, AgentMessage::ProcessTimeout { .. }));
     }
 
     #[tokio::test]
