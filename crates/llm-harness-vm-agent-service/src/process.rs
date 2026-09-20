@@ -76,6 +76,14 @@ impl ProcessManager {
         })
     }
 
+    /// Build a manager from an already opened workspace root.
+    pub(crate) fn from_root_fd(root_fd: Arc<OwnedFd>) -> Self {
+        Self {
+            root_fd,
+            processes: Arc::default(),
+        }
+    }
+
     fn start_process(
         &self,
         command: String,

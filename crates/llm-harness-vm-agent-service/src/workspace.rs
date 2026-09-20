@@ -56,6 +56,14 @@ impl WorkspaceFileHandler {
         })
     }
 
+    /// Build a handler from an already opened workspace root.
+    pub(crate) fn from_root_fd(root_fd: OwnedFd) -> Self {
+        Self {
+            root_fd,
+            temp_dirs: Arc::default(),
+        }
+    }
+
     #[cfg(test)]
     async fn handle_message(&self, request: AgentMessage) -> Result<AgentMessage, HandlerError> {
         match self.handle(request).await? {
