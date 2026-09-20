@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "llm-harness-vm-agent"
+path = "src/bin/vm_agent.rs"
+
 [dependencies]
 async-trait.workspace = true
 base64.workspace = true
