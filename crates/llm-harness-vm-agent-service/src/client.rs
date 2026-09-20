@@ -102,11 +102,17 @@ impl GuestAgentClient {
         &self,
         message: AgentMessage,
     ) -> Result<AgentMessage, GuestAgentClientError> {
+        if matches!(message, AgentMessage::StartProcess { .. }) {
+            return Err(GuestAgentClientError::Protocol(
+                "use start_process for process requests".to_owned(),
+            ));
+        }
         let request_id = self.allocate_request_id();
         let (response_tx, response_rx) = oneshot::channel();
         self.insert_pending(request_id, PendingRequest::Response(response_tx));
 
         let frame = Frame::new(ProtocolPeer::Host, request_id, message)
+            .inspect_err(|_| self.remove_pending(request_id))
             .map_err(|error| GuestAgentClientError::Protocol(error.to_string()))?;
         if self.request_tx.send(frame).await.is_err() {
             self.remove_pending(request_id);
@@ -175,6 +181,7 @@ impl GuestAgentClient {
             max_output_bytes,
         };
         let frame = Frame::new(ProtocolPeer::Host, request_id, message)
+            .inspect_err(|_| self.remove_pending(request_id))
             .map_err(|error| GuestAgentClientError::Protocol(error.to_string()))?;
         if self.request_tx.send(frame).await.is_err() {
             self.remove_pending(request_id);
@@ -608,5 +615,25 @@ mod tests {
 
         let error = client.ping().await.expect_err("connection closed");
         assert!(matches!(error, GuestAgentClientError::ConnectionClosed));
+    }
+
+    #[tokio::test]
+    async fn request_rejects_start_process() {
+        let (host_io, guest_io) = duplex(4096);
+        let client = GuestAgentClient::new(host_io).expect("client");
+        drop(guest_io);
+
+        let error = client
+            .request(AgentMessage::StartProcess {
+                command: String::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                timeout_ms: None,
+                max_output_bytes: 0,
+            })
+            .await
+            .expect_err("start process rejected");
+
+        assert!(matches!(error, GuestAgentClientError::Protocol(_)));
     }
 }

@@ -9,6 +9,8 @@ Linux, a direct AF_VSOCK connection constructor.
 ## Scope
 
 - Send host requests with monotonically increasing request IDs.
+- Reject generic use of `StartProcess`; process starts must use
+  `start_process` so their event stream is routed.
 - Await correlated guest responses without blocking unrelated requests.
 - Start a process and expose its asynchronous stdout/stderr/exit event stream.
 - Multiplex later request/response traffic with events from a running process.
