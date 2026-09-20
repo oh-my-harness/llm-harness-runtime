@@ -73,8 +73,6 @@ force-stopping the affected VM as appropriate.
   semantics behind the dispatcher.
 - No host-side Firecracker lifecycle manager is added; the Linux
   `llm-harness-vm-agent` binary now provides the guest-side AF_VSOCK listener.
-- No vsock listener or guest binary is added; any `AsyncRead + AsyncWrite`
-  transport can be wrapped with `FrameStream`.
 - No Firecracker lifecycle, policy enforcement, or deployment validation is
   claimed by this slice.
 
