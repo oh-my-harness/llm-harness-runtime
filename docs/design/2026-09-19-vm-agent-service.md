@@ -71,10 +71,8 @@ force-stopping the affected VM as appropriate.
 
 - No filesystem operations are implemented here; handlers provide those
   semantics behind the dispatcher.
-- No vsock listener or guest binary is added; callers can already compose the
-  complete `WorkspaceAgentHandler` with any suitable transport.
-- No vsock listener or guest binary is added; any `AsyncRead + AsyncWrite`
-  transport can be wrapped with `FrameStream`.
+- No host-side Firecracker lifecycle manager is added; the Linux
+  `llm-harness-vm-agent` binary now provides the guest-side AF_VSOCK listener.
 - No Firecracker lifecycle, policy enforcement, or deployment validation is
   claimed by this slice.
 
