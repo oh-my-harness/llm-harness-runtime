@@ -6439,6 +6439,7 @@ impl TaskStore for CrashAfterStateSaveStore {
 struct CrashBeforeStateSaveStore {
     inner: Arc<JsonlTaskStore>,
     should_crash: Arc<dyn Fn(&WorkflowState) -> bool + Send + Sync>,
+    crashes_remaining: AtomicUsize,
 }
 
 impl TaskStore for CrashBeforeStateSaveStore {
@@ -6460,8 +6461,15 @@ impl TaskStore for CrashBeforeStateSaveStore {
         let should_crash = self.should_crash.clone();
         let task_id = task_id.clone();
         let state = state.clone();
+        let crash_now = should_crash(&state)
+            && self
+                .crashes_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
         Box::pin(async move {
-            if should_crash(&state) {
+            if crash_now {
                 anyhow::bail!("simulated crash before state save");
             }
             inner.save_workflow_state(&task_id, &state).await
@@ -6884,6 +6892,7 @@ async fn to_loop_continuation_survives_crash_before_persist() {
                     .last()
                     .is_some_and(|record| record.step_id == "vet")
         }),
+        crashes_remaining: AtomicUsize::new(1),
     });
     let config = engine_config(
         dir.path(),
@@ -6954,6 +6963,260 @@ async fn to_loop_continuation_survives_crash_before_persist() {
         restored.step_history().await.last().unwrap().step_id,
         "done"
     );
+}
+
+/// A failed save of no-exit exhaustion must leave a pending terminal result
+/// that the surviving engine can persist on its next run without executing
+/// the LoopConfig owner again or granting a fresh iteration budget.
+#[tokio::test]
+async fn loop_exhaustion_store_error_retries_terminal_persist_without_owner_replay() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let inner_store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let fail_store = Arc::new(CrashBeforeStateSaveStore {
+        inner: inner_store.clone(),
+        should_crash: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Failed
+                && state.error.as_ref().is_some_and(|error| {
+                    matches!(error, TaskError::Internal(message) if message.contains("no exit_route configured"))
+                })
+        }),
+        crashes_remaining: AtomicUsize::new(1),
+    });
+    let visited = visit_log();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("check 1")]));
+    let workflow = Workflow {
+        entry_step: "check".into(),
+        steps: vec![loop_step("check", "Check", "validate", 0, "check", None)],
+        edges: vec![Edge {
+            from: "check".into(),
+            to: "check".into(),
+            condition: None,
+        }],
+    };
+    let engine = WorkflowEngine::new(
+        workflow,
+        engine_config(dir.path(), client.clone()),
+        Arc::new(AlwaysRetryJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_task_store(fail_store);
+
+    assert!(matches!(
+        engine.run().await,
+        Err(WorkflowError::StoreError(_))
+    ));
+    assert_eq!(engine.state().await, WorkflowStatus::Running);
+    let durable_before_retry = inner_store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable_before_retry.status, WorkflowStatus::Running);
+    assert!(durable_before_retry.step_history.is_empty());
+
+    let retry = engine.run().await;
+    assert!(
+        matches!(retry, Err(WorkflowError::TaskFailed(ref message)) if message.contains("no exit_route configured")),
+        "same-engine retry must finalize the pending exhaustion, got {retry:?}"
+    );
+    assert_eq!(*visited.lock(), vec!["check"]);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+
+    let durable_failure = inner_store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable_failure.status, WorkflowStatus::Failed);
+    assert!(durable_failure.loop_iterations.is_empty());
+    assert_eq!(durable_failure.step_history.len(), 1);
+    assert!(matches!(
+        &durable_failure.step_history[0].transition,
+        Transition::Fail { reason } if reason.contains("no exit_route configured")
+    ));
+}
+
+/// Pending terminal persistence can fail repeatedly. Each failed attempt must
+/// leave the same completed exhaustion retryable without replaying its owner.
+#[tokio::test]
+async fn loop_exhaustion_repeated_store_errors_remain_retryable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let inner_store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let fail_store = Arc::new(CrashBeforeStateSaveStore {
+        inner: inner_store.clone(),
+        should_crash: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Failed
+                && state.error.as_ref().is_some_and(|error| {
+                    matches!(error, TaskError::Internal(message) if message.contains("no exit_route configured"))
+                })
+        }),
+        crashes_remaining: AtomicUsize::new(2),
+    });
+    let visited = visit_log();
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("check continuation"),
+        MockResponse::text("check exhaustion"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "check".into(),
+        steps: vec![loop_step("check", "Check", "validate", 1, "check", None)],
+        edges: vec![Edge {
+            from: "check".into(),
+            to: "check".into(),
+            condition: None,
+        }],
+    };
+    let engine = WorkflowEngine::new(
+        workflow,
+        engine_config(dir.path(), client.clone()),
+        Arc::new(AlwaysRetryJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_task_store(fail_store);
+
+    assert!(matches!(
+        engine.run().await,
+        Err(WorkflowError::StoreError(_))
+    ));
+    let pending_after_first = engine.workflow_state.lock().await.clone();
+    assert_eq!(pending_after_first.status, WorkflowStatus::Running);
+    assert!(pending_after_first.error.is_none());
+    assert!(pending_after_first.ended_at.is_none());
+    assert!(pending_after_first.loop_iterations.is_empty());
+    assert!(matches!(
+        &pending_after_first.step_history.last().unwrap().transition,
+        Transition::Fail { reason } if reason.contains("no exit_route configured")
+    ));
+
+    assert!(matches!(
+        engine.run().await,
+        Err(WorkflowError::StoreError(_))
+    ));
+    let pending_after_second = engine.workflow_state.lock().await.clone();
+    let durable_after_second = inner_store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable_after_second.status, WorkflowStatus::Running);
+    assert_eq!(durable_after_second.loop_iterations.get("check"), Some(&1));
+    assert_eq!(durable_after_second.step_history.len(), 1);
+
+    let final_run = engine.run().await;
+    assert!(
+        matches!(final_run, Err(WorkflowError::TaskFailed(ref message)) if message.contains("no exit_route configured")),
+        "third run must persist and return the pending terminal failure; \
+         second pending state was {pending_after_second:?}, got {final_run:?}"
+    );
+    assert_eq!(pending_after_second.status, WorkflowStatus::Running);
+    assert!(pending_after_second.error.is_none());
+    assert!(pending_after_second.ended_at.is_none());
+    assert!(pending_after_second.loop_iterations.is_empty());
+    assert!(matches!(
+        &pending_after_second.step_history.last().unwrap().transition,
+        Transition::Fail { reason } if reason.contains("no exit_route configured")
+    ));
+    assert_eq!(*visited.lock(), vec!["check", "check"]);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
+
+    let durable_failure = inner_store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable_failure.status, WorkflowStatus::Failed);
+    assert!(
+        matches!(durable_failure.error, Some(TaskError::Internal(ref message)) if message.contains("no exit_route configured"))
+    );
+    assert!(durable_failure.ended_at.is_some());
+    assert!(durable_failure.loop_iterations.is_empty());
+    assert_eq!(durable_failure.step_history.len(), 2);
+    assert!(matches!(
+        &durable_failure.step_history.last().unwrap().transition,
+        Transition::Fail { reason } if reason.contains("no exit_route configured")
+    ));
+}
+
+/// A configured but unresolvable exit route uses the same pending-terminal
+/// recovery as a missing exit route when its first failure save is rejected.
+#[tokio::test]
+async fn unresolved_exit_route_store_error_retries_terminal_persist_without_owner_replay() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let inner_store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let fail_store = Arc::new(CrashBeforeStateSaveStore {
+        inner: inner_store.clone(),
+        should_crash: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Failed
+                && state.error.as_ref().is_some_and(|error| {
+                    matches!(error, TaskError::Internal(message) if message.contains("has no matching edge"))
+                })
+        }),
+        crashes_remaining: AtomicUsize::new(1),
+    });
+    let visited = visit_log();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("check 1")]));
+    let workflow = Workflow {
+        entry_step: "check".into(),
+        steps: vec![loop_step(
+            "check",
+            "Check",
+            "validate",
+            0,
+            "check",
+            Some("missing"),
+        )],
+        edges: vec![Edge {
+            from: "check".into(),
+            to: "check".into(),
+            condition: None,
+        }],
+    };
+    let engine = WorkflowEngine::new(
+        workflow,
+        engine_config(dir.path(), client.clone()),
+        Arc::new(AlwaysRetryJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_task_store(fail_store);
+
+    assert!(matches!(
+        engine.run().await,
+        Err(WorkflowError::StoreError(_))
+    ));
+    let durable_before_retry = inner_store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable_before_retry.status, WorkflowStatus::Running);
+    assert!(durable_before_retry.step_history.is_empty());
+
+    let retry = engine.run().await;
+    assert!(
+        matches!(retry, Err(WorkflowError::TaskFailed(ref message)) if message.contains("exit_route 'missing' has no matching edge")),
+        "same-engine retry must finalize the unresolved-route failure, got {retry:?}"
+    );
+    assert_eq!(*visited.lock(), vec!["check"]);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+
+    let durable_failure = inner_store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable_failure.status, WorkflowStatus::Failed);
+    assert!(durable_failure.loop_iterations.is_empty());
+    assert_eq!(durable_failure.step_history.len(), 1);
+    assert!(matches!(
+        &durable_failure.step_history[0].transition,
+        Transition::Fail { reason } if reason.contains("exit_route 'missing' has no matching edge")
+    ));
 }
 
 /// Counter isolation: an unrelated step's To transition to the same target

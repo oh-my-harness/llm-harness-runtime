@@ -422,6 +422,13 @@ impl super::WorkflowEngine {
         &self,
         request: WorkflowRunRequest,
     ) -> Result<TaskResult, WorkflowError> {
+        struct RunningGuard<'a>(&'a AtomicBool);
+        impl Drop for RunningGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
         enum StartupAction {
             Continue,
             Return(TaskResult),
@@ -432,6 +439,9 @@ impl super::WorkflowEngine {
         if self.running.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Err(WorkflowError::AlreadyRunning);
         }
+        // Cover startup persistence as well as run_loop: every exit after the
+        // successful swap must release the re-entry flag.
+        let _guard = RunningGuard(&self.running);
 
         // 1. 翻转 status → Running，落盘。
         //    允许 Running → Running：崩溃恢复场景下 status 仍为 Running（已落盘），
@@ -493,8 +503,6 @@ impl super::WorkflowEngine {
                     }
                 }
                 _ => {
-                    self.running
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
                     return Err(WorkflowError::InvalidStatus {
                         status: state.status.clone(),
                     });
@@ -503,22 +511,19 @@ impl super::WorkflowEngine {
             // 持锁期间只构造快照，drop 锁后再做文件 I/O。
             let snapshot = state.clone();
             drop(state);
-            self.persist_state(&snapshot).await?;
+            if let Err(error) = self.persist_state(&snapshot).await {
+                if let StartupAction::Fail(reason) = &action {
+                    self.restore_pending_terminal_after_persist_error(reason)
+                        .await;
+                }
+                return Err(error);
+            }
             action
         };
         // 若有 task_store，保存 workflow 定义（供 restore 重建）。
         if let Some(store) = &self.task_store {
             store.save_workflow(&self.task_id, &self.workflow).await?;
         }
-
-        // RAII 守卫：无论 run_loop 正常返回、Err 还是 panic，都清除重入标志。
-        struct RunningGuard<'a>(&'a AtomicBool);
-        impl Drop for RunningGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        let _guard = RunningGuard(&self.running);
 
         match startup_action {
             StartupAction::Continue => self.run_loop(&request).await,
@@ -1594,6 +1599,52 @@ impl super::WorkflowEngine {
         Ok(())
     }
 
+    async fn restore_pending_terminal_after_persist_error(&self, msg: &str) {
+        let mut state = self.workflow_state.lock().await;
+        if state.status == WorkflowStatus::Failed
+            && state.step_history.last().is_some_and(|record| {
+                matches!(
+                    &record.transition,
+                    Transition::Fail { reason } if reason == msg
+                )
+            })
+        {
+            state.status = WorkflowStatus::Running;
+            state.error = None;
+            state.ended_at = None;
+        }
+    }
+
+    /// Persist an explicit LoopConfig exhaustion failure. If the store rejects
+    /// the terminal snapshot, retain its Fail transition but return the shared
+    /// state to Running so the next run() persists/finalizes it before any
+    /// further step execution.
+    async fn persist_loop_terminal_failure(
+        &self,
+        mut state: tokio::sync::MutexGuard<'_, WorkflowState>,
+        msg: String,
+    ) -> Result<Option<StepId>, WorkflowError> {
+        if let Some(record) = state.step_history.last_mut() {
+            record.transition = Transition::Fail {
+                reason: msg.clone(),
+            };
+        }
+        state.status = WorkflowStatus::Failed;
+        state.error = Some(TaskError::Internal(msg.clone()));
+        state.ended_at = Some(chrono::Utc::now());
+        let snapshot = state.clone();
+        drop(state);
+        if let Err(error) = self.persist_state(&snapshot).await {
+            // A process restart still loads the previous durable Running
+            // snapshot and replays. A surviving engine retains the terminal
+            // record and can retry its persistence without replaying the owner.
+            self.restore_pending_terminal_after_persist_error(&msg)
+                .await;
+            return Err(error);
+        }
+        Err(WorkflowError::TaskFailed(msg))
+    }
+
     /// 声明式循环（LoopConfig）续环判定 — Retry 与 To 两条路径共用。
     ///
     /// 调用前置条件：调用方已确认这是"续环"转换（Retry，或
@@ -1656,13 +1707,7 @@ impl super::WorkflowEngine {
                     loop_cfg.max_iterations,
                     label
                 );
-                state.status = WorkflowStatus::Failed;
-                state.error = Some(TaskError::Internal(msg.clone()));
-                state.ended_at = Some(chrono::Utc::now());
-                let snapshot = state.clone();
-                drop(state);
-                self.persist_state(&snapshot).await?;
-                return Err(WorkflowError::TaskFailed(msg));
+                return self.persist_loop_terminal_failure(state, msg).await;
             }
             // exit_route missing: To-based loops have no Retry records, so
             // falling through to max_retries can never bound them. Fail
@@ -1672,13 +1717,7 @@ impl super::WorkflowEngine {
                 step.id(),
                 loop_cfg.max_iterations
             );
-            state.status = WorkflowStatus::Failed;
-            state.error = Some(TaskError::Internal(msg.clone()));
-            state.ended_at = Some(chrono::Utc::now());
-            let snapshot = state.clone();
-            drop(state);
-            self.persist_state(&snapshot).await?;
-            return Err(WorkflowError::TaskFailed(msg));
+            return self.persist_loop_terminal_failure(state, msg).await;
         }
 
         // Loop continues: jump to target_stage or re-run current.
