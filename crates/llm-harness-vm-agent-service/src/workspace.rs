@@ -20,7 +20,7 @@ use rustix::fd::OwnedFd;
 use rustix::fs::{self, AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags};
 use uuid::Uuid;
 
-use crate::{GuestAgentHandler, HandlerError};
+use crate::{GuestAgentHandler, HandlerError, HandlerOutcome};
 
 const MAX_RECURSIVE_REMOVE_DEPTH: usize = 128;
 const MAX_WORKSPACE_PATH_BYTES: usize = 4096;
@@ -55,11 +55,21 @@ impl WorkspaceFileHandler {
             temp_dirs: Arc::default(),
         })
     }
+
+    #[cfg(test)]
+    async fn handle_message(&self, request: AgentMessage) -> Result<AgentMessage, HandlerError> {
+        match self.handle(request).await? {
+            HandlerOutcome::Message(message) => Ok(message),
+            HandlerOutcome::ProcessStarted { .. } => {
+                Err(HandlerError::unsupported("process_started"))
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl GuestAgentHandler for WorkspaceFileHandler {
-    async fn handle(&self, request: AgentMessage) -> Result<AgentMessage, HandlerError> {
+    async fn handle(&self, request: AgentMessage) -> Result<HandlerOutcome, HandlerError> {
         request
             .validate()
             .map_err(|error| HandlerError::operation("protocol_error", error.to_string()))?;
@@ -72,6 +82,7 @@ impl GuestAgentHandler for WorkspaceFileHandler {
         tokio::task::spawn_blocking(move || handle_request(root_fd, request, temp_dirs))
             .await
             .map_err(|error| HandlerError::operation("handler_failure", error.to_string()))?
+            .map(HandlerOutcome::Message)
     }
 }
 
@@ -621,7 +632,7 @@ mod tests {
         let handler = handler(root.path());
 
         handler
-            .handle(AgentMessage::WriteFile {
+            .handle_message(AgentMessage::WriteFile {
                 path: "/workspace/file.txt".to_owned(),
                 content: text("first"),
                 append: false,
@@ -629,7 +640,7 @@ mod tests {
             .await
             .expect("write");
         handler
-            .handle(AgentMessage::WriteFile {
+            .handle_message(AgentMessage::WriteFile {
                 path: "/workspace/file.txt".to_owned(),
                 content: text("-second"),
                 append: true,
@@ -637,7 +648,7 @@ mod tests {
             .await
             .expect("append");
         match handler
-            .handle(AgentMessage::ReadFile {
+            .handle_message(AgentMessage::ReadFile {
                 path: "/workspace/file.txt".to_owned(),
                 binary: false,
             })
@@ -651,7 +662,7 @@ mod tests {
         }
 
         handler
-            .handle(AgentMessage::WriteFile {
+            .handle_message(AgentMessage::WriteFile {
                 path: "/workspace/file.bin".to_owned(),
                 content: FileContent::Binary {
                     base64: base64::engine::general_purpose::STANDARD.encode([0, 255, 10]),
@@ -661,7 +672,7 @@ mod tests {
             .await
             .expect("write binary");
         match handler
-            .handle(AgentMessage::ReadFile {
+            .handle_message(AgentMessage::ReadFile {
                 path: "/workspace/file.bin".to_owned(),
                 binary: true,
             })
@@ -689,14 +700,14 @@ mod tests {
         let handler = handler(root.path());
 
         handler
-            .handle(AgentMessage::CreateDir {
+            .handle_message(AgentMessage::CreateDir {
                 path: "/workspace/dir".to_owned(),
                 recursive: false,
             })
             .await
             .expect("create dir");
         handler
-            .handle(AgentMessage::WriteFile {
+            .handle_message(AgentMessage::WriteFile {
                 path: "/workspace/dir/file".to_owned(),
                 content: text("data"),
                 append: false,
@@ -705,7 +716,7 @@ mod tests {
             .expect("write file");
 
         match handler
-            .handle(AgentMessage::FileInfo {
+            .handle_message(AgentMessage::FileInfo {
                 path: "/workspace/dir/file".to_owned(),
             })
             .await
@@ -719,7 +730,7 @@ mod tests {
             message => panic!("unexpected response: {message:?}"),
         }
         match handler
-            .handle(AgentMessage::ListDir {
+            .handle_message(AgentMessage::ListDir {
                 path: "/workspace".to_owned(),
             })
             .await
@@ -732,7 +743,7 @@ mod tests {
             message => panic!("unexpected response: {message:?}"),
         }
         match handler
-            .handle(AgentMessage::ListDir {
+            .handle_message(AgentMessage::ListDir {
                 path: "/workspace/dir".to_owned(),
             })
             .await
@@ -745,7 +756,7 @@ mod tests {
             message => panic!("unexpected response: {message:?}"),
         }
         match handler
-            .handle(AgentMessage::Exists {
+            .handle_message(AgentMessage::Exists {
                 path: "/workspace/dir/file".to_owned(),
             })
             .await
@@ -756,7 +767,7 @@ mod tests {
         }
 
         handler
-            .handle(AgentMessage::Remove {
+            .handle_message(AgentMessage::Remove {
                 path: "/workspace/dir".to_owned(),
                 recursive: true,
                 force: false,
@@ -773,7 +784,7 @@ mod tests {
         std::fs::write(root.path().join("user-file"), b"keep").expect("write user file");
 
         let temp_path = match handler
-            .handle(AgentMessage::CreateTempDir {
+            .handle_message(AgentMessage::CreateTempDir {
                 prefix: "agent".to_owned(),
             })
             .await
@@ -787,7 +798,7 @@ mod tests {
             .expect("write temp file");
 
         handler
-            .handle(AgentMessage::Cleanup)
+            .handle_message(AgentMessage::Cleanup)
             .await
             .expect("cleanup");
         assert!(root.path().join("user-file").exists());
@@ -807,7 +818,7 @@ mod tests {
 
         for path in ["/workspace/escape", "/workspace/parent/secret"] {
             let error = handler
-                .handle(AgentMessage::ReadFile {
+                .handle_message(AgentMessage::ReadFile {
                     path: path.to_owned(),
                     binary: false,
                 })
@@ -824,7 +835,7 @@ mod tests {
         fs::mkfifoat(&handler.root_fd, "fifo", Mode::RUSR | Mode::WUSR).expect("create fifo");
 
         let error = handler
-            .handle(AgentMessage::ReadFile {
+            .handle_message(AgentMessage::ReadFile {
                 path: "/workspace/fifo".to_owned(),
                 binary: false,
             })
@@ -833,7 +844,7 @@ mod tests {
         assert_eq!(error.code(), "filesystem_error");
 
         let error = handler
-            .handle(AgentMessage::WriteFile {
+            .handle_message(AgentMessage::WriteFile {
                 path: "/workspace/fifo".to_owned(),
                 content: text("data"),
                 append: false,

@@ -40,10 +40,13 @@ pub struct FrameStream<S> {
     local_peer: ProtocolPeer,
 }
 
-impl<S> FrameStream<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+/// The read half returned by [`FrameStream::split`].
+pub type ReadFrameStream<S> = FrameStream<tokio::io::ReadHalf<S>>;
+
+/// The write half returned by [`FrameStream::split`].
+pub type WriteFrameStream<S> = FrameStream<tokio::io::WriteHalf<S>>;
+
+impl<S> FrameStream<S> {
     /// Create a stream for the local protocol peer.
     ///
     /// Outbound frames must originate from `peer`; inbound frames must
@@ -72,6 +75,45 @@ where
         Self::new(stream, peer, DEFAULT_MAX_PAYLOAD_BYTES)
     }
 
+    /// Split a duplex frame stream into independently owned read/write halves.
+    ///
+    /// The read half retains already decoded frames. This allows a service to
+    /// process requests and emit process events concurrently over one stream.
+    pub fn split(self) -> Result<(ReadFrameStream<S>, WriteFrameStream<S>), TransportError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let max_payload_bytes = self.max_payload_bytes;
+        let local_peer = self.local_peer;
+        let pending = self.pending;
+        let (read_half, write_half) = tokio::io::split(self.stream);
+        let remote_peer = match local_peer {
+            ProtocolPeer::Host => ProtocolPeer::Guest,
+            ProtocolPeer::Guest => ProtocolPeer::Host,
+        };
+
+        let reader = FrameStream {
+            stream: read_half,
+            decoder: FrameDecoder::new(remote_peer, max_payload_bytes)?,
+            pending,
+            max_payload_bytes,
+            local_peer,
+        };
+        let writer = FrameStream {
+            stream: write_half,
+            decoder: FrameDecoder::new(remote_peer, max_payload_bytes)?,
+            pending: VecDeque::new(),
+            max_payload_bytes,
+            local_peer,
+        };
+        Ok((reader, writer))
+    }
+}
+
+impl<S> FrameStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
     /// Send one validated frame and flush the stream.
     pub async fn send(&mut self, frame: Frame) -> Result<(), TransportError> {
         if frame.peer() != self.local_peer {
@@ -84,7 +126,12 @@ where
         self.stream.flush().await?;
         Ok(())
     }
+}
 
+impl<S> FrameStream<S>
+where
+    S: AsyncRead + Unpin,
+{
     /// Receive the next inbound frame, buffering partial and coalesced frames.
     pub async fn recv(&mut self) -> Result<Frame, TransportError> {
         if let Some(frame) = self.pending.pop_front() {
@@ -113,13 +160,20 @@ where
                 .expect("decoded frames are inserted before being returned"));
         }
     }
+}
 
+impl<S> FrameStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
     /// Shut down the write half of the underlying stream.
     pub async fn close(&mut self) -> Result<(), TransportError> {
         self.stream.shutdown().await?;
         Ok(())
     }
+}
 
+impl<S> FrameStream<S> {
     /// Return the local peer whose outbound frames this stream accepts.
     pub fn peer(&self) -> ProtocolPeer {
         self.local_peer
@@ -183,6 +237,35 @@ mod tests {
             .expect("send guest");
         let received = host_stream.recv().await.expect("recv guest");
         assert_eq!(received, response);
+    }
+
+    #[tokio::test]
+    async fn frame_stream_split_supports_concurrent_read_write() {
+        let (host_io, guest_io) = duplex(128);
+        let mut host =
+            FrameStream::with_default_limit(host_io, ProtocolPeer::Host).expect("host stream");
+        let guest =
+            FrameStream::with_default_limit(guest_io, ProtocolPeer::Guest).expect("guest stream");
+        let (mut guest_reader, guest_writer) = guest.split().expect("split guest stream");
+        let writer_task = tokio::spawn(async move {
+            let mut guest_writer = guest_writer;
+            guest_writer
+                .send(guest_frame(17, AgentMessage::Pong))
+                .await
+                .expect("guest sends pong");
+        });
+
+        host.send(host_frame(17, AgentMessage::Ping))
+            .await
+            .expect("host sends ping");
+        let request = guest_reader.recv().await.expect("guest receives ping");
+        assert_eq!(request.request_id(), 17);
+        assert_eq!(request.into_message(), AgentMessage::Ping);
+
+        let response = host.recv().await.expect("host receives pong");
+        assert_eq!(response.request_id(), 17);
+        assert_eq!(response.into_message(), AgentMessage::Pong);
+        writer_task.await.expect("writer task completed");
     }
 
     #[tokio::test]
