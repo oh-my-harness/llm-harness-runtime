@@ -561,6 +561,37 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wait_ready_fails_after_stop() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let binary_path = root.path().join("fake-firecracker");
+        std::fs::write(&binary_path, "#!/bin/sh\nexec sleep 30\n").expect("write fake firecracker");
+        set_executable(&binary_path);
+        let vm_config = FirecrackerConfig::new(
+            root.path().join("vmlinux"),
+            root.path().join("rootfs.ext4"),
+            root.path().join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        );
+        let process_config = FirecrackerProcessConfig::new(
+            &binary_path,
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+        let mut process =
+            FirecrackerProcess::start(&process_config, &vm_config).expect("start fake firecracker");
+        process.stop().await.expect("stop fake firecracker");
+
+        let error = process
+            .wait_ready(Duration::from_millis(20))
+            .await
+            .expect_err("firecracker is stopped");
+        assert!(error.to_string().contains("firecracker process is stopped"));
+    }
+
+    #[cfg(target_os = "linux")]
     fn set_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
 
