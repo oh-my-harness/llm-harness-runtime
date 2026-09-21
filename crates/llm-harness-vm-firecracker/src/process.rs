@@ -2,7 +2,12 @@ use std::ffi::OsString;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
+#[cfg(target_os = "linux")]
+use tokio::net::UnixStream;
 #[cfg(target_os = "linux")]
 use tokio::process::Child;
 
@@ -161,6 +166,31 @@ impl FirecrackerProcess {
         wait_result?;
         cleanup_result?;
         Ok(())
+    }
+
+    pub async fn wait_ready(&mut self, timeout: Duration) -> Result<(), FirecrackerProcessError> {
+        if self.stopped {
+            return Err(FirecrackerProcessError {
+                message: "firecracker process is stopped".to_owned(),
+            });
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Err(FirecrackerProcessError {
+                    message: format!("firecracker process exited before ready: {status}"),
+                });
+            }
+            if UnixStream::connect(&self.api_socket_path).await.is_ok() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(FirecrackerProcessError {
+                    message: format!("firecracker process did not become ready within {timeout:?}"),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     pub fn api_socket_path(&self) -> &Path {
@@ -431,6 +461,103 @@ mod tests {
         drop(process);
         assert!(!process_config.api_socket_path.exists());
         assert!(!process_config.config_file_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wait_ready_succeeds_when_api_socket_is_listening() {
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().expect("temp directory");
+        let binary_path = root.path().join("fake-firecracker");
+        std::fs::write(&binary_path, "#!/bin/sh\nexec sleep 30\n").expect("write fake firecracker");
+        set_executable(&binary_path);
+        let vm_config = FirecrackerConfig::new(
+            root.path().join("vmlinux"),
+            root.path().join("rootfs.ext4"),
+            root.path().join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        );
+        let process_config = FirecrackerProcessConfig::new(
+            &binary_path,
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+        let mut process =
+            FirecrackerProcess::start(&process_config, &vm_config).expect("start fake firecracker");
+        let listener =
+            UnixListener::bind(&process_config.api_socket_path).expect("bind fake api socket");
+
+        process
+            .wait_ready(Duration::from_millis(500))
+            .await
+            .expect("firecracker becomes ready");
+        process.stop().await.expect("stop fake firecracker");
+        drop(listener);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wait_ready_fails_when_process_exits() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let binary_path = root.path().join("fake-firecracker");
+        std::fs::write(&binary_path, "#!/bin/sh\nexit 7\n").expect("write fake firecracker");
+        set_executable(&binary_path);
+        let vm_config = FirecrackerConfig::new(
+            root.path().join("vmlinux"),
+            root.path().join("rootfs.ext4"),
+            root.path().join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        );
+        let process_config = FirecrackerProcessConfig::new(
+            &binary_path,
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+        let mut process =
+            FirecrackerProcess::start(&process_config, &vm_config).expect("start fake firecracker");
+
+        let error = process
+            .wait_ready(Duration::from_millis(500))
+            .await
+            .expect_err("firecracker exits before ready");
+        assert!(error.to_string().contains("exited before ready"));
+        process.stop().await.expect("stop fake firecracker");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wait_ready_times_out_when_api_socket_is_missing() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let binary_path = root.path().join("fake-firecracker");
+        std::fs::write(&binary_path, "#!/bin/sh\nexec sleep 30\n").expect("write fake firecracker");
+        set_executable(&binary_path);
+        let vm_config = FirecrackerConfig::new(
+            root.path().join("vmlinux"),
+            root.path().join("rootfs.ext4"),
+            root.path().join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        );
+        let process_config = FirecrackerProcessConfig::new(
+            &binary_path,
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+        let mut process =
+            FirecrackerProcess::start(&process_config, &vm_config).expect("start fake firecracker");
+
+        let error = process
+            .wait_ready(Duration::from_millis(20))
+            .await
+            .expect_err("firecracker does not become ready");
+        assert!(error.to_string().contains("did not become ready"));
+        process.stop().await.expect("stop fake firecracker");
     }
 
     #[cfg(target_os = "linux")]
