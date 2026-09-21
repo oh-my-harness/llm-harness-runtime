@@ -181,12 +181,30 @@ the gateway.
    - Validate bare-metal/KVM deployment, image integrity, host firewall rules,
      crash recovery, and cleanup under gateway restart.
 
+### Implemented Firecracker primitives
+
+`llm-harness-vm-firecracker` currently provides validated VM configuration and
+a Linux process-launching primitive. VM configuration rejects relative,
+non-UTF-8, and NUL-containing host paths before JSON serialization. The
+process configuration requires absolute, distinct API-socket and config-file
+paths and preserves non-UTF-8 OS paths when constructing command arguments.
+
+`FirecrackerProcess` writes its private config file with `create_new` and mode
+`0600`, syncs it before launch, and removes it if launch fails. `stop` and drop
+kill the child. `stop` waits for exit, removes the API socket and config file,
+and is idempotent; drop performs best-effort artifact cleanup for callers that
+do not stop explicitly.
+These primitives are not yet a full VM lifecycle manager: readiness, jailer
+integration, image allocation, graceful guest shutdown, registry recovery, and
+deployment validation remain future slices.
+
 ## Current status
 
 This document selects Firecracker and defines the required threat model. The
-transport-independent guest-agent wire protocol is implemented in
-`llm-harness-vm-agent-protocol`; it has not yet been connected to a guest agent
-or Firecracker lifecycle. No Firecracker backend implementation exists yet. The
-Bwrap gateway remains the only implemented remote execution backend, and #193
-remains open until VM-level isolation, production policy enforcement, and
-deployment validation are complete.
+transport-independent guest-agent wire protocol, AF_VSOCK transport, guest
+filesystem/process handlers, guest binary, host client, and initial
+Firecracker configuration/process primitives are implemented. They are not yet
+assembled into a complete Firecracker lifecycle backend with jailer, image,
+network, readiness, registry recovery, and deployment validation. The Bwrap
+gateway remains the only implemented remote execution backend, and #193 remains
+open until those requirements are complete.

@@ -117,11 +117,21 @@ fn validate_absolute_path(label: &'static str, path: &Path) -> Result<(), Firecr
             "{label} path must be absolute"
         )));
     }
+    let path = path.to_str().ok_or_else(|| {
+        FirecrackerConfigError::invalid(format!("{label} path must be valid UTF-8"))
+    })?;
+    if path.contains('\0') {
+        return Err(FirecrackerConfigError::invalid(format!(
+            "{label} path contains a NUL byte"
+        )));
+    }
     Ok(())
 }
 
 fn path_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+    path.to_str()
+        .expect("path was validated as UTF-8")
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -169,6 +179,17 @@ mod tests {
 
         let mut config = valid_config();
         config.kernel_image_path = PathBuf::from("vmlinux");
+        assert!(config.to_json().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_rejects_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut config = valid_config();
+        config.kernel_image_path = PathBuf::from(OsString::from_vec(b"/tmp/\xff".to_vec()));
         assert!(config.to_json().is_err());
     }
 }
