@@ -194,9 +194,11 @@ paths and preserves non-UTF-8 OS paths when constructing command arguments.
 kill the child. `stop` waits for exit, removes the API socket and config file,
 and is idempotent; drop performs best-effort artifact cleanup for callers that
 do not stop explicitly.
-These primitives are not yet a full VM lifecycle manager: readiness, jailer
-integration, image allocation, graceful guest shutdown, registry recovery, and
-deployment validation remain future slices.
+`wait_ready` polls the child and the API socket until the process is accepting
+connections, the child exits, or the configured timeout elapses.
+These primitives are not yet a full VM lifecycle manager: jailer integration,
+image allocation, graceful guest shutdown, registry recovery, and deployment
+validation remain future slices.
 
 ## Current status
 
