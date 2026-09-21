@@ -322,6 +322,23 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn process_config_rejects_nul_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let api_socket_path =
+            PathBuf::from(OsString::from_vec(b"/tmp/llm-harness-\0.sock".to_vec()));
+        let config_file_path = PathBuf::from(OsString::from_vec(b"/tmp/llm-harness.json".to_vec()));
+        let config = FirecrackerProcessConfig::new(
+            "/usr/bin/firecracker",
+            api_socket_path,
+            config_file_path,
+        );
+
+        assert!(config.validate().is_err());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn start_failure_removes_the_config_file() {
@@ -381,6 +398,39 @@ mod tests {
         assert!(!process_config.api_socket_path.exists());
         assert!(!process_config.config_file_path.exists());
         process.stop().await.expect("stop is idempotent");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn drop_removes_artifacts_without_explicit_stop() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let binary_path = root.path().join("fake-firecracker");
+        std::fs::write(
+            &binary_path,
+            "#!/bin/sh\napi_socket=$2\n: > \"$api_socket\"\nexec sleep 30\n",
+        )
+        .expect("write fake firecracker");
+        set_executable(&binary_path);
+        let vm_config = FirecrackerConfig::new(
+            root.path().join("vmlinux"),
+            root.path().join("rootfs.ext4"),
+            root.path().join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        );
+        let process_config = FirecrackerProcessConfig::new(
+            &binary_path,
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+        let process =
+            FirecrackerProcess::start(&process_config, &vm_config).expect("start fake firecracker");
+
+        wait_for_file(&process_config.api_socket_path).await;
+        drop(process);
+        assert!(!process_config.api_socket_path.exists());
+        assert!(!process_config.config_file_path.exists());
     }
 
     #[cfg(target_os = "linux")]
