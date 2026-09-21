@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -39,15 +40,20 @@ impl FirecrackerProcessConfig {
         validate_absolute_path("binary", &self.binary_path)?;
         validate_absolute_path("API socket", &self.api_socket_path)?;
         validate_absolute_path("config file", &self.config_file_path)?;
+        if self.api_socket_path == self.config_file_path {
+            return Err(FirecrackerProcessConfigError {
+                message: "API socket and config file paths must be different".to_owned(),
+            });
+        }
         Ok(())
     }
 
-    pub fn command_args(&self) -> Vec<String> {
+    pub fn command_args(&self) -> Vec<OsString> {
         vec![
-            "--api-sock".to_owned(),
-            self.api_socket_path.to_string_lossy().into_owned(),
-            "--config-file".to_owned(),
-            self.config_file_path.to_string_lossy().into_owned(),
+            OsString::from("--api-sock"),
+            self.api_socket_path.as_os_str().to_owned(),
+            OsString::from("--config-file"),
+            self.config_file_path.as_os_str().to_owned(),
         ]
     }
 }
@@ -95,6 +101,7 @@ pub struct FirecrackerProcess {
     child: Child,
     api_socket_path: PathBuf,
     config_file_path: PathBuf,
+    stopped: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -112,31 +119,47 @@ impl FirecrackerProcess {
         if let Some(parent) = config.api_socket_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        #[cfg(target_os = "linux")]
-        {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&config.config_file_path)?;
-            file.write_all(&config_json)?;
+        match std::fs::symlink_metadata(&config.api_socket_path) {
+            Ok(_) => {
+                return Err(FirecrackerProcessError {
+                    message: "API socket path already exists".to_owned(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
+        write_config_file(&config.config_file_path, &config_json)?;
 
         let mut command = tokio::process::Command::new(&config.binary_path);
         command.args(config.command_args());
         command.kill_on_drop(true);
-        let child = command.spawn()?;
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_file(&config.config_file_path);
+                return Err(error.into());
+            }
+        };
         Ok(Self {
             child,
             api_socket_path: config.api_socket_path.clone(),
             config_file_path: config.config_file_path.clone(),
+            stopped: false,
         })
     }
 
     pub async fn stop(&mut self) -> Result<(), FirecrackerProcessError> {
-        self.child.start_kill()?;
-        self.child.wait().await?;
+        if self.stopped {
+            return Ok(());
+        }
+        let _ = self.child.start_kill();
+        let wait_result = self.child.wait().await;
+        let cleanup_result = remove_artifacts(&self.api_socket_path, &self.config_file_path);
+        if wait_result.is_ok() && cleanup_result.is_ok() {
+            self.stopped = true;
+        }
+        wait_result?;
+        cleanup_result?;
         Ok(())
     }
 
@@ -146,6 +169,56 @@ impl FirecrackerProcess {
 
     pub fn config_file_path(&self) -> &Path {
         &self.config_file_path
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FirecrackerProcess {
+    fn drop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        let _ = self.child.start_kill();
+        let _ = remove_artifacts(&self.api_socket_path, &self.config_file_path);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_config_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    if let Err(error) = file.write_all(contents) {
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    if let Err(error) = file.sync_all() {
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_artifacts(api_socket_path: &Path, config_file_path: &Path) -> std::io::Result<()> {
+    let api_socket_error = remove_owned_file(api_socket_path).err();
+    let config_file_error = remove_owned_file(config_file_path).err();
+    if let Some(error) = api_socket_error.or(config_file_error) {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_owned_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -163,7 +236,25 @@ fn validate_absolute_path(
             message: format!("{label} path must be absolute"),
         });
     }
+    if path_contains_nul(path) {
+        return Err(FirecrackerProcessConfigError {
+            message: format!("{label} path contains a NUL byte"),
+        });
+    }
     Ok(())
+}
+
+fn path_contains_nul(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        path.as_os_str().as_bytes().contains(&0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_str().is_some_and(|path| path.contains('\0'))
+    }
 }
 
 #[cfg(test)]
@@ -181,16 +272,16 @@ mod tests {
         assert_eq!(
             config.command_args(),
             vec![
-                "--api-sock".to_owned(),
+                OsString::from("--api-sock"),
                 std::env::temp_dir()
                     .join("llm-harness-api.sock")
-                    .to_string_lossy()
-                    .to_string(),
-                "--config-file".to_owned(),
+                    .as_os_str()
+                    .to_owned(),
+                OsString::from("--config-file"),
                 std::env::temp_dir()
                     .join("llm-harness-firecracker.json")
-                    .to_string_lossy()
-                    .to_string(),
+                    .as_os_str()
+                    .to_owned(),
             ]
         );
     }
@@ -203,5 +294,114 @@ mod tests {
             std::env::temp_dir().join("llm-harness-firecracker.json"),
         );
         assert!(config.validate().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_config_preserves_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let api_socket_path =
+            PathBuf::from(OsString::from_vec(b"/tmp/llm-harness-\xff.sock".to_vec()));
+        let config_file_path =
+            PathBuf::from(OsString::from_vec(b"/tmp/llm-harness-\xff.json".to_vec()));
+        let config = FirecrackerProcessConfig::new(
+            "/usr/bin/firecracker",
+            api_socket_path.clone(),
+            config_file_path.clone(),
+        );
+
+        assert_eq!(
+            config.command_args(),
+            vec![
+                OsString::from("--api-sock"),
+                api_socket_path.as_os_str().to_owned(),
+                OsString::from("--config-file"),
+                config_file_path.as_os_str().to_owned(),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_failure_removes_the_config_file() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let vm_config = FirecrackerConfig::new(
+            root.path().join("vmlinux"),
+            root.path().join("rootfs.ext4"),
+            root.path().join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        );
+        let process_config = FirecrackerProcessConfig::new(
+            root.path().join("missing-firecracker"),
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+
+        let error = match FirecrackerProcess::start(&process_config, &vm_config) {
+            Err(error) => error,
+            Ok(_) => panic!("missing binary unexpectedly started"),
+        };
+        assert!(error.to_string().contains("firecracker process io error"));
+        assert!(!process_config.config_file_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stop_kills_the_process_and_removes_artifacts() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let binary_path = root.path().join("fake-firecracker");
+        std::fs::write(
+            &binary_path,
+            "#!/bin/sh\napi_socket=$2\n: > \"$api_socket\"\nexec sleep 30\n",
+        )
+        .expect("write fake firecracker");
+        set_executable(&binary_path);
+        let vm_config = FirecrackerConfig::new(
+            root.path().join("vmlinux"),
+            root.path().join("rootfs.ext4"),
+            root.path().join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        );
+        let process_config = FirecrackerProcessConfig::new(
+            &binary_path,
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+        let mut process =
+            FirecrackerProcess::start(&process_config, &vm_config).expect("start fake firecracker");
+
+        wait_for_file(&process_config.api_socket_path).await;
+        assert!(process_config.config_file_path.exists());
+        process.stop().await.expect("stop fake firecracker");
+        assert!(!process_config.api_socket_path.exists());
+        assert!(!process_config.config_file_path.exists());
+        process.stop().await.expect("stop is idempotent");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path)
+            .expect("fake firecracker metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("make fake firecracker executable");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_file(path: &Path) {
+        for _ in 0..100 {
+            if path.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("fake firecracker did not create {path:?}");
     }
 }
