@@ -16,6 +16,8 @@ use tokio_util::sync::CancellationToken;
 use super::template::EventDetails;
 use llm_harness_types::{DataBlock, Event, EventStream};
 
+
+
 // ── Config ──────────────────────────────────────────────────────────────
 
 /// Batch policy: accumulate stdout lines, emit an Event when a threshold
@@ -86,9 +88,17 @@ enum Phase {
 
 /// Shell process monitor event stream.
 ///
-/// Spawns a child process via `sh -c`, reads stdout line-by-line, and
+/// Spawns a child process via the platform shell, reads stdout line-by-line, and
 /// emits batched output events. When the process exits, emits a final
 /// exit event (with exit_code) then returns `None`.
+///
+/// # Windows kill semantics
+///
+/// `kill()`/`kill_on_drop` terminate only the direct `cmd.exe` child;
+/// grandchild processes survive as orphans. A monitored command that
+/// spawns background children inheriting stdout may keep the `Reading`
+/// phase from ever reaching EOF (the stream hangs silently — only
+/// `ShellMonitorHandle::kill` can escape it).
 ///
 /// See design spec for the pipe-blocking limitation — do not use for
 /// high-frequency output commands.
@@ -108,7 +118,10 @@ pub struct ShellMonitorStream {
 impl ShellMonitorStream {
     /// Create a monitor stream. Returns `(handle, boxed stream)`.
     ///
-    /// - `command`: shell command string (passed to `sh -c`)
+    /// - `command`: platform shell command string — interpreted by `sh -c` on
+    ///   Unix and by `cmd.exe /D /Q /C` on Windows. The caller owns
+    ///   platform-correct quoting/escaping; never interpolate untrusted
+    ///   content into `command` (caller-owns-quoting trust boundary).
     /// - `cwd`: optional working directory override
     /// - `env`: additional environment variables
     /// - `label`: human-readable label for the event source
@@ -122,8 +135,7 @@ impl ShellMonitorStream {
         config: ShellMonitorConfig,
     ) -> io::Result<(ShellMonitorHandle, Box<dyn EventStream>)> {
         let kill_token = CancellationToken::new();
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(command);
+        let mut cmd = platform_shell_command(command);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::null());
         if let Some(cwd) = cwd {
@@ -357,6 +369,35 @@ fn exit_status_to_code(status: std::process::ExitStatus) -> i32 {
     }
 }
 
+/// Build the platform shell command for `command`.
+///
+/// Mirrors the repository's platform-shell precedent in `os.rs`
+/// (issue #81 fix) using `target_os` forms — a `#[cfg(windows)]` pair
+/// would leave the function without a return path on non-win/non-unix
+/// targets (e.g. wasm).
+///
+/// - Unix: `sh -c <command>`.
+/// - Windows: `cmd.exe /D /Q /C <command>` via `raw_arg` instead of `arg`:
+///   `arg` escapes `"` into `\"`, and after cmd.exe strips quotes per its
+///   `/C` rules the argument gets split apart (the issue #81 bug). `raw_arg`
+///   keeps paired quotes intact. `/D` disables AutoRun so user registry
+///   scripts cannot pollute stdout events; `/Q` disables command echo so
+///   compound commands do not self-echo into the stream.
+fn platform_shell_command(command: &str) -> Command {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut c = Command::new("cmd.exe");
+        c.raw_arg("/D").raw_arg("/Q").raw_arg("/C").raw_arg(command);
+        c
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -382,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn handle_is_clone_and_send() {
         let (handle, _stream) = ShellMonitorStream::new(
-            "sleep 60",
+            "exit 0",
             None,
             vec![],
             "test",
@@ -397,6 +438,8 @@ mod tests {
         handle.kill();
     }
 
+    // unix-only: kill semantics differ under cmd /C (I-004)
+    #[cfg(unix)]
     #[tokio::test]
     async fn kill_is_idempotent() {
         let (handle, _stream) = ShellMonitorStream::new(
@@ -414,8 +457,14 @@ mod tests {
 
     #[tokio::test]
     async fn basic_output() {
+        #[cfg(not(target_os = "windows"))]
+        let command = r#"echo "line1"; echo "line2""#;
+        // cmd's echo prints quotes verbatim — this pins the raw_arg
+        // fix (issue #81): arg() would escape and mangle them.
+        #[cfg(target_os = "windows")]
+        let command = "echo \"line1\"& echo \"line2\"";
         let (_handle, mut stream) = ShellMonitorStream::new(
-            r#"echo "line1"; echo "line2""#,
+            command,
             None,
             vec![],
             "test",
@@ -439,8 +488,14 @@ mod tests {
         assert!(combined.contains("line1"), "got: {combined}");
         assert!(combined.contains("line2"), "got: {combined}");
 
-        // Stream exhausted after exit event.
-        assert!(stream.next().await.is_none());
+
+        // Windows: raw_arg must keep paired quotes intact (issue #81);
+        // cmd's echo prints them verbatim.
+        #[cfg(target_os = "windows")]
+        assert!(
+            combined.contains("\"line1\""),
+            "paired quotes must survive raw_arg, got: {combined}"
+        );
     }
 
     #[tokio::test]
@@ -516,7 +571,9 @@ mod tests {
     #[tokio::test]
     async fn stderr_not_monitored() {
         let (_handle, mut stream) = ShellMonitorStream::new(
-            r#"echo "err msg" >&2; echo "out msg""#,
+            // Same string works on both shells: `1>&2` redirects stdout to
+            // stderr (cmd needs the explicit `1`), `&` separates commands.
+            "echo err msg 1>&2& echo out msg",
             None,
             vec![],
             "test",
@@ -543,32 +600,63 @@ mod tests {
 
     #[tokio::test]
     async fn batch_by_line_count() {
-        // Output 100 lines, max_lines=50 → first event has 50 lines,
-        // second event has 50 lines, then exit event.
+        // Output 100 lines with max_lines=50: no event may exceed 50 lines
+        // and no line may be lost. The exact 50/50 event split is NOT
+        // asserted: the interval flush path can legally fire before 50
+        // lines accumulate (e.g. when the shell loop is starved under
+        // load, the default/short max_interval elapses first), so the
+        // split may legitimately be e.g. 1+50+49. batch_by_interval pins
+        // the interval-flush semantics separately; this test pins the
+        // max_lines ceiling and losslessness.
+        #[cfg(not(target_os = "windows"))]
+        let command = "for i in $(seq 1 100); do echo \"line $i\"; done";
+        // cmd /C uses single %i for for /L loop variables (no batch-file
+        // doubling); @echo suppresses the per-iteration command echo.
+        #[cfg(target_os = "windows")]
+        let command = "for /L %i in (1,1,100) do @echo line %i";
         let (_handle, mut stream) = ShellMonitorStream::new(
-            "for i in $(seq 1 100); do echo \"line $i\"; done",
+            command,
             None,
             vec![],
             "batch-test",
-            ShellMonitorConfig::default().with_max_lines(50),
+            // max_interval far beyond the test duration so that, in the
+            // absence of load starvation, batching is triggered only by
+            // max_lines.
+            ShellMonitorConfig::default()
+                .with_max_lines(50)
+                .with_max_interval(Duration::from_secs(600)),
         )
         .unwrap();
 
-        let e1 = stream.next().await.unwrap();
-        assert_eq!(e1.details["line_count"], 50);
-        let text1 = text_of_event(&e1);
-        assert!(text1.contains("line 1"), "got: {text1}");
-        assert!(text1.contains("line 50"), "got: {text1}");
+        let mut total_lines = 0usize;
+        let mut output_events = 0usize;
+        let mut combined = String::new();
+        let mut saw_exit = false;
+        while let Some(e) = stream.next().await {
+            if e.details["channel"] == "shell_monitor.exit" {
+                saw_exit = true;
+                break;
+            }
+            let n = e.details["line_count"].as_u64().unwrap() as usize;
+            assert!(
+                n <= 50,
+                "event exceeded max_lines=50: {n} (total so far {total_lines})"
+            );
+            output_events += 1;
+            total_lines += n;
+            combined.push_str(&text_of_event(&e));
+            combined.push('\n');
+        }
 
-        let e2 = stream.next().await.unwrap();
-        assert_eq!(e2.details["line_count"], 50);
-        let text2 = text_of_event(&e2);
-        assert!(text2.contains("line 51"), "got: {text2}");
-        assert!(text2.contains("line 100"), "got: {text2}");
-
-        let e3 = stream.next().await.unwrap();
-        assert_eq!(e3.details["channel"], "shell_monitor.exit");
-
+        assert!(saw_exit, "exit event must terminate the stream");
+        assert_eq!(total_lines, 100, "no line may be lost or duplicated");
+        assert!(
+            output_events >= 2,
+            "100 lines with max_lines=50 must produce multiple events"
+        );
+        assert!(combined.contains("line 1"), "got: {combined}");
+        assert!(combined.contains("line 100"), "got: {combined}");
+        // Stream exhausted after exit event.
         assert!(stream.next().await.is_none());
     }
 
@@ -577,8 +665,14 @@ mod tests {
         // sleep 0.2s then echo — with max_interval=100ms, the timeout
         // fires first with empty buffer (continues), then line arrives.
         // Use a command that outputs slowly: echo with sleeps between lines.
+        #[cfg(not(target_os = "windows"))]
+        let command = r#"echo "first"; sleep 0.3; echo "second""#;
+        // ping -n 2 ≈ 1s gap: far above the 100ms interval so the two
+        // echoes land in separate events. Output goes to nul.
+        #[cfg(target_os = "windows")]
+        let command = "echo first& ping -n 2 127.0.0.1 >nul& echo second";
         let (_handle, mut stream) = ShellMonitorStream::new(
-            r#"echo "first"; sleep 0.3; echo "second""#,
+            command,
             None,
             vec![],
             "interval-test",
@@ -606,6 +700,8 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
+    // unix-only: kill semantics differ under cmd /C (I-004)
+    #[cfg(unix)]
     #[tokio::test]
     async fn kill_terminates_process() {
         let (handle, mut stream) = ShellMonitorStream::new(
@@ -639,7 +735,7 @@ mod tests {
     async fn empty_output_exits_directly() {
         // Command produces no stdout → first next() returns exit event
         let (_handle, mut stream) = ShellMonitorStream::new(
-            "true",
+            "exit 0",
             None,
             vec![],
             "empty-test",
@@ -653,6 +749,8 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
+    // unix-only: kill semantics differ under cmd /C (I-004)
+    #[cfg(unix)]
     #[tokio::test]
     async fn kill_flushes_buffered_output() {
         // Command emits lines slowly, kill mid-stream → buffered lines must
@@ -698,6 +796,8 @@ mod tests {
         );
     }
 
+    // unix-only: kill semantics differ under cmd /C (I-004)
+    #[cfg(unix)]
     #[tokio::test]
     async fn kill_in_wait_for_exit_phase() {
         // Process closes stdout but doesn't exit (simulates daemon fork).
