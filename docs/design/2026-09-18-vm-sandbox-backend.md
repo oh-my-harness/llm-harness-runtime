@@ -164,8 +164,8 @@ the gateway.
    - Add bounded frames, request ids, and fail-closed decoding.
 
 3. **Firecracker lifecycle**
-   - Add image allocation, VM configuration, start, health/readiness, force stop,
-     and artifact cleanup.
+   - Add VM configuration, start, health/readiness, force stop, and artifact
+     cleanup.
    - Validate host prerequisites (KVM, Firecracker binary, image, permissions).
 
 4. **Policy and limits**
@@ -196,17 +196,21 @@ and is idempotent; drop performs best-effort artifact cleanup for callers that
 do not stop explicitly.
 `wait_ready` polls the child and the API socket until the process is accepting
 connections, the child exits, or the configured timeout elapses.
+`FirecrackerImageAllocator` copies a non-empty regular base image to a new
+private destination, rejects symlinks at every path component, creates the
+destination exclusively with mode `0600`, syncs the file and parent directory,
+and removes the image through its opened parent descriptor on cleanup.
 These primitives are not yet a full VM lifecycle manager: jailer integration,
-image allocation, graceful guest shutdown, registry recovery, and deployment
-validation remain future slices.
+graceful guest shutdown, registry recovery, and deployment validation remain
+future slices.
 
 ## Current status
 
 This document selects Firecracker and defines the required threat model. The
 transport-independent guest-agent wire protocol, AF_VSOCK transport, guest
 filesystem/process handlers, guest binary, host client, and initial
-Firecracker configuration/process primitives are implemented. They are not yet
-assembled into a complete Firecracker lifecycle backend with jailer, image,
+Firecracker configuration/process/image primitives are implemented. They are
+not yet assembled into a complete Firecracker lifecycle backend with jailer,
 network, readiness, registry recovery, and deployment validation. The Bwrap
 gateway remains the only implemented remote execution backend, and #193 remains
 open until those requirements are complete.
