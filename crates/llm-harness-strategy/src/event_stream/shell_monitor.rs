@@ -123,6 +123,8 @@ impl ShellMonitorStream {
     ///   Unpaired quotes: `raw_arg` keeps paired quotes intact, but cmd.exe
     ///   parses unpaired quotes differently from `sh` — the caller must
     ///   ensure quotes are balanced.
+    /// - `cwd`: optional working directory override
+    /// - `env`: additional environment variables
     /// - `label`: human-readable label for the event source
     /// - `config`: batch thresholds
     #[allow(clippy::new_ret_no_self)]
