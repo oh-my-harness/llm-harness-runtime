@@ -600,10 +600,22 @@ impl FirecrackerLifecycle {
 
     pub async fn graceful_stop(
         &mut self,
-        timeout: Duration,
+        timeout_duration: Duration,
     ) -> Result<(), FirecrackerLifecycleError> {
-        self.guest_agent = None;
-        let process_result = self.process.graceful_stop(timeout).await;
+        let deadline = Instant::now() + timeout_duration;
+        let guest_cleanup_error = match self.guest_agent.take() {
+            Some(client) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, client.cleanup()).await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error),
+                    Err(_) => Some(guest_cleanup_timeout()),
+                }
+            }
+            None => None,
+        };
+        let process_timeout = deadline.saturating_duration_since(Instant::now());
+        let process_result = self.process.graceful_stop(process_timeout).await;
         let image_result = self.image.remove();
         let jail_result = cleanup_jail(&mut self.jail);
         let cgroup_result = self.cgroups.remove();
@@ -611,33 +623,37 @@ impl FirecrackerLifecycle {
             let image_error = image_result.err();
             let jail_error = jail_result;
             let cgroup_error = cgroup_result.err();
-            return Err(stop_error(
-                process_error,
-                image_error,
-                jail_error,
-                cgroup_error,
-            ));
+            let mut error = stop_error(process_error, image_error, jail_error, cgroup_error);
+            append_guest_cleanup_error(&mut error, guest_cleanup_error.as_ref());
+            return Err(error);
         }
         if let Err(image_error) = image_result {
             let jail_error = jail_result;
             let cgroup_error = cgroup_result.err();
-            return Err(stop_cleanup_error(
-                image_error.to_string(),
-                jail_error,
-                cgroup_error,
-            ));
+            let mut error = stop_cleanup_error(image_error.to_string(), jail_error, cgroup_error);
+            append_guest_cleanup_error(&mut error, guest_cleanup_error.as_ref());
+            return Err(error);
         }
         if let Some(jail_error) = jail_result {
             let cgroup_error = cgroup_result.err();
-            return Err(stop_cleanup_error(
+            let mut error = stop_cleanup_error(
                 "firecracker jail cleanup failed".to_owned(),
                 Some(jail_error),
                 cgroup_error,
-            ));
+            );
+            append_guest_cleanup_error(&mut error, guest_cleanup_error.as_ref());
+            return Err(error);
         }
         if let Err(cgroup_error) = cgroup_result {
-            return Err(FirecrackerLifecycleError::new(format!(
+            let mut error = FirecrackerLifecycleError::new(format!(
                 "firecracker cgroup cleanup failed: {cgroup_error}"
+            ));
+            append_guest_cleanup_error(&mut error, guest_cleanup_error.as_ref());
+            return Err(error);
+        }
+        if let Some(guest_cleanup_error) = guest_cleanup_error {
+            return Err(FirecrackerLifecycleError::new(format!(
+                "firecracker guest cleanup failed: {guest_cleanup_error}"
             )));
         }
         Ok(())
@@ -709,6 +725,21 @@ async fn wait_before_retry(deadline: Instant) {
 
 fn guest_agent_timeout() -> GuestAgentClientError {
     GuestAgentClientError::Protocol("guest agent did not become ready in time".to_owned())
+}
+
+fn guest_cleanup_timeout() -> GuestAgentClientError {
+    GuestAgentClientError::Protocol("guest agent cleanup timed out".to_owned())
+}
+
+fn append_guest_cleanup_error(
+    error: &mut FirecrackerLifecycleError,
+    guest_cleanup_error: Option<&GuestAgentClientError>,
+) {
+    if let Some(guest_cleanup_error) = guest_cleanup_error {
+        error
+            .message
+            .push_str(&format!("; guest cleanup failed: {guest_cleanup_error}"));
+    }
 }
 
 fn validate_host_path(label: &'static str, path: &Path) -> Result<(), FirecrackerLifecycleError> {
@@ -831,7 +862,7 @@ mod tests {
         std::fs::set_permissions(path, permissions).expect("set executable permissions");
     }
 
-    fn write_fake_firecracker(path: &Path, guest_port: u32) {
+    fn write_fake_firecracker(path: &Path, guest_port: u32, cleanup_supported: bool) {
         let script = r#"#!/usr/bin/env python3
 import json, os, select, socket, sys
 args = sys.argv[1:]
@@ -845,6 +876,21 @@ vsock_server.bind(vsock_path)
 vsock_server.listen(4)
 connections = []
 
+def recv_exact(connection, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = connection.recv(size - len(data))
+        if not chunk:
+            raise EOFError("guest agent connection closed")
+        data.extend(chunk)
+    return bytes(data)
+
+def read_frame(connection):
+    header = recv_exact(connection, 20)
+    payload_len = int.from_bytes(header[8:12], "big")
+    payload = recv_exact(connection, payload_len)
+    return int.from_bytes(header[12:20], "big"), json.loads(payload)
+
 def frame(request_id, message):
     payload = json.dumps(message, separators=(",", ":")).encode()
     return (
@@ -854,13 +900,37 @@ def frame(request_id, message):
         + payload
     )
 
+def record_order(event):
+    with open(os.path.join(os.path.dirname(api_path), "order.log"), "a") as log:
+        log.write(event + "\n")
+
+def handle_guest_connection(connection):
+    request_id, message = read_frame(connection)
+    kind = message.get("type")
+    if kind == "ping":
+        message["type"] = "pong"
+    elif kind == "cleanup" and CLEANUP_SUPPORTED:
+        record_order("cleanup")
+        message["type"] = "cleanup_result"
+    else:
+        return
+    connection.sendall(frame(request_id, message))
+
 while True:
-    readable, _, _ = select.select([api_server, vsock_server], [], [])
-    for server in readable:
-        connection, _ = server.accept()
-        if server is api_server:
+    readable, _, _ = select.select([api_server, vsock_server, *connections], [], [])
+    for source in readable:
+        if source in connections:
+            try:
+                handle_guest_connection(source)
+            except EOFError:
+                connections.remove(source)
+                source.close()
+            continue
+        connection, _ = source.accept()
+        if source is api_server:
             request = connection.recv(4096)
             if request.startswith(b"PUT /actions"):
+                record_order("shutdown")
                 connection.sendall(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 connection.close()
                 sys.exit(0)
@@ -871,20 +941,13 @@ while True:
             handshake.extend(connection.recv(1))
         assert handshake == b"connect 6000\n"
         connection.sendall(b"OK 1073741824\n")
-        header = connection.recv(20)
-        if len(header) != 20:
-            connection.close()
-            continue
-        payload_len = int.from_bytes(header[8:12], "big")
-        payload = connection.recv(payload_len)
-        message = json.loads(payload)
-        assert message.get("type") == "ping"
-        request_id = int.from_bytes(header[12:20], "big")
-        message["type"] = "pong"
-        connection.sendall(frame(request_id, message))
         connections.append(connection)
 "#;
         let script = script.replace("connect 6000", &format!("connect {guest_port}"));
+        let script = script.replace(
+            "CLEANUP_SUPPORTED",
+            if cleanup_supported { "True" } else { "False" },
+        );
         write_regular_file(path, script.as_bytes());
         set_executable(path);
     }
@@ -1157,7 +1220,11 @@ while True:
     #[tokio::test]
     async fn start_and_stop_clean_lifecycle_artifacts() {
         let (root, config) = test_environment();
-        write_fake_firecracker(&root.path().join("firecracker"), DEFAULT_GUEST_AGENT_PORT);
+        write_fake_firecracker(
+            &root.path().join("firecracker"),
+            DEFAULT_GUEST_AGENT_PORT,
+            true,
+        );
         let mut lifecycle = FirecrackerLifecycle::start(&config)
             .await
             .expect("start lifecycle");
@@ -1175,6 +1242,32 @@ while True:
             .graceful_stop(Duration::from_secs(2))
             .await
             .expect("graceful stop is idempotent");
+        let order = std::fs::read_to_string(root.path().join("run/order.log"))
+            .expect("read lifecycle operation order");
+        assert_eq!(order, "cleanup\nshutdown\n");
+        assert!(!config.rootfs_path().exists());
+        assert!(!config.api_socket_path().exists());
+        assert!(!config.config_file_path().exists());
+        assert!(!config.vsock_socket_path().exists());
+    }
+
+    #[tokio::test]
+    async fn guest_cleanup_timeout_falls_back_to_vm_destruction() {
+        let (root, config) = test_environment();
+        write_fake_firecracker(
+            &root.path().join("firecracker"),
+            DEFAULT_GUEST_AGENT_PORT,
+            false,
+        );
+        let mut lifecycle = FirecrackerLifecycle::start(&config)
+            .await
+            .expect("start lifecycle with unavailable guest cleanup");
+
+        let error = lifecycle
+            .graceful_stop(Duration::from_millis(100))
+            .await
+            .expect_err("guest cleanup times out");
+        assert!(error.to_string().contains("guest agent cleanup timed out"));
         assert!(!config.rootfs_path().exists());
         assert!(!config.api_socket_path().exists());
         assert!(!config.config_file_path().exists());
@@ -1232,7 +1325,11 @@ while True:
     #[tokio::test]
     async fn drop_cleans_lifecycle_artifacts() {
         let (root, config) = test_environment();
-        write_fake_firecracker(&root.path().join("firecracker"), DEFAULT_GUEST_AGENT_PORT);
+        write_fake_firecracker(
+            &root.path().join("firecracker"),
+            DEFAULT_GUEST_AGENT_PORT,
+            true,
+        );
         let lifecycle = FirecrackerLifecycle::start(&config)
             .await
             .expect("start lifecycle");
@@ -1247,7 +1344,7 @@ while True:
     #[tokio::test]
     async fn start_uses_the_configured_guest_agent_port() {
         let (root, config) = test_environment();
-        write_fake_firecracker(&root.path().join("firecracker"), 6100);
+        write_fake_firecracker(&root.path().join("firecracker"), 6100, true);
         let config = config.with_guest_agent_port(6100);
 
         let mut lifecycle = FirecrackerLifecycle::start(&config)
