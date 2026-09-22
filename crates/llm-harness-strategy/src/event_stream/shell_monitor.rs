@@ -16,8 +16,6 @@ use tokio_util::sync::CancellationToken;
 use super::template::EventDetails;
 use llm_harness_types::{DataBlock, Event, EventStream};
 
-
-
 // ── Config ──────────────────────────────────────────────────────────────
 
 /// Batch policy: accumulate stdout lines, emit an Event when a threshold
@@ -122,8 +120,9 @@ impl ShellMonitorStream {
     ///   Unix and by `cmd.exe /D /Q /C` on Windows. The caller owns
     ///   platform-correct quoting/escaping; never interpolate untrusted
     ///   content into `command` (caller-owns-quoting trust boundary).
-    /// - `cwd`: optional working directory override
-    /// - `env`: additional environment variables
+    ///   Unpaired quotes: `raw_arg` keeps paired quotes intact, but cmd.exe
+    ///   parses unpaired quotes differently from `sh` — the caller must
+    ///   ensure quotes are balanced.
     /// - `label`: human-readable label for the event source
     /// - `config`: batch thresholds
     #[allow(clippy::new_ret_no_self)]
@@ -488,7 +487,6 @@ mod tests {
         assert!(combined.contains("line1"), "got: {combined}");
         assert!(combined.contains("line2"), "got: {combined}");
 
-
         // Windows: raw_arg must keep paired quotes intact (issue #81);
         // cmd's echo prints them verbatim.
         #[cfg(target_os = "windows")]
@@ -496,6 +494,9 @@ mod tests {
             combined.contains("\"line1\""),
             "paired quotes must survive raw_arg, got: {combined}"
         );
+
+        // Stream exhausted after exit event.
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
