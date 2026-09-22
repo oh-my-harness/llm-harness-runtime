@@ -56,6 +56,18 @@ impl FirecrackerProcessConfig {
         Ok(())
     }
 
+    pub fn binary_path(&self) -> &Path {
+        &self.binary_path
+    }
+
+    pub fn api_socket_path(&self) -> &Path {
+        &self.api_socket_path
+    }
+
+    pub fn config_file_path(&self) -> &Path {
+        &self.config_file_path
+    }
+
     pub fn command_args(&self) -> Vec<OsString> {
         vec![
             OsString::from("--api-sock"),

@@ -212,12 +212,13 @@ readiness polling; startup failure, explicit graceful/force stop, and drop clean
 process and image artifacts. This is not yet a production VM lifecycle backend:
 `FirecrackerJailerConfig` now builds and validates Linux jailer command
 arguments, including the upstream 1–64 byte alphanumeric/hyphen ID constraint,
-cgroup and resource-limit formats, and forwarding of Firecracker arguments
-after `--`. It intentionally omits `--daemonize` and `--new-pid-ns` in this
-slice. Jailed lifecycle integration, including making API-socket, config-file,
-rootfs, and kernel paths valid inside the chroot, remains future work, along
-with guest-agent-coordinated shutdown confirmation, registry recovery, network
-policy, and deployment validation.
+cgroup and resource-limit formats, chroot-directory derivation, and translation
+of host API-socket/config-file paths inside that chroot into jail-relative
+Firecracker arguments after `--`. It intentionally omits `--daemonize` and
+`--new-pid-ns` in this slice. Jailed lifecycle integration, including staging
+API-socket, config-file, rootfs, and kernel resources inside the chroot,
+remains future work, along with guest-agent-coordinated shutdown confirmation,
+registry recovery, network policy, and deployment validation.
 
 ## Current status
 

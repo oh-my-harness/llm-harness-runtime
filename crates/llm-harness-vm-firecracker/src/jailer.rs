@@ -95,6 +95,13 @@ impl FirecrackerJailerConfig {
     pub fn validate(&self) -> Result<(), FirecrackerJailerConfigError> {
         validate_host_path("jailer binary", &self.jailer_binary_path)?;
         validate_host_path("Firecracker binary", &self.firecracker_binary_path)?;
+        if self.jailer_binary_path.file_name().is_none()
+            || self.firecracker_binary_path.file_name().is_none()
+        {
+            return Err(FirecrackerJailerConfigError::invalid(
+                "jailer and Firecracker binary paths must include a file name",
+            ));
+        }
         if self.jailer_binary_path == self.firecracker_binary_path {
             return Err(FirecrackerJailerConfigError::invalid(
                 "jailer binary and Firecracker binary paths must be different",
@@ -107,6 +114,11 @@ impl FirecrackerJailerConfig {
             ));
         }
         validate_host_path("chroot base directory", &self.chroot_base_dir)?;
+        if self.chroot_base_dir == Path::new("/") {
+            return Err(FirecrackerJailerConfigError::invalid(
+                "chroot base directory must not be the filesystem root",
+            ));
+        }
         if !self.cgroups.is_empty() && self.cgroup_version.is_none() {
             return Err(FirecrackerJailerConfigError::invalid(
                 "cgroup version must be explicit when cgroup settings are set",
@@ -123,14 +135,41 @@ impl FirecrackerJailerConfig {
         Ok(())
     }
 
+    pub fn chroot_dir(&self) -> Result<PathBuf, FirecrackerJailerConfigError> {
+        self.validate()?;
+        let firecracker_file_name = self.firecracker_binary_path.file_name().ok_or_else(|| {
+            FirecrackerJailerConfigError::invalid(
+                "Firecracker binary path must include a file name",
+            )
+        })?;
+        Ok(self
+            .chroot_base_dir
+            .join(firecracker_file_name)
+            .join(&self.id)
+            .join("root"))
+    }
+
     pub fn command_args(
         &self,
         process_config: &FirecrackerProcessConfig,
     ) -> Result<Vec<OsString>, FirecrackerJailerConfigError> {
         self.validate()?;
+        let chroot_dir = self.chroot_dir()?;
         process_config
             .validate()
             .map_err(|error| FirecrackerJailerConfigError::invalid(error.to_string()))?;
+        if process_config.binary_path() != self.firecracker_binary_path {
+            return Err(FirecrackerJailerConfigError::invalid(
+                "process binary path must match the jailer Firecracker binary path",
+            ));
+        }
+        let api_socket_path =
+            jail_path(&chroot_dir, process_config.api_socket_path(), "API socket")?;
+        let config_file_path = jail_path(
+            &chroot_dir,
+            process_config.config_file_path(),
+            "config file",
+        )?;
 
         let mut args = vec![
             OsString::from("--id"),
@@ -168,7 +207,10 @@ impl FirecrackerJailerConfig {
             args.push(OsString::from(resource_limit.clone()));
         }
         args.push(OsString::from("--"));
-        args.extend(process_config.command_args());
+        args.push(OsString::from("--api-sock"));
+        args.push(api_socket_path.as_os_str().to_owned());
+        args.push(OsString::from("--config-file"));
+        args.push(config_file_path.as_os_str().to_owned());
         Ok(args)
     }
 }
@@ -187,6 +229,11 @@ fn validate_host_path(
             "{label} path must be absolute"
         )));
     }
+    if path.to_str().is_none() {
+        return Err(FirecrackerJailerConfigError::invalid(format!(
+            "{label} path must be valid UTF-8"
+        )));
+    }
     if path_contains_nul(path) {
         return Err(FirecrackerJailerConfigError::invalid(format!(
             "{label} path contains a NUL byte"
@@ -198,6 +245,29 @@ fn validate_host_path(
         )));
     }
     Ok(())
+}
+
+fn jail_path(
+    chroot_dir: &Path,
+    host_path: &Path,
+    label: &'static str,
+) -> Result<PathBuf, FirecrackerJailerConfigError> {
+    if !host_path.starts_with(chroot_dir) {
+        return Err(FirecrackerJailerConfigError::invalid(format!(
+            "{label} host path must be inside the jailer chroot"
+        )));
+    }
+    let relative_path = host_path.strip_prefix(chroot_dir).map_err(|_| {
+        FirecrackerJailerConfigError::invalid(format!(
+            "{label} host path must be inside the jailer chroot"
+        ))
+    })?;
+    if relative_path.as_os_str().is_empty() {
+        return Err(FirecrackerJailerConfigError::invalid(format!(
+            "{label} host path must not be the jailer chroot"
+        )));
+    }
+    Ok(Path::new("/").join(relative_path))
 }
 
 fn validate_id(id: &str) -> Result<(), FirecrackerJailerConfigError> {
@@ -347,8 +417,8 @@ mod tests {
     fn valid_process_config() -> FirecrackerProcessConfig {
         FirecrackerProcessConfig::new(
             "/usr/local/bin/firecracker",
-            "/run/firecracker/sandbox-1.sock",
-            "/run/firecracker/sandbox-1.json",
+            "/srv/jailer/firecracker/sandbox-1/root/run/firecracker.sock",
+            "/srv/jailer/firecracker/sandbox-1/root/run/firecracker.json",
         )
     }
 
@@ -373,9 +443,9 @@ mod tests {
                 OsString::from("/srv/jailer"),
                 OsString::from("--"),
                 OsString::from("--api-sock"),
-                OsString::from("/run/firecracker/sandbox-1.sock"),
+                OsString::from("/run/firecracker.sock"),
                 OsString::from("--config-file"),
-                OsString::from("/run/firecracker/sandbox-1.json"),
+                OsString::from("/run/firecracker.json"),
             ]
         );
     }
@@ -392,8 +462,13 @@ mod tests {
             .with_parent_cgroup("llm-harness")
             .with_netns("/run/netns/sandbox-1")
             .with_resource_limits(vec!["no-file=1024".to_owned()]);
+        let process_config = FirecrackerProcessConfig::new(
+            "/usr/local/bin/firecracker",
+            "/var/lib/firecracker/firecracker/sandbox-1/root/run/firecracker.sock",
+            "/var/lib/firecracker/firecracker/sandbox-1/root/run/firecracker.json",
+        );
         let args = config
-            .command_args(&valid_process_config())
+            .command_args(&process_config)
             .expect("valid jailer command");
         assert_eq!(
             args,
@@ -422,10 +497,55 @@ mod tests {
                 OsString::from("no-file=1024"),
                 OsString::from("--"),
                 OsString::from("--api-sock"),
-                OsString::from("/run/firecracker/sandbox-1.sock"),
+                OsString::from("/run/firecracker.sock"),
                 OsString::from("--config-file"),
-                OsString::from("/run/firecracker/sandbox-1.json"),
+                OsString::from("/run/firecracker.json"),
             ]
+        );
+    }
+
+    #[test]
+    fn config_derives_the_jailer_chroot_directory() {
+        let config = valid_jailer_config();
+        assert_eq!(
+            config.chroot_dir().expect("valid chroot directory"),
+            PathBuf::from("/srv/jailer/firecracker/sandbox-1/root")
+        );
+    }
+
+    #[test]
+    fn command_args_rejects_artifacts_outside_the_jailer_chroot() {
+        let process_config = FirecrackerProcessConfig::new(
+            "/usr/local/bin/firecracker",
+            "/run/firecracker/sandbox-1.sock",
+            "/srv/jailer/firecracker/sandbox-1/root/run/firecracker.json",
+        );
+        let error = valid_jailer_config()
+            .command_args(&process_config)
+            .expect_err("API socket outside chroot");
+        assert!(
+            error
+                .to_string()
+                .contains("API socket host path must be inside the jailer chroot"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn command_args_rejects_a_mismatched_process_binary() {
+        let process_config = FirecrackerProcessConfig::new(
+            "/usr/bin/firecracker",
+            "/srv/jailer/firecracker/sandbox-1/root/run/firecracker.sock",
+            "/srv/jailer/firecracker/sandbox-1/root/run/firecracker.json",
+        );
+        let error = valid_jailer_config()
+            .command_args(&process_config)
+            .expect_err("mismatched process binary");
+        assert!(
+            error
+                .to_string()
+                .contains("process binary path must match the jailer Firecracker binary path"),
+            "{error}"
         );
     }
 
@@ -451,6 +571,10 @@ mod tests {
                     1000,
                 ),
                 "Firecracker binary path must not contain . or .. components",
+            ),
+            (
+                FirecrackerJailerConfig::new("/usr/local/bin/jailer", "/", "sandbox-1", 1000, 1000),
+                "jailer and Firecracker binary paths must include a file name",
             ),
             (
                 FirecrackerJailerConfig::new(
@@ -497,6 +621,45 @@ mod tests {
             let error = config.validate().expect_err("invalid jailer config");
             assert!(error.to_string().contains(expected), "{error}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_rejects_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let firecracker_binary_path = PathBuf::from(OsString::from_vec(
+            b"/usr/local/bin/firecracker\xff".to_vec(),
+        ));
+        let config = FirecrackerJailerConfig::new(
+            "/usr/local/bin/jailer",
+            firecracker_binary_path,
+            "sandbox-1",
+            1000,
+            1000,
+        );
+        let error = config.validate().expect_err("non-UTF-8 Firecracker binary");
+        assert!(
+            error
+                .to_string()
+                .contains("Firecracker binary path must be valid UTF-8"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_rejects_the_filesystem_root_as_chroot_base() {
+        let config = valid_jailer_config().with_chroot_base_dir("/");
+        let error = config
+            .validate()
+            .expect_err("filesystem root as chroot base");
+        assert!(
+            error
+                .to_string()
+                .contains("chroot base directory must not be the filesystem root"),
+            "{error}"
+        );
     }
 
     #[test]
