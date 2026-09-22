@@ -1509,7 +1509,7 @@ async fn chat_history(State(state): State<AppState>, Query(q): Query<AgentCtlQue
         && project
             .team
             .social_context()
-            .map_or(true, |ctx| ctx.get_agent_info(&agent_id).is_none())
+            .is_none_or(|ctx| ctx.get_agent_info(&agent_id).is_none())
     {
         return err_resp(format!("unknown agent: {}", q.agent), StatusCode::NOT_FOUND);
     }

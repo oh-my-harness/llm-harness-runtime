@@ -633,6 +633,7 @@ impl SocialContext {
     /// Studio APIs use this so the ID emitted over WebSocket is the same ID
     /// later returned by chat history. When no ID is supplied, the social
     /// context generates one before delivery.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_direct_with_message_id(
         &self,
         from: &AgentId,
@@ -1447,7 +1448,7 @@ mod tests {
         let delivered_id = delivered[0].message_id.as_deref();
         let history = ctx.private_history(&operator, &alice, 10);
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].message_id.as_deref(), delivered_id.as_deref());
+        assert_eq!(history[0].message_id.as_deref(), delivered_id);
 
         let broadcast = ctx
             .broadcast_with_message_id(&operator, "same text", None)

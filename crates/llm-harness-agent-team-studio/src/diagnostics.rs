@@ -125,7 +125,7 @@ fn append_private_jsonl(path: &Path, event: &serde_json::Value) -> std::io::Resu
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)?;
+        .open(path)?;
     set_private_permissions(path, &mut file)?;
     let mut line = serde_json::to_vec(event)?;
     line.push(b'\n');
