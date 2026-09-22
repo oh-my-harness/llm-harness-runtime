@@ -9,7 +9,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use llm_harness_agent_team::{
-    AgentTeam, InboxJournal, IndividualSpec, TeamConfig, TeamError, TimeoutJournal,
+    AgentTeam, ChatHistoryJournal, InboxJournal, IndividualSpec, TeamConfig, TeamError,
+    TimeoutJournal,
 };
 use llm_harness_loop::LlmClient;
 use llm_harness_mcp::manager::McpManager;
@@ -57,6 +58,8 @@ pub enum AssembleError {
     InboxJournal(#[from] llm_harness_agent_team::InboxJournalError),
     #[error(transparent)]
     TimerJournal(#[from] llm_harness_agent_team::TimerJournalError),
+    #[error(transparent)]
+    ChatHistoryJournal(#[from] llm_harness_agent_team::ChatHistoryJournalError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -466,6 +469,7 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
     let project_dir = inputs.data_dir.clone();
     let inbox_journal = InboxJournal::open(project_dir.join("inbox.sqlite3"))?;
     let timer_journal = TimeoutJournal::open(project_dir.join("timers.sqlite3"))?;
+    let chat_history_journal = ChatHistoryJournal::open(project_dir.join("chat.sqlite3"))?;
     let config = TeamConfig {
         memory_root: project_dir.join("memory"),
         session_base_dir: project_dir.join("sessions"),
@@ -475,6 +479,7 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
         max_contacts_per_agent: inputs.spec.members.len().max(20),
         inbox_journal: Some(Arc::new(inbox_journal)),
         timer_journal: Some(Arc::new(timer_journal)),
+        chat_history_journal: Some(Arc::new(chat_history_journal)),
         ..TeamConfig::default()
     };
     std::fs::create_dir_all(project_dir.join("memory"))?;

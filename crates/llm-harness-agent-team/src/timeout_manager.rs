@@ -160,6 +160,7 @@ impl TimeoutManager {
                 },
                 task_id: request.task_id.clone(),
                 broadcast_id: None,
+                message_id: None,
             }) {
                 tracing::error!(agent = %request.agent_id, error = %error, "failed to journal timer message");
                 return;

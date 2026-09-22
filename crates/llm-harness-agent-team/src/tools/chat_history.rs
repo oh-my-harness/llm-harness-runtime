@@ -257,8 +257,13 @@ mod tests {
     #[test]
     fn with_matches_either_side() {
         let ctx = Arc::new(SocialContext::new(10));
-        ctx.send_direct(&AgentId::new("a"), &AgentId::new("b"), "hello from a", NORMAL)
-            .unwrap();
+        ctx.send_direct(
+            &AgentId::new("a"),
+            &AgentId::new("b"),
+            "hello from a",
+            NORMAL,
+        )
+        .unwrap();
         ctx.send_direct(&AgentId::new("b"), &AgentId::new("c"), "hello to c", NORMAL)
             .unwrap();
         let tool = tool_for(&ctx, "b");
@@ -273,7 +278,8 @@ mod tests {
     #[test]
     fn keyword_case_insensitive() {
         let ctx = seeded_ctx();
-        ctx.broadcast(&AgentId::new("a"), "Deploy API gateway").unwrap();
+        ctx.broadcast(&AgentId::new("a"), "Deploy API gateway")
+            .unwrap();
         ctx.broadcast(&AgentId::new("a"), "standup notes").unwrap();
         let tool = tool_for(&ctx, "b");
 
@@ -289,7 +295,8 @@ mod tests {
     #[test]
     fn combined_filters_intersect() {
         let ctx = seeded_ctx();
-        ctx.broadcast(&AgentId::new("b"), "Deploy API gateway now").unwrap();
+        ctx.broadcast(&AgentId::new("b"), "Deploy API gateway now")
+            .unwrap();
         ctx.broadcast(&AgentId::new("operator"), "standup notes today")
             .unwrap();
         ctx.send_direct(&AgentId::new("b"), &AgentId::new("a"), "API reply", NORMAL)
@@ -319,9 +326,15 @@ mod tests {
     #[test]
     fn privacy_boundary_excludes_strangers_direct() {
         let ctx = seeded_ctx();
-        ctx.broadcast(&AgentId::new("x"), "public announcement").unwrap();
-        ctx.send_direct(&AgentId::new("x"), &AgentId::new("y"), "secret private note", NORMAL)
+        ctx.broadcast(&AgentId::new("x"), "public announcement")
             .unwrap();
+        ctx.send_direct(
+            &AgentId::new("x"),
+            &AgentId::new("y"),
+            "secret private note",
+            NORMAL,
+        )
+        .unwrap();
         let tool = tool_for(&ctx, "b");
 
         let out = tool.call_inner(&serde_json::json!({}));

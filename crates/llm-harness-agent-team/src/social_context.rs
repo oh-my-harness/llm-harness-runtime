@@ -5,10 +5,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 
 use crate::agent_id::AgentId;
+use crate::chat_history_journal::ChatHistoryEntry;
 use crate::contact::{ContactRecord, ContactStore};
 use crate::inbox::{InboxMessage, InboxStore, MessageType};
 use crate::relation::RelationEngine;
@@ -45,6 +45,19 @@ pub struct CancelledTimeout {
     pub key: String,
     /// Remote agent the cancelled request targeted, if recorded.
     pub peer: Option<AgentId>,
+}
+
+/// Logical and correlation IDs for one group broadcast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastMessageIds {
+    /// Stable identity of the logical group message.
+    pub message_id: String,
+    /// Shared correlation key carried by all recipient deliveries and replies.
+    pub broadcast_id: String,
+}
+
+fn generate_message_id() -> String {
+    uuid::Uuid::now_v7().to_string()
 }
 
 /// One pending entry: `(AbortHandle, Option<AgentId>)` — the remote peer
@@ -277,26 +290,6 @@ impl TimeoutRegistry {
         self.fired.lock().clear();
         cancelled
     }
-
-    /// Abort every pending timeout for one agent and clear its fired keys.
-    ///
-    /// Used when a member is removed: its timers must not fire into a dead
-    /// inbox or mutate relation state after the member is unregistered.
-    pub fn cancel_for_agent(&self, agent: &AgentId) -> Vec<String> {
-        let bucket = self.pending.lock().remove(agent);
-        let cancelled = bucket
-            .map(|entries| {
-                let (keys, pending_entries): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
-                for (handle, _) in pending_entries {
-                    handle.abort();
-                }
-                keys
-            })
-            .unwrap_or_default();
-        self.fired.lock().remove(agent);
-        cancelled
-    }
-
     /// Restore a previously cancelled (or fired) deadline under
     /// `(agent, key)` with a live timer's abort handle.
     ///
@@ -436,18 +429,19 @@ impl Default for AgentRegistry {
 pub struct SocialContext {
     registry: Arc<AgentRegistry>,
     inboxes: Arc<InboxStore>,
+    chat_history: Arc<Mutex<VecDeque<InboxMessage>>>,
     contacts: Arc<ContactStore>,
     relations: Arc<RelationEngine>,
     /// Timeout bookkeeping shared with [`crate::timeout_manager::TimeoutManager`].
     timeouts: Arc<TimeoutRegistry>,
     timer_journal: Option<Arc<crate::timer_journal::TimeoutJournal>>,
+    /// Durable transcript for all social messages. Unlike the inbox journal,
+    /// rows are never deleted when a message is consumed.
+    chat_history_journal: Option<Arc<crate::chat_history_journal::ChatHistoryJournal>>,
     /// Live per-agent monitor tasks, keyed by agent id. Registered by
     /// [`crate::agent_runner::spawn_monitor_task`] so shutdown can abort
     /// monitors whose runner died without running its own cleanup.
     monitor_registry: Arc<Mutex<HashMap<AgentId, AbortHandle>>>,
-    /// Live message observer stream. It sees messages at delivery time and
-    /// therefore never competes with the receiving agent's monitor task.
-    message_events: Arc<broadcast::Sender<InboxMessage>>,
     max_contacts: usize,
 }
 
@@ -461,8 +455,9 @@ impl SocialContext {
             relations: Arc::new(RelationEngine::default()),
             timeouts: Arc::new(TimeoutRegistry::default()),
             timer_journal: None,
+            chat_history_journal: None,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
-            message_events: Arc::new(broadcast::channel(256).0),
+            chat_history: Arc::new(Mutex::new(VecDeque::new())),
             max_contacts,
         }
     }
@@ -475,6 +470,18 @@ impl SocialContext {
         journal: Option<Arc<crate::inbox_journal::InboxJournal>>,
         timer_journal: Option<Arc<crate::timer_journal::TimeoutJournal>>,
     ) -> crate::Result<Self> {
+        Self::with_journals(max_contacts, journal, timer_journal, None)
+    }
+
+    /// Create a social context with optional durable delivery and transcript
+    /// journals. The transcript survives after inbox rows are consumed.
+    pub fn with_journals(
+        max_contacts: usize,
+        inbox_journal: Option<Arc<crate::inbox_journal::InboxJournal>>,
+        timer_journal: Option<Arc<crate::timer_journal::TimeoutJournal>>,
+        chat_history_journal: Option<Arc<crate::chat_history_journal::ChatHistoryJournal>>,
+    ) -> crate::Result<Self> {
+        let journal = inbox_journal;
         let mut inbox_journal = None;
         let inboxes = match journal {
             Some(journal) => {
@@ -490,8 +497,9 @@ impl SocialContext {
             relations: Arc::new(RelationEngine::default()),
             timeouts: Arc::new(TimeoutRegistry::default()),
             timer_journal,
+            chat_history_journal,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
-            message_events: Arc::new(broadcast::channel(256).0),
+            chat_history: Arc::new(Mutex::new(VecDeque::new())),
             max_contacts,
         };
         if let Some(journal) = &context.timer_journal {
@@ -536,29 +544,6 @@ impl SocialContext {
     pub fn get_agent_info(&self, id: &AgentId) -> Option<AgentInfo> {
         self.registry.get(id)
     }
-
-    /// Subscribe to every message at delivery time. This is an observation
-    /// stream only; consumers must not drain or acknowledge inboxes.
-    pub fn subscribe_messages(&self) -> broadcast::Receiver<InboxMessage> {
-        self.message_events.subscribe()
-    }
-
-    /// Remove an agent from social participation.
-    ///
-    /// This aborts the agent's monitor, acknowledges any durable inbox rows
-    /// that are discarded with the member, and unregisters it. Contact edges
-    /// are retained as historical social state; they do not make the removed
-    /// agent addressable again.
-    pub fn remove_agent(&self, id: &AgentId) {
-        self.cancel_agent_timeouts(id);
-        if let Some(handle) = self.monitor_registry.lock().remove(id) {
-            handle.abort();
-        }
-        let messages = self.drain_inbox(id);
-        self.ack_inbox_messages(&messages);
-        self.registry.remove(id);
-    }
-
     /// Mark every registered agent as [`AgentStatus::Stopped`].
     ///
     /// Called at team shutdown: statuses left Idle/Busy would misreport
@@ -619,18 +604,7 @@ impl SocialContext {
         body: impl Into<String>,
         priority: u32,
     ) -> crate::Result<()> {
-        self.apply_relation_event(from, to, crate::relation::RelationEvent::Communication);
-        let message = InboxMessage {
-            journal_id: None,
-            from: from.clone(),
-            to: to.clone(),
-            body: body.into(),
-            message_type: MessageType::Direct,
-            priority,
-            task_id: None,
-            broadcast_id: None,
-        };
-        self.push_message(message)?;
+        self.send_direct_with_message_id(from, to, body, priority, None, None, None)?;
         Ok(())
     }
     /// Send a direct message with optional `task_id` and `broadcast_id`
@@ -650,7 +624,27 @@ impl SocialContext {
         task_id: Option<String>,
         broadcast_id: Option<String>,
     ) -> crate::Result<()> {
+        self.send_direct_with_message_id(from, to, body, priority, task_id, broadcast_id, None)?;
+        Ok(())
+    }
+
+    /// Send a direct message while preserving a caller-provided logical ID.
+    ///
+    /// Studio APIs use this so the ID emitted over WebSocket is the same ID
+    /// later returned by chat history. When no ID is supplied, the social
+    /// context generates one before delivery.
+    pub fn send_direct_with_message_id(
+        &self,
+        from: &AgentId,
+        to: &AgentId,
+        body: impl Into<String>,
+        priority: u32,
+        task_id: Option<String>,
+        broadcast_id: Option<String>,
+        message_id: Option<String>,
+    ) -> crate::Result<String> {
         self.apply_relation_event(from, to, crate::relation::RelationEvent::Communication);
+        let message_id = message_id.unwrap_or_else(generate_message_id);
         let message = InboxMessage {
             journal_id: None,
             from: from.clone(),
@@ -660,9 +654,10 @@ impl SocialContext {
             priority,
             task_id,
             broadcast_id,
+            message_id: Some(message_id.clone()),
         };
         self.push_message(message)?;
-        Ok(())
+        Ok(message_id)
     }
 
     /// Broadcast a message to all agents except the sender.
@@ -676,7 +671,20 @@ impl SocialContext {
     /// Returns the generated `broadcast_id` so callers (e.g. the broadcast
     /// tool) can register a cancellable timeout keyed by it.
     pub fn broadcast(&self, from: &AgentId, body: impl Into<String>) -> crate::Result<String> {
+        Ok(self
+            .broadcast_with_message_id(from, body, None)?
+            .broadcast_id)
+    }
+
+    /// Broadcast with an explicit logical message ID and return both IDs.
+    pub fn broadcast_with_message_id(
+        &self,
+        from: &AgentId,
+        body: impl Into<String>,
+        message_id: Option<String>,
+    ) -> crate::Result<BroadcastMessageIds> {
         let body = body.into();
+        let message_id = message_id.unwrap_or_else(generate_message_id);
         let broadcast_id = uuid::Uuid::now_v7().to_string();
         for info in self.registry.list() {
             if info.id == *from {
@@ -691,10 +699,14 @@ impl SocialContext {
                 priority: crate::inbox::priority::NORMAL,
                 task_id: None,
                 broadcast_id: Some(broadcast_id.clone()),
+                message_id: Some(message_id.clone()),
             };
             self.push_message(message)?;
         }
-        Ok(broadcast_id)
+        Ok(BroadcastMessageIds {
+            message_id,
+            broadcast_id,
+        })
     }
     /// Push a pre-constructed message into the recipient's inbox.
     ///
@@ -705,15 +717,183 @@ impl SocialContext {
     /// `search_contacts`. Timer messages (from "timer"/"self") are skipped —
     /// they are system notifications, not social peers.
     pub fn push_message(&self, message: InboxMessage) -> crate::Result<()> {
+        let mut message = message;
+        if message.message_id.is_none() {
+            message.message_id = Some(generate_message_id());
+        }
         if message.from.as_str() != reserved::TIMER
             && message.from.as_str() != reserved::SELF
             && message.from != message.to
         {
             self.ensure_contact(&message.to, &message.from);
         }
-        let message = self.inboxes.push_for_observer(message)?;
-        let _ = self.message_events.send(message);
+        if matches!(
+            message.message_type,
+            MessageType::Broadcast | MessageType::Direct
+        ) {
+            if let Some(transcript) = &self.chat_history_journal {
+                transcript.append(&message)?;
+            }
+            let mut history = self.chat_history.lock();
+            history.push_back(message.clone());
+            while history.len() > 512 {
+                history.pop_front();
+            }
+        }
+        self.inboxes.push(message)?;
         Ok(())
+    }
+
+    /// Public/group history plus the calling agent's private history.
+    pub fn chat_history(&self, agent_id: &AgentId, limit: usize) -> Vec<InboxMessage> {
+        let history = self.chat_history.lock();
+        history
+            .iter()
+            .rev()
+            .filter(|message| match message.message_type {
+                MessageType::Broadcast => true,
+                MessageType::Direct => message.from == *agent_id || message.to == *agent_id,
+                _ => false,
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// History for the shared group view, including member replies to a group
+    /// broadcast but excluding operator-to-member private conversations.
+    pub fn group_history(&self, limit: usize) -> Vec<InboxMessage> {
+        let history = self.chat_history.lock();
+        let filtered = history
+            .iter()
+            .rev()
+            .filter(|message| match message.message_type {
+                MessageType::Broadcast => true,
+                MessageType::Direct => {
+                    message.broadcast_id.is_some() && message.to.as_str() == reserved::OPERATOR
+                }
+                _ => false,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut seen_group_messages = std::collections::HashSet::new();
+        filtered
+            .into_iter()
+            .filter(|message| {
+                if message.message_type != MessageType::Broadcast {
+                    return true;
+                }
+                let logical_id = message
+                    .message_id
+                    .clone()
+                    .or_else(|| message.broadcast_id.clone());
+                seen_group_messages.insert(logical_id)
+            })
+            .take(limit)
+            .collect()
+    }
+
+    /// History for one operator-to-member private conversation.
+    pub fn private_history(
+        &self,
+        peer_a: &AgentId,
+        peer_b: &AgentId,
+        limit: usize,
+    ) -> Vec<InboxMessage> {
+        let history = self.chat_history.lock();
+        history
+            .iter()
+            .rev()
+            .filter(|message| message.message_type == MessageType::Direct)
+            .filter(|message| message.broadcast_id.is_none())
+            .filter(|message| {
+                (message.from == *peer_a && message.to == *peer_b)
+                    || (message.from == *peer_b && message.to == *peer_a)
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// Durable-aware group history with stable storage sequence.
+    pub fn group_history_entries(
+        &self,
+        limit: usize,
+        before: Option<i64>,
+    ) -> crate::Result<Vec<ChatHistoryEntry>> {
+        if let Some(transcript) = &self.chat_history_journal {
+            return transcript
+                .group_history(limit, before)
+                .map_err(crate::TeamError::from);
+        }
+
+        let history = self.chat_history.lock();
+        let filtered = history
+            .iter()
+            .rev()
+            .filter(|message| match message.message_type {
+                MessageType::Broadcast => true,
+                MessageType::Direct => {
+                    message.broadcast_id.is_some() && message.to.as_str() == reserved::OPERATOR
+                }
+                _ => false,
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut seen_group_messages = std::collections::HashSet::new();
+        Ok(filtered
+            .into_iter()
+            .filter(|message| {
+                if message.message_type != MessageType::Broadcast {
+                    return true;
+                }
+                let logical_id = message
+                    .message_id
+                    .clone()
+                    .or_else(|| message.broadcast_id.clone());
+                seen_group_messages.insert(logical_id)
+            })
+            .take(limit)
+            .map(|message| ChatHistoryEntry {
+                sequence: None,
+                created_at: None,
+                message,
+            })
+            .collect())
+    }
+
+    /// Durable-aware private history with stable storage sequence.
+    pub fn private_history_entries(
+        &self,
+        peer_a: &AgentId,
+        peer_b: &AgentId,
+        limit: usize,
+        before: Option<i64>,
+    ) -> crate::Result<Vec<ChatHistoryEntry>> {
+        if let Some(transcript) = &self.chat_history_journal {
+            return transcript
+                .private_history(peer_a, peer_b, limit, before)
+                .map_err(crate::TeamError::from);
+        }
+
+        let history = self.chat_history.lock();
+        Ok(history
+            .iter()
+            .rev()
+            .filter(|message| message.message_type == MessageType::Direct)
+            .filter(|message| message.broadcast_id.is_none())
+            .filter(|message| {
+                (message.from == *peer_a && message.to == *peer_b)
+                    || (message.from == *peer_b && message.to == *peer_a)
+            })
+            .take(limit)
+            .cloned()
+            .map(|message| ChatHistoryEntry {
+                sequence: None,
+                created_at: None,
+                message,
+            })
+            .collect())
     }
 
     /// Return drained messages to an agent's inbox unchanged.
@@ -912,12 +1092,6 @@ impl SocialContext {
         let cancelled = self.timeouts.cancel_all();
         for (agent, key) in cancelled {
             self.cancel_timer(&agent, &key);
-        }
-    }
-
-    pub(crate) fn cancel_agent_timeouts(&self, agent: &AgentId) {
-        for key in self.timeouts.cancel_for_agent(agent) {
-            self.cancel_timer(agent, &key);
         }
     }
 
@@ -1138,6 +1312,7 @@ mod tests {
         let poisoned = SocialContext {
             registry: Arc::new(AgentRegistry::new()),
             inboxes: Arc::new(InboxStore::new()),
+            chat_history: Arc::new(Mutex::new(VecDeque::new())),
             contacts: Arc::new(ContactStore::new()),
             relations: Arc::new(RelationEngine::new(crate::relation::RelationConfig {
                 initial_strength: 1.5,
@@ -1146,7 +1321,7 @@ mod tests {
             timeouts: Arc::new(TimeoutRegistry::default()),
             timer_journal: None,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
-            message_events: Arc::new(broadcast::channel(256).0),
+            chat_history_journal: None,
             max_contacts: 10,
         };
         let alice = AgentId::new("alice");
@@ -1192,43 +1367,6 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, alice);
         assert_eq!(all[0].expertise, "rust systems programming");
-    }
-
-    #[tokio::test]
-    async fn message_observer_sees_delivered_message() {
-        let ctx = SocialContext::new(10);
-        let alice = AgentId::new("alice");
-        let bob = AgentId::new("bob");
-        ctx.register_agent(alice.clone(), "rust");
-        ctx.register_agent(bob.clone(), "writing");
-        let mut observer = ctx.subscribe_messages();
-
-        ctx.send_direct(&alice, &bob, "peer update", 0).unwrap();
-
-        let message = observer.recv().await.unwrap();
-        assert_eq!(message.from, alice);
-        assert_eq!(message.to, bob);
-        assert_eq!(message.body, "peer update");
-    }
-
-    #[tokio::test]
-    async fn message_observer_receives_journal_id() {
-        let directory = tempfile::tempdir().unwrap();
-        let journal = Arc::new(
-            crate::inbox_journal::InboxJournal::open(directory.path().join("inbox.sqlite3"))
-                .unwrap(),
-        );
-        let ctx = SocialContext::with_journal(10, Some(journal), None).unwrap();
-        let alice = AgentId::new("alice");
-        let bob = AgentId::new("bob");
-        ctx.register_agent(alice.clone(), "rust");
-        ctx.register_agent(bob.clone(), "writing");
-        let mut observer = ctx.subscribe_messages();
-
-        ctx.send_direct(&alice, &bob, "durable update", 0).unwrap();
-
-        let message = observer.recv().await.unwrap();
-        assert!(message.journal_id.is_some());
     }
 
     #[test]
@@ -1282,6 +1420,78 @@ mod tests {
         let carol_msgs = ctx.drain_inbox(&carol);
         assert_eq!(carol_msgs.len(), 1);
         assert_eq!(carol_msgs[0].body, "team announcement");
+    }
+
+    #[test]
+    fn chat_messages_have_stable_logical_ids() {
+        let ctx = SocialContext::new(10);
+        let operator = AgentId::new(reserved::OPERATOR);
+        let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
+        ctx.register_agent(operator.clone(), reserved::OPERATOR);
+        ctx.register_agent(alice.clone(), "analysis");
+        ctx.register_agent(bob.clone(), "review");
+
+        ctx.send_direct_with_message_id(
+            &operator,
+            &alice,
+            "same text",
+            crate::inbox::priority::OPERATOR,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let delivered = ctx.drain_inbox(&alice);
+        assert_eq!(delivered.len(), 1);
+        let delivered_id = delivered[0].message_id.as_deref();
+        let history = ctx.private_history(&operator, &alice, 10);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].message_id.as_deref(), delivered_id.as_deref());
+
+        let broadcast = ctx
+            .broadcast_with_message_id(&operator, "same text", None)
+            .unwrap();
+        let alice_message = ctx.drain_inbox(&AgentId::new("alice")).remove(0);
+        let bob_message = ctx.drain_inbox(&AgentId::new("bob")).remove(0);
+        assert_eq!(alice_message.message_id, bob_message.message_id);
+        assert_eq!(
+            alice_message.broadcast_id.as_deref(),
+            Some(broadcast.broadcast_id.as_str())
+        );
+        assert_eq!(alice_message.message_id, Some(broadcast.message_id));
+
+        ctx.send_direct_with_message_id(
+            &bob,
+            &operator,
+            "same reply",
+            0,
+            None,
+            Some(broadcast.broadcast_id),
+            None,
+        )
+        .unwrap();
+        assert_eq!(ctx.group_history(10).len(), 2);
+    }
+
+    #[test]
+    fn identical_messages_from_different_members_have_distinct_ids() {
+        let ctx = SocialContext::new(10);
+        let operator = AgentId::new(reserved::OPERATOR);
+        let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
+        ctx.register_agent(operator.clone(), "human");
+        ctx.register_agent(alice.clone(), "rust");
+        ctx.register_agent(bob.clone(), "python");
+
+        ctx.send_direct_with_message_id(&alice, &operator, "done", 0, None, None, None)
+            .unwrap();
+        ctx.send_direct_with_message_id(&bob, &operator, "done", 0, None, None, None)
+            .unwrap();
+
+        let alice_message = ctx.private_history(&operator, &alice, 1).remove(0);
+        let bob_message = ctx.private_history(&operator, &bob, 1).remove(0);
+        assert_ne!(alice_message.message_id, bob_message.message_id);
     }
 
     #[test]
@@ -1641,6 +1851,7 @@ mod tests {
                     priority: crate::inbox::priority::TIMEOUT,
                     task_id: Some("task-0".to_string()),
                     broadcast_id: None,
+                    message_id: None,
                 });
                 let _peer = ctx.mark_timeout_fired(&alice, "task-0");
             }
@@ -1718,6 +1929,7 @@ mod tests {
                     priority: crate::inbox::priority::TIMEOUT,
                     task_id: Some("task-0".to_string()),
                     broadcast_id: None,
+                    message_id: None,
                 });
                 let _peer = ctx.mark_timeout_fired(&alice, "task-0");
             }
@@ -2007,6 +2219,7 @@ mod tests {
             priority: crate::inbox::priority::TIMEOUT,
             task_id: Some("task-0".to_string()),
             broadcast_id: None,
+            message_id: None,
         });
 
         // Draining the notification clears the fired mark.
@@ -2042,6 +2255,7 @@ mod tests {
             priority: crate::inbox::priority::SELF_REMINDER,
             task_id: Some("task-0".to_string()),
             broadcast_id: None,
+            message_id: None,
         });
         let msgs = ctx.drain_inbox(&alice);
         assert_eq!(msgs.len(), 1);
@@ -2122,6 +2336,7 @@ mod tests {
             priority: crate::inbox::priority::DELEGATION,
             task_id: Some("task-alice-0".into()),
             broadcast_id: None,
+            message_id: None,
         };
         ctx.push_message(message);
 
@@ -2138,6 +2353,7 @@ mod tests {
             priority: crate::inbox::priority::TIMEOUT,
             task_id: Some("task-alice-0".into()),
             broadcast_id: None,
+            message_id: None,
         };
         ctx.push_message(timer_msg);
         assert!(!ctx.has_contact(&alice, &AgentId::new(reserved::TIMER)));
@@ -2303,6 +2519,7 @@ mod tests {
             priority: crate::inbox::priority::NORMAL,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
 
         // Delivered despite the rejected inbound auto-contact.

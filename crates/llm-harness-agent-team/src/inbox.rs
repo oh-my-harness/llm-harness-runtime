@@ -27,6 +27,27 @@ pub enum MessageType {
     ReflectionTrigger,
 }
 
+/// Server-defined conversation view for a chat message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatView {
+    /// Original message in the shared team group chat.
+    GroupMessage,
+    /// Member reply that belongs in the shared team group chat.
+    GroupReply,
+    /// Operator-to-member private conversation message.
+    DirectMessage,
+}
+
+impl ChatView {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GroupMessage => "group_message",
+            Self::GroupReply => "group_reply",
+            Self::DirectMessage => "direct_message",
+        }
+    }
+}
+
 /// Priority levels for inbox messages. Higher = processed first.
 pub mod priority {
     /// Operator-submitted task (highest — human-initiated).
@@ -58,6 +79,9 @@ pub struct InboxMessage {
     pub message_type: MessageType,
     /// Queue priority; see the `priority` module constants for tiers.
     pub priority: u32,
+    /// Stable logical identity shared by live delivery and chat history.
+    #[serde(default)]
+    pub message_id: Option<String>,
     /// Correlation id for delegation/broadcast timeouts, when applicable.
     pub task_id: Option<String>,
     /// Correlation id shared by all messages of one broadcast, when applicable.
@@ -205,6 +229,14 @@ impl InboxStore {
         for pending in journal.recover()? {
             let mut message = pending.message;
             message.journal_id = Some(pending.id);
+            if message.message_id.is_none() {
+                message.message_id = Some(match (&message.message_type, &message.broadcast_id) {
+                    (MessageType::Broadcast, Some(broadcast_id)) => {
+                        format!("legacy-broadcast-{broadcast_id}")
+                    }
+                    _ => uuid::Uuid::now_v7().to_string(),
+                });
+            }
             store.push_returned(message);
         }
         Ok(store)
@@ -338,6 +370,7 @@ mod tests {
             priority,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         }
     }
 

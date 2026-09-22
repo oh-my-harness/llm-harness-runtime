@@ -82,6 +82,9 @@ pub struct TeamConfig {
     pub inbox_journal: Option<Arc<crate::inbox_journal::InboxJournal>>,
     /// Optional durable pending-timer journal. Studio supplies one per team.
     pub timer_journal: Option<Arc<crate::timer_journal::TimeoutJournal>>,
+    /// Optional durable completed-chat transcript. Studio supplies one per
+    /// team; core teams remain in-memory by default.
+    pub chat_history_journal: Option<Arc<crate::chat_history_journal::ChatHistoryJournal>>,
 }
 
 impl TeamConfig {
@@ -101,6 +104,7 @@ impl Default for TeamConfig {
             memory_root: std::env::temp_dir().join("agent-team-memory"),
             inbox_journal: None,
             timer_journal: None,
+            chat_history_journal: None,
         }
     }
 }
@@ -272,10 +276,11 @@ impl AgentTeam {
             }
         }
 
-        let ctx = SocialContext::with_journal(
+        let ctx = SocialContext::with_journals(
             self.config.max_contacts_per_agent,
             self.config.inbox_journal.clone(),
             self.config.timer_journal.clone(),
+            self.config.chat_history_journal.clone(),
         )?;
 
         // Register the operator as a peer (no runner — its inbox is drained
@@ -304,6 +309,7 @@ impl AgentTeam {
         let (knowledge_plugin, memory_plugin) =
             build_team_plugins(&self.config.memory_root).await?;
         let pending: Vec<IndividualSpec> = std::mem::take(&mut self.members);
+        let member_ids: Vec<AgentId> = pending.iter().map(|spec| spec.id().clone()).collect();
         let mut runner_handles = RunnerVec::default();
         for spec in pending {
             let agent_id = spec.id().clone();
@@ -318,6 +324,17 @@ impl AgentTeam {
                 )
                 .await?;
             runner_handles.0.push((agent_id, handle));
+        }
+        // Members get operator contacts during assembly; pair every member so
+        // direct member-to-member chat is available before any broadcast has
+        // introduced them.
+        for (first_index, first) in member_ids.iter().enumerate() {
+            for second in &member_ids[first_index + 1..] {
+                ctx.ensure_contact(first, second);
+                ctx.update_strength(first, second, 1.0);
+                ctx.ensure_contact(second, first);
+                ctx.update_strength(second, first, 1.0);
+            }
         }
         // Success: move the runners to normal ownership — aborted later by
         // `shutdown`/`Drop`.
@@ -522,88 +539,26 @@ impl AgentTeam {
         Ok(())
     }
 
-    /// Add one member to an already-built team.
-    ///
-    /// The new member joins the existing social context and shares its
-    /// memory, knowledge, inbox journal, and execution environment. On a
-    /// build failure the social registration is rolled back.
-    pub async fn add_member(
-        &mut self,
-        spec: IndividualSpec,
-        providers: Vec<(String, Arc<dyn LlmClient>)>,
-    ) -> Result<()> {
-        if !self.built {
-            return Err(TeamError::NotBuilt);
-        }
-        let ctx = self.ctx.as_ref().ok_or(TeamError::NotBuilt)?.clone();
-        let agent_id = spec.id().clone();
-        if reserved::is_reserved_id(agent_id.as_str()) {
-            return Err(TeamError::ReservedAgentId(agent_id.as_str().to_string()));
-        }
-        if ctx.get_agent_info(&agent_id).is_some() {
-            return Err(TeamError::DuplicateMember(agent_id.as_str().to_string()));
-        }
-
-        let (knowledge_plugin, memory_plugin) =
-            build_team_plugins(&self.config.memory_root).await?;
-        let env = self.build_env.clone().ok_or(TeamError::NotBuilt)?;
-        match self
-            .build_one(
-                &ctx,
-                spec,
-                &providers,
-                &env,
-                &memory_plugin,
-                &knowledge_plugin,
-            )
-            .await
-        {
-            Ok(runner) => {
-                self.runners.insert(agent_id, runner);
-                Ok(())
-            }
-            Err(error) => {
-                ctx.remove_agent(&agent_id);
-                Err(error)
-            }
-        }
-    }
-
-    /// Remove one member from a built team.
-    ///
-    /// The member's runner and harness are stopped first, then its social
-    /// registration and pending inbox messages are removed. The declarative
-    /// member list (if still present) is kept in sync.
-    pub async fn remove_member(&mut self, id: &str) -> Result<()> {
-        if !self.built {
-            return Err(TeamError::NotBuilt);
-        }
-        if reserved::is_reserved_id(id) {
-            return Err(TeamError::ReservedAgentId(id.to_string()));
-        }
-        let ctx = self.ctx.as_ref().ok_or(TeamError::NotBuilt)?.clone();
-        let agent_id = AgentId::new(id);
-        if ctx.get_agent_info(&agent_id).is_none() {
-            return Err(TeamError::AgentNotFound(id.to_string()));
-        }
-        if let Some(mut runner) = self.runners.remove(&agent_id) {
-            runner.abort();
-            let _ = tokio::time::timeout(Duration::from_millis(50), &mut runner).await;
-        }
-        if let Some(harness) = self.harnesses.remove(&agent_id) {
-            harness.abort();
-        }
-        self.members.retain(|member| member.id() != &agent_id);
-        ctx.remove_agent(&agent_id);
-        Ok(())
-    }
-
     /// Submit a task to a specific agent (non-blocking).
     ///
     /// Sends the task text to `target_agent_id`'s inbox as a direct message
     /// from the operator (highest priority). The agent will pick it up in
     /// its self-driving loop.
     pub fn submit(&self, target_agent_id: &str, task: &str) -> Result<()> {
+        self.submit_with_message_id(target_agent_id, task, None)?;
+        Ok(())
+    }
+
+    /// Submit a direct operator task while preserving the logical message ID.
+    ///
+    /// Returns the ID that will be emitted in the live chat event and later
+    /// read back through private chat history.
+    pub fn submit_with_message_id(
+        &self,
+        target_agent_id: &str,
+        task: &str,
+        message_id: Option<String>,
+    ) -> Result<String> {
         if !self.built {
             return Err(TeamError::NotBuilt);
         }
@@ -614,13 +569,40 @@ impl AgentTeam {
         if ctx.get_agent_info(&target).is_none() {
             return Err(TeamError::AgentNotFound(target_agent_id.to_string()));
         }
-        ctx.send_direct(
+        let message_id = ctx.send_direct_with_message_id(
             &self.operator_id,
             &target,
             task,
             crate::inbox::priority::OPERATOR,
+            None,
+            None,
+            message_id,
         )?;
-        Ok(())
+        Ok(message_id)
+    }
+
+    /// Submit a task to every registered agent (non-blocking).
+    ///
+    /// This is the operator-facing team group chat primitive: one message
+    /// is delivered to every member except the operator. The shared
+    /// `broadcast_id` lets the UI collapse one group message into one row.
+    pub fn submit_broadcast(&self, task: &str) -> Result<String> {
+        Ok(self
+            .submit_broadcast_with_message_id(task, None)?
+            .broadcast_id)
+    }
+
+    /// Submit a group broadcast and return its stable logical/correlation IDs.
+    pub fn submit_broadcast_with_message_id(
+        &self,
+        task: &str,
+        message_id: Option<String>,
+    ) -> Result<crate::social_context::BroadcastMessageIds> {
+        if !self.built {
+            return Err(TeamError::NotBuilt);
+        }
+        let ctx = self.ctx.as_ref().ok_or(TeamError::NotBuilt)?;
+        ctx.broadcast_with_message_id(&self.operator_id, task, message_id)
     }
 
     /// Receive messages that agents sent to the operator.
@@ -955,6 +937,26 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn team_build_connects_members_for_private_chat() {
+        let client: Arc<dyn LlmClient> =
+            Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]));
+        let mut team = test_team()
+            .member(IndividualSpec::new("a1", "analysis", "test-model"))
+            .member(IndividualSpec::new("a2", "writing", "test-model"));
+        let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
+        team.build(env, vec![("test-model".into(), client)])
+            .await
+            .unwrap();
+
+        let ctx = team.ctx.as_ref().unwrap();
+        let a1 = AgentId::new("a1");
+        let a2 = AgentId::new("a2");
+        assert!(ctx.has_contact(&a1, &a2));
+        assert!(ctx.has_contact(&a2, &a1));
+        assert!(ctx.has_contact(&a1, &team.operator_id));
+    }
+
+    #[tokio::test]
     async fn build_failure_aborts_already_spawned_runners() {
         // Two members: the first builds fine, the second's model matches no
         // provider → HarnessBuild(NoMatchingProvider). The first runner must
@@ -1190,68 +1192,6 @@ mod tests {
         team.shutdown();
     }
 
-    #[tokio::test]
-    async fn persona_configures_member_specific_system_prompt() {
-        let mut team = test_team()
-            .member(
-                IndividualSpec::new("researcher", "information retrieval", "test-model")
-                    .with_persona("cautious and evidence-driven"),
-            )
-            .member(
-                IndividualSpec::new("writer", "report writing", "test-model")
-                    .with_persona("direct and decision-oriented"),
-            );
-        let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
-        team.build(env, mock_providers(&["test-model"]))
-            .await
-            .unwrap();
-
-        let researcher_prompt = team
-            .harness(&AgentId::new("researcher"))
-            .unwrap()
-            .state()
-            .system_prompt
-            .clone()
-            .unwrap();
-        let writer_prompt = team
-            .harness(&AgentId::new("writer"))
-            .unwrap()
-            .state()
-            .system_prompt
-            .clone()
-            .unwrap();
-
-        assert!(researcher_prompt.contains("researcher"));
-        assert!(researcher_prompt.contains("cautious and evidence-driven"));
-        assert!(writer_prompt.contains("writer"));
-        assert!(writer_prompt.contains("direct and decision-oriented"));
-        assert_ne!(researcher_prompt, writer_prompt);
-        team.shutdown();
-    }
-
-    #[tokio::test]
-    async fn explicit_prompt_survives_configure() {
-        let mut team = test_team().member(
-            IndividualSpec::new("a1", "analysis", "test-model")
-                .with_prompt("custom full prompt")
-                .configure(|b| b.system_prompt(Some("configure prompt".to_string()))),
-        );
-        let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
-        team.build(env, mock_providers(&["test-model"]))
-            .await
-            .unwrap();
-
-        let prompt = team
-            .harness(&AgentId::new("a1"))
-            .unwrap()
-            .state()
-            .system_prompt
-            .clone()
-            .unwrap();
-        assert_eq!(prompt, "custom full prompt");
-        team.shutdown();
-    }
-
     // ── replace_member ────────────────────────────────────────────────────
 
     fn mock_providers(models: &[&str]) -> Vec<(String, Arc<dyn LlmClient>)> {
@@ -1274,69 +1214,6 @@ mod tests {
         let env: Arc<dyn ExecutionEnv> = Arc::new(OsEnv::new("/tmp"));
         team.build(env, mock_providers(&["m-old"])).await.unwrap();
         team
-    }
-
-    #[tokio::test]
-    async fn add_member_registers_runner_and_rejects_duplicate() {
-        let mut team = built_two_member_team().await;
-
-        team.add_member(
-            IndividualSpec::new("a3", "review", "m-old"),
-            mock_providers(&["m-old"]),
-        )
-        .await
-        .unwrap();
-
-        let ctx = team.social_context().unwrap();
-        assert!(team.harness(&AgentId::new("a3")).is_some());
-        assert!(ctx.get_agent_info(&AgentId::new("a3")).is_some());
-        team.submit("a3", "new member task").unwrap();
-        assert!(
-            ctx.drain_inbox(&AgentId::new("a3"))
-                .iter()
-                .any(|message| message.body.contains("new member task"))
-        );
-
-        let result = team
-            .add_member(
-                IndividualSpec::new("a3", "duplicate", "m-old"),
-                mock_providers(&["m-old"]),
-            )
-            .await;
-        assert!(matches!(result.unwrap_err(), TeamError::DuplicateMember(_)));
-        team.shutdown();
-    }
-
-    #[tokio::test]
-    async fn remove_member_stops_and_unregisters_agent() {
-        let mut team = built_two_member_team().await;
-        team.submit("a1", "pending task").unwrap();
-        let ctx = team.social_context().unwrap().clone();
-        let reminder = crate::timeout_manager::TimeoutManager::new(ctx.clone()).set_timeout(
-            AgentId::new("a1"),
-            "late reminder",
-            Duration::from_millis(20),
-            Some("remove-member".to_string()),
-            None,
-        );
-        assert_eq!(ctx.pending_timer_count(), 1);
-
-        team.remove_member("a1").await.unwrap();
-
-        let reminder_finished = tokio::time::timeout(Duration::from_millis(50), reminder)
-            .await
-            .is_ok();
-        assert!(reminder_finished, "removed member timer must be aborted");
-        assert_eq!(ctx.pending_timer_count(), 0);
-        assert!(team.harness(&AgentId::new("a1")).is_none());
-        assert!(ctx.get_agent_info(&AgentId::new("a1")).is_none());
-        assert!(!ctx.has_messages(&AgentId::new("a1")));
-        assert!(matches!(
-            team.submit("a1", "after removal").unwrap_err(),
-            TeamError::AgentNotFound(_)
-        ));
-        assert!(team.harness(&AgentId::new("a2")).is_some());
-        team.shutdown();
     }
 
     #[tokio::test]

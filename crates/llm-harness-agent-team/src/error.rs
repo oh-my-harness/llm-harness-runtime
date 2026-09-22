@@ -45,6 +45,9 @@ pub enum TeamError {
     /// A durable timer journal could not be opened.
     #[error(transparent)]
     TimerJournal(#[from] crate::timer_journal::TimerJournalError),
+    /// A durable chat transcript could not be opened or read.
+    #[error(transparent)]
+    ChatHistoryJournal(#[from] crate::chat_history_journal::ChatHistoryJournalError),
 }
 
 /// Crate-wide result alias with [`TeamError`] as the default error type.

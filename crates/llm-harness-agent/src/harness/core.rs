@@ -606,6 +606,13 @@ impl AgentHarness {
         Ok(self.session.read_active_path().await?)
     }
 
+    /// Delete specific session entries.
+    ///
+    /// This is the runtime-facing counterpart to `Session::delete_entries`.
+    pub async fn delete_entries(&self, ids: Vec<EntryId>) -> Result<(), HarnessError> {
+        Ok(self.session.delete_entries(ids).await?)
+    }
+
     /// Return all session entries (every node in the tree, unordered).
     ///
     /// UI calls this with `/branch list` to reconstruct the full tree

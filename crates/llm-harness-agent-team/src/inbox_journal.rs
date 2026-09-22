@@ -157,6 +157,7 @@ mod tests {
             priority: priority::NORMAL,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         }
     }
 
@@ -179,5 +180,44 @@ mod tests {
         let recovered = journal.recover().unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].message.body, "second");
+    }
+
+    #[test]
+    fn stable_message_id_round_trips_for_restart_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("inbox.sqlite3");
+        let journal = InboxJournal::open(&path).unwrap();
+        let mut sent = message("durable message");
+        sent.message_id = Some("stable-message-id".to_string());
+        let row_id = journal.enqueue(&sent).unwrap();
+
+        let recovered = journal.recover().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, row_id);
+        assert_eq!(
+            recovered[0].message.message_id.as_deref(),
+            Some("stable-message-id")
+        );
+    }
+
+    #[test]
+    fn legacy_broadcast_recipients_recover_one_logical_message_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("inbox.sqlite3");
+        let journal = InboxJournal::open(&path).unwrap();
+        let mut first = message("group message");
+        first.message_type = MessageType::Broadcast;
+        first.broadcast_id = Some("legacy-broadcast".to_string());
+        let mut second = first.clone();
+        second.to = AgentId::new("c");
+        journal.enqueue(&first).unwrap();
+        journal.enqueue(&second).unwrap();
+
+        let recovered = journal.recover().unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(
+            recovered[0].message.message_id,
+            recovered[1].message.message_id
+        );
     }
 }
