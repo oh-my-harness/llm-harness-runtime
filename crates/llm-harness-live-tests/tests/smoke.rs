@@ -76,6 +76,7 @@ async fn openai_provider_smoke() {
         .await
         .expect("prompt should succeed");
 
+    capture.settle().await;
     let texts = capture.texts();
     assert!(!texts.is_empty(), "should have captured text deltas");
     println!("OpenAI response: {}", texts);
@@ -99,6 +100,7 @@ async fn anthropic_provider_smoke() {
         .await
         .expect("prompt should succeed");
 
+    capture.settle().await;
     let texts = capture.texts();
     assert!(!texts.is_empty(), "should have captured text deltas");
     println!("Anthropic response: {}", texts);

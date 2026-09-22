@@ -134,6 +134,11 @@ pub enum WorkflowError {
     #[error("task store error: {0}")]
     StoreError(#[from] anyhow::Error),
 
+    /// The caller stopped waiting for workflow-state persistence. The owned
+    /// save retains its ordering position and may still complete afterward.
+    #[error("workflow state persistence timed out after {timeout_ms} ms")]
+    StoreTimeout { timeout_ms: u64 },
+
     /// env_factory / session_factory create() 失败。
     #[error("factory error: {0}")]
     Factory(#[from] llm_harness_types::AgentError),

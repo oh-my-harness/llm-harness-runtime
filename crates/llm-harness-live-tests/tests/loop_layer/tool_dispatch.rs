@@ -168,6 +168,8 @@ async fn tool_error_propagates_to_llm() {
     )
     .await
     .expect("prompt should succeed");
+    capture.settle().await;
+
     // The LLM should continue after the error (not crash).
     let text = capture.texts();
     assert!(!text.is_empty(), "LLM should produce text after tool error");
