@@ -220,11 +220,25 @@ impl super::WorkflowEngine {
         state.ended_at = None;
 
         // 把改写后的 state 写回 engine 的 workflow_state + persist 落盘。
-        {
-            let mut ws = engine.workflow_state.lock().await;
-            *ws = state.clone();
-        }
-        engine.persist_state(&state).await?;
+        // 持锁期间的入队不允许 await：先取 admission permit + context 快照。
+        // 14C：绝对持久化 deadline 从本操作入口起算。
+        let deadline = tokio::time::Instant::now() + engine.persistence_timeout;
+        let timeout_error = || WorkflowError::StoreTimeout {
+            timeout_ms: engine.persistence_timeout_ms(),
+        };
+        let permit = engine.acquire_persistence_permit(deadline).await?;
+        let context = tokio::time::timeout_at(deadline, async { engine.context_snapshot().await })
+            .await
+            .map_err(|_elapsed| timeout_error())?;
+        let mut ws = tokio::time::timeout_at(deadline, engine.workflow_state.lock())
+            .await
+            .map_err(|_elapsed| timeout_error())?;
+        *ws = state.clone();
+        ws.context = context.clone();
+        state.context = context;
+        let receipt = engine.enqueue_state(state, permit)?;
+        drop(ws);
+        engine.await_persistence(receipt, deadline).await?;
 
         Ok(engine)
     }
@@ -303,6 +317,21 @@ impl super::WorkflowEngine {
             step_tools_cache,
             extra_tools: vec![],
             task_store,
+            persistence_tx: std::sync::Mutex::new(None),
+            persistence_timeout: DEFAULT_PERSISTENCE_TIMEOUT,
+            persistence_permits: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_PERSISTENCE_CAPACITY,
+            )),
+            #[cfg(test)]
+            abort_finalization_gate: None,
+            #[cfg(test)]
+            to_continuation_gate: None,
+            #[cfg(test)]
+            retry_continuation_gate: None,
+            #[cfg(test)]
+            pause_admission_gate: None,
+            #[cfg(test)]
+            fail_task_admission_gate: None,
             task_id,
             workflow_state: Arc::new(Mutex::new(state)),
             context,
@@ -383,6 +412,31 @@ impl super::WorkflowEngine {
         self
     }
 
+    /// Set the maximum time a caller waits for one workflow-state save.
+    /// A timed-out save retains the persistence lane until it actually
+    /// finishes, preventing later snapshots from being overwritten by it.
+    #[must_use]
+    pub fn with_persistence_timeout(mut self, timeout: Duration) -> Self {
+        self.persistence_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum number of workflow-state persistence operations that
+    /// may be active plus queued at once. Capacity 0 is rejected: it would
+    /// deadlock every admission.
+    ///
+    /// # Errors
+    /// Returns [`WorkflowError::Internal`] when `capacity == 0`.
+    pub fn with_persistence_capacity(mut self, capacity: usize) -> Result<Self, WorkflowError> {
+        if capacity == 0 {
+            return Err(WorkflowError::Internal(
+                "persistence capacity must be at least 1".into(),
+            ));
+        }
+        self.persistence_permits = Arc::new(tokio::sync::Semaphore::new(capacity));
+        Ok(self)
+    }
+
     #[must_use]
     pub fn with_max_steps(mut self, max: usize) -> Self {
         self.max_steps = max;
@@ -447,7 +501,23 @@ impl super::WorkflowEngine {
         //    允许 Running → Running：崩溃恢复场景下 status 仍为 Running（已落盘），
         //    重启后需从这里恢复。回退 current_step 到最后一个 completed step。
         let startup_action = {
-            let mut state = self.workflow_state.lock().await;
+            // 持锁期间的入队不允许 await：先取 admission permit + context 快照。
+            // 14C：绝对持久化 deadline 从本次启动落盘操作入口起算，覆盖
+            // admission、context snapshot 与 workflow_state 锁等待，中途不重置。
+            let deadline = tokio::time::Instant::now() + self.persistence_timeout;
+            let timeout_error = || WorkflowError::StoreTimeout {
+                timeout_ms: self.persistence_timeout_ms(),
+            };
+            let permit = self.acquire_persistence_permit(deadline).await?;
+            let context = tokio::time::timeout_at(deadline, async {
+                let ctx = self.context_snapshot().await;
+                Ok::<_, WorkflowError>(ctx)
+            })
+            .await
+            .map_err(|_elapsed| timeout_error())??;
+            let mut state = tokio::time::timeout_at(deadline, self.workflow_state.lock())
+                .await
+                .map_err(|_elapsed| timeout_error())?;
             let mut action = StartupAction::Continue;
             // 将 planned_by（struct 字段）写入 state（若有）。
             if let Some(plan_id) = &self.planned_by {
@@ -508,10 +578,12 @@ impl super::WorkflowEngine {
                     });
                 }
             }
-            // 持锁期间只构造快照，drop 锁后再做文件 I/O。
-            let snapshot = state.clone();
+            // 持锁期间构造快照并入队，drop 锁后再等待持久化完成。
+            let mut snapshot = state.clone();
+            snapshot.context = context;
+            let receipt = self.enqueue_state(snapshot, permit)?;
             drop(state);
-            if let Err(error) = self.persist_state(&snapshot).await {
+            if let Err(error) = self.await_persistence(receipt, deadline).await {
                 if let StartupAction::Fail(reason) = &action {
                     self.restore_pending_terminal_after_persist_error(reason)
                         .await;
@@ -633,7 +705,7 @@ impl super::WorkflowEngine {
             // max_steps 安全阀。
             if history_len >= self.max_steps {
                 return self
-                    .fail_task(format!("max_steps ({}) exceeded", self.max_steps))
+                    .fail_task(format!("max_steps ({}) exceeded", self.max_steps), false)
                     .await;
             }
 
@@ -641,7 +713,7 @@ impl super::WorkflowEngine {
             // a cache hit skips execute() entirely.
             if let Err(error) = self.validate_executor_step(&step) {
                 return self
-                    .fail_task(format!("step '{}' failed: {}", step.id(), error))
+                    .fail_task(format!("step '{}' failed: {}", step.id(), error), false)
                     .await;
             }
 
@@ -705,7 +777,7 @@ impl super::WorkflowEngine {
                         drop(state);
                         // step agent 失败 → task Failed。
                         return self
-                            .fail_task(format!("step '{}' failed: {}", step.id(), e))
+                            .fail_task(format!("step '{}' failed: {}", step.id(), e), false)
                             .await;
                     }
                 },
@@ -739,11 +811,49 @@ impl super::WorkflowEngine {
             // 7. 流程走完？
             match (transition, next_step) {
                 (Transition::Fail { reason }, _) => {
-                    return self.fail_task(reason).await;
+                    return self.fail_task(reason, true).await;
                 }
                 (Transition::Abort { .. }, _) => {
                     // 流程终止（正常结束或 abort）。
-                    let mut state = self.workflow_state.lock().await;
+                    #[cfg(test)]
+                    if let Some(gate) = &self.abort_finalization_gate {
+                        gate.0.notify_one();
+                        gate.1.notified().await;
+                    }
+                    // 持锁期间的入队不允许 await：先取 admission permit + context 快照。
+                    // 14C：绝对持久化 deadline 从本次落盘操作入口起算。
+                    let deadline = tokio::time::Instant::now() + self.persistence_timeout;
+                    let timeout_error = || WorkflowError::StoreTimeout {
+                        timeout_ms: self.persistence_timeout_ms(),
+                    };
+                    let permit = self.acquire_persistence_permit(deadline).await?;
+                    let context = tokio::time::timeout_at(deadline, async {
+                        let ctx = self.context_snapshot().await;
+                        Ok::<_, WorkflowError>(ctx)
+                    })
+                    .await
+                    .map_err(|_elapsed| timeout_error())??;
+                    let mut state = tokio::time::timeout_at(deadline, self.workflow_state.lock())
+                        .await
+                        .map_err(|_elapsed| timeout_error())?;
+                    // The earlier cancel check is only provisional: admission
+                    // and context acquisition above may let cancel establish a
+                    // terminal state before this definitive state lock.
+                    if state.status == WorkflowStatus::Cancelled {
+                        return Ok(state.result.clone().unwrap_or_else(|| TaskResult {
+                            cost: aggregate_cost(&state.step_history),
+                            turns: count_executed_turns(&state.step_history),
+                            final_message: None,
+                        }));
+                    }
+                    if matches!(
+                        state.status,
+                        WorkflowStatus::Succeeded | WorkflowStatus::Failed
+                    ) {
+                        return Err(WorkflowError::InvalidStatus {
+                            status: state.status.clone(),
+                        });
+                    }
                     let cost = aggregate_cost(&state.step_history);
                     let final_message = state
                         .step_history
@@ -758,31 +868,117 @@ impl super::WorkflowEngine {
                     state.status = WorkflowStatus::Succeeded;
                     state.result = Some(result.clone());
                     state.ended_at = Some(chrono::Utc::now());
-                    let snapshot = state.clone();
+                    let mut snapshot = state.clone();
+                    snapshot.context = context;
+                    let receipt = self.enqueue_state(snapshot, permit)?;
                     drop(state);
-                    self.persist_state(&snapshot).await?;
+                    self.await_persistence(receipt, deadline).await?;
                     return Ok(result);
                 }
                 (Transition::To(next), override_next) => {
                     // LoopConfig 续环/退出（apply_transition 返回的 next_step）
                     // 优先于 judge 的原始 next：耗尽时 exit_route 覆盖 judge 路由。
                     let target = override_next.unwrap_or(next);
-                    let mut state = self.workflow_state.lock().await;
+                    // 持锁期间的入队不允许 await：先取 admission permit + context 快照。
+                    // 14C：绝对持久化 deadline 从本次落盘操作入口起算。
+                    let deadline = tokio::time::Instant::now() + self.persistence_timeout;
+                    #[cfg(test)]
+                    if let Some(gate) = &self.to_continuation_gate {
+                        gate.0.notify_one();
+                        gate.1.notified().await;
+                    }
+                    let timeout_error = || WorkflowError::StoreTimeout {
+                        timeout_ms: self.persistence_timeout_ms(),
+                    };
+                    let permit = self.acquire_persistence_permit(deadline).await?;
+                    let context = tokio::time::timeout_at(deadline, async {
+                        let ctx = self.context_snapshot().await;
+                        Ok::<_, WorkflowError>(ctx)
+                    })
+                    .await
+                    .map_err(|_elapsed| timeout_error())??;
+                    let mut state = tokio::time::timeout_at(deadline, self.workflow_state.lock())
+                        .await
+                        .map_err(|_elapsed| timeout_error())?;
+                    // The earlier cancel check is only provisional: admission
+                    // and context acquisition above may let cancel() establish
+                    // a terminal state before this definitive state lock. A
+                    // post-admission continuation must never mutate a
+                    // terminal state (phantom current_step / Paused overwrite).
+                    if state.status == WorkflowStatus::Cancelled {
+                        return Ok(state.result.clone().unwrap_or_else(|| TaskResult {
+                            cost: aggregate_cost(&state.step_history),
+                            turns: count_executed_turns(&state.step_history),
+                            final_message: None,
+                        }));
+                    }
+                    if matches!(
+                        state.status,
+                        WorkflowStatus::Succeeded | WorkflowStatus::Failed
+                    ) {
+                        return Err(WorkflowError::InvalidStatus {
+                            status: state.status.clone(),
+                        });
+                    }
                     state.current_step = target;
-                    let snapshot = state.clone();
+                    let mut snapshot = state.clone();
+                    snapshot.context = context;
+                    let receipt = self.enqueue_state(snapshot, permit)?;
                     drop(state);
-                    self.persist_state(&snapshot).await?;
+                    self.await_persistence(receipt, deadline).await?;
                     self.pause_if_requested().await?;
                 }
                 (Transition::Retry, next) => {
                     // current_step 不变，重跑。LoopConfig 在场时 apply_transition
                     // 可能返回目标 stage（循环跳转/退出路由），需跟随。
                     if let Some(target) = next {
-                        let mut state = self.workflow_state.lock().await;
+                        // 持锁期间的入队不允许 await：先取 admission permit + context 快照。
+                        // 14C：绝对持久化 deadline 从本次落盘操作入口起算。
+                        let deadline = tokio::time::Instant::now() + self.persistence_timeout;
+                        let timeout_error = || WorkflowError::StoreTimeout {
+                            timeout_ms: self.persistence_timeout_ms(),
+                        };
+                        #[cfg(test)]
+                        if let Some(gate) = &self.retry_continuation_gate {
+                            gate.0.notify_one();
+                            gate.1.notified().await;
+                        }
+                        let permit = self.acquire_persistence_permit(deadline).await?;
+                        let context = tokio::time::timeout_at(deadline, async {
+                            let ctx = self.context_snapshot().await;
+                            Ok::<_, WorkflowError>(ctx)
+                        })
+                        .await
+                        .map_err(|_elapsed| timeout_error())??;
+                        let mut state =
+                            tokio::time::timeout_at(deadline, self.workflow_state.lock())
+                                .await
+                                .map_err(|_elapsed| timeout_error())?;
+                        // Same post-admission terminal re-check as the To
+                        // branch: a LoopConfig jump resolved by
+                        // apply_transition must not be written into a state
+                        // that cancel() finalized in the admission window.
+                        if state.status == WorkflowStatus::Cancelled {
+                            return Ok(state.result.clone().unwrap_or_else(|| TaskResult {
+                                cost: aggregate_cost(&state.step_history),
+                                turns: count_executed_turns(&state.step_history),
+                                final_message: None,
+                            }));
+                        }
+                        if matches!(
+                            state.status,
+                            WorkflowStatus::Succeeded | WorkflowStatus::Failed
+                        ) {
+                            return Err(WorkflowError::InvalidStatus {
+                                status: state.status.clone(),
+                            });
+                        }
                         state.current_step = target;
-                        let snapshot = state.clone();
+                        let mut snapshot = state.clone();
+                        snapshot.context = context;
+                        let receipt = self.enqueue_state(snapshot, permit)?;
                         drop(state);
-                        self.persist_state(&snapshot).await?;
+                        self.await_persistence(receipt, deadline).await?;
                     }
                     self.pause_if_requested().await?;
                 }
@@ -805,18 +1001,64 @@ impl super::WorkflowEngine {
         {
             return Ok(());
         }
+        // Test-only gate between the pause flag check and persistence
+        // admission; pins the window where cancel() can win the state lock.
+        #[cfg(test)]
+        if let Some(gate) = &self.pause_admission_gate {
+            gate.0.notify_one();
+            gate.1.notified().await;
+        }
+        // 持锁期间的入队不允许 await：先取 admission permit + context 快照。
+        // 14C：绝对持久化 deadline 从本操作入口起算，覆盖 admission、
+        // context snapshot 与 workflow_state 锁等待，中途不重置。
+        let deadline = tokio::time::Instant::now() + self.persistence_timeout;
+        let timeout_error = || WorkflowError::StoreTimeout {
+            timeout_ms: self.persistence_timeout_ms(),
+        };
+        let permit = self.acquire_persistence_permit(deadline).await?;
+        let context = tokio::time::timeout_at(deadline, async {
+            let ctx = self.context_snapshot().await;
+            Ok::<_, WorkflowError>(ctx)
+        })
+        .await
+        .map_err(|_elapsed| timeout_error())??;
 
         let reason = self
             .pause_reason
             .lock()
             .map(|r| r.clone().unwrap_or_else(|| "pause requested".into()))
             .unwrap_or_else(|_| "pause requested".into());
-        let mut state = self.workflow_state.lock().await;
+        let mut state = tokio::time::timeout_at(deadline, self.workflow_state.lock())
+            .await
+            .map_err(|_elapsed| timeout_error())?;
+        // Post-admission terminal re-check: cancel() may have established a
+        // terminal state while this pause was waiting for admission. A pause
+        // must never overwrite it. Consume the pause trigger (mirroring
+        // resume()'s trigger consumption) and let run_loop's next-iteration
+        // registration guard return the cancelled result.
+        if state.status == WorkflowStatus::Cancelled {
+            self.pause_requested
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(mut r) = self.pause_reason.lock() {
+                *r = None;
+            }
+            return Ok(());
+        }
+        if matches!(
+            state.status,
+            WorkflowStatus::Succeeded | WorkflowStatus::Failed
+        ) {
+            return Err(WorkflowError::InvalidStatus {
+                status: state.status.clone(),
+            });
+        }
         state.status = WorkflowStatus::Paused;
         state.reason = Some(reason.clone());
-        let snapshot = state.clone();
+        let mut snapshot = state.clone();
+        snapshot.context = context;
+        let receipt = self.enqueue_state(snapshot, permit)?;
         drop(state);
-        self.persist_state(&snapshot).await?;
+        self.await_persistence(receipt, deadline).await?;
         self.pause_requested
             .store(false, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut r) = self.pause_reason.lock() {
@@ -868,17 +1110,128 @@ impl super::WorkflowEngine {
 
     /// 统一的 task 失败处理：置 Failed + error + ended_at + persist + 事件 + bail。
     /// 消除 run()/apply_transition 中重复的错误处理模式。
-    async fn fail_task(&self, error_msg: String) -> Result<TaskResult, WorkflowError> {
-        let mut state = self.workflow_state.lock().await;
+    async fn fail_task(
+        &self,
+        error_msg: String,
+        has_fail_record: bool,
+    ) -> Result<TaskResult, WorkflowError> {
+        #[cfg(test)]
+        if let Some(gate) = &self.fail_task_admission_gate {
+            gate.0.notify_one();
+            gate.1.notified().await;
+        }
+        // 持锁期间的入队不允许 await：先取 admission permit + context 快照。
+        // 14C：绝对持久化 deadline 从本操作入口起算，覆盖 admission、
+        // context snapshot 与 workflow_state 锁等待，中途不重置。
+        let deadline = tokio::time::Instant::now() + self.persistence_timeout;
+        let timeout_error = || WorkflowError::StoreTimeout {
+            timeout_ms: self.persistence_timeout_ms(),
+        };
+        let admission = async {
+            let permit = self.acquire_persistence_permit(deadline).await?;
+            let context = tokio::time::timeout_at(deadline, async {
+                let ctx = self.context_snapshot().await;
+                Ok::<_, WorkflowError>(ctx)
+            })
+            .await
+            .map_err(|_elapsed| timeout_error())??;
+            let state = tokio::time::timeout_at(deadline, self.workflow_state.lock())
+                .await
+                .map_err(|_elapsed| timeout_error())?;
+            let acquired: Result<
+                (
+                    WorkflowContext,
+                    tokio::sync::OwnedSemaphorePermit,
+                    tokio::sync::MutexGuard<'_, WorkflowState>,
+                ),
+                WorkflowError,
+            > = Ok((context, permit, state));
+            acquired
+        }
+        .await;
+        let (context, permit, mut state) = match admission {
+            Ok(acquired) => acquired,
+            // 原始失败 E 不允许被 admission/snapshot/锁超时顶掉：本地置
+            // Failed 标记后直接以 TaskFailed 返回，跳过持久化。
+            Err(_degraded) => {
+                return self.mark_failed_without_persist(error_msg).await;
+            }
+        };
+        if state.status == WorkflowStatus::Cancelled {
+            return Ok(state.result.clone().unwrap_or_else(|| TaskResult {
+                cost: aggregate_cost(&state.step_history),
+                turns: count_executed_turns(&state.step_history),
+                final_message: None,
+            }));
+        }
+        if matches!(
+            state.status,
+            WorkflowStatus::Succeeded | WorkflowStatus::Failed
+        ) {
+            return Err(WorkflowError::InvalidStatus {
+                status: state.status.clone(),
+            });
+        }
         state.status = WorkflowStatus::Failed;
         state.error = Some(TaskError::Internal(error_msg.clone()));
         state.ended_at = Some(chrono::Utc::now());
-        let snapshot = state.clone();
+        let mut snapshot = state.clone();
+        snapshot.context = context;
+        let receipt = self.enqueue_state(snapshot, permit)?;
         drop(state);
-        self.persist_state(&snapshot).await?;
+        if let Err(error) = self.await_persistence(receipt, deadline).await {
+            // A timeout does not cancel the queued save: it may still commit
+            // Failed. Keep RAM terminal so a retry cannot enqueue Running
+            // after that commit or re-execute a failed executor.
+            //
+            // A definite backend error permits the existing record-based
+            // recovery for a judge's Fail transition. Non-judge failures have
+            // no Fail record and must remain Failed: their executor may have
+            // performed external work before returning the error.
+            if has_fail_record && matches!(error, WorkflowError::StoreError(_)) {
+                self.restore_pending_terminal_after_persist_error(&error_msg)
+                    .await;
+            }
+            return Err(error);
+        }
         let _ = self.event_tx.send(WorkflowEvent::Failed {
             error: error_msg.clone(),
         });
+        Err(WorkflowError::TaskFailed(error_msg))
+    }
+
+    /// Locally mutate `workflow_state` to the terminal Failed marks without
+    /// enqueueing a save, then surface the original failure reason.
+    ///
+    /// Degraded path for `fail_task` when admission, the context snapshot or
+    /// the state lock times out before any mutation happened: the step-side
+    /// effects behind `error_msg` already occurred, so silently returning
+    /// StoreTimeout would both discard the original failure E and leave RAM
+    /// Running — a same-engine `run()` retry would then re-execute the failed
+    /// step (duplicate LLM/executor side effects). The RAM marks keep the
+    /// failure observable and let the caller converge on `TaskFailed` on
+    /// retry, matching the durable pending-terminal contract of
+    /// `persist_loop_terminal_failure` for a surviving engine.
+    async fn mark_failed_without_persist(
+        &self,
+        error_msg: String,
+    ) -> Result<TaskResult, WorkflowError> {
+        {
+            let mut state = self.workflow_state.lock().await;
+            if matches!(
+                state.status,
+                WorkflowStatus::Succeeded | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+            ) {
+                // 终态不可变：cancel() 或并发完成可能已抢先落终态，
+                // 保留其结果。
+                return Err(WorkflowError::InvalidStatus {
+                    status: state.status.clone(),
+                });
+            }
+            state.status = WorkflowStatus::Failed;
+            state.error = Some(TaskError::Internal(error_msg.clone()));
+            state.ended_at = Some(chrono::Utc::now());
+        }
         Err(WorkflowError::TaskFailed(error_msg))
     }
 
@@ -1078,12 +1431,64 @@ impl super::WorkflowEngine {
         }
     }
 
+    /// Admit one workflow-state persistence operation by acquiring an owned
+    /// permit from the fixed-capacity semaphore. MUST be awaited before
+    /// taking the `workflow_state` lock; `enqueue_state` consumes the permit
+    /// synchronously so no admission wait ever happens under the lock.
+    ///
+    /// `deadline` is the absolute persistence deadline for the whole
+    /// operation: if admission has not completed by then, the wait is
+    /// abandoned with `StoreTimeout`. Semaphore cancellation is atomic, so
+    /// no permit is retained on timeout.
+    async fn acquire_persistence_permit(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, WorkflowError> {
+        match tokio::time::timeout_at(deadline, self.persistence_permits.clone().acquire_owned())
+            .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(WorkflowError::Internal(
+                "workflow-state persistence lane closed".into(),
+            )),
+            Err(_elapsed) => Err(WorkflowError::StoreTimeout {
+                timeout_ms: self.persistence_timeout_ms(),
+            }),
+        }
+    }
+
+    /// Saturating `Duration` → ms conversion for `StoreTimeout` payloads.
+    /// `as_millis()` is `u128`; saturate instead of truncating so absurd
+    /// durations report `u64::MAX` rather than wrapping near zero.
+    fn persistence_timeout_ms(&self) -> u64 {
+        self.persistence_timeout
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
     async fn persist_finalized_executor_state(
         &self,
         step: &Step,
         finalized_result: Option<&StepResult>,
     ) -> Result<(), WorkflowError> {
-        let mut state = self.workflow_state.lock().await;
+        // 持锁期间的入队不允许 await：先取 admission permit + context 快照。
+        // 14C：绝对持久化 deadline 从本操作入口起算，覆盖 admission、
+        // context snapshot 与 workflow_state 锁等待，中途不重置。
+        let deadline = tokio::time::Instant::now() + self.persistence_timeout;
+        let timeout_error = || WorkflowError::StoreTimeout {
+            timeout_ms: self.persistence_timeout_ms(),
+        };
+        let permit = self.acquire_persistence_permit(deadline).await?;
+        let context = tokio::time::timeout_at(deadline, async {
+            let ctx = self.context_snapshot().await;
+            Ok::<_, WorkflowError>(ctx)
+        })
+        .await
+        .map_err(|_elapsed| timeout_error())??;
+        let mut state = tokio::time::timeout_at(deadline, self.workflow_state.lock())
+            .await
+            .map_err(|_elapsed| timeout_error())?;
         if state.status == WorkflowStatus::Cancelled
             && let Some(result) = finalized_result
             && let Some(record) = state
@@ -1095,9 +1500,11 @@ impl super::WorkflowEngine {
             record.result = Some(result.clone());
             record.ended_at = chrono::Utc::now();
         }
-        let snapshot = state.clone();
+        let mut snapshot = state.clone();
+        snapshot.context = context;
+        let receipt = self.enqueue_state(snapshot, permit)?;
         drop(state);
-        self.persist_state(&snapshot).await
+        self.await_persistence(receipt, deadline).await
     }
 
     /// Run a deterministic non-LLM executor step.
@@ -1587,16 +1994,85 @@ impl super::WorkflowEngine {
 
     // ── 生命周期 ───────────────────────────────────────────────────────
 
-    /// 持久化 WorkflowState（若有 task_store）。
-    /// 调用方应在 drop 锁后调用（传入 snapshot），避免持锁 await I/O。
-    pub(super) async fn persist_state(&self, state: &WorkflowState) -> Result<(), WorkflowError> {
-        // 同步共享 context 快照进 state，保证落盘的是最新 context。
-        let mut state = state.clone();
-        state.context = self.context_snapshot().await;
-        if let Some(store) = &self.task_store {
-            store.save_workflow_state(&self.task_id, &state).await?;
+    /// Enqueue one exact workflow-state snapshot without awaiting storage.
+    /// FIFO ownership transfers to the persistence worker before this method
+    /// returns; the receipt tracks completion of this specific request.
+    fn enqueue_state(
+        &self,
+        state: WorkflowState,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<PersistenceReceipt, WorkflowError> {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let Some(store) = self.task_store.clone() else {
+            let _ = completion_tx.send(Ok(()));
+            return Ok(PersistenceReceipt {
+                completion: completion_rx,
+            });
+        };
+        let request = PersistenceRequest {
+            store,
+            task_id: self.task_id.clone(),
+            state,
+            completion: completion_tx,
+            permit,
+        };
+        {
+            let mut sender = self.persistence_tx.lock().map_err(|_| {
+                WorkflowError::Internal("workflow-state persistence lane poisoned".into())
+            })?;
+            if sender.as_ref().is_none_or(|tx| tx.is_closed()) {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PersistenceRequest>();
+                tokio::spawn(async move {
+                    while let Some(request) = rx.recv().await {
+                        let PersistenceRequest {
+                            store,
+                            task_id,
+                            state,
+                            completion,
+                            permit,
+                        } = request;
+                        let result = store.save_workflow_state(&task_id, &state).await;
+                        // Permit held through the backend save; released only
+                        // after it finishes so capacity counts the active save.
+                        drop(permit);
+                        let _ = completion.send(result);
+                    }
+                });
+                *sender = Some(tx);
+            }
+            sender
+                .as_ref()
+                .expect("persistence sender initialized")
+                .send(request)
+                .map_err(|_| {
+                    WorkflowError::Internal("workflow-state persistence lane closed".into())
+                })?;
         }
-        Ok(())
+
+        Ok(PersistenceReceipt {
+            completion: completion_rx,
+        })
+    }
+
+    /// Await one previously enqueued save using the caller's absolute
+    /// persistence deadline. Timing out only abandons the waiter: the
+    /// already-enqueued request stays in the FIFO lane and its permit is
+    /// retained by the worker until the backend save actually finishes.
+    async fn await_persistence(
+        &self,
+        receipt: PersistenceReceipt,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), WorkflowError> {
+        let timeout_error = || WorkflowError::StoreTimeout {
+            timeout_ms: self.persistence_timeout_ms(),
+        };
+        match tokio::time::timeout_at(deadline, receipt.completion).await {
+            Ok(Ok(result)) => result.map_err(WorkflowError::StoreError),
+            Ok(Err(_)) => Err(WorkflowError::Internal(
+                "workflow-state persistence lane stopped".into(),
+            )),
+            Err(_) => Err(timeout_error()),
+        }
     }
 
     async fn restore_pending_terminal_after_persist_error(&self, msg: &str) {
@@ -1619,11 +2095,20 @@ impl super::WorkflowEngine {
     /// the terminal snapshot, retain its Fail transition but return the shared
     /// state to Running so the next run() persists/finalizes it before any
     /// further step execution.
+    ///
+    /// The admission permit is transferred from the caller (acquired before
+    /// `workflow_state` was locked); no permit is awaited while the guard is
+    /// held. The context snapshot and 14C absolute deadline are transferred
+    /// from `apply_transition` together with the permit.
     async fn persist_loop_terminal_failure(
         &self,
         mut state: tokio::sync::MutexGuard<'_, WorkflowState>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        context: WorkflowContext,
+        deadline: tokio::time::Instant,
         msg: String,
     ) -> Result<Option<StepId>, WorkflowError> {
+        // permit 由调用方在取锁前取得并随锁转入；持锁期间不再有 permit await。
         if let Some(record) = state.step_history.last_mut() {
             record.transition = Transition::Fail {
                 reason: msg.clone(),
@@ -1632,9 +2117,11 @@ impl super::WorkflowEngine {
         state.status = WorkflowStatus::Failed;
         state.error = Some(TaskError::Internal(msg.clone()));
         state.ended_at = Some(chrono::Utc::now());
-        let snapshot = state.clone();
+        let mut snapshot = state.clone();
+        snapshot.context = context;
+        let receipt = self.enqueue_state(snapshot, permit)?;
         drop(state);
-        if let Err(error) = self.persist_state(&snapshot).await {
+        if let Err(error) = self.await_persistence(receipt, deadline).await {
             // A process restart still loads the previous durable Running
             // snapshot and replays. A surviving engine retains the terminal
             // record and can retry its persistence without replaying the owner.
@@ -1648,8 +2135,9 @@ impl super::WorkflowEngine {
     /// 声明式循环（LoopConfig）续环判定 — Retry 与 To 两条路径共用。
     ///
     /// 调用前置条件：调用方已确认这是"续环"转换（Retry，或
-    /// To(target_stage)，包括 target 等于当前步）。函数消费
-    /// `workflow_state` 锁，并在持久化前释放，避免持锁 await I/O。
+    /// To(target_stage)，包括 target 等于当前步），并已在取锁前取得
+    /// admission permit（随 `workflow_state` 锁一起转入，本函数不再获取）。函数消费
+    /// `workflow_state` 锁，同步入队快照后释放，再等待持久化完成（不持锁 await I/O）。
     ///
     /// 计数/耗尽语义见 `LoopConfig`（`max_iterations=N` 允许 N 次续环，
     /// 第 N+1 次耗尽）。耗尽时：清零该步计数，跟随 `exit_route` 标签边
@@ -1658,9 +2146,14 @@ impl super::WorkflowEngine {
     async fn step_loop_continuation(
         &self,
         mut state: tokio::sync::MutexGuard<'_, WorkflowState>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        context: WorkflowContext,
         step: &Step,
         loop_cfg: &LoopConfig,
+        deadline: tokio::time::Instant,
     ) -> Result<Option<StepId>, WorkflowError> {
+        // permit/context 由 apply_transition 在取锁前取得并随锁转入；此处不再获取。
+        // 14C：deadline 也由 apply_transition 创建（本持久化操作入口）并传入。
         // 声明式循环计数：持久化在 WorkflowState.loop_iterations，
         // 跨节点跳转（check→Retry→target→To(check)）后仍保留。
         // 语义：max_iterations=N 允许 N 次循环继续（跳转），
@@ -1694,9 +2187,11 @@ impl super::WorkflowEngine {
                     if let Some(record) = state.step_history.last_mut() {
                         record.transition = Transition::To(next.clone());
                     }
-                    let snapshot = state.clone();
+                    let mut snapshot = state.clone();
+                    snapshot.context = context;
+                    let receipt = self.enqueue_state(snapshot, permit)?;
                     drop(state);
-                    self.persist_state(&snapshot).await?;
+                    self.await_persistence(receipt, deadline).await?;
                     return Ok(Some(next));
                 }
                 // exit_route set but no matching edge → explicit failure.
@@ -1707,7 +2202,9 @@ impl super::WorkflowEngine {
                     loop_cfg.max_iterations,
                     label
                 );
-                return self.persist_loop_terminal_failure(state, msg).await;
+                return self
+                    .persist_loop_terminal_failure(state, permit, context, deadline, msg)
+                    .await;
             }
             // exit_route missing: To-based loops have no Retry records, so
             // falling through to max_retries can never bound them. Fail
@@ -1717,7 +2214,9 @@ impl super::WorkflowEngine {
                 step.id(),
                 loop_cfg.max_iterations
             );
-            return self.persist_loop_terminal_failure(state, msg).await;
+            return self
+                .persist_loop_terminal_failure(state, permit, context, deadline, msg)
+                .await;
         }
 
         // Loop continues: jump to target_stage or re-run current.
@@ -1727,15 +2226,19 @@ impl super::WorkflowEngine {
             if let Some(record) = state.step_history.last_mut() {
                 record.transition = Transition::To(target.clone());
             }
-            let snapshot = state.clone();
+            let mut snapshot = state.clone();
+            snapshot.context = context;
+            let receipt = self.enqueue_state(snapshot, permit)?;
             drop(state);
-            self.persist_state(&snapshot).await?;
+            self.await_persistence(receipt, deadline).await?;
             return Ok(Some(target.clone()));
         }
         // target_stage is None or same as current: re-run in place.
-        let snapshot = state.clone();
+        let mut snapshot = state.clone();
+        snapshot.context = context;
+        let receipt = self.enqueue_state(snapshot, permit)?;
         drop(state);
-        self.persist_state(&snapshot).await?;
+        self.await_persistence(receipt, deadline).await?;
         Ok(None)
     }
 
@@ -1748,7 +2251,23 @@ impl super::WorkflowEngine {
         transition: Transition,
         cache_key: Option<serde_json::Value>,
     ) -> Result<Option<StepId>, WorkflowError> {
-        let mut state = self.workflow_state.lock().await;
+        // 持锁期间的入队不允许 await：先取 admission permit + context 快照。
+        // 14C：绝对持久化 deadline 从本操作入口起算，覆盖 admission、context
+        // snapshot 与 workflow_state 锁等待；随 permit/锁转入嵌套 helper。
+        let deadline = tokio::time::Instant::now() + self.persistence_timeout;
+        let timeout_error = || WorkflowError::StoreTimeout {
+            timeout_ms: self.persistence_timeout_ms(),
+        };
+        let permit = self.acquire_persistence_permit(deadline).await?;
+        let context = tokio::time::timeout_at(deadline, async {
+            let ctx = self.context_snapshot().await;
+            Ok::<_, WorkflowError>(ctx)
+        })
+        .await
+        .map_err(|_elapsed| timeout_error())??;
+        let mut state = tokio::time::timeout_at(deadline, self.workflow_state.lock())
+            .await
+            .map_err(|_elapsed| timeout_error())?;
 
         // cancel 守卫：cancel() 已抢先置 Cancelled，不推 record、不覆盖状态。
         if state.status == WorkflowStatus::Cancelled {
@@ -1775,9 +2294,11 @@ impl super::WorkflowEngine {
                     state.status = WorkflowStatus::Failed;
                     state.error = Some(TaskError::Internal(msg.clone()));
                     state.ended_at = Some(now);
-                    let snapshot = state.clone();
+                    let mut snapshot = state.clone();
+                    snapshot.context = context;
+                    let receipt = self.enqueue_state(snapshot, permit)?;
                     drop(state);
-                    self.persist_state(&snapshot).await?;
+                    self.await_persistence(receipt, deadline).await?;
                     return Err(WorkflowError::TaskFailed(msg));
                 }
                 let reachable = self
@@ -1795,9 +2316,11 @@ impl super::WorkflowEngine {
                     state.status = WorkflowStatus::Failed;
                     state.error = Some(TaskError::Internal(msg.clone()));
                     state.ended_at = Some(now);
-                    let snapshot = state.clone();
+                    let mut snapshot = state.clone();
+                    snapshot.context = context;
+                    let receipt = self.enqueue_state(snapshot, permit)?;
                     drop(state);
-                    self.persist_state(&snapshot).await?;
+                    self.await_persistence(receipt, deadline).await?;
                     return Err(WorkflowError::TaskFailed(msg));
                 }
 
@@ -1810,13 +2333,19 @@ impl super::WorkflowEngine {
                         Some(target) if target == &next
                     );
                     if is_loop_continuation {
-                        return self.step_loop_continuation(state, step, loop_cfg).await;
+                        return self
+                            .step_loop_continuation(
+                                state, permit, context, step, loop_cfg, deadline,
+                            )
+                            .await;
                     }
                     state.loop_iterations.remove(step.id());
                 }
-                let snapshot = state.clone();
+                let mut snapshot = state.clone();
+                snapshot.context = context;
+                let receipt = self.enqueue_state(snapshot, permit)?;
                 drop(state);
-                self.persist_state(&snapshot).await?;
+                self.await_persistence(receipt, deadline).await?;
                 Ok(Some(next))
             }
             Transition::Retry => {
@@ -1827,7 +2356,9 @@ impl super::WorkflowEngine {
                     // 续环计数/耗尽/退出共用判定（To 路径亦走此函数）。
                     // 注意：exit_route 缺失或无法解析时显式失败（原 fall-through
                     // 到 max_retries 只对纯 Retry 循环有界；两者现已合一）。
-                    return self.step_loop_continuation(state, step, loop_cfg).await;
+                    return self
+                        .step_loop_continuation(state, permit, context, step, loop_cfg, deadline)
+                        .await;
                 }
 
                 // max_retries 安全阀。统计当前步连续 Retry 次数。
@@ -1851,14 +2382,18 @@ impl super::WorkflowEngine {
                     state.status = WorkflowStatus::Failed;
                     state.error = Some(TaskError::Internal(msg.clone()));
                     state.ended_at = Some(now);
-                    let snapshot = state.clone();
+                    let mut snapshot = state.clone();
+                    snapshot.context = context;
+                    let receipt = self.enqueue_state(snapshot, permit)?;
                     drop(state);
-                    self.persist_state(&snapshot).await?;
+                    self.await_persistence(receipt, deadline).await?;
                     return Err(WorkflowError::TaskFailed(msg));
                 }
-                let snapshot = state.clone();
+                let mut snapshot = state.clone();
+                snapshot.context = context;
+                let receipt = self.enqueue_state(snapshot, permit)?;
                 drop(state);
-                self.persist_state(&snapshot).await?;
+                self.await_persistence(receipt, deadline).await?;
                 Ok(None)
             }
             Transition::Fail { .. } => {
@@ -1866,17 +2401,21 @@ impl super::WorkflowEngine {
                 Ok(None)
             }
             Transition::Abort { .. } => {
-                let snapshot = state.clone();
+                let mut snapshot = state.clone();
+                snapshot.context = context;
+                let receipt = self.enqueue_state(snapshot, permit)?;
                 drop(state);
-                self.persist_state(&snapshot).await?;
+                self.await_persistence(receipt, deadline).await?;
                 Ok(None)
             }
             Transition::Pause { reason } => {
                 state.status = WorkflowStatus::Paused;
                 state.reason = Some(reason.clone());
-                let snapshot = state.clone();
+                let mut snapshot = state.clone();
+                snapshot.context = context;
+                let receipt = self.enqueue_state(snapshot, permit)?;
                 drop(state);
-                self.persist_state(&snapshot).await?;
+                self.await_persistence(receipt, deadline).await?;
                 Ok(None)
             }
         }
@@ -1914,11 +2453,6 @@ impl super::WorkflowEngine {
 
     /// Prepare a paused or failed task for continuation.
     ///
-    /// Accepts `Paused` (operator-initiated pause) and `Failed` (transient error
-    /// such as LLM 403 / network blip). Resets to `Paused` so that `run()` —
-    /// which owns the `Paused -> Running` transition — can drive execution
-    /// from `current_step`.
-    ///
     /// `Succeeded` and `Cancelled` are terminal and cannot be resumed.
     ///
     /// **Side-effect policy**: Runtime only resets the state machine; it does
@@ -1927,7 +2461,23 @@ impl super::WorkflowEngine {
     /// resumed `Failed` step will be re-driven by `run_loop`, and the executor
     /// decides to skip/recompute based on its own domain markers.
     pub async fn resume(&self) -> Result<(), WorkflowError> {
-        let mut state = self.workflow_state.lock().await;
+        // 持锁期间的入队不允许 await：先取 admission permit + context 快照。
+        // 14C：绝对持久化 deadline 从本操作入口起算，覆盖 admission、
+        // context snapshot 与 workflow_state 锁等待，中途不重置。
+        let deadline = tokio::time::Instant::now() + self.persistence_timeout;
+        let timeout_error = || WorkflowError::StoreTimeout {
+            timeout_ms: self.persistence_timeout_ms(),
+        };
+        let permit = self.acquire_persistence_permit(deadline).await?;
+        let context = tokio::time::timeout_at(deadline, async {
+            let ctx = self.context_snapshot().await;
+            Ok::<_, WorkflowError>(ctx)
+        })
+        .await
+        .map_err(|_elapsed| timeout_error())??;
+        let mut state = tokio::time::timeout_at(deadline, self.workflow_state.lock())
+            .await
+            .map_err(|_elapsed| timeout_error())?;
         match state.status {
             WorkflowStatus::Paused => {}
             WorkflowStatus::Failed => {
@@ -1942,15 +2492,21 @@ impl super::WorkflowEngine {
                 return Err(WorkflowError::InvalidStatus { status: s.clone() });
             }
         }
+        // The pause request has already materialized as Paused. Once resume
+        // has admission and validates that state, consume the pending trigger
+        // before enqueueing the resume snapshot so a failed/timed-out save
+        // cannot leave RAM armed to pause again at the next boundary.
         self.pause_requested
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut r) = self.pause_reason.lock() {
-            *r = None;
+        if let Ok(mut reason) = self.pause_reason.lock() {
+            *reason = None;
         }
         state.reason = None;
-        let snapshot = state.clone();
+        let mut snapshot = state.clone();
+        snapshot.context = context;
+        let receipt = self.enqueue_state(snapshot, permit)?;
         drop(state);
-        self.persist_state(&snapshot).await?;
+        self.await_persistence(receipt, deadline).await?;
         let _ = self.event_tx.send(WorkflowEvent::Resumed);
         Ok(())
     }
@@ -1974,14 +2530,48 @@ impl super::WorkflowEngine {
     /// 完成 → cancel 看到终态直接返回，不会把真实结果改写成 Cancelled。
     /// Idle / Paused / Running 的取消行为不变。
     pub async fn cancel(&self, reason: &str) -> Result<(), WorkflowError> {
+        // 14C：绝对持久化 deadline 从本操作入口起算，覆盖 admission、
+        // context/context snapshot、workflow_state 锁等待与完成等待，
+        // 中途不重置。
+        let deadline = tokio::time::Instant::now() + self.persistence_timeout;
+        let timeout_error = || WorkflowError::StoreTimeout {
+            timeout_ms: self.persistence_timeout_ms(),
+        };
+        let is_terminal = |status: &WorkflowStatus| {
+            matches!(
+                status,
+                WorkflowStatus::Succeeded | WorkflowStatus::Failed | WorkflowStatus::Cancelled
+            )
+        };
+
+        // Read-only terminal fast path: terminal cancellation is an idempotent
+        // no-op and must not depend on persistence admission. A nonterminal
+        // observation is only provisional because the state may become
+        // terminal while this guard is released for admission.
+        {
+            let state = tokio::time::timeout_at(deadline, self.workflow_state.lock())
+                .await
+                .map_err(|_elapsed| timeout_error())?;
+            if is_terminal(&state.status) {
+                return Ok(());
+            }
+        }
+
+        // 持锁期间的入队不允许 await：先取 admission permit + context 快照。
+        let permit = self.acquire_persistence_permit(deadline).await?;
+        let context = tokio::time::timeout_at(deadline, async {
+            let ctx = self.context_snapshot().await;
+            Ok::<_, WorkflowError>(ctx)
+        })
+        .await
+        .map_err(|_elapsed| timeout_error())??;
         // 与 run_loop 注册 step token 使用同一锁顺序并保持两个 guard，确保
         // "注册 token" 与 "置 Cancelled" 之间不存在丢失取消信号的窗口。
         let mut current_abort = self.current_abort.lock().await;
-        let mut state = self.workflow_state.lock().await;
-        if matches!(
-            state.status,
-            WorkflowStatus::Succeeded | WorkflowStatus::Failed | WorkflowStatus::Cancelled
-        ) {
+        let mut state = tokio::time::timeout_at(deadline, self.workflow_state.lock())
+            .await
+            .map_err(|_elapsed| timeout_error())?;
+        if is_terminal(&state.status) {
             // 终态不可变：run()/resume() 都拒绝从终态重启（run() 对终态返回
             // InvalidStatus，resume() 拒绝 Cancelled），因此这里不能丢掉已
             // 落盘的真实结果。迟到的 cancel（例如外部调用方的超时计时器在
@@ -2014,10 +2604,12 @@ impl super::WorkflowEngine {
         state.status = WorkflowStatus::Cancelled;
         state.reason = Some(reason.to_string());
         state.ended_at = Some(now);
-        let snapshot = state.clone();
+        let mut snapshot = state.clone();
+        snapshot.context = context;
+        let receipt = self.enqueue_state(snapshot, permit)?;
         drop(state);
         drop(current_abort);
-        self.persist_state(&snapshot).await?;
+        self.await_persistence(receipt, deadline).await?;
         let _ = self.event_tx.send(WorkflowEvent::Cancelled {
             reason: reason.to_string(),
         });
@@ -2057,5 +2649,131 @@ impl super::WorkflowEngine {
     /// 取 context 快照（用于持久化）。
     async fn context_snapshot(&self) -> WorkflowContext {
         self.context.lock().await.clone()
+    }
+}
+
+#[cfg(test)]
+mod loop_context_regression {
+    use super::*;
+    use crate::lifecycle::task_store::{JsonlTaskStore, TaskStore};
+    use crate::workflow::engine::WorkflowEngineConfig;
+    use crate::workflow::judge::NoopJudge;
+    use crate::workflow::model::StepExecutionPolicy;
+    use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
+    use llm_harness_platform::env::EnvFactory;
+    use llm_harness_subagents::spawner::JsonlSessionFactory;
+    use llm_harness_types::{AgentError, ExecutionEnv};
+
+    struct TestEnvFactory;
+
+    impl EnvFactory for TestEnvFactory {
+        fn create(
+            &self,
+            _cwd: &std::path::Path,
+        ) -> std::result::Result<Arc<dyn ExecutionEnv>, AgentError> {
+            Ok(Arc::new(llm_harness_loop::test_utils::NoOpEnv))
+        }
+    }
+
+    /// Regression: `apply_transition` owns one context snapshot for its whole
+    /// persistence operation. Once that capture succeeds, LoopConfig
+    /// continuation must neither reacquire `context` nor replace the snapshot
+    /// after mutating `workflow_state`.
+    ///
+    /// Polling the future once while `workflow_state` is held deterministically
+    /// advances it through permit admission and the first context capture,
+    /// then parks it on the state lock. We can therefore change and hold
+    /// `context` before releasing the state lock: the old helper blocks on its
+    /// redundant second capture, while the correct implementation completes
+    /// and persists the value captured by `apply_transition`.
+    #[tokio::test]
+    async fn loop_continuation_reuses_apply_transition_context_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+        let loop_owner =
+            Step::llm("check", "Check", "check", vec![]).with_policy(StepExecutionPolicy {
+                timeout_ms: None,
+                max_attempts: None,
+                retry_backoff_ms: None,
+                cache: None,
+                r#loop: Some(LoopConfig {
+                    max_iterations: 2,
+                    target_stage: Some("check".into()),
+                    exit_route: None,
+                }),
+            });
+        let engine = WorkflowEngine::new(
+            Workflow {
+                entry_step: "check".into(),
+                steps: vec![loop_owner.clone()],
+                edges: vec![],
+            },
+            WorkflowEngineConfig {
+                client: Arc::new(MockLlmClient::new(vec![MockResponse::text("unused")])),
+                model: "mock-model".into(),
+                env_factory: Arc::new(TestEnvFactory),
+                session_factory: Arc::new(JsonlSessionFactory),
+                session_base_dir: dir.path().join("sessions"),
+                customize_builder: None,
+            },
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_task_store(store.clone());
+
+        engine
+            .context
+            .lock()
+            .await
+            .variables
+            .insert("version".into(), serde_json::json!("captured"));
+
+        let state_guard = engine.workflow_state.lock().await;
+        let transition = engine.apply_transition(
+            &loop_owner,
+            StepResult {
+                output: "loop result".into(),
+                structured: None,
+                structured_status: StructuredStatus::NotRequired,
+                tool_calls_count: 0,
+                session_id: "loop-session".into(),
+                cost: CostAggregate::default(),
+                started_at: Some(chrono::Utc::now()),
+                ended_at: Some(chrono::Utc::now()),
+            },
+            Transition::Retry,
+            None,
+        );
+        tokio::pin!(transition);
+        assert!(matches!(
+            futures::poll!(transition.as_mut()),
+            std::task::Poll::Pending
+        ));
+
+        let mut context_guard = engine.context.lock().await;
+        context_guard
+            .variables
+            .insert("version".into(), serde_json::json!("changed later"));
+        drop(state_guard);
+
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), transition.as_mut())
+            .await
+            .expect("LoopConfig continuation must not reacquire the held context lock")
+            .unwrap();
+        assert_eq!(next, None);
+
+        let persisted = store
+            .load_workflow_state(&engine.task_id)
+            .await
+            .unwrap()
+            .expect("LoopConfig continuation must persist its state");
+        assert_eq!(persisted.loop_iterations.get("check"), Some(&1));
+        assert_eq!(persisted.step_history.len(), 1);
+        assert_eq!(
+            persisted.context.variables.get("version"),
+            Some(&serde_json::json!("captured")),
+            "the persisted snapshot must use apply_transition's original context capture"
+        );
+        drop(context_guard);
     }
 }

@@ -52,6 +52,20 @@ impl Plugin for NoopPlugin {
 }
 use prompt_context::{format_context_vars, format_step_history_summary};
 
+struct PersistenceRequest {
+    store: Arc<dyn TaskStore>,
+    task_id: TaskId,
+    state: WorkflowState,
+    completion: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    /// Bounded admission for this persistence operation. Held by the worker
+    /// until the backend save finishes, then released.
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+struct PersistenceReceipt {
+    completion: tokio::sync::oneshot::Receiver<anyhow::Result<()>>,
+}
+
 #[cfg(test)]
 use runner::aggregate_cost;
 
@@ -68,6 +82,16 @@ const DEFAULT_MAX_STEPS: usize = 500;
 /// = max_retries × max_attempts（judge Retry 触发完整 policy retry 循环）。
 /// max_steps 是最终兜底。如需更严格的联合上限，在业务层自行限制。
 const DEFAULT_MAX_RETRIES: usize = 5;
+
+/// Maximum time one engine call waits for a workflow-state persistence
+/// operation. The owned operation keeps its ordering position after this
+/// deadline so a late older save cannot overtake a newer snapshot.
+const DEFAULT_PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Fixed number of workflow-state persistence operations that may be active
+/// plus queued at once (one permit per request, held until the backend save
+/// finishes). Bounds the full WorkflowState snapshots the lane retains.
+const DEFAULT_PERSISTENCE_CAPACITY: usize = 2;
 
 fn default_declarative_judge(
     workflow: &Workflow,
@@ -114,6 +138,35 @@ pub struct WorkflowEngine {
     /// 额外 tool（对 new/new_free_task 路径）。run() 内部构造每步 harness 时注册。
     extra_tools: Vec<Arc<dyn Tool>>,
     task_store: Option<Arc<dyn TaskStore>>,
+    /// FIFO lane for workflow-state commits. Requests stay owned by the lane
+    /// after a caller timeout, so older saves cannot finish after newer ones.
+    persistence_tx:
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<PersistenceRequest>>>,
+    /// Maximum caller wait for persistence; the owned save may finish later.
+    persistence_timeout: Duration,
+    /// Fixed-capacity admission for workflow-state persistence. One permit
+    /// travels with each PersistenceRequest; the worker holds it until the
+    /// backend save finishes, so capacity bounds active + queued saves and
+    /// the retained full WorkflowState snapshots they carry.
+    persistence_permits: Arc<tokio::sync::Semaphore>,
+    /// Test-only gate after the run loop's provisional cancellation check.
+    #[cfg(test)]
+    abort_finalization_gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+    /// Test-only gate inside run_loop's To continuation branch, after the
+    /// provisional cancellation check and before persistence admission.
+    #[cfg(test)]
+    to_continuation_gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+    /// Test-only gate inside run_loop's Retry-with-target continuation branch
+    /// (LoopConfig jump), before persistence admission.
+    #[cfg(test)]
+    retry_continuation_gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+    /// Test-only gate inside pause_if_requested, after the pause flag check
+    /// and before persistence admission.
+    #[cfg(test)]
+    pause_admission_gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+    /// Test-only gate before fail_task persistence admission.
+    #[cfg(test)]
+    fail_task_admission_gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
     /// task 标识。由引擎内部生成（uuid）。
     task_id: TaskId,
     /// workflow 状态（步骤推进 + 生命周期状态，统一表达）。

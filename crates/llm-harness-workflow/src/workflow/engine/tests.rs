@@ -1419,6 +1419,94 @@ async fn resume_then_run_does_not_enter_crash_recovery() {
     assert_eq!(result.final_message.as_deref(), Some("step2 done"));
 }
 
+/// A failed Paused-state save leaves the already-materialized pause request
+/// armed because `pause_if_requested` clears it only after persistence. A
+/// valid `resume` must consume that stale request even if its own persistence
+/// attempt fails, so a successful retry can cross the next ordinary step
+/// boundary without immediately pausing again.
+#[tokio::test]
+async fn resume_consumes_stale_pause_request_after_pause_persist_failure() {
+    struct ThreeStepJudge;
+
+    impl StepTransitionJudge for ThreeStepJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let current = ctx.current_step.id().clone();
+            Box::pin(async move {
+                match current.as_str() {
+                    "s1" => Transition::To("s2".into()),
+                    "s2" => Transition::To("s3".into()),
+                    _ => Transition::Abort {
+                        reason: "done".into(),
+                    },
+                }
+            })
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(CrashBeforeStateSaveStore {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        should_crash: Arc::new(|state: &WorkflowState| state.status == WorkflowStatus::Paused),
+        // Reject both the initial pause snapshot and the first resume snapshot.
+        crashes_remaining: AtomicUsize::new(2),
+    });
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("step1 done"),
+        MockResponse::text("step2 done"),
+        MockResponse::text("step3 done"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "s1".into(),
+        steps: vec![
+            Step::llm("s1", "Step 1", "do step 1", vec![]),
+            Step::llm("s2", "Step 2", "do step 2", vec![]),
+            Step::llm("s3", "Step 3", "do step 3", vec![]),
+        ],
+        edges: vec![
+            Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            },
+            Edge {
+                from: "s2".into(),
+                to: "s3".into(),
+                condition: None,
+            },
+        ],
+    };
+    let engine = WorkflowEngine::new(
+        workflow,
+        engine_config(dir.path(), client.clone()),
+        Arc::new(ThreeStepJudge),
+    )
+    .unwrap()
+    .with_task_store(store);
+
+    engine.pause("operator checkpoint").unwrap();
+    assert!(matches!(
+        engine.run().await,
+        Err(WorkflowError::StoreError(_))
+    ));
+    assert_eq!(engine.state().await, WorkflowStatus::Paused);
+    assert_eq!(engine.current_step().await, "s2");
+
+    assert!(matches!(
+        engine.resume().await,
+        Err(WorkflowError::StoreError(_))
+    ));
+    assert_eq!(engine.state().await, WorkflowStatus::Paused);
+    engine.resume().await.unwrap();
+    let result = engine
+        .run()
+        .await
+        .expect("resumed workflow must cross the next pause boundary");
+
+    assert_eq!(engine.state().await, WorkflowStatus::Succeeded);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 3);
+    assert_eq!(result.final_message.as_deref(), Some("step3 done"));
+}
+
 /// #36: a task that enters `Failed` due to a transient error (e.g. LLM 403)
 /// can be resumed via `resume()` (Failed → Paused) and then `run()` picks it
 /// up from `current_step`, retrying the failed step.
@@ -1489,6 +1577,136 @@ async fn succeeded_task_cannot_be_resumed() {
 
     let err = engine.resume().await.unwrap_err();
     assert!(matches!(err, WorkflowError::InvalidStatus { .. }));
+}
+
+/// Dedicated terminality regression for `resume()`: a Cancelled workflow
+/// must be rejected before any mutation or persistence. The prior coverage
+/// (one `is_err()` inside the pause-admission race test) could not catch a
+/// refactor that persists a resurrection snapshot (Paused/Running) ahead of
+/// the terminal validation. This test pins the full contract on the real
+/// public path: real `run()` parked in an executor, real `cancel()`, real
+/// `resume()`.
+#[tokio::test]
+async fn resume_after_cancelled_is_rejected_without_resurrection() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // LoopCounterRecorder delegates to a real JsonlTaskStore and records one
+    // entry per completed save_workflow_state call, so its snapshot-vector
+    // length doubles as the save count the no-resurrection check needs.
+    let recorder = LoopCounterRecorder {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        gate_step: "exec",
+        snapshots: Arc::new(parking_lot::Mutex::new(Vec::new())),
+    };
+    let store: Arc<dyn TaskStore> = Arc::new(recorder.clone());
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            Workflow {
+                entry_step: "exec".into(),
+                steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+                edges: vec![],
+            },
+            engine_config(dir.path(), Arc::new(MockLlmClient::new(vec![]))),
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_task_store(store.clone())
+        .with_executor("blocking", Arc::new(BlockingExecutor)),
+    );
+    let task_id = engine.task_id().clone();
+
+    // Establish Cancelled through the real production path: run() parks
+    // inside the blocking executor, cancel() aborts it and durably commits
+    // the terminal snapshot. Polling for Running (no sleeps) makes the
+    // interleaving deterministic: cancel always lands mid-step.
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while engine.state().await != WorkflowStatus::Running {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("run should enter the blocking executor");
+    engine.cancel("terminal before resume").await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), runner)
+        .await
+        .expect("cancel must stop the parked executor")
+        .unwrap()
+        .unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(result.turns, 0);
+
+    // Snapshot every observable terminal field before touching resume().
+    let (ram_reason_before, ram_ended_at_before) = {
+        let state = engine.workflow_state.lock().await;
+        (state.reason.clone(), state.ended_at)
+    };
+    let current_step_before = engine.current_step().await;
+    let history_ids_before: Vec<String> = engine
+        .step_history()
+        .await
+        .into_iter()
+        .map(|record| record.step_id)
+        .collect();
+    let durable_before = store
+        .load_workflow_state(&task_id)
+        .await
+        .unwrap()
+        .expect("cancel must have persisted the Cancelled snapshot");
+    assert_eq!(durable_before.status, WorkflowStatus::Cancelled);
+    let saves_before = recorder.snapshots.lock().len();
+    assert!(
+        saves_before > 0,
+        "cancel must have completed at least one state save"
+    );
+
+    let err = engine.resume().await.unwrap_err();
+    assert!(
+        matches!(err, WorkflowError::InvalidStatus { ref status } if *status == WorkflowStatus::Cancelled),
+        "resume() must reject a Cancelled workflow with InvalidStatus, got {err:?}"
+    );
+
+    // RAM stays terminally Cancelled, field-for-field.
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(engine.current_step().await, current_step_before);
+    assert_eq!(
+        engine
+            .step_history()
+            .await
+            .into_iter()
+            .map(|record| record.step_id)
+            .collect::<Vec<_>>(),
+        history_ids_before
+    );
+    let (ram_reason_after, ram_ended_at_after) = {
+        let state = engine.workflow_state.lock().await;
+        (state.reason.clone(), state.ended_at)
+    };
+    assert_eq!(ram_reason_after, ram_reason_before);
+    assert_eq!(ram_ended_at_after, ram_ended_at_before);
+
+    // Durable state stays terminally Cancelled, field-for-field.
+    let durable_after = store
+        .load_workflow_state(&task_id)
+        .await
+        .unwrap()
+        .expect("cancelled snapshot must still be loadable after resume()");
+    assert_eq!(durable_after.status, WorkflowStatus::Cancelled);
+    assert_eq!(durable_after.current_step, current_step_before);
+    assert_eq!(durable_after.reason, ram_reason_before);
+    assert_eq!(durable_after.ended_at, ram_ended_at_before);
+    assert_eq!(durable_after.step_history.len(), history_ids_before.len());
+
+    // No snapshot was persisted after the Cancelled one: the recorder sees
+    // every completed save_workflow_state, so an unchanged count proves
+    // resume() enqueued nothing — not even an identical-content rewrite.
+    let saves_after = recorder.snapshots.lock().len();
+    assert_eq!(
+        saves_after, saves_before,
+        "resume() must not persist any workflow-state snapshot after the Cancelled snapshot"
+    );
 }
 
 /// #36: restore() a persisted Failed task, then resume() + run() recovers.
@@ -1945,6 +2163,1011 @@ async fn cancel_llm_step_discards_partial_result() {
     assert!(matches!(history[0].transition, Transition::Abort { .. }));
 }
 
+/// Regression for the persistence-ordering guarantee around cancel().
+///
+/// The startup run() save and cancel()'s Cancelled save share one FIFO
+/// persistence lane. A Running snapshot enqueued before cancel() (here: the
+/// real startup Idle → Running save, held in-flight inside the store) must
+/// commit before cancel()'s save, so the durable store never regresses from
+/// Cancelled to Running and `restore` cannot resurrect a cancelled workflow.
+///
+/// Deterministic construction (no timing): ReorderingStateStore blocks the
+/// startup Running save inside the store (blocked_started). cancel() then
+/// queues behind it in the lane — poll! observes Pending. After release, the
+/// Running save commits first, then the Cancelled save; durable state and
+/// restore both end at Cancelled.
+#[tokio::test]
+async fn cancel_during_pre_enqueue_running_snapshot_cannot_resurrect_running() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(ReorderingStateStore {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        durable_state: parking_lot::Mutex::new(None),
+        should_block: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Running && state.step_history.is_empty()
+        }),
+        block_available: AtomicBool::new(true),
+        blocked_started: Notify::new(),
+        release_blocked: Notify::new(),
+        blocked_finished: Notify::new(),
+        search_committed: Notify::new(),
+        save_count: AtomicUsize::new(0),
+    });
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+        edges: vec![],
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            engine_config(dir.path(), client),
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_task_store(store.clone())
+        .with_executor("blocking", Arc::new(BlockingExecutor)),
+    );
+    let task_id = engine.task_id().clone();
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+
+    // The real startup Idle → Running save is now in-flight inside the store.
+    store.blocked_started.notified().await;
+
+    // cancel() must queue its Cancelled save behind the retained Running save.
+    let cancel = engine.cancel("stop during persistence");
+    tokio::pin!(cancel);
+    let cancel_ready = match futures::poll!(&mut cancel) {
+        std::task::Poll::Ready(result) => {
+            result.unwrap();
+            true
+        }
+        std::task::Poll::Pending => false,
+    };
+    store.release_blocked.notify_one();
+    if !cancel_ready {
+        cancel.await.unwrap();
+    }
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), runner)
+        .await
+        .expect("cancelled run must finish")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.turns, 0);
+
+    let durable = store
+        .load_workflow_state(&task_id)
+        .await
+        .unwrap()
+        .expect("durable state must exist");
+    assert_eq!(
+        durable.status,
+        WorkflowStatus::Cancelled,
+        "in-flight Running save must commit before cancel's Cancelled save"
+    );
+
+    let restored = WorkflowEngine::restore(
+        store,
+        task_id,
+        engine_config(dir.path(), Arc::new(MockLlmClient::new(vec![]))),
+        Arc::new(NoopJudge),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restored.state().await,
+        WorkflowStatus::Cancelled,
+        "restore must not resurrect a cancelled workflow as Running"
+    );
+}
+
+/// cancel() admission-exhaustion regression: with `with_persistence_capacity(1)`
+/// the ONLY permit is occupied by the in-flight startup Idle→Running save.
+/// Interleaving: run() parks in `await_persistence` while the worker holds the
+/// permit inside `ReorderingStateStore`; cancel() observes Running in its
+/// read-only terminal fast path, then awaits `acquire_persistence_permit()`,
+/// so one `futures::poll!` must return `Pending` before any mutation.
+/// After release the worker commits Running, drops the permit (waking
+/// cancel), then cancel writes Cancelled; run()'s post-save transition
+/// observes terminal status and must not overwrite it with Succeeded.
+/// No sleeps: Notify gates only; the 10s timeout is a deadlock guard.
+#[tokio::test]
+async fn cancel_while_persistence_admission_exhausted_cannot_lose_to_succeeded() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(ReorderingStateStore {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        durable_state: parking_lot::Mutex::new(None),
+        should_block: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Running && state.step_history.is_empty()
+        }),
+        block_available: AtomicBool::new(true),
+        blocked_started: Notify::new(),
+        release_blocked: Notify::new(),
+        blocked_finished: Notify::new(),
+        search_committed: Notify::new(),
+        save_count: AtomicUsize::new(0),
+    });
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+        edges: vec![],
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            engine_config(dir.path(), client),
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_task_store(store.clone())
+        .with_persistence_capacity(1)
+        .unwrap()
+        .with_executor("blocking", Arc::new(BlockingExecutor)),
+    );
+    let task_id = engine.task_id().clone();
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+
+    // Step 1-2: the real startup Idle→Running save is in-flight inside the
+    // store; with capacity 1 its worker-held permit drains the semaphore.
+    store.blocked_started.notified().await;
+
+    // Step 3-4: the initial read sees nonterminal Running, then cancel must
+    // block on the exhausted admission permit; one poll asserts Pending.
+    let cancel = engine.cancel("stop while admission exhausted");
+    tokio::pin!(cancel);
+    let cancel_ready = match futures::poll!(&mut cancel) {
+        std::task::Poll::Ready(result) => {
+            result.unwrap();
+            true
+        }
+        std::task::Poll::Pending => false,
+    };
+    assert!(
+        !cancel_ready,
+        "cancel must be Pending while the only persistence permit is occupied"
+    );
+
+    // Step 5: release the blocked save; its commit drops the permit, which
+    // admits cancel, then `blocked_finished` confirms durability.
+    store.release_blocked.notify_one();
+    store.blocked_finished.notified().await;
+
+    // Step 6: drive both futures to completion in a controlled order:
+    // cancel first (its save rides the lane FIFO), then the runner, which
+    // must observe the abort token instead of executing the step.
+    tokio::time::timeout(std::time::Duration::from_secs(10), &mut cancel)
+        .await
+        .expect("cancel must finish after permit release")
+        .expect("cancel must succeed");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), runner)
+        .await
+        .expect("cancelled run must finish")
+        .expect("runner task must not panic")
+        .unwrap();
+    assert_eq!(result.turns, 0);
+
+    // Step 7: every observable surface must end Cancelled, never Succeeded.
+    let in_memory = engine.workflow_state.lock().await.clone();
+    assert_eq!(
+        in_memory.status,
+        WorkflowStatus::Cancelled,
+        "in-memory state must be Cancelled after admission-exhausted cancel"
+    );
+    let durable = store
+        .load_workflow_state(&task_id)
+        .await
+        .unwrap()
+        .expect("durable state must exist");
+    assert_eq!(
+        durable.status,
+        WorkflowStatus::Cancelled,
+        "durable state must be Cancelled, not Succeeded"
+    );
+    let restored = WorkflowEngine::restore(
+        store,
+        task_id,
+        engine_config(dir.path(), Arc::new(MockLlmClient::new(vec![]))),
+        Arc::new(NoopJudge),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restored.state().await,
+        WorkflowStatus::Cancelled,
+        "restore must not resurrect the workflow as Succeeded"
+    );
+}
+
+/// capacity=2 regression: setup + #1 (blocked startup save) + #2 (cancel()).
+///
+/// #1 blocks inside `save_workflow_state`; with capacity 2 its permit is
+/// occupied but one remains. cancel() must be admitted immediately (permit
+/// #2), flip RAM status to Cancelled, and enqueue its Cancelled save — which
+/// queues behind the still-blocked #1 in the single FIFO lane. Before
+/// releasing #1: durable_state must still be None (lane is strictly FIFO),
+/// while RAM is Cancelled.
+#[tokio::test]
+async fn persistence_capacity_two_cancel_admitted_behind_blocked_startup_save() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(ReorderingStateStore {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        durable_state: parking_lot::Mutex::new(None),
+        should_block: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Running && state.step_history.is_empty()
+        }),
+        block_available: AtomicBool::new(true),
+        blocked_started: Notify::new(),
+        release_blocked: Notify::new(),
+        blocked_finished: Notify::new(),
+        search_committed: Notify::new(),
+        save_count: AtomicUsize::new(0),
+    });
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+        edges: vec![],
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            engine_config(dir.path(), client),
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_task_store(store.clone())
+        .with_persistence_capacity(2)
+        .unwrap()
+        .with_executor("blocking", Arc::new(BlockingExecutor)),
+    );
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    // #1: the startup Idle→Running save is in-flight inside the store.
+    store.blocked_started.notified().await;
+    assert!(
+        store.durable_state.lock().is_none(),
+        "blocked startup save must not have committed any durable state"
+    );
+
+    // #2: cancel() must be admitted immediately (second permit free), flip
+    // RAM status to Cancelled, and enqueue its Cancelled save behind blocked
+    // #1. One poll drives it to its first await (permit → lock → enqueue →
+    // await_persistence); Pending proves its save is queued, not committed.
+    let cancel = engine.cancel("stop while first persistence blocked");
+    tokio::pin!(cancel);
+    match futures::poll!(&mut cancel) {
+        std::task::Poll::Ready(result) => {
+            panic!("cancel completed while #1 was blocked: {result:?}")
+        }
+        std::task::Poll::Pending => {}
+    }
+    {
+        let state = engine.workflow_state.lock().await;
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Cancelled,
+            "cancel must have flipped RAM status before its save commits"
+        );
+    }
+    assert!(
+        store.durable_state.lock().is_none(),
+        "cancel's save must be queued behind blocked #1, not committed"
+    );
+
+    // #3: both persistence permits are occupied (#1 blocked in-store, #2
+    // queued cancel save). resume()'s FIRST await is
+    // `acquire_persistence_permit`, so a Pending first poll proves resume
+    // is parked at admission: it has not reached status validation, RAM
+    // mutation, or any enqueue. Note: resume() is being called on an
+    // already-Cancelled workflow, so even if admission later succeeded the
+    // status guard would return `InvalidStatus` without persisting —
+    // admission exhaustion is not what prevents a third save here; the
+    // Pending poll only proves resume is queued behind admission.
+    let resume = engine.resume();
+    tokio::pin!(resume);
+    match futures::poll!(&mut resume) {
+        std::task::Poll::Ready(result) => {
+            panic!("resume completed while both permits were held: {result:?}")
+        }
+        std::task::Poll::Pending => {}
+    }
+    assert!(
+        store.durable_state.lock().is_none(),
+        "no third save may commit while #1 is still blocked"
+    );
+
+    // Finish: release #1 (commits Running, drops permit), lane then runs
+    // cancel's Cancelled save; run()'s loop observes the abort and returns.
+    store.release_blocked.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(10), &mut cancel)
+        .await
+        .expect("cancel must finish after #1 releases")
+        .expect("cancel must succeed");
+    // Drive the parked resume to completion: once admitted, the Cancelled
+    // status guard rejects it with InvalidStatus — no mutation, no enqueue.
+    let resume_result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut resume)
+        .await
+        .expect("resume must finish once a permit is free");
+    assert!(
+        matches!(resume_result, Err(WorkflowError::InvalidStatus { .. })),
+        "admitted resume on Cancelled must be rejected by the status guard"
+    );
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), runner)
+        .await
+        .expect("cancelled run must finish")
+        .expect("runner task must not panic")
+        .unwrap();
+    assert_eq!(result.turns, 0);
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    let durable = store.durable_state.lock().clone().expect("durable state");
+    assert_eq!(
+        durable.status,
+        WorkflowStatus::Cancelled,
+        "cancel's save must commit after #1, ending durable at Cancelled"
+    );
+}
+
+/// capacity=1 regression: the startup Idle→Running save blocks inside the
+/// store while holding the ONLY persistence permit, so the persistence lane
+/// is fully occupied. `cancel()` on a Running workflow is a valid,
+/// state-mutating operation (status→Cancelled + Abort StepRecord + ended_at),
+/// but its `acquire_persistence_permit` must hit the caller's absolute
+/// deadline and return `StoreTimeout` BEFORE admission — no RAM mutation and
+/// no enqueue (the permit is consumed by value at enqueue, so nothing can
+/// enter the FIFO lane without admission).
+///
+/// Proves all three invariants:
+/// 1. Timeout fires pre-admission: RAM keeps Running, empty step_history,
+///    no reason/ended_at; durable_state stays None (the parked startup save
+///    has not committed either).
+/// 2. No delayed write: after releasing the blocked save, a second admitted
+///    cancel runs to completion as a FIFO drain barrier. Its receipt
+///    resolving proves the single worker already committed every earlier
+///    lane entry, so asserting the save count afterwards is race-free: the
+///    timed-out cancel's save never entered the lane (a hypothetical
+///    delayed write would have been processed before the barrier save,
+///    making the count 3 instead of 2).
+/// 3. The timed-out cancel left no half-mutated state behind.
+///
+/// No sleeps: Notify gates only; the 10s timeout is a deadlock guard.
+#[tokio::test]
+async fn persistence_timeout_before_admission_does_not_mutate_or_enqueue() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(ReorderingStateStore {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        durable_state: parking_lot::Mutex::new(None),
+        should_block: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Running && state.step_history.is_empty()
+        }),
+        block_available: AtomicBool::new(true),
+        blocked_started: Notify::new(),
+        release_blocked: Notify::new(),
+        blocked_finished: Notify::new(),
+        search_committed: Notify::new(),
+        save_count: AtomicUsize::new(0),
+    });
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+        edges: vec![],
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            engine_config(dir.path(), client),
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_task_store(store.clone())
+        .with_persistence_capacity(1)
+        .unwrap()
+        .with_executor("blocking", Arc::new(BlockingExecutor))
+        .with_persistence_timeout(std::time::Duration::from_millis(50)),
+    );
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    // #1: the startup Idle→Running save is parked inside the store, holding
+    // the single persistence permit.
+    store.blocked_started.notified().await;
+    assert!(
+        store.durable_state.lock().is_none(),
+        "blocked startup save must not have committed any durable state"
+    );
+
+    // #2: cancel() on Running is valid and WOULD mutate if admitted (status
+    // → Cancelled + Abort StepRecord + ended_at). With the lane full, its
+    // admission wait must exhaust the absolute deadline and return
+    // StoreTimeout before any mutation or enqueue.
+    assert!(matches!(
+        engine
+            .cancel("stop while startup persistence blocks the only permit")
+            .await,
+        Err(WorkflowError::StoreTimeout { .. })
+    ));
+    {
+        let state = engine.workflow_state.lock().await;
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Running,
+            "pre-admission timeout must leave RAM status untouched"
+        );
+        assert!(
+            state.step_history.is_empty(),
+            "pre-admission timeout must not append an Abort StepRecord"
+        );
+        assert!(
+            state.reason.is_none(),
+            "pre-admission timeout must not set a cancel reason"
+        );
+        assert!(
+            state.ended_at.is_none(),
+            "pre-admission timeout must not set ended_at"
+        );
+    }
+    assert!(
+        store.durable_state.lock().is_none(),
+        "no save may commit while the blocked startup save still holds the \
+         gate: None proves the timed-out cancel never reached the store"
+    );
+
+    // Release #1; the parked startup save commits and finishes. The first
+    // durable snapshot must be the startup Running state.
+    store.release_blocked.notify_one();
+    store.blocked_finished.notified().await;
+    {
+        let durable = store.durable_state.lock().clone();
+        let state = durable
+            .as_ref()
+            .expect("startup save must commit after release");
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Running,
+            "the only durable snapshot must be the startup Running save"
+        );
+        assert!(
+            state.step_history.is_empty(),
+            "startup snapshot carries no step history"
+        );
+        assert!(
+            state.reason.is_none() && state.ended_at.is_none(),
+            "startup snapshot carries no cancel/terminal markers"
+        );
+    }
+
+    // FIFO drain barrier: issue a SECOND, now-admitted cancel (the startup
+    // save's permit was freed when it committed) and let it run to
+    // completion. The single FIFO worker commits this barrier save only
+    // after every earlier lane entry — including any hypothetical delayed
+    // write from the timed-out cancel — has committed. Once the barrier
+    // cancel's receipt resolves, the save count is final and race-free.
+    assert!(
+        engine
+            .cancel("drain barrier after pre-admission timeout")
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        store.save_count.load(Ordering::SeqCst),
+        2,
+        "exactly two saves may have been requested: startup Running + drain \
+         barrier cancel; a third would be a delayed write from the \
+         timed-out cancel"
+    );
+    {
+        let durable = store.durable_state.lock().clone();
+        let state = durable.expect("durable state after drain barrier");
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Cancelled,
+            "final durable snapshot must be the drain-barrier cancel's"
+        );
+        assert_eq!(
+            state.reason.as_deref(),
+            Some("drain barrier after pre-admission timeout"),
+            "durable reason must be the drain-barrier cancel's, proving the \
+             timed-out cancel's snapshot never overwrote it"
+        );
+    }
+
+    // Cleanup: run()'s own await_persistence shares the same 50ms absolute
+    // deadline (set at run() entry), so the runner self-terminates with
+    // StoreTimeout while the save was still parked. Drain it; the result is
+    // intentionally not part of this regression's contract.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), runner)
+        .await
+        .expect("run loop must terminate after its startup save released");
+}
+
+/// Startup persistence stage 2 (context snapshot) timeout regression.
+///
+/// The startup persistence operation computes ONE absolute deadline at
+/// `run()` entry and reuses it across all of its stages. This test pins the
+/// context-snapshot stage to that contract by holding the shared context
+/// mutex from the test task: the snapshot's `context.lock().await` cannot
+/// resolve, the stage must exhaust the caller's absolute deadline, and
+/// `run()` must return `StoreTimeout` BEFORE the workflow_state lock is ever
+/// acquired — so no RAM mutation (status stays Idle) and no enqueue happens.
+///
+/// Proves:
+/// 1. The timeout fired at the context-snapshot stage (not later): RAM
+///    keeps Idle status, empty step_history, no reason/ended_at.
+/// 2. No request entered the FIFO lane: `save_count == 0` and durable_state
+///    stays None.
+/// 3. The timed-out operation released its permit: after dropping the held
+///    context lock, a subsequent `cancel()` (valid on Idle and
+///    state-mutating) runs to completion as a FIFO drain barrier — its
+///    success is only possible with a free permit and proves no permit
+///    leaked. The barrier's receipt resolving means every earlier lane
+///    entry committed, making the final save count race-free: exactly 1
+///    (the barrier's own save; 2 would mean the timed-out run enqueued).
+#[tokio::test]
+async fn persistence_timeout_at_context_snapshot_stage_times_out_before_state_lock() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(ReorderingStateStore {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        durable_state: parking_lot::Mutex::new(None),
+        should_block: Arc::new(|_: &WorkflowState| false),
+        block_available: AtomicBool::new(true),
+        blocked_started: Notify::new(),
+        release_blocked: Notify::new(),
+        blocked_finished: Notify::new(),
+        search_committed: Notify::new(),
+        save_count: AtomicUsize::new(0),
+    });
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+        edges: vec![],
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            engine_config(dir.path(), client),
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_task_store(store.clone())
+        .with_executor("blocking", Arc::new(BlockingExecutor))
+        .with_persistence_timeout(std::time::Duration::from_millis(50)),
+    );
+
+    // Hold the shared context mutex so the context-snapshot stage's
+    // `context.lock().await` cannot resolve within the deadline.
+    let context_handle = engine.context();
+    let _context_guard = context_handle.lock().await;
+
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    assert!(
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), runner)
+                .await
+                .expect("run must terminate after its context-snapshot timeout")
+                .unwrap(),
+            Err(WorkflowError::StoreTimeout { .. })
+        ),
+        "context-snapshot stage must exhaust the absolute deadline and \
+         return StoreTimeout"
+    );
+    {
+        let state = engine.workflow_state.lock().await;
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Idle,
+            "context-stage timeout must fire before the workflow_state lock \
+             is acquired: RAM status must stay Idle"
+        );
+        assert!(
+            state.step_history.is_empty(),
+            "context-stage timeout must not append any StepRecord"
+        );
+        assert!(
+            state.reason.is_none(),
+            "context-stage timeout must not set a reason"
+        );
+        assert!(
+            state.ended_at.is_none(),
+            "context-stage timeout must not set ended_at"
+        );
+    }
+    assert_eq!(
+        store.save_count.load(Ordering::SeqCst),
+        0,
+        "context-stage timeout must not enqueue any save into the FIFO lane"
+    );
+    assert!(
+        store.durable_state.lock().is_none(),
+        "no durable snapshot may exist: nothing entered the store"
+    );
+
+    // Drop the held context lock, then use a state-mutating `cancel()` on
+    // Idle as a FIFO drain barrier. Its success proves the timed-out run's
+    // permit was released (no leak); its committed save makes the count
+    // final: exactly 1 means the timed-out run never enqueued.
+    drop(_context_guard);
+    assert!(
+        engine
+            .cancel("drain barrier after context-snapshot timeout")
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        store.save_count.load(Ordering::SeqCst),
+        1,
+        "exactly one save (the barrier's) may have been requested; 2 would \
+         mean the timed-out run enqueued its snapshot after the fact"
+    );
+    {
+        let durable = store.durable_state.lock().clone();
+        let state = durable.expect("drain-barrier cancel must commit");
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Cancelled,
+            "the only durable snapshot must be the drain-barrier cancel's"
+        );
+        assert_eq!(
+            state.reason.as_deref(),
+            Some("drain barrier after context-snapshot timeout"),
+            "durable reason must be the drain-barrier cancel's"
+        );
+    }
+}
+
+/// Startup persistence stage 3 (workflow_state lock) timeout regression.
+///
+/// Mirrors the context-snapshot test one stage later: the test task holds
+/// the shared workflow_state mutex so the startup persistence operation's
+/// lock acquisition cannot resolve. The stage must exhaust the caller's
+/// absolute deadline and return `StoreTimeout` with the lock still held —
+/// since the Idle→Running flip happens only AFTER the lock is acquired, the
+/// RAM state must remain completely untouched.
+///
+/// Proves:
+/// 1. The timeout fired at the workflow_state-lock stage: RAM keeps Idle
+///    status, empty step_history, no reason/ended_at (asserted after
+///    dropping the test's own lock guard so the assertions can lock).
+/// 2. No request entered the FIFO lane: `save_count == 0`, durable_state
+///    None.
+/// 3. The timed-out operation released its permit: the drain-barrier
+///    `cancel()` (whose own path locks workflow_state) succeeds and commits
+///    the only save, making the final count race-free.
+#[tokio::test]
+async fn persistence_timeout_at_workflow_state_lock_stage_leaves_state_idle() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(ReorderingStateStore {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        durable_state: parking_lot::Mutex::new(None),
+        should_block: Arc::new(|_: &WorkflowState| false),
+        block_available: AtomicBool::new(true),
+        blocked_started: Notify::new(),
+        release_blocked: Notify::new(),
+        blocked_finished: Notify::new(),
+        search_committed: Notify::new(),
+        save_count: AtomicUsize::new(0),
+    });
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+        edges: vec![],
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            engine_config(dir.path(), client),
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_task_store(store.clone())
+        .with_executor("blocking", Arc::new(BlockingExecutor))
+        .with_persistence_timeout(std::time::Duration::from_millis(50)),
+    );
+
+    // Hold the shared workflow_state mutex so the lock-acquisition stage
+    // cannot resolve within the deadline.
+    let state_guard = engine.workflow_state.lock().await;
+
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    assert!(
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), runner)
+                .await
+                .expect("run must terminate after its workflow_state-lock timeout")
+                .unwrap(),
+            Err(WorkflowError::StoreTimeout { .. })
+        ),
+        "workflow_state-lock stage must exhaust the absolute deadline and \
+         return StoreTimeout"
+    );
+    assert_eq!(
+        store.save_count.load(Ordering::SeqCst),
+        0,
+        "workflow_state-lock stage timeout must not enqueue any save into \
+         the FIFO lane"
+    );
+    assert!(
+        store.durable_state.lock().is_none(),
+        "no durable snapshot may exist: nothing entered the store"
+    );
+
+    // Release the test's own lock guard before inspecting RAM state: the
+    // run() attempt already returned, so any mutation the timeout path
+    // could have made is already visible (there must be none — the
+    // Idle→Running flip happens only after the lock is acquired).
+    drop(state_guard);
+    {
+        let state = engine.workflow_state.lock().await;
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Idle,
+            "workflow_state-lock timeout must fire before the Idle→Running \
+             flip: RAM status must stay Idle"
+        );
+        assert!(
+            state.step_history.is_empty(),
+            "workflow_state-lock timeout must not append any StepRecord"
+        );
+        assert!(
+            state.reason.is_none(),
+            "workflow_state-lock timeout must not set a reason"
+        );
+        assert!(
+            state.ended_at.is_none(),
+            "workflow_state-lock timeout must not set ended_at"
+        );
+    }
+
+    // Drain barrier: cancel()'s own path locks workflow_state (now free) and
+    // must succeed — proving the timed-out run's permit was released. Its
+    // committed save makes the final count race-free.
+    assert!(
+        engine
+            .cancel("drain barrier after workflow_state-lock timeout")
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        store.save_count.load(Ordering::SeqCst),
+        1,
+        "exactly one save (the barrier's) may have been requested; 2 would \
+         mean the timed-out run enqueued its snapshot after the fact"
+    );
+    {
+        let durable = store.durable_state.lock().clone();
+        let state = durable.expect("drain-barrier cancel must commit");
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Cancelled,
+            "the only durable snapshot must be the drain-barrier cancel's"
+        );
+        assert_eq!(
+            state.reason.as_deref(),
+            Some("drain barrier after workflow_state-lock timeout"),
+            "durable reason must be the drain-barrier cancel's"
+        );
+    }
+}
+
+/// Absolute-deadline non-stacking regression (#14C): ONE deadline shared
+/// across MULTIPLE async stages of the SAME persistence operation.
+///
+/// The startup persistence operation is staged: acquire the permit (stage
+/// 1) → context snapshot (stage 2) → workflow_state lock (stage 3) →
+/// enqueue + await (stage 4). All stages share the single absolute deadline
+/// computed at `run()` entry; a stage that becomes runnable late must not
+/// receive a fresh full `persistence_timeout` budget.
+///
+/// Setup: persistence capacity is 1 with `persistence_timeout = 100ms`.
+/// Task A holds the only permit for 40ms (within the absolute deadline).
+/// Task B (an independent spawned task — never the test task) holds the
+/// workflow_state mutex for 120ms, past the absolute deadline. Correct
+/// behavior: the permit is acquired at ~40ms, the context snapshot is fast,
+/// the lock stage waits until the absolute deadline at 100ms and times out
+/// while the lock is still held; `run()` returns `StoreTimeout`, RAM stays
+/// Idle, nothing is enqueued.
+///
+/// A broken implementation that gives the lock stage a fresh full budget
+/// would instead acquire the lock at 120ms (< 40ms + 100ms = 140ms), flip
+/// RAM Idle→Running, and enqueue the startup snapshot — so `run()` also
+/// ends in `StoreTimeout` (the enqueue+await stage sees the expired
+/// deadline), but the observable damage differs. The error alone does not
+/// discriminate; the RAM status and save count do:
+///
+/// |                     | correct (shared deadline) | broken (per-stage reset) |
+/// | RAM after timeout   | Idle                      | Running                  |
+/// | save_count before   | 0                         | 1                        |
+/// |   barrier           |                           |                          |
+/// | save_count after    | 1                         | 2                        |
+/// |   barrier           |                           |                          |
+///
+/// The lock-release time of 120ms sits in the discrimination window
+/// (100ms, 140ms) with 20ms margin on both sides; concurrent sleeps only
+/// drift late, preserving both bounds. All assertions are boolean/counts —
+/// no wall-clock duration assertions.
+#[tokio::test]
+async fn persistence_deadline_does_not_reset_per_stage_of_same_operation() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(ReorderingStateStore {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        durable_state: parking_lot::Mutex::new(None),
+        should_block: Arc::new(|_: &WorkflowState| false),
+        block_available: AtomicBool::new(true),
+        blocked_started: Notify::new(),
+        release_blocked: Notify::new(),
+        blocked_finished: Notify::new(),
+        search_committed: Notify::new(),
+        save_count: AtomicUsize::new(0),
+    });
+    let client = Arc::new(MockLlmClient::new(vec![]));
+    let workflow = Workflow {
+        entry_step: "exec".into(),
+        steps: vec![Step::executor("exec", "Executor Step", "blocking", None)],
+        edges: vec![],
+    };
+    // Mirror the permit-hold pattern: clone the semaphore before the engine
+    // is moved into its Arc.
+    let engine = WorkflowEngine::new(
+        workflow,
+        engine_config(dir.path(), client),
+        Arc::new(NoopJudge),
+    )
+    .unwrap()
+    .with_task_store(store.clone())
+    .with_persistence_capacity(1)
+    .unwrap()
+    .with_executor("blocking", Arc::new(BlockingExecutor))
+    .with_persistence_timeout(std::time::Duration::from_millis(100));
+    let permits_lane = engine.persistence_permits.clone();
+    let engine = Arc::new(engine);
+
+    // Task A: hold the only persistence permit for 40ms (within the 100ms
+    // absolute deadline), then release it.
+    let permit_holder = tokio::spawn(async move {
+        let _permit = permits_lane.acquire_owned().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    });
+
+    // Task B: hold the workflow_state mutex for 120ms — past the 100ms
+    // absolute deadline but before 140ms (permit acquired at ~40ms + a
+    // fresh full 100ms budget). Spawned, never the test task: a broken
+    // impl must deadlock B, not this test.
+    let lock_holder = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let _guard = engine.workflow_state.lock().await;
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        })
+    };
+
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    assert!(
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), runner)
+                .await
+                .expect("run must terminate after its persistence deadline")
+                .unwrap(),
+            Err(WorkflowError::StoreTimeout { .. })
+        ),
+        "startup persistence must exhaust its absolute deadline and return \
+         StoreTimeout"
+    );
+    // Wait for the lock holder to finish: RAM state is stable afterwards.
+    lock_holder.await.expect("lock-holder task must not panic");
+    permit_holder
+        .await
+        .expect("permit-holder task must not panic");
+    {
+        let state = engine.workflow_state.lock().await;
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Idle,
+            "the shared absolute deadline must expire while the lock stage \
+             still waits: the Idle→Running flip (which happens only after \
+             the lock is acquired) must never occur; a Running status means \
+             the lock stage received a fresh full persistence_timeout"
+        );
+        assert!(
+            state.step_history.is_empty(),
+            "the timed-out startup persistence must not append any StepRecord"
+        );
+        assert!(
+            state.reason.is_none(),
+            "the timed-out startup persistence must not set a reason"
+        );
+        assert!(
+            state.ended_at.is_none(),
+            "the timed-out startup persistence must not set ended_at"
+        );
+    }
+    assert_eq!(
+        store.save_count.load(Ordering::SeqCst),
+        0,
+        "no save may have been requested: a request would mean the lock \
+         stage was granted a fresh full budget and enqueued the startup \
+         snapshot past the absolute deadline"
+    );
+    assert!(
+        store.durable_state.lock().is_none(),
+        "no durable snapshot may exist: nothing entered the store"
+    );
+
+    // Drain barrier: a state-mutating cancel() on Idle runs to completion.
+    // Its receipt resolving proves every earlier lane entry committed and
+    // that the timed-out run's permit was released, making the final count
+    // race-free: exactly 1 means the timed-out run never enqueued.
+    assert!(
+        engine
+            .cancel("drain barrier after absolute-deadline timeout")
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        store.save_count.load(Ordering::SeqCst),
+        1,
+        "exactly one save (the barrier's) may have been requested; 2 would \
+         mean the timed-out run enqueued its snapshot past the absolute \
+         deadline (per-stage budget reset)"
+    );
+    {
+        let durable = store.durable_state.lock().clone();
+        let state = durable.expect("drain-barrier cancel must commit");
+        assert_eq!(
+            state.status,
+            WorkflowStatus::Cancelled,
+            "the only durable snapshot must be the drain-barrier cancel's"
+        );
+        assert_eq!(
+            state.reason.as_deref(),
+            Some("drain barrier after absolute-deadline timeout"),
+            "durable reason must be the drain-barrier cancel's"
+        );
+    }
+}
+
+/// The documented builder contract: `with_persistence_capacity(0)` is
+/// rejected (it would deadlock every admission) with `WorkflowError::Internal`.
+/// Uses only the public builder path.
+#[test]
+fn with_persistence_capacity_zero_is_rejected() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = WorkflowEngine::new_free_task(
+        "capacity zero".into(),
+        vec![],
+        noop_test_config(&dir, Arc::new(MockLlmClient::new(vec![]))),
+    )
+    .unwrap();
+    let err = engine
+        .with_persistence_capacity(0)
+        .err()
+        .expect("capacity 0 must be rejected");
+    assert!(
+        matches!(err, WorkflowError::Internal(_)),
+        "expected WorkflowError::Internal, got {err:?}"
+    );
+}
+
 // ── cancel() 终态保护测试（cancel 对 Succeeded/Failed/Cancelled 是 no-op）──
 
 fn noop_test_config(
@@ -1959,6 +3182,146 @@ fn noop_test_config(
         session_base_dir: dir.path().join("sessions"),
         customize_builder: None,
     }
+}
+
+/// Terminal cancel is an idempotent in-memory no-op and must not require
+/// persistence admission. Holding the only permit proves a successful
+/// first-poll completion cannot have acquired admission or enqueued a save.
+#[tokio::test]
+async fn terminal_cancel_bypasses_exhausted_persistence_admission() {
+    let dir = tempfile::TempDir::new().unwrap();
+
+    for (index, status) in [
+        WorkflowStatus::Succeeded,
+        WorkflowStatus::Failed,
+        WorkflowStatus::Cancelled,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let store = Arc::new(JsonlTaskStore::new(
+            dir.path().join(format!("terminal-{index}")),
+        ));
+        let engine = WorkflowEngine::new_free_task(
+            "terminal cancel".into(),
+            vec![],
+            noop_test_config(&dir, Arc::new(MockLlmClient::new(vec![]))),
+        )
+        .unwrap()
+        .with_task_store(store.clone())
+        .with_persistence_capacity(1)
+        .unwrap();
+        {
+            let mut state = engine.workflow_state.lock().await;
+            state.status = status.clone();
+            state.ended_at = Some(chrono::Utc::now());
+            match status {
+                WorkflowStatus::Succeeded => {
+                    state.result = Some(TaskResult {
+                        cost: CostAggregate::default(),
+                        turns: 1,
+                        final_message: Some("terminal result".into()),
+                    });
+                }
+                WorkflowStatus::Failed => {
+                    state.reason = Some("terminal failure".into());
+                    state.error = Some(TaskError::Internal("terminal failure".into()));
+                }
+                WorkflowStatus::Cancelled => {
+                    state.reason = Some("already cancelled".into());
+                }
+                _ => unreachable!(),
+            }
+        }
+        let before = serde_json::to_value(engine.workflow_state.lock().await.clone()).unwrap();
+        let held_permit = engine
+            .persistence_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let cancel = engine.cancel("late cancel");
+        tokio::pin!(cancel);
+        match futures::poll!(cancel.as_mut()) {
+            std::task::Poll::Ready(result) => result.unwrap(),
+            std::task::Poll::Pending => {
+                panic!("terminal cancel must not wait for persistence admission")
+            }
+        }
+
+        let after = serde_json::to_value(engine.workflow_state.lock().await.clone()).unwrap();
+        assert_eq!(after, before, "terminal state must remain unchanged");
+        assert!(
+            store
+                .load_workflow_state(&engine.task_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "terminal cancel must not enqueue a persistence operation"
+        );
+        drop(held_permit);
+    }
+}
+
+/// A nonterminal initial observation cannot authorize cancellation after the
+/// admission wait: another operation may make the workflow terminal meanwhile.
+/// The post-admission definitive check must preserve that terminal state.
+#[tokio::test]
+async fn cancel_rechecks_terminal_state_after_admission_race() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(JsonlTaskStore::new(dir.path().join("race")));
+    let engine = WorkflowEngine::new_free_task(
+        "racing cancel".into(),
+        vec![],
+        noop_test_config(&dir, Arc::new(MockLlmClient::new(vec![]))),
+    )
+    .unwrap()
+    .with_task_store(store.clone())
+    .with_persistence_capacity(1)
+    .unwrap();
+    let held_permit = engine
+        .persistence_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+
+    let cancel = engine.cancel("raced cancel");
+    tokio::pin!(cancel);
+    assert!(matches!(
+        futures::poll!(cancel.as_mut()),
+        std::task::Poll::Pending
+    ));
+
+    {
+        let mut state = engine.workflow_state.lock().await;
+        state.status = WorkflowStatus::Succeeded;
+        state.result = Some(TaskResult {
+            cost: CostAggregate::default(),
+            turns: 1,
+            final_message: Some("won the race".into()),
+        });
+        state.ended_at = Some(chrono::Utc::now());
+    }
+    let terminal = serde_json::to_value(engine.workflow_state.lock().await.clone()).unwrap();
+    drop(held_permit);
+
+    cancel.await.unwrap();
+
+    let after = serde_json::to_value(engine.workflow_state.lock().await.clone()).unwrap();
+    assert_eq!(
+        after, terminal,
+        "racing cancel must preserve terminal state"
+    );
+    assert!(
+        store
+            .load_workflow_state(&engine.task_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "definitive terminal check must prevent a cancellation save"
+    );
 }
 
 /// 两步 LLM workflow（s1 → s2），FailingJudge 首步执行后即 Fail —— 产出
@@ -2351,6 +3714,370 @@ async fn race_natural_completion_vs_cancel_is_always_consistent() {
     }
 }
 
+/// The completed Abort step has passed run_loop's provisional Cancelled check,
+/// but its separate Succeeded persistence has not begun. Cancellation must
+/// remain authoritative when finalization resumes after the gate.
+#[tokio::test]
+async fn cancel_after_abort_guard_cannot_be_overwritten_by_finalization() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let gate = Arc::new((Notify::new(), Notify::new()));
+    let mut engine = WorkflowEngine::new(
+        Workflow {
+            entry_step: "done".into(),
+            steps: vec![Step::executor("done", "Done", "completed", None)],
+            edges: vec![],
+        },
+        engine_config(dir.path(), Arc::new(MockLlmClient::new(vec![]))),
+        Arc::new(NoopJudge),
+    )
+    .unwrap()
+    .with_executor("completed", Arc::new(StructuredExecutor))
+    .with_task_store(store.clone());
+    engine.abort_finalization_gate = Some(gate.clone());
+    let engine = Arc::new(engine);
+    let task_id = engine.task_id().clone();
+
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.0.notified())
+        .await
+        .expect("runner must reach Abort finalization after its cancel guard");
+
+    let history = engine.step_history().await;
+    assert_eq!(history.len(), 1);
+    assert!(
+        history[0].result.is_some(),
+        "executor step must have completed"
+    );
+    assert!(matches!(history[0].transition, Transition::Abort { .. }));
+    assert_eq!(engine.state().await, WorkflowStatus::Running);
+
+    engine
+        .cancel("cancel completed step before finalization")
+        .await
+        .unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(
+        store
+            .load_workflow_state(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Cancelled,
+        "cancel must durably establish Cancelled before finalization resumes"
+    );
+
+    gate.1.notify_one();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), runner)
+        .await
+        .expect("finalization must finish")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.turns, 1);
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(
+        store
+            .load_workflow_state(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Cancelled,
+        "drained finalization must not persist Succeeded after Cancelled"
+    );
+}
+
+/// Regression A: pause() arms the flag, the To branch finishes its own
+/// persistence, and pause_if_requested parks at its admission gate. cancel()
+/// establishes Cancelled (durably) during that window. The unfixed code then
+/// unconditionally writes `status = Paused` after re-acquiring the state
+/// lock, overwriting Cancelled and making the workflow resumable.
+#[tokio::test]
+async fn cancel_during_pause_admission_cannot_be_overwritten_by_pause() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let gate = Arc::new((Notify::new(), Notify::new()));
+    let mut engine = WorkflowEngine::new(
+        Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::llm("s1", "S1", "first", vec![]),
+                Step::llm("s2", "S2", "second", vec![]),
+            ],
+            edges: vec![Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            }],
+        },
+        engine_config(
+            dir.path(),
+            Arc::new(MockLlmClient::new(vec![MockResponse::text("s1 done")])),
+        ),
+        Arc::new(TwoStepJudge),
+    )
+    .unwrap()
+    .with_task_store(store.clone());
+    engine.pause_admission_gate = Some(gate.clone());
+    // Arm the pause request before run(): the first step boundary after the
+    // To transition is where pause_if_requested engages the gate.
+    engine.pause("pause at boundary").unwrap();
+    let engine = Arc::new(engine);
+    let task_id = engine.task_id().clone();
+
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.0.notified())
+        .await
+        .expect("runner must reach pause admission after the To transition");
+
+    // Precondition: the To branch already advanced to s2 and persisted.
+    assert_eq!(engine.current_step().await, "s2");
+    assert_eq!(engine.state().await, WorkflowStatus::Running);
+
+    engine
+        .cancel("cancel while pause admission is parked")
+        .await
+        .unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(
+        store
+            .load_workflow_state(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Cancelled,
+        "cancel must durably establish Cancelled while pause admission is parked"
+    );
+
+    gate.1.notify_one();
+    let run_res = tokio::time::timeout(std::time::Duration::from_secs(10), runner)
+        .await
+        .expect("run must finish after the pause window")
+        .unwrap();
+    assert!(
+        run_res.is_ok(),
+        "run must return the cancelled result, not Err(Paused)"
+    );
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(
+        store
+            .load_workflow_state(&task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Cancelled,
+        "pause finalization must not overwrite durably-established Cancelled"
+    );
+    // A cancelled workflow must not be resumable: resume() rejects Cancelled
+    // only while the status actually is Cancelled.
+    assert!(
+        engine.resume().await.is_err(),
+        "resume() must reject a cancelled workflow"
+    );
+}
+
+/// Regression B (To arm): apply_transition returned Ok(Some(target)) — status
+/// was Running at its lock — but run_loop's To branch re-acquires the state
+/// lock after admission. cancel() wins that second window and durably
+/// establishes Cancelled with current_step = s1 (the step that actually ran).
+/// The unfixed branch then writes current_step = s2 into the Cancelled
+/// snapshot: a durable phantom step that never executed.
+#[tokio::test]
+async fn cancel_during_to_admission_does_not_advance_current_step() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let gate = Arc::new((Notify::new(), Notify::new()));
+    let mut engine = WorkflowEngine::new(
+        Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::llm("s1", "S1", "first", vec![]),
+                Step::llm("s2", "S2", "second", vec![]),
+            ],
+            edges: vec![Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            }],
+        },
+        engine_config(
+            dir.path(),
+            Arc::new(MockLlmClient::new(vec![MockResponse::text("s1 done")])),
+        ),
+        Arc::new(TwoStepJudge),
+    )
+    .unwrap()
+    .with_task_store(store.clone());
+    engine.to_continuation_gate = Some(gate.clone());
+    let engine = Arc::new(engine);
+    let task_id = engine.task_id().clone();
+
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.0.notified())
+        .await
+        .expect("runner must reach To continuation admission");
+
+    // Precondition: parked before the branch's own persistence; current_step
+    // is still the executed step.
+    assert_eq!(engine.current_step().await, "s1");
+    assert_eq!(engine.state().await, WorkflowStatus::Running);
+
+    engine
+        .cancel("cancel while To admission is parked")
+        .await
+        .unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    {
+        let durable = store.load_workflow_state(&task_id).await.unwrap().unwrap();
+        assert_eq!(durable.status, WorkflowStatus::Cancelled);
+        assert_eq!(
+            durable.current_step, "s1",
+            "cancel must record the executed step, not a phantom advance"
+        );
+    }
+
+    gate.1.notify_one();
+    let run_res = tokio::time::timeout(std::time::Duration::from_secs(10), runner)
+        .await
+        .expect("run must finish after the To admission window")
+        .unwrap();
+    assert!(
+        run_res.is_ok(),
+        "run must return the cancelled result, not an error"
+    );
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(engine.current_step().await, "s1");
+    let durable = store.load_workflow_state(&task_id).await.unwrap().unwrap();
+    assert_eq!(durable.status, WorkflowStatus::Cancelled);
+    assert_eq!(
+        durable.current_step, "s1",
+        "drained To continuation must not persist a phantom current_step after Cancelled"
+    );
+}
+
+/// Regression B (Retry arm, LoopConfig jump): check --Retry--> run resolves
+/// via LoopConfig to Ok(Some("run")). cancel() wins run_loop's Retry branch
+/// admission window; the unfixed branch then writes current_step = run into
+/// the Cancelled snapshot even though `run` was never re-entered.
+#[tokio::test]
+async fn cancel_during_retry_loop_jump_does_not_advance_current_step() {
+    /// check: 1st visit Retry (LoopConfig jump to run), later To(done);
+    /// run: To(check) to keep the loop declarative shape.
+    struct JumpJudge;
+    impl StepTransitionJudge for JumpJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            Box::pin(async move {
+                match step_id.as_str() {
+                    "run" => Transition::To("check".into()),
+                    "check" => Transition::Retry,
+                    _ => Transition::Abort {
+                        reason: "end".into(),
+                    },
+                }
+            })
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let gate = Arc::new((Notify::new(), Notify::new()));
+    let mut engine = WorkflowEngine::new(
+        Workflow {
+            entry_step: "run".into(),
+            steps: vec![
+                Step::llm("run", "Run", "do work", vec![]),
+                loop_step("check", "Check", "validate", 5, "run", Some("done")),
+                Step::Terminal {
+                    id: "done".into(),
+                    name: "Done".into(),
+                    exit_code: 0,
+                    message: Some("done".into()),
+                },
+            ],
+            edges: vec![
+                Edge {
+                    from: "run".into(),
+                    to: "check".into(),
+                    condition: None,
+                },
+                Edge {
+                    from: "check".into(),
+                    to: "done".into(),
+                    condition: None,
+                },
+            ],
+        },
+        engine_config(
+            dir.path(),
+            Arc::new(MockLlmClient::new(vec![
+                MockResponse::text("run pass"),
+                MockResponse::text("check fail"),
+            ])),
+        ),
+        Arc::new(JumpJudge),
+    )
+    .unwrap()
+    .with_task_store(store.clone());
+    engine.retry_continuation_gate = Some(gate.clone());
+    let engine = Arc::new(engine);
+    let task_id = engine.task_id().clone();
+
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.0.notified())
+        .await
+        .expect("runner must reach Retry continuation admission");
+
+    // Precondition: parked before the jump persistence; current_step is the
+    // executed check step whose record was already rewritten to To(run).
+    assert_eq!(engine.current_step().await, "check");
+    assert_eq!(engine.state().await, WorkflowStatus::Running);
+
+    engine
+        .cancel("cancel while Retry jump admission is parked")
+        .await
+        .unwrap();
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    {
+        let durable = store.load_workflow_state(&task_id).await.unwrap().unwrap();
+        assert_eq!(durable.status, WorkflowStatus::Cancelled);
+        assert_eq!(durable.current_step, "check");
+    }
+
+    gate.1.notify_one();
+    let run_res = tokio::time::timeout(std::time::Duration::from_secs(10), runner)
+        .await
+        .expect("run must finish after the Retry admission window")
+        .unwrap();
+    assert!(
+        run_res.is_ok(),
+        "run must return the cancelled result, not an error"
+    );
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(engine.current_step().await, "check");
+    let durable = store.load_workflow_state(&task_id).await.unwrap().unwrap();
+    assert_eq!(durable.status, WorkflowStatus::Cancelled);
+    assert_eq!(
+        durable.current_step, "check",
+        "drained Retry continuation must not persist a phantom current_step after Cancelled"
+    );
+}
+
 /// 方向三：cancel() 与 run() 同时启动（join! 并发），executor 立即完成 ——
 /// cancel 与 run_loop 的终态写在锁上直接竞争；修复后两条路径收敛到的
 /// 终态必须一致且互斥，绝不出现 Cancelled 覆盖已建立的 Succeeded。
@@ -2540,21 +4267,26 @@ async fn context_survives_crash_recovery() {
     let task_id = engine.task_id().clone();
 
     // 從獨立 context 寫入，再手動觸發 persist。
-    // persist_state 內部會從 self.context 取 snapshot 覆蓋 state.context。
+    // 持久化前先將 self.context 的快照覆蓋 state.context（模擬引擎
+    // 持久化路徑的行為），再直接寫入 store。
     engine
         .context()
         .lock()
         .await
         .variables
         .insert("survives".into(), serde_json::json!(true));
-    // save_workflow + persist_state（模拟 run() 启动时的落盘）。
+    // save_workflow + save_workflow_state（模拟 run() 启动时的落盘）。
     store
         .save_workflow(&task_id, &engine.workflow)
         .await
         .unwrap();
-    // 手动触发一次 persist（模拟 run() 启动时的 persist）。
-    let snapshot = engine.workflow_state.lock().await.clone();
-    engine.persist_state(&snapshot).await.unwrap();
+    // 手动持久化一份快照（模拟 run() 启动时的 persist）。
+    let mut snapshot = engine.workflow_state.lock().await.clone();
+    snapshot.context = engine.context().lock().await.clone();
+    store
+        .save_workflow_state(&task_id, &snapshot)
+        .await
+        .unwrap();
 
     // restore 后 context 应包含写入的值。
     let config2 = WorkflowEngineConfig {
@@ -4793,57 +6525,41 @@ async fn retry_with_loop_config_jumps_to_target_stage() {
     );
 }
 
+/// LoopConfig with `target_stage: None`: Retry must re-run the step IN PLACE
+/// while still counting toward max_iterations — the None-target sub-path of
+/// `step_loop_continuation` (no history rewrite, no cross-node jump). With
+/// max_iterations=1 the step executes exactly twice (the original visit plus
+/// the single permitted continuation); the second Retry exhausts the loop and
+/// takes exit_route. Termination must come from LoopConfig exhaustion, not
+/// the generic max_retries valve (left at the default of 5 here): a broken
+/// None-target path that bypassed the loop counter would run `check` six
+/// times and fail with "max_retries (5) exceeded" instead.
 #[tokio::test]
-async fn loop_config_early_exit_clears_counter_before_reentry() {
-    use parking_lot::Mutex;
-
+async fn loop_config_target_none_reruns_in_place_and_exhausts() {
     let visited = visit_log();
 
-    struct LoopJudge {
-        visited: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl StepTransitionJudge for LoopJudge {
-        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
-            let step_id = ctx.current_step.id().clone();
-            let mut visits = self.visited.lock();
-            visits.push(step_id.clone());
-            let check_visits = visits.iter().filter(|s| s.as_str() == "check").count();
-            let run_visits = visits.iter().filter(|s| s.as_str() == "run").count();
-            drop(visits);
-
-            Box::pin(async move {
-                match step_id.as_str() {
-                    "check" if check_visits == 1 => Transition::Retry,
-                    "check" if check_visits == 2 => Transition::To("outside".into()),
-                    "check" => Transition::Retry,
-                    "run" if run_visits == 1 => Transition::To("check".into()),
-                    "run" => Transition::To("done".into()),
-                    "outside" => Transition::To("check".into()),
-                    _ => Transition::Abort {
-                        reason: "end".into(),
-                    },
-                }
-            })
-        }
-    }
-
     let dir = tempfile::TempDir::new().unwrap();
+    // Exactly enough responses for TWO check visits (original + the single
+    // permitted continuation). The mock serves fallback text once dry (it
+    // does not fail), so the visit-order assertion below is the real bound.
     let client = Arc::new(MockLlmClient::new(vec![
         MockResponse::text("check 1"),
-        MockResponse::text("run 1"),
         MockResponse::text("check 2"),
-        MockResponse::text("outside 2"),
-        MockResponse::text("check 3"),
-        MockResponse::text("run 3"),
     ]));
-
     let workflow = Workflow {
         entry_step: "check".into(),
         steps: vec![
-            loop_step("check", "Check", "validate", 1, "run", None),
-            Step::llm("run", "Run", "do work", vec![]),
-            Step::llm("outside", "Outside", "leave loop", vec![]),
+            Step::llm("check", "Check", "validate", vec![]).with_policy(StepExecutionPolicy {
+                timeout_ms: None,
+                max_attempts: None,
+                retry_backoff_ms: None,
+                cache: None,
+                r#loop: Some(LoopConfig {
+                    max_iterations: 1,
+                    target_stage: None,
+                    exit_route: Some("done".into()),
+                }),
+            }),
             Step::Terminal {
                 id: "done".into(),
                 name: "Done".into(),
@@ -4852,46 +6568,70 @@ async fn loop_config_early_exit_clears_counter_before_reentry() {
             },
         ],
         edges: vec![
+            // The declarative exit edge (from next_on_done in Senza).
             Edge {
                 from: "check".into(),
-                to: "run".into(),
-                condition: None,
-            },
-            Edge {
-                from: "run".into(),
-                to: "check".into(),
-                condition: None,
-            },
-            Edge {
-                from: "check".into(),
-                to: "outside".into(),
-                condition: None,
-            },
-            Edge {
-                from: "run".into(),
                 to: "done".into(),
-                condition: None,
+                condition: Some(EdgeCondition::Label("done".into())),
             },
         ],
     };
-
     let config = engine_config(dir.path(), client);
-
     let engine = WorkflowEngine::new(
         workflow,
         config,
-        Arc::new(LoopJudge {
+        Arc::new(AlwaysRetryJudge {
             visited: visited.clone(),
         }),
     )
     .unwrap();
+    let result = engine.run().await.unwrap();
 
-    let result = engine.run().await;
-    assert!(
-        result.is_ok(),
-        "each loop episode must start with a fresh counter, got {:?}",
-        result
+    let order = visited.lock().clone();
+    assert_eq!(
+        order,
+        vec!["check".to_string(), "check".to_string()],
+        "target_stage=None must re-run the step in place: one original visit plus exactly one \
+         continuation (max_iterations=1); got {order:?}"
     );
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Succeeded,
+        "exhaustion must take the exit_route to the terminal step"
+    );
+    // TaskResult comes from the Terminal short-circuit (exit_code 0).
+    assert_eq!(result.final_message.as_deref(), Some("done"));
+    // Counter cleanup: exhaustion clears the persisted counter.
+    let state = engine.workflow_state.lock().await.clone();
+    assert!(
+        state.loop_iterations.is_empty(),
+        "exhaustion must clear the step's loop counter; got {:?}",
+        state.loop_iterations
+    );
+    // In-place semantics: exactly two check records (first Retry kept,
+    // exhausting one rewritten to the exit jump) plus the terminal record.
+    let history = engine.step_history().await;
+    assert_eq!(
+        history.len(),
+        3,
+        "two check visits + the terminal record; got {:?}",
+        history
+            .iter()
+            .map(|r| r.step_id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(history[0].step_id, "check");
+    assert!(matches!(&history[0].transition, Transition::Retry));
+    assert_eq!(history.last().unwrap().step_id, "done");
+    let check_record = history
+        .iter()
+        .rev()
+        .find(|r| r.step_id.as_str() == "check")
+        .unwrap();
+    assert!(matches!(
+        &check_record.transition,
+        Transition::To(target) if target == "done"
+    ));
 }
 
 /// Shared judge used by LoopConfig exhaustion tests: `check` ALWAYS returns
@@ -5174,45 +6914,6 @@ async fn loop_config_max_iterations_reached_across_cross_node_iterations() {
     }
 }
 
-/// Counter reset/re-entry semantics at the state level: the persisted
-/// per-step counter must survive unrelated steps' transitions, and clearing
-/// it on loop exit must give a fresh count on re-entry (no stale carry-over).
-#[test]
-fn loop_iterations_counter_survives_interleaving_and_resets_on_exit() {
-    let mut state = WorkflowState::new("run".into());
-
-    // Episode 1: three Retry iterations on `check` (crosses max_iterations=2).
-    for _ in 0..3 {
-        state
-            .loop_iterations
-            .entry("check".into())
-            .and_modify(|c| *c += 1)
-            .or_insert(1);
-    }
-    assert_eq!(state.loop_iterations.get("check"), Some(&3));
-
-    // Interleaved unrelated steps must NOT touch the `check` counter.
-    state
-        .loop_iterations
-        .entry("run".into())
-        .and_modify(|c| *c += 1)
-        .or_insert(1);
-    assert_eq!(state.loop_iterations.get("check"), Some(&3));
-    assert_eq!(state.loop_iterations.get("run"), Some(&1));
-
-    // Loop exit clears only that step's counter; a sibling loop is untouched.
-    state.loop_iterations.remove("check");
-    assert_eq!(state.loop_iterations.get("check"), None);
-
-    // Re-entry: fresh count starting at 1, not inherited from episode 1.
-    state
-        .loop_iterations
-        .entry("check".into())
-        .and_modify(|c| *c += 1)
-        .or_insert(1);
-    assert_eq!(state.loop_iterations.get("check"), Some(&1));
-}
-
 /// Backward compatibility: a persisted snapshot from before the
 /// `loop_iterations` field existed (no key in JSON) must deserialize with an
 /// empty counter map, and a snapshot that carries the key round-trips.
@@ -5310,6 +7011,96 @@ async fn loop_config_exit_route_terminates_after_max_iterations() {
     assert_eq!(result.final_message.as_deref(), Some("done"));
 }
 
+/// exit_route with the `next_on_` prefix: authors may write the route key
+/// exactly as it appears in a Senza stage's routing table (`next_on_done`),
+/// and the engine strips the prefix before matching the declarative
+/// Label("done") edge. Identical shape to the test above but with the
+/// prefixed exit_route — if the `strip_prefix("next_on_")` behavior were
+/// removed, the label "next_on_done" would match no edge and the engine
+/// would fail with "exit_route 'next_on_done' has no matching edge" instead
+/// of reaching the terminal.
+#[tokio::test]
+async fn loop_config_exit_route_with_next_on_prefix_strips_to_label() {
+    let visited = visit_log();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    // Exactly enough responses for 3 run + 3 check visits. The mock serves
+    // fallback text once dry (it does not fail), so the visit-count
+    // assertion below is the real bound.
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("run 1"),
+        MockResponse::text("check 1"),
+        MockResponse::text("run 2"),
+        MockResponse::text("check 2"),
+        MockResponse::text("run 3"),
+        MockResponse::text("check 3"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "run".into(),
+        steps: vec![
+            Step::llm("run", "Run", "do work", vec![]),
+            // exit_route written as the Senza routing-table key; the engine
+            // strips "next_on_" and matches the Label("done") edge below.
+            loop_step("check", "Check", "validate", 2, "run", Some("next_on_done")),
+            Step::Terminal {
+                id: "done".into(),
+                name: "Done".into(),
+                exit_code: 0,
+                message: Some("done".into()),
+            },
+        ],
+        edges: vec![
+            Edge {
+                from: "run".into(),
+                to: "check".into(),
+                condition: None,
+            },
+            // The declarative exit edge (from next_on_done in Senza).
+            Edge {
+                from: "check".into(),
+                to: "done".into(),
+                condition: Some(EdgeCondition::Label("done".into())),
+            },
+        ],
+    };
+    let config = engine_config(dir.path(), client);
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(AlwaysRetryJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_max_retries(0);
+    let result = engine.run().await.unwrap();
+
+    let check_visits = visit_count(&visited, "check");
+    assert_eq!(
+        check_visits, 3,
+        "loop must run exactly max_iterations=2 iterations plus the exhausting visit"
+    );
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Succeeded,
+        "'next_on_done' exit_route must strip the prefix and route to the terminal"
+    );
+    // TaskResult comes from the Terminal short-circuit (exit_code 0).
+    assert_eq!(result.final_message.as_deref(), Some("done"));
+    // The exhausting check record's transition must have been rewritten to
+    // the resolved exit jump.
+    let history = engine.step_history().await;
+    let check_record = history
+        .iter()
+        .rev()
+        .find(|r| r.step_id.as_str() == "check")
+        .unwrap();
+    assert!(matches!(
+        &check_record.transition,
+        Transition::To(target) if target == "done"
+    ));
+}
+
 /// Route-key / Transition::To loop continuation: a LoopConfig-carrying step
 /// that routes To(target_stage) counts as a loop iteration and must exhaust
 /// at max_iterations, then follow exit_route. Research Agent shape:
@@ -5351,6 +7142,84 @@ async fn to_based_cross_node_loop_reaches_max_iterations_and_exits() {
         "exhausted To-loop must exit via exit_route to the terminal step"
     );
     assert_eq!(result.final_message.as_deref(), Some("done"));
+}
+
+/// Ordinary Retry/max_retries safety valve WITHOUT LoopConfig: a plain step
+/// whose judge always returns Retry must be bounded by the engine's generic
+/// consecutive-Retry counter, not by max_steps. max_retries=2 permits two
+/// Retries, so the step executes exactly 3 times and the run fails with
+/// "max_retries (2) exceeded". Guards the invariant that the LoopConfig
+/// continuation path did not swallow or widen the non-LoopConfig Retry
+/// fallback (a too-broad LoopConfig match or a broken consecutive-Retry
+/// scan would instead run until max_steps and fail with a different error).
+#[tokio::test]
+async fn plain_step_retry_without_loop_config_fails_at_max_retries() {
+    let visited = visit_log();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    // Exactly enough responses for THREE check visits (the original
+    // execution plus the two permitted Retries). The mock serves fallback
+    // text once dry (it does not fail), so the visit-count assertion below
+    // is the real bound.
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("check 1"),
+        MockResponse::text("check 2"),
+        MockResponse::text("check 3"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "check".into(),
+        steps: vec![
+            Step::llm("check", "Check", "validate", vec![]),
+            // Second step + edge keep the workflow out of the free-task
+            // short-circuit in decide_transition (single step, no edges),
+            // so the judge is actually consulted for `check`.
+            Step::llm("run", "Run", "do work", vec![]),
+        ],
+        edges: vec![Edge {
+            from: "check".into(),
+            to: "run".into(),
+            condition: None,
+        }],
+    };
+    let config = engine_config(dir.path(), client);
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(AlwaysRetryJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_max_retries(2);
+    let run = engine.run().await;
+    let check_visits = visit_count(&visited, "check");
+    assert_eq!(
+        check_visits, 3,
+        "max_retries=2 permits two Retries: one original execution plus two re-runs; got \
+         {check_visits} visits"
+    );
+    match &run {
+        Err(WorkflowError::TaskFailed(msg)) => {
+            assert!(
+                msg.contains("max_retries (2) exceeded"),
+                "ordinary Retry exhaustion must fail via the generic max_retries valve; got: {msg}"
+            );
+        }
+        other => panic!("expected TaskFailed from max_retries exhaustion, got {other:?}"),
+    }
+    assert_eq!(
+        engine.state().await,
+        WorkflowStatus::Failed,
+        "max_retries exhaustion must fail the workflow"
+    );
+    // Exactly three consecutive Retry records for the step.
+    let history = engine.step_history().await;
+    assert_eq!(history.len(), 3);
+    assert!(
+        history
+            .iter()
+            .all(|r| r.step_id == "check" && matches!(r.transition, Transition::Retry))
+    );
 }
 
 #[tokio::test]
@@ -5425,8 +7294,9 @@ async fn loop_config_max_iterations_zero_exits_on_first_continuation() {
     let visited = visit_log();
 
     let dir = tempfile::TempDir::new().unwrap();
-    // Exactly enough responses for ONE run + ONE check visit: any extra
-    // loop continuation runs the mock dry and fails the test.
+    // Exactly enough responses for ONE run + ONE check visit. The mock
+    // serves fallback text once dry (it does not fail), so the exact
+    // visit-order assertion below is the real bound.
     let client = Arc::new(MockLlmClient::new(vec![
         MockResponse::text("run 1"),
         MockResponse::text("check 1"),
@@ -5515,10 +7385,11 @@ async fn loop_config_max_iterations_zero_exits_on_first_continuation() {
 #[tokio::test]
 async fn loop_config_max_iterations_zero_without_exit_route_fails_explicitly() {
     let visited = visit_log();
-
     let dir = tempfile::TempDir::new().unwrap();
-    // Exactly 2 responses: one run + one check. An unbounded loop would
-    // run the mock dry; a max_retries fall-through would show the
+
+    // Exactly 2 responses: one run + one check. The mock serves fallback
+    // text once dry (it does not fail), so the exact visit-count assertion
+    // below is the real bound; a max_retries fall-through would show the
     // "max_retries (0) exceeded" message instead.
     let client = Arc::new(MockLlmClient::new(vec![
         MockResponse::text("run 1"),
@@ -5592,8 +7463,9 @@ async fn to_based_loop_max_iterations_zero_exits_on_first_continuation() {
     let visited = visit_log();
 
     let dir = tempfile::TempDir::new().unwrap();
-    // Exactly 2 responses: one search + one vet. Any To-loop continuation
-    // would run the mock dry and fail the test.
+    // Exactly 2 responses: one search + one vet. The mock serves fallback
+    // text once dry (it does not fail), so the exact visit-order assertion
+    // below is the real bound.
     let client = Arc::new(MockLlmClient::new(vec![
         MockResponse::text("search 1"),
         MockResponse::text("vet 1"),
@@ -5685,8 +7557,9 @@ async fn exhausted_loop_reentry_gets_fresh_budget() {
 
     let dir = tempfile::TempDir::new().unwrap();
     // Exactly enough responses for both episodes: per episode 3× run +
-    // 3× check (2 continuations + the exhausting attempt) + 1× bridge.
-    // Any extra continuation runs the mock dry and fails the test.
+    // 3× check (2 continuations + the exhausting attempt) + 1× bridge. The
+    // mock serves fallback text once dry (it does not fail), so the exact
+    // visit-count assertion below is the real bound.
     let client = Arc::new(MockLlmClient::new(vec![
         MockResponse::text("run 1"),
         MockResponse::text("check 1"),
@@ -6442,6 +8315,110 @@ struct CrashBeforeStateSaveStore {
     crashes_remaining: AtomicUsize,
 }
 
+/// State store whose first matching save can be held before its durable
+/// commit: the caller times out waiting for the save while the save itself
+/// later commits. This models a slow TaskStore save that outlives the
+/// caller's persistence deadline, not backend reordering — ordering among
+/// saves is enforced engine-side by the single-worker FIFO persistence
+/// lane.
+struct ReorderingStateStore {
+    inner: Arc<JsonlTaskStore>,
+    durable_state: parking_lot::Mutex<Option<WorkflowState>>,
+    should_block: Arc<dyn Fn(&WorkflowState) -> bool + Send + Sync>,
+    block_available: AtomicBool,
+    blocked_started: Notify,
+    release_blocked: Notify,
+    blocked_finished: Notify,
+    search_committed: Notify,
+    /// Total number of `save_workflow_state` invocations; incremented at
+    /// method entry. Test-only drain/count probe: a completed later save
+    /// implies all earlier FIFO requests already committed.
+    save_count: AtomicUsize,
+}
+
+impl TaskStore for ReorderingStateStore {
+    fn load_workflow_state(
+        &self,
+        _task_id: &TaskId,
+    ) -> BoxFuture<'_, Result<Option<WorkflowState>>> {
+        let state = self.durable_state.lock().clone();
+        Box::pin(async move { Ok(state) })
+    }
+
+    fn save_workflow_state(
+        &self,
+        _task_id: &TaskId,
+        state: &WorkflowState,
+    ) -> BoxFuture<'_, Result<()>> {
+        self.save_count.fetch_add(1, Ordering::SeqCst);
+        let state = state.clone();
+        let should_block = (self.should_block)(&state)
+            && self
+                .block_available
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+        Box::pin(async move {
+            if should_block {
+                self.blocked_started.notify_one();
+                self.release_blocked.notified().await;
+            }
+            let committed_search = state.current_step == "search";
+            *self.durable_state.lock() = Some(state);
+            if should_block {
+                self.blocked_finished.notify_one();
+            }
+            if committed_search {
+                self.search_committed.notify_one();
+            }
+            Ok(())
+        })
+    }
+
+    fn load_workflow(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Option<Workflow>>> {
+        self.inner.load_workflow(task_id)
+    }
+
+    fn save_workflow(&self, task_id: &TaskId, workflow: &Workflow) -> BoxFuture<'_, Result<()>> {
+        self.inner.save_workflow(task_id, workflow)
+    }
+
+    fn list_checkpoints(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Vec<Checkpoint>>> {
+        self.inner.list_checkpoints(task_id)
+    }
+
+    fn save_checkpoint(
+        &self,
+        task_id: &TaskId,
+        checkpoint: &Checkpoint,
+    ) -> BoxFuture<'_, Result<()>> {
+        self.inner.save_checkpoint(task_id, checkpoint)
+    }
+
+    fn load_event_wait(&self, task_id: &TaskId) -> BoxFuture<'_, Result<Option<EventWaitRecord>>> {
+        self.inner.load_event_wait(task_id)
+    }
+
+    fn save_event_wait(
+        &self,
+        task_id: &TaskId,
+        descriptor: &serde_json::Value,
+    ) -> BoxFuture<'_, Result<()>> {
+        self.inner.save_event_wait(task_id, descriptor)
+    }
+
+    fn clear_event_wait(&self, task_id: &TaskId) -> BoxFuture<'_, Result<()>> {
+        self.inner.clear_event_wait(task_id)
+    }
+
+    fn delete(&self, task_id: &TaskId) -> BoxFuture<'_, Result<()>> {
+        self.inner.delete(task_id)
+    }
+
+    fn list_tasks(&self) -> BoxFuture<'_, Result<Vec<TaskSummary>>> {
+        self.inner.list_tasks()
+    }
+}
+
 impl TaskStore for CrashBeforeStateSaveStore {
     fn load_workflow_state(
         &self,
@@ -7038,6 +9015,292 @@ async fn loop_exhaustion_store_error_retries_terminal_persist_without_owner_repl
     ));
 }
 
+/// Cancellation is a newer logical snapshot than an in-flight LoopConfig
+/// continuation. Even when the store permits the older save to finish last,
+/// durable state must not regress from Cancelled back to Running.
+#[tokio::test]
+async fn cancel_during_loop_continuation_persist_cannot_restore_stale_running_state() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(ReorderingStateStore {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        durable_state: parking_lot::Mutex::new(None),
+        should_block: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Running
+                && state.loop_iterations.get("check") == Some(&1)
+                && state.step_history.last().is_some_and(|record| {
+                    record.step_id == "check"
+                        && matches!(&record.transition, Transition::To(next) if next == "search")
+                })
+        }),
+        block_available: AtomicBool::new(true),
+        blocked_started: Notify::new(),
+        release_blocked: Notify::new(),
+        blocked_finished: Notify::new(),
+        search_committed: Notify::new(),
+        save_count: AtomicUsize::new(0),
+    });
+    let visited = visit_log();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("check 1")]));
+    let workflow = Workflow {
+        entry_step: "check".into(),
+        steps: vec![
+            loop_step("check", "Check", "validate", 1, "search", None),
+            Step::terminal("search", "Search", 0, Some("unused".into())),
+        ],
+        edges: vec![Edge {
+            from: "check".into(),
+            to: "search".into(),
+            condition: None,
+        }],
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            engine_config(dir.path(), client.clone()),
+            Arc::new(AlwaysRetryJudge {
+                visited: visited.clone(),
+            }),
+        )
+        .unwrap()
+        .with_task_store(store.clone()),
+    );
+    let task_id = engine.task_id().clone();
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+
+    store.blocked_started.notified().await;
+
+    // Poll cancel once. Without engine ordering, its in-memory save completes
+    // immediately. With ordering, it waits behind the retained older save.
+    let cancel = engine.cancel("stop during persistence");
+    tokio::pin!(cancel);
+    let cancel_ready = match futures::poll!(&mut cancel) {
+        std::task::Poll::Ready(result) => {
+            result.unwrap();
+            true
+        }
+        std::task::Poll::Pending => false,
+    };
+    store.release_blocked.notify_one();
+    if !cancel_ready {
+        cancel.await.unwrap();
+    }
+
+    runner.await.unwrap().unwrap();
+    assert_eq!(*visited.lock(), vec!["check"]);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+
+    let restored = WorkflowEngine::restore(
+        store,
+        task_id,
+        engine_config(dir.path(), Arc::new(MockLlmClient::new(vec![]))),
+        Arc::new(NoopJudge),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.state().await, WorkflowStatus::Cancelled);
+}
+
+/// A persistence deadline bounds the caller's wait while the owned save keeps
+/// its ordering position. A late completion must precede, never overwrite, the
+/// newer startup-recovery snapshot.
+#[tokio::test]
+async fn loop_continuation_persist_timeout_retains_order_and_budget_on_retry() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(ReorderingStateStore {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        durable_state: parking_lot::Mutex::new(None),
+        should_block: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Running
+                && state.current_step == "check"
+                && state.loop_iterations.get("check") == Some(&1)
+                && state.step_history.last().is_some_and(|record| {
+                    record.step_id == "check"
+                        && matches!(&record.transition, Transition::To(next) if next == "search")
+                })
+        }),
+        block_available: AtomicBool::new(true),
+        blocked_started: Notify::new(),
+        release_blocked: Notify::new(),
+        blocked_finished: Notify::new(),
+        search_committed: Notify::new(),
+        save_count: AtomicUsize::new(0),
+    });
+    let visited = visit_log();
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("check 1")]));
+    let workflow = Workflow {
+        entry_step: "check".into(),
+        steps: vec![
+            loop_step("check", "Check", "validate", 2, "search", None),
+            Step::executor("search", "Search", "blocking", None),
+        ],
+        edges: vec![Edge {
+            from: "check".into(),
+            to: "search".into(),
+            condition: None,
+        }],
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            engine_config(dir.path(), client.clone()),
+            Arc::new(AlwaysRetryJudge {
+                visited: visited.clone(),
+            }),
+        )
+        .unwrap()
+        .with_task_store(store.clone())
+        .with_executor("blocking", Arc::new(BlockingExecutor))
+        .with_persistence_timeout(std::time::Duration::from_millis(20)),
+    );
+
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    store.blocked_started.notified().await;
+    assert!(matches!(
+        runner.await.unwrap(),
+        Err(WorkflowError::StoreTimeout { .. })
+    ));
+    assert!(!engine.running.load(Ordering::SeqCst));
+
+    let pending = engine.workflow_state.lock().await.clone();
+    assert_eq!(pending.status, WorkflowStatus::Running);
+    assert_eq!(pending.current_step, "check");
+    assert_eq!(pending.loop_iterations.get("check"), Some(&1));
+    assert!(matches!(
+        &pending.step_history.last().unwrap().transition,
+        Transition::To(next) if next == "search"
+    ));
+
+    // Drive recovery once while the timed-out save still owns the persistence
+    // lane. It must wait rather than overtaking the older operation.
+    {
+        let retry = engine.run();
+        tokio::pin!(retry);
+        assert!(matches!(
+            futures::poll!(&mut retry),
+            std::task::Poll::Pending
+        ));
+        store.release_blocked.notify_one();
+        store.blocked_finished.notified().await;
+        assert!(matches!(
+            futures::poll!(&mut retry),
+            std::task::Poll::Pending
+        ));
+        store.search_committed.notified().await;
+
+        let durable = store
+            .load_workflow_state(engine.task_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, WorkflowStatus::Running);
+        assert_eq!(durable.current_step, "search");
+        assert_eq!(durable.loop_iterations.get("check"), Some(&1));
+        assert_eq!(*visited.lock(), vec!["check"]);
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+    }
+    assert!(!engine.running.load(Ordering::SeqCst));
+}
+
+/// A terminal persistence timeout follows the same pending-failure recovery
+/// path as StoreError. Retrying finalizes the recorded exhaustion without
+/// executing its owner or granting another LoopConfig iteration.
+#[tokio::test]
+async fn loop_terminal_persist_timeout_remains_retryable_without_owner_replay() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(ReorderingStateStore {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        durable_state: parking_lot::Mutex::new(None),
+        should_block: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Failed
+                && state.error.as_ref().is_some_and(|error| {
+                    matches!(error, TaskError::Internal(message) if message.contains("no exit_route configured"))
+                })
+        }),
+        block_available: AtomicBool::new(true),
+        blocked_started: Notify::new(),
+        release_blocked: Notify::new(),
+        blocked_finished: Notify::new(),
+        search_committed: Notify::new(),
+        save_count: AtomicUsize::new(0),
+    });
+    let visited = visit_log();
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("check continuation"),
+        MockResponse::text("check exhaustion"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "check".into(),
+        steps: vec![loop_step("check", "Check", "validate", 1, "check", None)],
+        edges: vec![Edge {
+            from: "check".into(),
+            to: "check".into(),
+            condition: None,
+        }],
+    };
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            workflow,
+            engine_config(dir.path(), client.clone()),
+            Arc::new(AlwaysRetryJudge {
+                visited: visited.clone(),
+            }),
+        )
+        .unwrap()
+        .with_task_store(store.clone())
+        .with_persistence_timeout(std::time::Duration::from_millis(20)),
+    );
+
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    store.blocked_started.notified().await;
+    assert!(matches!(
+        runner.await.unwrap(),
+        Err(WorkflowError::StoreTimeout { .. })
+    ));
+    assert!(!engine.running.load(Ordering::SeqCst));
+
+    let pending = engine.workflow_state.lock().await.clone();
+    assert_eq!(pending.status, WorkflowStatus::Running);
+    assert!(pending.error.is_none());
+    assert!(pending.ended_at.is_none());
+    assert!(pending.loop_iterations.is_empty());
+    assert!(matches!(
+        &pending.step_history.last().unwrap().transition,
+        Transition::Fail { reason } if reason.contains("no exit_route configured")
+    ));
+
+    store.release_blocked.notify_one();
+    store.blocked_finished.notified().await;
+    let result = engine.run().await;
+    assert!(
+        matches!(result, Err(WorkflowError::TaskFailed(ref reason)) if reason.contains("no exit_route configured")),
+        "pending terminal retry returned {result:?}"
+    );
+    assert_eq!(*visited.lock(), vec!["check", "check"]);
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 2);
+
+    let durable = store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, WorkflowStatus::Failed);
+    assert!(durable.loop_iterations.is_empty());
+    assert!(durable.ended_at.is_some());
+    assert!(matches!(
+        &durable.step_history.last().unwrap().transition,
+        Transition::Fail { reason } if reason.contains("no exit_route configured")
+    ));
+}
+
 /// Pending terminal persistence can fail repeatedly. Each failed attempt must
 /// leave the same completed exhaustion retryable without replaying its owner.
 #[tokio::test]
@@ -7219,26 +9482,393 @@ async fn unresolved_exit_route_store_error_retries_terminal_persist_without_owne
     ));
 }
 
-/// Counter isolation: an unrelated step's To transition to the same target
-/// must not increment another step's loop counter. Only the LoopConfig-
-/// carrying step's own To(target_stage) counts.
-#[test]
-fn unrelated_to_to_same_target_does_not_count_as_loop_iteration() {
-    let mut state = WorkflowState::new("search".into());
+/// `fail_task` must never replace the original step failure with a
+/// persistence-lane timeout acquired before any mutation. When admission is
+/// congested, the failure reason is retained in RAM and surfaced as
+/// TaskFailed; a same-engine retry dead-ends in the Failed status instead of
+/// re-executing the already-failed step (duplicate side effects).
+#[tokio::test]
+async fn fail_task_admission_timeout_preserves_failure_and_replay_dead_ends() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    /// Executor that fails on every attempt, parking on a Notify gate after
+    /// incrementing the counter so the test can congest the persistence
+    /// lane before `fail_task` runs.
+    struct GatedFailingExecutor {
+        attempts: Arc<AtomicUsize>,
+        entered: Notify,
+        release: Notify,
+    }
+    impl StepExecutor for GatedFailingExecutor {
+        fn execute<'a>(&'a self, _ctx: &'a ExecutorCtx<'a>) -> BoxFuture<'a, Result<StepResult>> {
+            Box::pin(async move {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                self.entered.notify_one();
+                self.release.notified().await;
+                anyhow::bail!("transient executor failure");
+            })
+        }
+    }
+    let executor = Arc::new(GatedFailingExecutor {
+        attempts: attempts.clone(),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("unused")]));
+    let workflow = Workflow {
+        entry_step: "run".into(),
+        steps: vec![Step::executor("run", "Run", "gated-flaky", None)],
+        edges: vec![],
+    };
+    let mut engine = WorkflowEngine::new(
+        workflow,
+        engine_config(dir.path(), client),
+        Arc::new(NoopJudge),
+    )
+    .unwrap()
+    .with_task_store(store.clone())
+    .with_executor("gated-flaky", executor.clone());
+    // Shrink the persistence deadline so the congested fail_task admission
+    // times out promptly instead of hanging the test.
+    engine.persistence_timeout = std::time::Duration::from_millis(20);
+    let permits_lane = engine.persistence_permits.clone();
+    let engine = Arc::new(engine);
 
-    // `other` routes To(search) — search has no LoopConfig, and even if some
-    // third step carried one for target "search", THIS transition originates
-    // from `other`, not from the LoopConfig-carrying step.
-    state
-        .loop_iterations
-        .entry("vet".into())
-        .and_modify(|c| *c += 1)
-        .or_insert(1);
-    assert_eq!(state.loop_iterations.get("vet"), Some(&1));
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    // Park the step mid-execution, then exhaust every persistence permit so
+    // the subsequent fail_task admission cannot acquire one.
+    executor.entered.notified().await;
+    let mut held: Vec<tokio::sync::OwnedSemaphorePermit> =
+        Vec::with_capacity(DEFAULT_PERSISTENCE_CAPACITY);
+    for _ in 0..DEFAULT_PERSISTENCE_CAPACITY {
+        held.push(permits_lane.clone().acquire_owned().await.unwrap());
+    }
+    executor.release.notify_one();
+    let first = runner.await.unwrap();
+    drop(held);
+    assert!(
+        matches!(&first, Err(WorkflowError::TaskFailed(message)) if message.contains("transient executor failure")),
+        "congested fail_task must surface the original failure, got {first:?}"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
-    // A To from a different source (`fresh_entry`) is a separate episode and
-    // must not be visible in `vet`'s counter.
-    assert_eq!(state.loop_iterations.get("fresh_entry"), None);
+    // RAM retains the failure marks: a same-engine retry must dead-end in
+    // InvalidStatus rather than re-executing the failed step.
+    let pending = engine.workflow_state.lock().await.clone();
+    assert_eq!(pending.status, WorkflowStatus::Failed);
+    assert!(matches!(
+        &pending.error,
+        Some(TaskError::Internal(message)) if message.contains("transient executor failure")
+    ));
+    assert!(pending.ended_at.is_some());
+    let durable = store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, WorkflowStatus::Running);
+    let retry = engine.run().await;
+    assert!(
+        matches!(
+            &retry,
+            Err(WorkflowError::InvalidStatus {
+                status: WorkflowStatus::Failed
+            })
+        ),
+        "retry after congested fail_task must not re-execute the step, got {retry:?}"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+/// A definite backend StoreError means the Failed snapshot did not commit,
+/// but does not mean the failed executor performed no external work. Keep
+/// RAM Failed so an ordinary same-engine run cannot repeat it implicitly.
+#[tokio::test]
+async fn fail_task_store_error_keeps_failed_without_executor_replay() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let inner_store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let fail_store = Arc::new(CrashBeforeStateSaveStore {
+        inner: inner_store.clone(),
+        should_crash: Arc::new(|state: &WorkflowState| {
+            state.status == WorkflowStatus::Failed
+                && state.error.as_ref().is_some_and(|error| {
+                    matches!(error, TaskError::Internal(message) if message.contains("transient executor failure"))
+                })
+        }),
+        crashes_remaining: AtomicUsize::new(1),
+    });
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("unused")]));
+    let workflow = Workflow {
+        entry_step: "run".into(),
+        steps: vec![Step::executor("run", "Run", "flaky", None)],
+        edges: vec![],
+    };
+    let engine = WorkflowEngine::new(
+        workflow,
+        engine_config(dir.path(), client),
+        Arc::new(NoopJudge),
+    )
+    .unwrap()
+    .with_task_store(fail_store)
+    .with_executor(
+        "flaky",
+        Arc::new(FlakyExecutor {
+            attempts: attempts.clone(),
+        }),
+    );
+
+    // First run: the FlakyExecutor fails, fail_task's save is rejected.
+    let first = engine.run().await;
+    assert!(
+        matches!(first, Err(WorkflowError::StoreError(_))),
+        "rejected fail_task save must surface StoreError, got {first:?}"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let pending = engine.workflow_state.lock().await.clone();
+    assert_eq!(pending.status, WorkflowStatus::Failed);
+    assert!(
+        matches!(&pending.error, Some(TaskError::Internal(message)) if message.contains("transient executor failure"))
+    );
+    assert!(pending.ended_at.is_some());
+
+    // The rejected save leaves the previous Running snapshot durable.
+    let durable = inner_store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, WorkflowStatus::Running);
+
+    let second = engine.run().await;
+    assert!(
+        matches!(
+            second,
+            Err(WorkflowError::InvalidStatus {
+                status: WorkflowStatus::Failed
+            })
+        ),
+        "retry after failed persistence must not re-execute the executor, got {second:?}"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.state().await, WorkflowStatus::Failed);
+
+    let durable = inner_store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, WorkflowStatus::Running);
+}
+
+/// A judge Fail has a pending Fail StepRecord. After a definite rejected
+/// terminal save, startup can finalize that record without running the step.
+#[tokio::test]
+async fn fail_task_judge_fail_store_error_retries_record_without_step_replay() {
+    struct FailingJudge;
+    impl StepTransitionJudge for FailingJudge {
+        fn decide<'a>(&'a self, _ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            Box::pin(async {
+                Transition::Fail {
+                    reason: "route failed".into(),
+                }
+            })
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let inner_store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let fail_store = Arc::new(CrashBeforeStateSaveStore {
+        inner: inner_store.clone(),
+        should_crash: Arc::new(|state: &WorkflowState| state.status == WorkflowStatus::Failed),
+        crashes_remaining: AtomicUsize::new(1),
+    });
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("step done")]));
+    let engine = WorkflowEngine::new(
+        Workflow {
+            entry_step: "s1".into(),
+            steps: vec![
+                Step::llm("s1", "Step 1", "do work", vec![]),
+                Step::llm("s2", "Step 2", "later", vec![]),
+            ],
+            edges: vec![Edge {
+                from: "s1".into(),
+                to: "s2".into(),
+                condition: None,
+            }],
+        },
+        engine_config(dir.path(), client.clone()),
+        Arc::new(FailingJudge),
+    )
+    .unwrap()
+    .with_task_store(fail_store);
+
+    assert!(matches!(
+        engine.run().await,
+        Err(WorkflowError::StoreError(_))
+    ));
+    let pending = engine.workflow_state.lock().await.clone();
+    assert_eq!(pending.status, WorkflowStatus::Running);
+    assert!(
+        matches!(&pending.step_history.last().unwrap().transition, Transition::Fail { reason } if reason == "route failed")
+    );
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+
+    assert!(
+        matches!(engine.run().await, Err(WorkflowError::TaskFailed(reason)) if reason == "route failed")
+    );
+    assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.state().await, WorkflowStatus::Failed);
+    assert_eq!(
+        inner_store
+            .load_workflow_state(engine.task_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Failed
+    );
+}
+
+/// A timed-out fail_task save remains queued and can commit Failed later.
+/// Retrying this same engine must not replace that terminal state with a
+/// Running startup snapshot or execute the failed step a second time.
+#[tokio::test]
+async fn fail_task_timeout_late_failed_commit_cannot_be_replayed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(ReorderingStateStore {
+        inner: Arc::new(JsonlTaskStore::new(dir.path().to_path_buf())),
+        durable_state: parking_lot::Mutex::new(None),
+        should_block: Arc::new(|state: &WorkflowState| state.status == WorkflowStatus::Failed),
+        block_available: AtomicBool::new(true),
+        blocked_started: Notify::new(),
+        release_blocked: Notify::new(),
+        blocked_finished: Notify::new(),
+        search_committed: Notify::new(),
+        save_count: AtomicUsize::new(0),
+    });
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            Workflow {
+                entry_step: "run".into(),
+                steps: vec![Step::executor("run", "Run", "flaky", None)],
+                edges: vec![],
+            },
+            engine_config(
+                dir.path(),
+                Arc::new(MockLlmClient::new(vec![MockResponse::text("unused")])),
+            ),
+            Arc::new(NoopJudge),
+        )
+        .unwrap()
+        .with_task_store(store.clone())
+        .with_executor(
+            "flaky",
+            Arc::new(FlakyExecutor {
+                attempts: attempts.clone(),
+            }),
+        )
+        .with_persistence_timeout(std::time::Duration::from_millis(20)),
+    );
+
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    store.blocked_started.notified().await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        runner.await.unwrap(),
+        Err(WorkflowError::StoreTimeout { .. })
+    ));
+    assert_eq!(engine.state().await, WorkflowStatus::Failed);
+
+    store.release_blocked.notify_one();
+    store.blocked_finished.notified().await;
+    let durable = store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, WorkflowStatus::Failed);
+
+    let retry = engine.run().await;
+    assert!(matches!(
+        retry,
+        Err(WorkflowError::InvalidStatus {
+            status: WorkflowStatus::Failed
+        })
+    ));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.state().await, WorkflowStatus::Failed);
+    let durable = store
+        .load_workflow_state(engine.task_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, WorkflowStatus::Failed);
+    assert_eq!(store.save_count.load(Ordering::SeqCst), 2);
+}
+
+/// An executor can fail before fail_task acquires the definitive state lock.
+/// If cancel finalizes in that window, fail_task must preserve Cancelled.
+#[tokio::test]
+async fn cancel_during_fail_task_admission_remains_terminal() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let store = Arc::new(JsonlTaskStore::new(dir.path().to_path_buf()));
+    let gate = Arc::new((Notify::new(), Notify::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut engine = WorkflowEngine::new(
+        Workflow {
+            entry_step: "run".into(),
+            steps: vec![Step::executor("run", "Run", "flaky", None)],
+            edges: vec![],
+        },
+        engine_config(
+            dir.path(),
+            Arc::new(MockLlmClient::new(vec![MockResponse::text("unused")])),
+        ),
+        Arc::new(NoopJudge),
+    )
+    .unwrap()
+    .with_task_store(store.clone())
+    .with_executor(
+        "flaky",
+        Arc::new(FlakyExecutor {
+            attempts: attempts.clone(),
+        }),
+    );
+    engine.fail_task_admission_gate = Some(gate.clone());
+    let engine = Arc::new(engine);
+
+    let runner = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run().await })
+    };
+    gate.0.notified().await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    engine
+        .cancel("cancel before failure admission")
+        .await
+        .unwrap();
+    gate.1.notify_one();
+    assert!(runner.await.unwrap().is_ok());
+    assert_eq!(engine.state().await, WorkflowStatus::Cancelled);
+    assert_eq!(
+        store
+            .load_workflow_state(engine.task_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        WorkflowStatus::Cancelled
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
 /// Mixed Retry + To continuation: both paths share the same persisted
@@ -7375,6 +10005,98 @@ async fn exhausted_to_loop_without_resolvable_exit_route_fails_explicitly() {
     )
     .unwrap();
     let run = engine.run().await;
+    let vet_visits = visit_count(&visited, "vet");
+    assert_eq!(
+        vet_visits, 3,
+        "To-loop must run max_iterations=2 continuations plus the exhausting visit"
+    );
+    match run {
+        Err(WorkflowError::TaskFailed(msg)) => {
+            assert!(
+                msg.contains("exit_route"),
+                "explicit failure must name the unresolvable exit_route, got: {msg}"
+            );
+        }
+        other => panic!("expected explicit TaskFailed for unresolvable exit_route, got {other:?}"),
+    }
+}
+
+/// Deadlock regression: nested persistence admission under `workflow_state`.
+/// Before permit threading, `apply_transition` held the only permit
+/// (capacity 1 here) plus the state guard while `step_loop_continuation`
+/// tried to acquire a second permit, and exhaustion further stacked a third
+/// in `persist_loop_terminal_failure` — self-deadlock at any capacity. The
+/// admitted permit must transfer through the guard-consuming helpers instead.
+/// The 10s timeout is a deadlock guard only; a healthy run finishes quickly.
+#[tokio::test]
+async fn loop_exhaustion_survives_persistence_capacity_one() {
+    use parking_lot::Mutex;
+
+    let visited = visit_log();
+
+    struct ToLoopJudge {
+        visited: Arc<Mutex<Vec<String>>>,
+    }
+    impl StepTransitionJudge for ToLoopJudge {
+        fn decide<'a>(&'a self, ctx: &StepCtx<'a>) -> BoxFuture<'a, Transition> {
+            let step_id = ctx.current_step.id().clone();
+            self.visited.lock().push(step_id.clone());
+            Box::pin(async move {
+                match step_id.as_str() {
+                    "vet" => Transition::To("search".into()),
+                    "search" => Transition::To("vet".into()),
+                    _ => Transition::Abort {
+                        reason: "end".into(),
+                    },
+                }
+            })
+        }
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let client = Arc::new(MockLlmClient::new(vec![
+        MockResponse::text("search 1"),
+        MockResponse::text("vet 1"),
+        MockResponse::text("search 2"),
+        MockResponse::text("vet 2"),
+        MockResponse::text("search 3"),
+        MockResponse::text("vet 3"),
+    ]));
+    let workflow = Workflow {
+        entry_step: "search".into(),
+        steps: vec![
+            Step::llm("search", "Search", "find sources", vec![]),
+            // Unresolvable exit_route forces the terminal-failure persist
+            // path (the former depth-3 permit stack).
+            loop_step("vet", "Vet", "vet sources", 2, "search", Some("typo")),
+        ],
+        edges: vec![
+            Edge {
+                from: "search".into(),
+                to: "vet".into(),
+                condition: None,
+            },
+            Edge {
+                from: "vet".into(),
+                to: "search".into(),
+                condition: Some(EdgeCondition::Label("research".into())),
+            },
+        ],
+    };
+    let config = engine_config(dir.path(), client);
+    let engine = WorkflowEngine::new(
+        workflow,
+        config,
+        Arc::new(ToLoopJudge {
+            visited: visited.clone(),
+        }),
+    )
+    .unwrap()
+    .with_persistence_capacity(1)
+    .unwrap();
+    let run = tokio::time::timeout(std::time::Duration::from_secs(10), engine.run())
+        .await
+        .expect("loop exhaustion must not deadlock with persistence capacity 1");
     let vet_visits = visit_count(&visited, "vet");
     assert_eq!(
         vet_visits, 3,

@@ -603,7 +603,9 @@ pub struct WorkflowState {
     /// Per-`LoopConfig`-step declarative loop iteration counters
     /// (step_id → number of continuations consumed). The counter survives
     /// transitions through other steps in the same cross-node loop and is
-    /// cleared only when that loop episode exhausts. `#[serde(default)]`
+    /// cleared when the episode ends: on exhaustion, when the owner exits
+    /// the loop early (non-continuation transition), or when
+    /// `restore_from_step` truncates the active episode. `#[serde(default)]`
     /// keeps old snapshots (without this key) deserializable as an empty map.
     #[serde(default)]
     pub loop_iterations: std::collections::HashMap<StepId, u32>,
