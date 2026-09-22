@@ -372,6 +372,21 @@ impl ExecutionEnv for OsEnv {
     }
 }
 
+/// Windows App Execution Alias stub 的退出码（9009 = 命令未找到）。
+/// 已知误报：脚本自身 exit 9009 会被判为无 Python 静默 skip——接受并在此注明。
+const PYTHON_ALIAS_EXIT_CODE: i32 = 9009;
+/// Store stub 的固定 stderr 前缀（非英文 locale 可能被翻译，仅作尽力回退，9009 为主信号）。
+const PYTHON_MISSING_MARKER: &str = "Python was not found";
+
+/// 判定一次 shell 执行失败是否等于“环境没有真 Python”。
+///
+/// Windows 自带 python.exe App Execution Alias stub：spawn 成功但以
+/// [`PYTHON_ALIAS_EXIT_CODE`] 退出（F-3 实测：提示走 stderr、英文 locale 下
+/// 含 [`PYTHON_MISSING_MARKER`]）。命中即视为无 Python（调用方静默 skip）。
+fn is_missing_python(exit_code: i32, stderr: &str) -> bool {
+    exit_code == PYTHON_ALIAS_EXIT_CODE || stderr.contains(PYTHON_MISSING_MARKER)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,13 +752,20 @@ mod tests {
         let cmd = "python -c \"import sys; sys.stdout.write('A'*5000 + '\u{4e2d}')\"";
 
         let out = env.execute_shell(cmd, opts).await;
-        // Python 可能未安装——此时 spawn 返回 Io(program not found)，跳过测试。
-        // 但若 Python 存在却执行失败（如 exit_code != 0 的 ShellFailed），必须 panic：
+        // 双路径跳过语义（issue I-005）：① spawn 返回 Io(NotFound) —— 环境无 Python；
+        // ② Windows App Execution Alias stub（spawn 成功但 exit 9009）—— 假 Python，
+        // 经 is_missing_python 判定后跳过。其余 Io 错误与 ShellFailed 必须 panic：
         // 静默 return 会把命令执行失败伪装成"无 Python"，遮蔽真实问题（issue #85
         // 的 multibyte 测试就曾因引号截断导致 Python SyntaxError 被静默跳过）。
         let out = match out {
             Ok(o) => o,
-            Err(EnvError::Io(_)) => return, // 环境无 Python，跳过
+            Err(EnvError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return, // 环境无 Python
+            Err(EnvError::Io(e)) => panic!("execute_shell failed (Python should be installed): {e:?}"),
+            Err(EnvError::ShellFailed { exit_code, stderr, .. })
+                if is_missing_python(exit_code, &stderr) =>
+            {
+                return; // App Execution Alias stub（exit 9009）：无真 Python，跳过
+            }
             Err(e) => panic!("execute_shell failed (Python should be installed): {e:?}"),
         };
         assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
@@ -927,5 +949,31 @@ mod sandbox_tests {
         assert_eq!(content, "hello world");
 
         Box::new(sandbox).shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn is_missing_python_matches_alias_stub_exit_code() {
+        // Windows App Execution Alias stub：spawn 成功但 exit 9009。
+        assert!(is_missing_python(9009, ""));
+    }
+
+    #[test]
+    fn is_missing_python_matches_stderr_marker() {
+        // 字符串回退：非 9009 但 stderr 带固定前缀（尽力而为路径）。
+        assert!(is_missing_python(
+            1,
+            "Python was not found; run without arguments to install from the Microsoft Store.",
+        ));
+    }
+
+    #[test]
+    fn is_missing_python_rejects_real_failures() {
+        // Python 存在但脚本失败：不得误判为无 Python（issue #85 教训）。
+        assert!(!is_missing_python(2, "SyntaxError"));
+    }
+
+    #[test]
+    fn is_missing_python_rejects_success() {
+        assert!(!is_missing_python(0, ""));
     }
 }
