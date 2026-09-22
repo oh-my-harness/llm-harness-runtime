@@ -129,6 +129,7 @@ impl DelegateTaskTool {
             priority: crate::inbox::priority::DELEGATION,
             task_id: Some(task_id_str.clone()),
             broadcast_id: None,
+            message_id: None,
         };
         self.ctx.push_message(message).map_err(|error| {
             ToolFailure::new(

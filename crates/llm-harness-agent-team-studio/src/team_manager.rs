@@ -26,6 +26,12 @@ pub enum TeamManagerError {
     NotAGitRepo(PathBuf),
     #[error("unknown team: {0}")]
     UnknownTeam(String),
+    #[error("failed to delete team directory {path}: {source}")]
+    DeleteTeam {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("timer journal: {0}")]
     TimerJournal(#[from] TimerJournalError),
     #[error("team already registered: {0}")]
@@ -205,6 +211,22 @@ impl TeamManager {
         }
     }
 
+    /// Delete a team and its isolated data directory, including chat,
+    /// issues, memory, sessions, inbox and timers.
+    pub async fn delete(&mut self, id: &str) -> Result<(), TeamManagerError> {
+        let entry = self
+            .teams
+            .remove(id)
+            .ok_or_else(|| TeamManagerError::UnknownTeam(id.to_string()))?;
+        let data_dir = entry.data_dir().to_path_buf();
+        shutdown_entry(entry);
+        std::fs::remove_dir_all(&data_dir).map_err(|source| TeamManagerError::DeleteTeam {
+            path: data_dir.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
     /// Cleanly stop and immediately rebuild one team from its persisted spec.
     /// Pending timer rows are captured and rewritten so a deliberate restart
     /// does not lose scheduled work.
@@ -307,19 +329,18 @@ impl TeamManager {
                 let client = providers[0].1.clone();
                 providers.push((model.clone(), client));
             }
-            let spec = IndividualSpec::new(&member.id, &member.role_label, model)
-                .with_prompt(member.persona.clone())
-                .configure(|b| {
-                    let mut b = b;
-                    for tk in &member.toolkits {
-                        b = match tk.as_str() {
-                            "fs" => b.install(&llm_harness_tools::FsToolsPlugin::new(None)),
-                            "web" => b.install(&llm_harness_tools::WebToolsPlugin::default()),
-                            _ => b,
-                        };
-                    }
-                    b
-                });
+            let spec = IndividualSpec::new(&member.id, &member.role_label, model).configure(|b| {
+                let b = b.system_prompt(Some(member.persona.clone()));
+                let mut b = b;
+                for tk in &member.toolkits {
+                    b = match tk.as_str() {
+                        "fs" => b.install(&llm_harness_tools::FsToolsPlugin::new(None)),
+                        "web" => b.install(&llm_harness_tools::WebToolsPlugin::default()),
+                        _ => b,
+                    };
+                }
+                b
+            });
             entry
                 .team
                 .replace_member(&member.id, spec, providers)
@@ -342,111 +363,6 @@ impl TeamManager {
         }
         crate::team_manager::persist_spec(&self.data_root, &entry.spec);
         Ok(update)
-    }
-
-    /// Add one member to a live team and persist the updated spec.
-    pub async fn add_member(
-        &mut self,
-        team_id: &str,
-        member: crate::team_spec::MemberSpec,
-        settings: &crate::settings::Settings,
-        api_key: &str,
-    ) -> Result<(), TeamManagerError> {
-        let entry = self
-            .teams
-            .get_mut(team_id)
-            .ok_or_else(|| TeamManagerError::UnknownTeam(team_id.to_string()))?;
-        let mut prospective_spec = entry.spec.clone();
-        prospective_spec.members.push(member.clone());
-        engine::validate_spec(&prospective_spec)?;
-        engine::validate_toolkits(&member)?;
-        let model = member
-            .provider_override
-            .as_ref()
-            .and_then(|override_config| override_config.model.clone())
-            .filter(|model| !model.is_empty())
-            .unwrap_or_else(|| member.model.resolve(&settings.models));
-        let mut member_for_providers = member.clone();
-        member_for_providers.model = crate::team_spec::ModelRef::Explicit(model.clone());
-        if let Some(override_config) = member_for_providers.provider_override.as_mut()
-            && override_config
-                .api_key
-                .as_deref()
-                .map(str::is_empty)
-                .unwrap_or(false)
-        {
-            let path = self
-                .data_root
-                .join("teams")
-                .join(team_id)
-                .join("secrets")
-                .join(&member.id);
-            if let Ok(key) = std::fs::read_to_string(&path) {
-                override_config.api_key = Some(key);
-            }
-        }
-        let mut providers =
-            engine::build_member_providers(&member_for_providers, settings, api_key);
-        if providers.is_empty() {
-            providers = crate::env_cfg::providers_from_factory();
-        }
-        if providers.is_empty() {
-            return Err(TeamManagerError::NoProviders);
-        }
-        if !providers
-            .iter()
-            .any(|(provider_model, _)| provider_model == &model)
-        {
-            let client = providers[0].1.clone();
-            providers.push((model.clone(), client));
-        }
-        let spec = IndividualSpec::new(&member.id, &member.role_label, model)
-            .with_prompt(member.persona.clone())
-            .configure(|builder| {
-                let mut builder = builder;
-                for toolkit in &member.toolkits {
-                    builder = match toolkit.as_str() {
-                        "fs" => builder.install(&llm_harness_tools::FsToolsPlugin::new(None)),
-                        "web" => builder.install(&llm_harness_tools::WebToolsPlugin::default()),
-                        _ => builder,
-                    };
-                }
-                builder
-            });
-        entry.team.add_member(spec, providers).await?;
-        if let Some(context) = entry.team.social_context() {
-            let new_agent = llm_harness_agent_team::AgentId::new(&member.id);
-            for peer in entry.spec.members.iter().map(|peer| &peer.id) {
-                let peer_agent = llm_harness_agent_team::AgentId::new(peer);
-                context.ensure_contact(&new_agent, &peer_agent);
-                context.ensure_contact(&peer_agent, &new_agent);
-            }
-        }
-        entry.spec.members.push(member);
-        persist_spec(&self.data_root, &entry.spec);
-        Ok(())
-    }
-
-    /// Remove one member from a live team and persist the updated spec.
-    pub async fn remove_member(
-        &mut self,
-        team_id: &str,
-        member_id: &str,
-    ) -> Result<(), TeamManagerError> {
-        let entry = self
-            .teams
-            .get_mut(team_id)
-            .ok_or_else(|| TeamManagerError::UnknownTeam(team_id.to_string()))?;
-        let index = entry
-            .spec
-            .members
-            .iter()
-            .position(|member| member.id == member_id)
-            .ok_or_else(|| TeamManagerError::UnknownMember(member_id.to_string()))?;
-        entry.team.remove_member(member_id).await?;
-        entry.spec.members.remove(index);
-        persist_spec(&self.data_root, &entry.spec);
-        Ok(())
     }
 
     /// Apply the current template to members that still match the creation
@@ -972,6 +888,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_chat_history_survives_restart() {
+        let _factory = install_mock_factory();
+        let root = unique_dir("ct-tm-chat-restart");
+        let mut tm = TeamManager::new(&root);
+        tm.create(blank_spec(), None, &settings(), "")
+            .await
+            .unwrap();
+        let operator = llm_harness_agent_team::AgentId::new("operator");
+        let member_a = llm_harness_agent_team::AgentId::new("a");
+
+        let ctx = tm.get("t").unwrap().team.social_context().unwrap().clone();
+        let broadcast = ctx
+            .broadcast_with_message_id(&operator, "group prompt", None)
+            .unwrap();
+        ctx.send_direct_with_message_id(
+            &member_a,
+            &operator,
+            "group reply",
+            0,
+            None,
+            Some(broadcast.broadcast_id),
+            None,
+        )
+        .unwrap();
+        ctx.send_direct_with_message_id(
+            &operator,
+            &member_a,
+            "private note",
+            llm_harness_agent_team::priority::OPERATOR,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        tm.shutdown("t").await.unwrap();
+        let persisted_specs = list_persisted(&root);
+        assert_eq!(persisted_specs.len(), 1);
+        let mut restored = TeamManager::new(&root);
+        restored
+            .create(
+                persisted_specs[0].clone(),
+                persisted_specs[0].repo_hint(),
+                &settings(),
+                "",
+            )
+            .await
+            .unwrap();
+
+        let ctx = restored
+            .get("t")
+            .unwrap()
+            .team
+            .social_context()
+            .unwrap()
+            .clone();
+        let group = ctx.group_history_entries(10, None).unwrap();
+        assert_eq!(
+            group
+                .iter()
+                .map(|entry| entry.message.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["group prompt", "group reply"]
+        );
+        let private = ctx
+            .private_history_entries(&operator, &member_a, 10, None)
+            .unwrap();
+        assert_eq!(private.len(), 1);
+        assert_eq!(private[0].message.body, "private note");
+    }
+
+    #[tokio::test]
+    async fn delete_removes_chat_history_before_recreating_same_id() {
+        let _factory = install_mock_factory();
+        let root = unique_dir("ct-tm-chat-delete");
+        let mut tm = TeamManager::new(&root);
+        let spec = blank_spec();
+        tm.create(spec.clone(), None, &settings(), "")
+            .await
+            .unwrap();
+        let operator = llm_harness_agent_team::AgentId::new("operator");
+        let ctx = tm.get("t").unwrap().team.social_context().unwrap().clone();
+        ctx.broadcast_with_message_id(&operator, "old conversation", None)
+            .unwrap();
+        tm.delete("t").await.unwrap();
+        assert!(!root.join("teams").join("t").exists());
+
+        tm.create(spec, None, &settings(), "").await.unwrap();
+        let ctx = tm.get("t").unwrap().team.social_context().unwrap().clone();
+        assert!(ctx.group_history_entries(10, None).unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn persisted_team_restarts_with_issues_contacts_and_runner() {
         let _factory = env_cfg::install_test_provider_factory(std::sync::Arc::new(|| {
             vec![(
@@ -1210,7 +1219,7 @@ mod tests {
         loop {
             match event_rx.try_recv() {
                 Ok(event)
-                    if event.contains("\"operator_msg\"")
+                    if event.contains("\"team_message\"")
                         && event.contains("operator ack test") =>
                 {
                     break;
