@@ -96,6 +96,10 @@ impl FirecrackerJailerConfig {
         &self.jailer_binary_path
     }
 
+    pub fn firecracker_binary_path(&self) -> &Path {
+        &self.firecracker_binary_path
+    }
+
     pub fn uid(&self) -> u32 {
         self.uid
     }

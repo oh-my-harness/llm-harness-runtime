@@ -209,7 +209,14 @@ vsock socket from a symlink-free run directory, validates host files and
 resource limits, and preflights that no lifecycle artifact already exists.
 `FirecrackerLifecycle::start` combines image allocation, process launch, and
 readiness polling; startup failure, explicit graceful/force stop, and drop clean
-process and image artifacts. This is not yet a production VM lifecycle backend:
+process and image artifacts. With an optional `FirecrackerJailerConfig`, the
+lifecycle derives all VM artifacts inside the jailer chroot, creates the chroot
+with `openat`/`mkdirat` while rejecting symlinks, stages the kernel and private
+rootfs, assigns the staged resources to the configured non-root uid/gid, and
+launches through `FirecrackerProcess::start_jailed`. Explicit stop, startup
+failure, and drop remove process artifacts and recursively remove the jail
+through directory descriptors rather than host-path traversal. This is not yet
+a complete production VM lifecycle backend:
 `FirecrackerJailerConfig` now builds and validates Linux jailer command
 arguments, including the upstream 1–64 byte alphanumeric/hyphen ID constraint,
 cgroup and resource-limit formats, chroot-directory derivation, and translation
@@ -219,21 +226,22 @@ Firecracker arguments after `--`. It intentionally omits `--daemonize` and
 jail-relative VM configuration, writes the config file exclusively with mode
 `0600`, changes its ownership to the jailed uid/gid, launches the configured
 jailer binary, and reuses readiness plus API/config cleanup through the host
-paths inside the chroot. Callers must pre-create and stage the chroot and its
-kernel/rootfs/vsock resources; this primitive does not create or remove the
-chroot and does not clean jailer-created cgroups. Jailed lifecycle integration
-remains future work, along with guest-agent-coordinated shutdown confirmation,
-registry recovery, network policy, and deployment validation.
+paths inside the chroot. The process primitive itself still requires a staged
+chroot; lifecycle composition now provides that staging. Jail lifecycle cleanup
+does not remove jailer-created cgroups, and guest-agent-coordinated shutdown
+confirmation, registry recovery, network policy, and deployment validation
+remain future work.
 
 ## Current status
 
 This document selects Firecracker and defines the required threat model. The
 transport-independent guest-agent wire protocol, AF_VSOCK transport, guest
 filesystem/process handlers, guest binary, host client, and initial
-Firecracker configuration/process/image/lifecycle primitives and the jailer
-command-configuration primitive are implemented. They are not yet assembled
-into a complete production VM backend with jailed lifecycle integration,
+Firecracker configuration/process/image/lifecycle primitives, the jailer
+command-configuration primitive, and initial jailed lifecycle staging are
+implemented. They are not yet assembled into a complete production VM backend,
 network policy, registry recovery, end-to-end gateway integration,
 guest-agent-coordinated shutdown confirmation, or deployment validation. The
-Bwrap gateway remains the only implemented remote execution backend, and #193
-remains open until those requirements are complete.
+Bwrap gateway remains the only implemented remote execution backend. Issue
+#193 is closed; the VM backend and deployment work continues under #207 and its
+related production hardening issues.

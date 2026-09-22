@@ -7,6 +7,8 @@ pub mod image;
 #[cfg(target_os = "linux")]
 pub use image::{FirecrackerImage, FirecrackerImageAllocator, FirecrackerImageError};
 #[cfg(target_os = "linux")]
+mod jail;
+#[cfg(target_os = "linux")]
 pub mod jailer;
 #[cfg(target_os = "linux")]
 pub use jailer::{
