@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use llm_harness_platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
-use llm_harness_sandbox_gateway::{GatewayConfig, GatewayPrincipalConfig, SandboxGateway};
+use llm_harness_sandbox_gateway::{
+    FirecrackerBackendConfig, GatewayBackend, GatewayConfig, GatewayPrincipalConfig, SandboxGateway,
+};
 use llm_harness_sandbox_remote::protocol::RemoteSandboxState;
 use llm_harness_sandbox_remote::{
     RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig, RemoteSandboxConfig,
@@ -98,6 +100,145 @@ fn private_tempdir() -> tempfile::TempDir {
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
         .expect("gateway work root permissions");
     directory
+}
+
+#[test]
+fn gateway_defaults_to_the_bwrap_backend() {
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)]).expect("gateway config");
+    assert!(matches!(config.backend(), GatewayBackend::Bwrap));
+}
+
+#[test]
+fn gateway_validates_a_firecracker_backend_at_construction() {
+    let root = private_tempdir();
+    for name in ["firecracker", "vmlinux", "rootfs-base.ext4"] {
+        std::fs::write(root.path().join(name), b"artifact").expect("write Firecracker artifact");
+    }
+    let mut permissions = std::fs::metadata(root.path().join("firecracker"))
+        .expect("binary metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(root.path().join("firecracker"), permissions)
+        .expect("make Firecracker binary executable");
+
+    let backend = firecracker_backend(root.path(), 3);
+    let work_root = private_tempdir();
+    let _gateway = SandboxGateway::new(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_work_root(work_root.path().to_path_buf())
+            .with_backend(backend),
+    )
+    .expect("valid Firecracker gateway");
+}
+
+#[test]
+fn gateway_rejects_a_relative_firecracker_path() {
+    let backend = GatewayBackend::Firecracker(FirecrackerBackendConfig {
+        binary_path: PathBuf::from("firecracker"),
+        kernel_image_path: PathBuf::from("/vmlinux"),
+        base_image_path: PathBuf::from("/rootfs.ext4"),
+        max_vcpu_count: 1,
+        max_memory_mib: 128,
+        vsock_guest_cid_base: 3,
+        guest_agent_port: 6000,
+        readiness_timeout: Duration::from_secs(1),
+    });
+
+    let work_root = private_tempdir();
+    let error = match SandboxGateway::new(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_work_root(work_root.path().to_path_buf())
+            .with_backend(backend),
+    ) {
+        Ok(_) => panic!("relative Firecracker binary accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("binary path must be absolute"));
+}
+
+#[test]
+fn gateway_rejects_vsock_cid_capacity_overflow() {
+    let root = private_tempdir();
+    for name in ["firecracker", "vmlinux", "rootfs-base.ext4"] {
+        std::fs::write(root.path().join(name), b"artifact").expect("write Firecracker artifact");
+    }
+    let mut permissions = std::fs::metadata(root.path().join("firecracker"))
+        .expect("binary metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(root.path().join("firecracker"), permissions)
+        .expect("make Firecracker binary executable");
+
+    let backend = firecracker_backend(root.path(), u32::MAX);
+
+    let work_root = private_tempdir();
+    let error = match SandboxGateway::new(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_work_root(work_root.path().to_path_buf())
+            .with_max_sandboxes(2)
+            .with_backend(backend),
+    ) {
+        Ok(_) => panic!("Firecracker CID capacity overflow accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("vsock CID capacity"));
+}
+
+#[tokio::test]
+async fn firecracker_backend_rejects_sandbox_creation_without_bwrap_fallback() {
+    let root = private_tempdir();
+    for name in ["firecracker", "vmlinux", "rootfs-base.ext4"] {
+        std::fs::write(root.path().join(name), b"artifact").expect("write Firecracker artifact");
+    }
+    let mut permissions = std::fs::metadata(root.path().join("firecracker"))
+        .expect("binary metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(root.path().join("firecracker"), permissions)
+        .expect("make Firecracker binary executable");
+    let work_root = private_tempdir();
+    let gateway = start_gateway_with_config(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_work_root(work_root.path().to_path_buf())
+            .with_backend(firecracker_backend(root.path(), 3)),
+    )
+    .await;
+
+    let error =
+        match RemoteSandbox::connect(sandbox_config(), remote_client(&gateway.base_url, TOKEN_A))
+            .await
+        {
+            Ok(_) => panic!("Firecracker backend must not fall back to Bwrap"),
+            Err(error) => error,
+        };
+    assert!(
+        error
+            .to_string()
+            .contains("Firecracker backend execution is not integrated yet")
+    );
+    assert_eq!(
+        std::fs::read_dir(work_root.path().join("sandboxes"))
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        0
+    );
+}
+
+fn firecracker_backend(root: &Path, vsock_guest_cid_base: u32) -> GatewayBackend {
+    GatewayBackend::Firecracker(FirecrackerBackendConfig {
+        binary_path: root.join("firecracker"),
+        kernel_image_path: root.join("vmlinux"),
+        base_image_path: root.join("rootfs-base.ext4"),
+        max_vcpu_count: 2,
+        max_memory_mib: 256,
+        vsock_guest_cid_base,
+        guest_agent_port: 6000,
+        readiness_timeout: Duration::from_secs(2),
+    })
 }
 
 fn remote_client(base_url: &str, token: &str) -> Arc<RemoteSandboxClient> {

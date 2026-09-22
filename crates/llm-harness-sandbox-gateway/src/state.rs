@@ -152,6 +152,7 @@ struct PersistedSandbox {
 
 impl GatewayState {
     pub(crate) fn new(mut config: crate::auth::GatewayConfig) -> anyhow::Result<Self> {
+        config.validate()?;
         let work_root = config.prepare_work_root()?;
         let sandbox_root = work_root.join("sandboxes");
         create_private_directory(&sandbox_root)?;
@@ -191,6 +192,14 @@ impl GatewayState {
         principal: &AuthenticatedPrincipal,
         request: RemoteSandboxConfig,
     ) -> Result<String, GatewayStateError> {
+        if matches!(
+            self.config.backend(),
+            crate::auth::GatewayBackend::Firecracker(_)
+        ) {
+            return Err(GatewayStateError::InvalidConfig(anyhow::anyhow!(
+                "Firecracker backend execution is not integrated yet"
+            )));
+        }
         let mut sandboxes = self.lock_sandboxes();
         if sandboxes.len() >= self.config.max_sandboxes {
             return Err(GatewayStateError::Capacity);

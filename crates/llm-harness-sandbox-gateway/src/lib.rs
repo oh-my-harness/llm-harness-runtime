@@ -9,7 +9,7 @@ mod auth;
 mod routes;
 mod state;
 
-pub use auth::{GatewayConfig, GatewayPrincipalConfig};
+pub use auth::{FirecrackerBackendConfig, GatewayBackend, GatewayConfig, GatewayPrincipalConfig};
 pub use routes::serve;
 
 use std::sync::Arc;
