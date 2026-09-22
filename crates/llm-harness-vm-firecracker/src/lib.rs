@@ -6,6 +6,10 @@ pub use config::{FirecrackerConfig, FirecrackerConfigError};
 pub mod image;
 #[cfg(target_os = "linux")]
 pub use image::{FirecrackerImage, FirecrackerImageAllocator, FirecrackerImageError};
+#[cfg(target_os = "linux")]
+pub mod lifecycle;
+#[cfg(target_os = "linux")]
+pub use lifecycle::{FirecrackerLifecycle, FirecrackerLifecycleConfig, FirecrackerLifecycleError};
 pub mod process;
 #[cfg(target_os = "linux")]
 pub use process::FirecrackerProcess;

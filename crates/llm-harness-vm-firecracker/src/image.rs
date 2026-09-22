@@ -116,7 +116,7 @@ impl Drop for FirecrackerImage {
     }
 }
 
-fn open_regular_file(path: &Path) -> Result<File, FirecrackerImageError> {
+pub(crate) fn open_regular_file(path: &Path) -> Result<File, FirecrackerImageError> {
     let file = open_path(path, OPEN_REGULAR_FILE_FLAGS)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -127,7 +127,7 @@ fn open_regular_file(path: &Path) -> Result<File, FirecrackerImageError> {
     Ok(file)
 }
 
-fn open_directory(path: &Path) -> Result<File, FirecrackerImageError> {
+pub(crate) fn open_directory(path: &Path) -> Result<File, FirecrackerImageError> {
     let directory = open_path(path, OPEN_DIRECTORY_FLAGS)?;
     let metadata = directory.metadata()?;
     if !metadata.is_dir() {
