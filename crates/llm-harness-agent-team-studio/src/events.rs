@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// How many recent events a new WS client sees on connect.
-const REPLAY_LEN: usize = 500;
+const REPLAY_LEN: usize = 50;
 
 #[derive(Clone)]
 pub struct EventBus {
@@ -50,6 +50,24 @@ impl EventBus {
         self.buffer.read().iter().cloned().collect()
     }
 
+    /// Drop buffered events for a project; used after deleting a team so a
+    /// recreated team with the same ID does not inherit old chat context.
+    pub fn clear_project(&self, project: &str) {
+        let project = project.to_string();
+        self.buffer.write().retain(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|event| {
+                    event
+                        .get("project")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                != Some(project.as_str())
+        });
+    }
+
     /// Subscribe to live events.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
         self.tx.subscribe()
@@ -78,41 +96,54 @@ pub fn operator_event(project: &str, from: &str, text: &str) -> serde_json::Valu
     })
 }
 
-/// Build one team-message event. This includes user→agent, agent→agent,
-/// and agent→operator traffic observed at inbox delivery time.
-pub fn team_message_event(
-    project: &str,
-    from: &str,
-    to: &str,
-    message_type: &str,
-    body: &str,
-    broadcast_id: Option<&str>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type": "team_message",
-        "project": project,
-        "from": from,
-        "to": to,
-        "message_type": message_type,
-        "text": body,
-        "broadcast_id": broadcast_id,
-        "ts": chrono::Utc::now().to_rfc3339(),
-    })
-}
-
-/// Build one live thinking-delta event for the shared process stream.
+/// Build one member thinking-delta event for the live team panel.
 pub fn agent_thought_event(
     project: &str,
     agent: &str,
     message_id: &str,
-    thinking: &str,
+    text: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "type": "agent_thought",
         "project": project,
         "agent": agent,
         "message_id": message_id,
-        "text": thinking,
+        "text": text,
+        "ts": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+/// Build one chat-message event for the WeChat-style panel.
+#[allow(clippy::too_many_arguments)]
+pub fn team_message_event(
+    project: &str,
+    from: &str,
+    to: &str,
+    text: &str,
+    message_type: &str,
+    message_id: Option<String>,
+    broadcast_id: Option<String>,
+    view_kind: &str,
+) -> serde_json::Value {
+    let conversation =
+        if view_kind == "direct_message" && from == llm_harness_agent_team::reserved::OPERATOR {
+            to
+        } else if view_kind == "direct_message" {
+            from
+        } else {
+            "team"
+        };
+    serde_json::json!({
+        "type": "team_message",
+        "project": project,
+        "from": from,
+        "to": to,
+        "text": text,
+        "message_type": message_type,
+        "message_id": message_id,
+        "broadcast_id": broadcast_id,
+        "view_kind": view_kind,
+        "conversation": conversation,
         "ts": chrono::Utc::now().to_rfc3339(),
     })
 }
@@ -124,6 +155,24 @@ pub fn issue_event(project: &str, id: &str, status: &str) -> serde_json::Value {
         "project": project,
         "id": id,
         "status": status,
+        "ts": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+pub fn team_deleted_event(project: &str) -> serde_json::Value {
+    let ts = chrono::Utc::now().to_rfc3339();
+    serde_json::json!({
+        "type": "team_deleted",
+        "project": project,
+        "ts": ts,
+    })
+}
+
+pub fn team_delete_failed_event(project: &str, error: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "team_delete_failed",
+        "project": project,
+        "text": error,
         "ts": chrono::Utc::now().to_rfc3339(),
     })
 }
@@ -143,13 +192,13 @@ mod tests {
     }
 
     #[test]
-    fn replay_caps_at_500() {
+    fn replay_caps_at_50() {
         let bus = EventBus::new();
-        for i in 0..510 {
+        for i in 0..60 {
             bus.publish(operator_event("p", "a", &i.to_string()));
         }
         let replay = bus.replay();
-        assert_eq!(replay.len(), 500);
+        assert_eq!(replay.len(), 50);
         assert!(
             replay[0].contains("\"10\""),
             "oldest evicted: {:?}",
@@ -162,5 +211,13 @@ mod tests {
         let bus = EventBus::new();
         bus.publish(operator_event("p", "a", "x"));
         assert_eq!(bus.replay().len(), 1);
+    }
+
+    #[test]
+    fn delete_failure_event_is_actionable() {
+        let event = team_delete_failed_event("p1", "directory is locked");
+        assert_eq!(event["type"], "team_delete_failed");
+        assert_eq!(event["project"], "p1");
+        assert_eq!(event["text"], "directory is locked");
     }
 }

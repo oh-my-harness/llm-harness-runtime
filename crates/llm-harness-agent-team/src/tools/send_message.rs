@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock};
 use futures::future::BoxFuture;
 use llm_harness_types::{DataBlock, Tool, ToolContext, ToolFailure, ToolResult};
 
-use crate::{AgentId, SocialContext};
+use crate::{AgentId, GroupReplyContext, SocialContext};
 
 static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
     serde_json::json!({
@@ -48,11 +48,22 @@ impl SendMessageTool {
     // ToolFailure is ~144 bytes; the harness Tool trait boxes the future so
     // its own signatures never trip this lint. Mirrors failure_breaker.rs.
     #[allow(clippy::result_large_err)]
+    #[cfg(test)]
     pub(crate) fn call_inner(&self, input: &serde_json::Value) -> Result<String, ToolFailure> {
+        self.call_inner_with_group(input, None)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn call_inner_with_group(
+        &self,
+        input: &serde_json::Value,
+        group: Option<&GroupReplyContext>,
+    ) -> Result<String, ToolFailure> {
         let to_str = field_str(input, "to")?;
         let body = field_str(input, "body")?;
         let task_id = optional_str(input, "task_id");
-        let broadcast_id = optional_str(input, "broadcast_id");
+        let broadcast_id = optional_str(input, "broadcast_id")
+            .or_else(|| group.map(|group| group.broadcast_id.clone()));
 
         let target_id = AgentId::new(to_str);
 
@@ -70,6 +81,16 @@ impl SendMessageTool {
             )));
         }
 
+        if to_str == crate::timeout_manager::reserved::OPERATOR && broadcast_id.is_some() {
+            if let Some(responder) = group.and_then(|group| group.responder.as_deref())
+                && self.agent_id.as_str() != responder
+            {
+                return Err(ToolFailure::invalid_arguments(format!(
+                    "This public reply is reserved for '{responder}'. Use send_message to ask a peer directly instead."
+                )));
+            }
+            return self.public_reply(body);
+        }
         self.ctx
             .send_direct_with_task(&self.agent_id, &target_id, body, 0, task_id, broadcast_id)
             .map_err(|error| {
@@ -79,6 +100,14 @@ impl SendMessageTool {
                 )
             })?;
         Ok(format!("Message sent to {to_str}."))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn public_reply(&self, body: &str) -> Result<String, ToolFailure> {
+        match self.ctx.broadcast(&self.agent_id, body) {
+            Ok(_) => Ok("sent".to_string()),
+            Err(_) => Err(ToolFailure::new("code", "failed".to_string())),
+        }
     }
 }
 
@@ -115,6 +144,8 @@ impl Tool for SendMessageTool {
          Don't use for: sending to multiple agents (use broadcast); delegating \
          a task with tracking (use delegate_task); reaching agents not in your \
          contact list (use search_contacts first).\n\n\
+         If you are answering a public group message, use broadcast instead of \
+         send_message so every member can see your reply.\n\n\
          When responding to a broadcast, include the broadcast_id from the \
          broadcast message so the sender can correlate your reply. Keep your \
          reply short (e.g. \"I can help, I have experience with X\") — do not \
@@ -134,10 +165,11 @@ impl Tool for SendMessageTool {
     fn execute<'a>(
         &'a self,
         args: serde_json::Value,
-        _ctx: &'a ToolContext,
+        ctx: &'a ToolContext,
     ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
         Box::pin(async move {
-            let text = self.call_inner(&args)?;
+            let text =
+                self.call_inner_with_group(&args, ctx.run.extension::<GroupReplyContext>())?;
             Ok(ToolResult::full(
                 vec![DataBlock::text(text)],
                 serde_json::Value::Null,
@@ -150,6 +182,7 @@ impl Tool for SendMessageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GroupReplyContext;
 
     #[test]
     fn unregistered_target_error_mentions_delegate_task() {
@@ -177,5 +210,40 @@ mod tests {
         );
         // No message may have been delivered to the unknown peer.
         assert!(!ctx.has_messages(&AgentId::new("ghost")));
+    }
+
+    #[test]
+    fn only_mentioned_agent_may_reply_publicly() {
+        let ctx = SocialContext::new(10);
+        let operator = AgentId::new(crate::timeout_manager::reserved::OPERATOR);
+        let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
+        ctx.register_agent(operator.clone(), "operator");
+        ctx.register_agent(alice.clone(), "research");
+        ctx.register_agent(bob.clone(), "coder");
+        ctx.ensure_contact(&alice, &operator);
+        ctx.ensure_contact(&bob, &operator);
+
+        let group = GroupReplyContext {
+            broadcast_id: "broadcast-1".to_string(),
+            responder: Some("bob".to_string()),
+        };
+        let forbidden = SendMessageTool::new(alice.clone(), Arc::new(ctx.clone()));
+        let error = forbidden
+            .call_inner_with_group(
+                &serde_json::json!({"to": "operator", "body": "I'll take this"}),
+                Some(&group),
+            )
+            .unwrap_err();
+        assert!(error.model_message.contains("reserved for 'bob'"));
+
+        let allowed = SendMessageTool::new(bob.clone(), Arc::new(ctx.clone()));
+        allowed
+            .call_inner_with_group(
+                &serde_json::json!({"to": "operator", "body": "on it"}),
+                Some(&group),
+            )
+            .unwrap();
+        assert!(ctx.has_messages(&operator));
     }
 }

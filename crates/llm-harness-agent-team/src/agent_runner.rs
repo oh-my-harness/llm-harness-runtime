@@ -20,11 +20,12 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{debug, error, warn};
 
 use crate::AgentId;
+use crate::GroupReplyContext;
 use crate::inbox::{InboxMessage, MessageType};
 use crate::social_context::{AgentStatus, SocialContext};
 use futures::FutureExt;
 use llm_harness_agent::session::types::{SessionEntry, SessionEntryPayload};
-use llm_harness_types::{AgentMessage, ContentBlock, UserMessage};
+use llm_harness_types::{AgentMessage, ContentBlock, EntryId, UserMessage};
 
 // ── format helper ────────────────────────────────────────────────────────────
 
@@ -92,7 +93,82 @@ pub fn format_inbox_messages(messages: &[InboxMessage]) -> String {
         }
     }
 
+    if messages
+        .iter()
+        .any(|msg| msg.message_type == MessageType::Broadcast)
+    {
+        out.push_str(
+            "\nBroadcast protocol: if this batch does not require a response or action from you, \
+             reply with exactly <NO_RESPONSE>. The runtime treats this sentinel as silence: it \
+             does not appear in chat and is removed from your session context.\n",
+        );
+    }
+
     out
+}
+
+/// Return the first explicit agent mention in a message body.
+fn first_agent_mention(body: &str) -> Option<&str> {
+    body.split_whitespace()
+        .find_map(|word| word.strip_prefix('@').filter(|id| !id.is_empty()))
+}
+
+pub const NO_RESPONSE: &str = "<NO_RESPONSE>";
+
+/// Only an explicit broadcast may establish a public-reply turn. Direct
+/// messages can correlate with a prior broadcast, but they must not turn a
+/// mixed batch into a restricted broadcast turn.
+fn group_reply_context(messages: &[InboxMessage]) -> Option<GroupReplyContext> {
+    let message = messages
+        .iter()
+        .rev()
+        .find(|message| message.message_type == MessageType::Broadcast)?;
+    let responder = first_agent_mention(&message.body).map(str::to_owned);
+    Some(GroupReplyContext {
+        broadcast_id: message.broadcast_id.clone()?,
+        responder,
+    })
+}
+
+/// A sentinel-only final answer is an explicit runtime decline.
+fn is_no_response_message(message: &AgentMessage) -> bool {
+    let AgentMessage::Assistant(message) = message else {
+        return false;
+    };
+    !message
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        && message.text_content().trim() == NO_RESPONSE
+}
+
+/// Return the active-path leaf entry when it is a sentinel-only assistant reply.
+fn final_no_response_entry(entries: &[SessionEntry]) -> Option<EntryId> {
+    let entry = entries.last()?;
+    if let SessionEntryPayload::Message(message) = &entry.payload
+        && is_no_response_message(message)
+    {
+        Some(entry.id)
+    } else {
+        None
+    }
+}
+
+/// Remove a just-created sentinel response and report whether it was removed.
+async fn discard_no_response_entry(harness: &AgentHarness) -> bool {
+    let Ok(entries) = harness.read_active_path().await else {
+        return false;
+    };
+    if let Some(entry_id) = final_no_response_entry(&entries) {
+        match harness.delete_entries(vec![entry_id]).await {
+            Ok(()) => return true,
+            Err(error) => warn!(
+                error = ?error,
+                "failed to discard <NO_RESPONSE> from session context"
+            ),
+        }
+    }
+    false
 }
 
 fn message_type_label(mt: &MessageType) -> &'static str {
@@ -512,6 +588,9 @@ impl AgentRunner {
                     .all(|m| m.message_type == crate::inbox::MessageType::ReflectionTrigger);
                 let text = format_inbox_messages(&messages);
                 let mut request = RunRequest::from_text(text);
+                if let Some(group) = group_reply_context(&messages) {
+                    request = request.with_extension(group);
+                }
                 if let Some(access) = &knowledge_access {
                     // T15: knowledge/memory tools resolve their
                     // KnowledgeRequestContext from run extensions; without it
@@ -521,6 +600,7 @@ impl AgentRunner {
 
                 // Spawn monitor task: drain inbox → steer during run.
                 let monitor = spawn_monitor_task(agent_id.clone(), harness.clone(), ctx.clone());
+                let mut no_response_run = false;
 
                 // AssertUnwindSafe: the harness and ctx are Arc-backed shared
                 // state that stays consistent across a panic (worse case: a
@@ -554,6 +634,9 @@ impl AgentRunner {
                             ctx.return_messages(&agent_id, messages);
                         } else {
                             consecutive_failures = 0;
+                            if !is_reflection_run {
+                                no_response_run = discard_no_response_entry(&harness).await;
+                            }
                             ctx.ack_inbox_messages(&messages);
                         }
                     }
@@ -610,7 +693,7 @@ impl AgentRunner {
                             agent = %agent_id,
                             "reflection-only run: not counting toward next reflection"
                         );
-                    } else {
+                    } else if !no_response_run {
                         let entries = match harness.read_active_path().await {
                             Ok(entries) => Some(entries),
                             Err(e) => {
@@ -641,6 +724,7 @@ impl AgentRunner {
                                 priority: crate::inbox::priority::REFLECTION,
                                 task_id: None,
                                 broadcast_id: None,
+                                message_id: None,
                             }) {
                                 error!(
                                     agent = %agent_id,
@@ -679,6 +763,7 @@ mod tests {
                 body: "hello".into(),
                 message_type: MessageType::Direct,
                 priority: 0,
+                message_id: None,
                 task_id: None,
                 broadcast_id: None,
             },
@@ -691,6 +776,7 @@ mod tests {
                 priority: 50,
                 task_id: Some("t1".into()),
                 broadcast_id: None,
+                message_id: None,
             },
         ];
         let text = format_inbox_messages(&msgs);
@@ -698,6 +784,51 @@ mod tests {
         assert!(text.contains("Timeout"));
         assert!(text.contains("hello"));
         assert!(text.contains("timeout!"));
+    }
+
+    #[test]
+    fn format_inbox_messages_declares_no_response_protocol_for_broadcasts() {
+        let msgs = vec![broadcast_message("general update")];
+        let text = format_inbox_messages(&msgs);
+
+        assert!(text.contains("<NO_RESPONSE>"));
+        assert!(text.contains("removed from your session context"));
+    }
+
+    #[test]
+    fn no_response_protocol_omitted_for_private_messages() {
+        let msgs = vec![private_message("hello")];
+        let text = format_inbox_messages(&msgs);
+
+        assert!(!text.contains("<NO_RESPONSE>"));
+    }
+
+    #[test]
+    fn final_no_response_entry_detects_sentinel_only_assistant() {
+        let sentinel = assistant_entry(NO_RESPONSE, None);
+        assert_eq!(
+            final_no_response_entry(std::slice::from_ref(&sentinel)),
+            Some(sentinel.id)
+        );
+
+        let tool_use = assistant_entry(
+            "",
+            Some(ContentBlock::ToolUse {
+                id: "tool-1".into(),
+                name: "send_message".into(),
+                input: serde_json::json!({"to": "operator", "body": "done"}),
+            }),
+        );
+        assert_eq!(
+            final_no_response_entry(std::slice::from_ref(&tool_use)),
+            None
+        );
+
+        let real_reply = assistant_entry("here is the answer", None);
+        assert_eq!(
+            final_no_response_entry(std::slice::from_ref(&real_reply)),
+            None
+        );
     }
 
     #[test]
@@ -712,6 +843,7 @@ mod tests {
                 priority: 0,
                 task_id: None,
                 broadcast_id: None,
+                message_id: None,
             },
             InboxMessage {
                 journal_id: None,
@@ -722,6 +854,7 @@ mod tests {
                 priority: 0,
                 task_id: None,
                 broadcast_id: Some("bid-123".into()),
+                message_id: None,
             },
             InboxMessage {
                 journal_id: None,
@@ -732,6 +865,7 @@ mod tests {
                 priority: 0,
                 task_id: None,
                 broadcast_id: Some("bid-123".into()),
+                message_id: None,
             },
         ];
         let text = format_inbox_messages(&msgs);
@@ -757,6 +891,7 @@ mod tests {
                 priority: 0,
                 task_id: None,
                 broadcast_id: Some("bid-x".into()),
+                message_id: None,
             },
             InboxMessage {
                 journal_id: None,
@@ -767,6 +902,7 @@ mod tests {
                 priority: 0,
                 task_id: Some("t9".into()),
                 broadcast_id: Some("bid-x".into()),
+                message_id: None,
             },
         ];
         let text = format_inbox_messages(&msgs);
@@ -782,6 +918,72 @@ mod tests {
         );
     }
 
+    fn message(
+        from: &str,
+        to: &str,
+        body: &str,
+        message_type: MessageType,
+        broadcast_id: Option<&str>,
+    ) -> InboxMessage {
+        InboxMessage {
+            journal_id: None,
+            from: AgentId::new(from),
+            to: AgentId::new(to),
+            body: body.into(),
+            message_type,
+            priority: 0,
+            task_id: None,
+            broadcast_id: broadcast_id.map(str::to_owned),
+            message_id: None,
+        }
+    }
+
+    #[test]
+    fn group_context_comes_only_from_explicit_broadcast() {
+        let messages = [message(
+            "operator",
+            "alice",
+            "@bob please lead this",
+            MessageType::Broadcast,
+            Some("broadcast-1"),
+        )];
+        let context = group_reply_context(&messages).unwrap();
+        assert_eq!(context.broadcast_id, "broadcast-1");
+        assert_eq!(context.responder.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn mixed_direct_batch_does_not_leak_group_context() {
+        let messages = [
+            message(
+                "carol",
+                "alice",
+                "private request",
+                MessageType::Direct,
+                Some("stale-broadcast"),
+            ),
+            message(
+                "operator",
+                "alice",
+                "@bob public request",
+                MessageType::Broadcast,
+                Some("broadcast-1"),
+            ),
+        ];
+        let context = group_reply_context(&messages).unwrap();
+        assert_eq!(context.broadcast_id, "broadcast-1");
+        assert_eq!(context.responder.as_deref(), Some("bob"));
+
+        let messages = [message(
+            "carol",
+            "alice",
+            "private request",
+            MessageType::Direct,
+            Some("stale-broadcast"),
+        )];
+        assert!(group_reply_context(&messages).is_none());
+    }
+
     #[test]
     fn grouping_order_deterministic() {
         let mut msgs = Vec::new();
@@ -795,6 +997,7 @@ mod tests {
                 priority: 0,
                 task_id: None,
                 broadcast_id: Some(bid.into()),
+                message_id: None,
             });
         }
         // HashMap iteration is randomized per call; repeat to flush out any
@@ -823,6 +1026,7 @@ mod tests {
                 priority: 0,
                 task_id: None,
                 broadcast_id: None,
+                message_id: None,
             },
             InboxMessage {
                 journal_id: None,
@@ -833,6 +1037,7 @@ mod tests {
                 priority: 0,
                 task_id: None,
                 broadcast_id: Some("bid-m".into()),
+                message_id: None,
             },
         ];
         let text = format_inbox_messages(&msgs);
@@ -891,6 +1096,65 @@ mod tests {
                 content: vec![ContentBlock::Text { text: text.into() }],
                 timestamp: chrono::Utc::now(),
             })),
+            compaction_policy: None,
+        }
+    }
+
+    fn broadcast_message(body: &str) -> InboxMessage {
+        InboxMessage {
+            journal_id: None,
+            from: AgentId::new("operator"),
+            to: AgentId::new("alice"),
+            body: body.into(),
+            message_type: MessageType::Broadcast,
+            priority: crate::inbox::priority::NORMAL,
+            task_id: None,
+            broadcast_id: Some("broadcast-1".into()),
+            message_id: None,
+        }
+    }
+
+    fn private_message(body: &str) -> InboxMessage {
+        InboxMessage {
+            journal_id: None,
+            from: AgentId::new("operator"),
+            to: AgentId::new("alice"),
+            body: body.into(),
+            message_type: MessageType::Direct,
+            priority: crate::inbox::priority::OPERATOR,
+            task_id: None,
+            broadcast_id: None,
+            message_id: None,
+        }
+    }
+
+    fn assistant_entry(text: &str, extra_block: Option<ContentBlock>) -> SessionEntry {
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(ContentBlock::Text { text: text.into() });
+        }
+        if let Some(block) = extra_block {
+            content.push(block);
+        }
+        SessionEntry {
+            id: llm_harness_types::EntryId::new(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            payload: SessionEntryPayload::Message(AgentMessage::Assistant(
+                llm_harness_types::AssistantMessage {
+                    kind: llm_harness_types::AssistantMessageKind::FinalAnswer,
+                    message_id: uuid::Uuid::now_v7().to_string(),
+                    turn_id: uuid::Uuid::now_v7().to_string(),
+                    content,
+                    stop_reason: None,
+                    timestamp: chrono::Utc::now(),
+                    provider: None,
+                    api: None,
+                    model: None,
+                    usage: None,
+                    error_message: None,
+                },
+            )),
             compaction_policy: None,
         }
     }
@@ -1068,6 +1332,7 @@ mod tests {
             priority: 0,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
         let monitor = spawn_monitor_task(alice.clone(), harness.clone(), ctx.clone());
         // Current-thread runtime: give the spawned monitor its first poll
@@ -1114,6 +1379,7 @@ mod tests {
             priority: 0,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
         let monitor = spawn_monitor_task(alice.clone(), harness.clone(), ctx.clone());
 
@@ -1151,6 +1417,7 @@ mod tests {
             priority: 0,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
         let monitor = spawn_monitor_task(alice.clone(), harness.clone(), ctx.clone());
 
@@ -1202,6 +1469,7 @@ mod tests {
             priority: crate::inbox::priority::REFLECTION,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
 
         assert!(ctx.has_messages(&alice));
@@ -1279,6 +1547,7 @@ mod tests {
             priority: 0,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
 
         let runner = AgentRunner::new(alice.clone(), harness.clone(), ctx.clone(), None, None);
@@ -1316,6 +1585,64 @@ mod tests {
         );
 
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn no_response_is_removed_from_session_context() {
+        let harness = Arc::new(
+            AgentHarness::new_in_memory(
+                Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![
+                    llm_harness_loop::test_utils::MockResponse::text(NO_RESPONSE),
+                ])) as std::sync::Arc<dyn llm_harness_loop::LlmClient>,
+                Arc::new(llm_harness_loop::test_utils::NoOpEnv),
+                llm_harness_agent::AgentHarnessOptions::new("test-model"),
+            )
+            .await,
+        );
+        let ctx = SocialContext::new(10);
+        let alice = AgentId::new("alice");
+        ctx.register_agent(alice.clone(), "rust");
+        ctx.push_message(broadcast_message("information for another member"));
+
+        let runner = AgentRunner::new(alice.clone(), harness.clone(), ctx.clone(), None, None);
+        let task = runner.spawn();
+        for _ in 0..200 {
+            if ctx.get_agent_info(&alice).map(|info| info.status) == Some(AgentStatus::Idle)
+                && !ctx.has_messages(&alice)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            !task.is_finished(),
+            "sentinel decline must not kill the runner"
+        );
+        assert_eq!(
+            ctx.get_agent_info(&alice).unwrap().status,
+            AgentStatus::Idle
+        );
+        assert!(!ctx.has_messages(&alice));
+        let entries = harness.read_active_path().await.unwrap();
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| final_no_response_entry(std::slice::from_ref(entry)).is_some()),
+            "sentinel reply must not enter session context"
+        );
+        assert!(
+            entries.iter().any(|entry| matches!(
+                &entry.payload,
+                SessionEntryPayload::Message(AgentMessage::User(message))
+                    if message.content.iter().any(|block| matches!(
+                        block,
+                        ContentBlock::Text { text }
+                            if text.contains("information for another member")
+                    ))
+            )),
+            "the triggering group message should remain in context"
+        );
     }
 
     #[tokio::test]
@@ -1363,6 +1690,7 @@ mod tests {
             priority: 0,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
 
         let runner = AgentRunner::new(alice.clone(), harness.clone(), ctx.clone(), None, None);
@@ -1471,6 +1799,7 @@ mod tests {
             priority: 0,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
 
         let runner = AgentRunner::new(alice.clone(), harness.clone(), ctx.clone(), None, None);
@@ -1552,6 +1881,7 @@ mod tests {
             priority: 0,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
         let mut since_reset = std::time::Duration::ZERO;
         while attempts.load(std::sync::atomic::Ordering::SeqCst) < 7 {
@@ -1608,6 +1938,7 @@ mod tests {
             priority: 0,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
         for _ in 0..100 {
             if !ctx.has_messages(&alice) {
@@ -1633,6 +1964,7 @@ mod tests {
             priority: 0,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
         for _ in 0..200 {
             if !ctx.has_messages(&alice)
@@ -1758,6 +2090,7 @@ mod tests {
             priority: 0,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
         for _ in 0..200 {
             if !ctx.has_messages(&alice)
@@ -1850,6 +2183,7 @@ mod tests {
             priority: 0,
             task_id: None,
             broadcast_id: None,
+            message_id: None,
         });
 
         let runner = AgentRunner::new(alice.clone(), harness.clone(), ctx.clone(), None, None);

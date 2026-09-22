@@ -274,6 +274,38 @@ impl Session {
         self.storage.metadata().await
     }
 
+    /// Delete specific entries and restore the cursor to their parent.
+    ///
+    /// This is a targeted cleanup primitive for callers that have already
+    /// identified leaf entries (for example, a runtime protocol message).
+    /// Unlike branch deletion, it never walks unique parent chains.
+    pub async fn delete_entries(&self, ids: Vec<EntryId>) -> Result<(), SessionError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut deleted_ids = Vec::new();
+        let mut restore_cursor = None;
+        let old_cursor = self.storage.active_cursor().await?;
+        for id in ids {
+            let Some(entry) = self.storage.get_entry(id).await? else {
+                continue;
+            };
+            if !self.storage.children(id).await?.is_empty() {
+                continue;
+            }
+            if old_cursor == Some(id) {
+                restore_cursor = entry.parent_id;
+            }
+            deleted_ids.push(id);
+        }
+        self.storage.delete_entries(deleted_ids).await?;
+        if let Some(parent_id) = restore_cursor {
+            self.storage.set_active_cursor(parent_id).await?;
+        }
+        Ok(())
+    }
+
     /// Atomically replace cross-session recall eligibility and authorization scope.
     pub async fn update_recall_settings(
         &self,

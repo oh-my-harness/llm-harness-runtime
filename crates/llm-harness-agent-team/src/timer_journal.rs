@@ -260,6 +260,7 @@ mod tests {
                 priority: crate::inbox::priority::TIMEOUT,
                 task_id: Some("task".into()),
                 broadcast_id: None,
+                message_id: None,
             })
             .unwrap();
 
@@ -341,6 +342,7 @@ mod tests {
             priority: crate::inbox::priority::NORMAL,
             task_id: Some("task".into()),
             broadcast_id: None,
+            message_id: None,
         };
         assert_eq!(
             context.cancel_timeouts_for_messages(&alice, &[reply]).len(),
