@@ -3,7 +3,7 @@
 use std::fmt::Display;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cgroup::{FirecrackerCgroupCleanup, FirecrackerCgroupError};
 use crate::config::{FirecrackerConfig, FirecrackerConfigError};
@@ -17,11 +17,15 @@ use crate::process::{
     FirecrackerProcess, FirecrackerProcessConfig, FirecrackerProcessConfigError,
     FirecrackerProcessError,
 };
+use llm_harness_vm_agent_service::{GuestAgentClient, GuestAgentClientError};
+use tokio::time::{sleep, timeout};
 
 const ROOTFS_FILE_NAME: &str = "rootfs.ext4";
 const API_SOCKET_FILE_NAME: &str = "firecracker.sock";
 const CONFIG_FILE_NAME: &str = "firecracker.json";
 const VSOCK_SOCKET_FILE_NAME: &str = "guest-agent.sock";
+const DEFAULT_GUEST_AGENT_PORT: u32 = 6000;
+const GUEST_AGENT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
@@ -79,6 +83,12 @@ impl From<FirecrackerCgroupError> for FirecrackerLifecycleError {
     }
 }
 
+impl From<GuestAgentClientError> for FirecrackerLifecycleError {
+    fn from(error: GuestAgentClientError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
 impl From<std::io::Error> for FirecrackerLifecycleError {
     fn from(error: std::io::Error) -> Self {
         Self::new(format!("firecracker lifecycle io error: {error}"))
@@ -95,6 +105,7 @@ pub struct FirecrackerLifecycleConfig {
     vcpu_count: u32,
     mem_size_mib: u32,
     vsock_guest_cid: u32,
+    guest_agent_port: u32,
     boot_args: String,
     rootfs_read_only: bool,
     readiness_timeout: Duration,
@@ -130,6 +141,7 @@ impl FirecrackerLifecycleConfig {
             vcpu_count,
             mem_size_mib,
             vsock_guest_cid,
+            guest_agent_port: DEFAULT_GUEST_AGENT_PORT,
             boot_args: String::new(),
             rootfs_read_only: false,
             readiness_timeout: Duration::from_secs(5),
@@ -149,6 +161,11 @@ impl FirecrackerLifecycleConfig {
 
     pub fn with_readiness_timeout(mut self, timeout: Duration) -> Self {
         self.readiness_timeout = timeout;
+        self
+    }
+
+    pub fn with_guest_agent_port(mut self, port: u32) -> Self {
+        self.guest_agent_port = port;
         self
     }
 
@@ -261,6 +278,11 @@ impl FirecrackerLifecycleConfig {
         if self.vsock_guest_cid < 3 {
             return Err(FirecrackerLifecycleError::new(
                 "vsock guest CID must be at least 3",
+            ));
+        }
+        if self.guest_agent_port == 0 {
+            return Err(FirecrackerLifecycleError::new(
+                "guest agent vsock port must be nonzero",
             ));
         }
         if self.readiness_timeout.is_zero() {
@@ -401,6 +423,7 @@ pub struct FirecrackerLifecycle {
     image: FirecrackerImage,
     jail: Option<FirecrackerJail>,
     cgroups: FirecrackerCgroupCleanup,
+    guest_agent: Option<GuestAgentClient>,
 }
 
 impl FirecrackerLifecycle {
@@ -485,7 +508,9 @@ impl FirecrackerLifecycle {
             }
         };
 
-        if let Err(error) = process.wait_ready(config.readiness_timeout).await {
+        let readiness_deadline = Instant::now() + config.readiness_timeout;
+        let api_readiness_timeout = readiness_deadline.saturating_duration_since(Instant::now());
+        if let Err(error) = process.wait_ready(api_readiness_timeout).await {
             let stop_error = process.stop().await.err();
             let image_error = image.remove().err();
             let jail_error = cleanup_jail(&mut jail);
@@ -499,15 +524,40 @@ impl FirecrackerLifecycle {
             ));
         }
 
+        let guest_agent = match wait_for_guest_agent(
+            &paths.vsock_socket_path,
+            config.guest_agent_port,
+            readiness_deadline,
+        )
+        .await
+        {
+            Ok(client) => Some(client),
+            Err(error) => {
+                let stop_error = process.stop().await.err();
+                let image_error = image.remove().err();
+                let jail_error = cleanup_jail(&mut jail);
+                let cgroup_error = cgroups.remove().err();
+                return Err(startup_error(
+                    error,
+                    stop_error,
+                    image_error,
+                    jail_error,
+                    cgroup_error,
+                ));
+            }
+        };
+
         Ok(Self {
             process,
             image,
             jail,
             cgroups,
+            guest_agent,
         })
     }
 
     pub async fn stop(&mut self) -> Result<(), FirecrackerLifecycleError> {
+        self.guest_agent = None;
         let process_result = self.process.stop().await;
         let image_result = self.image.remove();
         let jail_result = cleanup_jail(&mut self.jail);
@@ -552,6 +602,7 @@ impl FirecrackerLifecycle {
         &mut self,
         timeout: Duration,
     ) -> Result<(), FirecrackerLifecycleError> {
+        self.guest_agent = None;
         let process_result = self.process.graceful_stop(timeout).await;
         let image_result = self.image.remove();
         let jail_result = cleanup_jail(&mut self.jail);
@@ -603,6 +654,61 @@ impl FirecrackerLifecycle {
     pub fn rootfs_path(&self) -> &Path {
         self.image.path()
     }
+
+    pub fn guest_agent(&self) -> Option<&GuestAgentClient> {
+        self.guest_agent.as_ref()
+    }
+}
+
+async fn wait_for_guest_agent(
+    uds_path: &Path,
+    guest_port: u32,
+    deadline: Instant,
+) -> Result<GuestAgentClient, GuestAgentClientError> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(guest_agent_timeout());
+        }
+
+        let client = match timeout(
+            remaining,
+            GuestAgentClient::connect_firecracker_vsock(uds_path, guest_port),
+        )
+        .await
+        {
+            Ok(Ok(client)) => client,
+            Ok(Err(_)) => {
+                wait_before_retry(deadline).await;
+                continue;
+            }
+            Err(_) => return Err(guest_agent_timeout()),
+        };
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(guest_agent_timeout());
+        }
+        match timeout(remaining, client.ping()).await {
+            Ok(Ok(())) => return Ok(client),
+            Ok(Err(_)) => {
+                wait_before_retry(deadline).await;
+            }
+            Err(_) => return Err(guest_agent_timeout()),
+        }
+    }
+}
+
+async fn wait_before_retry(deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return;
+    }
+    sleep(remaining.min(GUEST_AGENT_RETRY_INTERVAL)).await;
+}
+
+fn guest_agent_timeout() -> GuestAgentClientError {
+    GuestAgentClientError::Protocol("guest agent did not become ready in time".to_owned())
 }
 
 fn validate_host_path(label: &'static str, path: &Path) -> Result<(), FirecrackerLifecycleError> {
@@ -725,6 +831,64 @@ mod tests {
         std::fs::set_permissions(path, permissions).expect("set executable permissions");
     }
 
+    fn write_fake_firecracker(path: &Path, guest_port: u32) {
+        let script = r#"#!/usr/bin/env python3
+import json, os, select, socket, sys
+args = sys.argv[1:]
+api_path = args[args.index("--api-sock") + 1]
+vsock_path = os.path.join(os.path.dirname(api_path), "guest-agent.sock")
+api_server = socket.socket(socket.AF_UNIX)
+api_server.bind(api_path)
+api_server.listen(4)
+vsock_server = socket.socket(socket.AF_UNIX)
+vsock_server.bind(vsock_path)
+vsock_server.listen(4)
+connections = []
+
+def frame(request_id, message):
+    payload = json.dumps(message, separators=(",", ":")).encode()
+    return (
+        b"LHSV\x01\x00\x00\x00"
+        + len(payload).to_bytes(4, "big")
+        + request_id.to_bytes(8, "big")
+        + payload
+    )
+
+while True:
+    readable, _, _ = select.select([api_server, vsock_server], [], [])
+    for server in readable:
+        connection, _ = server.accept()
+        if server is api_server:
+            request = connection.recv(4096)
+            if request.startswith(b"PUT /actions"):
+                connection.sendall(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                connection.close()
+                sys.exit(0)
+            connection.close()
+            continue
+        handshake = bytearray()
+        while not handshake.endswith(b"\n"):
+            handshake.extend(connection.recv(1))
+        assert handshake == b"connect 6000\n"
+        connection.sendall(b"OK 1073741824\n")
+        header = connection.recv(20)
+        if len(header) != 20:
+            connection.close()
+            continue
+        payload_len = int.from_bytes(header[8:12], "big")
+        payload = connection.recv(payload_len)
+        message = json.loads(payload)
+        assert message.get("type") == "ping"
+        request_id = int.from_bytes(header[12:20], "big")
+        message["type"] = "pong"
+        connection.sendall(frame(request_id, message))
+        connections.append(connection)
+"#;
+        let script = script.replace("connect 6000", &format!("connect {guest_port}"));
+        write_regular_file(path, script.as_bytes());
+        set_executable(path);
+    }
+
     fn test_environment() -> (tempfile::TempDir, FirecrackerLifecycleConfig) {
         let root = tempfile::tempdir().expect("temp directory");
         let binary_path = root.path().join("firecracker");
@@ -803,7 +967,7 @@ mod tests {
         let (uid, gid) = non_root_ids();
         let jailer_script = format!(
             r#"#!/usr/bin/env python3
-import json, os, socket, sys, time
+import json, os, select, socket, sys
 args = sys.argv[1:]
 api_path = args[args.index("--api-sock") + 1]
 config_path = args[args.index("--config-file") + 1]
@@ -819,10 +983,47 @@ with open(chroot + "/nested/deep/child", "w") as child:
     child.write("child")
 os.symlink("/etc/passwd", chroot + "/nested/link")
 os.makedirs(cgroup + "/firecracker/sandbox-1")
-server = socket.socket(socket.AF_UNIX)
-server.bind(chroot + api_path)
-server.listen(1)
-time.sleep(30)
+api_server = socket.socket(socket.AF_UNIX)
+api_server.bind(chroot + api_path)
+api_server.listen(4)
+vsock_server = socket.socket(socket.AF_UNIX)
+vsock_server.bind(chroot + "/guest-agent.sock")
+vsock_server.listen(4)
+connections = []
+
+def frame(request_id, message):
+    payload = json.dumps(message, separators=(",", ":")).encode()
+    return (
+        b"LHSV\x01\x00\x00\x00"
+        + len(payload).to_bytes(4, "big")
+        + request_id.to_bytes(8, "big")
+        + payload
+    )
+
+while True:
+    readable, _, _ = select.select([api_server, vsock_server], [], [])
+    for server in readable:
+        connection, _ = server.accept()
+        if server is api_server:
+            connection.close()
+            continue
+        handshake = bytearray()
+        while not handshake.endswith(b"\n"):
+            handshake.extend(connection.recv(1))
+        assert handshake == b"connect 6000\n"
+        connection.sendall(b"OK 1073741824\n")
+        header = connection.recv(20)
+        if len(header) != 20:
+            connection.close()
+            continue
+        payload_len = int.from_bytes(header[8:12], "big")
+        payload = connection.recv(payload_len)
+        message = json.loads(payload)
+        assert message.get("type") == "ping"
+        request_id = int.from_bytes(header[12:20], "big")
+        message["type"] = "pong"
+        connection.sendall(frame(request_id, message))
+        connections.append(connection)
 "#,
             chroot_dir, cgroup_hierarchy
         );
@@ -920,6 +1121,19 @@ time.sleep(30)
     }
 
     #[test]
+    fn config_rejects_guest_agent_port_zero() {
+        let (_root, config) = test_environment();
+        let config = config.with_guest_agent_port(0);
+
+        let error = config.validate().expect_err("guest agent port zero");
+        assert!(
+            error
+                .to_string()
+                .contains("guest agent vsock port must be nonzero")
+        );
+    }
+
+    #[test]
     fn config_rejects_run_directory_symlink() {
         let (root, config) = test_environment();
         let actual_run_directory = tempfile::tempdir().expect("actual run directory");
@@ -943,12 +1157,7 @@ time.sleep(30)
     #[tokio::test]
     async fn start_and_stop_clean_lifecycle_artifacts() {
         let (root, config) = test_environment();
-        let binary_path = root.path().join("firecracker");
-        write_regular_file(
-            &binary_path,
-            b"#!/usr/bin/env python3\nimport socket, sys\nserver = socket.socket(socket.AF_UNIX)\nserver.bind(sys.argv[2])\nserver.listen(4)\nwhile True:\n    connection, _ = server.accept()\n    request = connection.recv(4096)\n    if request.startswith(b\"PUT /actions\"):\n        connection.sendall(b\"HTTP/1.1 204 No Content\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n\")\n        connection.close()\n        break\n    connection.close()\n",
-        );
-        set_executable(&binary_path);
+        write_fake_firecracker(&root.path().join("firecracker"), DEFAULT_GUEST_AGENT_PORT);
         let mut lifecycle = FirecrackerLifecycle::start(&config)
             .await
             .expect("start lifecycle");
@@ -957,6 +1166,7 @@ time.sleep(30)
         assert!(config.api_socket_path().exists());
         assert!(config.config_file_path().is_file());
         assert_eq!(lifecycle.rootfs_path(), config.rootfs_path());
+        assert!(lifecycle.guest_agent().is_some());
         lifecycle
             .graceful_stop(Duration::from_secs(2))
             .await
@@ -968,6 +1178,7 @@ time.sleep(30)
         assert!(!config.rootfs_path().exists());
         assert!(!config.api_socket_path().exists());
         assert!(!config.config_file_path().exists());
+        assert!(!config.vsock_socket_path().exists());
     }
 
     #[tokio::test]
@@ -993,7 +1204,7 @@ time.sleep(30)
     }
 
     #[tokio::test]
-    async fn drop_cleans_lifecycle_artifacts() {
+    async fn guest_agent_readiness_failure_cleans_lifecycle_artifacts() {
         let (root, config) = test_environment();
         let binary_path = root.path().join("firecracker");
         write_regular_file(
@@ -1001,6 +1212,27 @@ time.sleep(30)
             b"#!/usr/bin/env python3\nimport socket, sys, time\nserver = socket.socket(socket.AF_UNIX)\nserver.bind(sys.argv[2])\nserver.listen(1)\ntime.sleep(30)\n",
         );
         set_executable(&binary_path);
+        let config = config.with_readiness_timeout(Duration::from_millis(100));
+
+        let error = match FirecrackerLifecycle::start(&config).await {
+            Ok(_) => panic!("fake firecracker unexpectedly exposed a guest agent"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("guest agent did not become ready in time")
+        );
+        assert!(!config.rootfs_path().exists());
+        assert!(!config.api_socket_path().exists());
+        assert!(!config.config_file_path().exists());
+        assert!(!config.vsock_socket_path().exists());
+    }
+
+    #[tokio::test]
+    async fn drop_cleans_lifecycle_artifacts() {
+        let (root, config) = test_environment();
+        write_fake_firecracker(&root.path().join("firecracker"), DEFAULT_GUEST_AGENT_PORT);
         let lifecycle = FirecrackerLifecycle::start(&config)
             .await
             .expect("start lifecycle");
@@ -1009,6 +1241,24 @@ time.sleep(30)
         assert!(!config.rootfs_path().exists());
         assert!(!config.api_socket_path().exists());
         assert!(!config.config_file_path().exists());
+        assert!(!config.vsock_socket_path().exists());
+    }
+
+    #[tokio::test]
+    async fn start_uses_the_configured_guest_agent_port() {
+        let (root, config) = test_environment();
+        write_fake_firecracker(&root.path().join("firecracker"), 6100);
+        let config = config.with_guest_agent_port(6100);
+
+        let mut lifecycle = FirecrackerLifecycle::start(&config)
+            .await
+            .expect("start lifecycle with custom guest port");
+        assert!(lifecycle.guest_agent().is_some());
+
+        lifecycle
+            .graceful_stop(Duration::from_secs(2))
+            .await
+            .expect("stop lifecycle with custom guest port");
     }
 
     #[cfg(target_os = "linux")]
