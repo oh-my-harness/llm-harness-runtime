@@ -215,8 +215,13 @@ arguments, including the upstream 1–64 byte alphanumeric/hyphen ID constraint,
 cgroup and resource-limit formats, chroot-directory derivation, and translation
 of host API-socket/config-file paths inside that chroot into jail-relative
 Firecracker arguments after `--`. It intentionally omits `--daemonize` and
-`--new-pid-ns` in this slice. Jailed lifecycle integration, including staging
-API-socket, config-file, rootfs, and kernel resources inside the chroot,
+`--new-pid-ns` in this slice. `FirecrackerProcess::start_jailed` builds a
+jail-relative VM configuration, writes the config file exclusively with mode
+`0600`, changes its ownership to the jailed uid/gid, launches the configured
+jailer binary, and reuses readiness plus API/config cleanup through the host
+paths inside the chroot. Callers must pre-create and stage the chroot and its
+kernel/rootfs/vsock resources; this primitive does not create or remove the
+chroot and does not clean jailer-created cgroups. Jailed lifecycle integration
 remains future work, along with guest-agent-coordinated shutdown confirmation,
 registry recovery, network policy, and deployment validation.
 

@@ -92,6 +92,18 @@ impl FirecrackerJailerConfig {
         self
     }
 
+    pub fn jailer_binary_path(&self) -> &Path {
+        &self.jailer_binary_path
+    }
+
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+
     pub fn validate(&self) -> Result<(), FirecrackerJailerConfigError> {
         validate_host_path("jailer binary", &self.jailer_binary_path)?;
         validate_host_path("Firecracker binary", &self.firecracker_binary_path)?;

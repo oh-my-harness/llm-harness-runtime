@@ -17,6 +17,12 @@ use tokio::process::Child;
 #[cfg(target_os = "linux")]
 use crate::config::FirecrackerConfig;
 use crate::config::FirecrackerConfigError;
+#[cfg(target_os = "linux")]
+use crate::image::open_directory;
+#[cfg(target_os = "linux")]
+use crate::jailer::FirecrackerJailerConfig;
+#[cfg(target_os = "linux")]
+use crate::jailer::FirecrackerJailerConfigError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirecrackerProcessConfig {
@@ -100,6 +106,15 @@ impl From<FirecrackerConfigError> for FirecrackerProcessError {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl From<FirecrackerJailerConfigError> for FirecrackerProcessError {
+    fn from(error: FirecrackerJailerConfigError) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+}
+
 impl From<std::io::Error> for FirecrackerProcessError {
     fn from(error: std::io::Error) -> Self {
         Self {
@@ -164,6 +179,75 @@ impl FirecrackerProcess {
             child,
             api_socket_path: config.api_socket_path.clone(),
             config_file_path: config.config_file_path.clone(),
+            stopped: false,
+        })
+    }
+
+    pub fn start_jailed(
+        jailer_config: &FirecrackerJailerConfig,
+        config: &FirecrackerProcessConfig,
+        vm_config: &FirecrackerConfig,
+    ) -> Result<Self, FirecrackerProcessError> {
+        let jailer_args = jailer_config.command_args(config)?;
+        let jail_root = jailer_config.chroot_dir()?;
+        let config_json = serde_json::to_vec_pretty(&vm_config.to_jailed_json(&jail_root)?)?;
+
+        let config_parent =
+            config
+                .config_file_path()
+                .parent()
+                .ok_or_else(|| FirecrackerProcessError {
+                    message: "config file path must have a parent directory".to_owned(),
+                })?;
+        let api_socket_parent =
+            config
+                .api_socket_path()
+                .parent()
+                .ok_or_else(|| FirecrackerProcessError {
+                    message: "API socket path must have a parent directory".to_owned(),
+                })?;
+        validate_jail_parent(config_parent, "config file")?;
+        validate_jail_parent(api_socket_parent, "API socket")?;
+
+        for (label, path) in [
+            ("API socket", config.api_socket_path()),
+            ("config file", config.config_file_path()),
+        ] {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => {
+                    return Err(FirecrackerProcessError {
+                        message: format!("{label} path already exists"),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        write_config_file(config.config_file_path(), &config_json)?;
+        if let Err(error) = std::os::unix::fs::chown(
+            config.config_file_path(),
+            Some(jailer_config.uid()),
+            Some(jailer_config.gid()),
+        ) {
+            let _ = std::fs::remove_file(config.config_file_path());
+            return Err(error.into());
+        }
+
+        let mut command = tokio::process::Command::new(jailer_config.jailer_binary_path());
+        command.args(jailer_args);
+        command.kill_on_drop(true);
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_file(config.config_file_path());
+                return Err(error.into());
+            }
+        };
+        Ok(Self {
+            child,
+            api_socket_path: config.api_socket_path().to_path_buf(),
+            config_file_path: config.config_file_path().to_path_buf(),
             stopped: false,
         })
     }
@@ -396,6 +480,15 @@ fn remove_owned_file(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn validate_jail_parent(path: &Path, label: &'static str) -> Result<(), FirecrackerProcessError> {
+    open_directory(path)
+        .map(|_| ())
+        .map_err(|error| FirecrackerProcessError {
+            message: format!("invalid {label} parent directory: {error}"),
+        })
+}
+
 fn validate_absolute_path(
     label: &'static str,
     path: &Path,
@@ -434,6 +527,8 @@ fn path_contains_nul(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::jailer::FirecrackerJailerConfig;
 
     #[test]
     fn process_config_builds_firecracker_command_args() {
@@ -818,6 +913,169 @@ mod tests {
             .await
             .expect_err("firecracker is stopped");
         assert!(error.to_string().contains("firecracker process is stopped"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn non_root_ids() -> (u32, u32) {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        if uid == 0 || gid == 0 {
+            (1000, 1000)
+        } else {
+            (uid, gid)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn jailed_process_environment() -> (
+        tempfile::TempDir,
+        FirecrackerJailerConfig,
+        FirecrackerProcessConfig,
+        FirecrackerConfig,
+    ) {
+        let root = tempfile::tempdir().expect("temp directory");
+        let jailer_binary_path = root.path().join("fake-jailer");
+        let firecracker_binary_path = root.path().join("firecracker");
+        let chroot_base_dir = root.path().join("jail");
+        let chroot_dir = chroot_base_dir
+            .join("firecracker")
+            .join("sandbox-1")
+            .join("root");
+        std::fs::create_dir_all(&chroot_dir).expect("create chroot directory");
+        std::fs::write(&firecracker_binary_path, b"fake firecracker")
+            .expect("write fake firecracker");
+        std::fs::write(chroot_dir.join("vmlinux"), b"kernel").expect("stage kernel");
+        std::fs::write(chroot_dir.join("rootfs.ext4"), b"rootfs").expect("stage rootfs");
+        let (uid, gid) = non_root_ids();
+        let jailer_script = format!(
+            r#"#!/usr/bin/env python3
+import socket, sys, time
+args = sys.argv[1:]
+api_path = args[args.index("--api-sock") + 1]
+host_path = {:?} + api_path
+server = socket.socket(socket.AF_UNIX)
+server.bind(host_path)
+server.listen(1)
+time.sleep(30)
+"#,
+            chroot_dir
+        );
+        std::fs::write(&jailer_binary_path, jailer_script).expect("write fake jailer");
+        set_executable(&jailer_binary_path);
+
+        let jailer_config = FirecrackerJailerConfig::new(
+            &jailer_binary_path,
+            &firecracker_binary_path,
+            "sandbox-1",
+            uid,
+            gid,
+        )
+        .with_chroot_base_dir(&chroot_base_dir);
+        let process_config = FirecrackerProcessConfig::new(
+            &firecracker_binary_path,
+            chroot_dir.join("api.sock"),
+            chroot_dir.join("firecracker.json"),
+        );
+        let vm_config = FirecrackerConfig::new(
+            chroot_dir.join("vmlinux"),
+            chroot_dir.join("rootfs.ext4"),
+            chroot_dir.join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        );
+        (root, jailer_config, process_config, vm_config)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn start_jailed_maps_paths_and_owns_the_config_file() {
+        let (root, jailer_config, process_config, vm_config) = jailed_process_environment();
+        let mut process =
+            FirecrackerProcess::start_jailed(&jailer_config, &process_config, &vm_config)
+                .expect("start fake jailer");
+
+        let config_contents =
+            std::fs::read(process_config.config_file_path()).expect("read jailed config file");
+        let config_json: serde_json::Value =
+            serde_json::from_slice(&config_contents).expect("parse jailed config file");
+        assert_eq!(config_json["boot-source"]["kernel_image_path"], "/vmlinux");
+        assert_eq!(config_json["drives"][0]["path_on_host"], "/rootfs.ext4");
+        assert_eq!(config_json["vsock"]["uds_path"], "/guest-agent.sock");
+
+        use std::os::unix::fs::MetadataExt;
+        let metadata =
+            std::fs::metadata(process_config.config_file_path()).expect("jailed config metadata");
+        assert_eq!(metadata.uid(), jailer_config.uid());
+        assert_eq!(metadata.gid(), jailer_config.gid());
+
+        process
+            .wait_ready(Duration::from_millis(500))
+            .await
+            .expect("fake jailed firecracker becomes ready");
+        process.stop().await.expect("stop fake jailer");
+        assert!(!process_config.api_socket_path().exists());
+        assert!(!process_config.config_file_path().exists());
+        assert!(
+            root.path()
+                .join("jail/firecracker/sandbox-1/root/vmlinux")
+                .exists()
+        );
+        assert!(
+            root.path()
+                .join("jail/firecracker/sandbox-1/root/rootfs.ext4")
+                .exists()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_jailed_failure_removes_the_config_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_root, jailer_config, process_config, vm_config) = jailed_process_environment();
+        let mut permissions = std::fs::metadata(jailer_config.jailer_binary_path())
+            .expect("fake jailer metadata")
+            .permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(jailer_config.jailer_binary_path(), permissions)
+            .expect("remove fake jailer execute permission");
+
+        let error =
+            match FirecrackerProcess::start_jailed(&jailer_config, &process_config, &vm_config) {
+                Err(error) => error,
+                Ok(_) => panic!("fake jailer unexpectedly started"),
+            };
+        assert!(error.to_string().contains("firecracker process io error"));
+        assert!(!process_config.config_file_path().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_jailed_rejects_vm_resources_outside_the_chroot() {
+        let (root, jailer_config, process_config, _vm_config) = jailed_process_environment();
+        let chroot_dir = root.path().join("jail/firecracker/sandbox-1/root");
+        let vm_config = FirecrackerConfig::new(
+            root.path().join("outside-vmlinux"),
+            chroot_dir.join("rootfs.ext4"),
+            chroot_dir.join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        );
+
+        let error =
+            match FirecrackerProcess::start_jailed(&jailer_config, &process_config, &vm_config) {
+                Err(error) => error,
+                Ok(_) => panic!("jailed process unexpectedly started"),
+            };
+        assert!(
+            error
+                .to_string()
+                .contains("kernel image host path must be inside the jail root"),
+            "{error}"
+        );
+        assert!(!process_config.config_file_path().exists());
     }
 
     #[cfg(target_os = "linux")]

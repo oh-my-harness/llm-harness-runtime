@@ -81,14 +81,37 @@ impl FirecrackerConfig {
 
     pub fn to_json(&self) -> Result<serde_json::Value, FirecrackerConfigError> {
         self.validate()?;
-        Ok(serde_json::json!({
+        let kernel_image_path = self.kernel_image_path.to_string_lossy().to_string();
+        let rootfs_path = self.rootfs_path.to_string_lossy().to_string();
+        let vsock_uds_path = self.vsock_uds_path.to_string_lossy().to_string();
+        Ok(self.config_json(kernel_image_path, rootfs_path, vsock_uds_path))
+    }
+
+    pub fn to_jailed_json(
+        &self,
+        jail_root: &Path,
+    ) -> Result<serde_json::Value, FirecrackerConfigError> {
+        self.validate()?;
+        let kernel_image_path = jailed_path("kernel image", jail_root, &self.kernel_image_path)?;
+        let rootfs_path = jailed_path("rootfs", jail_root, &self.rootfs_path)?;
+        let vsock_uds_path = jailed_path("vsock UDS", jail_root, &self.vsock_uds_path)?;
+        Ok(self.config_json(kernel_image_path, rootfs_path, vsock_uds_path))
+    }
+
+    fn config_json(
+        &self,
+        kernel_image_path: String,
+        rootfs_path: String,
+        vsock_uds_path: String,
+    ) -> serde_json::Value {
+        serde_json::json!({
             "boot-source": {
-                "kernel_image_path": path_string(&self.kernel_image_path),
+                "kernel_image_path": kernel_image_path,
                 "boot_args": self.boot_args,
             },
             "drives": [{
                 "drive_id": "rootfs",
-                "path_on_host": path_string(&self.rootfs_path),
+                "path_on_host": rootfs_path,
                 "is_root_device": true,
                 "is_read_only": self.rootfs_read_only,
             }],
@@ -100,10 +123,34 @@ impl FirecrackerConfig {
             "network-interfaces": [],
             "vsock": {
                 "guest_cid": self.vsock_guest_cid,
-                "uds_path": path_string(&self.vsock_uds_path),
+                "uds_path": vsock_uds_path,
             },
-        }))
+        })
     }
+}
+
+fn jailed_path(
+    label: &'static str,
+    jail_root: &Path,
+    host_path: &Path,
+) -> Result<String, FirecrackerConfigError> {
+    if !host_path.starts_with(jail_root) {
+        return Err(FirecrackerConfigError::invalid(format!(
+            "{label} host path must be inside the jail root"
+        )));
+    }
+    let relative_path = host_path.strip_prefix(jail_root).map_err(|_| {
+        FirecrackerConfigError::invalid(format!("{label} host path must be inside the jail root"))
+    })?;
+    if relative_path.as_os_str().is_empty() {
+        return Err(FirecrackerConfigError::invalid(format!(
+            "{label} host path must not be the jail root"
+        )));
+    }
+    Ok(Path::new("/")
+        .join(relative_path)
+        .to_string_lossy()
+        .to_string())
 }
 
 fn validate_absolute_path(label: &'static str, path: &Path) -> Result<(), FirecrackerConfigError> {
@@ -126,12 +173,6 @@ fn validate_absolute_path(label: &'static str, path: &Path) -> Result<(), Firecr
         )));
     }
     Ok(())
-}
-
-fn path_string(path: &Path) -> String {
-    path.to_str()
-        .expect("path was validated as UTF-8")
-        .to_owned()
 }
 
 #[cfg(test)]
@@ -165,6 +206,50 @@ mod tests {
         assert_eq!(value["drives"][0]["is_root_device"], true);
         assert_eq!(value["machine-config"]["vcpu_count"], 1);
         assert_eq!(value["vsock"]["guest_cid"], 3);
+    }
+
+    #[test]
+    fn config_generates_jailed_machine_json() {
+        let jail_root = PathBuf::from("/srv/jailer/firecracker/sandbox-1/root");
+        let config = FirecrackerConfig::new(
+            jail_root.join("vmlinux"),
+            jail_root.join("rootfs.ext4"),
+            jail_root.join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        )
+        .with_boot_args("console=ttyS0");
+        let value = config
+            .to_jailed_json(&jail_root)
+            .expect("jailed config json");
+
+        assert_eq!(value["boot-source"]["kernel_image_path"], "/vmlinux");
+        assert_eq!(value["boot-source"]["boot_args"], "console=ttyS0");
+        assert_eq!(value["drives"][0]["path_on_host"], "/rootfs.ext4");
+        assert_eq!(value["vsock"]["uds_path"], "/guest-agent.sock");
+    }
+
+    #[test]
+    fn config_rejects_jailed_resources_outside_the_jail_root() {
+        let jail_root = PathBuf::from("/srv/jailer/firecracker/sandbox-1/root");
+        let config = FirecrackerConfig::new(
+            PathBuf::from("/opt/vmlinux"),
+            jail_root.join("rootfs.ext4"),
+            jail_root.join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        );
+        let error = config
+            .to_jailed_json(&jail_root)
+            .expect_err("kernel image outside jail root");
+        assert!(
+            error
+                .to_string()
+                .contains("kernel image host path must be inside the jail root"),
+            "{error}"
+        );
     }
 
     #[test]
