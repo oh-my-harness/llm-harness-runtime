@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::cgroup::{FirecrackerCgroupCleanup, FirecrackerCgroupError};
 use crate::config::{FirecrackerConfig, FirecrackerConfigError};
 use crate::image::{
     FirecrackerImage, FirecrackerImageAllocator, FirecrackerImageError, open_directory,
@@ -72,6 +73,12 @@ impl From<FirecrackerJailError> for FirecrackerLifecycleError {
     }
 }
 
+impl From<FirecrackerCgroupError> for FirecrackerLifecycleError {
+    fn from(error: FirecrackerCgroupError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
 impl From<std::io::Error> for FirecrackerLifecycleError {
     fn from(error: std::io::Error) -> Self {
         Self::new(format!("firecracker lifecycle io error: {error}"))
@@ -84,6 +91,7 @@ pub struct FirecrackerLifecycleConfig {
     kernel_image_path: PathBuf,
     base_image_path: PathBuf,
     run_directory: PathBuf,
+    cgroup_mounts_path: PathBuf,
     vcpu_count: u32,
     mem_size_mib: u32,
     vsock_guest_cid: u32,
@@ -118,6 +126,7 @@ impl FirecrackerLifecycleConfig {
             kernel_image_path: kernel_image_path.into(),
             base_image_path: base_image_path.into(),
             run_directory: run_directory.into(),
+            cgroup_mounts_path: PathBuf::from("/proc/mounts"),
             vcpu_count,
             mem_size_mib,
             vsock_guest_cid,
@@ -145,6 +154,12 @@ impl FirecrackerLifecycleConfig {
 
     pub fn with_jailer(mut self, jailer: FirecrackerJailerConfig) -> Self {
         self.jailer = Some(jailer);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_cgroup_mounts_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cgroup_mounts_path = path.into();
         self
     }
 
@@ -385,6 +400,7 @@ pub struct FirecrackerLifecycle {
     process: FirecrackerProcess,
     image: FirecrackerImage,
     jail: Option<FirecrackerJail>,
+    cgroups: FirecrackerCgroupCleanup,
 }
 
 impl FirecrackerLifecycle {
@@ -394,7 +410,9 @@ impl FirecrackerLifecycle {
         config.validate()?;
         let paths = config.lifecycle_paths()?;
         let mut jail = None;
+        let mut cgroups = FirecrackerCgroupCleanup::default();
         if let Some(jailer_config) = &config.jailer {
+            cgroups = FirecrackerCgroupCleanup::plan(jailer_config, &config.cgroup_mounts_path)?;
             let chroot_dir = paths
                 .chroot_dir
                 .clone()
@@ -402,7 +420,8 @@ impl FirecrackerLifecycle {
             let mut created_jail = FirecrackerJail::create(&chroot_dir)?;
             if let Err(error) = created_jail.prepare(jailer_config.uid(), jailer_config.gid()) {
                 let jail_error = created_jail.remove().err();
-                return Err(startup_error(error, None, None, jail_error));
+                let cgroup_error = cgroups.remove().err();
+                return Err(startup_error(error, None, None, jail_error, cgroup_error));
             }
             if let Err(error) = created_jail.stage_kernel(
                 &config.kernel_image_path,
@@ -410,13 +429,22 @@ impl FirecrackerLifecycle {
                 jailer_config.gid(),
             ) {
                 let jail_error = created_jail.remove().err();
-                return Err(startup_error(error, None, None, jail_error));
+                let cgroup_error = cgroups.remove().err();
+                return Err(startup_error(error, None, None, jail_error, cgroup_error));
             }
             jail = Some(created_jail);
         }
 
-        let mut image = FirecrackerImageAllocator::new(&config.base_image_path)
-            .allocate(paths.rootfs_path.clone())?;
+        let mut image = match FirecrackerImageAllocator::new(&config.base_image_path)
+            .allocate(paths.rootfs_path.clone())
+        {
+            Ok(image) => image,
+            Err(error) => {
+                let jail_error = cleanup_jail(&mut jail);
+                let cgroup_error = cgroups.remove().err();
+                return Err(startup_error(error, None, None, jail_error, cgroup_error));
+            }
+        };
         if let Some(created_jail) = jail.as_mut()
             && let Some(jailer_config) = &config.jailer
             && let Err(error) =
@@ -424,7 +452,14 @@ impl FirecrackerLifecycle {
         {
             let image_error = image.remove().err();
             let jail_error = cleanup_jail(&mut jail);
-            return Err(startup_error(error, None, image_error, jail_error));
+            let cgroup_error = cgroups.remove().err();
+            return Err(startup_error(
+                error,
+                None,
+                image_error,
+                jail_error,
+                cgroup_error,
+            ));
         }
         let vm_config =
             config.vm_config(paths.kernel_image_path.clone(), image.path().to_path_buf())?;
@@ -439,7 +474,14 @@ impl FirecrackerLifecycle {
             Err(error) => {
                 let image_error = image.remove().err();
                 let jail_error = cleanup_jail(&mut jail);
-                return Err(startup_error(error, None, image_error, jail_error));
+                let cgroup_error = cgroups.remove().err();
+                return Err(startup_error(
+                    error,
+                    None,
+                    image_error,
+                    jail_error,
+                    cgroup_error,
+                ));
             }
         };
 
@@ -447,13 +489,21 @@ impl FirecrackerLifecycle {
             let stop_error = process.stop().await.err();
             let image_error = image.remove().err();
             let jail_error = cleanup_jail(&mut jail);
-            return Err(startup_error(error, stop_error, image_error, jail_error));
+            let cgroup_error = cgroups.remove().err();
+            return Err(startup_error(
+                error,
+                stop_error,
+                image_error,
+                jail_error,
+                cgroup_error,
+            ));
         }
 
         Ok(Self {
             process,
             image,
             jail,
+            cgroups,
         })
     }
 
@@ -461,18 +511,38 @@ impl FirecrackerLifecycle {
         let process_result = self.process.stop().await;
         let image_result = self.image.remove();
         let jail_result = cleanup_jail(&mut self.jail);
+        let cgroup_result = self.cgroups.remove();
         if let Err(process_error) = process_result {
             let image_error = image_result.err();
             let jail_error = jail_result;
-            return Err(stop_error(process_error, image_error, jail_error));
+            let cgroup_error = cgroup_result.err();
+            return Err(stop_error(
+                process_error,
+                image_error,
+                jail_error,
+                cgroup_error,
+            ));
         }
         if let Err(image_error) = image_result {
             let jail_error = jail_result;
-            return Err(stop_cleanup_error(image_error.to_string(), jail_error));
+            let cgroup_error = cgroup_result.err();
+            return Err(stop_cleanup_error(
+                image_error.to_string(),
+                jail_error,
+                cgroup_error,
+            ));
         }
         if let Some(jail_error) = jail_result {
+            let cgroup_error = cgroup_result.err();
+            return Err(stop_cleanup_error(
+                "firecracker jail cleanup failed".to_owned(),
+                Some(jail_error),
+                cgroup_error,
+            ));
+        }
+        if let Err(cgroup_error) = cgroup_result {
             return Err(FirecrackerLifecycleError::new(format!(
-                "firecracker jail cleanup failed: {jail_error}"
+                "firecracker cgroup cleanup failed: {cgroup_error}"
             )));
         }
         Ok(())
@@ -485,18 +555,38 @@ impl FirecrackerLifecycle {
         let process_result = self.process.graceful_stop(timeout).await;
         let image_result = self.image.remove();
         let jail_result = cleanup_jail(&mut self.jail);
+        let cgroup_result = self.cgroups.remove();
         if let Err(process_error) = process_result {
             let image_error = image_result.err();
             let jail_error = jail_result;
-            return Err(stop_error(process_error, image_error, jail_error));
+            let cgroup_error = cgroup_result.err();
+            return Err(stop_error(
+                process_error,
+                image_error,
+                jail_error,
+                cgroup_error,
+            ));
         }
         if let Err(image_error) = image_result {
             let jail_error = jail_result;
-            return Err(stop_cleanup_error(image_error.to_string(), jail_error));
+            let cgroup_error = cgroup_result.err();
+            return Err(stop_cleanup_error(
+                image_error.to_string(),
+                jail_error,
+                cgroup_error,
+            ));
         }
         if let Some(jail_error) = jail_result {
+            let cgroup_error = cgroup_result.err();
+            return Err(stop_cleanup_error(
+                "firecracker jail cleanup failed".to_owned(),
+                Some(jail_error),
+                cgroup_error,
+            ));
+        }
+        if let Err(cgroup_error) = cgroup_result {
             return Err(FirecrackerLifecycleError::new(format!(
-                "firecracker jail cleanup failed: {jail_error}"
+                "firecracker cgroup cleanup failed: {cgroup_error}"
             )));
         }
         Ok(())
@@ -548,6 +638,7 @@ fn startup_error(
     stop_error: Option<FirecrackerProcessError>,
     image_error: Option<FirecrackerImageError>,
     jail_error: Option<FirecrackerJailError>,
+    cgroup_error: Option<FirecrackerCgroupError>,
 ) -> FirecrackerLifecycleError {
     let mut message = format!("firecracker lifecycle startup failed: {error}");
     if let Some(stop_error) = stop_error {
@@ -559,6 +650,9 @@ fn startup_error(
     if let Some(jail_error) = jail_error {
         message.push_str(&format!("; jail cleanup failed: {jail_error}"));
     }
+    if let Some(cgroup_error) = cgroup_error {
+        message.push_str(&format!("; cgroup cleanup failed: {cgroup_error}"));
+    }
     FirecrackerLifecycleError::new(message)
 }
 
@@ -566,6 +660,7 @@ fn stop_error(
     process_error: FirecrackerProcessError,
     image_error: Option<FirecrackerImageError>,
     jail_error: Option<FirecrackerJailError>,
+    cgroup_error: Option<FirecrackerCgroupError>,
 ) -> FirecrackerLifecycleError {
     let mut message = format!("firecracker process cleanup failed: {process_error}");
     if let Some(image_error) = image_error {
@@ -574,16 +669,23 @@ fn stop_error(
     if let Some(jail_error) = jail_error {
         message.push_str(&format!("; jail cleanup failed: {jail_error}"));
     }
+    if let Some(cgroup_error) = cgroup_error {
+        message.push_str(&format!("; cgroup cleanup failed: {cgroup_error}"));
+    }
     FirecrackerLifecycleError::new(message)
 }
 
 fn stop_cleanup_error(
     message: String,
     jail_error: Option<FirecrackerJailError>,
+    cgroup_error: Option<FirecrackerCgroupError>,
 ) -> FirecrackerLifecycleError {
     let mut message = format!("firecracker lifecycle cleanup failed: {message}");
     if let Some(jail_error) = jail_error {
         message.push_str(&format!("; jail cleanup failed: {jail_error}"));
+    }
+    if let Some(cgroup_error) = cgroup_error {
+        message.push_str(&format!("; cgroup cleanup failed: {cgroup_error}"));
     }
     FirecrackerLifecycleError::new(message)
 }
@@ -608,6 +710,7 @@ fn contains_dot_component(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jailer::FirecrackerJailerCgroupVersion;
 
     fn write_regular_file(path: &Path, contents: &[u8]) {
         std::fs::write(path, contents).expect("write regular file");
@@ -674,12 +777,28 @@ mod tests {
             .join("firecracker")
             .join("sandbox-1")
             .join("root");
+        let cgroup_hierarchy = root.path().join("cgroup");
+        let cgroup_mounts = root.path().join("proc-mounts");
 
         write_regular_file(&firecracker_binary_path, b"fake firecracker");
         set_executable(&firecracker_binary_path);
         write_regular_file(&kernel_path, b"kernel");
         write_regular_file(&base_image_path, b"rootfs");
         std::fs::create_dir(&run_directory).expect("create run directory");
+        std::fs::create_dir(&cgroup_hierarchy).expect("create cgroup hierarchy");
+        std::fs::write(
+            cgroup_hierarchy.join("cgroup.controllers"),
+            "cpuset cpu io memory\n",
+        )
+        .expect("write available cgroup controllers");
+        std::fs::write(
+            &cgroup_mounts,
+            format!(
+                "cgroup2 {} cgroup2 rw,nosuid,nodev,noexec 0 0\n",
+                cgroup_hierarchy.display()
+            ),
+        )
+        .expect("write cgroup mounts");
 
         let (uid, gid) = non_root_ids();
         let jailer_script = format!(
@@ -689,6 +808,7 @@ args = sys.argv[1:]
 api_path = args[args.index("--api-sock") + 1]
 config_path = args[args.index("--config-file") + 1]
 chroot = {:?}
+cgroup = {:?}
 with open(chroot + config_path) as config_file:
     config = json.load(config_file)
 assert config["boot-source"]["kernel_image_path"] == "/vmlinux"
@@ -698,12 +818,13 @@ os.makedirs(chroot + "/nested/deep")
 with open(chroot + "/nested/deep/child", "w") as child:
     child.write("child")
 os.symlink("/etc/passwd", chroot + "/nested/link")
+os.makedirs(cgroup + "/firecracker/sandbox-1")
 server = socket.socket(socket.AF_UNIX)
 server.bind(chroot + api_path)
 server.listen(1)
 time.sleep(30)
 "#,
-            chroot_dir
+            chroot_dir, cgroup_hierarchy
         );
         write_regular_file(&jailer_binary_path, jailer_script.as_bytes());
         set_executable(&jailer_binary_path);
@@ -716,6 +837,9 @@ time.sleep(30)
             gid,
         )
         .with_chroot_base_dir(&chroot_base_dir);
+        let jailer = jailer
+            .with_cgroup_version(FirecrackerJailerCgroupVersion::V2)
+            .with_cgroups(vec!["cpu.max=100000".to_owned()]);
         let config = FirecrackerLifecycleConfig::new(
             &firecracker_binary_path,
             &kernel_path,
@@ -726,7 +850,8 @@ time.sleep(30)
             3,
         )
         .with_readiness_timeout(Duration::from_millis(1000))
-        .with_jailer(jailer.clone());
+        .with_jailer(jailer.clone())
+        .with_cgroup_mounts_path(&cgroup_mounts);
         (root, config, jailer, chroot_dir)
     }
 
@@ -919,6 +1044,23 @@ time.sleep(30)
         lifecycle.stop().await.expect("stop jailed lifecycle");
         assert!(!chroot_dir.exists());
         assert!(!root.path().join("jail").exists());
+        assert!(!root.path().join("cgroup/firecracker/sandbox-1").exists());
+        assert!(root.path().join("cgroup/firecracker").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn jailed_lifecycle_drop_cleans_created_cgroups() {
+        let (root, config, _jailer, chroot_dir) = jailed_lifecycle_environment();
+        let cgroup_id = root.path().join("cgroup/firecracker/sandbox-1");
+        let lifecycle = FirecrackerLifecycle::start(&config)
+            .await
+            .expect("start jailed lifecycle");
+
+        drop(lifecycle);
+        assert!(!chroot_dir.exists());
+        assert!(!cgroup_id.exists());
+        assert!(cgroup_id.parent().expect("cgroup parent").exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -939,6 +1081,32 @@ time.sleep(30)
         );
         assert!(!chroot_dir.exists());
         assert!(!root.path().join("jail").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn jailed_lifecycle_startup_failure_cleans_created_cgroups() {
+        let (root, config, _jailer, chroot_dir) = jailed_lifecycle_environment();
+        let cgroup_id = root.path().join("cgroup/firecracker/sandbox-1");
+        let jailer_script = format!(
+            "#!/usr/bin/env python3\nimport os\nos.makedirs({:?})\nraise SystemExit(7)\n",
+            cgroup_id
+        );
+        write_regular_file(&root.path().join("fake-jailer"), jailer_script.as_bytes());
+        set_executable(&root.path().join("fake-jailer"));
+
+        let error = match FirecrackerLifecycle::start(&config).await {
+            Ok(_) => panic!("fake jailer unexpectedly stayed ready"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("firecracker process exited before ready")
+        );
+        assert!(!chroot_dir.exists());
+        assert!(!cgroup_id.exists());
+        assert!(cgroup_id.parent().expect("cgroup parent").exists());
     }
 
     #[cfg(target_os = "linux")]

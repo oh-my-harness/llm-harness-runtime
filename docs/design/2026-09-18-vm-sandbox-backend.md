@@ -229,9 +229,11 @@ jail-relative VM configuration, writes the config file exclusively with mode
 jailer binary, and reuses readiness plus API/config cleanup through the host
 paths inside the chroot. The process primitive itself still requires a staged
 chroot; lifecycle composition now provides that staging. Jail lifecycle cleanup
-does not remove jailer-created cgroups, and guest-agent-coordinated shutdown
-confirmation, registry recovery, network policy, and deployment validation
-remain future work.
+also plans the cgroup paths created by jailer `--cgroup` settings: cgroup v2
+uses the unified mount, cgroup v1 resolves each controller mount, and cleanup
+removes only the jailer-specific `<parent>/<id>` directory while retaining the
+shared parent. Guest-agent-coordinated shutdown confirmation, registry
+recovery, network policy, and deployment validation remain future work.
 
 ## Current status
 
