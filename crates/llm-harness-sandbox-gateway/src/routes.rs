@@ -113,7 +113,7 @@ async fn create_sandbox(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<CreateSandboxRequest>,
 ) -> Response {
-    let sandbox_id = match state.create_sandbox(&principal, request.config) {
+    let sandbox_id = match state.create_sandbox(&principal, request.config).await {
         Ok(id) => id,
         Err(error) => return state_error(error),
     };
@@ -141,7 +141,7 @@ async fn create_sandbox(
         Json(CreateSandboxResponse {
             sandbox_id,
             work_dir,
-            backend: "linux-bwrap".to_owned(),
+            backend: state.backend_label().to_owned(),
             state: RemoteSandboxState::Running,
         }),
     )
@@ -173,7 +173,7 @@ async fn get_sandbox(
     Json(RemoteSandboxStatus {
         sandbox_id: id,
         work_dir: sandbox.work_dir.to_string_lossy().into_owned(),
-        backend: "linux-bwrap".to_owned(),
+        backend: state.backend_label().to_owned(),
         state: sandbox.state,
         config: sandbox.config,
     })

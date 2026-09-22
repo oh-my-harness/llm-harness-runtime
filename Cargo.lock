@@ -2465,6 +2465,8 @@ dependencies = [
  "llm-harness-sandbox",
  "llm-harness-sandbox-remote",
  "llm-harness-types",
+ "llm-harness-vm-agent-env",
+ "llm-harness-vm-firecracker",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
