@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use llm_harness_platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
+use llm_harness_platform::sandbox::{NetRule, ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_sandbox_gateway::{
     FirecrackerBackendConfig, GatewayBackend, GatewayConfig, GatewayPrincipalConfig, SandboxGateway,
 };
@@ -241,6 +241,20 @@ fn firecracker_backend(root: &Path, vsock_guest_cid_base: u32) -> GatewayBackend
     })
 }
 
+fn firecracker_artifact_root() -> tempfile::TempDir {
+    let root = private_tempdir();
+    for name in ["firecracker", "vmlinux", "rootfs-base.ext4"] {
+        std::fs::write(root.path().join(name), b"artifact").expect("write Firecracker artifact");
+    }
+    let mut permissions = std::fs::metadata(root.path().join("firecracker"))
+        .expect("binary metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(root.path().join("firecracker"), permissions)
+        .expect("make Firecracker binary executable");
+    root
+}
+
 fn remote_client(base_url: &str, token: &str) -> Arc<RemoteSandboxClient> {
     let config = RemoteSandboxClientConfig::new(base_url, token).expect("client config");
     Arc::new(RemoteSandboxClient::new(config).expect("client"))
@@ -277,6 +291,191 @@ fn persisted_sandbox_config_json() -> String {
         work_dir: None,
     })
     .expect("serialize persisted sandbox config")
+}
+
+#[test]
+fn gateway_migrates_registry_schema_v1_to_v2() {
+    let work_root = private_tempdir();
+    let sandbox_root = work_root.path().join("sandboxes");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&sandbox_root)
+        .expect("create sandbox root");
+    let sandbox_id = uuid::Uuid::new_v4().to_string();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(sandbox_root.join(&sandbox_id))
+        .expect("create persisted sandbox root");
+
+    let connection =
+        Connection::open(work_root.path().join("registry.sqlite")).expect("create v1 registry");
+    std::fs::set_permissions(
+        work_root.path().join("registry.sqlite"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("set v1 registry permissions");
+    let config_json = persisted_sandbox_config_json();
+    connection
+        .execute_batch(&format!(
+            "PRAGMA application_id = 1279808327;
+             PRAGMA user_version = 1;
+             CREATE TABLE sandboxes (
+                 sandbox_id TEXT PRIMARY KEY,
+                 owner TEXT NOT NULL,
+                 config_json TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK (state IN ('creating', 'running', 'deleting')),
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO sandboxes
+                 (sandbox_id, owner, config_json, state, created_at_ms, updated_at_ms)
+             VALUES ('{sandbox_id}', 'tenant-a', '{config_json}', 'deleting', 0, 0);",
+        ))
+        .expect("create v1 registry schema");
+
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf());
+    let gateway = SandboxGateway::new(config).expect("migrate registry");
+    drop(gateway);
+
+    let connection =
+        Connection::open(work_root.path().join("registry.sqlite")).expect("open migrated registry");
+    let application_id: i64 = connection
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .expect("read application id");
+    let schema_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read schema version");
+    let columns: Vec<String> = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(sandboxes)")
+            .expect("read table schema");
+        statement
+            .query_map([], |row| row.get(1))
+            .expect("query table schema")
+            .collect::<Result<_, _>>()
+            .expect("read table columns")
+    };
+    assert_eq!(application_id, 0x4c_48_53_47);
+    assert_eq!(schema_version, 2);
+    assert_eq!(columns.last().map(String::as_str), Some("vsock_guest_cid"));
+    assert_eq!(registry_record_count(work_root.path()), 0);
+}
+
+#[test]
+fn gateway_registry_requires_unique_vsock_cids() {
+    let work_root = private_tempdir();
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf());
+    let gateway = SandboxGateway::new(config).expect("gateway");
+    drop(gateway);
+
+    let connection =
+        Connection::open(work_root.path().join("registry.sqlite")).expect("open registry");
+    let insert = |sandbox_id: &str, cid: Option<i64>| {
+        connection
+            .execute(
+                "INSERT INTO sandboxes
+                     (sandbox_id, owner, config_json, state, vsock_guest_cid, created_at_ms, updated_at_ms)
+                 VALUES (?1, 'tenant-a', '{}', 'creating', ?2, 0, 0)",
+                rusqlite::params![sandbox_id, cid],
+            )
+            .expect("insert first CID record");
+    };
+    insert(&uuid::Uuid::new_v4().to_string(), Some(3));
+    let error = connection
+        .execute(
+            "INSERT INTO sandboxes
+                 (sandbox_id, owner, config_json, state, vsock_guest_cid, created_at_ms, updated_at_ms)
+             VALUES (?1, 'tenant-a', '{}', 'creating', 3, 0, 0)",
+            rusqlite::params![uuid::Uuid::new_v4().to_string()],
+        )
+        .expect_err("duplicate vsock CID must be rejected");
+    assert!(error.to_string().contains("UNIQUE"));
+}
+
+#[tokio::test]
+async fn firecracker_backend_rejects_unsupported_sandbox_policies() {
+    let artifacts = firecracker_artifact_root();
+    let work_root = private_tempdir();
+    let gateway = start_gateway_with_config(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_work_root(work_root.path().to_path_buf())
+            .with_backend(firecracker_backend(artifacts.path(), 3)),
+    )
+    .await;
+
+    let unsupported = [
+        (
+            "fs_allowlist",
+            SandboxConfig {
+                fs_allowlist: vec![PathBuf::from("/workspace/allowed")],
+                ..sandbox_config()
+            },
+        ),
+        (
+            "fs_denylist",
+            SandboxConfig {
+                fs_denylist: vec![PathBuf::from("/workspace/denied")],
+                ..sandbox_config()
+            },
+        ),
+        (
+            "net_allowlist",
+            SandboxConfig {
+                net_allowlist: vec![NetRule {
+                    host: "example.com".to_owned(),
+                    port_range: None,
+                }],
+                ..sandbox_config()
+            },
+        ),
+        (
+            "max_processes",
+            SandboxConfig {
+                resource_limits: ResourceLimits {
+                    max_processes: Some(16),
+                    ..sandbox_config().resource_limits
+                },
+                ..sandbox_config()
+            },
+        ),
+        (
+            "max_disk_mb",
+            SandboxConfig {
+                resource_limits: ResourceLimits {
+                    max_disk_mb: Some(1024),
+                    ..sandbox_config().resource_limits
+                },
+                ..sandbox_config()
+            },
+        ),
+        (
+            "exceeds backend maximum",
+            SandboxConfig {
+                resource_limits: ResourceLimits {
+                    max_cpus: Some(3),
+                    max_memory_mb: Some(512),
+                    ..sandbox_config().resource_limits
+                },
+                ..sandbox_config()
+            },
+        ),
+    ];
+    for (label, config) in unsupported {
+        let error =
+            match RemoteSandbox::connect(config, remote_client(&gateway.base_url, TOKEN_A)).await {
+                Ok(_) => panic!("unsupported Firecracker policy {label} must be rejected"),
+                Err(error) => error,
+            };
+        assert!(
+            error.to_string().contains(label),
+            "unexpected error for {label}: {error}"
+        );
+    }
 }
 
 fn insert_test_registry_record(
