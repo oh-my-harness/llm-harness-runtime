@@ -307,18 +307,19 @@ impl TeamManager {
                 let client = providers[0].1.clone();
                 providers.push((model.clone(), client));
             }
-            let spec = IndividualSpec::new(&member.id, &member.role_label, model).configure(|b| {
-                let b = b.system_prompt(Some(member.persona.clone()));
-                let mut b = b;
-                for tk in &member.toolkits {
-                    b = match tk.as_str() {
-                        "fs" => b.install(&llm_harness_tools::FsToolsPlugin::new(None)),
-                        "web" => b.install(&llm_harness_tools::WebToolsPlugin::default()),
-                        _ => b,
-                    };
-                }
-                b
-            });
+            let spec = IndividualSpec::new(&member.id, &member.role_label, model)
+                .with_prompt(member.persona.clone())
+                .configure(|b| {
+                    let mut b = b;
+                    for tk in &member.toolkits {
+                        b = match tk.as_str() {
+                            "fs" => b.install(&llm_harness_tools::FsToolsPlugin::new(None)),
+                            "web" => b.install(&llm_harness_tools::WebToolsPlugin::default()),
+                            _ => b,
+                        };
+                    }
+                    b
+                });
             entry
                 .team
                 .replace_member(&member.id, spec, providers)
@@ -341,6 +342,111 @@ impl TeamManager {
         }
         crate::team_manager::persist_spec(&self.data_root, &entry.spec);
         Ok(update)
+    }
+
+    /// Add one member to a live team and persist the updated spec.
+    pub async fn add_member(
+        &mut self,
+        team_id: &str,
+        member: crate::team_spec::MemberSpec,
+        settings: &crate::settings::Settings,
+        api_key: &str,
+    ) -> Result<(), TeamManagerError> {
+        let entry = self
+            .teams
+            .get_mut(team_id)
+            .ok_or_else(|| TeamManagerError::UnknownTeam(team_id.to_string()))?;
+        let mut prospective_spec = entry.spec.clone();
+        prospective_spec.members.push(member.clone());
+        engine::validate_spec(&prospective_spec)?;
+        engine::validate_toolkits(&member)?;
+        let model = member
+            .provider_override
+            .as_ref()
+            .and_then(|override_config| override_config.model.clone())
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| member.model.resolve(&settings.models));
+        let mut member_for_providers = member.clone();
+        member_for_providers.model = crate::team_spec::ModelRef::Explicit(model.clone());
+        if let Some(override_config) = member_for_providers.provider_override.as_mut()
+            && override_config
+                .api_key
+                .as_deref()
+                .map(str::is_empty)
+                .unwrap_or(false)
+        {
+            let path = self
+                .data_root
+                .join("teams")
+                .join(team_id)
+                .join("secrets")
+                .join(&member.id);
+            if let Ok(key) = std::fs::read_to_string(&path) {
+                override_config.api_key = Some(key);
+            }
+        }
+        let mut providers =
+            engine::build_member_providers(&member_for_providers, settings, api_key);
+        if providers.is_empty() {
+            providers = crate::env_cfg::providers_from_factory();
+        }
+        if providers.is_empty() {
+            return Err(TeamManagerError::NoProviders);
+        }
+        if !providers
+            .iter()
+            .any(|(provider_model, _)| provider_model == &model)
+        {
+            let client = providers[0].1.clone();
+            providers.push((model.clone(), client));
+        }
+        let spec = IndividualSpec::new(&member.id, &member.role_label, model)
+            .with_prompt(member.persona.clone())
+            .configure(|builder| {
+                let mut builder = builder;
+                for toolkit in &member.toolkits {
+                    builder = match toolkit.as_str() {
+                        "fs" => builder.install(&llm_harness_tools::FsToolsPlugin::new(None)),
+                        "web" => builder.install(&llm_harness_tools::WebToolsPlugin::default()),
+                        _ => builder,
+                    };
+                }
+                builder
+            });
+        entry.team.add_member(spec, providers).await?;
+        if let Some(context) = entry.team.social_context() {
+            let new_agent = llm_harness_agent_team::AgentId::new(&member.id);
+            for peer in entry.spec.members.iter().map(|peer| &peer.id) {
+                let peer_agent = llm_harness_agent_team::AgentId::new(peer);
+                context.ensure_contact(&new_agent, &peer_agent);
+                context.ensure_contact(&peer_agent, &new_agent);
+            }
+        }
+        entry.spec.members.push(member);
+        persist_spec(&self.data_root, &entry.spec);
+        Ok(())
+    }
+
+    /// Remove one member from a live team and persist the updated spec.
+    pub async fn remove_member(
+        &mut self,
+        team_id: &str,
+        member_id: &str,
+    ) -> Result<(), TeamManagerError> {
+        let entry = self
+            .teams
+            .get_mut(team_id)
+            .ok_or_else(|| TeamManagerError::UnknownTeam(team_id.to_string()))?;
+        let index = entry
+            .spec
+            .members
+            .iter()
+            .position(|member| member.id == member_id)
+            .ok_or_else(|| TeamManagerError::UnknownMember(member_id.to_string()))?;
+        entry.team.remove_member(member_id).await?;
+        entry.spec.members.remove(index);
+        persist_spec(&self.data_root, &entry.spec);
+        Ok(())
     }
 
     /// Apply the current template to members that still match the creation

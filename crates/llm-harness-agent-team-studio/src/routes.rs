@@ -18,6 +18,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::AbortHandle;
 
+use llm_harness_agent_team::TeamError;
+use llm_harness_types::AgentEvent;
 use parking_lot::Mutex;
 
 use crate::issue::IssueStatus;
@@ -43,6 +45,8 @@ pub struct AppState {
     /// Live operator pump tasks, keyed by project id. Restarting a project
     /// must abort the pump bound to the old `SocialContext`.
     pub operator_pumps: Arc<Mutex<HashMap<String, AbortHandle>>>,
+    /// Live per-member thinking pumps, keyed by `<project>/<agent>`.
+    pub thought_pumps: Arc<Mutex<HashMap<String, AbortHandle>>>,
     /// Explicitly authorized workspace roots for host filesystem browsing.
     pub grants: Arc<RwLock<WorkspaceGrants>>,
     /// Startup restoration outcome so clients can distinguish healthy and degraded launches.
@@ -96,6 +100,10 @@ fn team_routes(prefix: &'static str, state: AppState) -> Router {
         .route(
             &format!("{prefix}/agent/config"),
             get(agent_config).put(put_agent_config),
+        )
+        .route(
+            &format!("{prefix}/members"),
+            get(list_members).post(add_member).delete(remove_member),
         )
         .route(&format!("{prefix}/templates"), get(list_templates))
         .route(&format!("{prefix}/upgrade-check"), post(upgrade_check))
@@ -283,6 +291,7 @@ async fn delete_project(State(state): State<AppState>, Query(q): Query<DeleteQue
         Ok(_) => {
             remove_team_from_registry(&state.registry, &q.id);
             stop_operator_pump(&state.operator_pumps, &q.id);
+            remove_team_thought_pumps(&state.thought_pumps, &q.id);
             unpersist_spec(&state.data_root, &q.id);
             Json(serde_json::json!({ "ok": true })).into_response()
         }
@@ -947,6 +956,8 @@ struct AgentConfigBody {
     #[serde(default)]
     persona: Option<String>,
     #[serde(default)]
+    role_label: Option<String>,
+    #[serde(default)]
     toolkits: Option<Vec<String>>,
     /// "strong"/"main"/"cheap" → tier ref; anything else → explicit model.
     #[serde(default)]
@@ -1012,6 +1023,9 @@ async fn put_agent_config(
     if let Some(persona) = body.persona {
         member.persona = persona;
     }
+    if let Some(role_label) = body.role_label {
+        member.role_label = role_label;
+    }
     if let Some(toolkits) = body.toolkits {
         member.toolkits = toolkits;
     }
@@ -1062,7 +1076,14 @@ async fn put_agent_config(
             {
                 state
                     .registry
-                    .register(format!("{}/{}", body.project, body.agent), h);
+                    .register(format!("{}/{}", body.project, body.agent), h.clone());
+                spawn_agent_thought_pump(
+                    state.events.clone(),
+                    state.thought_pumps.clone(),
+                    &body.project,
+                    &body.agent,
+                    h,
+                );
             }
             Json(serde_json::json!({
                 "ok": true,
@@ -1071,6 +1092,157 @@ async fn put_agent_config(
             .into_response()
         }
         Err(e) => err_resp(e.to_string(), StatusCode::CONFLICT),
+    }
+}
+
+#[derive(Deserialize)]
+struct MembersQuery {
+    project: String,
+}
+
+/// GET /api/team/members?project= — declarative member specs for editing.
+async fn list_members(
+    State(state): State<AppState>,
+    Query(query): Query<MembersQuery>,
+) -> Response {
+    let pm = state.pm.read().await;
+    let Some(project) = pm.get(&query.project) else {
+        return err_resp(
+            format!("unknown project: {}", query.project),
+            StatusCode::NOT_FOUND,
+        );
+    };
+    let members: Vec<serde_json::Value> = project
+        .spec
+        .members
+        .iter()
+        .map(|member| {
+            let model = match &member.model {
+                crate::team_spec::ModelRef::Tier(tier) => tier.clone(),
+                crate::team_spec::ModelRef::Explicit(model) => model.clone(),
+            };
+            serde_json::json!({
+                "id": member.id,
+                "persona": member.persona,
+                "role_label": member.role_label,
+                "model": model,
+                "toolkits": member.toolkits,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "members": members })).into_response()
+}
+
+#[derive(Deserialize)]
+struct AddMemberBody {
+    project: String,
+    id: String,
+    #[serde(default)]
+    persona: String,
+    #[serde(default)]
+    role_label: Option<String>,
+    #[serde(default = "default_member_model")]
+    model: String,
+    #[serde(default)]
+    toolkits: Vec<String>,
+}
+
+fn default_member_model() -> String {
+    "main".to_string()
+}
+
+/// POST /api/team/members — add and immediately start one member.
+async fn add_member(State(state): State<AppState>, Json(body): Json<AddMemberBody>) -> Response {
+    let tier = state.tier.read().await.clone();
+    let base_url = crate::settings::Settings::load(&state.data_root)
+        .ok()
+        .flatten()
+        .map(|settings| settings.base_url)
+        .unwrap_or_default();
+    let settings = crate::settings::Settings {
+        models: tier,
+        scout_interval_secs: *state.scout_interval_secs.read().await,
+        base_url,
+    };
+    let api_key = crate::settings::load_api_key(&state.data_root).unwrap_or_default();
+    let persona = if body.persona.trim().is_empty() {
+        format!("你是团队的 {}，负责完成操作员和队友交给你的任务。", body.id)
+    } else {
+        body.persona
+    };
+    let model = match body.model.as_str() {
+        "strong" | "main" | "cheap" => crate::team_spec::ModelRef::Tier(body.model.clone()),
+        explicit => crate::team_spec::ModelRef::Explicit(explicit.to_string()),
+    };
+    let member = crate::team_spec::MemberSpec {
+        id: body.id.clone(),
+        persona,
+        role_label: body.role_label.unwrap_or_else(|| body.id.clone()),
+        model,
+        toolkits: body.toolkits,
+        behaviors: Vec::new(),
+        provider_override: None,
+        persona_file: None,
+    };
+
+    let mut pm = state.pm.write().await;
+    match pm
+        .add_member(&body.project, member, &settings, &api_key)
+        .await
+    {
+        Ok(()) => {
+            if let Some(harness) = pm.get(&body.project).and_then(|entry| {
+                entry
+                    .team
+                    .harness(&llm_harness_agent_team::AgentId::new(&body.id))
+            }) {
+                state
+                    .registry
+                    .register(format!("{}/{}", body.project, body.id), harness.clone());
+                spawn_agent_thought_pump(
+                    state.events.clone(),
+                    state.thought_pumps.clone(),
+                    &body.project,
+                    &body.id,
+                    harness,
+                );
+            }
+            (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
+        }
+        Err(TeamManagerError::UnknownTeam(project)) => {
+            err_resp(format!("unknown project: {project}"), StatusCode::NOT_FOUND)
+        }
+        Err(error) => err_resp(error.to_string(), StatusCode::CONFLICT),
+    }
+}
+
+#[derive(Deserialize)]
+struct RemoveMemberQuery {
+    project: String,
+    agent: String,
+}
+
+/// DELETE /api/team/members?project=&agent= — stop and remove one member.
+async fn remove_member(
+    State(state): State<AppState>,
+    Query(query): Query<RemoveMemberQuery>,
+) -> Response {
+    let mut pm = state.pm.write().await;
+    match pm.remove_member(&query.project, &query.agent).await {
+        Ok(()) => {
+            stop_agent_thought_pump(&state.thought_pumps, &query.project, &query.agent);
+            state
+                .registry
+                .remove(&format!("{}/{}", query.project, query.agent));
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(TeamManagerError::UnknownTeam(project)) => {
+            err_resp(format!("unknown project: {project}"), StatusCode::NOT_FOUND)
+        }
+        Err(TeamManagerError::UnknownMember(agent)) => {
+            err_resp(format!("unknown member: {agent}"), StatusCode::NOT_FOUND)
+        }
+        Err(error) => err_resp(error.to_string(), StatusCode::CONFLICT),
     }
 }
 
@@ -1083,18 +1255,37 @@ pub fn spawn_operator_pump(
     ctx: llm_harness_agent_team::SocialContext,
 ) {
     let pump_team_id = team_id.clone();
+    let mut messages = ctx.subscribe_messages();
     let handle = tokio::spawn(async move {
         let operator = llm_harness_agent_team::AgentId::new("operator");
         loop {
-            ctx.wait_for_message(&operator).await;
-            for msg in ctx.drain_inbox(&operator) {
+            let Ok(msg) = messages.recv().await else {
+                break;
+            };
+            let message_type = match msg.message_type {
+                llm_harness_agent_team::MessageType::Direct => "direct",
+                llm_harness_agent_team::MessageType::DelegationRequest => "delegation",
+                llm_harness_agent_team::MessageType::Broadcast => "broadcast",
+                llm_harness_agent_team::MessageType::Timeout => "timeout",
+                llm_harness_agent_team::MessageType::SelfReminder => "self_reminder",
+                llm_harness_agent_team::MessageType::ReflectionTrigger => "reflection",
+            };
+            events.publish(crate::events::team_message_event(
+                &pump_team_id,
+                msg.from.as_str(),
+                msg.to.as_str(),
+                message_type,
+                &msg.body,
+                msg.broadcast_id.as_deref(),
+            ));
+            if msg.to == operator {
                 let message = msg.clone();
+                ctx.ack_inbox_messages(&[message]);
                 events.publish(crate::events::operator_event(
                     &pump_team_id,
                     msg.from.as_str(),
                     &msg.body,
                 ));
-                ctx.ack_inbox_messages(&[message]);
             }
         }
     });
@@ -1114,6 +1305,75 @@ fn register_operator_pump(
 
 fn stop_operator_pump(pumps: &Arc<Mutex<HashMap<String, AbortHandle>>>, team_id: &str) {
     if let Some(handle) = pumps.lock().remove(team_id) {
+        handle.abort();
+    }
+}
+
+/// Forward one member's thinking deltas to the WS event bus.
+pub fn spawn_agent_thought_pump(
+    events: Arc<crate::events::EventBus>,
+    pumps: Arc<Mutex<HashMap<String, AbortHandle>>>,
+    project: &str,
+    agent: &str,
+    harness: Arc<llm_harness_agent::AgentHarness>,
+) {
+    let mut event_rx = harness.subscribe();
+    let pump_project = project.to_string();
+    let pump_agent = agent.to_string();
+    let key = format!("{project}/{agent}");
+    let handle = tokio::spawn(async move {
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => {
+                    if let llm_harness_agent::AgentHarnessEvent::Agent(
+                        AgentEvent::ThinkingDelta {
+                            message_id,
+                            thinking,
+                            ..
+                        },
+                    ) = event.as_ref()
+                    {
+                        events.publish(crate::events::agent_thought_event(
+                            &pump_project,
+                            &pump_agent,
+                            message_id,
+                            thinking,
+                        ));
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    let mut pumps = pumps.lock();
+    if let Some(old) = pumps.insert(key, handle.abort_handle()) {
+        old.abort();
+    }
+}
+
+fn remove_team_thought_pumps(pumps: &Arc<Mutex<HashMap<String, AbortHandle>>>, team_id: &str) {
+    let prefix = format!("{team_id}/");
+    let keys: Vec<String> = pumps
+        .lock()
+        .keys()
+        .filter(|key| key.starts_with(&prefix))
+        .cloned()
+        .collect();
+    let mut pumps = pumps.lock();
+    for key in keys {
+        if let Some(handle) = pumps.remove(&key) {
+            handle.abort();
+        }
+    }
+}
+
+fn stop_agent_thought_pump(
+    pumps: &Arc<Mutex<HashMap<String, AbortHandle>>>,
+    project: &str,
+    agent: &str,
+) {
+    if let Some(handle) = pumps.lock().remove(&format!("{project}/{agent}")) {
         handle.abort();
     }
 }
@@ -1179,8 +1439,8 @@ fn err_resp(message: String, status: StatusCode) -> Response {
 #[derive(Deserialize)]
 struct ChatBody {
     project: String,
-    /// Routing target: any member of the team (panel offers the member
-    /// list; the backend re-checks against the spec).
+    /// Routing target: `team` broadcasts to every member; any other value
+    /// must name a member (the backend re-checks against the spec).
     target: String,
     text: String,
 }
@@ -1194,15 +1454,26 @@ async fn chat(State(state): State<AppState>, Json(body): Json<ChatBody>) -> Resp
         )
             .into_response();
     };
-    if !project.spec.members.iter().any(|m| m.id == body.target) {
+    if body.target != "team" && !project.spec.members.iter().any(|m| m.id == body.target) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "ok": false, "error": format!("unknown member: {}", body.target) })),
         )
             .into_response();
     }
-    match project.team.submit(&body.target, &body.text) {
-        Ok(()) => (
+    let result = if body.target == "team" {
+        let operator = llm_harness_agent_team::AgentId::new("operator");
+        project
+            .team
+            .social_context()
+            .ok_or_else(|| TeamError::NotBuilt)
+            .and_then(|context| context.broadcast(&operator, body.text))
+            .map(|_| ())
+    } else {
+        project.team.submit(&body.target, &body.text)
+    };
+    match result {
+        Ok(_) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({ "ok": true })),
         )
@@ -1389,6 +1660,7 @@ async fn restart_project(State(state): State<AppState>, Query(q): Query<DeleteQu
     let mut pm = state.pm.write().await;
     remove_team_from_registry(&state.registry, &q.id);
     stop_operator_pump(&state.operator_pumps, &q.id);
+    remove_team_thought_pumps(&state.thought_pumps, &q.id);
     let result = pm.restart(&q.id, &settings, &api_key).await;
     register_team_side_effects(&state, &pm, &q.id);
     match result {
@@ -1425,7 +1697,7 @@ fn remove_team_from_registry(
     }
 }
 
-fn register_team_side_effects(state: &AppState, pm: &TeamManager, team_id: &str) {
+pub(crate) fn register_team_side_effects(state: &AppState, pm: &TeamManager, team_id: &str) {
     if let Some(entry) = pm.get(team_id) {
         for member in &entry.spec.members {
             if let Some(harness) = entry
@@ -1434,7 +1706,14 @@ fn register_team_side_effects(state: &AppState, pm: &TeamManager, team_id: &str)
             {
                 state
                     .registry
-                    .register(format!("{team_id}/{}", member.id), harness);
+                    .register(format!("{team_id}/{}", member.id), harness.clone());
+                spawn_agent_thought_pump(
+                    state.events.clone(),
+                    state.thought_pumps.clone(),
+                    team_id,
+                    &member.id,
+                    harness,
+                );
             }
         }
     }
@@ -1555,6 +1834,7 @@ mod tests {
             events: Arc::new(crate::events::EventBus::new()),
             registry: llm_harness_inspector::state::HarnessRegistry::new("default"),
             operator_pumps: Arc::new(Mutex::new(HashMap::new())),
+            thought_pumps: Arc::new(Mutex::new(HashMap::new())),
             grants: Arc::new(RwLock::new(
                 crate::workspace::WorkspaceGrants::load("unused-for-recovery").unwrap(),
             )),
@@ -1640,6 +1920,7 @@ mod tests {
             events: Arc::new(crate::events::EventBus::new()),
             registry: llm_harness_inspector::state::HarnessRegistry::new("default"),
             operator_pumps: Arc::new(Mutex::new(HashMap::new())),
+            thought_pumps: Arc::new(Mutex::new(HashMap::new())),
             grants: Arc::new(RwLock::new(grants)),
             startup_recovery: Arc::new(RwLock::new(crate::runtime::StartupRecovery::default())),
         };
@@ -1729,6 +2010,7 @@ mod tests {
         };
         old_ctx.push_message(message("before restart")).unwrap();
         assert!(rx.recv().await.unwrap().contains("before restart"));
+        assert!(rx.recv().await.unwrap().contains("\"operator_msg\""));
 
         super::spawn_operator_pump(
             events,
@@ -1740,6 +2022,123 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(rx.try_recv().is_err(), "old pump must be aborted");
         assert_eq!(pumps.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_pump_projects_agent_to_agent_messages() {
+        let events = Arc::new(crate::events::EventBus::new());
+        let mut rx = events.subscribe();
+        let pumps = Arc::new(Mutex::new(HashMap::new()));
+        let ctx = llm_harness_agent_team::SocialContext::new(10);
+        let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
+        let operator = AgentId::new("operator");
+        ctx.register_agent(alice.clone(), "rust");
+        ctx.register_agent(bob.clone(), "writing");
+        ctx.register_agent(operator.clone(), "operator");
+        super::spawn_operator_pump(events, pumps, "p1".into(), ctx.clone());
+
+        ctx.send_direct(&alice, &bob, "peer update", 0).unwrap();
+        let team_message = rx.recv().await.unwrap();
+        assert!(
+            team_message.contains("\"team_message\"") && team_message.contains("peer update"),
+            "{team_message}"
+        );
+
+        ctx.send_direct(&alice, &operator, "operator update", 0)
+            .unwrap();
+        let team_message = rx.recv().await.unwrap();
+        assert!(team_message.contains("operator update"), "{team_message}");
+        let operator_message = rx.recv().await.unwrap();
+        assert!(
+            operator_message.contains("\"operator_msg\"")
+                && operator_message.contains("operator update"),
+            "{operator_message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn thought_pump_publishes_thinking_delta() {
+        let _factory = crate::env_cfg::install_test_provider_factory(Arc::new(|| {
+            vec![(
+                "m".into(),
+                Arc::new(MockLlmClient::new(vec![
+                    llm_harness_loop::test_utils::MockResponse::text_with_thinking(
+                        "internal reasoning",
+                        "final answer",
+                    ),
+                ])) as Arc<dyn llm_harness_loop::LlmClient>,
+            )]
+        }));
+        let root = unique_dir("ct-routes-thinking");
+        let mut manager = TeamManager::new(&root);
+        let spec = crate::team_spec::TeamSpec {
+            id: "p1".into(),
+            template: None,
+            template_baseline: None,
+            name: "Thinking Team".into(),
+            repo_path: None,
+            members: vec![crate::team_spec::MemberSpec {
+                id: "a".into(),
+                persona: "worker".into(),
+                role_label: "worker".into(),
+                model: crate::team_spec::ModelRef::Tier("main".into()),
+                toolkits: vec![],
+                behaviors: vec![],
+                provider_override: None,
+                persona_file: None,
+            }],
+        };
+        manager
+            .create(
+                spec,
+                Some(make_repo()),
+                &crate::settings::Settings {
+                    models: tier(),
+                    scout_interval_secs: 0,
+                    base_url: String::new(),
+                },
+                "",
+            )
+            .await
+            .unwrap();
+
+        let events = Arc::new(crate::events::EventBus::new());
+        let mut event_rx = events.subscribe();
+        let thought_pumps = Arc::new(Mutex::new(HashMap::new()));
+        let harness = manager
+            .get("p1")
+            .unwrap()
+            .team
+            .harness(&AgentId::new("a"))
+            .unwrap();
+        super::spawn_agent_thought_pump(events, thought_pumps, "p1", "a", harness);
+        manager
+            .get("p1")
+            .unwrap()
+            .team
+            .submit("a", "produce a thought")
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match event_rx.try_recv() {
+                Ok(event)
+                    if event.contains("\"agent_thought\"")
+                        && event.contains("internal reasoning") =>
+                {
+                    break;
+                }
+                _ => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "thought pump did not publish the thinking delta"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+        manager.shutdown_all().await;
     }
 
     #[tokio::test]
@@ -1855,6 +2254,22 @@ mod tests {
         // The brainstormer received its message too.
         let drained = project.drain_inbox(&llm_harness_agent_team::AgentId::new("brainstormer"));
         assert!(drained.iter().any(|m| m.body.contains("I want a feature")));
+    }
+
+    #[tokio::test]
+    async fn chat_accepts_team_broadcast_target() {
+        let (router, _pm, repo, _factory) = setup().await;
+        register_template_team(&router, &repo).await;
+
+        let (status, json) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "p1", "target": "team", "text": "coordinate now"
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{json}");
     }
 
     #[tokio::test]
@@ -2018,6 +2433,7 @@ mod tests {
             events: bus,
             registry: llm_harness_inspector::state::HarnessRegistry::new("default"),
             operator_pumps: Arc::new(Mutex::new(HashMap::new())),
+            thought_pumps: Arc::new(Mutex::new(HashMap::new())),
             grants: Arc::new(RwLock::new(grants)),
             startup_recovery: Arc::new(RwLock::new(crate::runtime::StartupRecovery::default())),
         };
@@ -2382,6 +2798,156 @@ mod tests {
             std::fs::read_to_string(pm.read().await.data_root().join("teams/p1/team.json"))
                 .unwrap();
         assert!(spec_text.contains("new persona text"));
+    }
+
+    #[tokio::test]
+    async fn member_routes_add_delete_and_persist() {
+        let (router, pm, repo, _factory) = setup().await;
+        register_template_team(&router, &repo).await;
+
+        let (status, json) = json_post(
+            &router,
+            "/api/team/members",
+            serde_json::json!({
+                "project": "p1",
+                "id": "docs-writer",
+                "persona": "Write concise documentation.",
+                "role_label": "Documentation Writer",
+                "model": "main",
+                "toolkits": ["fs"],
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{json}");
+
+        let (status, json) = get_json(&router, "/api/team/members?project=p1").await;
+        assert_eq!(status, 200, "{json}");
+        let member = json["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["id"] == "docs-writer")
+            .unwrap();
+        assert_eq!(member["persona"], "Write concise documentation.");
+        assert_eq!(member["role_label"], "Documentation Writer");
+        assert_eq!(member["model"], "main");
+        assert_eq!(member["toolkits"][0], "fs");
+
+        {
+            let manager = pm.read().await;
+            let entry = manager.get("p1").unwrap();
+            assert!(
+                entry
+                    .team
+                    .harness(&llm_harness_agent_team::AgentId::new("docs-writer"))
+                    .is_some()
+            );
+            let context = entry.team.social_context().unwrap();
+            let new_agent = llm_harness_agent_team::AgentId::new("docs-writer");
+            let peer = llm_harness_agent_team::AgentId::new("planner");
+            assert!(context.has_contact(&new_agent, &peer));
+            assert!(context.has_contact(&peer, &new_agent));
+        }
+
+        let spec_text =
+            std::fs::read_to_string(pm.read().await.data_root().join("teams/p1/team.json"))
+                .unwrap();
+        assert!(spec_text.contains("docs-writer"));
+        assert!(spec_text.contains("Write concise documentation."));
+
+        let (status, json) = json_method(
+            &router,
+            "DELETE",
+            "/api/team/members?project=p1&agent=docs-writer",
+            serde_json::json!(null),
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+
+        let (status, json) = get_json(&router, "/api/team/members?project=p1").await;
+        assert_eq!(status, 200, "{json}");
+        assert!(
+            !json["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|member| member["id"] == "docs-writer")
+        );
+        {
+            let manager = pm.read().await;
+            let entry = manager.get("p1").unwrap();
+            assert!(
+                entry
+                    .team
+                    .harness(&llm_harness_agent_team::AgentId::new("docs-writer"))
+                    .is_none()
+            );
+        }
+
+        let spec_text =
+            std::fs::read_to_string(pm.read().await.data_root().join("teams/p1/team.json"))
+                .unwrap();
+        assert!(!spec_text.contains("docs-writer"));
+    }
+
+    #[tokio::test]
+    async fn member_routes_return_404_for_unknown_team_and_member() {
+        let (router, _pm, repo, _factory) = setup().await;
+        register_template_team(&router, &repo).await;
+
+        let (status, _) = get_json(&router, "/api/team/members?project=ghost").await;
+        assert_eq!(status, 404);
+        let (status, _) = json_post(
+            &router,
+            "/api/team/members",
+            serde_json::json!({ "project": "ghost", "id": "new-agent" }),
+        )
+        .await;
+        assert_eq!(status, 404);
+        let (status, _) = json_method(
+            &router,
+            "DELETE",
+            "/api/team/members?project=p1&agent=ghost",
+            serde_json::json!(null),
+        )
+        .await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn agent_config_updates_role_label_and_persists() {
+        let (router, pm, repo, _factory) = setup().await;
+        register_template_team(&router, &repo).await;
+
+        let (status, json) = json_put(
+            &router,
+            "/api/team/agent/config",
+            serde_json::json!({
+                "project": "p1",
+                "agent": "coder",
+                "role_label": "Implementation Lead",
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(
+            json["rebuilt"], true,
+            "role label is a social identity field"
+        );
+
+        let (_, json) = get_json(&router, "/api/team/members?project=p1").await;
+        let member = json["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["id"] == "coder")
+            .unwrap();
+        assert_eq!(member["role_label"], "Implementation Lead");
+
+        let spec_text =
+            std::fs::read_to_string(pm.read().await.data_root().join("teams/p1/team.json"))
+                .unwrap();
+        assert!(spec_text.contains("Implementation Lead"));
     }
 
     #[tokio::test]

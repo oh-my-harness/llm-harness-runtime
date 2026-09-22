@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
 
 use crate::agent_id::AgentId;
@@ -276,6 +277,26 @@ impl TimeoutRegistry {
         self.fired.lock().clear();
         cancelled
     }
+
+    /// Abort every pending timeout for one agent and clear its fired keys.
+    ///
+    /// Used when a member is removed: its timers must not fire into a dead
+    /// inbox or mutate relation state after the member is unregistered.
+    pub fn cancel_for_agent(&self, agent: &AgentId) -> Vec<String> {
+        let bucket = self.pending.lock().remove(agent);
+        let cancelled = bucket
+            .map(|entries| {
+                let (keys, pending_entries): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+                for (handle, _) in pending_entries {
+                    handle.abort();
+                }
+                keys
+            })
+            .unwrap_or_default();
+        self.fired.lock().remove(agent);
+        cancelled
+    }
+
     /// Restore a previously cancelled (or fired) deadline under
     /// `(agent, key)` with a live timer's abort handle.
     ///
@@ -424,6 +445,9 @@ pub struct SocialContext {
     /// [`crate::agent_runner::spawn_monitor_task`] so shutdown can abort
     /// monitors whose runner died without running its own cleanup.
     monitor_registry: Arc<Mutex<HashMap<AgentId, AbortHandle>>>,
+    /// Live message observer stream. It sees messages at delivery time and
+    /// therefore never competes with the receiving agent's monitor task.
+    message_events: Arc<broadcast::Sender<InboxMessage>>,
     max_contacts: usize,
 }
 
@@ -438,6 +462,7 @@ impl SocialContext {
             timeouts: Arc::new(TimeoutRegistry::default()),
             timer_journal: None,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
+            message_events: Arc::new(broadcast::channel(256).0),
             max_contacts,
         }
     }
@@ -466,6 +491,7 @@ impl SocialContext {
             timeouts: Arc::new(TimeoutRegistry::default()),
             timer_journal,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
+            message_events: Arc::new(broadcast::channel(256).0),
             max_contacts,
         };
         if let Some(journal) = &context.timer_journal {
@@ -510,6 +536,29 @@ impl SocialContext {
     pub fn get_agent_info(&self, id: &AgentId) -> Option<AgentInfo> {
         self.registry.get(id)
     }
+
+    /// Subscribe to every message at delivery time. This is an observation
+    /// stream only; consumers must not drain or acknowledge inboxes.
+    pub fn subscribe_messages(&self) -> broadcast::Receiver<InboxMessage> {
+        self.message_events.subscribe()
+    }
+
+    /// Remove an agent from social participation.
+    ///
+    /// This aborts the agent's monitor, acknowledges any durable inbox rows
+    /// that are discarded with the member, and unregisters it. Contact edges
+    /// are retained as historical social state; they do not make the removed
+    /// agent addressable again.
+    pub fn remove_agent(&self, id: &AgentId) {
+        self.cancel_agent_timeouts(id);
+        if let Some(handle) = self.monitor_registry.lock().remove(id) {
+            handle.abort();
+        }
+        let messages = self.drain_inbox(id);
+        self.ack_inbox_messages(&messages);
+        self.registry.remove(id);
+    }
+
     /// Mark every registered agent as [`AgentStatus::Stopped`].
     ///
     /// Called at team shutdown: statuses left Idle/Busy would misreport
@@ -662,7 +711,8 @@ impl SocialContext {
         {
             self.ensure_contact(&message.to, &message.from);
         }
-        self.inboxes.push(message)?;
+        let message = self.inboxes.push_for_observer(message)?;
+        let _ = self.message_events.send(message);
         Ok(())
     }
 
@@ -862,6 +912,12 @@ impl SocialContext {
         let cancelled = self.timeouts.cancel_all();
         for (agent, key) in cancelled {
             self.cancel_timer(&agent, &key);
+        }
+    }
+
+    pub(crate) fn cancel_agent_timeouts(&self, agent: &AgentId) {
+        for key in self.timeouts.cancel_for_agent(agent) {
+            self.cancel_timer(agent, &key);
         }
     }
 
@@ -1090,6 +1146,7 @@ mod tests {
             timeouts: Arc::new(TimeoutRegistry::default()),
             timer_journal: None,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
+            message_events: Arc::new(broadcast::channel(256).0),
             max_contacts: 10,
         };
         let alice = AgentId::new("alice");
@@ -1135,6 +1192,43 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, alice);
         assert_eq!(all[0].expertise, "rust systems programming");
+    }
+
+    #[tokio::test]
+    async fn message_observer_sees_delivered_message() {
+        let ctx = SocialContext::new(10);
+        let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
+        ctx.register_agent(alice.clone(), "rust");
+        ctx.register_agent(bob.clone(), "writing");
+        let mut observer = ctx.subscribe_messages();
+
+        ctx.send_direct(&alice, &bob, "peer update", 0).unwrap();
+
+        let message = observer.recv().await.unwrap();
+        assert_eq!(message.from, alice);
+        assert_eq!(message.to, bob);
+        assert_eq!(message.body, "peer update");
+    }
+
+    #[tokio::test]
+    async fn message_observer_receives_journal_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Arc::new(
+            crate::inbox_journal::InboxJournal::open(directory.path().join("inbox.sqlite3"))
+                .unwrap(),
+        );
+        let ctx = SocialContext::with_journal(10, Some(journal), None).unwrap();
+        let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
+        ctx.register_agent(alice.clone(), "rust");
+        ctx.register_agent(bob.clone(), "writing");
+        let mut observer = ctx.subscribe_messages();
+
+        ctx.send_direct(&alice, &bob, "durable update", 0).unwrap();
+
+        let message = observer.recv().await.unwrap();
+        assert!(message.journal_id.is_some());
     }
 
     #[test]

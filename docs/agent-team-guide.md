@@ -78,9 +78,19 @@ workspace 的 `reqwest` 依赖启用 `rustls-tls-native-roots`，使 provider
 | 方法 | 说明 |
 |------|------|
 | `new(id, expertise, model)` | 成员 id、专长描述（进入其 system prompt 与通讯录）、模型 |
+| `with_persona(persona)` | 设置成员性格/协作风格；在没有显式 prompt 时自动生成包含 id、专长和 persona 的成员专属 system prompt |
+| `with_prompt(prompt)` | 设置该成员的完整 system prompt；显式完整 prompt 优先于 `configure(system_prompt)` 和 persona 生成 prompt |
 | `configure(\|b\| b.system_prompt(...))` | 定制内部 `HarnessBuilder`（工具、hooks 等全部可用） |
+| `prompt()` | 读取当前生效 prompt；优先级为 `with_prompt` > `configure(system_prompt)` > persona 生成 prompt |
 | `reflection_interval(n)` | 每 n 次 run 触发一次反思（见下文反思循环） |
 | `allow_subagents(true)` | 允许该成员派生自己的子 agent（默认关闭——spawn 会放大 LLM 流量与失控半径） |
+
+```rust
+let researcher = IndividualSpec::new("researcher", "信息检索与事实核查", "claude-sonnet-4")
+    .with_persona("严谨、保守、只基于证据下结论");
+let writer = IndividualSpec::new("writer", "把研究结论写成报告", "claude-sonnet-4")
+    .with_persona("直接、面向决策者、避免术语堆砌");
+```
 
 ### AgentTeam（组队与生命周期）
 
@@ -184,9 +194,9 @@ backtrace，便于桌面宿主或运维在进程退出后定位原因。
 `workspace_unauthorized`、`workspace_check`、`team_create`）。这样可以先处理已恢复
 的团队，同时定位未恢复团队的数据或授权问题，而不是把失败静默吞掉。
 
-面板三列工作区：左列成员卡片（状态/插话/停止）、中列选中成员 session
-历史、右列 per-agent 配置（persona 热应用；model/api key/base url/工具包
-改动重建该成员 harness）；右上角 ⚙ 是全局设置模态框。
+面板三列工作区：左列成员卡片（状态/插话/停止/动态增删）、中列共享聊天与
+思考过程流、右列 per-agent 配置（persona 热应用；model/api key/base url/
+工具包改动重建该成员 harness）；右上角 ⚙ 是全局设置模态框。
 
 关键 API：
 
@@ -195,11 +205,20 @@ backtrace，便于桌面宿主或运维在进程退出后定位原因。
 
 - `GET /api/team/templates` — 模板列表
 - `POST /api/team/projects {id, template_id, repo_path}` — 从模板创建团队
+- `GET/POST/DELETE /api/team/members` — 声明式成员列表、动态新增/删除；
+  新成员会与既有成员建立双向 contact，删除会停止 runner 并更新 `team.json`
+- `POST /api/team/chat {project, target, text}` — 操作员发给指定成员；
+  `target="team"` 会广播给全部成员
 - `GET/PUT /api/team/agent/config` — per-agent 配置（PUT persona 热应用，
   model/key/url 重建）
 - `POST /api/team/upgrade-check` — 升级检查（逐字段相等判定哪些成员会跟随
   模板升级、哪些是本地覆写）
 - `GET /api/team/startup` — 启动恢复报告
+
+`/api/team/events` WebSocket 会回放并直播 `team_message` 与
+`agent_thought`。`team_message` 覆盖 operator→member、operator→team、
+member→member 的落库投递；团队广播对同一 `broadcast_id` 去重后显示一次。
+`agent_thought` 只用于操作员可见的过程流，不注入其它成员的模型上下文。
 
 
 设计：`docs/design/2026-08-30-agent-team-studio-design.md`（含 inspector 两层定位

@@ -4,7 +4,6 @@ use crate::routes::{AppState, team_router};
 use crate::settings::Settings;
 use crate::team_manager::TeamManager;
 use axum::Router;
-use llm_harness_agent_team::AgentId;
 use llm_harness_inspector::Inspector;
 use llm_harness_inspector::state::HarnessRegistry;
 use std::io::Write as _;
@@ -230,37 +229,11 @@ impl StudioRuntime {
         };
 
         let registry = HarnessRegistry::new("default");
-        for id in tm.ids() {
-            let Some(entry) = tm.get(&id) else {
-                continue;
-            };
-            for member in &entry.spec.members {
-                if let Some(harness) = entry.team.harness(&AgentId::new(&member.id)) {
-                    registry.register(format!("{id}/{}", member.id), harness);
-                }
-            }
-        }
 
         let tm_shared = Arc::new(RwLock::new(tm));
         let events = Arc::new(crate::events::EventBus::new());
         let operator_pumps = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-        {
-            let tm = tm_shared.read().await;
-            for id in tm.ids() {
-                let Some(entry) = tm.get(&id) else {
-                    continue;
-                };
-                let Some(ctx) = entry.team.social_context().cloned() else {
-                    continue;
-                };
-                crate::routes::spawn_operator_pump(
-                    events.clone(),
-                    operator_pumps.clone(),
-                    id.clone(),
-                    ctx,
-                );
-            }
-        }
+        let thought_pumps = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
         let state = AppState {
             pm: tm_shared.clone(),
@@ -270,9 +243,16 @@ impl StudioRuntime {
             events,
             registry: registry.clone(),
             operator_pumps,
+            thought_pumps,
             grants,
             startup_recovery: Arc::new(RwLock::new(recovery.clone())),
         };
+        {
+            let tm = tm_shared.read().await;
+            for id in tm.ids() {
+                crate::routes::register_team_side_effects(&state, &tm, &id);
+            }
+        }
         let mut routes = team_router(state);
         if let Some(extra_routes) = extra_routes {
             routes = routes.merge(extra_routes);

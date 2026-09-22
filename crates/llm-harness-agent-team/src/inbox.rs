@@ -219,6 +219,15 @@ impl InboxStore {
         &self,
         message: InboxMessage,
     ) -> Result<(), crate::inbox_journal::InboxJournalError> {
+        self.push_for_observer(message).map(|_| ())
+    }
+
+    /// Push a durable message and return the stored form, including its
+    /// journal row id. Observers need that id to acknowledge delivery.
+    pub fn push_for_observer(
+        &self,
+        message: InboxMessage,
+    ) -> Result<InboxMessage, crate::inbox_journal::InboxJournalError> {
         let mut message = message;
         if let Some(journal) = &self.journal
             && message.journal_id.is_none()
@@ -227,8 +236,8 @@ impl InboxStore {
         }
         let to = message.to.clone();
         let mut queues = self.queues.lock();
-        queues.entry(to).or_default().push(message);
-        Ok(())
+        queues.entry(to).or_default().push(message.clone());
+        Ok(message)
     }
 
     /// Requeue an already-journaled message without creating a new row.

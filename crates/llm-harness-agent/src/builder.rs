@@ -500,6 +500,11 @@ impl HarnessBuilder {
         self
     }
 
+    /// Read the currently configured system prompt, if any.
+    pub fn configured_system_prompt(&self) -> Option<&str> {
+        self.system_prompt.as_deref()
+    }
+
     /// Set the initial thinking level.
     pub fn thinking_level(mut self, level: ThinkingLevel) -> Self {
         self.thinking_level = Some(level);
@@ -1445,6 +1450,14 @@ mod tests {
             .system_prompt(Some("be brief".to_string()))
             .build_options(None);
         assert_eq!(opts.system_prompt.as_deref(), Some("be brief"));
+    }
+
+    #[test]
+    fn configured_system_prompt_reads_current_value() {
+        let builder = HarnessBuilder::new("m");
+        assert_eq!(builder.configured_system_prompt(), None);
+        let builder = builder.system_prompt(Some("be brief".to_string()));
+        assert_eq!(builder.configured_system_prompt(), Some("be brief"));
     }
 
     #[test]
