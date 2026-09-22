@@ -147,6 +147,7 @@ struct PersistedSandbox {
     sandbox_id: String,
     owner: String,
     config: RemoteSandboxConfig,
+    vsock_guest_cid: Option<u32>,
     state: RegistryState,
 }
 
@@ -192,10 +193,9 @@ impl GatewayState {
         principal: &AuthenticatedPrincipal,
         request: RemoteSandboxConfig,
     ) -> Result<String, GatewayStateError> {
-        if matches!(
-            self.config.backend(),
-            crate::auth::GatewayBackend::Firecracker(_)
-        ) {
+        if let crate::auth::GatewayBackend::Firecracker(backend) = self.config.backend() {
+            validate_firecracker_policies(&request, backend)
+                .map_err(GatewayStateError::InvalidConfig)?;
             return Err(GatewayStateError::InvalidConfig(anyhow::anyhow!(
                 "Firecracker backend execution is not integrated yet"
             )));
@@ -238,6 +238,7 @@ impl GatewayState {
             &sandbox_id,
             &principal.id,
             &config_json,
+            None,
             now_ms,
         )
         .map_err(|error| {
@@ -518,6 +519,51 @@ fn validate_fs_paths(paths: &[String], field: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_firecracker_policies(
+    request: &RemoteSandboxConfig,
+    backend: &crate::auth::FirecrackerBackendConfig,
+) -> anyhow::Result<()> {
+    if !request.fs_allowlist.is_empty() {
+        anyhow::bail!("Firecracker backend does not support fs_allowlist entries");
+    }
+    if !request.fs_denylist.is_empty() {
+        anyhow::bail!("Firecracker backend does not support fs_denylist entries");
+    }
+    if !request.net_allowlist.is_empty() {
+        anyhow::bail!("Firecracker backend does not support net_allowlist rules");
+    }
+    let limits = &request.resource_limits;
+    if limits.max_processes.is_some() {
+        anyhow::bail!("Firecracker backend does not support max_processes");
+    }
+    if limits.max_disk_mb.is_some() {
+        anyhow::bail!("Firecracker backend does not support max_disk_mb");
+    }
+    if let Some(max_cpus) = limits.max_cpus {
+        let max_cpus = u32::try_from(max_cpus)
+            .map_err(|_| anyhow::anyhow!("Firecracker max_cpus is too large"))?;
+        if max_cpus > backend.max_vcpu_count {
+            anyhow::bail!(
+                "Firecracker max_cpus {} exceeds backend maximum {}",
+                max_cpus,
+                backend.max_vcpu_count
+            );
+        }
+    }
+    if let Some(max_memory_mb) = limits.max_memory_mb {
+        let max_memory_mb = u32::try_from(max_memory_mb)
+            .map_err(|_| anyhow::anyhow!("Firecracker max_memory_mb is too large"))?;
+        if max_memory_mb > backend.max_memory_mib {
+            anyhow::bail!(
+                "Firecracker max_memory_mb {} exceeds backend maximum {}",
+                max_memory_mb,
+                backend.max_memory_mib
+            );
+        }
+    }
+    Ok(())
+}
+
 fn restore_sandbox(
     config: &crate::auth::GatewayConfig,
     persisted: PersistedSandbox,
@@ -525,7 +571,28 @@ fn restore_sandbox(
     let principal = config
         .principal(&persisted.owner)
         .ok_or_else(|| anyhow::anyhow!("persisted sandbox owner is not configured"))?;
-    let persisted_config = normalize_request_config(&principal, persisted.config)?;
+    let PersistedSandbox {
+        ref sandbox_id,
+        owner: _,
+        config: request,
+        vsock_guest_cid,
+        state: _,
+    } = persisted;
+    match (&config.backend(), vsock_guest_cid) {
+        (crate::auth::GatewayBackend::Bwrap, Some(_)) => {
+            anyhow::bail!("persisted sandbox {sandbox_id:?} has a vsock CID on the Bwrap backend")
+        }
+        (crate::auth::GatewayBackend::Firecracker(backend), Some(cid)) => {
+            if cid < backend.vsock_guest_cid_base {
+                anyhow::bail!(
+                    "persisted sandbox {sandbox_id:?} has a vsock CID below the configured base"
+                );
+            }
+            anyhow::bail!("Firecracker backend execution is not integrated yet");
+        }
+        _ => {}
+    }
+    let persisted_config = normalize_request_config(&principal, request)?;
     let sandbox_config = build_sandbox_config(&persisted_config)?;
     let work_dir = config
         .work_root()
@@ -591,7 +658,8 @@ fn lock_work_root(work_root: &std::path::Path) -> anyhow::Result<File> {
 }
 
 const REGISTRY_APPLICATION_ID: i64 = 0x4c_48_53_47;
-const REGISTRY_SCHEMA_VERSION: i64 = 1;
+const REGISTRY_SCHEMA_VERSION: i64 = 2;
+const REGISTRY_VSOCK_CID_INDEX: &str = "idx_sandboxes_vsock_guest_cid";
 
 fn open_registry(path: &std::path::Path) -> anyhow::Result<Connection> {
     let file = std::fs::OpenOptions::new()
@@ -632,14 +700,42 @@ fn open_registry(path: &std::path::Path) -> anyhow::Result<Connection> {
                  config_json TEXT NOT NULL,
                  state TEXT NOT NULL CHECK (state IN ('creating', 'running', 'deleting')),
                  created_at_ms INTEGER NOT NULL,
-                 updated_at_ms INTEGER NOT NULL
+                 updated_at_ms INTEGER NOT NULL,
+                 vsock_guest_cid INTEGER
              );
+             CREATE UNIQUE INDEX {REGISTRY_VSOCK_CID_INDEX}
+                 ON sandboxes(vsock_guest_cid);
              PRAGMA application_id = {REGISTRY_APPLICATION_ID};
              PRAGMA user_version = {REGISTRY_SCHEMA_VERSION};
              COMMIT;",
         ))?;
-    } else if application_id != REGISTRY_APPLICATION_ID || schema_version != REGISTRY_SCHEMA_VERSION
-    {
+    } else if application_id != REGISTRY_APPLICATION_ID {
+        anyhow::bail!("unsupported gateway sandbox registry schema");
+    } else if schema_version == 1 {
+        connection.execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE sandboxes_v2 (
+                 sandbox_id TEXT PRIMARY KEY,
+                 owner TEXT NOT NULL,
+                 config_json TEXT NOT NULL,
+                 state TEXT NOT NULL CHECK (state IN ('creating', 'running', 'deleting')),
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 vsock_guest_cid INTEGER
+             );
+             INSERT INTO sandboxes_v2
+                 (sandbox_id, owner, config_json, state, created_at_ms, updated_at_ms, vsock_guest_cid)
+             SELECT sandbox_id, owner, config_json, state, created_at_ms, updated_at_ms, NULL
+                 FROM sandboxes;
+             DROP TABLE sandboxes;
+             ALTER TABLE sandboxes_v2 RENAME TO sandboxes;
+             CREATE UNIQUE INDEX idx_sandboxes_vsock_guest_cid
+                 ON sandboxes(vsock_guest_cid);
+             PRAGMA application_id = {REGISTRY_APPLICATION_ID};
+             PRAGMA user_version = {REGISTRY_SCHEMA_VERSION};
+             COMMIT;",
+        ))?;
+    } else if schema_version != REGISTRY_SCHEMA_VERSION {
         anyhow::bail!("unsupported gateway sandbox registry schema");
     }
     validate_registry_schema(&connection)?;
@@ -662,8 +758,21 @@ fn validate_registry_schema(connection: &Connection) -> anyhow::Result<()> {
         "state",
         "created_at_ms",
         "updated_at_ms",
+        "vsock_guest_cid",
     ];
     if columns != expected {
+        anyhow::bail!("invalid gateway sandbox registry schema");
+    }
+    let mut statement = connection.prepare("PRAGMA index_list(sandboxes)")?;
+    let indexes = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !indexes
+        .iter()
+        .any(|(name, unique)| name == REGISTRY_VSOCK_CID_INDEX && *unique == 1)
+    {
         anyhow::bail!("invalid gateway sandbox registry schema");
     }
     Ok(())
@@ -682,14 +791,15 @@ fn insert_registry_record(
     sandbox_id: &str,
     owner: &str,
     config_json: &str,
+    vsock_guest_cid: Option<u32>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
     let connection = lock_registry(registry);
     connection.execute(
         "INSERT INTO sandboxes
-             (sandbox_id, owner, config_json, state, created_at_ms, updated_at_ms)
-         VALUES (?1, ?2, ?3, 'creating', ?4, ?4)",
-        rusqlite::params![sandbox_id, owner, config_json, now_ms],
+             (sandbox_id, owner, config_json, state, vsock_guest_cid, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, ?3, 'creating', ?4, ?5, ?5)",
+        rusqlite::params![sandbox_id, owner, config_json, vsock_guest_cid, now_ms],
     )?;
     Ok(())
 }
@@ -796,7 +906,7 @@ fn load_registry_records(
 ) -> anyhow::Result<Vec<PersistedSandbox>> {
     let connection = lock_registry(registry);
     let mut statement = connection.prepare(
-        "SELECT sandbox_id, owner, config_json, state
+        "SELECT sandbox_id, owner, config_json, vsock_guest_cid, state
          FROM sandboxes
          ORDER BY sandbox_id",
     )?;
@@ -806,14 +916,21 @@ fn load_registry_records(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, Option<u32>>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     records
         .into_iter()
         .map(
-            |(sandbox_id, owner, config_json, state)| -> anyhow::Result<PersistedSandbox> {
+            |(
+                sandbox_id,
+                owner,
+                config_json,
+                vsock_guest_cid,
+                state,
+            )| -> anyhow::Result<PersistedSandbox> {
                 let config = serde_json::from_str(&config_json).map_err(|error| {
                     anyhow::anyhow!("invalid persisted sandbox config: {error}")
                 })?;
@@ -821,6 +938,7 @@ fn load_registry_records(
                     sandbox_id,
                     owner,
                     config,
+                    vsock_guest_cid,
                     state: RegistryState::parse(&state)?,
                 })
             },
