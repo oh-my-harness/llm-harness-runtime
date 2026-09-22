@@ -210,16 +210,23 @@ resource limits, and preflights that no lifecycle artifact already exists.
 `FirecrackerLifecycle::start` combines image allocation, process launch, and
 readiness polling; startup failure, explicit graceful/force stop, and drop clean
 process and image artifacts. This is not yet a production VM lifecycle backend:
-jailer integration, guest-agent-coordinated shutdown confirmation, registry
-recovery, network policy, and deployment validation remain future slices.
+`FirecrackerJailerConfig` now builds and validates Linux jailer command
+arguments, including the upstream 1–64 byte alphanumeric/hyphen ID constraint,
+cgroup and resource-limit formats, and forwarding of Firecracker arguments
+after `--`. It intentionally omits `--daemonize` and `--new-pid-ns` in this
+slice. Jailed lifecycle integration, including making API-socket, config-file,
+rootfs, and kernel paths valid inside the chroot, remains future work, along
+with guest-agent-coordinated shutdown confirmation, registry recovery, network
+policy, and deployment validation.
 
 ## Current status
 
 This document selects Firecracker and defines the required threat model. The
 transport-independent guest-agent wire protocol, AF_VSOCK transport, guest
 filesystem/process handlers, guest binary, host client, and initial
-Firecracker configuration/process/image/lifecycle primitives are implemented.
-They are not yet assembled into a complete production VM backend with jailer,
+Firecracker configuration/process/image/lifecycle primitives and the jailer
+command-configuration primitive are implemented. They are not yet assembled
+into a complete production VM backend with jailed lifecycle integration,
 network policy, registry recovery, end-to-end gateway integration,
 guest-agent-coordinated shutdown confirmation, or deployment validation. The
 Bwrap gateway remains the only implemented remote execution backend, and #193
