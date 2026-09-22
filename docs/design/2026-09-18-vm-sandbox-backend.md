@@ -215,8 +215,9 @@ with `openat`/`mkdirat` while rejecting symlinks, stages the kernel and private
 rootfs, assigns the staged resources to the configured non-root uid/gid, and
 launches through `FirecrackerProcess::start_jailed`. Explicit stop, startup
 failure, and drop remove process artifacts and recursively remove the jail
-through directory descriptors rather than host-path traversal. This is not yet
-a complete production VM lifecycle backend:
+through directory descriptors rather than host-path traversal. Created ancestor
+directories shared with another jail are retained when they are non-empty. This
+is not yet a complete production VM lifecycle backend:
 `FirecrackerJailerConfig` now builds and validates Linux jailer command
 arguments, including the upstream 1–64 byte alphanumeric/hyphen ID constraint,
 cgroup and resource-limit formats, chroot-directory derivation, and translation

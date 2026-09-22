@@ -227,6 +227,9 @@ impl FirecrackerJail {
         }
         for directory in self.created_parents.iter_mut().rev() {
             if let Err(error) = directory.remove() {
+                if error.raw_os_error() == Some(libc::ENOTEMPTY) {
+                    break;
+                }
                 errors.push(error.to_string());
             }
         }
@@ -353,12 +356,6 @@ fn remove_directory_contents(directory: &File, depth: usize) -> io::Result<()> {
         ));
     }
     let entries = directory_entries(directory)?;
-    if entries.len() > MAX_DIRECTORY_ENTRIES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "firecracker jail directory entry count exceeded",
-        ));
-    }
     for name in entries {
         if metadata_at(directory, &name)? {
             let child = open_directory_at(directory, &name)?;
@@ -400,6 +397,12 @@ fn directory_entries(directory: &File) -> io::Result<Vec<CString>> {
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
         }
+        if entries.len() >= MAX_DIRECTORY_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "firecracker jail directory entry count exceeded",
+            ));
+        }
         entries.push(name.to_owned());
     }
     Ok(entries)
@@ -433,5 +436,30 @@ fn metadata_at(directory: &File, name: &CStr) -> io::Result<bool> {
 fn cleanup_created_directories(directories: &mut [CreatedDirectory]) {
     for directory in directories.iter_mut().rev() {
         let _ = directory.remove();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remove_treats_a_shared_created_ancestor_as_not_empty() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let shared_parent = root.path().join("jail").join("firecracker");
+        let first_root = shared_parent.join("sandbox-1").join("root");
+        let second_root = shared_parent.join("sandbox-2").join("root");
+
+        let mut first_jail = FirecrackerJail::create(&first_root).expect("create first jail");
+        let mut second_jail = FirecrackerJail::create(&second_root).expect("create second jail");
+
+        first_jail.remove().expect("remove first jail");
+        assert!(!first_root.exists());
+        assert!(second_root.exists());
+
+        second_jail.remove().expect("remove second jail");
+        assert!(!second_root.exists());
+        assert!(shared_parent.exists());
     }
 }
