@@ -15,4 +15,8 @@ __pycache__
 /AGENTS.md
 .mcp-lock.json
 tests/wasm-smoke/target/
+/.agent-team-studio/
+/target-patrol/
+/pr211.zip
+.tmp-*
 tests/wasm-smoke/bindgen/
