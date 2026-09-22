@@ -2628,6 +2628,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "llm-harness-vm-agent-env"
+version = "0.5.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "futures",
+ "llm-harness-types",
+ "llm-harness-vm-agent-protocol",
+ "llm-harness-vm-agent-service",
+ "llm-harness-vm-agent-transport",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "llm-harness-vm-agent-protocol"
 version = "0.5.0"
 dependencies = [
