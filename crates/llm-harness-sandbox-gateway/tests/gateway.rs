@@ -188,7 +188,7 @@ fn gateway_rejects_vsock_cid_capacity_overflow() {
 }
 
 #[tokio::test]
-async fn firecracker_backend_rejects_sandbox_creation_without_bwrap_fallback() {
+async fn firecracker_backend_does_not_fall_back_to_bwrap() {
     let root = private_tempdir();
     for name in ["firecracker", "vmlinux", "rootfs-base.ext4"] {
         std::fs::write(root.path().join(name), b"artifact").expect("write Firecracker artifact");
@@ -218,7 +218,7 @@ async fn firecracker_backend_rejects_sandbox_creation_without_bwrap_fallback() {
     assert!(
         error
             .to_string()
-            .contains("Firecracker backend execution is not integrated yet")
+            .contains("firecracker lifecycle startup failed")
     );
     assert_eq!(
         std::fs::read_dir(work_root.path().join("sandboxes"))
@@ -253,6 +253,130 @@ fn firecracker_artifact_root() -> tempfile::TempDir {
     std::fs::set_permissions(root.path().join("firecracker"), permissions)
         .expect("make Firecracker binary executable");
     root
+}
+
+fn write_fake_firecracker(path: &Path, guest_port: u32) {
+    let script = r#"#!/usr/bin/env python3
+import base64, json, os, select, socket, sys
+args = sys.argv[1:]
+api_path = args[args.index("--api-sock") + 1]
+vsock_path = os.path.join(os.path.dirname(api_path), "guest-agent.sock")
+api_server = socket.socket(socket.AF_UNIX)
+api_server.bind(api_path)
+api_server.listen(4)
+vsock_server = socket.socket(socket.AF_UNIX)
+vsock_server.bind(vsock_path)
+vsock_server.listen(4)
+connections = []
+files = {}
+
+def recv_exact(connection, size):
+    data = bytearray()
+    while len(data) < size:
+        chunk = connection.recv(size - len(data))
+        if not chunk:
+            raise EOFError("guest agent connection closed")
+        data.extend(chunk)
+    return bytes(data)
+
+def read_frame(connection):
+    header = recv_exact(connection, 20)
+    payload_len = int.from_bytes(header[8:12], "big")
+    payload = recv_exact(connection, payload_len)
+    return int.from_bytes(header[12:20], "big"), json.loads(payload)
+
+def frame(request_id, message):
+    payload = json.dumps(message, separators=(",", ":")).encode()
+    return (
+        b"LHSV\x01\x00\x00\x00"
+        + len(payload).to_bytes(4, "big")
+        + request_id.to_bytes(8, "big")
+        + payload
+    )
+
+def handle_guest_connection(connection):
+    request_id, message = read_frame(connection)
+    kind = message.get("type")
+    data = message.get("data", {})
+    if kind == "ping":
+        message["type"] = "pong"
+    elif kind == "cleanup":
+        message["type"] = "cleanup_result"
+    elif kind == "write_file":
+        content = data["content"]
+        files[data["path"]] = base64.b64decode(content["base64"]).decode()
+        message = {"type": "write_file_result"}
+    elif kind == "read_file":
+        if data["path"] not in files:
+            message = {"type": "error", "data": {"code": "not_found", "message": "missing"}}
+        else:
+            message = {
+                "type": "read_file_result",
+                "data": {"content": {"kind": "text", "value": files[data["path"]]}},
+            }
+    elif kind == "list_dir":
+        message = {
+            "type": "list_dir_result",
+            "data": {"entries": [
+                {"path": path, "is_dir": False, "size": len(value), "modified_ms": 0}
+                for path, value in sorted(files.items())
+            ]},
+        }
+    elif kind == "start_process":
+        connection.sendall(frame(request_id, {
+            "type": "process_started",
+            "data": {"execution_id": "exec-1", "pid": 42},
+        }))
+        for name, value in sorted(files.items()):
+            if name in data["command"]:
+                connection.sendall(frame(request_id, {
+                    "type": "process_stdout",
+                    "data": {"execution_id": "exec-1", "chunk": value},
+                }))
+        connection.sendall(frame(request_id, {
+            "type": "process_exit",
+            "data": {"execution_id": "exec-1", "result": {
+                "exit_code": 0, "stdout_truncated_bytes": 0, "stderr_truncated_bytes": 0,
+            }},
+        }))
+        return
+    else:
+        return
+    connection.sendall(frame(request_id, message))
+
+while True:
+    readable, _, _ = select.select([api_server, vsock_server, *connections], [], [])
+    for source in readable:
+        if source in connections:
+            try:
+                handle_guest_connection(source)
+            except EOFError:
+                connections.remove(source)
+                source.close()
+            continue
+        connection, _ = source.accept()
+        if source is api_server:
+            request = connection.recv(4096)
+            if request.startswith(b"PUT /actions"):
+                connection.sendall(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                connection.close()
+                sys.exit(0)
+            connection.close()
+            continue
+        handshake = bytearray()
+        while not handshake.endswith(b"\n"):
+            handshake.extend(connection.recv(1))
+        assert handshake == b"connect {guest_port}\n"
+        connection.sendall(b"OK 1073741824\n")
+        connections.append(connection)
+"#;
+    let script = script.replace("connect {guest_port}", &format!("connect {guest_port}"));
+    std::fs::write(path, script).expect("write fake Firecracker");
+    let mut permissions = std::fs::metadata(path)
+        .expect("fake Firecracker metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).expect("make fake Firecracker executable");
 }
 
 fn remote_client(base_url: &str, token: &str) -> Arc<RemoteSandboxClient> {
@@ -476,6 +600,105 @@ async fn firecracker_backend_rejects_unsupported_sandbox_policies() {
             "unexpected error for {label}: {error}"
         );
     }
+}
+
+#[tokio::test]
+async fn firecracker_gateway_start_reset_and_shutdown() {
+    let artifacts = firecracker_artifact_root();
+    write_fake_firecracker(artifacts.path().join("firecracker").as_path(), 6000);
+    let gateway = start_gateway_with_config(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_backend(firecracker_backend(artifacts.path(), 3)),
+    )
+    .await;
+
+    let sandbox =
+        RemoteSandbox::connect(sandbox_config(), remote_client(&gateway.base_url, TOKEN_A))
+            .await
+            .expect("start Firecracker sandbox");
+    assert_eq!(sandbox.backend(), "linux-firecracker");
+
+    let connection =
+        Connection::open(gateway.work_root().join("registry.sqlite")).expect("open registry");
+    let cid: i64 = connection
+        .query_row("SELECT vsock_guest_cid FROM sandboxes", [], |row| {
+            row.get(0)
+        })
+        .expect("read persisted CID");
+    assert_eq!(cid, 3);
+
+    Sandbox::reset(&sandbox)
+        .await
+        .expect("reset Firecracker sandbox");
+    Sandbox::shutdown(Box::new(sandbox))
+        .await
+        .expect("shut down Firecracker sandbox");
+    assert_eq!(
+        std::fs::read_dir(gateway.work_root().join("sandboxes"))
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        0
+    );
+}
+
+#[tokio::test]
+async fn firecracker_gateway_supports_shell_and_files() {
+    let artifacts = firecracker_artifact_root();
+    write_fake_firecracker(artifacts.path().join("firecracker").as_path(), 6000);
+    let gateway = start_gateway_with_config(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_backend(firecracker_backend(artifacts.path(), 3)),
+    )
+    .await;
+
+    let sandbox =
+        RemoteSandbox::connect(sandbox_config(), remote_client(&gateway.base_url, TOKEN_A))
+            .await
+            .expect("start Firecracker sandbox");
+    let file = PathBuf::from("/workspace/hello.txt");
+    sandbox
+        .env()
+        .write_file(&file, b"persisted", CancellationToken::new())
+        .await
+        .expect("write guest file");
+    assert_eq!(
+        sandbox
+            .env()
+            .read_text_file(&file, CancellationToken::new())
+            .await
+            .expect("read guest file"),
+        "persisted"
+    );
+    let entries = sandbox
+        .env()
+        .list_dir(Path::new("/workspace"), CancellationToken::new())
+        .await
+        .expect("list guest directory");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].path, file);
+
+    let output = sandbox
+        .env()
+        .execute_shell(
+            "cat /workspace/hello.txt",
+            shell_options(Duration::from_secs(5)),
+        )
+        .await
+        .expect("execute guest shell");
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, "persisted");
+
+    Sandbox::shutdown(Box::new(sandbox))
+        .await
+        .expect("shut down Firecracker sandbox");
+    assert_eq!(
+        std::fs::read_dir(gateway.work_root().join("sandboxes"))
+            .expect("read sandbox root")
+            .count(),
+        0
+    );
 }
 
 fn insert_test_registry_record(
@@ -1024,6 +1247,48 @@ fn gateway_fails_closed_on_invalid_persisted_registry_entries() {
     };
     assert!(error.to_string().contains("unconfigured owner"));
     assert!(sandbox_path.exists());
+}
+
+#[test]
+fn firecracker_gateway_fails_closed_on_restarted_sandboxes() {
+    let artifacts = firecracker_artifact_root();
+    let work_root = private_tempdir();
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf())
+        .with_backend(firecracker_backend(artifacts.path(), 3));
+    drop(SandboxGateway::new(config.clone()).expect("initialize registry"));
+    let sandbox_id = uuid::Uuid::new_v4().to_string();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(work_root.path().join("sandboxes").join(&sandbox_id))
+        .expect("create Firecracker work root");
+    insert_test_registry_record(
+        work_root.path(),
+        &sandbox_id,
+        "tenant-a",
+        &persisted_sandbox_config_json(),
+        "running",
+    );
+    let connection =
+        Connection::open(work_root.path().join("registry.sqlite")).expect("open registry");
+    connection
+        .execute(
+            "UPDATE sandboxes SET vsock_guest_cid = 3 WHERE sandbox_id = ?1",
+            [&sandbox_id],
+        )
+        .expect("persist Firecracker CID");
+
+    let error = match SandboxGateway::new(config) {
+        Ok(_) => panic!("gateway must not report a restarted Firecracker sandbox as Running"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be restored across gateway restart")
+    );
+    assert_eq!(registry_record_count(work_root.path()), 1);
 }
 
 #[test]

@@ -6,6 +6,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
@@ -13,7 +14,9 @@ use llm_harness_platform::sandbox::{NetRule, ResourceLimits, Sandbox, SandboxCon
 use llm_harness_sandbox::BwrapSandbox;
 use llm_harness_sandbox_remote::RemoteSandboxConfig;
 use llm_harness_sandbox_remote::protocol::RemoteSandboxState;
-use llm_harness_types::ExecutionEnv;
+use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
+use llm_harness_vm_agent_env::GuestAgentEnv;
+use llm_harness_vm_firecracker::{FirecrackerLifecycle, FirecrackerLifecycleConfig};
 use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 
@@ -71,43 +74,345 @@ pub(crate) struct SandboxRecord {
 
 pub(crate) enum GatewaySandbox {
     Bwrap(BwrapSandbox),
+    Firecracker(Box<FirecrackerSandbox>),
 }
 
 impl Sandbox for GatewaySandbox {
     fn start(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         match self {
             Self::Bwrap(sandbox) => sandbox.start(),
+            Self::Firecracker(sandbox) => Box::pin(sandbox.start()),
         }
     }
 
     fn env(&self) -> Arc<dyn ExecutionEnv> {
         match self {
             Self::Bwrap(sandbox) => sandbox.env(),
+            Self::Firecracker(sandbox) => sandbox.env(),
         }
     }
 
     fn reset(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         match self {
             Self::Bwrap(sandbox) => sandbox.reset(),
+            Self::Firecracker(sandbox) => Box::pin(sandbox.reset()),
         }
     }
 
     fn shutdown(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         match *self {
             Self::Bwrap(sandbox) => Box::new(sandbox).shutdown(),
+            Self::Firecracker(sandbox) => Box::pin(sandbox.shutdown_owned()),
         }
     }
 
     fn config(&self) -> &SandboxConfig {
         match self {
             Self::Bwrap(sandbox) => sandbox.config(),
+            Self::Firecracker(sandbox) => sandbox.config(),
         }
     }
 
     fn is_running(&self) -> bool {
         match self {
             Self::Bwrap(sandbox) => sandbox.is_running(),
+            Self::Firecracker(sandbox) => sandbox.is_running(),
         }
+    }
+}
+
+pub(crate) struct FirecrackerSandboxConfig {
+    backend: crate::auth::FirecrackerBackendConfig,
+    run_directory: PathBuf,
+    vsock_guest_cid: u32,
+}
+
+struct PendingGuestAgentEnv {
+    env: Arc<std::sync::RwLock<Option<Arc<dyn ExecutionEnv>>>>,
+}
+
+impl PendingGuestAgentEnv {
+    fn new() -> Self {
+        Self {
+            env: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    fn set(&self, env: Arc<dyn ExecutionEnv>) {
+        *self
+            .env
+            .write()
+            .expect("firecracker guest env lock is poisoned") = Some(env);
+    }
+
+    fn clear(&self) {
+        *self
+            .env
+            .write()
+            .expect("firecracker guest env lock is poisoned") = None;
+    }
+
+    fn env(&self) -> Result<Arc<dyn ExecutionEnv>, EnvError> {
+        self.env
+            .read()
+            .expect("firecracker guest env lock is poisoned")
+            .clone()
+            .ok_or_else(|| EnvError::Other("firecracker sandbox is not ready".to_owned()))
+    }
+}
+
+impl ExecutionEnv for PendingGuestAgentEnv {
+    fn working_dir(&self) -> &Path {
+        Path::new(GUEST_WORK_DIR)
+    }
+
+    fn read_text_file<'a>(
+        &'a self,
+        path: &'a Path,
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<String, EnvError>> {
+        Box::pin(async move { self.env()?.read_text_file(path, abort).await })
+    }
+
+    fn read_text_lines<'a>(
+        &'a self,
+        path: &'a Path,
+        max_lines: Option<usize>,
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<Vec<String>, EnvError>> {
+        Box::pin(async move { self.env()?.read_text_lines(path, max_lines, abort).await })
+    }
+
+    fn read_binary_file<'a>(
+        &'a self,
+        path: &'a Path,
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<Vec<u8>, EnvError>> {
+        Box::pin(async move { self.env()?.read_binary_file(path, abort).await })
+    }
+
+    fn write_file<'a>(
+        &'a self,
+        path: &'a Path,
+        content: &'a [u8],
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), EnvError>> {
+        Box::pin(async move { self.env()?.write_file(path, content, abort).await })
+    }
+
+    fn append_file<'a>(
+        &'a self,
+        path: &'a Path,
+        content: &'a [u8],
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), EnvError>> {
+        Box::pin(async move { self.env()?.append_file(path, content, abort).await })
+    }
+
+    fn file_info<'a>(
+        &'a self,
+        path: &'a Path,
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<FileInfo, EnvError>> {
+        Box::pin(async move { self.env()?.file_info(path, abort).await })
+    }
+
+    fn list_dir<'a>(
+        &'a self,
+        path: &'a Path,
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<Vec<FileInfo>, EnvError>> {
+        Box::pin(async move { self.env()?.list_dir(path, abort).await })
+    }
+
+    fn exists<'a>(
+        &'a self,
+        path: &'a Path,
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<bool, EnvError>> {
+        Box::pin(async move { self.env()?.exists(path, abort).await })
+    }
+
+    fn create_dir<'a>(
+        &'a self,
+        path: &'a Path,
+        recursive: bool,
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), EnvError>> {
+        Box::pin(async move { self.env()?.create_dir(path, recursive, abort).await })
+    }
+
+    fn remove<'a>(
+        &'a self,
+        path: &'a Path,
+        recursive: bool,
+        force: bool,
+        abort: CancellationToken,
+    ) -> BoxFuture<'a, Result<(), EnvError>> {
+        Box::pin(async move { self.env()?.remove(path, recursive, force, abort).await })
+    }
+
+    fn create_temp_dir<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<PathBuf, EnvError>> {
+        Box::pin(async move { self.env()?.create_temp_dir(prefix).await })
+    }
+
+    fn execute_shell<'a>(
+        &'a self,
+        cmd: &'a str,
+        opts: ShellOptions<'a>,
+    ) -> BoxFuture<'a, Result<ShellOutput, EnvError>> {
+        Box::pin(async move { self.env()?.execute_shell(cmd, opts).await })
+    }
+
+    fn cleanup<'a>(&'a self) -> BoxFuture<'a, Result<(), EnvError>> {
+        Box::pin(async move { self.env()?.cleanup().await })
+    }
+}
+
+pub(crate) struct FirecrackerSandbox {
+    config: SandboxConfig,
+    firecracker_config: Option<FirecrackerSandboxConfig>,
+    lifecycle: tokio::sync::Mutex<Option<FirecrackerLifecycle>>,
+    env: Arc<PendingGuestAgentEnv>,
+    running: AtomicBool,
+}
+
+impl FirecrackerSandbox {
+    fn new(config: SandboxConfig, firecracker_config: FirecrackerSandboxConfig) -> Self {
+        Self {
+            config,
+            firecracker_config: Some(firecracker_config),
+            lifecycle: tokio::sync::Mutex::new(None),
+            env: Arc::new(PendingGuestAgentEnv::new()),
+            running: AtomicBool::new(false),
+        }
+    }
+
+    async fn start(&self) -> anyhow::Result<()> {
+        let mut lifecycle = self.lifecycle.lock().await;
+        if self.running.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.running.store(false, Ordering::SeqCst);
+        self.env.clear();
+        let current = lifecycle.take();
+        if let Some(mut current) = current {
+            current.stop().await?;
+        }
+        let config = self.lifecycle_config()?;
+        let started = FirecrackerLifecycle::start(&config).await?;
+        let Some(client) = started.guest_agent_shared() else {
+            let mut failed = started;
+            let stop_error = failed.stop().await.err();
+            anyhow::bail!(
+                "firecracker guest agent is unavailable{}",
+                stop_error
+                    .map(|error| format!("; cleanup failed: {error}"))
+                    .unwrap_or_default()
+            );
+        };
+        let guest_env = GuestAgentEnv::from_shared(client);
+        self.env.set(Arc::new(guest_env));
+        *lifecycle = Some(started);
+        self.running.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn reset(&self) -> anyhow::Result<()> {
+        if !self.running.load(Ordering::SeqCst) {
+            anyhow::bail!("sandbox is not running; cannot reset");
+        }
+        self.running.store(false, Ordering::SeqCst);
+        let mut lifecycle = self.lifecycle.lock().await;
+        if let Some(mut current) = lifecycle.take() {
+            current
+                .graceful_stop(
+                    self.config
+                        .resource_limits
+                        .timeout
+                        .unwrap_or(std::time::Duration::from_secs(5)),
+                )
+                .await?;
+        }
+        self.env.clear();
+        let config = self.lifecycle_config()?;
+        let started = FirecrackerLifecycle::start(&config).await?;
+        let Some(client) = started.guest_agent_shared() else {
+            let mut failed = started;
+            let stop_error = failed.stop().await.err();
+            anyhow::bail!(
+                "firecracker guest agent is unavailable{}",
+                stop_error
+                    .map(|error| format!("; cleanup failed: {error}"))
+                    .unwrap_or_default()
+            );
+        };
+        let guest_env = GuestAgentEnv::from_shared(client);
+        self.env.set(Arc::new(guest_env));
+        *lifecycle = Some(started);
+        self.running.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn shutdown_owned(self: Box<Self>) -> anyhow::Result<()> {
+        self.running.store(false, Ordering::SeqCst);
+        let mut lifecycle = self.lifecycle.lock().await;
+        if let Some(mut current) = lifecycle.take() {
+            current
+                .graceful_stop(
+                    self.config
+                        .resource_limits
+                        .timeout
+                        .unwrap_or(std::time::Duration::from_secs(5)),
+                )
+                .await?;
+        }
+        self.env.clear();
+        if let Some(config) = self.firecracker_config.as_ref() {
+            tokio::fs::remove_dir_all(&config.run_directory).await?;
+        }
+        Ok(())
+    }
+
+    fn lifecycle_config(&self) -> anyhow::Result<FirecrackerLifecycleConfig> {
+        let FirecrackerSandboxConfig {
+            backend,
+            run_directory,
+            vsock_guest_cid,
+        } = self
+            .firecracker_config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("firecracker sandbox is not configured"))?;
+        let limits = &self.config.resource_limits;
+        Ok(FirecrackerLifecycleConfig::new(
+            &backend.binary_path,
+            &backend.kernel_image_path,
+            &backend.base_image_path,
+            run_directory,
+            limits
+                .max_cpus
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(backend.max_vcpu_count),
+            limits
+                .max_memory_mb
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(backend.max_memory_mib),
+            *vsock_guest_cid,
+        )
+        .with_guest_agent_port(backend.guest_agent_port)
+        .with_readiness_timeout(backend.readiness_timeout))
+    }
+
+    fn config(&self) -> &SandboxConfig {
+        &self.config
+    }
+
+    fn env(&self) -> Arc<dyn ExecutionEnv> {
+        Arc::clone(&self.env) as Arc<dyn ExecutionEnv>
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
     }
 }
 
@@ -188,18 +493,31 @@ impl GatewayState {
         &self.config
     }
 
-    pub(crate) fn create_sandbox(
+    pub(crate) fn backend_label(&self) -> &'static str {
+        match self.config.backend() {
+            crate::auth::GatewayBackend::Bwrap => "linux-bwrap",
+            crate::auth::GatewayBackend::Firecracker(_) => "linux-firecracker",
+        }
+    }
+
+    pub(crate) async fn create_sandbox(
         &self,
         principal: &AuthenticatedPrincipal,
         request: RemoteSandboxConfig,
     ) -> Result<String, GatewayStateError> {
         if let crate::auth::GatewayBackend::Firecracker(backend) = self.config.backend() {
-            validate_firecracker_policies(&request, backend)
-                .map_err(GatewayStateError::InvalidConfig)?;
-            return Err(GatewayStateError::InvalidConfig(anyhow::anyhow!(
-                "Firecracker backend execution is not integrated yet"
-            )));
+            return self
+                .create_firecracker_sandbox(principal, request, backend)
+                .await;
         }
+        self.create_bwrap_sandbox(principal, request)
+    }
+
+    fn create_bwrap_sandbox(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: RemoteSandboxConfig,
+    ) -> Result<String, GatewayStateError> {
         let mut sandboxes = self.lock_sandboxes();
         if sandboxes.len() >= self.config.max_sandboxes {
             return Err(GatewayStateError::Capacity);
@@ -262,6 +580,84 @@ impl GatewayState {
             state: RemoteSandboxState::Creating,
         };
 
+        sandboxes.insert(sandbox_id.clone(), record);
+        Ok(sandbox_id)
+    }
+
+    async fn create_firecracker_sandbox(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: RemoteSandboxConfig,
+        backend: &crate::auth::FirecrackerBackendConfig,
+    ) -> Result<String, GatewayStateError> {
+        let mut sandboxes = self.lock_sandboxes();
+        if sandboxes.len() >= self.config.max_sandboxes {
+            return Err(GatewayStateError::Capacity);
+        }
+        let request = normalize_request_config(principal, request)
+            .map_err(GatewayStateError::InvalidConfig)?;
+        validate_firecracker_policies(&request, backend)
+            .map_err(GatewayStateError::InvalidConfig)?;
+        let sandbox_config =
+            build_sandbox_config(&request).map_err(GatewayStateError::InvalidConfig)?;
+        let sandbox_id = uuid::Uuid::new_v4().to_string();
+        let run_directory = self.work_root.join("sandboxes").join(&sandbox_id);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&run_directory)
+            .map_err(|error| GatewayStateError::InvalidConfig(error.into()))?;
+        let vsock_guest_cid =
+            allocate_vsock_guest_cid(&self.registry, backend.vsock_guest_cid_base).map_err(
+                |error| {
+                    if let Err(cleanup_error) = std::fs::remove_dir_all(&run_directory) {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id,
+                            error = %cleanup_error,
+                            "failed to remove work root after CID allocation failure"
+                        );
+                    }
+                    GatewayStateError::Storage(error)
+                },
+            )?;
+        let sandbox = FirecrackerSandbox::new(
+            sandbox_config,
+            FirecrackerSandboxConfig {
+                backend: backend.clone(),
+                run_directory,
+                vsock_guest_cid,
+            },
+        );
+        let config_json = serde_json::to_string(&request)
+            .map_err(|error| GatewayStateError::Storage(error.into()))?;
+        let now_ms = unix_now_ms().map_err(GatewayStateError::Storage)?;
+        insert_registry_record(
+            &self.registry,
+            &sandbox_id,
+            &principal.id,
+            &config_json,
+            Some(vsock_guest_cid),
+            now_ms,
+        )
+        .map_err(|error| {
+            let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
+            if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %cleanup_error,
+                    "failed to remove work root after registry failure"
+                );
+            }
+            GatewayStateError::Storage(error)
+        })?;
+        let env = sandbox.env();
+        let record = SandboxRecord {
+            owner: Arc::clone(&principal.id),
+            sandbox: Arc::new(GatewaySandbox::Firecracker(Box::new(sandbox))),
+            env,
+            work_dir: PathBuf::from(GUEST_WORK_DIR),
+            config: request,
+            state: RemoteSandboxState::Creating,
+        };
         sandboxes.insert(sandbox_id.clone(), record);
         Ok(sandbox_id)
     }
@@ -588,7 +984,12 @@ fn restore_sandbox(
                     "persisted sandbox {sandbox_id:?} has a vsock CID below the configured base"
                 );
             }
-            anyhow::bail!("Firecracker backend execution is not integrated yet");
+            anyhow::bail!(
+                "persisted Firecracker sandbox {sandbox_id:?} cannot be restored across gateway restart"
+            );
+        }
+        (crate::auth::GatewayBackend::Firecracker(_), None) => {
+            anyhow::bail!("persisted sandbox {sandbox_id:?} is missing a vsock CID");
         }
         _ => {}
     }
@@ -784,6 +1185,31 @@ fn unix_now_ms() -> anyhow::Result<i64> {
         .map_err(|error| anyhow::anyhow!("system clock is before UNIX epoch: {error}"))?
         .as_millis();
     i64::try_from(millis).map_err(|_| anyhow::anyhow!("system time is too large"))
+}
+
+fn allocate_vsock_guest_cid(
+    registry: &std::sync::Mutex<Connection>,
+    cid_base: u32,
+) -> anyhow::Result<u32> {
+    let connection = lock_registry(registry);
+    let mut statement = connection.prepare("SELECT vsock_guest_cid FROM sandboxes")?;
+    let used = statement
+        .query_map([], |row| row.get::<_, Option<u32>>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let used_values = used.into_iter().flatten().collect::<Vec<u32>>();
+    if used_values.iter().any(|cid| *cid < cid_base) {
+        anyhow::bail!("gateway registry contains a vsock CID below the configured base");
+    }
+    let mut used = used_values
+        .into_iter()
+        .collect::<std::collections::BTreeSet<u32>>();
+    used.retain(|cid| *cid >= cid_base);
+    for candidate in cid_base..=u32::MAX {
+        if !used.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("no vsock CID is available")
 }
 
 fn insert_registry_record(
