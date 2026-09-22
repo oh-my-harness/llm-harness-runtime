@@ -196,6 +196,10 @@ and is idempotent; drop performs best-effort artifact cleanup for callers that
 do not stop explicitly.
 `wait_ready` polls the child and the API socket until the process is accepting
 connections, the child exits, or the configured timeout elapses.
+`graceful_stop` sends the Firecracker API `SendCtrlAltDel` action over its Unix
+socket, reads only a bounded HTTP status response, waits for exit within the
+configured timeout, and falls back to the force-stop path if signaling or exit
+does not succeed.
 `FirecrackerImageAllocator` copies a non-empty regular base image to a new
 private destination, rejects symlinks at every path component, creates the
 destination exclusively with mode `0600`, syncs the file and parent directory,
@@ -204,10 +208,10 @@ and removes the image through its opened parent descriptor on cleanup.
 vsock socket from a symlink-free run directory, validates host files and
 resource limits, and preflights that no lifecycle artifact already exists.
 `FirecrackerLifecycle::start` combines image allocation, process launch, and
-readiness polling; startup failure, explicit stop, and drop clean process and
-image artifacts. This is not yet a production VM lifecycle backend: jailer
-integration, graceful guest shutdown, registry recovery, network policy, and
-deployment validation remain future slices.
+readiness polling; startup failure, explicit graceful/force stop, and drop clean
+process and image artifacts. This is not yet a production VM lifecycle backend:
+jailer integration, guest-agent-coordinated shutdown confirmation, registry
+recovery, network policy, and deployment validation remain future slices.
 
 ## Current status
 
@@ -216,6 +220,7 @@ transport-independent guest-agent wire protocol, AF_VSOCK transport, guest
 filesystem/process handlers, guest binary, host client, and initial
 Firecracker configuration/process/image/lifecycle primitives are implemented.
 They are not yet assembled into a complete production VM backend with jailer,
-network policy, registry recovery, end-to-end gateway integration, or
-deployment validation. The Bwrap gateway remains the only implemented remote
-execution backend, and #193 remains open until those requirements are complete.
+network policy, registry recovery, end-to-end gateway integration,
+guest-agent-coordinated shutdown confirmation, or deployment validation. The
+Bwrap gateway remains the only implemented remote execution backend, and #193
+remains open until those requirements are complete.

@@ -8,7 +8,7 @@ license.workspace = true
 libc.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process", "rt", "sync", "time", "net"] }
+tokio = { workspace = true, features = ["process", "rt", "sync", "time", "net", "io-util"] }
 
 [dev-dependencies]
 tempfile.workspace = true
