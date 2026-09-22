@@ -2670,6 +2670,7 @@ dependencies = [
 name = "llm-harness-vm-firecracker"
 version = "0.5.0"
 dependencies = [
+ "libc",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
