@@ -1050,6 +1050,21 @@ time.sleep(30)
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn jailed_lifecycle_drop_cleans_created_cgroups() {
+        let (root, config, _jailer, chroot_dir) = jailed_lifecycle_environment();
+        let cgroup_id = root.path().join("cgroup/firecracker/sandbox-1");
+        let lifecycle = FirecrackerLifecycle::start(&config)
+            .await
+            .expect("start jailed lifecycle");
+
+        drop(lifecycle);
+        assert!(!chroot_dir.exists());
+        assert!(!cgroup_id.exists());
+        assert!(cgroup_id.parent().expect("cgroup parent").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn jailed_lifecycle_startup_failure_cleans_the_jail() {
         let (root, config, _jailer, chroot_dir) = jailed_lifecycle_environment();
         write_regular_file(&root.path().join("fake-jailer"), b"#!/bin/sh\nexit 7\n");
@@ -1066,6 +1081,32 @@ time.sleep(30)
         );
         assert!(!chroot_dir.exists());
         assert!(!root.path().join("jail").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn jailed_lifecycle_startup_failure_cleans_created_cgroups() {
+        let (root, config, _jailer, chroot_dir) = jailed_lifecycle_environment();
+        let cgroup_id = root.path().join("cgroup/firecracker/sandbox-1");
+        let jailer_script = format!(
+            "#!/usr/bin/env python3\nimport os\nos.makedirs({:?})\nraise SystemExit(7)\n",
+            cgroup_id
+        );
+        write_regular_file(&root.path().join("fake-jailer"), jailer_script.as_bytes());
+        set_executable(&root.path().join("fake-jailer"));
+
+        let error = match FirecrackerLifecycle::start(&config).await {
+            Ok(_) => panic!("fake jailer unexpectedly stayed ready"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("firecracker process exited before ready")
+        );
+        assert!(!chroot_dir.exists());
+        assert!(!cgroup_id.exists());
+        assert!(cgroup_id.parent().expect("cgroup parent").exists());
     }
 
     #[cfg(target_os = "linux")]
