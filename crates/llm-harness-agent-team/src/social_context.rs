@@ -277,6 +277,26 @@ impl TimeoutRegistry {
         self.fired.lock().clear();
         cancelled
     }
+
+    /// Abort every pending timeout for one agent and clear its fired keys.
+    ///
+    /// Used when a member is removed: its timers must not fire into a dead
+    /// inbox or mutate relation state after the member is unregistered.
+    pub fn cancel_for_agent(&self, agent: &AgentId) -> Vec<String> {
+        let bucket = self.pending.lock().remove(agent);
+        let cancelled = bucket
+            .map(|entries| {
+                let (keys, pending_entries): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
+                for (handle, _) in pending_entries {
+                    handle.abort();
+                }
+                keys
+            })
+            .unwrap_or_default();
+        self.fired.lock().remove(agent);
+        cancelled
+    }
+
     /// Restore a previously cancelled (or fired) deadline under
     /// `(agent, key)` with a live timer's abort handle.
     ///
@@ -530,6 +550,7 @@ impl SocialContext {
     /// are retained as historical social state; they do not make the removed
     /// agent addressable again.
     pub fn remove_agent(&self, id: &AgentId) {
+        self.cancel_agent_timeouts(id);
         if let Some(handle) = self.monitor_registry.lock().remove(id) {
             handle.abort();
         }
@@ -891,6 +912,12 @@ impl SocialContext {
         let cancelled = self.timeouts.cancel_all();
         for (agent, key) in cancelled {
             self.cancel_timer(&agent, &key);
+        }
+    }
+
+    pub(crate) fn cancel_agent_timeouts(&self, agent: &AgentId) {
+        for key in self.timeouts.cancel_for_agent(agent) {
+            self.cancel_timer(agent, &key);
         }
     }
 

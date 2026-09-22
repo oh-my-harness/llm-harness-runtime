@@ -1311,11 +1311,24 @@ mod tests {
     async fn remove_member_stops_and_unregisters_agent() {
         let mut team = built_two_member_team().await;
         team.submit("a1", "pending task").unwrap();
+        let ctx = team.social_context().unwrap().clone();
+        let reminder = crate::timeout_manager::TimeoutManager::new(ctx.clone()).set_timeout(
+            AgentId::new("a1"),
+            "late reminder",
+            Duration::from_millis(20),
+            Some("remove-member".to_string()),
+            None,
+        );
+        assert_eq!(ctx.pending_timer_count(), 1);
 
         team.remove_member("a1").await.unwrap();
 
+        let reminder_finished = tokio::time::timeout(Duration::from_millis(50), reminder)
+            .await
+            .is_ok();
+        assert!(reminder_finished, "removed member timer must be aborted");
+        assert_eq!(ctx.pending_timer_count(), 0);
         assert!(team.harness(&AgentId::new("a1")).is_none());
-        let ctx = team.social_context().unwrap();
         assert!(ctx.get_agent_info(&AgentId::new("a1")).is_none());
         assert!(!ctx.has_messages(&AgentId::new("a1")));
         assert!(matches!(
