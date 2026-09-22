@@ -332,6 +332,24 @@ impl FirecrackerLifecycle {
         Ok(())
     }
 
+    pub async fn graceful_stop(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), FirecrackerLifecycleError> {
+        let process_result = self.process.graceful_stop(timeout).await;
+        let image_result = self.image.remove();
+        if let Err(process_error) = process_result {
+            let image_error = image_result.err();
+            return Err(stop_error(process_error, image_error));
+        }
+        if let Err(image_error) = image_result {
+            return Err(FirecrackerLifecycleError::new(format!(
+                "firecracker image cleanup failed: {image_error}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn api_socket_path(&self) -> &Path {
         self.process.api_socket_path()
     }
@@ -543,7 +561,7 @@ mod tests {
         let binary_path = root.path().join("firecracker");
         write_regular_file(
             &binary_path,
-            b"#!/usr/bin/env python3\nimport socket, sys, time\nserver = socket.socket(socket.AF_UNIX)\nserver.bind(sys.argv[2])\nserver.listen(1)\ntime.sleep(30)\n",
+            b"#!/usr/bin/env python3\nimport socket, sys\nserver = socket.socket(socket.AF_UNIX)\nserver.bind(sys.argv[2])\nserver.listen(4)\nwhile True:\n    connection, _ = server.accept()\n    request = connection.recv(4096)\n    if request.startswith(b\"PUT /actions\"):\n        connection.sendall(b\"HTTP/1.1 204 No Content\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n\")\n        connection.close()\n        break\n    connection.close()\n",
         );
         set_executable(&binary_path);
         let mut lifecycle = FirecrackerLifecycle::start(&config)
@@ -554,8 +572,14 @@ mod tests {
         assert!(config.api_socket_path().exists());
         assert!(config.config_file_path().is_file());
         assert_eq!(lifecycle.rootfs_path(), config.rootfs_path());
-        lifecycle.stop().await.expect("stop lifecycle");
-        lifecycle.stop().await.expect("stop is idempotent");
+        lifecycle
+            .graceful_stop(Duration::from_secs(2))
+            .await
+            .expect("graceful stop lifecycle");
+        lifecycle
+            .graceful_stop(Duration::from_secs(2))
+            .await
+            .expect("graceful stop is idempotent");
         assert!(!config.rootfs_path().exists());
         assert!(!config.api_socket_path().exists());
         assert!(!config.config_file_path().exists());

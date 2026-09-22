@@ -2,10 +2,13 @@ use std::ffi::OsString;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 
+#[cfg(target_os = "linux")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(target_os = "linux")]
 use tokio::net::UnixStream;
 #[cfg(target_os = "linux")]
@@ -168,6 +171,62 @@ impl FirecrackerProcess {
         Ok(())
     }
 
+    pub async fn graceful_stop(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), FirecrackerProcessError> {
+        if self.stopped {
+            return Ok(());
+        }
+        if self.child.try_wait()?.is_some() {
+            let cleanup_result = remove_artifacts(&self.api_socket_path, &self.config_file_path);
+            match cleanup_result {
+                Ok(()) => {
+                    self.stopped = true;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let signal_result = tokio::time::timeout(timeout, send_ctrl_alt_del(&self.api_socket_path))
+            .await
+            .map_err(|_| FirecrackerProcessError {
+                message: format!(
+                    "firecracker graceful shutdown request timed out within {timeout:?}"
+                ),
+            })
+            .and_then(|result| result);
+        if let Err(error) = signal_result {
+            if self.child.try_wait()?.is_some() {
+                let cleanup_result =
+                    remove_artifacts(&self.api_socket_path, &self.config_file_path);
+                match cleanup_result {
+                    Ok(()) => {
+                        self.stopped = true;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let stop_error = self.stop().await.err();
+            return Err(graceful_stop_error(error, stop_error));
+        }
+
+        let wait_result = wait_for_exit(&mut self.child, timeout).await;
+        if let Err(wait_error) = wait_result {
+            let stop_error = self.stop().await.err();
+            return Err(graceful_stop_error(wait_error, stop_error));
+        }
+
+        let cleanup_result = remove_artifacts(&self.api_socket_path, &self.config_file_path);
+        if cleanup_result.is_ok() {
+            self.stopped = true;
+            return Ok(());
+        }
+        Ok(cleanup_result?)
+    }
+
     pub async fn wait_ready(&mut self, timeout: Duration) -> Result<(), FirecrackerProcessError> {
         if self.stopped {
             return Err(FirecrackerProcessError {
@@ -200,6 +259,79 @@ impl FirecrackerProcess {
     pub fn config_file_path(&self) -> &Path {
         &self.config_file_path
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn send_ctrl_alt_del(api_socket_path: &Path) -> Result<(), FirecrackerProcessError> {
+    let body = r#"{"action_type":"SendCtrlAltDel"}"#;
+    let request = format!(
+        "PUT /actions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let mut stream = UnixStream::connect(api_socket_path).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 256];
+    loop {
+        let bytes_read = stream.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buffer[..bytes_read]);
+        if response.contains(&b'\n') || response.len() >= 1024 {
+            break;
+        }
+    }
+    let response = String::from_utf8_lossy(&response);
+    let status_line = response
+        .lines()
+        .next()
+        .ok_or_else(|| invalid_http_response("empty response"))?;
+    if !status_line.starts_with("HTTP/1.1 2") {
+        return Err(invalid_http_response(format!(
+            "unexpected status line: {status_line}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_exit(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<(), FirecrackerProcessError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(FirecrackerProcessError {
+                message: format!("firecracker did not exit within {timeout:?}"),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn invalid_http_response(message: impl Into<String>) -> FirecrackerProcessError {
+    FirecrackerProcessError {
+        message: format!("invalid firecracker API response: {}", message.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn graceful_stop_error(
+    error: FirecrackerProcessError,
+    stop_error: Option<FirecrackerProcessError>,
+) -> FirecrackerProcessError {
+    let mut message = format!("firecracker graceful stop failed: {error}");
+    if let Some(stop_error) = stop_error {
+        message.push_str(&format!("; force stop failed: {stop_error}"));
+    }
+    FirecrackerProcessError { message }
 }
 
 #[cfg(target_os = "linux")]
@@ -428,6 +560,91 @@ mod tests {
         assert!(!process_config.api_socket_path.exists());
         assert!(!process_config.config_file_path.exists());
         process.stop().await.expect("stop is idempotent");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn graceful_stop_sends_ctrl_alt_del_and_cleans_artifacts() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let binary_path = root.path().join("fake-firecracker");
+        std::fs::write(
+            &binary_path,
+            b"#!/usr/bin/env python3\nimport socket, sys\nserver = socket.socket(socket.AF_UNIX)\nserver.bind(sys.argv[2])\nserver.listen(4)\nwhile True:\n    connection, _ = server.accept()\n    request = connection.recv(4096)\n    if request.startswith(b\"PUT /actions\"):\n        connection.sendall(b\"HTTP/1.1 204 No Content\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n\")\n        connection.close()\n        break\n    connection.close()\n",
+        )
+        .expect("write fake firecracker");
+        set_executable(&binary_path);
+        let vm_config = FirecrackerConfig::new(
+            root.path().join("vmlinux"),
+            root.path().join("rootfs.ext4"),
+            root.path().join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        );
+        let process_config = FirecrackerProcessConfig::new(
+            &binary_path,
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+        let mut process =
+            FirecrackerProcess::start(&process_config, &vm_config).expect("start fake firecracker");
+
+        process
+            .wait_ready(Duration::from_millis(500))
+            .await
+            .expect("fake firecracker becomes ready");
+        process
+            .graceful_stop(Duration::from_secs(2))
+            .await
+            .expect("graceful stop fake firecracker");
+        assert!(!process_config.api_socket_path.exists());
+        assert!(!process_config.config_file_path.exists());
+        process
+            .graceful_stop(Duration::from_secs(2))
+            .await
+            .expect("graceful stop is idempotent");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn graceful_stop_times_out_and_falls_back_to_force_stop() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let binary_path = root.path().join("fake-firecracker");
+        std::fs::write(
+            &binary_path,
+            b"#!/usr/bin/env python3\nimport socket, sys, time\nserver = socket.socket(socket.AF_UNIX)\nserver.bind(sys.argv[2])\nserver.listen(1)\ntime.sleep(30)\n",
+        )
+        .expect("write fake firecracker");
+        set_executable(&binary_path);
+        let vm_config = FirecrackerConfig::new(
+            root.path().join("vmlinux"),
+            root.path().join("rootfs.ext4"),
+            root.path().join("guest-agent.sock"),
+            1,
+            128,
+            3,
+        );
+        let process_config = FirecrackerProcessConfig::new(
+            &binary_path,
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+        let mut process =
+            FirecrackerProcess::start(&process_config, &vm_config).expect("start fake firecracker");
+
+        wait_for_file(&process_config.api_socket_path).await;
+        let error = process
+            .graceful_stop(Duration::from_millis(50))
+            .await
+            .expect_err("fake firecracker ignores graceful shutdown");
+        let message = error.to_string();
+        assert!(
+            message.contains("graceful shutdown request timed out"),
+            "{message}"
+        );
+        assert!(!error.to_string().contains("force stop failed: "));
+        assert!(!process_config.api_socket_path.exists());
+        assert!(!process_config.config_file_path.exists());
     }
 
     #[cfg(target_os = "linux")]
