@@ -24,8 +24,13 @@ pub struct GuestAgentEnv {
 impl GuestAgentEnv {
     /// Create an environment over a connected guest-agent client.
     pub fn new(client: GuestAgentClient) -> Self {
+        Self::from_shared(Arc::new(client))
+    }
+
+    /// Create an environment over a client shared with its lifecycle owner.
+    pub fn from_shared(client: Arc<GuestAgentClient>) -> Self {
         Self {
-            client: Arc::new(client),
+            client,
             work_dir: PathBuf::from(WORK_DIR),
         }
     }

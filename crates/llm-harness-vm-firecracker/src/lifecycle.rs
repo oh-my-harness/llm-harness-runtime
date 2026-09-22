@@ -3,6 +3,7 @@
 use std::fmt::Display;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::cgroup::{FirecrackerCgroupCleanup, FirecrackerCgroupError};
@@ -423,7 +424,7 @@ pub struct FirecrackerLifecycle {
     image: FirecrackerImage,
     jail: Option<FirecrackerJail>,
     cgroups: FirecrackerCgroupCleanup,
-    guest_agent: Option<GuestAgentClient>,
+    guest_agent: Option<Arc<GuestAgentClient>>,
 }
 
 impl FirecrackerLifecycle {
@@ -672,7 +673,11 @@ impl FirecrackerLifecycle {
     }
 
     pub fn guest_agent(&self) -> Option<&GuestAgentClient> {
-        self.guest_agent.as_ref()
+        self.guest_agent.as_ref().map(|client| client.as_ref())
+    }
+
+    pub fn guest_agent_shared(&self) -> Option<Arc<GuestAgentClient>> {
+        self.guest_agent.clone()
     }
 }
 
@@ -680,7 +685,7 @@ async fn wait_for_guest_agent(
     uds_path: &Path,
     guest_port: u32,
     deadline: Instant,
-) -> Result<GuestAgentClient, GuestAgentClientError> {
+) -> Result<Arc<GuestAgentClient>, GuestAgentClientError> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -693,7 +698,7 @@ async fn wait_for_guest_agent(
         )
         .await
         {
-            Ok(Ok(client)) => client,
+            Ok(Ok(client)) => Arc::new(client),
             Ok(Err(_)) => {
                 wait_before_retry(deadline).await;
                 continue;
@@ -1234,6 +1239,10 @@ while True:
         assert!(config.config_file_path().is_file());
         assert_eq!(lifecycle.rootfs_path(), config.rootfs_path());
         assert!(lifecycle.guest_agent().is_some());
+        let shared_guest_agent = lifecycle
+            .guest_agent_shared()
+            .expect("shared guest agent client");
+        assert_eq!(Arc::strong_count(&shared_guest_agent), 2);
         lifecycle
             .graceful_stop(Duration::from_secs(2))
             .await
