@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use llm_harness_vm_agent_protocol::{AgentMessage, Frame, ProtocolPeer};
 #[cfg(target_os = "linux")]
+use llm_harness_vm_agent_transport::firecracker::FirecrackerVsockStream;
+#[cfg(target_os = "linux")]
 use llm_harness_vm_agent_transport::vsock::{VsockAddress, VsockStream};
 use llm_harness_vm_agent_transport::{FrameStream, TransportError};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -67,6 +69,18 @@ impl GuestAgentClient {
     #[cfg(target_os = "linux")]
     pub async fn connect_vsock(address: VsockAddress) -> Result<Self, GuestAgentClientError> {
         let stream = VsockStream::connect(address)
+            .await
+            .map_err(|error| GuestAgentClientError::Protocol(error.to_string()))?;
+        Self::new(stream)
+    }
+
+    /// Connect to a guest agent through a Firecracker host-side UDS.
+    #[cfg(target_os = "linux")]
+    pub async fn connect_firecracker_vsock(
+        uds_path: impl AsRef<std::path::Path>,
+        guest_port: u32,
+    ) -> Result<Self, GuestAgentClientError> {
+        let stream = FirecrackerVsockStream::connect(uds_path, guest_port)
             .await
             .map_err(|error| GuestAgentClientError::Protocol(error.to_string()))?;
         Self::new(stream)
@@ -465,6 +479,48 @@ mod tests {
             .await
             .expect("client task")
             .expect("ping succeeded");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn firecracker_vsock_client_completes_handshake_and_ping() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let root = tempfile::tempdir().expect("temp directory");
+        let socket_path = root.path().join("firecracker.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind Firecracker socket");
+
+        let server = spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept host connection");
+            let mut command = [0_u8; b"connect 6000\n".len()];
+            socket
+                .read_exact(&mut command)
+                .await
+                .expect("read connect command");
+            assert_eq!(command.as_slice(), b"connect 6000\n");
+            socket
+                .write_all(b"OK 1073741824\n")
+                .await
+                .expect("write handshake response");
+            socket.flush().await.expect("flush handshake response");
+
+            let mut guest =
+                FrameStream::with_default_limit(socket, ProtocolPeer::Guest).expect("guest stream");
+            let request = guest.recv().await.expect("receive ping");
+            let request_id = request.request_id();
+            assert_eq!(request.into_message(), AgentMessage::Ping);
+            guest
+                .send(guest_frame(request_id, AgentMessage::Pong))
+                .await
+                .expect("send pong");
+        });
+
+        let client = GuestAgentClient::connect_firecracker_vsock(&socket_path, 6000)
+            .await
+            .expect("connect Firecracker vsock");
+        client.ping().await.expect("ping guest agent");
+        server.await.expect("server task");
     }
 
     #[tokio::test]

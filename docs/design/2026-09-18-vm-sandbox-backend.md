@@ -235,16 +235,26 @@ removes only the jailer-specific `<parent>/<id>` directory while retaining the
 shared parent. Guest-agent-coordinated shutdown confirmation, registry
 recovery, network policy, and deployment validation remain future work.
 
+`llm-harness-vm-agent-transport` also implements the Linux Firecracker
+host-side vsock UDS adapter. It connects to the configured Unix socket, sends
+the upstream `connect <guest-port>\n` request, validates a bounded
+`OK <host-port>\n` acknowledgement, and then carries the existing framed
+guest-agent protocol on the same stream. `GuestAgentClient` exposes this
+transport through `connect_firecracker_vsock`, providing the prerequisite for
+lifecycle readiness checks and coordinated shutdown. Those lifecycle
+integrations remain future work.
+
 ## Current status
 
 This document selects Firecracker and defines the required threat model. The
 transport-independent guest-agent wire protocol, AF_VSOCK transport, guest
 filesystem/process handlers, guest binary, host client, and initial
 Firecracker configuration/process/image/lifecycle primitives, the jailer
-command-configuration primitive, and initial jailed lifecycle staging are
-implemented. They are not yet assembled into a complete production VM backend,
-network policy, registry recovery, end-to-end gateway integration,
-guest-agent-coordinated shutdown confirmation, or deployment validation. The
+command-configuration primitive, initial jailed lifecycle staging, and the
+Firecracker host-side vsock UDS transport are implemented. They are not yet
+assembled into a complete production VM backend, network policy, registry
+recovery, end-to-end gateway integration, guest-agent-coordinated shutdown
+confirmation, or deployment validation. The
 Bwrap gateway remains the only implemented remote execution backend. Issue
 #193 is closed; the VM backend and deployment work continues under #207 and its
 related production hardening issues.

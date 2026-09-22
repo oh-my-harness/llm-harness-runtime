@@ -5,6 +5,9 @@
 //! AF_VSOCK, Unix sockets, or another byte-oriented transport.
 
 #[cfg(target_os = "linux")]
+pub mod firecracker;
+
+#[cfg(target_os = "linux")]
 pub mod vsock;
 
 use std::collections::VecDeque;
