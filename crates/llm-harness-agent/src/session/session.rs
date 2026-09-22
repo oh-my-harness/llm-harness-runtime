@@ -288,10 +288,10 @@ impl Session {
         let mut restore_cursor = None;
         let old_cursor = self.storage.active_cursor().await?;
         for id in ids {
-            let Some(entry) = self.storage.get_entry(id.clone()).await? else {
+            let Some(entry) = self.storage.get_entry(id).await? else {
                 continue;
             };
-            if !self.storage.children(id.clone()).await?.is_empty() {
+            if !self.storage.children(id).await?.is_empty() {
                 continue;
             }
             if old_cursor == Some(id) {

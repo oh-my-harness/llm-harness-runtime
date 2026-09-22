@@ -53,6 +53,7 @@ impl SendMessageTool {
         self.call_inner_with_group(input, None)
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) fn call_inner_with_group(
         &self,
         input: &serde_json::Value,
@@ -81,12 +82,12 @@ impl SendMessageTool {
         }
 
         if to_str == crate::timeout_manager::reserved::OPERATOR && broadcast_id.is_some() {
-            if let Some(responder) = group.and_then(|group| group.responder.as_deref()) {
-                if self.agent_id.as_str() != responder {
-                    return Err(ToolFailure::invalid_arguments(format!(
-                        "This public reply is reserved for '{responder}'. Use send_message to ask a peer directly instead."
-                    )));
-                }
+            if let Some(responder) = group.and_then(|group| group.responder.as_deref())
+                && self.agent_id.as_str() != responder
+            {
+                return Err(ToolFailure::invalid_arguments(format!(
+                    "This public reply is reserved for '{responder}'. Use send_message to ask a peer directly instead."
+                )));
             }
             return self.public_reply(body);
         }
@@ -101,6 +102,7 @@ impl SendMessageTool {
         Ok(format!("Message sent to {to_str}."))
     }
 
+    #[allow(clippy::result_large_err)]
     fn public_reply(&self, body: &str) -> Result<String, ToolFailure> {
         match self.ctx.broadcast(&self.agent_id, body) {
             Ok(_) => Ok("sent".to_string()),

@@ -130,13 +130,15 @@ impl ChatHistoryJournal {
         before: Option<i64>,
     ) -> Result<Vec<ChatHistoryEntry>, ChatHistoryJournalError> {
         let sql = "SELECT id, payload, created_at FROM chat_messages
-             WHERE message_type = 'broadcast'
-                OR (
-                    message_type = 'direct'
-                    AND broadcast_id IS NOT NULL
-                    AND to_id = ?3
+             WHERE (?1 IS NULL OR id < ?1)
+                AND (
+                    message_type = 'broadcast'
+                    OR (
+                        message_type = 'direct'
+                        AND broadcast_id IS NOT NULL
+                        AND to_id = ?3
+                    )
                 )
-                AND (?1 IS NULL OR id < ?1)
              ORDER BY id DESC LIMIT ?2";
         self.query(
             sql,
@@ -356,5 +358,38 @@ mod tests {
             .unwrap();
         assert_eq!(private_entries.len(), 1);
         assert_eq!(private_entries[0].message.body, "private note");
+    }
+
+    #[test]
+    fn group_cursor_bounds_broadcasts_and_replies() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("chat.sqlite3");
+        let journal = ChatHistoryJournal::open(&path).unwrap();
+
+        let older_prompt = direct(
+            "operator",
+            "planner",
+            "older prompt",
+            "message-1",
+            Some("broadcast-1"),
+        );
+        journal
+            .append(&InboxMessage {
+                message_type: MessageType::Broadcast,
+                ..older_prompt
+            })
+            .unwrap();
+        let newer_reply = direct(
+            "planner",
+            "operator",
+            "newer reply",
+            "message-2",
+            Some("broadcast-1"),
+        );
+        journal.append(&newer_reply).unwrap();
+
+        let paged = journal.group_history(1, Some(2)).unwrap();
+        assert_eq!(paged.len(), 1);
+        assert_eq!(paged[0].message.body, "older prompt");
     }
 }

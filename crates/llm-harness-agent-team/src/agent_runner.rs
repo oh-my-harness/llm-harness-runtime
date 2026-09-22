@@ -148,7 +148,7 @@ fn final_no_response_entry(entries: &[SessionEntry]) -> Option<EntryId> {
     if let SessionEntryPayload::Message(message) = &entry.payload
         && is_no_response_message(message)
     {
-        Some(entry.id.clone())
+        Some(entry.id)
     } else {
         None
     }
@@ -808,7 +808,7 @@ mod tests {
         let sentinel = assistant_entry(NO_RESPONSE, None);
         assert_eq!(
             final_no_response_entry(std::slice::from_ref(&sentinel)),
-            Some(sentinel.id.clone())
+            Some(sentinel.id)
         );
 
         let tool_use = assistant_entry(
