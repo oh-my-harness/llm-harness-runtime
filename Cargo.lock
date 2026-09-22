@@ -2671,6 +2671,7 @@ name = "llm-harness-vm-firecracker"
 version = "0.5.0"
 dependencies = [
  "libc",
+ "llm-harness-vm-agent-service",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",

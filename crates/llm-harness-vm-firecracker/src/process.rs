@@ -136,6 +136,7 @@ pub struct FirecrackerProcess {
     child: Child,
     api_socket_path: PathBuf,
     config_file_path: PathBuf,
+    vsock_socket_path: PathBuf,
     stopped: bool,
 }
 
@@ -163,6 +164,15 @@ impl FirecrackerProcess {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        match std::fs::symlink_metadata(vm_config.vsock_uds_path()) {
+            Ok(_) => {
+                return Err(FirecrackerProcessError {
+                    message: "vsock socket path already exists".to_owned(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         write_config_file(&config.config_file_path, &config_json)?;
 
         let mut command = tokio::process::Command::new(&config.binary_path);
@@ -179,6 +189,7 @@ impl FirecrackerProcess {
             child,
             api_socket_path: config.api_socket_path.clone(),
             config_file_path: config.config_file_path.clone(),
+            vsock_socket_path: vm_config.vsock_uds_path().to_path_buf(),
             stopped: false,
         })
     }
@@ -212,6 +223,7 @@ impl FirecrackerProcess {
         for (label, path) in [
             ("API socket", config.api_socket_path()),
             ("config file", config.config_file_path()),
+            ("vsock socket", vm_config.vsock_uds_path()),
         ] {
             match std::fs::symlink_metadata(path) {
                 Ok(_) => {
@@ -248,6 +260,7 @@ impl FirecrackerProcess {
             child,
             api_socket_path: config.api_socket_path().to_path_buf(),
             config_file_path: config.config_file_path().to_path_buf(),
+            vsock_socket_path: vm_config.vsock_uds_path().to_path_buf(),
             stopped: false,
         })
     }
@@ -258,7 +271,11 @@ impl FirecrackerProcess {
         }
         let _ = self.child.start_kill();
         let wait_result = self.child.wait().await;
-        let cleanup_result = remove_artifacts(&self.api_socket_path, &self.config_file_path);
+        let cleanup_result = remove_artifacts(
+            &self.api_socket_path,
+            &self.config_file_path,
+            &self.vsock_socket_path,
+        );
         if wait_result.is_ok() && cleanup_result.is_ok() {
             self.stopped = true;
         }
@@ -275,7 +292,11 @@ impl FirecrackerProcess {
             return Ok(());
         }
         if self.child.try_wait()?.is_some() {
-            let cleanup_result = remove_artifacts(&self.api_socket_path, &self.config_file_path);
+            let cleanup_result = remove_artifacts(
+                &self.api_socket_path,
+                &self.config_file_path,
+                &self.vsock_socket_path,
+            );
             match cleanup_result {
                 Ok(()) => {
                     self.stopped = true;
@@ -295,8 +316,11 @@ impl FirecrackerProcess {
             .and_then(|result| result);
         if let Err(error) = signal_result {
             if self.child.try_wait()?.is_some() {
-                let cleanup_result =
-                    remove_artifacts(&self.api_socket_path, &self.config_file_path);
+                let cleanup_result = remove_artifacts(
+                    &self.api_socket_path,
+                    &self.config_file_path,
+                    &self.vsock_socket_path,
+                );
                 match cleanup_result {
                     Ok(()) => {
                         self.stopped = true;
@@ -315,7 +339,11 @@ impl FirecrackerProcess {
             return Err(graceful_stop_error(wait_error, stop_error));
         }
 
-        let cleanup_result = remove_artifacts(&self.api_socket_path, &self.config_file_path);
+        let cleanup_result = remove_artifacts(
+            &self.api_socket_path,
+            &self.config_file_path,
+            &self.vsock_socket_path,
+        );
         if cleanup_result.is_ok() {
             self.stopped = true;
             return Ok(());
@@ -437,7 +465,11 @@ impl Drop for FirecrackerProcess {
             return;
         }
         let _ = self.child.start_kill();
-        let _ = remove_artifacts(&self.api_socket_path, &self.config_file_path);
+        let _ = remove_artifacts(
+            &self.api_socket_path,
+            &self.config_file_path,
+            &self.vsock_socket_path,
+        );
     }
 }
 
@@ -462,10 +494,18 @@ fn write_config_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn remove_artifacts(api_socket_path: &Path, config_file_path: &Path) -> std::io::Result<()> {
+fn remove_artifacts(
+    api_socket_path: &Path,
+    config_file_path: &Path,
+    vsock_socket_path: &Path,
+) -> std::io::Result<()> {
     let api_socket_error = remove_owned_file(api_socket_path).err();
     let config_file_error = remove_owned_file(config_file_path).err();
-    if let Some(error) = api_socket_error.or(config_file_error) {
+    let vsock_socket_error = remove_owned_file(vsock_socket_path).err();
+    if let Some(error) = api_socket_error
+        .or(config_file_error)
+        .or(vsock_socket_error)
+    {
         return Err(error);
     }
     Ok(())
@@ -631,6 +671,42 @@ mod tests {
             Ok(_) => panic!("missing binary unexpectedly started"),
         };
         assert!(error.to_string().contains("firecracker process io error"));
+        assert!(!process_config.config_file_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_rejects_an_existing_vsock_socket() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let vsock_socket_path = root.path().join("guest-agent.sock");
+        std::fs::write(&vsock_socket_path, b"unowned").expect("write existing vsock socket");
+        let vm_config = FirecrackerConfig::new(
+            root.path().join("vmlinux"),
+            root.path().join("rootfs.ext4"),
+            &vsock_socket_path,
+            1,
+            128,
+            3,
+        );
+        let process_config = FirecrackerProcessConfig::new(
+            root.path().join("missing-firecracker"),
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+
+        let error = match FirecrackerProcess::start(&process_config, &vm_config) {
+            Err(error) => error,
+            Ok(_) => panic!("existing vsock socket unexpectedly accepted"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("vsock socket path already exists")
+        );
+        assert_eq!(
+            std::fs::read(&vsock_socket_path).expect("existing vsock socket remains"),
+            b"unowned"
+        );
         assert!(!process_config.config_file_path.exists());
     }
 
@@ -1026,6 +1102,31 @@ time.sleep(30)
                 .join("jail/firecracker/sandbox-1/root/rootfs.ext4")
                 .exists()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_jailed_rejects_an_existing_vsock_socket() {
+        let (root, jailer_config, process_config, vm_config) = jailed_process_environment();
+        let vsock_socket_path = vm_config.vsock_uds_path().to_path_buf();
+        std::fs::write(&vsock_socket_path, b"unowned").expect("write existing vsock socket");
+
+        let error =
+            match FirecrackerProcess::start_jailed(&jailer_config, &process_config, &vm_config) {
+                Err(error) => error,
+                Ok(_) => panic!("existing jailed vsock socket unexpectedly accepted"),
+            };
+        assert!(
+            error
+                .to_string()
+                .contains("vsock socket path already exists")
+        );
+        assert_eq!(
+            std::fs::read(&vsock_socket_path).expect("existing vsock socket remains"),
+            b"unowned"
+        );
+        assert!(!process_config.config_file_path.exists());
+        drop(root);
     }
 
     #[cfg(target_os = "linux")]

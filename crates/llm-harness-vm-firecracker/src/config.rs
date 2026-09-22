@@ -57,6 +57,10 @@ impl FirecrackerConfig {
         self
     }
 
+    pub fn vsock_uds_path(&self) -> &Path {
+        &self.vsock_uds_path
+    }
+
     pub fn validate(&self) -> Result<(), FirecrackerConfigError> {
         validate_absolute_path("kernel image", &self.kernel_image_path)?;
         validate_absolute_path("rootfs", &self.rootfs_path)?;
