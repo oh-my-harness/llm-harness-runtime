@@ -3,6 +3,8 @@
 pub mod config;
 pub use config::{FirecrackerConfig, FirecrackerConfigError};
 #[cfg(target_os = "linux")]
+mod cgroup;
+#[cfg(target_os = "linux")]
 pub mod image;
 #[cfg(target_os = "linux")]
 pub use image::{FirecrackerImage, FirecrackerImageAllocator, FirecrackerImageError};

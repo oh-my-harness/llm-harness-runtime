@@ -108,6 +108,34 @@ impl FirecrackerJailerConfig {
         self.gid
     }
 
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn cgroup_version(&self) -> Option<FirecrackerJailerCgroupVersion> {
+        self.cgroup_version
+    }
+
+    pub(crate) fn cgroups(&self) -> &[String] {
+        &self.cgroups
+    }
+
+    pub(crate) fn cgroup_parent(&self) -> Result<String, FirecrackerJailerConfigError> {
+        if let Some(parent_cgroup) = &self.parent_cgroup {
+            return Ok(parent_cgroup.clone());
+        }
+        let file_name = self
+            .firecracker_binary_path
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .ok_or_else(|| {
+                FirecrackerJailerConfigError::invalid(
+                    "Firecracker binary path must include a valid UTF-8 file name",
+                )
+            })?;
+        Ok(file_name.to_owned())
+    }
+
     pub fn validate(&self) -> Result<(), FirecrackerJailerConfigError> {
         validate_host_path("jailer binary", &self.jailer_binary_path)?;
         validate_host_path("Firecracker binary", &self.firecracker_binary_path)?;
@@ -327,6 +355,16 @@ fn validate_key_values(
                 "{label} must be in key=value format"
             )));
         };
+        let Some((controller, property)) = key.split_once('.') else {
+            return Err(FirecrackerJailerConfigError::invalid(format!(
+                "{label} key must be in controller.property format"
+            )));
+        };
+        if controller.is_empty() || property.is_empty() {
+            return Err(FirecrackerJailerConfigError::invalid(format!(
+                "{label} key is invalid"
+            )));
+        }
         if key.is_empty() || key.contains(char::is_whitespace) {
             return Err(FirecrackerJailerConfigError::invalid(format!(
                 "{label} key is invalid"
@@ -707,6 +745,9 @@ mod tests {
     fn config_rejects_invalid_and_duplicate_key_values() {
         let cgroup_cases = [
             vec!["cpuset.cpus".to_owned()],
+            vec!["cpu=100".to_owned()],
+            vec![".max=100".to_owned()],
+            vec!["cpu.=100".to_owned()],
             vec![" cpu.max=100".to_owned()],
             vec!["cpu.max=".to_owned()],
             vec!["../cpu.max=100".to_owned()],
