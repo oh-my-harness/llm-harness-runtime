@@ -374,8 +374,10 @@ impl ExecutionEnv for OsEnv {
 
 /// Windows App Execution Alias stub 的退出码（9009 = 命令未找到）。
 /// 已知误报：脚本自身 exit 9009 会被判为无 Python 静默 skip——接受并在此注明。
+#[cfg(test)]
 const PYTHON_ALIAS_EXIT_CODE: i32 = 9009;
 /// Store stub 的固定 stderr 前缀（非英文 locale 可能被翻译，仅作尽力回退，9009 为主信号）。
+#[cfg(test)]
 const PYTHON_MISSING_MARKER: &str = "Python was not found";
 
 /// 判定一次 shell 执行失败是否等于“环境没有真 Python”。
@@ -383,6 +385,8 @@ const PYTHON_MISSING_MARKER: &str = "Python was not found";
 /// Windows 自带 python.exe App Execution Alias stub：spawn 成功但以
 /// [`PYTHON_ALIAS_EXIT_CODE`] 退出（F-3 实测：提示走 stderr、英文 locale 下
 /// 含 [`PYTHON_MISSING_MARKER`]）。命中即视为无 Python（调用方静默 skip）。
+/// 生产接线候选：见 T5b 决策记录（2026-09-22：(a) 现状契约 = 模型自治；若未来生产需区分缺依赖，优先 code_exec 的 LazyLock 探针先例而非 9009 嗅探）。
+#[cfg(test)]
 fn is_missing_python(exit_code: i32, stderr: &str) -> bool {
     exit_code == PYTHON_ALIAS_EXIT_CODE || stderr.contains(PYTHON_MISSING_MARKER)
 }
