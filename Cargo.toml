@@ -13,6 +13,7 @@ members = [
     "crates/llm-harness-sandbox-gateway",
     "crates/llm-harness-vm-agent-protocol",
     "crates/llm-harness-vm-agent-transport",
+    "crates/llm-harness-vm-agent-env",
     "crates/llm-harness-vm-agent-service",
     "crates/llm-harness-vm-firecracker",
     "crates/llm-harness-mcp",

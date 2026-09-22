@@ -4,8 +4,11 @@
 //! events on one bounded frame stream.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use llm_harness_vm_agent_protocol::{AgentMessage, Frame, ProtocolPeer};
 #[cfg(target_os = "linux")]
@@ -50,6 +53,7 @@ pub struct GuestProcessHandle {
 
 enum PendingRequest {
     Response(oneshot::Sender<Result<AgentMessage, GuestAgentClientError>>),
+    OrphanedResponse,
     Process {
         response: Option<oneshot::Sender<Result<AgentMessage, GuestAgentClientError>>>,
         events: Option<mpsc::Sender<AgentMessage>>,
@@ -124,19 +128,26 @@ impl GuestAgentClient {
         let request_id = self.allocate_request_id();
         let (response_tx, response_rx) = oneshot::channel();
         self.insert_pending(request_id, PendingRequest::Response(response_tx));
+        let mut pending_guard = PendingResponseGuard {
+            pending: Arc::clone(&self.pending),
+            request_id,
+            preserve: false,
+        };
 
         let frame = Frame::new(ProtocolPeer::Host, request_id, message)
-            .inspect_err(|_| self.remove_pending(request_id))
+            .inspect_err(|_| pending_guard.remove_pending())
             .map_err(|error| GuestAgentClientError::Protocol(error.to_string()))?;
         if self.request_tx.send(frame).await.is_err() {
-            self.remove_pending(request_id);
             return Err(GuestAgentClientError::ConnectionClosed);
         }
+        pending_guard.preserve = true;
 
-        match response_rx.await {
-            Ok(result) => result,
-            Err(_) => Err(GuestAgentClientError::ConnectionClosed),
+        ResponseFuture {
+            pending: Arc::clone(&self.pending),
+            request_id,
+            receiver: Some(response_rx),
         }
+        .await
     }
 
     /// Check guest-agent liveness.
@@ -255,11 +266,80 @@ impl GuestAgentClient {
     }
 
     fn remove_pending(&self, request_id: u64) {
-        self.pending
-            .lock()
-            .expect("guest agent pending map poisoned")
-            .remove(&request_id);
+        remove_pending_entry(&self.pending, request_id);
     }
+}
+
+struct PendingResponseGuard {
+    pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
+    request_id: u64,
+    preserve: bool,
+}
+
+impl PendingResponseGuard {
+    fn remove_pending(&self) {
+        remove_pending_entry(&self.pending, self.request_id);
+    }
+}
+
+impl Drop for PendingResponseGuard {
+    fn drop(&mut self) {
+        if !self.preserve {
+            self.remove_pending();
+        }
+    }
+}
+
+struct ResponseFuture {
+    pending: Arc<Mutex<HashMap<u64, PendingRequest>>>,
+    request_id: u64,
+    receiver: Option<oneshot::Receiver<Result<AgentMessage, GuestAgentClientError>>>,
+}
+
+impl Future for ResponseFuture {
+    type Output = Result<AgentMessage, GuestAgentClientError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let Some(receiver) = self.receiver.as_mut() else {
+            return Poll::Pending;
+        };
+        match Pin::new(receiver).poll(cx) {
+            Poll::Ready(Ok(result)) => {
+                self.receiver = None;
+                remove_pending_entry(&self.pending, self.request_id);
+                Poll::Ready(result)
+            }
+            Poll::Ready(Err(_)) => {
+                self.receiver = None;
+                Poll::Ready(Err(GuestAgentClientError::ConnectionClosed))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for ResponseFuture {
+    fn drop(&mut self) {
+        if self.receiver.take().is_some() {
+            let mut pending = self
+                .pending
+                .lock()
+                .expect("guest agent pending map poisoned");
+            if matches!(
+                pending.get(&self.request_id),
+                Some(PendingRequest::Response(_))
+            ) {
+                pending.insert(self.request_id, PendingRequest::OrphanedResponse);
+            }
+        }
+    }
+}
+
+fn remove_pending_entry(pending: &Arc<Mutex<HashMap<u64, PendingRequest>>>, request_id: u64) {
+    pending
+        .lock()
+        .expect("guest agent pending map poisoned")
+        .remove(&request_id);
 }
 
 async fn run_client<S>(
@@ -333,6 +413,7 @@ async fn route_frame(
         PendingRequest::Response(sender) => {
             let _ = sender.send(response_result(message));
         }
+        PendingRequest::OrphanedResponse => {}
         PendingRequest::Process {
             mut response,
             mut events,
@@ -410,6 +491,7 @@ async fn fail_pending(
             PendingRequest::Response(sender) => {
                 let _ = sender.send(Err(error.clone()));
             }
+            PendingRequest::OrphanedResponse => {}
             PendingRequest::Process { response, events } => {
                 if let Some(sender) = response {
                     let _ = sender.send(Err(error.clone()));
@@ -479,6 +561,43 @@ mod tests {
             .await
             .expect("client task")
             .expect("ping succeeded");
+    }
+
+    #[tokio::test]
+    async fn dropped_request_consumes_late_response_without_leaking_pending() {
+        let (host_io, guest_io) = duplex(4096);
+        let client = GuestAgentClient::new(host_io).expect("client");
+        let mut guest =
+            FrameStream::with_default_limit(guest_io, ProtocolPeer::Guest).expect("guest stream");
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let request_task = spawn(async move {
+            let result = tokio::select! {
+                result = client.request(AgentMessage::Ping) => result,
+                _ = cancel_rx => Err(GuestAgentClientError::ConnectionClosed),
+            };
+            (client, result)
+        });
+
+        let request = guest.recv().await.expect("request");
+        let request_id = request.request_id();
+        assert_eq!(request.into_message(), AgentMessage::Ping);
+        cancel_tx.send(()).expect("cancel request");
+        let (client, result) = request_task.await.expect("request task");
+        assert!(result.is_err());
+
+        guest
+            .send(guest_frame(request_id, AgentMessage::Pong))
+            .await
+            .expect("send late pong");
+        let ping_task = spawn(async move { client.ping().await });
+        let ping_request = guest.recv().await.expect("ping request");
+        let ping_request_id = ping_request.request_id();
+        assert_eq!(ping_request.into_message(), AgentMessage::Ping);
+        guest
+            .send(guest_frame(ping_request_id, AgentMessage::Pong))
+            .await
+            .expect("send pong");
+        ping_task.await.expect("ping task").expect("ping succeeded");
     }
 
     #[cfg(target_os = "linux")]
