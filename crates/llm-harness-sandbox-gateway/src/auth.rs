@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Json;
 use axum::http::{StatusCode, header::AUTHORIZATION};
@@ -15,6 +16,26 @@ pub struct GatewayPrincipalConfig {
     pub fs_allowlist: Vec<PathBuf>,
 }
 
+/// Firecracker VM artifacts and VM defaults used by the gateway backend.
+#[derive(Clone)]
+pub struct FirecrackerBackendConfig {
+    pub binary_path: PathBuf,
+    pub kernel_image_path: PathBuf,
+    pub base_image_path: PathBuf,
+    pub max_vcpu_count: u32,
+    pub max_memory_mib: u32,
+    pub vsock_guest_cid_base: u32,
+    pub guest_agent_port: u32,
+    pub readiness_timeout: Duration,
+}
+
+/// Execution backend selected for every sandbox in this gateway process.
+#[derive(Clone)]
+pub enum GatewayBackend {
+    Bwrap,
+    Firecracker(FirecrackerBackendConfig),
+}
+
 /// Static gateway configuration.
 #[derive(Clone)]
 pub struct GatewayConfig {
@@ -25,6 +46,7 @@ pub struct GatewayConfig {
     pub max_output_bytes: usize,
     pub max_request_bytes: usize,
     work_root: Option<PathBuf>,
+    backend: GatewayBackend,
 }
 
 #[derive(Clone)]
@@ -86,6 +108,7 @@ impl GatewayConfig {
             max_output_bytes: 1024 * 1024,
             max_request_bytes: 64 * 1024 * 1024,
             work_root: None,
+            backend: GatewayBackend::Bwrap,
         };
         config.validate()?;
         Ok(config)
@@ -120,6 +143,16 @@ impl GatewayConfig {
     pub fn with_work_root(mut self, root: PathBuf) -> Self {
         self.work_root = Some(root);
         self
+    }
+
+    /// Select an explicit execution backend for all sandboxes.
+    pub fn with_backend(mut self, backend: GatewayBackend) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    pub fn backend(&self) -> &GatewayBackend {
+        &self.backend
     }
 
     pub(crate) fn prepare_work_root(&mut self) -> anyhow::Result<PathBuf> {
@@ -157,7 +190,7 @@ impl GatewayConfig {
         Ok(canonical)
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.max_sandboxes == 0 {
             anyhow::bail!("max_sandboxes must be positive");
         }
@@ -172,6 +205,12 @@ impl GatewayConfig {
         }
         if self.max_request_bytes == 0 {
             anyhow::bail!("max_request_bytes must be positive");
+        }
+        match &self.backend {
+            GatewayBackend::Bwrap => {}
+            GatewayBackend::Firecracker(config) => {
+                validate_firecracker_backend(config, self.max_sandboxes)?
+            }
         }
         Ok(())
     }
@@ -204,6 +243,81 @@ impl GatewayConfig {
     }
 }
 
+fn validate_firecracker_backend(
+    config: &FirecrackerBackendConfig,
+    max_sandboxes: usize,
+) -> anyhow::Result<()> {
+    let paths = [
+        ("binary", &config.binary_path),
+        ("kernel image", &config.kernel_image_path),
+        ("base image", &config.base_image_path),
+    ];
+    for (label, path) in paths {
+        if path.as_os_str().is_empty() {
+            anyhow::bail!("firecracker {label} path must not be empty");
+        }
+        if !path.is_absolute() {
+            anyhow::bail!("firecracker {label} path must be absolute");
+        }
+        if path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        }) {
+            anyhow::bail!("firecracker {label} path must not contain . or ..");
+        }
+    }
+    for (left_index, (left_label, left_path)) in paths.iter().enumerate() {
+        for (right_label, right_path) in paths.iter().skip(left_index + 1) {
+            if left_path == right_path {
+                anyhow::bail!("firecracker {left_label} and {right_label} paths must differ");
+            }
+        }
+    }
+
+    let binary = std::fs::metadata(&config.binary_path)
+        .map_err(|error| anyhow::anyhow!("invalid firecracker binary path: {error}"))?;
+    use std::os::unix::fs::PermissionsExt;
+    if !binary.is_file() || binary.permissions().mode() & 0o111 == 0 {
+        anyhow::bail!("firecracker binary must be an executable regular file");
+    }
+    for (label, path) in [
+        ("kernel image", &config.kernel_image_path),
+        ("base image", &config.base_image_path),
+    ] {
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| anyhow::anyhow!("invalid firecracker {label} path: {error}"))?;
+        if !metadata.is_file() {
+            anyhow::bail!("firecracker {label} must be a regular file");
+        }
+        if metadata.len() == 0 {
+            anyhow::bail!("firecracker {label} must not be empty");
+        }
+    }
+
+    if config.max_vcpu_count == 0 {
+        anyhow::bail!("firecracker max_vcpu_count must be positive");
+    }
+    if config.max_memory_mib == 0 {
+        anyhow::bail!("firecracker max_memory_mib must be positive");
+    }
+    if config.vsock_guest_cid_base < 3 {
+        anyhow::bail!("firecracker vsock_guest_cid_base must be at least 3");
+    }
+    let cid_capacity = u32::MAX - config.vsock_guest_cid_base + 1;
+    if max_sandboxes > usize::try_from(cid_capacity).unwrap_or(usize::MAX) {
+        anyhow::bail!("max_sandboxes exceeds vsock CID capacity");
+    }
+    if config.guest_agent_port == 0 {
+        anyhow::bail!("firecracker guest_agent_port must be nonzero");
+    }
+    if config.readiness_timeout.is_zero() {
+        anyhow::bail!("firecracker readiness_timeout must be positive");
+    }
+    Ok(())
+}
+
 fn is_guest_workspace_path(value: &str) -> bool {
     value == "/workspace"
         || (value.starts_with("/workspace/")
@@ -223,6 +337,13 @@ impl std::fmt::Debug for GatewayConfig {
             .field("default_exec_timeout_ms", &self.default_exec_timeout_ms)
             .field("max_exec_timeout_ms", &self.max_exec_timeout_ms)
             .field("max_output_bytes", &self.max_output_bytes)
+            .field(
+                "backend",
+                &match self.backend {
+                    GatewayBackend::Bwrap => "bwrap",
+                    GatewayBackend::Firecracker(_) => "firecracker",
+                },
+            )
             .finish()
     }
 }
