@@ -25,7 +25,7 @@ fn reads_and_validates_panel_descriptor() {
     let descriptor_path = root.path().join("panel.json");
     std::fs::write(
         &descriptor_path,
-        r#"{"schema":"llm-harness.studio.panel-descriptor.v1","url":"http://127.0.0.1:12345/app/agent-team?token=secret"}"#,
+        r#"{"schema":"llm-harness.studio.panel-descriptor.v1","url":"http://127.0.0.1:12345/?token=secret"}"#,
     )
     .unwrap();
 
@@ -33,7 +33,7 @@ fn reads_and_validates_panel_descriptor() {
     assert_eq!(panel_url.scheme(), "http");
     assert_eq!(panel_url.host_str(), Some("127.0.0.1"));
     assert_eq!(panel_url.port(), Some(12345));
-    assert_eq!(panel_url.path(), "/app/agent-team");
+    assert_eq!(panel_url.path(), "/");
 
     std::fs::write(
         &descriptor_path,
@@ -73,7 +73,7 @@ fn core_process_starts_reports_panel_and_shuts_down() {
         panel_url.host_str(),
         Some("127.0.0.1") | Some("localhost")
     ));
-    assert_eq!(panel_url.path(), "/app/agent-team");
+    assert_eq!(panel_url.path(), "/");
 
     match core_process.shutdown() {
         llm_harness_runtime_app_shell::core_process::ShutdownOutcome::Graceful(status) => {

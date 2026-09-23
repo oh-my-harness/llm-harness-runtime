@@ -464,14 +464,9 @@ mod tests {
         // fix (issue #81): arg() would escape and mangle them.
         #[cfg(target_os = "windows")]
         let command = "echo \"line1\"& echo \"line2\"";
-        let (_handle, mut stream) = ShellMonitorStream::new(
-            command,
-            None,
-            vec![],
-            "test",
-            ShellMonitorConfig::default(),
-        )
-        .unwrap();
+        let (_handle, mut stream) =
+            ShellMonitorStream::new(command, None, vec![], "test", ShellMonitorConfig::default())
+                .unwrap();
 
         // Collect all output events until the exit event. Batching is
         // non-deterministic (interval ticks may split output), so we

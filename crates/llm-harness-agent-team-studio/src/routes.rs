@@ -9,7 +9,7 @@
 use axum::Router;
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Json, Response};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -62,9 +62,7 @@ pub type SharedPm = Arc<RwLock<TeamManager>>;
 
 /// Build the domain router. Mount with `InspectorBuilder::extra_routes`.
 pub fn team_router(state: AppState) -> Router {
-    team_routes("/api/team", state.clone())
-        .route("/app/team.html", get(team_panel))
-        .merge(team_routes("/api/agent-team", state))
+    team_routes("/api/team", state.clone()).merge(team_routes("/api/agent-team", state))
 }
 
 fn team_routes(prefix: &'static str, state: AppState) -> Router {
@@ -114,10 +112,6 @@ fn team_routes(prefix: &'static str, state: AppState) -> Router {
         .route(&format!("{prefix}/upgrade-check"), post(upgrade_check))
         .route(&format!("{prefix}/upgrade-apply"), post(upgrade_apply))
         .with_state(state)
-}
-
-async fn team_panel() -> Html<&'static str> {
-    Html(include_str!("../static/team.html"))
 }
 
 async fn startup_recovery(State(state): State<AppState>) -> Response {
@@ -2039,25 +2033,6 @@ mod tests {
         let dir = unique_dir("ct-routes-repo");
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         dir
-    }
-
-    #[tokio::test]
-    async fn team_panel_is_embedded() {
-        let (router, _pm, _repo, _factory) = setup().await;
-        let response = router
-            .clone()
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("GET")
-                    .uri("/app/team.html")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(std::str::from_utf8(&body).unwrap().contains("Coding Team"));
     }
 
     #[tokio::test]

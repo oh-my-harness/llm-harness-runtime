@@ -1008,7 +1008,7 @@ mod binary_lifecycle_tests {
         );
         let panel_url = descriptor["url"].as_str().unwrap();
         assert!(panel_url.starts_with("http://127.0.0.1:"));
-        assert!(panel_url.contains("/app/team.html#token="));
+        assert!(panel_url.contains("/#token="));
         let token = panel_url.rsplit("#token=").next().unwrap();
         assert!(!token.is_empty());
         assert!(!descriptor_line.contains("#token="));

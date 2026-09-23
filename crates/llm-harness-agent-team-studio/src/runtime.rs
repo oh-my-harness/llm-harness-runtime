@@ -74,7 +74,7 @@ pub enum StudioError {
 pub struct StudioConfig {
     pub data_root: PathBuf,
     pub port: u16,
-    panel_path: &'static str,
+    service_base_path: &'static str,
     provider_factory: Option<crate::env_cfg::ProviderFactory>,
     extra_routes: Option<Router>,
 }
@@ -89,7 +89,7 @@ impl StudioConfig {
         Self {
             data_root: default_data_root(),
             port,
-            panel_path: "/app/team.html",
+            service_base_path: "/",
             provider_factory: None,
             extra_routes: None,
         }
@@ -105,8 +105,8 @@ impl StudioConfig {
         self
     }
 
-    pub fn with_panel_path(mut self, panel_path: &'static str) -> Self {
-        self.panel_path = panel_path;
+    pub fn with_service_base_path(mut self, service_base_path: &'static str) -> Self {
+        self.service_base_path = service_base_path;
         self
     }
 
@@ -129,7 +129,7 @@ pub struct StudioRuntime {
     inspector: Inspector,
     pm: Arc<RwLock<TeamManager>>,
     recovery: StartupRecovery,
-    panel_path: &'static str,
+    service_base_path: &'static str,
     _panel_descriptor: PanelDescriptorGuard,
     _singleton: StudioSingleton,
 }
@@ -270,7 +270,7 @@ impl StudioRuntime {
             inspector,
             pm: tm_shared,
             recovery: recovery.clone(),
-            panel_path: config.panel_path,
+            service_base_path: config.service_base_path,
             _panel_descriptor: PanelDescriptorGuard {
                 path: panel_descriptor_path(&data_root),
             },
@@ -315,7 +315,10 @@ impl StudioRuntime {
     pub fn panel_url(&self) -> Option<String> {
         let addr = self.bound_addr()?;
         let token = self.auth_token()?;
-        Some(format!("http://{addr}{}#token={token}", self.panel_path))
+        Some(format!(
+            "http://{addr}{}#token={token}",
+            self.service_base_path
+        ))
     }
 
     pub async fn shutdown(self) {
@@ -562,7 +565,7 @@ mod tests {
         let token = runtime.auth_token().unwrap().to_owned();
         assert!(!token.is_empty());
         let url = runtime.panel_url().unwrap();
-        assert!(url.starts_with(&format!("http://{addr}/app/team.html#token=")));
+        assert!(url.starts_with(&format!("http://{addr}/#token=")));
         let descriptor_path = runtime.panel_descriptor_path();
         let descriptor: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&descriptor_path).unwrap()).unwrap();

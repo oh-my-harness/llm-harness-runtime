@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# agent-team-studio local development launcher: build → start → open panel.
+# agent-team-studio local development launcher: build and start headless.
 #
 # 用法:
 #   ./scripts/studio.sh              # allocate an ephemeral port
 #   PORT=9000 ./scripts/studio.sh    # fixed development port
-#   NO_OPEN=1 ./scripts/studio.sh    # start without opening the browser
 #
 # 数据根目录: ~/.harness/agent-team-studio（STUDIO_DATA_ROOT 可覆盖）。
 # 后端只输出 panel descriptor 路径；URL/token 保存在 data root 内的 0600 文件中。
@@ -37,12 +36,5 @@ if [ -z "$DESCRIPTOR" ]; then
   exit 1
 fi
 
-URL="$(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' "$DESCRIPTOR" | tail -1)"
-if [ -z "$URL" ]; then
-  cat "$LOG" >&2
-  exit 1
-fi
-
 echo "agent-team-studio ready: $DESCRIPTOR"
-[ "${NO_OPEN:-0}" = "1" ] || open "$URL"
 wait "$PID"
