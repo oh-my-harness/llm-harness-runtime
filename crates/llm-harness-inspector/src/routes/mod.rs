@@ -7,12 +7,7 @@ use axum::Router;
 
 pub fn build_router(state: InspectorState) -> Router {
     Router::new()
-        // Headless: no bundled UI. Root redirects to the app layer's panel
-        // if one is mounted (extra_static), else 404s.
-        .route(
-            "/",
-            axum::routing::get(async || axum::response::Redirect::temporary("/app/team.html")),
-        )
+        // Headless: runtime exposes APIs only; applications own product UI.
         .route("/api/agents", axum::routing::get(config::list_agents))
         .route("/api/agent/config", axum::routing::get(config::get_config))
         .route(

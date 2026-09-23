@@ -764,10 +764,12 @@ mod tests {
         let out = match out {
             Ok(o) => o,
             Err(EnvError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return, // 环境无 Python
-            Err(EnvError::Io(e)) => panic!("execute_shell failed (Python should be installed): {e:?}"),
-            Err(EnvError::ShellFailed { exit_code, stderr, .. })
-                if is_missing_python(exit_code, &stderr) =>
-            {
+            Err(EnvError::Io(e)) => {
+                panic!("execute_shell failed (Python should be installed): {e:?}")
+            }
+            Err(EnvError::ShellFailed {
+                exit_code, stderr, ..
+            }) if is_missing_python(exit_code, &stderr) => {
                 return; // App Execution Alias stub（exit 9009）：无真 Python，跳过
             }
             Err(e) => panic!("execute_shell failed (Python should be installed): {e:?}"),

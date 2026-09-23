@@ -22,9 +22,6 @@ pub fn app_router(state: AppState) -> Router {
         .route("/api/app/health", get(health))
         .route("/api/app/diagnostics", get(diagnostics))
         .route("/api/app/data-migration", get(data_migration))
-        .route("/app/agent-team", get(crate::frontend::index))
-        .route("/app/agent-team/", get(crate::frontend::index))
-        .route("/app/agent-team/{*path}", get(crate::frontend::asset))
         .with_state(state)
 }
 
