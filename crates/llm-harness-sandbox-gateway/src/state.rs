@@ -33,6 +33,7 @@ pub(crate) struct GatewayState {
     registry: std::sync::Mutex<Connection>,
     sandboxes: std::sync::Mutex<HashMap<String, SandboxRecord>>,
     executions: std::sync::Mutex<HashMap<String, ExecutionRecord>>,
+    lifecycle_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Debug)]
@@ -476,7 +477,13 @@ impl GatewayState {
         for record in persisted {
             let sandbox_id = record.sandbox_id.clone();
             let record = restore_sandbox(&config, record)?;
-            set_registry_state(&registry, &sandbox_id, RegistryState::Running)?;
+            let registry_state =
+                if matches!(record.sandbox.as_ref(), GatewaySandbox::Firecracker(_)) {
+                    RegistryState::Creating
+                } else {
+                    RegistryState::Running
+                };
+            set_registry_state(&registry, &sandbox_id, registry_state)?;
             sandboxes.insert(sandbox_id, record);
         }
         Ok(Self {
@@ -486,6 +493,7 @@ impl GatewayState {
             registry,
             sandboxes: std::sync::Mutex::new(sandboxes),
             executions: std::sync::Mutex::new(HashMap::new()),
+            lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -667,11 +675,22 @@ impl GatewayState {
         principal: &AuthenticatedPrincipal,
         sandbox_id: &str,
     ) -> anyhow::Result<()> {
+        let lifecycle_lock = self.lifecycle_lock(sandbox_id);
+        let _lifecycle_guard = lifecycle_lock.lock().await;
         let sandbox = self
             .get_sandbox(principal, sandbox_id)
             .ok_or_else(|| anyhow::anyhow!("sandbox not found"))?
             .sandbox;
         sandbox.start().await
+    }
+
+    fn lifecycle_lock(&self, sandbox_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.lifecycle_locks
+            .lock()
+            .expect("lifecycle lock registry poisoned")
+            .entry(sandbox_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     pub(crate) fn get_sandbox(
@@ -707,8 +726,24 @@ impl GatewayState {
     }
 
     pub(crate) async fn reset_sandbox(&self, sandbox_id: &str) -> anyhow::Result<()> {
+        let lifecycle_lock = self.lifecycle_lock(sandbox_id);
+        let _lifecycle_guard = lifecycle_lock.lock().await;
         let sandbox = self.get_sandbox_unchecked(sandbox_id)?.sandbox;
         sandbox.reset().await
+    }
+
+    pub(crate) async fn take_sandbox_for_delete(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<GatewaySandbox, GatewayStateError> {
+        let lifecycle_lock = self.lifecycle_lock(sandbox_id);
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+        let sandbox = self.take_sandbox_for_shutdown(sandbox_id)?;
+        self.lifecycle_locks
+            .lock()
+            .expect("lifecycle lock registry poisoned")
+            .remove(sandbox_id);
+        Ok(sandbox)
     }
 
     pub(crate) fn take_sandbox_for_shutdown(
@@ -733,6 +768,17 @@ impl GatewayState {
     }
 
     pub(crate) async fn shutdown_all(&self) -> anyhow::Result<()> {
+        let lifecycle_locks = self
+            .lifecycle_locks
+            .lock()
+            .expect("lifecycle lock registry poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut lifecycle_guards = Vec::with_capacity(lifecycle_locks.len());
+        for lifecycle_lock in lifecycle_locks {
+            lifecycle_guards.push(lifecycle_lock.lock_owned().await);
+        }
         let sandboxes = self
             .lock_sandboxes()
             .drain()
@@ -984,9 +1030,27 @@ fn restore_sandbox(
                     "persisted sandbox {sandbox_id:?} has a vsock CID below the configured base"
                 );
             }
-            anyhow::bail!(
-                "persisted Firecracker sandbox {sandbox_id:?} cannot be restored across gateway restart"
+            let persisted_config = normalize_request_config(&principal, request)?;
+            validate_firecracker_policies(&persisted_config, backend)?;
+            let sandbox_config = build_sandbox_config(&persisted_config)?;
+            let run_directory = config.work_root().join("sandboxes").join(sandbox_id);
+            let sandbox = FirecrackerSandbox::new(
+                sandbox_config,
+                FirecrackerSandboxConfig {
+                    backend: backend.clone(),
+                    run_directory,
+                    vsock_guest_cid: cid,
+                },
             );
+            let env = sandbox.env();
+            return Ok(SandboxRecord {
+                owner: Arc::clone(&principal.id),
+                sandbox: Arc::new(GatewaySandbox::Firecracker(Box::new(sandbox))),
+                env,
+                work_dir: PathBuf::from(GUEST_WORK_DIR),
+                config: persisted_config,
+                state: RemoteSandboxState::Creating,
+            });
         }
         (crate::auth::GatewayBackend::Firecracker(_), None) => {
             anyhow::bail!("persisted sandbox {sandbox_id:?} is missing a vsock CID");

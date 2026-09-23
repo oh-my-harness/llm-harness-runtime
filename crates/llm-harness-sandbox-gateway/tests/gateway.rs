@@ -1249,8 +1249,8 @@ fn gateway_fails_closed_on_invalid_persisted_registry_entries() {
     assert!(sandbox_path.exists());
 }
 
-#[test]
-fn firecracker_gateway_fails_closed_on_restarted_sandboxes() {
+#[tokio::test]
+async fn firecracker_gateway_restores_restarted_sandboxes_as_creating() {
     let artifacts = firecracker_artifact_root();
     let work_root = private_tempdir();
     let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
@@ -1279,16 +1279,155 @@ fn firecracker_gateway_fails_closed_on_restarted_sandboxes() {
         )
         .expect("persist Firecracker CID");
 
-    let error = match SandboxGateway::new(config) {
-        Ok(_) => panic!("gateway must not report a restarted Firecracker sandbox as Running"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("cannot be restored across gateway restart")
-    );
+    let gateway = SandboxGateway::new(config).expect("restore Firecracker sandbox");
     assert_eq!(registry_record_count(work_root.path()), 1);
+    let connection =
+        Connection::open(work_root.path().join("registry.sqlite")).expect("open registry");
+    let (state, cid): (String, i64) = connection
+        .query_row(
+            "SELECT state, vsock_guest_cid FROM sandboxes WHERE sandbox_id = ?1",
+            [&sandbox_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read restored record");
+    assert_eq!(state, "creating");
+    assert_eq!(cid, 3);
+    gateway
+        .shutdown_all()
+        .await
+        .expect("shut down restored gateway");
+    assert_eq!(registry_record_count(work_root.path()), 0);
+}
+
+#[tokio::test]
+async fn firecracker_gateway_starts_a_recovered_sandbox_only_after_guest_readiness() {
+    let artifacts = firecracker_artifact_root();
+    write_fake_firecracker(artifacts.path().join("firecracker").as_path(), 6000);
+    let work_root = private_tempdir();
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf())
+        .with_backend(firecracker_backend(artifacts.path(), 3));
+    drop(SandboxGateway::new(config.clone()).expect("initialize registry"));
+    let sandbox_id = uuid::Uuid::new_v4().to_string();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(work_root.path().join("sandboxes").join(&sandbox_id))
+        .expect("create Firecracker work root");
+    insert_test_registry_record(
+        work_root.path(),
+        &sandbox_id,
+        "tenant-a",
+        &persisted_sandbox_config_json(),
+        "creating",
+    );
+    Connection::open(work_root.path().join("registry.sqlite"))
+        .expect("open registry")
+        .execute(
+            "UPDATE sandboxes SET vsock_guest_cid = 3 WHERE sandbox_id = ?1",
+            [&sandbox_id],
+        )
+        .expect("persist Firecracker CID");
+
+    let work_root_path = work_root.path().to_path_buf();
+    let mut test_gateway = start_gateway_at(config, work_root_path).await;
+    test_gateway._work_root = Some(work_root);
+    let client = remote_client(&test_gateway.base_url, TOKEN_A);
+    let status = client
+        .get_sandbox(&sandbox_id)
+        .await
+        .expect("read restored sandbox");
+    assert_eq!(status.state, RemoteSandboxState::Creating);
+
+    client
+        .start_sandbox(&sandbox_id)
+        .await
+        .expect("start recovered Firecracker sandbox");
+    let status = client
+        .get_sandbox(&sandbox_id)
+        .await
+        .expect("read started sandbox");
+    assert_eq!(status.state, RemoteSandboxState::Running);
+    let connection =
+        Connection::open(test_gateway.work_root().join("registry.sqlite")).expect("open registry");
+    let (state, cid): (String, i64) = connection
+        .query_row(
+            "SELECT state, vsock_guest_cid FROM sandboxes WHERE sandbox_id = ?1",
+            [&sandbox_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read started record");
+    assert_eq!(state, "running");
+    assert_eq!(cid, 3);
+    test_gateway
+        ._gateway
+        .shutdown_all()
+        .await
+        .expect("shut down recovered gateway");
+}
+
+#[tokio::test]
+async fn firecracker_gateway_keeps_a_recovered_sandbox_creating_after_start_failure() {
+    let artifacts = firecracker_artifact_root();
+    let work_root = private_tempdir();
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.path().to_path_buf())
+        .with_backend(firecracker_backend(artifacts.path(), 3));
+    drop(SandboxGateway::new(config.clone()).expect("initialize registry"));
+    let sandbox_id = uuid::Uuid::new_v4().to_string();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(work_root.path().join("sandboxes").join(&sandbox_id))
+        .expect("create Firecracker work root");
+    insert_test_registry_record(
+        work_root.path(),
+        &sandbox_id,
+        "tenant-a",
+        &persisted_sandbox_config_json(),
+        "creating",
+    );
+    Connection::open(work_root.path().join("registry.sqlite"))
+        .expect("open registry")
+        .execute(
+            "UPDATE sandboxes SET vsock_guest_cid = 3 WHERE sandbox_id = ?1",
+            [&sandbox_id],
+        )
+        .expect("persist Firecracker CID");
+
+    let work_root_path = work_root.path().to_path_buf();
+    let mut test_gateway = start_gateway_at(config, work_root_path).await;
+    test_gateway._work_root = Some(work_root);
+    let client = remote_client(&test_gateway.base_url, TOKEN_A);
+    let error = client
+        .start_sandbox(&sandbox_id)
+        .await
+        .expect_err("invalid Firecracker binary must fail startup");
+    match error {
+        RemoteSandboxError::Gateway { status, .. } => assert_eq!(status, 503),
+        error => panic!("expected gateway error, got {error:?}"),
+    }
+    let status = client
+        .get_sandbox(&sandbox_id)
+        .await
+        .expect("read failed recovered sandbox");
+    assert_eq!(status.state, RemoteSandboxState::Creating);
+    let connection =
+        Connection::open(test_gateway.work_root().join("registry.sqlite")).expect("open registry");
+    let state: String = connection
+        .query_row(
+            "SELECT state FROM sandboxes WHERE sandbox_id = ?1",
+            [&sandbox_id],
+            |row| row.get(0),
+        )
+        .expect("read failed record");
+    assert_eq!(state, "creating");
+    assert_eq!(registry_record_count(test_gateway.work_root()), 1);
+    test_gateway
+        ._gateway
+        .shutdown_all()
+        .await
+        .expect("shut down failed recovery gateway");
 }
 
 #[test]

@@ -95,6 +95,19 @@ impl RemoteSandboxClient {
         Ok(())
     }
 
+    /// Start a sandbox restored into the `creating` state by a gateway restart.
+    pub async fn start_sandbox(&self, sandbox_id: &str) -> Result<(), RemoteSandboxError> {
+        let sandbox_id = path_segment(sandbox_id, "sandbox id")?;
+        self.request_empty(
+            Method::POST,
+            &format!("v1/sandboxes/{sandbox_id}/start"),
+            Some(serde_json::json!({})),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Delete a sandbox from the gateway.
     pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<(), RemoteSandboxError> {
         let sandbox_id = path_segment(sandbox_id, "sandbox id")?;

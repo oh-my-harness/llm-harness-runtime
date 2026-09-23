@@ -39,6 +39,7 @@ pub(crate) fn build_router(state: SharedState) -> Router {
             "/v1/sandboxes/{id}",
             get(get_sandbox).delete(delete_sandbox),
         )
+        .route("/v1/sandboxes/{id}/start", post(start_sandbox))
         .route("/v1/sandboxes/{id}/reset", post(reset_sandbox))
         .route("/v1/sandboxes/{id}/cleanup", post(cleanup_sandbox))
         .route("/v1/sandboxes/{id}/exec", post(exec_shell))
@@ -149,7 +150,7 @@ async fn create_sandbox(
 }
 
 async fn cleanup_failed_sandbox(state: &SharedState, sandbox_id: &str, stage: &str) {
-    if let Ok(sandbox) = state.take_sandbox_for_shutdown(sandbox_id)
+    if let Ok(sandbox) = state.take_sandbox_for_delete(sandbox_id).await
         && Box::new(sandbox).shutdown().await.is_ok()
         && let Err(registry_error) = state.finish_shutdown(sandbox_id)
     {
@@ -160,6 +161,36 @@ async fn cleanup_failed_sandbox(state: &SharedState, sandbox_id: &str, stage: &s
             "failed to remove sandbox registry record after sandbox failure"
         );
     }
+}
+
+async fn start_sandbox(
+    State(state): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    if state.get_sandbox(&principal, &id).is_none() {
+        return not_found(&id);
+    }
+    if let Err(error) = state.start_sandbox(&principal, &id).await {
+        tracing::warn!(
+            sandbox_id = %id,
+            principal = %principal.id,
+            error = %error,
+            "sandbox start failed"
+        );
+        return gateway_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sandbox_start_failed",
+            error.to_string(),
+            None,
+        );
+    }
+    if let Err(error) = state.mark_running(&id) {
+        cleanup_failed_sandbox(&state, &id, "sandbox state persistence failure").await;
+        return state_error(error);
+    }
+    tracing::info!(sandbox_id = %id, principal = %principal.id, "sandbox started");
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn get_sandbox(
@@ -188,7 +219,7 @@ async fn delete_sandbox(
     if state.get_sandbox(&principal, &id).is_none() {
         return not_found(&id);
     }
-    let sandbox = match state.take_sandbox_for_shutdown(&id) {
+    let sandbox = match state.take_sandbox_for_delete(&id).await {
         Ok(sandbox) => sandbox,
         Err(error) => return state_error(error),
     };
