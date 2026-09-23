@@ -346,6 +346,14 @@ impl FirecrackerLifecycleConfig {
 
     fn validate_artifact_paths_are_absent(&self) -> Result<(), FirecrackerLifecycleError> {
         let paths = self.lifecycle_paths()?;
+        if self.jailer.is_none() {
+            let process_config = self.process_config()?;
+            match std::fs::symlink_metadata(process_config.pid_file_path()) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let mut artifacts = vec![
             ("rootfs", paths.rootfs_path),
             ("API socket", paths.api_socket_path),
@@ -432,6 +440,20 @@ impl FirecrackerLifecycle {
         config: &FirecrackerLifecycleConfig,
     ) -> Result<Self, FirecrackerLifecycleError> {
         config.validate()?;
+        if config.jailer.is_none() {
+            let process_config = config.process_config()?;
+            let pid_file_path = process_config.pid_file_path();
+            if std::fs::symlink_metadata(&pid_file_path).is_ok() {
+                let paths = config.lifecycle_paths()?;
+                FirecrackerProcess::stop_stale(
+                    &process_config,
+                    Some(&paths.rootfs_path),
+                    &paths.vsock_socket_path,
+                )
+                .await?;
+                config.validate()?;
+            }
+        }
         let paths = config.lifecycle_paths()?;
         let mut jail = None;
         let mut cgroups = FirecrackerCgroupCleanup::default();
@@ -1150,6 +1172,36 @@ while True:
         std::fs::write(config.rootfs_path(), b"existing").expect("write existing rootfs");
         let error = config.validate().expect_err("rootfs already exists");
         assert!(error.to_string().contains("rootfs path already exists"));
+    }
+
+    #[tokio::test]
+    async fn start_recovers_from_a_dead_stale_pid() {
+        let (_root, config) = test_environment();
+        write_fake_firecracker(&config.binary_path, DEFAULT_GUEST_AGENT_PORT, true);
+        for path in [
+            config.rootfs_path(),
+            config.api_socket_path(),
+            config.config_file_path(),
+            config.vsock_socket_path(),
+        ] {
+            std::fs::write(path, b"stale").expect("write stale artifact");
+        }
+        let pid_file_path = config
+            .process_config()
+            .expect("derive process config")
+            .pid_file_path();
+        std::fs::write(&pid_file_path, b"999999").expect("write dead PID file");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&pid_file_path, std::fs::Permissions::from_mode(0o600))
+                .expect("set stale PID file permissions");
+        }
+
+        let mut lifecycle = FirecrackerLifecycle::start(&config)
+            .await
+            .expect("recover stale lifecycle");
+        lifecycle.stop().await.expect("stop recovered lifecycle");
+        assert!(!pid_file_path.exists());
     }
 
     #[test]

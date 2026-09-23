@@ -1,6 +1,12 @@
 use std::ffi::OsString;
 #[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
@@ -23,6 +29,8 @@ use crate::image::open_directory;
 use crate::jailer::FirecrackerJailerConfig;
 #[cfg(target_os = "linux")]
 use crate::jailer::FirecrackerJailerConfigError;
+
+pub(crate) const PROCESS_PID_FILE_NAME: &str = "firecracker.pid";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FirecrackerProcessConfig {
@@ -72,6 +80,10 @@ impl FirecrackerProcessConfig {
 
     pub fn config_file_path(&self) -> &Path {
         &self.config_file_path
+    }
+
+    pub fn pid_file_path(&self) -> PathBuf {
+        self.api_socket_path.with_file_name(PROCESS_PID_FILE_NAME)
     }
 
     pub fn command_args(&self) -> Vec<OsString> {
@@ -136,12 +148,54 @@ pub struct FirecrackerProcess {
     child: Child,
     api_socket_path: PathBuf,
     config_file_path: PathBuf,
+    pid_file_path: PathBuf,
     vsock_socket_path: PathBuf,
     stopped: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl FirecrackerProcess {
+    pub async fn stop_stale(
+        config: &FirecrackerProcessConfig,
+        rootfs_path: Option<&Path>,
+        vsock_socket_path: &Path,
+    ) -> Result<(), FirecrackerProcessError> {
+        let pid_file_path = config.pid_file_path();
+        let pid = read_pid_file(&pid_file_path)?;
+        if process_exists(pid) {
+            verify_process_identity(pid, config)?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } {
+                    0 => {}
+                    error => {
+                        if error == libc::ESRCH {
+                            break;
+                        }
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return Err(FirecrackerProcessError {
+                        message: format!("stale firecracker process {pid} did not exit"),
+                    });
+                }
+                if !process_exists(pid) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        remove_stale_artifacts(
+            &config.api_socket_path,
+            &config.config_file_path,
+            rootfs_path,
+            vsock_socket_path,
+            &pid_file_path,
+        )?;
+        Ok(())
+    }
+
     pub fn start(
         config: &FirecrackerProcessConfig,
         vm_config: &FirecrackerConfig,
@@ -154,6 +208,16 @@ impl FirecrackerProcess {
         }
         if let Some(parent) = config.api_socket_path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        let pid_file_path = config.pid_file_path();
+        match std::fs::symlink_metadata(&pid_file_path) {
+            Ok(_) => {
+                return Err(FirecrackerProcessError {
+                    message: "PID file path already exists".to_owned(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         match std::fs::symlink_metadata(&config.api_socket_path) {
             Ok(_) => {
@@ -178,17 +242,31 @@ impl FirecrackerProcess {
         let mut command = tokio::process::Command::new(&config.binary_path);
         command.args(config.command_args());
         command.kill_on_drop(true);
-        let child = match command.spawn() {
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
                 let _ = std::fs::remove_file(&config.config_file_path);
                 return Err(error.into());
             }
         };
+        let pid = child.id().ok_or_else(|| FirecrackerProcessError {
+            message: "firecracker process has no PID".to_owned(),
+        })?;
+        if let Err(error) = write_pid_file(&pid_file_path, pid) {
+            let _ = child.start_kill();
+            let _ = remove_artifacts(
+                &config.api_socket_path,
+                &config.config_file_path,
+                vm_config.vsock_uds_path(),
+                &pid_file_path,
+            );
+            return Err(error.into());
+        }
         Ok(Self {
             child,
             api_socket_path: config.api_socket_path.clone(),
             config_file_path: config.config_file_path.clone(),
+            pid_file_path,
             vsock_socket_path: vm_config.vsock_uds_path().to_path_buf(),
             stopped: false,
         })
@@ -235,6 +313,16 @@ impl FirecrackerProcess {
                 Err(error) => return Err(error.into()),
             }
         }
+        let pid_file_path = config.pid_file_path();
+        match std::fs::symlink_metadata(&pid_file_path) {
+            Ok(_) => {
+                return Err(FirecrackerProcessError {
+                    message: "PID file path already exists".to_owned(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
 
         write_config_file(config.config_file_path(), &config_json)?;
         if let Err(error) = std::os::unix::fs::chown(
@@ -249,17 +337,31 @@ impl FirecrackerProcess {
         let mut command = tokio::process::Command::new(jailer_config.jailer_binary_path());
         command.args(jailer_args);
         command.kill_on_drop(true);
-        let child = match command.spawn() {
+        let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
                 let _ = std::fs::remove_file(config.config_file_path());
                 return Err(error.into());
             }
         };
+        let pid = child.id().ok_or_else(|| FirecrackerProcessError {
+            message: "jailer process has no PID".to_owned(),
+        })?;
+        if let Err(error) = write_pid_file(&pid_file_path, pid) {
+            let _ = child.start_kill();
+            let _ = remove_artifacts(
+                config.api_socket_path(),
+                config.config_file_path(),
+                vm_config.vsock_uds_path(),
+                &pid_file_path,
+            );
+            return Err(error.into());
+        }
         Ok(Self {
             child,
             api_socket_path: config.api_socket_path().to_path_buf(),
             config_file_path: config.config_file_path().to_path_buf(),
+            pid_file_path,
             vsock_socket_path: vm_config.vsock_uds_path().to_path_buf(),
             stopped: false,
         })
@@ -275,6 +377,7 @@ impl FirecrackerProcess {
             &self.api_socket_path,
             &self.config_file_path,
             &self.vsock_socket_path,
+            &self.pid_file_path,
         );
         if wait_result.is_ok() && cleanup_result.is_ok() {
             self.stopped = true;
@@ -296,6 +399,7 @@ impl FirecrackerProcess {
                 &self.api_socket_path,
                 &self.config_file_path,
                 &self.vsock_socket_path,
+                &self.pid_file_path,
             );
             match cleanup_result {
                 Ok(()) => {
@@ -320,6 +424,7 @@ impl FirecrackerProcess {
                     &self.api_socket_path,
                     &self.config_file_path,
                     &self.vsock_socket_path,
+                    &self.pid_file_path,
                 );
                 match cleanup_result {
                     Ok(()) => {
@@ -343,6 +448,7 @@ impl FirecrackerProcess {
             &self.api_socket_path,
             &self.config_file_path,
             &self.vsock_socket_path,
+            &self.pid_file_path,
         );
         if cleanup_result.is_ok() {
             self.stopped = true;
@@ -469,6 +575,7 @@ impl Drop for FirecrackerProcess {
             &self.api_socket_path,
             &self.config_file_path,
             &self.vsock_socket_path,
+            &self.pid_file_path,
         );
     }
 }
@@ -494,21 +601,168 @@ fn write_config_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn write_pid_file(path: &Path, pid: u32) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(pid.to_string().as_bytes())?;
+    file.sync_all()
+}
+
+#[cfg(target_os = "linux")]
+fn read_pid_file(path: &Path) -> Result<u32, FirecrackerProcessError> {
+    use std::io::Read;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let mode = metadata.permissions().mode();
+    if !metadata.is_file() || metadata.uid() != unsafe { libc::getuid() } || mode & 0o077 != 0 {
+        return Err(FirecrackerProcessError {
+            message: format!("firecracker PID file {path:?} is untrusted"),
+        });
+    }
+    let mut contents = String::new();
+    file.take(24).read_to_string(&mut contents)?;
+    contents
+        .trim()
+        .parse()
+        .map_err(|_| FirecrackerProcessError {
+            message: format!("firecracker PID file {path:?} is invalid"),
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn process_exists(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+        return false;
+    }
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return true;
+    };
+    status
+        .split(") ")
+        .nth(1)
+        .and_then(|status_fields| status_fields.split_whitespace().next())
+        != Some("Z")
+}
+
+#[cfg(target_os = "linux")]
+fn verify_process_identity(
+    pid: u32,
+    config: &FirecrackerProcessConfig,
+) -> Result<(), FirecrackerProcessError> {
+    let expected_binary_metadata = std::fs::metadata(&config.binary_path)?;
+    let actual_binary_metadata = std::fs::metadata(format!("/proc/{pid}/exe"))?;
+    if expected_binary_metadata.dev() != actual_binary_metadata.dev()
+        || expected_binary_metadata.ino() != actual_binary_metadata.ino()
+    {
+        return Err(FirecrackerProcessError {
+            message: format!(
+                "stale firecracker PID {pid} executable does not match {:?}",
+                config.binary_path
+            ),
+        });
+    }
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline"))?;
+    let arguments = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .collect::<Vec<&[u8]>>();
+    let executable = arguments
+        .first()
+        .and_then(|argument| {
+            std::path::Path::new(std::ffi::OsStr::from_bytes(argument)).file_name()
+        })
+        .unwrap_or_default();
+    let expected_executable = config
+        .binary_path
+        .file_name()
+        .unwrap_or_default()
+        .as_encoded_bytes();
+    let api_flag = b"--api-sock".as_slice();
+    let api_path = config.api_socket_path.as_os_str().as_encoded_bytes();
+    let config_flag = b"--config-file".as_slice();
+    let config_path = config.config_file_path.as_os_str().as_encoded_bytes();
+    if executable.as_encoded_bytes() == expected_executable
+        && arguments
+            .windows(2)
+            .any(|arguments| arguments[0] == api_flag && arguments[1] == api_path)
+        && arguments
+            .windows(2)
+            .any(|arguments| arguments[0] == config_flag && arguments[1] == config_path)
+    {
+        return Ok(());
+    }
+    Err(FirecrackerProcessError {
+        message: format!(
+            "stale firecracker PID {pid} does not match {:?}",
+            config.binary_path
+        ),
+    })
+}
+
+#[cfg(target_os = "linux")]
 fn remove_artifacts(
     api_socket_path: &Path,
     config_file_path: &Path,
     vsock_socket_path: &Path,
+    pid_file_path: &Path,
 ) -> std::io::Result<()> {
     let api_socket_error = remove_owned_file(api_socket_path).err();
     let config_file_error = remove_owned_file(config_file_path).err();
     let vsock_socket_error = remove_owned_file(vsock_socket_path).err();
+    let pid_file_error = remove_owned_file(pid_file_path).err();
     if let Some(error) = api_socket_error
         .or(config_file_error)
         .or(vsock_socket_error)
+        .or(pid_file_error)
     {
         return Err(error);
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_stale_artifacts(
+    api_socket_path: &Path,
+    config_file_path: &Path,
+    rootfs_path: Option<&Path>,
+    vsock_socket_path: &Path,
+    pid_file_path: &Path,
+) -> Result<(), FirecrackerProcessError> {
+    if let Some(rootfs_path) = rootfs_path {
+        remove_owned_regular_file(rootfs_path)?;
+    }
+    remove_artifacts(
+        api_socket_path,
+        config_file_path,
+        vsock_socket_path,
+        pid_file_path,
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn remove_owned_regular_file(path: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stale rootfs is not a regular file",
+        ));
+    }
+    std::fs::remove_file(path)
 }
 
 #[cfg(target_os = "linux")]
@@ -828,6 +1082,105 @@ mod tests {
         assert!(!error.to_string().contains("force stop failed: "));
         assert!(!process_config.api_socket_path.exists());
         assert!(!process_config.config_file_path.exists());
+        assert!(!process_config.pid_file_path().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stop_stale_kills_a_verified_process_and_removes_artifacts() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let process_config = FirecrackerProcessConfig::new(
+            "/usr/bin/python3",
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+        let vsock_socket_path = root.path().join("guest-agent.sock");
+        let rootfs_path = root.path().join("rootfs.ext4");
+        let pid_file_path = process_config.pid_file_path();
+        std::fs::write(&rootfs_path, b"stale rootfs").expect("write stale rootfs");
+
+        let mut stale_process = std::process::Command::new("/usr/bin/python3")
+            .arg("-c")
+            .arg("import sys, time; time.sleep(30)")
+            .arg("--api-sock")
+            .arg(process_config.api_socket_path())
+            .arg("--config-file")
+            .arg(process_config.config_file_path())
+            .spawn()
+            .expect("start stale process");
+        let pid = stale_process.id();
+        std::fs::write(&pid_file_path, pid.to_string()).expect("write stale PID");
+        set_private_file_permissions(&pid_file_path);
+
+        let stop_result =
+            FirecrackerProcess::stop_stale(&process_config, Some(&rootfs_path), &vsock_socket_path)
+                .await;
+        let _ = stale_process.wait();
+        stop_result.expect("stop stale process");
+        assert!(!process_exists(pid));
+        assert!(!process_config.api_socket_path.exists());
+        assert!(!process_config.config_file_path.exists());
+        assert!(!pid_file_path.exists());
+        assert!(!rootfs_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stop_stale_removes_artifacts_after_a_dead_pid() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let process_config = FirecrackerProcessConfig::new(
+            root.path().join("firecracker"),
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+        let vsock_socket_path = root.path().join("guest-agent.sock");
+        let rootfs_path = root.path().join("rootfs.ext4");
+        let pid_file_path = process_config.pid_file_path();
+        for path in [
+            &rootfs_path,
+            &process_config.api_socket_path,
+            &process_config.config_file_path,
+            &vsock_socket_path,
+        ] {
+            std::fs::write(path, b"stale").expect("write stale artifact");
+        }
+        std::fs::write(&pid_file_path, b"999999").expect("write dead PID");
+        set_private_file_permissions(&pid_file_path);
+
+        FirecrackerProcess::stop_stale(&process_config, Some(&rootfs_path), &vsock_socket_path)
+            .await
+            .expect("clean dead stale process");
+        for path in [
+            rootfs_path,
+            process_config.api_socket_path,
+            process_config.config_file_path,
+            vsock_socket_path,
+            pid_file_path,
+        ] {
+            assert!(!path.exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stop_stale_rejects_an_untrusted_pid_file() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let process_config = FirecrackerProcessConfig::new(
+            root.path().join("firecracker"),
+            root.path().join("api.sock"),
+            root.path().join("firecracker.json"),
+        );
+        let vsock_socket_path = root.path().join("guest-agent.sock");
+        let pid_file_path = process_config.pid_file_path();
+        std::fs::write(&pid_file_path, b"999999").expect("write PID file");
+        std::fs::set_permissions(&pid_file_path, std::fs::Permissions::from_mode(0o644))
+            .expect("set PID file permissions");
+
+        let error = FirecrackerProcess::stop_stale(&process_config, None, &vsock_socket_path)
+            .await
+            .expect_err("reject an untrusted PID file");
+        assert!(error.to_string().contains("is untrusted"), "{error}");
+        assert!(pid_file_path.exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -1188,6 +1541,14 @@ time.sleep(30)
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(path, permissions).expect("make fake firecracker executable");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_private_file_permissions(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("make PID file private");
     }
 
     #[cfg(target_os = "linux")]
