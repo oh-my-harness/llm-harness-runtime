@@ -164,7 +164,24 @@ impl FirecrackerProcess {
         let pid = read_pid_file(&pid_file_path)?;
         if process_exists(pid) {
             verify_process_identity(pid, config)?;
-            let deadline = Instant::now() + Duration::from_secs(2);
+            const STOP_TIMEOUT: Duration = Duration::from_secs(2);
+            const GRACEFUL_TIMEOUT: Duration = Duration::from_millis(500);
+            let deadline = Instant::now() + STOP_TIMEOUT;
+            if std::fs::symlink_metadata(&config.api_socket_path).is_ok() {
+                let graceful = tokio::time::timeout(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(GRACEFUL_TIMEOUT),
+                    send_ctrl_alt_del(&config.api_socket_path),
+                )
+                .await;
+                if let Ok(Err(error)) = graceful {
+                    tracing::warn!(pid, error = %error, "stale Firecracker graceful stop failed");
+                }
+                while process_exists(pid) && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
             loop {
                 match unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } {
                     0 => {}
