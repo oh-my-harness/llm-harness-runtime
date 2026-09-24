@@ -1,98 +1,105 @@
-﻿# Experiment: Fast Small Model Agent Loop vs Standard Large Model ReAct Loop
+﻿# Experiment: Jev-Style Fast Decision Model in Agent Loop
 
 ## Goal
 
-Measure the speed and task-completion trade-off of using a **small/fast LLM** (target: ~0.1 s per call) for per-step agent-loop decisions, compared to the standard **large LLM** (~2 s per call) in the same sequential ReAct loop.
+Benchmark an agent loop where per-step decisions (which tool to call next) are made by a **fast structured-decision model** (Jev-style, ~70-500ms) instead of a traditional large LLM (~1-3s), and compare wall-clock speed and task completion quality.
 
 ## Hypothesis
 
-The agent loop remains **sequential ReAct** (observe -> decide -> act -> observe). The only change is the **model used for per-step decisions**: a small model (e.g. 0.5B-3B params) that responds in ~0.1 s instead of a large model (~2 s). Because tool calls in software domains are already fast (< 100 ms), reducing LLM latency from ~2 s to ~0.1 s per step should make the entire loop 2-10x faster for tasks with 5-15 steps.
+The agent loop remains **sequential ReAct** (observe -> decide -> act -> observe). The only change is that per-step decisions are made by a **decision-only model** that outputs structured choices (not free-text). Because the decision model:
+- Receives program state (conversation history, tool results)
+- Returns a pre-defined choice (e.g. which tool to call next, with parameters)
+- Has ~100ms latency vs ~2s for a large LLM
 
-Task-completion quality may decrease because the small model has weaker reasoning. We aim to quantify this gap.
+The total loop time should drop significantly (2-10x) for tasks with many steps, while maintaining comparable task completion for routine decisions. Complex reasoning steps are escalated to the large model only when needed.
+
+## Architecture: System 1 / System 2
+
+```
+┌─────────────────────────────────────────────┐
+│                 Agent Loop                   │
+│                                              │
+│   observe() ──> decide() ──> act()           │
+│                    │                         │
+│              ┌─────┴─────┐                   │
+│              │           │                   │
+│         Jev/Decision   Large LLM             │
+│         (~0.1s)        (~2s)                │
+│         Choice/Bool    Reasoning/Generation  │
+└─────────────────────────────────────────────┘
+```
+
+- **Decision model (System 1)**: handles high-frequency, low-latency structural judgments
+- **Large model (System 2)**: handles complex reasoning, planning, open-ended generation
 
 ## Two Modes Under Test
 
-| Aspect | Large Model ReAct (baseline) | Small Model ReAct (experimental) |
-|--------|------------------------------|----------------------------------|
-| LLM calls | One per step | One per step (same) |
-| Control flow | Sequential ReAct | Sequential ReAct (same) |
-| Model per step | Large (e.g. Qwen-72B, GPT-4o) ~2 s/call | Small (e.g. Qwen-0.5B, Phi-mini) ~0.1 s/call |
-| Structured output | Yes (tool call or JSON choice) | Yes (structured output: choice/action) |
-| Adaptive to errors | Yes | Yes (same, just faster decisions) |
-| Expected speed | Baseline | ~2-10x faster (fewer LLM wait per step) |
-| Expected quality | Baseline | May degrade on complex reasoning tasks |
+| Aspect | Large LLM ReAct (baseline) | Decision-Model ReAct (experimental) |
+|--------|----------------------------|--------------------------------------|
+| Per-step decision | Large LLM (~2s) | Decision model (~0.1s) |
+| Output | Free-form tool call or JSON | Structured: choice/action/score/bool |
+| Adaptive to errors | Yes | Yes (same loop, just faster decisions) |
+| Complex reasoning | Same model handles all | Escalated to large model when needed |
+| Expected speed | Baseline | ~2-10x faster |
+| Expected quality | Baseline | May degrade on tasks requiring deep reasoning at every step |
 
 ## Experiment Design
 
 ### Task Suite
 
-Prepare 10-20 tasks in a sandboxed repository that the agent must complete end-to-end. Tasks should vary in:
+10-20 tasks in a sandboxed repo. Vary in reasoning complexity and step count.
 
-- **Reasoning complexity** (simple tool selection -> requires multi-hop reasoning)
-- **Step count** (3 -> 15 steps)
-- **Tool type** (file ops, code search, shell commands)
+### Decision Provider Interface
 
-Example tasks:
+```rust
+trait DecisionProvider {
+    /// Given the current state, returns a structured decision.
+    async fn decide(&self, state: &AgentState, options: &[DecisionOption]) -> Decision;
+}
+```
 
-1. Read a file, find a function, rename it across the repo.
-2. Search for a bug pattern, fix it, run tests.
-3. Create a new module, wire it into the entry point, update docs.
-4. Multi-step debugging: read logs -> locate error -> patch -> verify.
-
-Each task has a **known-correct expected outcome** verified independently.
+Two implementations:
+- **LargeLlmDecision**: calls the large model with structured output (baseline)
+- **FastDecision**: calls a small/fast model or Jev API with pre-defined options
 
 ### Model Candidates
 
-Check [SiliconFlow](https://siliconflow.cn) for available small/fast models. Candidates:
+| Role | Provider | Latency/call |
+|------|----------|-------------|
+| Baseline (large) | SiliconFlow Qwen-72B / GPT-4o | ~1-3s |
+| Fast decision | Jev API / local small model with structured output | ~0.05-0.2s |
 
-| Role | Model | Expected latency/call |
-|------|-------|----------------------|
-| Baseline (large) | Qwen-72B / DeepSeek-V3 / GPT-4o | ~1-3 s |
-| Fast (small) | Qwen2.5-0.5B / Qwen2.5-1.5B / Phi-3-mini / Llama-3.2-1B | ~0.05-0.2 s |
-
-> Note: identify the specific "javi/jev" model with the team before running.
+> Note: Jev (TypeSafe AI) is not yet available in mainland China. Use a local small model with structured output as a proxy, or APUS fast-browser-use as an open-source alternative.
 
 ### Metrics
 
 | Metric | How to measure |
 |--------|---------------|
 | Total wall-clock time | `Instant::now()` around the full loop |
-| Per-step LLM latency | Timestamp each provider request |
+| Per-step decision latency | Timestamp each decision call |
 | Per-step tool latency | Timestamp each tool dispatch |
-| LLM total time vs tool total time | Sum separately |
+| Decision model calls vs LLM calls | Separate counters |
 | Task success | Binary: final state matches expected outcome? |
-| Partial completion | % of expected sub-goals achieved |
-
-### Runner Architecture
-
-Create a benchmark binary or integration test in `crates/llm-harness-loop` that:
-
-1. Sets up a temp workspace with known files.
-2. Runs the same task with **mode A (large model)** and **mode B (small model)**.
-3. Records per-step timing, call counts, and success/failure.
-4. Outputs a comparison table.
+| Escalation rate | % of steps that required large-model fallback |
 
 ### Controls
 
-- Same loop logic, same tools, same workspace.
-- Only the model changes between runs.
-- Same structured-output schema for tool selection.
-- Run each task >= 3 times for variance.
+- Same loop logic, tools, workspace for both modes.
+- Only the decision model changes.
+- Run each task >= 3 times.
 - Record model name, endpoint, date.
 
 ## Success Criteria
 
 | Criterion | Target |
 |-----------|--------|
-| Speed improvement (all tasks) | >= 2x wall-clock reduction |
-| Task completion (simple tasks) | >= 90% of large-model baseline |
-| Task completion (complex tasks) | Quantify gap; identify which steps degrade |
+| Speed improvement | >= 2x wall-clock reduction |
+| Task completion | >= 85% of baseline |
 | Stability | Reproducible across 3 runs |
 
 ## Next Steps
 
-1. Confirm the exact fast model ("javi/jev") available on SiliconFlow.
-2. Implement the benchmark runner (mode switch: model config only).
-3. Prepare the task suite.
-4. Run and collect results.
-5. Write up and decide whether to adopt small-model routing in production.
+1. Implement the `DecisionProvider` trait and benchmark runner.
+2. Prepare task suite.
+3. Run and collect results.
+4. Decide whether to adopt decision-model routing in production.
