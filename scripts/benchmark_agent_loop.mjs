@@ -90,9 +90,9 @@ function executeTool(name, toolArgs, ws) {
 
 // --- Agent Loop ---
 
-const SYSTEM_PROMPT = `You are a coding agent. Available tools:\n${JSON.stringify(TOOLS)}\n\nRespond ONLY with JSON (no markdown, no code fences):\n{"action":"<tool_name>","args":{...},"done":false}\nor\n{"action":null,"args":null,"done":true,"summary":"..."}\n\nCall exactly one tool per turn. Set done=true when finished.`;
+const SYSTEM_PROMPT = `You are a coding agent running on Windows (PowerShell shell). Available tools:\n${JSON.stringify(TOOLS)}\n\nRespond ONLY with JSON (no markdown, no code fences):\n{"action":"<tool_name>","args":{...},"done":false}\nor\n{"action":null,"args":null,"done":true,"summary":"..."}\n\nCall exactly one tool per turn. Set done=true when finished.`;
 
-const MAX_STEPS = 15;
+const MAX_STEPS = 10;
 
 async function runAgent(model, task, ws, metrics) {
   const messages = [
