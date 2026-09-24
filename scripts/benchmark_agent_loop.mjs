@@ -77,10 +77,9 @@ function executeTool(name, toolArgs, ws) {
     switch (name) {
       case "read_file": return readFileSync(join(ws, toolArgs.path), "utf-8");
       case "write_file": writeFileSync(join(ws, toolArgs.path), toolArgs.content); return `written ${toolArgs.content.length} bytes`;
-      case "list_files": return execSync("find . -type f", { cwd: ws, timeout: 5000, encoding: "utf-8" }).slice(0, 2000) || "(empty)";
+      case "list_files": return execSync("dir /s /b", { cwd: ws, timeout: 5000, encoding: "utf-8" }).slice(0, 2000) || "(empty)";
       case "grep":
-        try { return execSync(`grep -rn "${toolArgs.pattern}" .`, { cwd: ws, timeout: 5000, encoding: "utf-8" }).slice(0, 4000) || "(no matches)"; }
-        catch { return "(no matches)"; }
+        try { return execSync(`findstr /s /n /c:"${toolArgs.pattern}" *.*`, { cwd: ws, timeout: 5000, encoding: "utf-8" }).slice(0, 4000) || "(no matches)"; } catch { return "(no matches)"; }
       case "bash":
         try { return execSync(toolArgs.cmd, { cwd: ws, timeout: 10000, encoding: "utf-8" }).slice(0, 4000) || "(empty)"; }
         catch (e) { return `error: ${e.message}`; }
