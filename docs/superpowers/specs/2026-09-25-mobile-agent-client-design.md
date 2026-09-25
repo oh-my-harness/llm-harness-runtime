@@ -1,19 +1,3 @@
-# MVP 优先（2026-09-25 修订）
-
-完整形态之前先做 MVP 走通全流程，验证核心问题：**Rust runtime 能否在 Android 上运行，并通过现有 gateway 协议完成一次"LLM 对话 + 工具在远端沙箱执行"。**
-
-MVP 范围：
-
-1. gateway 接入 Seatbelt 后端（macOS，复用现有 `SeatbeltSandbox`，接口 `GatewayBackend`/`GatewaySandbox` 已留好）——使整条链可在 Mac 本机验证，不依赖 Linux 服务器。
-2. `llm-harness-mobile-core`：aarch64-linux-android 交叉编译 + uniffi 绑定，最小接口 `send()/events()`。无持久化、无恢复。
-3. Android 壳：单 Activity，消息列表 + 输入框，事件流直刷。亮屏测试，无前台服务。
-4. 端到端冒烟：手机发"在沙箱里执行 `ls -la`"，屏幕显示沙箱真实输出。
-
-MVP 砍掉：语音、前台服务、SQLite 持久化、通知、UI 打磨、公网穿透（gateway 跑 Mac loopback）。
-MVP 中最大不确定性是 uniffi 工具链 + tokio 在 Android 的启动，实施计划排最前先排雷。
-
----
-
 # Mobile Agent Client — 大方向设计
 
 日期：2026-09-25
@@ -86,68 +70,7 @@ MVP 中最大不确定性是 uniffi 工具链 + tokio 在 Android 的启动，�
 | uniffi/交叉编译工具链 | 构建期问题，先跑通再开发 |
 | UI 做不好导致弃用 | UI 详细设计单独立项，按上述硬约束执行 |
 
-## MVP 实测发现（2026-09-26 补录）
-
-MVP 端到端已在模拟器验证通过（手机 → gateway(Seatbelt) → GLM-5.2(SiliconFlow 公网) → 沙箱内 python 解析 PDF → 流式回屏）。实测暴露的后续项：
-
-1. **沙箱预装工具/文件注入 API**：沙箱内无网络（设计使然），pip 不可用；宿主预装的库按 python 路径而定（CLT python3 自带 PyMuPDF，但 `/usr/bin/python3` shim 曾被 denylist 拦截，已修复）。文件注入目前只能宿主侧手工 cp 进 `sandboxes/<id>/`。**需要**：gateway 增加"预置文件上传"协议端点（如 `POST /v1/sandboxes/{id}/fs/upload`，二进制走现有 Base64 语义），或预构建带常用工具的沙箱镜像。
-2. ** Seatbelt denylist 与开发工具链的边界**：`/Library/Developer/CommandLineTools` 已加 read-only allow（0f45924）。后续如需 swift/homebrew 等工具链，逐项评估放行，勿放宽 `/Library` 整体。
-3. **agent 对受限环境的韧性**：实测中 GLM-5.2 在网络/文件系统受限时能降级实现（纯 Python 解析 CID 字体 PDF）且不编造结果——策略层的硬约束 + agent 自适应是有效的组合，保持"deny 优先"设计。
-4. **LAN 明文 HTTP 端到端**：代码就绪（`new_insecure` + UI 开关 + `GATEWAY_BIND`），因测试机 UniVPN 全局路由劫持未完成端到端验证；需无 VPN 环境或分流规则排除 `192.168.0.0/16` 后复测。
-5. **真机验证项**（未做）：熄屏长任务、WiFi↔5G 切换、国产 ROM 后台策略。
-
 ## 后续流程
 
 1. 本 spec 评审通过后，进 writing-plans 出一期实施计划（core 骨架 → gateway 链路 → 最小 UI → 前台服务 → 语音 → 真机验证）。
 2. UI 详细设计在 core 骨架跑通后、正式 UI 开发前，单独立项。
-
----
-
-# 信任分级沙箱（2026-09-26 修订，用户确认）
-
-## 威胁模型变更
-
-原设计假设沙箱内运行**不可信代码**（防失控、防数据外泄），因此默认全断网络、全拒宿主路径。MVP 实测证明该假设与产品定位错位：本产品的 agent 是**用户全权授权的个人代理**，跑的是用户自己发起的任务（装依赖、克隆仓库、访问内网服务），而非第三方提交的代码。继续沿用"防失控代码"策略会让产品在每个真实任务上碰壁（实测：pip 不可用、git clone 不可用、内网 API 不可达）。
-
-新威胁模型：**防事故而非防恶意**。要防的是 agent 的错误命令（误删、误写系统目录、泄漏凭据文件）与 prompt injection 的放大效应，不再防"agent 本身不可信"。用户对宿主机拥有完全所有权，且以自己的账号授权 agent。
-
-## 分级设计
-
-`SandboxConfig` 增加 `trust_profile` 字段（wire + 内部），三档：
-
-| profile | 网络 | 宿主文件系统 | 适用 |
-|---|---|---|---|
-| `restricted`（默认，现状） | 全断 | 仅 work_dir + allowlist | 跑第三方代码、敏感数据场景 |
-| `trusted-lan` | 全放开（allow network*） | work_dir RW + 指定项目目录 RW + 系统区拒写 | 家庭/内网环境日常办公 |
-| `trusted-full` | 全放开 | 除系统区与凭据区外全可读写（近宿主） | 完全信任的个人设备 |
-
-**所有档位共同的硬底线**（deny 优先，profile 不能覆盖）：
-- 拒写 `/`、`/System`、`/usr`、`/bin`、`/sbin`、`/private/etc`
-- 拒读凭据区：`~/.ssh`、`~/Library/Keychains`、Keychain 数据库、浏览器 Cookie/密码库（`~/Library/Application Support/*/Cookies`、`Login Data`）
-- 拒读 `.env`（包括 work_dir 内的，防 agent 任务中意外外泄；确需读取时由用户显式逐文件加入 allowlist）
-
-**`trusted-lan` 的额外细则**：
-- 项目目录由 principal 的 `fs_allowlist` 注入（现有机制复用，gateway 侧 principal 配置已有该字段），guest 坐标映射到 `/workspace/<name>`
-- 网络放开含 DNS；如需再收紧，后置按域 allowlist（bwrap/seatbelt 都只支持 all-or-nothing 或不设限，按域过滤后置）
-
-## 落地面
-
-1. **`llm-harness-sandbox`（seatbelt.rs）**：`generate_policy` 按 profile 参数化——restricted 保持现状；trusted-lan 去掉 `(deny network*)`、追加项目目录 allow；trusted-full 追加 `$HOME` 读写 allow（凭据区 deny 保留在最后，last-match-wins）。
-2. **wire 协议**（`RemoteSandboxConfig`）+ **gateway**（`RemoteSandboxConfig → SandboxConfig` 转换、`GatewayPrincipalConfig` 加 profile 上限——principal 声明它最高愿意授予的档位，请求档位超出即拒绝）。
-3. **bwrap 后端**：同 profile 语义（网络放开 = 去掉 `--unshare-net`；项目目录 = 追加 bind）。Firecracker 不动（VM 边界本就更强）。
-4. **mobile-core / Android UI**：`MobileConfig.trust_profile`，UI 一个三选开关（默认 restricted）。
-5. **审计**：create 响应已含 backend 字段，追加 `trust_profile`，UI 常显当前档位（用户应始终知道 agent 此刻的权限级别）。
-
-## 非目标
-
-- 不做按域网络过滤（后置）
-- 不做 Firecracker profile 分级（VM 隔离下默认全放，另一条产品线）
-- 不做 agent 运行中动态提权（提权 = 新建沙箱，简洁且可审计）
-
-## 验收场景（实施计划的骨架）
-
-1. trusted-lan 沙箱内 `pip install requests` 成功（网络通）
-2. `git clone` 内网仓库到挂载的项目目录成功，宿主侧文件可见
-3. 尝试写 `/etc/hosts`、读 `~/.ssh/id_ed25519` 被拒（底线生效）
-4. principal 上限 `restricted` 时请求 `trusted-lan` 被拒（档位不越权）
-5. 手机 UI 档位切换 → 重建沙箱 → 新档位生效
