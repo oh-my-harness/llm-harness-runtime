@@ -27,6 +27,7 @@
         android:layout_height="wrap_content"
         android:hint="gateway url (http://10.0.2.2:7080)"
         android:inputType="textUri"
+        android:text="http://127.0.0.1:7080"
         android:textSize="12sp" />
 
     <EditText
@@ -35,6 +36,7 @@
         android:layout_height="wrap_content"
         android:hint="gateway bearer token"
         android:inputType="text"
+        android:text="mvp-smoke-token-0123456789abcdef"
         android:textSize="12sp" />
 
     <EditText
@@ -43,6 +45,7 @@
         android:layout_height="wrap_content"
         android:hint="LLM api key"
         android:inputType="textPassword"
+        android:text="@string/default_api_key"
         android:textSize="12sp" />
 
     <EditText
@@ -51,7 +54,7 @@
         android:layout_height="wrap_content"
         android:hint="model id"
         android:inputType="text"
-        android:text="claude-sonnet-4-6"
+        android:text="GLM-5.3-Flash"
         android:textSize="12sp" />
 
     <EditText
@@ -60,6 +63,7 @@
         android:layout_height="wrap_content"
         android:hint="LLM base url (optional)"
         android:inputType="textUri"
+        android:text="@string/default_llm_base_url"
         android:textSize="12sp" />
 
     <LinearLayout

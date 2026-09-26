@@ -7,7 +7,6 @@ import android.widget.EditText
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import com.sun.jna.Native
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -34,8 +33,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // JNA needs the temp extraction dir writable; the .so is packaged per-abi.
-        Native.setProtected(true)
         setContentView(R.layout.activity_main)
 
         transcriptView = findViewById(R.id.transcript)
@@ -63,6 +60,7 @@ class MainActivity : AppCompatActivity() {
             apiKey = findViewById<EditText>(R.id.apiKey).text.toString().trim(),
             model = findViewById<EditText>(R.id.model).text.toString().trim(),
             llmBaseUrl = findViewById<EditText>(R.id.llmBaseUrl).text.toString().trim(),
+            provider = "openai",
         )
         appendSystem("connecting to ${config.gatewayUrl} …")
         CoroutineScope(Dispatchers.IO).launch {
