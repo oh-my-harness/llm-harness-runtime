@@ -75,16 +75,21 @@ fn policy_denies_network() {
 fn policy_denies_sensitive_reads() {
     let config = default_config(PathBuf::from("/tmp/test"));
     let policy = generate_policy(&config, &PathBuf::from("/tmp/test"), &[]);
-    // Comprehensive denylist: /etc, /var, /root, /Users, /Library, /System,
-    // /private/etc, /private/var, /private/root, /opt, /srv, /home.
+    // Fine-grained denylist: /Library is intentionally NOT blanket-denied
+    // (toolchain shims resolve through it — see generate_policy comment).
+    // Credential-bearing subtrees are denied instead.
     assert!(policy.contains(r#"(deny file-read* (subpath "/etc"))"#));
-    assert!(policy.contains(r#"(deny file-read* (subpath "/var"))"#));
+    assert!(policy.contains(r#"(deny file-read* (subpath "/private/etc"))"#));
+    assert!(policy.contains(r#"(deny file-read* (subpath "/private/var/db"))"#));
     assert!(policy.contains(r#"(deny file-read* (subpath "/root"))"#));
     assert!(policy.contains(r#"(deny file-read* (subpath "/Users"))"#));
-    assert!(policy.contains(r#"(deny file-read* (subpath "/Library"))"#));
+    assert!(policy.contains(r#"(deny file-read* (subpath "/Library/Keychains"))"#));
+    assert!(policy.contains(r#"(deny file-read* (subpath "/Library/Preferences"))"#));
     assert!(policy.contains(r#"(deny file-read* (subpath "/System"))"#));
-    assert!(policy.contains(r#"(deny file-read* (subpath "/private/etc"))"#));
-    assert!(policy.contains(r#"(deny file-read* (subpath "/private/var"))"#));
+    assert!(!policy.contains(r#"(deny file-read* (subpath "/Library"))"#));
+    assert!(
+        policy.contains(r#"(allow file-read* (subpath "/Library/Developer/CommandLineTools"))"#)
+    );
 }
 
 #[test]

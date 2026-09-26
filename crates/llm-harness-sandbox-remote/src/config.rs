@@ -484,6 +484,7 @@ mod tests {
                 },
                 work_dir: Some(work_dir),
                 trust_profile: Default::default(),
+                host_binds: Vec::new(),
             };
             let error = RemoteSandboxConfig::try_from(config)
                 .expect_err("invalid guest path should be rejected");

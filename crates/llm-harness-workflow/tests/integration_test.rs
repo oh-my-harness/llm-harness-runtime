@@ -44,6 +44,8 @@ async fn infrastructure_assembly_smoke_test() {
             timeout: None,
         },
         work_dir: Some(work_dir.path().to_path_buf()),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     let sandbox = OsEnvSandbox::new(config);
     sandbox.start().await.unwrap();
@@ -134,6 +136,8 @@ async fn dev_configuration_smoke_test() {
             timeout: None,
         },
         work_dir: Some(tmp.path().to_path_buf()),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     let sandbox = OsEnvSandbox::new(config);
     sandbox.start().await.unwrap();
