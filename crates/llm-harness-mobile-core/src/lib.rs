@@ -32,6 +32,8 @@ pub struct MobileConfig {
     pub model: String,
     /// LLM base URL override; empty uses the provider default.
     pub llm_base_url: String,
+    /// LLM provider protocol: `anthropic` (default) or `openai`.
+    pub provider: String,
 }
 
 /// One mobile session: a remote sandbox plus an agent loop driving it.
@@ -49,6 +51,7 @@ pub struct MobileSession {
 impl MobileSession {
     /// Internal construction path; exposed via the free `connect` function.
     pub(crate) async fn new(config: MobileConfig) -> anyhow::Result<Arc<Self>> {
+        ensure_runtime();
         let client_config = RemoteSandboxClientConfig::new(
             config.gateway_url.clone(),
             config.gateway_token.clone(),
@@ -60,12 +63,22 @@ impl MobileSession {
                 .await
                 .context("connect to gateway sandbox")?,
         );
-        let llm_client: Arc<dyn llm_adapter::Provider> = {
-            let mut builder = llm_adapter::anthropic::AnthropicProvider::builder(config.api_key);
-            if !config.llm_base_url.is_empty() {
-                builder = builder.base_url(config.llm_base_url.clone());
+        let llm_client: Arc<dyn llm_adapter::Provider> = match config.provider.as_str() {
+            "openai" => {
+                let mut builder = llm_adapter::openai::OpenAIProvider::builder(config.api_key);
+                if !config.llm_base_url.is_empty() {
+                    builder = builder.base_url(config.llm_base_url.clone());
+                }
+                Arc::new(builder.build())
             }
-            Arc::new(builder.build())
+            _ => {
+                let mut builder =
+                    llm_adapter::anthropic::AnthropicProvider::builder(config.api_key);
+                if !config.llm_base_url.is_empty() {
+                    builder = builder.base_url(config.llm_base_url.clone());
+                }
+                Arc::new(builder.build())
+            }
         };
 
         let env = llm_harness_platform::sandbox::Sandbox::env(&*sandbox);
@@ -144,8 +157,9 @@ impl MobileSession {
     /// Takes the session by value (an `Arc`) so the spawned prompt task can
     /// route failures into this session's event queue.
     pub fn send(self: Arc<Self>, text: String) {
-        let harness = Arc::clone(&self.harness);
-        tokio::spawn(async move {
+        let runtime = ensure_runtime().clone();
+        runtime.spawn(async move {
+            let harness = Arc::clone(&self.harness);
             if let Err(error) = harness.prompt(text).await {
                 self.push(MobileEvent::Failed {
                     message: error.to_string(),
@@ -154,12 +168,16 @@ impl MobileSession {
         });
     }
 
-    /// Shut down the sandbox and release remote resources.
     pub async fn shutdown(&self) -> Result<(), MobileError> {
-        Ok(llm_harness_platform::sandbox::Sandbox::shutdown(Box::new(
-            <RemoteSandbox as Clone>::clone(&self.sandbox),
-        ))
-        .await?)
+        let sandbox = <RemoteSandbox as Clone>::clone(&self.sandbox);
+        Ok(ensure_runtime()
+            .spawn(async move {
+                llm_harness_platform::sandbox::Sandbox::shutdown(Box::new(sandbox)).await
+            })
+            .await
+            .map_err(|e| MobileError::Internal {
+                detail: e.to_string(),
+            })??)
     }
 
     /// Poll one buffered UI event, oldest first. `None` when idle.
@@ -224,8 +242,23 @@ impl From<anyhow::Error> for MobileError {
         }
     }
 }
-
 #[uniffi::export]
 pub async fn connect(config: MobileConfig) -> Result<Arc<MobileSession>, MobileError> {
-    Ok(MobileSession::new(config).await?)
+    let session = ensure_runtime().block_on(MobileSession::new(config))?;
+    Ok(session)
+}
+
+/// Install a global multi-thread tokio runtime exactly once.
+///
+/// uniffi drives its async entry points on the foreign side, so the Rust
+/// futures need a live runtime context for `tokio::spawn` and IO resources.
+/// The handle leaks deliberately: the runtime must live for the whole process.
+fn ensure_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime")
+    })
 }

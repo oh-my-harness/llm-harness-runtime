@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- MVP smoke defaults; not for production. -->
+    <string name="default_api_key" translatable="false">SK_REDACTED</string>
+    <string name="default_llm_base_url" translatable="false">http://10.0.2.2:8889/</string>
+</resources>
