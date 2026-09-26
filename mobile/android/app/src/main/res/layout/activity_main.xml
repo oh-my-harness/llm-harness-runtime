@@ -54,7 +54,7 @@
         android:layout_height="wrap_content"
         android:hint="model id"
         android:inputType="text"
-        android:text="GLM-5.3-Flash"
+        android:text="zai-org/GLM-5.2"
         android:textSize="12sp" />
 
     <EditText
