@@ -86,6 +86,16 @@ MVP 中最大不确定性是 uniffi 工具链 + tokio 在 Android 的启动，�
 | uniffi/交叉编译工具链 | 构建期问题，先跑通再开发 |
 | UI 做不好导致弃用 | UI 详细设计单独立项，按上述硬约束执行 |
 
+## MVP 实测发现（2026-09-26 补录）
+
+MVP 端到端已在模拟器验证通过（手机 → gateway(Seatbelt) → GLM-5.2(SiliconFlow 公网) → 沙箱内 python 解析 PDF → 流式回屏）。实测暴露的后续项：
+
+1. **沙箱预装工具/文件注入 API**：沙箱内无网络（设计使然），pip 不可用；宿主预装的库按 python 路径而定（CLT python3 自带 PyMuPDF，但 `/usr/bin/python3` shim 曾被 denylist 拦截，已修复）。文件注入目前只能宿主侧手工 cp 进 `sandboxes/<id>/`。**需要**：gateway 增加"预置文件上传"协议端点（如 `POST /v1/sandboxes/{id}/fs/upload`，二进制走现有 Base64 语义），或预构建带常用工具的沙箱镜像。
+2. ** Seatbelt denylist 与开发工具链的边界**：`/Library/Developer/CommandLineTools` 已加 read-only allow（0f45924）。后续如需 swift/homebrew 等工具链，逐项评估放行，勿放宽 `/Library` 整体。
+3. **agent 对受限环境的韧性**：实测中 GLM-5.2 在网络/文件系统受限时能降级实现（纯 Python 解析 CID 字体 PDF）且不编造结果——策略层的硬约束 + agent 自适应是有效的组合，保持"deny 优先"设计。
+4. **LAN 明文 HTTP 端到端**：代码就绪（`new_insecure` + UI 开关 + `GATEWAY_BIND`），因测试机 UniVPN 全局路由劫持未完成端到端验证；需无 VPN 环境或分流规则排除 `192.168.0.0/16` 后复测。
+5. **真机验证项**（未做）：熄屏长任务、WiFi↔5G 切换、国产 ROM 后台策略。
+
 ## 后续流程
 
 1. 本 spec 评审通过后，进 writing-plans 出一期实施计划（core 骨架 → gateway 链路 → 最小 UI → 前台服务 → 语音 → 真机验证）。
