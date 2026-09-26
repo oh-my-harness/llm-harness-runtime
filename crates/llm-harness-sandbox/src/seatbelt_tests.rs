@@ -124,6 +124,7 @@ fn make_env(tmp: &tempfile::TempDir) -> SeatbeltEnv {
     SeatbeltEnv::new(
         work_dir_canon.clone(),
         work_dir_canon,
+        None,
         vec![],
         config,
         false,
@@ -141,6 +142,7 @@ fn make_env_with_policy(tmp: &tempfile::TempDir) -> SeatbeltEnv {
     SeatbeltEnv::new(
         work_dir_canon.clone(),
         work_dir_canon,
+        None,
         vec![],
         config,
         false,

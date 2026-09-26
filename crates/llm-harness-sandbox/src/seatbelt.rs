@@ -27,6 +27,27 @@ use llm_harness_platform::sandbox::{Sandbox, SandboxConfig};
 use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
 
+/// Guest-coordinate work root used by gateway deployments.
+pub(crate) const GUEST_WORKSPACE: &str = "/workspace";
+
+/// Map a guest-coordinate policy path (`/workspace/...`) to its host path
+/// under `host_root`. Mirrors bwrap's `map_guest_policy_path`.
+pub(crate) fn map_guest_policy_path(
+    path: &Path,
+    guest_root: &Path,
+    host_root: &Path,
+) -> Result<PathBuf> {
+    let normalized = crate::lifecycle::lexical_normalize(path);
+    anyhow::ensure!(
+        normalized.starts_with(guest_root),
+        "policy path {path:?} is outside guest work directory {guest_root:?}"
+    );
+    let relative = normalized
+        .strip_prefix(guest_root)
+        .expect("guest prefix checked");
+    Ok(host_root.join(relative))
+}
+
 // ── Policy generation ─────────────────────────────────────────────────────
 
 /// Generate a seatbelt `.sb` policy string from the sandbox configuration.
@@ -187,6 +208,10 @@ impl Drop for TaintOnDrop {
 pub struct SeatbeltEnv {
     work_dir: PathBuf,
     work_dir_canon: PathBuf,
+    /// Optional guest-coordinate root (e.g. `/workspace`): paths under it are
+    /// translated to `work_dir_canon` before policy checks, mirroring
+    /// `BwrapEnv::new_mapped`. `None` keeps host-coordinate semantics.
+    guest_work_dir: Option<PathBuf>,
     allowlist_canon: Vec<PathBuf>,
     config: SandboxConfig,
     owned: bool,
@@ -200,6 +225,7 @@ impl SeatbeltEnv {
     pub(crate) fn new(
         work_dir: PathBuf,
         work_dir_canon: PathBuf,
+        guest_work_dir: Option<PathBuf>,
         allowlist_canon: Vec<PathBuf>,
         config: SandboxConfig,
         owned: bool,
@@ -208,6 +234,7 @@ impl SeatbeltEnv {
         Self {
             work_dir,
             work_dir_canon,
+            guest_work_dir,
             allowlist_canon,
             config,
             owned,
@@ -309,10 +336,35 @@ impl SeatbeltEnv {
     /// canonicalization and the actual open, but this is far narrower
     /// than unconditional symlink-following.
     fn resolve_path(&self, path: &Path) -> Result<PathBuf, EnvError> {
-        let resolved = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.work_dir_canon.join(path)
+        let resolved = match &self.guest_work_dir {
+            Some(guest_root) => {
+                // Guest coordinates: translate absolute guest paths under the
+                // guest root into the host work dir; relative paths are
+                // already work-dir-relative.
+                if path.is_absolute() {
+                    let normalized_guest = lexical_normalize(path);
+                    let guest_root_norm = lexical_normalize(guest_root);
+                    if normalized_guest == guest_root_norm {
+                        self.work_dir_canon.clone()
+                    } else if normalized_guest.starts_with(&guest_root_norm) {
+                        let relative = normalized_guest
+                            .strip_prefix(&guest_root_norm)
+                            .expect("guest prefix checked");
+                        self.work_dir_canon.join(relative)
+                    } else {
+                        return Err(EnvError::PermissionDenied(normalized_guest));
+                    }
+                } else {
+                    self.work_dir_canon.join(path)
+                }
+            }
+            None => {
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    self.work_dir_canon.join(path)
+                }
+            }
         };
         let normalized = lexical_normalize(&resolved);
 
@@ -817,21 +869,32 @@ impl SeatbeltSandbox {
         let work_dir_canon = std::fs::canonicalize(&work_dir)
             .map_err(|e| anyhow::anyhow!("failed to canonicalize work_dir: {e}"))?;
 
+        // Gateway deployments address the sandbox in guest coordinates
+        // (`/workspace` = the host work dir). Map them up front, mirroring
+        // `BwrapSandbox::new_mapped`.
+        let guest_root = PathBuf::from(GUEST_WORKSPACE);
         let allowlist_canon = config
             .fs_allowlist
             .iter()
             .map(|p| {
-                std::fs::canonicalize(p)
+                let mapped = map_guest_policy_path(p, &guest_root, &work_dir_canon)?;
+                if let Some(parent) = mapped.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        anyhow::anyhow!("fs_allowlist entry {p:?}: create parent: {e}")
+                    })?;
+                }
+                std::fs::create_dir_all(&mapped)
+                    .map_err(|e| anyhow::anyhow!("fs_allowlist entry {p:?}: create dir: {e}"))?;
+                std::fs::canonicalize(&mapped)
                     .map_err(|e| anyhow::anyhow!("fs_allowlist entry {:?}: {e}", p))
             })
             .collect::<Result<Vec<_>>>()?;
-
         let policy_path =
             std::env::temp_dir().join(format!("seatbelt-{}.sb", uuid::Uuid::new_v4()));
-
         let env = Arc::new(SeatbeltEnv::new(
             work_dir,
             work_dir_canon,
+            Some(guest_root),
             allowlist_canon,
             config.clone(),
             owned,

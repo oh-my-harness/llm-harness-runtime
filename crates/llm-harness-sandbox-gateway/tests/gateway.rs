@@ -1,5 +1,3 @@
-#![cfg(target_os = "linux")]
-
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +32,10 @@ async fn start_gateway(principals: Vec<GatewayPrincipalConfig>) -> TestGateway {
 }
 
 async fn start_gateway_with_config(config: GatewayConfig) -> TestGateway {
+    // Bwrap is Linux-only; on macOS the default backend is unavailable, so
+    // the shared behavior tests run against the Seatbelt backend instead.
+    #[cfg(target_os = "macos")]
+    let config = config.with_backend(GatewayBackend::Seatbelt);
     let work_root = private_tempdir();
     let path = work_root.path().to_path_buf();
     let mut gateway = start_gateway_at(config, path).await;
@@ -95,7 +97,11 @@ fn principal(id: &str, token: &str) -> GatewayPrincipalConfig {
 }
 
 fn private_tempdir() -> tempfile::TempDir {
-    let directory = tempfile::tempdir().expect("gateway work root");
+    // macOS tempdir parents are symlinked (/var -> /private/var); the gateway
+    // requires an already-canonical work root, so create the directory under
+    // the canonicalized system temp path.
+    let system_temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp");
+    let directory = tempfile::tempdir_in(system_temp).expect("gateway work root");
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
         .expect("gateway work root permissions");
@@ -106,6 +112,60 @@ fn private_tempdir() -> tempfile::TempDir {
 fn gateway_defaults_to_the_bwrap_backend() {
     let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)]).expect("gateway config");
     assert!(matches!(config.backend(), GatewayBackend::Bwrap));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn gateway_accepts_seatbelt_backend() {
+    let work_root = private_tempdir();
+    let gateway = SandboxGateway::new(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_work_root(work_root.path().to_path_buf())
+            .with_backend(GatewayBackend::Seatbelt),
+    );
+    assert!(gateway.is_ok(), "seatbelt gateway must construct on macOS");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn seatbelt_gateway_enforces_allowlists_and_rejects_denylists() {
+    let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+
+    // denylist: Seatbelt fails closed at construction time
+    let mut denied = sandbox_config();
+    denied.fs_denylist = vec![std::path::PathBuf::from("/workspace/denied")];
+    let error = client
+        .create_sandbox(denied)
+        .await
+        .expect_err("seatbelt must reject denylist policies");
+    assert!(
+        error.to_string().contains("fs_denylist is not supported"),
+        "unexpected denylist error: {error}"
+    );
+
+    // allowlist: guest-coordinate entries map into the sandbox work dir
+    let mut allowed = sandbox_config();
+    allowed.fs_allowlist = vec![std::path::PathBuf::from("/workspace/allowed")];
+    let sandbox = RemoteSandbox::connect(allowed, Arc::clone(&client))
+        .await
+        .expect("create sandbox with allowlist");
+    let env = sandbox.env();
+    let outside = std::path::PathBuf::from("/workspace/outside.txt");
+    let error = env
+        .write_file(&outside, b"forbidden\n", CancellationToken::new())
+        .await
+        .expect_err("allowlist must restrict guest paths");
+    assert!(matches!(error, EnvError::PermissionDenied(_)));
+    let inside = std::path::PathBuf::from("/workspace/allowed/file.txt");
+    env.write_file(&inside, b"allowed\n", CancellationToken::new())
+        .await
+        .expect("write allowed path");
+    Box::new(sandbox)
+        .shutdown()
+        .await
+        .expect("shutdown sandbox");
 }
 
 #[test]
@@ -187,6 +247,7 @@ fn gateway_rejects_vsock_cid_capacity_overflow() {
     assert!(error.to_string().contains("vsock CID capacity"));
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn firecracker_backend_does_not_fall_back_to_bwrap() {
     let root = private_tempdir();
@@ -520,6 +581,7 @@ fn gateway_registry_requires_unique_vsock_cids() {
     assert!(error.to_string().contains("UNIQUE"));
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn firecracker_backend_rejects_unsupported_sandbox_policies() {
     let artifacts = firecracker_artifact_root();
@@ -602,6 +664,7 @@ async fn firecracker_backend_rejects_unsupported_sandbox_policies() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn firecracker_gateway_start_reset_and_shutdown() {
     let artifacts = firecracker_artifact_root();
@@ -642,6 +705,7 @@ async fn firecracker_gateway_start_reset_and_shutdown() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn firecracker_gateway_supports_shell_and_files() {
     let artifacts = firecracker_artifact_root();
@@ -827,6 +891,9 @@ fn work_root_contains_file(work_root: &Path, file_name: &str) -> bool {
         })
 }
 
+// fs_denylist enforcement is a Bwrap capability; Seatbelt fails closed on
+// denylist policies by design (see llm-harness-sandbox seatbelt.rs).
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn gateway_enforces_guest_denylists() {
     let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
@@ -1250,6 +1317,7 @@ fn gateway_fails_closed_on_invalid_persisted_registry_entries() {
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
 async fn firecracker_gateway_restores_restarted_sandboxes_as_creating() {
     let artifacts = firecracker_artifact_root();
     let work_root = private_tempdir();
@@ -1300,6 +1368,7 @@ async fn firecracker_gateway_restores_restarted_sandboxes_as_creating() {
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
 async fn firecracker_gateway_starts_a_recovered_sandbox_only_after_guest_readiness() {
     let artifacts = firecracker_artifact_root();
     write_fake_firecracker(artifacts.path().join("firecracker").as_path(), 6000);
@@ -1367,6 +1436,7 @@ async fn firecracker_gateway_starts_a_recovered_sandbox_only_after_guest_readine
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
 async fn firecracker_gateway_keeps_a_recovered_sandbox_creating_after_start_failure() {
     let artifacts = firecracker_artifact_root();
     let work_root = private_tempdir();

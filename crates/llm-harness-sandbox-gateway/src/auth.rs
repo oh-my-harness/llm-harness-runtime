@@ -33,6 +33,9 @@ pub struct FirecrackerBackendConfig {
 #[derive(Clone)]
 pub enum GatewayBackend {
     Bwrap,
+    /// macOS `sandbox-exec` backend (Seatbelt). Only available on macOS.
+    #[cfg(target_os = "macos")]
+    Seatbelt,
     Firecracker(FirecrackerBackendConfig),
 }
 
@@ -204,11 +207,14 @@ impl GatewayConfig {
         if self.max_output_bytes == 0 {
             anyhow::bail!("max_output_bytes must be positive");
         }
-        if self.max_request_bytes == 0 {
-            anyhow::bail!("max_request_bytes must be positive");
-        }
         match &self.backend {
             GatewayBackend::Bwrap => {}
+            #[cfg(target_os = "macos")]
+            GatewayBackend::Seatbelt => {
+                if !self.work_root.is_some() {
+                    anyhow::bail!("seatbelt backend requires an explicit work root");
+                }
+            }
             GatewayBackend::Firecracker(config) => {
                 validate_firecracker_backend(config, self.max_sandboxes)?
             }
@@ -343,6 +349,8 @@ impl std::fmt::Debug for GatewayConfig {
                 "backend",
                 &match self.backend {
                     GatewayBackend::Bwrap => "bwrap",
+                    #[cfg(target_os = "macos")]
+                    GatewayBackend::Seatbelt => "macos-seatbelt",
                     GatewayBackend::Firecracker(_) => "firecracker",
                 },
             )
