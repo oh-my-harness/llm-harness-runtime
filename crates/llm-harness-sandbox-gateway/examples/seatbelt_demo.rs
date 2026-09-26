@@ -24,7 +24,9 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(7080);
 
-    let work_root = std::env::temp_dir().join("llm-harness-mobile-mvp-gateway");
+    let work_root = std::env::var("GATEWAY_WORK_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("llm-harness-mobile-mvp-gateway"));
     std::fs::create_dir_all(&work_root)?;
     let work_root = std::fs::canonicalize(&work_root)?;
     {
@@ -32,13 +34,23 @@ async fn main() -> anyhow::Result<()> {
         std::fs::set_permissions(&work_root, std::fs::Permissions::from_mode(0o700))?;
     }
 
-    let config = GatewayConfig::new(vec![GatewayPrincipalConfig {
-        principal: "phone".to_owned(),
-        bearer_token: token.clone(),
-        fs_allowlist: Vec::new(),
-        host_project_dirs: Vec::new(),
-        max_trust_profile: llm_harness_platform::trust::TrustProfile::TrustedFull,
-    }])?
+    let config = GatewayConfig::new(vec![
+        GatewayPrincipalConfig {
+            principal: "phone".to_owned(),
+            bearer_token: token.clone(),
+            fs_allowlist: Vec::new(),
+            host_project_dirs: Vec::new(),
+            max_trust_profile: llm_harness_platform::trust::TrustProfile::TrustedFull,
+        },
+        GatewayPrincipalConfig {
+            principal: "kiosk".to_owned(),
+            bearer_token: std::env::var("GATEWAY_KIOSK_TOKEN")
+                .unwrap_or_else(|_| "kiosk-readonly-token-0123456789abcdef".to_owned()),
+            fs_allowlist: Vec::new(),
+            host_project_dirs: Vec::new(),
+            max_trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
+        },
+    ])?
     .with_work_root(work_root)
     .with_backend(GatewayBackend::Seatbelt);
 

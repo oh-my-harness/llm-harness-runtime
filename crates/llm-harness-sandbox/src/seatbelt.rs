@@ -96,19 +96,28 @@ pub(crate) fn generate_policy(
     }
     s.push('\n');
 
-    // Deny reads to sensitive host paths. Both the symlink path (/etc)
-    // and the real path (/private/etc) are denied to prevent bypass.
-    s.push_str(";; Deny reads to sensitive host paths\n");
+    // Deny reads to sensitive host paths. IMPORTANT: /Library must NOT be
+    // blanket-denied — toolchain binaries (CLT python3/swift shims) resolve
+    // through it and seatbelt's deny beats subtree allows during exec-path
+    // resolution. Deny sensitive SUBDIRECTORIES instead. /etc and /var are
+    // denied via their real (/private/...) and symlink paths.
+    s.push_str(";; Deny reads to sensitive host paths (fine-grained)\n");
     for path in [
         "/etc",
-        "/var",
+        "/private/etc",
+        "/var/db",
+        "/private/var/db",
+        "/var/root",
+        "/private/var/root",
         "/root",
         "/Users",
-        "/Library",
+        "/Library/Keychains",
+        "/Library/Preferences",
+        "/Library/Application Support",
+        "/Library/Mail",
+        "/Library/Messages",
+        "/Library/Cookies",
         "/System",
-        "/private/etc",
-        "/private/var",
-        "/private/root",
         "/opt",
         "/srv",
         "/home",
@@ -137,10 +146,9 @@ pub(crate) fn generate_policy(
 
     // CommandLineTools toolchain (python3/swift/... real binaries live under
     // /usr/bin shims that forward here). Read-only: running and reading the
-    // toolchain is safe; it is not user data. Overrides the /Library deny
-    // above via last-match-wins.
+    // toolchain is safe; it is not user data. /Library itself is NOT
+    // blanket-denied (see above) so no override is needed.
     s.push_str(r#"(allow file-read* (subpath "/Library/Developer/CommandLineTools"))"#);
-    s.push('\n');
     s.push('\n');
 
     // Work_dir: read-write (overrides the /private/tmp deny via last-match-wins).
@@ -218,7 +226,15 @@ pub(crate) fn credential_read_deny_paths(home: &str, work_dir: &Path) -> Vec<Pat
         PathBuf::from(format!("{home}/.gnupg")),
         PathBuf::from(format!("{home}/.aws")),
         PathBuf::from(format!("{home}/.kube")),
+        // Work-dir-relative credential stores too: the agent controls its
+        // work_dir contents, so a task could drop keys there (its own or
+        // injected) — reading them back out is still an exfil channel.
         work_dir.join(".env"),
+        work_dir.join(".ssh"),
+        work_dir.join(".gnupg"),
+        work_dir.join(".aws"),
+        work_dir.join(".kube"),
+        work_dir.join(".netrc"),
     ];
     paths.sort();
     paths.dedup();

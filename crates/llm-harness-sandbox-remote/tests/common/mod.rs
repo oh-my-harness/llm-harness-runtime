@@ -52,6 +52,7 @@ pub fn test_sandbox_config() -> SandboxConfig {
         },
         work_dir: Some(PathBuf::from("/workspace")),
         trust_profile: Default::default(),
+        host_binds: Vec::new(),
     }
 }
 
