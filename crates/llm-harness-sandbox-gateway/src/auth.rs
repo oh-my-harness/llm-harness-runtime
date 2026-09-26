@@ -87,7 +87,6 @@ struct PrincipalSecret {
 }
 
 /// An authenticated principal attached to a request by the auth middleware.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone)]
 pub(crate) struct AuthenticatedPrincipal {
     pub(crate) id: Arc<str>,
