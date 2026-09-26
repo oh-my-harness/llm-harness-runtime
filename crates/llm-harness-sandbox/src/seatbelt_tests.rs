@@ -28,6 +28,7 @@ fn default_config(work_dir: PathBuf) -> SandboxConfig {
         },
         work_dir: Some(work_dir),
         trust_profile: Default::default(),
+        host_binds: Vec::new(),
     }
 }
 
@@ -45,6 +46,7 @@ fn owned_config() -> SandboxConfig {
         },
         work_dir: None,
         trust_profile: Default::default(),
+        host_binds: Vec::new(),
     }
 }
 

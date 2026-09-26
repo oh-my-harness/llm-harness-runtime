@@ -221,6 +221,7 @@ fn sandbox_config(
         },
         work_dir: None,
         trust_profile,
+        host_binds: Vec::new(),
     }
 }
 

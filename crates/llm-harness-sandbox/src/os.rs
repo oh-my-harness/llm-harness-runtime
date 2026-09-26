@@ -914,6 +914,7 @@ mod sandbox_tests {
             },
             work_dir: None,
             trust_profile: Default::default(),
+            host_binds: Vec::new(),
         };
         let sandbox = OsEnvSandbox::new(config);
         sandbox.start().await.unwrap();
@@ -941,6 +942,7 @@ mod sandbox_tests {
             },
             work_dir: Some(tmp.path().to_path_buf()),
             trust_profile: Default::default(),
+            host_binds: Vec::new(),
         };
         let sandbox = OsEnvSandbox::new(config);
         sandbox.start().await.unwrap();

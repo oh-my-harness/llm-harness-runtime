@@ -582,6 +582,13 @@ impl GatewayState {
         principal: &AuthenticatedPrincipal,
         request: RemoteSandboxConfig,
     ) -> Result<String, GatewayStateError> {
+        if request.trust_profile > principal.max_trust_profile {
+            return Err(GatewayStateError::InvalidConfig(anyhow::anyhow!(
+                "trust profile {:?} exceeds principal cap {:?}",
+                request.trust_profile,
+                principal.max_trust_profile
+            )));
+        }
         #[cfg(target_os = "linux")]
         if let crate::auth::GatewayBackend::Firecracker(backend) = self.config.backend() {
             return self
@@ -709,6 +716,24 @@ impl GatewayState {
         // same host directory.
         let mut sandbox_config = sandbox_config;
         sandbox_config.work_dir = Some(work_dir.clone());
+        // Trusted profiles bind the principal's host project directories at
+        // guest /workspace/<basename>. Ignored by restricted (floors hold).
+        for dir in principal.host_project_dirs.iter() {
+            let base = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    GatewayStateError::InvalidConfig(anyhow::anyhow!(
+                        "host project dir {dir:?} has no file name"
+                    ))
+                })?;
+            sandbox_config
+                .host_binds
+                .push(llm_harness_platform::sandbox::HostBind {
+                    host: dir.clone(),
+                    guest: std::path::PathBuf::from(GUEST_WORK_DIR).join(base),
+                });
+        }
         let sandbox = match llm_harness_sandbox::SeatbeltSandbox::new(sandbox_config) {
             Ok(sandbox) => GatewaySandbox::Seatbelt(sandbox),
             Err(error) => {
@@ -1113,6 +1138,7 @@ fn build_sandbox_config(request: &RemoteSandboxConfig) -> anyhow::Result<Sandbox
         resource_limits,
         work_dir: None,
         trust_profile: request.trust_profile,
+        host_binds: Vec::new(),
     })
 }
 
