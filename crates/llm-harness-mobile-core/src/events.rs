@@ -7,7 +7,7 @@ use llm_harness_types::AgentEvent;
 
 /// Events the mobile UI renders. `#[non_exhaustive]` upstream events that
 /// carry nothing displayable are dropped by [`map_event`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, uniffi::Enum)]
 pub enum MobileEvent {
     /// Assistant text delta (streaming reply).
     TextDelta { text: String },
@@ -29,6 +29,7 @@ pub fn map_event(event: &Arc<AgentHarnessEvent>) -> Option<MobileEvent> {
     map_agent_event(agent_event)
 }
 
+/// Map a raw loop event; also used directly by unit tests.
 pub fn map_agent_event(event: &AgentEvent) -> Option<MobileEvent> {
     match event {
         AgentEvent::TextDelta { text, .. } => Some(MobileEvent::TextDelta { text: text.clone() }),
