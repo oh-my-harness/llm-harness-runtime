@@ -14,6 +14,8 @@ use futures::future::BoxFuture;
 use llm_harness_platform::sandbox::{NetRule, ResourceLimits, Sandbox, SandboxConfig};
 #[cfg(target_os = "linux")]
 use llm_harness_sandbox::BwrapSandbox;
+#[cfg(target_os = "macos")]
+use llm_harness_sandbox::SeatbeltSandbox;
 use llm_harness_sandbox_remote::RemoteSandboxConfig;
 use llm_harness_sandbox_remote::protocol::RemoteSandboxState;
 use llm_harness_types::ExecutionEnv;
@@ -87,14 +89,58 @@ pub(crate) enum GatewaySandbox {
     Firecracker(Box<FirecrackerSandbox>),
 }
 
-/// Non-Linux placeholder: no sandbox backend is wired yet (Seatbelt lands in
-/// a follow-up task). Construction paths are `cfg`-gated to Linux, so this
-/// variant is unreachable at runtime; `Sandbox` methods fail closed.
-#[cfg(not(target_os = "linux"))]
+/// macOS backend: macOS `sandbox-exec` isolation via `SeatbeltSandbox`.
+#[cfg(target_os = "macos")]
+pub(crate) enum GatewaySandbox {
+    Seatbelt(SeatbeltSandbox),
+}
+
+#[cfg(target_os = "macos")]
+impl Sandbox for GatewaySandbox {
+    fn start(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        match self {
+            GatewaySandbox::Seatbelt(sandbox) => sandbox.start(),
+        }
+    }
+
+    fn env(&self) -> Arc<dyn ExecutionEnv> {
+        match self {
+            GatewaySandbox::Seatbelt(sandbox) => sandbox.env(),
+        }
+    }
+
+    fn reset(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        match self {
+            GatewaySandbox::Seatbelt(sandbox) => sandbox.reset(),
+        }
+    }
+
+    fn shutdown(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
+        match *self {
+            GatewaySandbox::Seatbelt(sandbox) => Sandbox::shutdown(Box::new(sandbox)),
+        }
+    }
+
+    fn config(&self) -> &SandboxConfig {
+        match self {
+            GatewaySandbox::Seatbelt(sandbox) => sandbox.config(),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        match self {
+            GatewaySandbox::Seatbelt(sandbox) => sandbox.is_running(),
+        }
+    }
+}
+
+/// Other non-Linux platforms: no sandbox backend is wired; construction
+/// paths fail closed before reaching this type.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[derive(Debug)]
 pub(crate) enum GatewaySandbox {}
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl Sandbox for GatewaySandbox {
     fn start(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         unreachable!("no sandbox backend is available on this platform")
@@ -511,6 +557,8 @@ impl GatewayState {
     pub(crate) fn backend_label(&self) -> &'static str {
         match self.config.backend() {
             crate::auth::GatewayBackend::Bwrap => "linux-bwrap",
+            #[cfg(target_os = "macos")]
+            crate::auth::GatewayBackend::Seatbelt => "macos-seatbelt",
             crate::auth::GatewayBackend::Firecracker(_) => "linux-firecracker",
         }
     }
@@ -527,10 +575,21 @@ impl GatewayState {
                 .await;
         }
         #[cfg(target_os = "linux")]
-        {
-            self.create_bwrap_sandbox(principal, request)
+        if let crate::auth::GatewayBackend::Bwrap = self.config.backend() {
+            return self.create_bwrap_sandbox(principal, request);
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        if let crate::auth::GatewayBackend::Seatbelt = self.config.backend() {
+            return self.create_seatbelt_sandbox(principal, request);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let _ = (principal, request);
+            Err(GatewayStateError::InvalidConfig(anyhow::anyhow!(
+                "no sandbox backend is available on this platform"
+            )))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = (principal, request);
             Err(GatewayStateError::InvalidConfig(anyhow::anyhow!(
@@ -575,6 +634,76 @@ impl GatewayState {
                     return Err(GatewayStateError::InvalidConfig(error));
                 }
             };
+        let config_json = serde_json::to_string(&request)
+            .map_err(|error| GatewayStateError::Storage(error.into()))?;
+        let now_ms = unix_now_ms().map_err(GatewayStateError::Storage)?;
+        insert_registry_record(
+            &self.registry,
+            &sandbox_id,
+            &principal.id,
+            &config_json,
+            None,
+            now_ms,
+        )
+        .map_err(|error| {
+            let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
+            if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %cleanup_error,
+                    "failed to remove work root after registry failure"
+                );
+            }
+            GatewayStateError::Storage(error)
+        })?;
+        let env = sandbox.env();
+        let record = SandboxRecord {
+            owner: Arc::clone(&principal.id),
+            sandbox: Arc::new(sandbox),
+            env,
+            work_dir: PathBuf::from(GUEST_WORK_DIR),
+            config: request,
+            state: RemoteSandboxState::Creating,
+        };
+
+        sandboxes.insert(sandbox_id.clone(), record);
+        Ok(sandbox_id)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn create_seatbelt_sandbox(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: RemoteSandboxConfig,
+    ) -> Result<String, GatewayStateError> {
+        let mut sandboxes = self.lock_sandboxes();
+        if sandboxes.len() >= self.config.max_sandboxes {
+            return Err(GatewayStateError::Capacity);
+        }
+        let request = normalize_request_config(principal, request)
+            .map_err(GatewayStateError::InvalidConfig)?;
+        let mut sandbox_config =
+            build_sandbox_config(&request).map_err(GatewayStateError::InvalidConfig)?;
+        let sandbox_id = uuid::Uuid::new_v4().to_string();
+        let work_dir = self.work_root.join("sandboxes").join(&sandbox_id);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&work_dir)
+            .map_err(|error| GatewayStateError::InvalidConfig(error.into()))?;
+        let sandbox = match llm_harness_sandbox::SeatbeltSandbox::new(sandbox_config) {
+            Ok(sandbox) => GatewaySandbox::Seatbelt(sandbox),
+            Err(error) => {
+                let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
+                if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %cleanup_error,
+                        "failed to remove work root after sandbox construction failure"
+                    );
+                }
+                return Err(GatewayStateError::InvalidConfig(error));
+            }
+        };
         let config_json = serde_json::to_string(&request)
             .map_err(|error| GatewayStateError::Storage(error.into()))?;
         let now_ms = unix_now_ms().map_err(GatewayStateError::Storage)?;
