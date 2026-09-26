@@ -124,6 +124,13 @@ pub(crate) fn generate_policy(
 
     // Allow /private/var/select (locale/sh setup, harmless system dir).
     s.push_str(r#"(allow file-read* (subpath "/private/var/select"))"#);
+
+    // CommandLineTools toolchain (python3/swift/... real binaries live under
+    // /usr/bin shims that forward here). Read-only: running and reading the
+    // toolchain is safe; it is not user data. Overrides the /Library deny
+    // above via last-match-wins.
+    s.push_str(r#"(allow file-read* (subpath "/Library/Developer/CommandLineTools"))"#);
+    s.push('\n');
     s.push('\n');
 
     // Work_dir: read-write (overrides the /private/tmp deny via last-match-wins).
