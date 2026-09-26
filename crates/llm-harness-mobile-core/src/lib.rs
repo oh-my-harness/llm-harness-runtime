@@ -34,6 +34,8 @@ pub struct MobileConfig {
     pub llm_base_url: String,
     /// LLM provider protocol: `anthropic` (default) or `openai`.
     pub provider: String,
+    /// Permit plain HTTP to non-loopback gateways (trusted LAN only).
+    pub allow_insecure_http: bool,
 }
 
 /// One mobile session: a remote sandbox plus an agent loop driving it.
@@ -49,13 +51,19 @@ pub struct MobileSession {
 }
 
 impl MobileSession {
-    /// Internal construction path; exposed via the free `connect` function.
     pub(crate) async fn new(config: MobileConfig) -> anyhow::Result<Arc<Self>> {
         ensure_runtime();
-        let client_config = RemoteSandboxClientConfig::new(
-            config.gateway_url.clone(),
-            config.gateway_token.clone(),
-        )
+        let client_config = if config.allow_insecure_http {
+            RemoteSandboxClientConfig::new_insecure(
+                config.gateway_url.clone(),
+                config.gateway_token.clone(),
+            )
+        } else {
+            RemoteSandboxClientConfig::new(
+                config.gateway_url.clone(),
+                config.gateway_token.clone(),
+            )
+        }
         .context("invalid gateway client config")?;
         let client = Arc::new(RemoteSandboxClient::new(client_config)?);
         let sandbox = Arc::new(
@@ -157,7 +165,7 @@ impl MobileSession {
     /// Takes the session by value (an `Arc`) so the spawned prompt task can
     /// route failures into this session's event queue.
     pub fn send(self: Arc<Self>, text: String) {
-        let runtime = ensure_runtime().clone();
+        let runtime = ensure_runtime();
         runtime.spawn(async move {
             let harness = Arc::clone(&self.harness);
             if let Err(error) = harness.prompt(text).await {
