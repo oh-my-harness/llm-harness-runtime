@@ -6,16 +6,22 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use llm_harness_platform::sandbox::{NetRule, ResourceLimits, Sandbox, SandboxConfig};
+#[cfg(target_os = "linux")]
 use llm_harness_sandbox::BwrapSandbox;
 use llm_harness_sandbox_remote::RemoteSandboxConfig;
 use llm_harness_sandbox_remote::protocol::RemoteSandboxState;
-use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
+use llm_harness_types::ExecutionEnv;
+#[cfg(target_os = "linux")]
+use llm_harness_types::{EnvError, FileInfo, ShellOptions, ShellOutput};
+#[cfg(target_os = "linux")]
 use llm_harness_vm_agent_env::GuestAgentEnv;
+#[cfg(target_os = "linux")]
 use llm_harness_vm_firecracker::{FirecrackerLifecycle, FirecrackerLifecycleConfig};
 use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +32,7 @@ pub(crate) const GUEST_WORK_DIR: &str = "/workspace";
 
 pub(crate) type SharedState = Arc<GatewayState>;
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct GatewayState {
     config: crate::auth::GatewayConfig,
     work_root: PathBuf,
@@ -40,6 +47,7 @@ pub(crate) struct GatewayState {
 pub(crate) enum GatewayStateError {
     InvalidConfig(anyhow::Error),
     Storage(anyhow::Error),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Capacity,
     Busy,
     NotFound,
@@ -73,72 +81,65 @@ pub(crate) struct SandboxRecord {
     pub(crate) state: RemoteSandboxState,
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) enum GatewaySandbox {
     Bwrap(BwrapSandbox),
     Firecracker(Box<FirecrackerSandbox>),
 }
 
+/// Non-Linux placeholder: no sandbox backend is wired yet (Seatbelt lands in
+/// a follow-up task). Construction paths are `cfg`-gated to Linux, so this
+/// variant is unreachable at runtime; `Sandbox` methods fail closed.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub(crate) enum GatewaySandbox {}
+
+#[cfg(not(target_os = "linux"))]
 impl Sandbox for GatewaySandbox {
     fn start(&self) -> BoxFuture<'_, anyhow::Result<()>> {
-        match self {
-            Self::Bwrap(sandbox) => sandbox.start(),
-            Self::Firecracker(sandbox) => Box::pin(sandbox.start()),
-        }
+        unreachable!("no sandbox backend is available on this platform")
     }
 
     fn env(&self) -> Arc<dyn ExecutionEnv> {
-        match self {
-            Self::Bwrap(sandbox) => sandbox.env(),
-            Self::Firecracker(sandbox) => sandbox.env(),
-        }
+        unreachable!("no sandbox backend is available on this platform")
     }
 
     fn reset(&self) -> BoxFuture<'_, anyhow::Result<()>> {
-        match self {
-            Self::Bwrap(sandbox) => sandbox.reset(),
-            Self::Firecracker(sandbox) => Box::pin(sandbox.reset()),
-        }
+        unreachable!("no sandbox backend is available on this platform")
     }
 
     fn shutdown(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
-        match *self {
-            Self::Bwrap(sandbox) => Box::new(sandbox).shutdown(),
-            Self::Firecracker(sandbox) => Box::pin(sandbox.shutdown_owned()),
-        }
+        unreachable!("no sandbox backend is available on this platform")
     }
 
     fn config(&self) -> &SandboxConfig {
-        match self {
-            Self::Bwrap(sandbox) => sandbox.config(),
-            Self::Firecracker(sandbox) => sandbox.config(),
-        }
+        unreachable!("no sandbox backend is available on this platform")
     }
 
     fn is_running(&self) -> bool {
-        match self {
-            Self::Bwrap(sandbox) => sandbox.is_running(),
-            Self::Firecracker(sandbox) => sandbox.is_running(),
-        }
+        false
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) struct FirecrackerSandboxConfig {
     backend: crate::auth::FirecrackerBackendConfig,
     run_directory: PathBuf,
     vsock_guest_cid: u32,
 }
 
+#[cfg(target_os = "linux")]
 struct PendingGuestAgentEnv {
     env: Arc<std::sync::RwLock<Option<Arc<dyn ExecutionEnv>>>>,
 }
 
+#[cfg(target_os = "linux")]
 impl PendingGuestAgentEnv {
     fn new() -> Self {
         Self {
             env: Arc::new(std::sync::RwLock::new(None)),
         }
     }
-
     fn set(&self, env: Arc<dyn ExecutionEnv>) {
         *self
             .env
@@ -162,6 +163,7 @@ impl PendingGuestAgentEnv {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl ExecutionEnv for PendingGuestAgentEnv {
     fn working_dir(&self) -> &Path {
         Path::new(GUEST_WORK_DIR)
@@ -270,6 +272,7 @@ impl ExecutionEnv for PendingGuestAgentEnv {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) struct FirecrackerSandbox {
     config: SandboxConfig,
     firecracker_config: Option<FirecrackerSandboxConfig>,
@@ -278,6 +281,7 @@ pub(crate) struct FirecrackerSandbox {
     running: AtomicBool,
 }
 
+#[cfg(target_os = "linux")]
 impl FirecrackerSandbox {
     fn new(config: SandboxConfig, firecracker_config: FirecrackerSandboxConfig) -> Self {
         Self {
@@ -477,12 +481,15 @@ impl GatewayState {
         for record in persisted {
             let sandbox_id = record.sandbox_id.clone();
             let record = restore_sandbox(&config, record)?;
+            #[cfg(target_os = "linux")]
             let registry_state =
                 if matches!(record.sandbox.as_ref(), GatewaySandbox::Firecracker(_)) {
                     RegistryState::Creating
                 } else {
                     RegistryState::Running
                 };
+            #[cfg(not(target_os = "linux"))]
+            let registry_state = RegistryState::Running;
             set_registry_state(&registry, &sandbox_id, registry_state)?;
             sandboxes.insert(sandbox_id, record);
         }
@@ -513,14 +520,26 @@ impl GatewayState {
         principal: &AuthenticatedPrincipal,
         request: RemoteSandboxConfig,
     ) -> Result<String, GatewayStateError> {
+        #[cfg(target_os = "linux")]
         if let crate::auth::GatewayBackend::Firecracker(backend) = self.config.backend() {
             return self
                 .create_firecracker_sandbox(principal, request, backend)
                 .await;
         }
-        self.create_bwrap_sandbox(principal, request)
+        #[cfg(target_os = "linux")]
+        {
+            self.create_bwrap_sandbox(principal, request)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (principal, request);
+            Err(GatewayStateError::InvalidConfig(anyhow::anyhow!(
+                "no sandbox backend is available on this platform"
+            )))
+        }
     }
 
+    #[cfg(target_os = "linux")]
     fn create_bwrap_sandbox(
         &self,
         principal: &AuthenticatedPrincipal,
@@ -592,6 +611,7 @@ impl GatewayState {
         Ok(sandbox_id)
     }
 
+    #[cfg(target_os = "linux")]
     async fn create_firecracker_sandbox(
         &self,
         principal: &AuthenticatedPrincipal,
@@ -884,6 +904,7 @@ impl GatewayState {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn normalize_request_config(
     principal: &AuthenticatedPrincipal,
     mut request: RemoteSandboxConfig,
@@ -918,6 +939,7 @@ fn normalize_request_config(
     Ok(request)
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn build_sandbox_config(request: &RemoteSandboxConfig) -> anyhow::Result<SandboxConfig> {
     let resource_limits = ResourceLimits {
         max_cpus: request.resource_limits.max_cpus,
@@ -945,6 +967,7 @@ fn build_sandbox_config(request: &RemoteSandboxConfig) -> anyhow::Result<Sandbox
     })
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn validate_fs_paths(paths: &[String], field: &str) -> anyhow::Result<()> {
     for path in paths {
         if path != GUEST_WORK_DIR
@@ -961,6 +984,7 @@ fn validate_fs_paths(paths: &[String], field: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn validate_firecracker_policies(
     request: &RemoteSandboxConfig,
     backend: &crate::auth::FirecrackerBackendConfig,
@@ -1006,6 +1030,7 @@ fn validate_firecracker_policies(
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables, unused_mut))]
 fn restore_sandbox(
     config: &crate::auth::GatewayConfig,
     persisted: PersistedSandbox,
@@ -1020,10 +1045,8 @@ fn restore_sandbox(
         vsock_guest_cid,
         state: _,
     } = persisted;
+    #[cfg(target_os = "linux")]
     match (&config.backend(), vsock_guest_cid) {
-        (crate::auth::GatewayBackend::Bwrap, Some(_)) => {
-            anyhow::bail!("persisted sandbox {sandbox_id:?} has a vsock CID on the Bwrap backend")
-        }
         (crate::auth::GatewayBackend::Firecracker(backend), Some(cid)) => {
             if cid < backend.vsock_guest_cid_base {
                 anyhow::bail!(
@@ -1057,26 +1080,34 @@ fn restore_sandbox(
         }
         _ => {}
     }
-    let persisted_config = normalize_request_config(&principal, request)?;
-    let sandbox_config = build_sandbox_config(&persisted_config)?;
-    let work_dir = config
-        .work_root()
-        .join("sandboxes")
-        .join(&persisted.sandbox_id);
-    let sandbox = GatewaySandbox::Bwrap(BwrapSandbox::new_mapped(
-        sandbox_config,
-        work_dir,
-        PathBuf::from(GUEST_WORK_DIR),
-    )?);
-    let env = sandbox.env();
-    Ok(SandboxRecord {
-        owner: Arc::clone(&principal.id),
-        sandbox: Arc::new(sandbox),
-        env: Arc::clone(&env),
-        work_dir: PathBuf::from(GUEST_WORK_DIR),
-        config: persisted_config,
-        state: RemoteSandboxState::Running,
-    })
+    #[cfg(target_os = "linux")]
+    {
+        let persisted_config = normalize_request_config(&principal, request)?;
+        let sandbox_config = build_sandbox_config(&persisted_config)?;
+        let work_dir = config
+            .work_root()
+            .join("sandboxes")
+            .join(&persisted.sandbox_id);
+        let sandbox = GatewaySandbox::Bwrap(BwrapSandbox::new_mapped(
+            sandbox_config,
+            work_dir,
+            PathBuf::from(GUEST_WORK_DIR),
+        )?);
+        let env = sandbox.env();
+        Ok(SandboxRecord {
+            owner: Arc::clone(&principal.id),
+            sandbox: Arc::new(sandbox),
+            env: Arc::clone(&env),
+            work_dir: PathBuf::from(GUEST_WORK_DIR),
+            config: persisted_config,
+            state: RemoteSandboxState::Running,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (config, vsock_guest_cid);
+        anyhow::bail!("no sandbox backend is available on this platform")
+    }
 }
 
 fn create_private_directory(path: &std::path::Path) -> anyhow::Result<()> {
@@ -1251,6 +1282,7 @@ fn unix_now_ms() -> anyhow::Result<i64> {
     i64::try_from(millis).map_err(|_| anyhow::anyhow!("system time is too large"))
 }
 
+#[cfg(target_os = "linux")]
 fn allocate_vsock_guest_cid(
     registry: &std::sync::Mutex<Connection>,
     cid_base: u32,
@@ -1276,6 +1308,7 @@ fn allocate_vsock_guest_cid(
     anyhow::bail!("no vsock CID is available")
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn insert_registry_record(
     registry: &std::sync::Mutex<Connection>,
     sandbox_id: &str,

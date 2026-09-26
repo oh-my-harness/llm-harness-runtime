@@ -57,6 +57,7 @@ struct PrincipalSecret {
 }
 
 /// An authenticated principal attached to a request by the auth middleware.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone)]
 pub(crate) struct AuthenticatedPrincipal {
     pub(crate) id: Arc<str>,
@@ -236,6 +237,7 @@ impl GatewayConfig {
             })
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn work_root(&self) -> &std::path::Path {
         self.work_root
             .as_deref()
