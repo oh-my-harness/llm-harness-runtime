@@ -1,3 +1,19 @@
+# MVP 优先（2026-09-25 修订）
+
+完整形态之前先做 MVP 走通全流程，验证核心问题：**Rust runtime 能否在 Android 上运行，并通过现有 gateway 协议完成一次"LLM 对话 + 工具在远端沙箱执行"。**
+
+MVP 范围：
+
+1. gateway 接入 Seatbelt 后端（macOS，复用现有 `SeatbeltSandbox`，接口 `GatewayBackend`/`GatewaySandbox` 已留好）——使整条链可在 Mac 本机验证，不依赖 Linux 服务器。
+2. `llm-harness-mobile-core`：aarch64-linux-android 交叉编译 + uniffi 绑定，最小接口 `send()/events()`。无持久化、无恢复。
+3. Android 壳：单 Activity，消息列表 + 输入框，事件流直刷。亮屏测试，无前台服务。
+4. 端到端冒烟：手机发"在沙箱里执行 `ls -la`"，屏幕显示沙箱真实输出。
+
+MVP 砍掉：语音、前台服务、SQLite 持久化、通知、UI 打磨、公网穿透（gateway 跑 Mac loopback）。
+MVP 中最大不确定性是 uniffi 工具链 + tokio 在 Android 的启动，实施计划排最前先排雷。
+
+---
+
 # Mobile Agent Client — 大方向设计
 
 日期：2026-09-25
