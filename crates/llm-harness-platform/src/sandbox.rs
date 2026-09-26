@@ -17,7 +17,7 @@ pub struct NetRule {
 }
 
 /// Resource limits for sandbox execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResourceLimits {
     /// Maximum CPU count. `None` means no limit.
     pub max_cpus: Option<usize>,
@@ -33,7 +33,7 @@ pub struct ResourceLimits {
 }
 
 /// Sandbox permission boundary declaration (v0.2 minimal set).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SandboxConfig {
     /// File system path allowlist (read/write).
     pub fs_allowlist: Vec<PathBuf>,
