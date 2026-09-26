@@ -69,10 +69,11 @@ pub(crate) fn map_guest_policy_path(
 /// is responsible for canonicalizing `work_dir` and `allowlist` paths
 /// before passing them.
 pub(crate) fn generate_policy(
-    _config: &SandboxConfig,
+    config: &SandboxConfig,
     work_dir_canon: &Path,
     allowlist_canon: &[PathBuf],
 ) -> String {
+    use llm_harness_platform::trust::TrustProfile;
     let work_dir_str = work_dir_canon.to_string_lossy();
     let mut s = String::with_capacity(1024);
 
@@ -81,9 +82,18 @@ pub(crate) fn generate_policy(
     s.push_str("(allow default)\n");
     s.push('\n');
 
-    // Deny network entirely.
-    s.push_str(";; Deny network\n");
-    s.push_str("(deny network*)\n");
+    let trusted = matches!(
+        config.trust_profile,
+        TrustProfile::TrustedLan | TrustProfile::TrustedFull
+    );
+
+    // restricted: deny network entirely. trusted: allow (incl. DNS).
+    s.push_str(";; Network\n");
+    if trusted {
+        s.push_str("(allow network*)\n");
+    } else {
+        s.push_str("(deny network*)\n");
+    }
     s.push('\n');
 
     // Deny reads to sensitive host paths. Both the symlink path (/etc)
@@ -154,7 +164,55 @@ pub(crate) fn generate_policy(
         }
     }
 
+    // Trusted profiles grant broad host read/write; the credential and
+    // system floors come LAST so last-match-wins keeps them denied no
+    // matter what was allowed above.
+    if trusted {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            s.push_str(&format!(r#"(allow file-read* (subpath "{home}"))"#));
+            s.push('\n');
+            if config.trust_profile == TrustProfile::TrustedFull {
+                s.push_str(&format!(r#"(allow file-write* (subpath "{home}"))"#));
+                s.push('\n');
+            }
+            for deny in credential_read_deny_paths(&home, work_dir_canon) {
+                s.push_str(&format!(
+                    r#"(deny file-read* (subpath "{}"))"#,
+                    deny.to_string_lossy()
+                ));
+                s.push('\n');
+            }
+            s.push_str(&format!(
+                r#"(deny file-read* (literal "{work_dir_str}/.env"))"#
+            ));
+            s.push('\n');
+        }
+    }
+
     s
+}
+
+/// Paths that hold credentials or trust anchors. Read-denied on every
+/// trusted profile, after any broad allows (last-match-wins).
+pub(crate) fn credential_read_deny_paths(home: &str, work_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![
+        PathBuf::from(format!("{home}/.ssh")),
+        PathBuf::from(format!("{home}/Library/Keychains")),
+        PathBuf::from(format!(
+            "{home}/Library/Application Support/Google/Chrome/Default/Cookies"
+        )),
+        PathBuf::from(format!(
+            "{home}/Library/Application Support/Google/Chrome/Default/Login Data"
+        )),
+        PathBuf::from(format!("{home}/.gnupg")),
+        PathBuf::from(format!("{home}/.aws")),
+        PathBuf::from(format!("{home}/.kube")),
+        work_dir.join(".env"),
+    ];
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 // LifecycleState, SHUTDOWN_KILL_GRACE, and lexical_normalize are shared
