@@ -36,6 +36,8 @@ async fn main() -> anyhow::Result<()> {
         principal: "phone".to_owned(),
         bearer_token: token.clone(),
         fs_allowlist: Vec::new(),
+        host_project_dirs: Vec::new(),
+        max_trust_profile: llm_harness_platform::trust::TrustProfile::TrustedFull,
     }])?
     .with_work_root(work_root)
     .with_backend(GatewayBackend::Seatbelt);

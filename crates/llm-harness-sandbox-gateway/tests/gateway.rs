@@ -93,6 +93,8 @@ fn principal(id: &str, token: &str) -> GatewayPrincipalConfig {
         principal: id.to_owned(),
         bearer_token: token.to_owned(),
         fs_allowlist: Vec::new(),
+        host_project_dirs: Vec::new(),
+        max_trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
     }
 }
 
@@ -166,6 +168,86 @@ async fn seatbelt_gateway_enforces_allowlists_and_rejects_denylists() {
         .shutdown()
         .await
         .expect("shutdown sandbox");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn trusted_lan_binds_host_project_dir_and_caps_by_principal() {
+    let project = private_tempdir();
+    std::fs::write(project.path().join("marker.txt"), b"from-host").expect("write marker");
+    let project_name = project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let mut trusted = principal("tenant-a", TOKEN_A);
+    trusted.host_project_dirs = vec![project.path().to_path_buf()];
+    trusted.max_trust_profile = llm_harness_platform::trust::TrustProfile::TrustedLan;
+    let mut kiosk = principal("kiosk", TOKEN_B);
+    kiosk.max_trust_profile = llm_harness_platform::trust::TrustProfile::Restricted;
+    let gateway = start_gateway(vec![trusted, kiosk]).await;
+    let client_a = remote_client(&gateway.base_url, TOKEN_A);
+    let client_b = remote_client(&gateway.base_url, TOKEN_B);
+
+    // 1. trusted-lan create succeeds; the project dir is visible at
+    //    /workspace/<basename> and read-write in both directions.
+    let mut request = sandbox_config();
+    request.trust_profile = llm_harness_platform::trust::TrustProfile::TrustedLan;
+    let sandbox = RemoteSandbox::connect(request.clone(), Arc::clone(&client_a))
+        .await
+        .expect("trusted-lan create");
+    let env = sandbox.env();
+    let marker = std::path::PathBuf::from(format!("/workspace/{project_name}/marker.txt"));
+    let text = env
+        .read_text_file(&marker, CancellationToken::new())
+        .await
+        .expect("read bound host file");
+    assert_eq!(text, "from-host");
+    env.write_file(
+        &std::path::PathBuf::from(format!("/workspace/{project_name}/from-guest.txt")),
+        b"from-guest",
+        CancellationToken::new(),
+    )
+    .await
+    .expect("write into bound dir");
+    assert_eq!(
+        std::fs::read(project.path().join("from-guest.txt")).expect("host sees guest write"),
+        b"from-guest"
+    );
+    Box::new(sandbox).shutdown().await.expect("shutdown");
+
+    // 2. principal capped at restricted cannot request trusted-lan.
+    let error = client_b
+        .create_sandbox(request.clone())
+        .await
+        .expect_err("over-cap profile must be rejected");
+    assert!(
+        error.to_string().contains("exceeds principal cap"),
+        "unexpected cap error: {error}"
+    );
+
+    // 3. a principal WITHOUT host_project_dirs: trusted-lan create still
+    //    succeeds but nothing is bound (empty binds are a no-op).
+    let mut empty = principal("tenant-c", TOKEN_A);
+    empty.max_trust_profile = llm_harness_platform::trust::TrustProfile::TrustedFull;
+    let _ = empty; // covered implicitly by tenant-a in other tests
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn trusted_lan_without_project_dirs_is_valid() {
+    let mut p = principal("tenant-a", TOKEN_A);
+    p.max_trust_profile = llm_harness_platform::trust::TrustProfile::TrustedFull;
+    let gateway = start_gateway(vec![p]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+    let mut request = sandbox_config();
+    request.trust_profile = llm_harness_platform::trust::TrustProfile::TrustedLan;
+    let sandbox = RemoteSandbox::connect(request, Arc::clone(&client))
+        .await
+        .expect("trusted-lan without binds is valid");
+    Box::new(sandbox).shutdown().await.expect("shutdown");
 }
 
 #[test]
@@ -459,6 +541,7 @@ fn sandbox_config() -> SandboxConfig {
         },
         work_dir: None,
         trust_profile: Default::default(),
+        host_binds: Vec::new(),
     }
 }
 
@@ -479,7 +562,6 @@ fn persisted_sandbox_config_json() -> String {
     })
     .expect("serialize persisted sandbox config")
 }
-
 #[test]
 fn gateway_migrates_registry_schema_v1_to_v2() {
     let work_root = private_tempdir();
