@@ -81,8 +81,9 @@ impl MobileSession {
         ];
         opts.system_prompt = Some(
             "You are a helpful agent working in the user's remote sandbox \
-             (a Linux workspace mounted at /workspace). Use the provided \
-             tools to inspect files and run commands. Be concise."
+             (an isolated workspace). Use the provided tools to inspect files \
+             and run commands; paths are relative to the sandbox work \
+             directory. Be concise."
                 .to_owned(),
         );
 
