@@ -7,6 +7,7 @@ import android.widget.EditText
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.sun.jna.Native
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -33,6 +34,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // JNA needs the temp extraction dir writable; the .so is packaged per-abi.
+        Native.setProtected(true)
         setContentView(R.layout.activity_main)
 
         transcriptView = findViewById(R.id.transcript)
@@ -60,13 +63,6 @@ class MainActivity : AppCompatActivity() {
             apiKey = findViewById<EditText>(R.id.apiKey).text.toString().trim(),
             model = findViewById<EditText>(R.id.model).text.toString().trim(),
             llmBaseUrl = findViewById<EditText>(R.id.llmBaseUrl).text.toString().trim(),
-            provider = "openai",
-            allowInsecureHttp = findViewById<android.widget.CheckBox>(R.id.insecureHttp).isChecked,
-            trustProfile = when (findViewById<android.widget.RadioGroup>(R.id.trustProfile).checkedRadioButtonId) {
-                R.id.profileTrustedLan -> "trusted-lan"
-                R.id.profileTrustedFull -> "trusted-full"
-                else -> "restricted"
-            },
         )
         appendSystem("connecting to ${config.gatewayUrl} …")
         CoroutineScope(Dispatchers.IO).launch {
@@ -74,7 +70,7 @@ class MainActivity : AppCompatActivity() {
                 val s = connect(config)
                 session = s
                 runOnUiThread {
-                    appendSystem("connected (trust profile: ${config.trustProfile}). send a message.")
+                    appendSystem("connected. send a message.")
                     findViewById<View>(R.id.connectBtn).isEnabled = false
                 }
                 startPolling(s)

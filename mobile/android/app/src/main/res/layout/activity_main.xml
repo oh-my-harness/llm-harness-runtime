@@ -27,7 +27,6 @@
         android:layout_height="wrap_content"
         android:hint="gateway url (http://10.0.2.2:7080)"
         android:inputType="textUri"
-        android:text="http://127.0.0.1:7080"
         android:textSize="12sp" />
 
     <EditText
@@ -36,7 +35,6 @@
         android:layout_height="wrap_content"
         android:hint="gateway bearer token"
         android:inputType="text"
-        android:text="mvp-smoke-token-0123456789abcdef"
         android:textSize="12sp" />
 
     <EditText
@@ -45,7 +43,6 @@
         android:layout_height="wrap_content"
         android:hint="LLM api key"
         android:inputType="textPassword"
-        android:text="@string/default_api_key"
         android:textSize="12sp" />
 
     <EditText
@@ -54,7 +51,7 @@
         android:layout_height="wrap_content"
         android:hint="model id"
         android:inputType="text"
-        android:text="zai-org/GLM-5.2"
+        android:text="claude-sonnet-4-6"
         android:textSize="12sp" />
 
     <EditText
@@ -63,45 +60,7 @@
         android:layout_height="wrap_content"
         android:hint="LLM base url (optional)"
         android:inputType="textUri"
-        android:text="@string/default_llm_base_url"
         android:textSize="12sp" />
-
-    <CheckBox
-        android:id="@+id/insecureHttp"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:checked="true"
-        android:text="Allow plain HTTP on LAN (trusted network)"
-        android:textSize="12sp" />
-
-    <RadioGroup
-        android:id="@+id/trustProfile"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal">
-
-        <RadioButton
-            android:id="@+id/profileRestricted"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:checked="true"
-            android:text="restricted"
-            android:textSize="12sp" />
-
-        <RadioButton
-            android:id="@+id/profileTrustedLan"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="trusted-lan"
-            android:textSize="12sp" />
-
-        <RadioButton
-            android:id="@+id/profileTrustedFull"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="trusted-full"
-            android:textSize="12sp" />
-    </RadioGroup>
 
     <LinearLayout
         android:layout_width="match_parent"
