@@ -36,6 +36,9 @@ pub struct MobileConfig {
     pub provider: String,
     /// Permit plain HTTP to non-loopback gateways (trusted LAN only).
     pub allow_insecure_http: bool,
+    /// Trust profile requested for the sandbox: `restricted` | `trusted-lan`
+    /// | `trusted-full`. Invalid values fail at connect.
+    pub trust_profile: String,
 }
 
 /// One mobile session: a remote sandbox plus an agent loop driving it.
@@ -59,17 +62,17 @@ impl MobileSession {
                 config.gateway_token.clone(),
             )
         } else {
-            RemoteSandboxClientConfig::new(
-                config.gateway_url.clone(),
-                config.gateway_token.clone(),
-            )
+            RemoteSandboxClientConfig::new(config.gateway_url.clone(), config.gateway_token.clone())
         }
         .context("invalid gateway client config")?;
         let client = Arc::new(RemoteSandboxClient::new(client_config)?);
         let sandbox = Arc::new(
-            RemoteSandbox::connect(sandbox_config(), client)
-                .await
-                .context("connect to gateway sandbox")?,
+            RemoteSandbox::connect(
+                sandbox_config(parse_trust_profile(&config.trust_profile)?),
+                client,
+            )
+            .await
+            .context("connect to gateway sandbox")?,
         );
         let llm_client: Arc<dyn llm_adapter::Provider> = match config.provider.as_str() {
             "openai" => {
@@ -201,8 +204,10 @@ impl MobileSession {
 }
 
 /// MVP sandbox policy: workspace-only file access, no network allowlist, no
-/// resource limits.
-fn sandbox_config() -> llm_harness_platform::sandbox::SandboxConfig {
+/// resource limits. Trust profile comes from `MobileConfig` at connect time.
+fn sandbox_config(
+    trust_profile: llm_harness_platform::trust::TrustProfile,
+) -> llm_harness_platform::sandbox::SandboxConfig {
     llm_harness_platform::sandbox::SandboxConfig {
         fs_allowlist: Vec::new(),
         fs_denylist: Vec::new(),
@@ -215,6 +220,21 @@ fn sandbox_config() -> llm_harness_platform::sandbox::SandboxConfig {
             timeout: None,
         },
         work_dir: None,
+        trust_profile,
+    }
+}
+
+/// Parse the FFI trust-profile string into the wire enum.
+pub(crate) fn parse_trust_profile(
+    value: &str,
+) -> anyhow::Result<llm_harness_platform::trust::TrustProfile> {
+    match value.trim() {
+        "" | "restricted" => Ok(llm_harness_platform::trust::TrustProfile::Restricted),
+        "trusted-lan" => Ok(llm_harness_platform::trust::TrustProfile::TrustedLan),
+        "trusted-full" => Ok(llm_harness_platform::trust::TrustProfile::TrustedFull),
+        other => Err(anyhow::anyhow!(
+            "invalid trust profile {other:?}: expected restricted, trusted-lan or trusted-full"
+        )),
     }
 }
 

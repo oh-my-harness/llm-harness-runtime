@@ -458,6 +458,7 @@ fn sandbox_config() -> SandboxConfig {
             timeout: None,
         },
         work_dir: None,
+        trust_profile: Default::default(),
     }
 }
 
@@ -474,6 +475,7 @@ fn persisted_sandbox_config_json() -> String {
             timeout_ms: None,
         },
         work_dir: None,
+        trust_profile: Default::default(),
     })
     .expect("serialize persisted sandbox config")
 }

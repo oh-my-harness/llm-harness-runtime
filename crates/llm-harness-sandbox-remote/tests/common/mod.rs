@@ -51,6 +51,7 @@ pub fn test_sandbox_config() -> SandboxConfig {
             timeout: Some(Duration::from_secs(5)),
         },
         work_dir: Some(PathBuf::from("/workspace")),
+        trust_profile: Default::default(),
     }
 }
 
@@ -203,6 +204,7 @@ async fn create_sandbox(
         work_dir,
         backend: "test-local-process".to_owned(),
         state: RemoteSandboxState::Running,
+        trust_profile: request.config.trust_profile,
     };
     state.0.sandboxes.lock().unwrap().insert(
         sandbox_id,

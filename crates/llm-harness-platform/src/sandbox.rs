@@ -48,6 +48,9 @@ pub struct SandboxConfig {
     /// After `start()` succeeds, `env().working_dir()` MUST return this path
     /// (if set), otherwise the sandbox backend's default working directory.
     pub work_dir: Option<PathBuf>,
+    /// Trust level granted to this sandbox. Backends parameterize their
+    /// isolation policy by it; `restricted` is the conservative default.
+    pub trust_profile: crate::trust::TrustProfile,
 }
 
 /// Sandbox abstraction — wraps `ExecutionEnv`, adding lifecycle management.

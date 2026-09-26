@@ -642,6 +642,7 @@ mod tests {
                 timeout: None,
             },
             work_dir: Some(PathBuf::from("/workspace")),
+            trust_profile: Default::default(),
         }
     }
 
@@ -651,6 +652,7 @@ mod tests {
             work_dir: work_dir.to_owned(),
             backend: "test".to_owned(),
             state: crate::protocol::RemoteSandboxState::Running,
+            trust_profile: Default::default(),
         }
     }
 
