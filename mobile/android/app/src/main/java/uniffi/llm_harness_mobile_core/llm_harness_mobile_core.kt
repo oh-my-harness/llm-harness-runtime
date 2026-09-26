@@ -948,7 +948,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_send() != 49766.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_shutdown() != 40673.toShort()) {
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_shutdown() != 37921.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1311,9 +1311,6 @@ public interface MobileSessionInterface {
      */
     fun `send`(`text`: kotlin.String)
     
-    /**
-     * Shut down the sandbox and release remote resources.
-     */
     suspend fun `shutdown`()
     
     companion object
@@ -1440,9 +1437,6 @@ open class MobileSession: Disposable, AutoCloseable, MobileSessionInterface
     
 
     
-    /**
-     * Shut down the sandbox and release remote resources.
-     */
     @Throws(MobileException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
     override suspend fun `shutdown`() {
@@ -1525,7 +1519,11 @@ data class MobileConfig (
     /**
      * LLM base URL override; empty uses the provider default.
      */
-    var `llmBaseUrl`: kotlin.String
+    var `llmBaseUrl`: kotlin.String, 
+    /**
+     * LLM provider protocol: `anthropic` (default) or `openai`.
+     */
+    var `provider`: kotlin.String
 ) {
     
     companion object
@@ -1542,6 +1540,7 @@ public object FfiConverterTypeMobileConfig: FfiConverterRustBuffer<MobileConfig>
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
         )
     }
 
@@ -1550,7 +1549,8 @@ public object FfiConverterTypeMobileConfig: FfiConverterRustBuffer<MobileConfig>
             FfiConverterString.allocationSize(value.`gatewayToken`) +
             FfiConverterString.allocationSize(value.`apiKey`) +
             FfiConverterString.allocationSize(value.`model`) +
-            FfiConverterString.allocationSize(value.`llmBaseUrl`)
+            FfiConverterString.allocationSize(value.`llmBaseUrl`) +
+            FfiConverterString.allocationSize(value.`provider`)
     )
 
     override fun write(value: MobileConfig, buf: ByteBuffer) {
@@ -1559,6 +1559,7 @@ public object FfiConverterTypeMobileConfig: FfiConverterRustBuffer<MobileConfig>
             FfiConverterString.write(value.`apiKey`, buf)
             FfiConverterString.write(value.`model`, buf)
             FfiConverterString.write(value.`llmBaseUrl`, buf)
+            FfiConverterString.write(value.`provider`, buf)
     }
 }
 
