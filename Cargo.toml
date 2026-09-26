@@ -18,6 +18,7 @@ members = [
     "crates/llm-harness-vm-firecracker",
     "crates/llm-harness-mcp",
     "crates/llm-harness-tools",
+    "crates/llm-harness-mobile-core",
     "crates/llm-harness-strategy",
     "crates/llm-harness-knowledge",
     "crates/llm-harness-knowledge-local",
