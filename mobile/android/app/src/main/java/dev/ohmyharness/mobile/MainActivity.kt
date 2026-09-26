@@ -62,6 +62,11 @@ class MainActivity : AppCompatActivity() {
             llmBaseUrl = findViewById<EditText>(R.id.llmBaseUrl).text.toString().trim(),
             provider = "openai",
             allowInsecureHttp = findViewById<android.widget.CheckBox>(R.id.insecureHttp).isChecked,
+            trustProfile = when (findViewById<android.widget.RadioGroup>(R.id.trustProfile).checkedRadioButtonId) {
+                R.id.profileTrustedLan -> "trusted-lan"
+                R.id.profileTrustedFull -> "trusted-full"
+                else -> "restricted"
+            },
         )
         appendSystem("connecting to ${config.gatewayUrl} …")
         CoroutineScope(Dispatchers.IO).launch {
@@ -69,7 +74,7 @@ class MainActivity : AppCompatActivity() {
                 val s = connect(config)
                 session = s
                 runOnUiThread {
-                    appendSystem("connected. send a message.")
+                    appendSystem("connected (trust profile: ${config.trustProfile}). send a message.")
                     findViewById<View>(R.id.connectBtn).isEnabled = false
                 }
                 startPolling(s)

@@ -16,6 +16,10 @@ use llm_harness_tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteT
 mod events;
 
 pub use events::{MobileEvent, map_agent_event, map_event};
+/// Public wrapper for integration tests; FFI surface uses it via connect.
+pub fn parse_trust_profile_pub(value: &str) -> anyhow::Result<llm_harness_platform::trust::TrustProfile> {
+    parse_trust_profile(value)
+}
 
 uniffi::setup_scaffolding!();
 

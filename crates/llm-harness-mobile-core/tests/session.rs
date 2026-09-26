@@ -80,3 +80,25 @@ fn tool_finished_summary_is_first_line_truncated() {
         other => panic!("unexpected event: {other:?}"),
     }
 }
+
+#[test]
+fn parses_trust_profile_strings() {
+    use llm_harness_platform::trust::TrustProfile;
+    assert_eq!(
+        llm_harness_mobile_core::parse_trust_profile_pub("restricted").unwrap(),
+        TrustProfile::Restricted
+    );
+    assert_eq!(
+        llm_harness_mobile_core::parse_trust_profile_pub("").unwrap(),
+        TrustProfile::Restricted
+    );
+    assert_eq!(
+        llm_harness_mobile_core::parse_trust_profile_pub("trusted-lan").unwrap(),
+        TrustProfile::TrustedLan
+    );
+    assert_eq!(
+        llm_harness_mobile_core::parse_trust_profile_pub("trusted-full").unwrap(),
+        TrustProfile::TrustedFull
+    );
+    assert!(llm_harness_mobile_core::parse_trust_profile_pub("root").is_err());
+}

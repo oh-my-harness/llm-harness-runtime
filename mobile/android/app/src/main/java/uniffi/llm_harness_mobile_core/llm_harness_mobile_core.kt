@@ -1550,7 +1550,12 @@ data class MobileConfig (
     /**
      * Permit plain HTTP to non-loopback gateways (trusted LAN only).
      */
-    var `allowInsecureHttp`: kotlin.Boolean
+    var `allowInsecureHttp`: kotlin.Boolean, 
+    /**
+     * Trust profile requested for the sandbox: `restricted` | `trusted-lan`
+     * | `trusted-full`. Invalid values fail at connect.
+     */
+    var `trustProfile`: kotlin.String
 ) {
     
     companion object
@@ -1569,6 +1574,7 @@ public object FfiConverterTypeMobileConfig: FfiConverterRustBuffer<MobileConfig>
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterString.read(buf),
         )
     }
 
@@ -1579,7 +1585,8 @@ public object FfiConverterTypeMobileConfig: FfiConverterRustBuffer<MobileConfig>
             FfiConverterString.allocationSize(value.`model`) +
             FfiConverterString.allocationSize(value.`llmBaseUrl`) +
             FfiConverterString.allocationSize(value.`provider`) +
-            FfiConverterBoolean.allocationSize(value.`allowInsecureHttp`)
+            FfiConverterBoolean.allocationSize(value.`allowInsecureHttp`) +
+            FfiConverterString.allocationSize(value.`trustProfile`)
     )
 
     override fun write(value: MobileConfig, buf: ByteBuffer) {
@@ -1590,6 +1597,7 @@ public object FfiConverterTypeMobileConfig: FfiConverterRustBuffer<MobileConfig>
             FfiConverterString.write(value.`llmBaseUrl`, buf)
             FfiConverterString.write(value.`provider`, buf)
             FfiConverterBoolean.write(value.`allowInsecureHttp`, buf)
+            FfiConverterString.write(value.`trustProfile`, buf)
     }
 }
 
