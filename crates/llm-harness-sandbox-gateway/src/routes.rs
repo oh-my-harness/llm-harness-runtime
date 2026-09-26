@@ -137,6 +137,7 @@ async fn create_sandbox(
         .map(|sandbox| sandbox.work_dir.to_string_lossy().into_owned())
         .unwrap_or_default();
     tracing::info!(sandbox_id = %sandbox_id, principal = %principal.id, "sandbox created");
+    let trust_profile = state.requested_profile(&sandbox_id);
     (
         StatusCode::CREATED,
         Json(CreateSandboxResponse {
@@ -144,6 +145,7 @@ async fn create_sandbox(
             work_dir,
             backend: state.backend_label().to_owned(),
             state: RemoteSandboxState::Running,
+            trust_profile,
         }),
     )
         .into_response()

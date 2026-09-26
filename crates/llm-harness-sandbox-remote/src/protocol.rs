@@ -23,13 +23,16 @@ pub struct CreateSandboxRequest {
     pub config: RemoteSandboxConfig,
 }
 
-/// Response body for sandbox creation and status.
+/// Response body for sandbox creation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSandboxResponse {
     pub sandbox_id: String,
     pub work_dir: String,
     pub backend: String,
     pub state: RemoteSandboxState,
+    /// Trust level actually granted (echoed for audit; UIs should display it).
+    #[serde(default)]
+    pub trust_profile: llm_harness_platform::trust::TrustProfile,
 }
 
 /// Detailed sandbox status.

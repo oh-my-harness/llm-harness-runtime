@@ -563,6 +563,20 @@ impl GatewayState {
         }
     }
 
+    /// Trust profile actually granted to a sandbox (from its stored config).
+    pub(crate) fn requested_profile(
+        &self,
+        sandbox_id: &str,
+    ) -> llm_harness_platform::trust::TrustProfile {
+        match self.sandboxes.lock() {
+            Ok(sandboxes) => sandboxes
+                .get(sandbox_id)
+                .map(|record| record.config.trust_profile)
+                .unwrap_or_default(),
+            Err(_) => Default::default(),
+        }
+    }
+
     pub(crate) async fn create_sandbox(
         &self,
         principal: &AuthenticatedPrincipal,
@@ -1098,6 +1112,7 @@ fn build_sandbox_config(request: &RemoteSandboxConfig) -> anyhow::Result<Sandbox
             .collect(),
         resource_limits,
         work_dir: None,
+        trust_profile: request.trust_profile,
     })
 }
 

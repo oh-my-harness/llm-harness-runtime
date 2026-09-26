@@ -256,6 +256,10 @@ pub struct RemoteSandboxConfig {
     pub net_allowlist: Vec<NetRuleWire>,
     pub resource_limits: ResourceLimitsWire,
     pub work_dir: Option<String>,
+    /// Trust level requested for the sandbox. Defaults to `restricted` so
+    /// clients that predate the field keep working unchanged.
+    #[serde(default)]
+    pub trust_profile: llm_harness_platform::trust::TrustProfile,
 }
 
 /// Wire representation of a network allowlist rule.
@@ -299,13 +303,13 @@ impl TryFrom<SandboxConfig> for RemoteSandboxConfig {
             None => None,
         };
         let resource_limits = ResourceLimitsWire::try_from(value.resource_limits)?;
-
         Ok(Self {
             fs_allowlist,
             fs_denylist,
             net_allowlist,
             resource_limits,
             work_dir,
+            trust_profile: value.trust_profile,
         })
     }
 }
@@ -416,6 +420,39 @@ mod tests {
     }
 
     #[test]
+    fn trust_profile_defaults_to_restricted_and_roundtrips() {
+        let json = r#"{"fs_allowlist":[],"fs_denylist":[],"net_allowlist":[],"resource_limits":{"max_cpus":null,"max_processes":null,"max_memory_mb":null,"max_disk_mb":null,"timeout":null}}"#;
+        let config: RemoteSandboxConfig =
+            serde_json::from_str(json).expect("old clients without trust_profile parse");
+        assert_eq!(
+            config.trust_profile,
+            llm_harness_platform::trust::TrustProfile::Restricted
+        );
+
+        let json_lan = json.replace(
+            r#""net_allowlist":[]"#,
+            r#""net_allowlist":[],"trust_profile":"trusted_lan""#,
+        );
+        let config: RemoteSandboxConfig =
+            serde_json::from_str(&json_lan).expect("explicit trust_profile parses");
+        assert_eq!(
+            config.trust_profile,
+            llm_harness_platform::trust::TrustProfile::TrustedLan
+        );
+        assert_eq!(
+            serde_json::to_string(&config.trust_profile).unwrap(),
+            "\"trusted_lan\""
+        );
+    }
+
+    #[test]
+    fn trust_profile_orders_restricted_lt_lan_lt_full() {
+        use llm_harness_platform::trust::TrustProfile;
+        assert!(TrustProfile::Restricted < TrustProfile::TrustedLan);
+        assert!(TrustProfile::TrustedLan < TrustProfile::TrustedFull);
+    }
+
+    #[test]
     fn rejects_zero_runtime_limits() {
         let error = RemoteSandboxClientConfig::validate_runtime_options(
             Duration::ZERO,
@@ -446,6 +483,7 @@ mod tests {
                     timeout: None,
                 },
                 work_dir: Some(work_dir),
+                trust_profile: Default::default(),
             };
             let error = RemoteSandboxConfig::try_from(config)
                 .expect_err("invalid guest path should be rejected");
