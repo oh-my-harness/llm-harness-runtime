@@ -4,7 +4,7 @@
 //! The core owns no retry/persistence policy of its own — errors propagate to
 //! the caller (the UI) verbatim, per the MVP design spec.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use tokio::sync::broadcast;
@@ -17,10 +17,12 @@ mod events;
 
 pub use events::{MobileEvent, map_agent_event, map_event};
 
+uniffi::setup_scaffolding!();
+
 /// Connection configuration for a mobile session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, uniffi::Record)]
 pub struct MobileConfig {
-    /// Gateway base URL, e.g. `http://127.0.0.1:7080`.
+    /// Gateway base URL, e.g. `http://10.0.2.2:7080`.
     pub gateway_url: String,
     /// Gateway bearer token (32+ bytes).
     pub gateway_token: String,
@@ -33,15 +35,20 @@ pub struct MobileConfig {
 }
 
 /// One mobile session: a remote sandbox plus an agent loop driving it.
+///
+/// Events are drained via [`MobileSession::poll_event`]: an internal FFI-side
+/// queue buffers every mapped event; the UI polls (e.g. on a 100ms timer) and
+/// renders. This sidesteps cross-FFI callbacks for the MVP.
+#[derive(uniffi::Object)]
 pub struct MobileSession {
     harness: Arc<AgentHarness>,
     sandbox: Arc<RemoteSandbox>,
-    event_tx: broadcast::Sender<MobileEvent>,
+    queue: Mutex<Vec<MobileEvent>>,
 }
 
 impl MobileSession {
-    /// Connect to the gateway, create a sandbox, and assemble the harness.
-    pub async fn connect(config: MobileConfig) -> anyhow::Result<Arc<Self>> {
+    /// Internal construction path; exposed via the free `connect` function.
+    pub(crate) async fn new(config: MobileConfig) -> anyhow::Result<Arc<Self>> {
         let client_config = RemoteSandboxClientConfig::new(
             config.gateway_url.clone(),
             config.gateway_token.clone(),
@@ -81,30 +88,37 @@ impl MobileSession {
 
         let harness = Arc::new(AgentHarness::new_in_memory(llm_client, env, opts).await);
 
-        let (event_tx, _) = broadcast::channel(256);
         let session = Arc::new(Self {
             harness,
             sandbox,
-            event_tx,
+            queue: Mutex::new(Vec::new()),
         });
 
-        // Event pump: forward harness events to mobile subscribers.
+        // Event pump: forward harness events into the FFI-side queue.
         let mut rx = session.harness.subscribe();
-        let tx = session.event_tx.clone();
+        let session_weak = Arc::downgrade(&session);
         tokio::spawn(async move {
             loop {
                 let event = match rx.recv().await {
                     Ok(event) => event,
                     Err(broadcast::error::RecvError::Closed) => break,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        let _ = tx.send(MobileEvent::Failed {
-                            message: format!("event stream lagged by {n} events"),
-                        });
+                        if let Some(session) = session_weak.upgrade() {
+                            session.push(MobileEvent::Failed {
+                                message: format!("event stream lagged by {n} events"),
+                            });
+                        } else {
+                            break;
+                        }
                         continue;
                     }
                 };
-                if let Some(mobile) = map_event(&event) {
-                    let _ = tx.send(mobile);
+                if let Some(session) = session_weak.upgrade() {
+                    if let Some(mobile) = map_event(&event) {
+                        session.push(mobile);
+                    }
+                } else {
+                    break;
                 }
             }
         });
@@ -112,30 +126,50 @@ impl MobileSession {
         Ok(session)
     }
 
+    fn push(&self, event: MobileEvent) {
+        if let Ok(mut queue) = self.queue.lock() {
+            // Bound the buffer: drop oldest text deltas under backpressure.
+            if queue.len() > 4096 {
+                queue.remove(0);
+            }
+            queue.push(event);
+        }
+    }
+}
+
+#[uniffi::export]
+impl MobileSession {
     /// Send a user message; returns immediately, results flow as events.
-    pub fn send(self: &Arc<Self>, text: String) {
+    /// Takes the session by value (an `Arc`) so the spawned prompt task can
+    /// route failures into this session's event queue.
+    pub fn send(self: Arc<Self>, text: String) {
         let harness = Arc::clone(&self.harness);
-        let session = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(error) = harness.prompt(text).await {
-                let _ = session.event_tx.send(MobileEvent::Failed {
+                self.push(MobileEvent::Failed {
                     message: error.to_string(),
                 });
             }
         });
     }
 
-    /// Subscribe to mobile events.
-    pub fn events(&self) -> broadcast::Receiver<MobileEvent> {
-        self.event_tx.subscribe()
+    /// Shut down the sandbox and release remote resources.
+    pub async fn shutdown(&self) -> Result<(), MobileError> {
+        Ok(llm_harness_platform::sandbox::Sandbox::shutdown(Box::new(
+            <RemoteSandbox as Clone>::clone(&self.sandbox),
+        ))
+        .await?)
     }
 
-    /// Shut down the sandbox and release remote resources.
-    pub async fn shutdown(&self) -> anyhow::Result<()> {
-        llm_harness_platform::sandbox::Sandbox::shutdown(Box::new(<RemoteSandbox as Clone>::clone(
-            &self.sandbox,
-        )))
-        .await
+    /// Poll one buffered UI event, oldest first. `None` when idle.
+    #[uniffi::method(name = "pollEvent")]
+    pub fn poll_event(&self) -> Option<MobileEvent> {
+        let mut queue = self.queue.lock().ok()?;
+        if queue.is_empty() {
+            None
+        } else {
+            Some(queue.remove(0))
+        }
     }
 }
 
@@ -155,4 +189,42 @@ fn sandbox_config() -> llm_harness_platform::sandbox::SandboxConfig {
         },
         work_dir: None,
     }
+}
+
+/// FFI-facing error surface. Anything else collapses into `Internal`.
+///
+/// Variant field is `detail` (not `message`): uniffi-generated Kotlin uses
+/// the field name verbatim and `message` collides with `Throwable.message`.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum MobileError {
+    #[error("gateway rejected the configuration: {detail}")]
+    InvalidConfig { detail: String },
+    #[error("gateway connection failed: {detail}")]
+    Connect { detail: String },
+    #[error("{detail}")]
+    Internal { detail: String },
+}
+
+impl From<anyhow::Error> for MobileError {
+    fn from(error: anyhow::Error) -> Self {
+        let remote = error.downcast_ref::<llm_harness_sandbox_remote::RemoteSandboxError>();
+        match remote {
+            Some(llm_harness_sandbox_remote::RemoteSandboxError::InvalidConfig(_)) => {
+                MobileError::InvalidConfig {
+                    detail: error.to_string(),
+                }
+            }
+            Some(_) => MobileError::Connect {
+                detail: error.to_string(),
+            },
+            None => MobileError::Internal {
+                detail: error.to_string(),
+            },
+        }
+    }
+}
+
+#[uniffi::export]
+pub async fn connect(config: MobileConfig) -> Result<Arc<MobileSession>, MobileError> {
+    Ok(MobileSession::new(config).await?)
 }
