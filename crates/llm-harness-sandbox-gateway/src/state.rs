@@ -1078,6 +1078,9 @@ fn restore_sandbox(
         (crate::auth::GatewayBackend::Firecracker(_), None) => {
             anyhow::bail!("persisted sandbox {sandbox_id:?} is missing a vsock CID");
         }
+        (crate::auth::GatewayBackend::Bwrap, Some(_)) => {
+            anyhow::bail!("persisted sandbox {sandbox_id:?} has a vsock CID on the Bwrap backend");
+        }
         _ => {}
     }
     #[cfg(target_os = "linux")]
