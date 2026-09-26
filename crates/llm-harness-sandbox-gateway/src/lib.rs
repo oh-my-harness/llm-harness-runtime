@@ -1,5 +1,3 @@
-#![cfg(target_os = "linux")]
-
 //! Authenticated Linux gateway for the remote sandbox protocol.
 //!
 //! The gateway uses [`BwrapSandbox`] as its execution backend. It rejects

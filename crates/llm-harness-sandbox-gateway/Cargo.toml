@@ -9,8 +9,6 @@ llm-harness-platform.workspace = true
 llm-harness-sandbox.workspace = true
 llm-harness-sandbox-remote.workspace = true
 llm-harness-types.workspace = true
-llm-harness-vm-agent-env.workspace = true
-llm-harness-vm-firecracker.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -25,6 +23,10 @@ tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 rusqlite.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+llm-harness-vm-agent-env.workspace = true
+llm-harness-vm-firecracker.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true
