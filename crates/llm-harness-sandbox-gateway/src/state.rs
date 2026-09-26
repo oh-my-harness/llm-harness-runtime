@@ -682,7 +682,7 @@ impl GatewayState {
         }
         let request = normalize_request_config(principal, request)
             .map_err(GatewayStateError::InvalidConfig)?;
-        let mut sandbox_config =
+        let sandbox_config =
             build_sandbox_config(&request).map_err(GatewayStateError::InvalidConfig)?;
         let sandbox_id = uuid::Uuid::new_v4().to_string();
         let work_dir = self.work_root.join("sandboxes").join(&sandbox_id);
@@ -690,6 +690,11 @@ impl GatewayState {
             .mode(0o700)
             .create(&work_dir)
             .map_err(|error| GatewayStateError::InvalidConfig(error.into()))?;
+        // Pin the sandbox to the gateway-created work dir so the shell cwd
+        // and the guest-coordinate fs mapping (/workspace) resolve to the
+        // same host directory.
+        let mut sandbox_config = sandbox_config;
+        sandbox_config.work_dir = Some(work_dir.clone());
         let sandbox = match llm_harness_sandbox::SeatbeltSandbox::new(sandbox_config) {
             Ok(sandbox) => GatewaySandbox::Seatbelt(sandbox),
             Err(error) => {
@@ -1235,7 +1240,34 @@ fn restore_sandbox(
             state: RemoteSandboxState::Running,
         })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        if vsock_guest_cid.is_some() {
+            anyhow::bail!(
+                "persisted sandbox {sandbox_id:?} has a vsock CID on the Seatbelt backend"
+            );
+        }
+        let persisted_config = normalize_request_config(&principal, request)?;
+        let sandbox_config = build_sandbox_config(&persisted_config)?;
+        let work_dir = config
+            .work_root()
+            .join("sandboxes")
+            .join(&persisted.sandbox_id);
+        let mut sandbox_config = sandbox_config;
+        sandbox_config.work_dir = Some(work_dir);
+        let sandbox =
+            GatewaySandbox::Seatbelt(llm_harness_sandbox::SeatbeltSandbox::new(sandbox_config)?);
+        let env = sandbox.env();
+        Ok(SandboxRecord {
+            owner: Arc::clone(&principal.id),
+            sandbox: Arc::new(sandbox),
+            env,
+            work_dir: PathBuf::from(GUEST_WORK_DIR),
+            config: persisted_config,
+            state: RemoteSandboxState::Running,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (config, vsock_guest_cid);
         anyhow::bail!("no sandbox backend is available on this platform")
