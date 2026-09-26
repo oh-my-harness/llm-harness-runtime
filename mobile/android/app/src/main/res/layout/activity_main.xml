@@ -74,6 +74,35 @@
         android:text="Allow plain HTTP on LAN (trusted network)"
         android:textSize="12sp" />
 
+    <RadioGroup
+        android:id="@+id/trustProfile"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <RadioButton
+            android:id="@+id/profileRestricted"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="true"
+            android:text="restricted"
+            android:textSize="12sp" />
+
+        <RadioButton
+            android:id="@+id/profileTrustedLan"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="trusted-lan"
+            android:textSize="12sp" />
+
+        <RadioButton
+            android:id="@+id/profileTrustedFull"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="trusted-full"
+            android:textSize="12sp" />
+    </RadioGroup>
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
