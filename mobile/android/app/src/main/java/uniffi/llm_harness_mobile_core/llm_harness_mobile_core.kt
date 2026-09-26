@@ -1137,6 +1137,29 @@ private class JavaLangRefCleanable(
 /**
  * @suppress
  */
+public object FfiConverterBoolean: FfiConverter<Boolean, Byte> {
+    override fun lift(value: Byte): Boolean {
+        return value.toInt() != 0
+    }
+
+    override fun read(buf: ByteBuffer): Boolean {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: Boolean): Byte {
+        return if (value) 1.toByte() else 0.toByte()
+    }
+
+    override fun allocationSize(value: Boolean) = 1UL
+
+    override fun write(value: Boolean, buf: ByteBuffer) {
+        buf.put(lower(value))
+    }
+}
+
+/**
+ * @suppress
+ */
 public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
     // Note: we don't inherit from FfiConverterRustBuffer, because we use a
     // special encoding when lowering/lifting.  We can use `RustBuffer.len` to
@@ -1523,7 +1546,11 @@ data class MobileConfig (
     /**
      * LLM provider protocol: `anthropic` (default) or `openai`.
      */
-    var `provider`: kotlin.String
+    var `provider`: kotlin.String, 
+    /**
+     * Permit plain HTTP to non-loopback gateways (trusted LAN only).
+     */
+    var `allowInsecureHttp`: kotlin.Boolean
 ) {
     
     companion object
@@ -1541,6 +1568,7 @@ public object FfiConverterTypeMobileConfig: FfiConverterRustBuffer<MobileConfig>
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -1550,7 +1578,8 @@ public object FfiConverterTypeMobileConfig: FfiConverterRustBuffer<MobileConfig>
             FfiConverterString.allocationSize(value.`apiKey`) +
             FfiConverterString.allocationSize(value.`model`) +
             FfiConverterString.allocationSize(value.`llmBaseUrl`) +
-            FfiConverterString.allocationSize(value.`provider`)
+            FfiConverterString.allocationSize(value.`provider`) +
+            FfiConverterBoolean.allocationSize(value.`allowInsecureHttp`)
     )
 
     override fun write(value: MobileConfig, buf: ByteBuffer) {
@@ -1560,6 +1589,7 @@ public object FfiConverterTypeMobileConfig: FfiConverterRustBuffer<MobileConfig>
             FfiConverterString.write(value.`model`, buf)
             FfiConverterString.write(value.`llmBaseUrl`, buf)
             FfiConverterString.write(value.`provider`, buf)
+            FfiConverterBoolean.write(value.`allowInsecureHttp`, buf)
     }
 }
 

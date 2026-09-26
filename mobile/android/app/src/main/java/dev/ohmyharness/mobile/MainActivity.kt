@@ -61,6 +61,7 @@ class MainActivity : AppCompatActivity() {
             model = findViewById<EditText>(R.id.model).text.toString().trim(),
             llmBaseUrl = findViewById<EditText>(R.id.llmBaseUrl).text.toString().trim(),
             provider = "openai",
+            allowInsecureHttp = findViewById<android.widget.CheckBox>(R.id.insecureHttp).isChecked,
         )
         appendSystem("connecting to ${config.gatewayUrl} …")
         CoroutineScope(Dispatchers.IO).launch {

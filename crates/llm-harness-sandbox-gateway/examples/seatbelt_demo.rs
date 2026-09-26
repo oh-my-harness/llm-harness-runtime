@@ -41,10 +41,13 @@ async fn main() -> anyhow::Result<()> {
     .with_backend(GatewayBackend::Seatbelt);
 
     let gateway = SandboxGateway::new(config)?;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    println!("gateway listening on http://127.0.0.1:{port}");
+    let bind_addr = std::env::var("GATEWAY_BIND")
+        .unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), port)).await?;
+    println!("gateway listening on http://{bind_addr}:{port}");
+    println!("LAN devices connect via http://<this-mac-LAN-ip>:{port}");
     println!("bearer token: {token}");
-    println!("(emulator connects via http://10.0.2.2:{port})");
+    println!("(emulator: 10.0.2.2:{port} + adb reverse; phone: this Mac's LAN IP)");
 
     let server = tokio::spawn({
         let router = gateway.router();
