@@ -103,7 +103,7 @@ graph TD
 | `llm-harness-session-recall` | 跨 Session 历史召回（in-memory + SQLite FTS5） | [session-recall-integration.md](docs/session-recall-integration.md) |
 | `llm-harness-sandbox` | 沙箱后端：bwrap（Linux）、seatbelt（macOS）、os | crate 内 lib.rs |
 | `llm-harness-sandbox-remote` | 远程沙箱协议客户端：HTTPS/Bearer、文件操作、流式 shell、abort/timeout | **[remote-sandbox-backend.md](docs/design/2026-09-15-remote-sandbox-backend.md)** |
-| `llm-harness-sandbox-gateway` | Linux Bwrap 远程沙箱网关：认证、租户绑定、默认断网、生命周期与失败关闭策略 | **[remote-sandbox-backend.md](docs/design/2026-09-15-remote-sandbox-backend.md)** |
+| `llm-harness-sandbox-gateway` | Linux 远程沙箱网关：认证、租户绑定、Bwrap/Firecracker 后端选择、生命周期、重启恢复与失败关闭策略 | **[remote-sandbox-backend.md](docs/design/2026-09-15-remote-sandbox-backend.md)** |
 | `llm-harness-audit-jsonl` | JSONL 审计后端（SHA-256 hash chain） | [crate-reference.md](docs/crate-reference.md) |
 | `llm-harness-trace-otel` | OpenTelemetry 追踪导出（OTLP → Jaeger/Tempo） | [crate-reference.md](docs/crate-reference.md) |
 | `llm-harness-live-tests` | 真实 LLM 集成测试（27 examples + 97 tests） | 见下方快速上手 |
@@ -204,6 +204,7 @@ Agent 调试 Web API：REST 配置/session/usage 端点 + WebSocket 实时事件
 
 ### Sandboxing
 Linux（bubblewrap）、macOS（seatbelt）、跨平台（OS 原生 + 路径限制）。
+远程 gateway 支持 Linux Bwrap 和内置 Linux Firecracker 后端；Firecracker 生命周期和重启恢复已实现，生产部署验证仍在进行。
 
 ### Observability
 审计日志（JSONL + SHA-256 hash chain）+ OpenTelemetry 追踪（OTLP → Jaeger/Tempo）。

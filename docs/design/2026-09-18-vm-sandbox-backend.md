@@ -232,17 +232,20 @@ chroot; lifecycle composition now provides that staging. Jail lifecycle cleanup
 also plans the cgroup paths created by jailer `--cgroup` settings: cgroup v2
 uses the unified mount, cgroup v1 resolves each controller mount, and cleanup
 removes only the jailer-specific `<parent>/<id>` directory while retaining the
-shared parent. Guest-agent-coordinated shutdown confirmation, registry
-recovery, network policy, and deployment validation remain future work.
+shared parent. The gateway now owns the persisted registry and restart recovery
+for Firecracker records. Guest-agent-coordinated shutdown confirmation, network
+policy, and deployment validation remain future work.
 
 `llm-harness-vm-agent-transport` also implements the Linux Firecracker
 host-side vsock UDS adapter. It connects to the configured Unix socket, sends
 the upstream `connect <guest-port>\n` request, validates a bounded
 `OK <host-port>\n` acknowledgement, and then carries the existing framed
 guest-agent protocol on the same stream. `GuestAgentClient` exposes this
-transport through `connect_firecracker_vsock`, providing the prerequisite for
-lifecycle readiness checks and coordinated shutdown. Those lifecycle
-integrations remain future work.
+transport through `connect_firecracker_vsock`. `FirecrackerLifecycle::start`
+now uses it to wait for a successful guest-agent ping before startup returns,
+and `graceful_stop` invokes guest cleanup before signaling Firecracker.
+Coordinated shutdown still does not wait for an additional guest shutdown
+acknowledgement beyond that cleanup step.
 
 ## Current status
 
@@ -252,9 +255,15 @@ filesystem/process handlers, guest binary, host client, and initial
 Firecracker configuration/process/image/lifecycle primitives, the jailer
 command-configuration primitive, initial jailed lifecycle staging, and the
 Firecracker host-side vsock UDS transport are implemented. They are not yet
-assembled into a complete production VM backend, network policy, registry
-recovery, end-to-end gateway integration, guest-agent-coordinated shutdown
-confirmation, or deployment validation. The
-Bwrap gateway remains the only implemented remote execution backend. Issue
-#193 is closed; the VM backend and deployment work continues under #207 and its
-related production hardening issues.
+assembled into a complete production VM backend, network policy, guest shutdown
+acknowledgement, or deployment validation. The gateway does now expose the
+Firecracker backend, maps guest CPU/memory limits, persists sandbox records,
+restores restart-interrupted records into `Creating`, and completes those
+records through `POST /v1/sandboxes/{id}/start`; startup recovery also cleans a
+verified stale Firecracker PID and artifacts. It remains a gateway-integrated
+Firecracker backend, not a production-ready VM sandbox. In particular, network
+allowlists and process/disk limits fail closed, real bare-metal/KVM/Firecracker
+deployment validation is still outstanding, and immutable production auditing
+and TLS deployment remain gateway-level work. Issue #193 is closed; the VM
+backend and deployment work continues under #207 and its related production
+hardening issues.
