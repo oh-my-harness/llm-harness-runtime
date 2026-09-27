@@ -22,7 +22,8 @@ runtime process
        └─ RemoteSandboxClient (HTTPS + Bearer + SSE)
             └─ remote sandbox gateway
                  └─ llm-harness-sandbox-gateway (Linux)
-                      └─ BwrapSandbox: namespace + capability isolation
+                      ├─ BwrapSandbox: namespace + capability isolation
+                      └─ FirecrackerSandbox: VM isolation + guest agent
 ```
 
 `RemoteSandbox::connect` 创建远端 sandbox 并保存 gateway 返回的 `sandbox_id`、`work_dir` 和 backend 标识。如果 create 响应未通过协议校验，客户端会用响应中的有效 sandbox id 尽力删除远端实例，再返回协议错误。远端资源存在与 `Running` 状态分开记录：`Creating` 时 `is_running()` 为 false。`RemoteEnv` 与 sandbox handle 共享远端资源所有权，因此仅 drop handle 不会清理实例；最后一个引用 drop 时会在独立 cleanup 线程中尽力删除远端实例，`shutdown()` 成功后只删除一次。gateway 崩溃后，Bwrap 活动命令通过 `--die-with-parent` 终止；重启时基于持久化 registry 恢复 sandbox id、owner、配置和 work root，并把 Bwrap 记录标记为 `Running`，但活动 execution id 不会恢复。Firecracker 记录重启时恢复为 `Creating`，客户端随后通过 start 端点显式完成启动。`RemoteEnv` 实现 `ExecutionEnv`，所有路径均使用 guest 坐标系，不泄漏 gateway 宿主机路径。
