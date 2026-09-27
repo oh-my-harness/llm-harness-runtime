@@ -4,7 +4,7 @@
 
 `llm-harness-sandbox-remote` 为 `Sandbox` / `ExecutionEnv` 提供远程网关客户端。它把 runtime 侧的文件和 shell 操作转换为 HTTP/SSE 协议，并保留超时、取消、输出上限和错误语义。
 
-`llm-harness-sandbox-gateway` 提供第一个 Linux Bwrap 后端实现。它不是 VM 级隔离平台，而是可嵌入的 container/namespace 级 gateway，用于已经接受该隔离边界的 Linux 部署。
+`llm-harness-sandbox-gateway` 提供 Linux Bwrap 后端实现，并已接入一个 Linux Firecracker 后端。Bwrap 是可嵌入的 container/namespace 级 gateway；Firecracker 是 gateway 内的 VM 级后端，但仍未完成生产部署验证。
 
 非目标：
 
@@ -25,7 +25,7 @@ runtime process
                       └─ BwrapSandbox: namespace + capability isolation
 ```
 
-`RemoteSandbox::connect` 创建远端 sandbox 并保存 gateway 返回的 `sandbox_id`、`work_dir` 和 backend 标识。如果 create 响应未通过协议校验，客户端会用响应中的有效 sandbox id 尽力删除远端实例，再返回协议错误。远端资源存在与 `Running` 状态分开记录：`Creating` 时 `is_running()` 为 false。`RemoteEnv` 与 sandbox handle 共享远端资源所有权，因此仅 drop handle 不会清理实例；最后一个引用 drop 时会在独立 cleanup 线程中尽力删除远端实例，`shutdown()` 成功后只删除一次。gateway 崩溃后，活动 bwrap 命令通过 `--die-with-parent` 终止；重启时基于持久化 registry 恢复 sandbox id、owner、配置和 work root，并把记录标记为 `Running`，但活动 execution id 不会恢复。`RemoteEnv` 实现 `ExecutionEnv`，所有路径均使用 guest 坐标系，不泄漏 gateway 宿主机路径。
+`RemoteSandbox::connect` 创建远端 sandbox 并保存 gateway 返回的 `sandbox_id`、`work_dir` 和 backend 标识。如果 create 响应未通过协议校验，客户端会用响应中的有效 sandbox id 尽力删除远端实例，再返回协议错误。远端资源存在与 `Running` 状态分开记录：`Creating` 时 `is_running()` 为 false。`RemoteEnv` 与 sandbox handle 共享远端资源所有权，因此仅 drop handle 不会清理实例；最后一个引用 drop 时会在独立 cleanup 线程中尽力删除远端实例，`shutdown()` 成功后只删除一次。gateway 崩溃后，Bwrap 活动命令通过 `--die-with-parent` 终止；重启时基于持久化 registry 恢复 sandbox id、owner、配置和 work root，并把 Bwrap 记录标记为 `Running`，但活动 execution id 不会恢复。Firecracker 记录重启时恢复为 `Creating`，客户端随后通过 start 端点显式完成启动。`RemoteEnv` 实现 `ExecutionEnv`，所有路径均使用 guest 坐标系，不泄漏 gateway 宿主机路径。
 
 ## HTTP 协议
 
@@ -45,6 +45,7 @@ JSON 响应必须是 `application/json`（忽略参数并按大小写不敏感�
 | `POST /v1/sandboxes` | `201` + `CreateSandboxResponse` | 创建 sandbox |
 | `GET /v1/sandboxes/{id}` | `200` + `RemoteSandboxStatus` | 查询状态 |
 | `DELETE /v1/sandboxes/{id}` | `204` | 删除实例 |
+| `POST /v1/sandboxes/{id}/start` | `204` | 启动重启后处于 `Creating` 状态的 sandbox |
 | `POST /v1/sandboxes/{id}/reset` | `204` | 重置到初始状态 |
 | `POST /v1/sandboxes/{id}/cleanup` | `204` | 清理临时资源 |
 | `POST /v1/sandboxes/{id}/fs/read` | `200` + `ReadFileResponse` | 读文本或二进制文件 |
@@ -140,7 +141,7 @@ SSE 行结束符支持 `LF`、`CRLF` 和 `CR`，且 `CRLF` 允许跨网络 chunk
 
 本 crate 的 `tests/common/mod.rs` 是本地 `sh` 测试网关，只用于验证协议和客户端行为。它没有实现真实隔离、网络策略或资源限额，不能作为生产 gateway。
 
-## Linux Bwrap gateway
+## Linux gateway backends
 
 VM-level backend selection and threat model are defined separately in
 [`2026-09-18-vm-sandbox-backend.md`](2026-09-18-vm-sandbox-backend.md).
@@ -169,15 +170,16 @@ VM-level backend selection and threat model are defined separately in
 - registry 只覆盖单 gateway work root，不提供跨节点高可用或调度。
 - token 轮换通过重建配置支持，尚无动态撤销 API。
 - 审计输出目前是结构化 request/lifecycle 日志，还不是不可变审计后端。
-- Bwrap 是 namespace/container 级隔离；如果威胁模型要求 VM 级隔离，仍需 Firecracker/Kata/gVisor 后端。
+- Bwrap 是 namespace/container 级隔离；如果威胁模型要求 VM 级隔离，可使用 gateway 的 Linux Firecracker 后端，但该后端仍未完成生产部署验证。
 
 ## 当前状态
 
 - 已实现 `Sandbox` / `ExecutionEnv` 适配、文件操作、流式 shell、abort、timeout、删除和协议防护。
 - 已实现 Linux Bwrap gateway 第一阶段：认证、租户绑定、独立 work root、稳定 guest `/workspace`、协议级文件 allow/deny、默认断网、timeout/output 上限、reset/delete、失败关闭策略、持久化 registry，以及 work root 独占锁与启动恢复。
+- 已实现 gateway 的 Linux Firecracker 后端：guest-agent readiness、guest cleanup、生命周期 start/reset/shutdown、持久化 registry、重启后恢复为 `Creating`、显式 `/start` 完成，以及 stale PID/artifact 清理。
 - mapped `fs_allowlist` / `fs_denylist` 路径会逐组件拒绝 symlink，并在 canonicalize 后强制落在 host work root 内，避免 Bwrap bind 跟随策略路径造成宿主逃逸。
 - 单元测试覆盖 SSE 解码（含跨 chunk CRLF）、事件大小限制、配置校验、IPv6 loopback HTTP 和 gateway 返回路径校验。
 - 集成测试通过本地 HTTP/SSE 网关覆盖文件系统、allowlist、denylist、流式输出、最终输出上限、timeout、客户端 timeout 上限、shell abort、文件请求取消、错误成功状态码拒绝、无效 create 响应后的远端清理、env 生命周期和删除。
-- 尚未提供 Firecracker/Kata/gVisor gateway，也未完成 cgroup v2 部署验证和不可变审计。
+- Firecracker 仍缺网络策略和真实部署验证；尚未提供 Kata/gVisor gateway。cgroup v2 部署验证和不可变审计仍未完成。
 
-结论：协议客户端与 Linux Bwrap gateway 第一阶段可以合入并被集成测试使用；不能宣称“远程沙箱整体生产可用”，直到上述生产要求全部满足并通过部署级验证。
+结论：协议客户端、Linux Bwrap gateway 第一阶段和 gateway 内的 Linux Firecracker 后端可以合入并被集成测试使用；不能宣称“远程沙箱整体生产可用”，直到上述生产要求全部满足并通过部署级验证。
