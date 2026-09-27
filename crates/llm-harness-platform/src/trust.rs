@@ -15,12 +15,13 @@ pub enum TrustProfile {
     Restricted,
     /// Network allowed; host project directories bound read-write; system
     /// areas and credential floors still denied.
+    #[serde(alias = "trusted-lan")]
     TrustedLan,
     /// Network allowed; near-host filesystem access (system areas and
     /// credential floors still denied).
+    #[serde(alias = "trusted-full")]
     TrustedFull,
 }
-
 impl TrustProfile {
     pub fn as_str(&self) -> &'static str {
         match self {
