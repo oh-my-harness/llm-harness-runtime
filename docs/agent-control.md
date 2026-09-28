@@ -109,6 +109,20 @@ cargo run -p llm-harness-agent-control --bin agent-control -- agent-control.json
 - 未知请求字段会被拒绝。
 - 沙箱仍由 gateway 和 platform sandbox 策略约束；control service 不绕过这些限制。
 
+## 重启与孤儿沙箱清理
+
+在配置中设置 `persistence_path` 可以启用孤儿沙箱跟踪：
+
+```json
+{
+  "persistence_path": "./agent-control-sessions.json"
+}
+```
+
+启用后，control service 会在每次创建 session 时把 sandbox ID 写入该文件，删除 session 时移除对应条目。进程重启时，如果该文件中仍有 sandbox ID，control service 会向 gateway 发送 `DELETE /v1/sandboxes/{id}` 请求清理这些孤儿沙箱，然后清空文件。
+
+如果部分清理失败（例如 gateway 暂时不可达），文件中会保留未清理的 sandbox ID，下次启动时重试。
+
 ## 测试
 
 ```sh

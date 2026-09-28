@@ -207,6 +207,7 @@ mod tests {
                 max_trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
                 max_sessions: Some(1),
             }],
+            persistence_path: None,
         };
         std::sync::Arc::new(
             crate::service::AgentControlManager::new(config, std::sync::Arc::new(FailingFactory))
