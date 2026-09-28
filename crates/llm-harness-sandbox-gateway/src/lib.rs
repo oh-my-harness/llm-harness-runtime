@@ -4,10 +4,12 @@
 //! policies that bubblewrap cannot enforce instead of downgrading them.
 
 mod auth;
+mod config;
 mod routes;
 mod state;
 
 pub use auth::{FirecrackerBackendConfig, GatewayBackend, GatewayConfig, GatewayPrincipalConfig};
+pub use config::GatewayServiceConfig;
 pub use routes::serve;
 
 use std::sync::Arc;
