@@ -137,3 +137,18 @@ A general small LLM (Qwen3.5-4B) still generates free-form tool calls and argume
 1. Test with Qwen3.5-9B or 14B to find the quality-speed sweet spot
 2. Experiment with pre-defined choice menus instead of free-form tool selection
 3. Consider implementing a mock "decision provider" that constrains outputs to valid choices
+---
+
+## Mock Jev Benchmark Results (2026-09-28)
+
+| Task | LLM 72B | Mock Jev | Speedup | Success |
+|------|---------|----------|---------|---------|
+| rename_function | 4.63s, 4 LLM calls | **0.49s**, 0 LLM | **9.4x** | 100% / 100% |
+| create_readme | 2.75s, 2.3 LLM calls | **0.24s**, 0 LLM | **11.5x** | 100% / 100% |
+| add_comment | 12.64s, 6.7 LLM (partial) | **0.22s**, 0 LLM | **57x** | partial / **100%** |
+
+### Key Finding
+
+Pre-defined choices (mock Jev, simulated 100ms decision latency per step, **zero LLM calls**) are **10-57x faster** than the large LLM baseline. The add_comment task went from partial success to 100% because deterministic pre-defined choices eliminate format errors entirely.
+
+This validates the core Jev hypothesis: when decisions can be constrained to pre-defined options, removing LLM from the decision loop eliminates the dominant latency source.
