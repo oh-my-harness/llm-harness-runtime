@@ -2253,6 +2253,7 @@ dependencies = [
  "llm-harness-agent",
  "llm-harness-loop",
  "llm-harness-platform",
+ "llm-harness-sandbox-gateway",
  "llm-harness-sandbox-remote",
  "llm-harness-tools",
  "llm-harness-types",

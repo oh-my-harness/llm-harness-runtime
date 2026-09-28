@@ -68,6 +68,7 @@ llm-harness-live-tests = { path = "crates/llm-harness-live-tests" }
 llm-harness-inspector = { path = "crates/llm-harness-inspector" }
 llm-harness-sandbox = { path = "crates/llm-harness-sandbox" }
 llm-harness-sandbox-remote = { path = "crates/llm-harness-sandbox-remote" }
+llm-harness-sandbox-gateway = { path = "crates/llm-harness-sandbox-gateway" }
 llm-harness-vm-agent-protocol = { path = "crates/llm-harness-vm-agent-protocol" }
 llm-harness-vm-agent-transport = { path = "crates/llm-harness-vm-agent-transport" }
 llm-harness-vm-agent-env = { path = "crates/llm-harness-vm-agent-env" }
