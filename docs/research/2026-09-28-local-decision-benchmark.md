@@ -3,6 +3,9 @@
 Updated: 2026-09-29, Asia/Shanghai.
 Research issue: https://github.com/oh-my-harness/llm-harness-runtime/issues/259
 
+Latest experiment: [20-task paired results, 2026-09-29](2026-09-29-paired-files-results.md).
+The smoke results below are earlier measurements, not the latest accuracy estimate.
+
 ## Objective
 
 Measure whether a local small model completes the same agent tasks faster than
@@ -62,7 +65,7 @@ two-model results below are retained without rewriting raw measurements; their
 aggregate tool timings are available but individual tool timings were not saved.
 Prompt version remains `relative-paths-v2`; metric changes do not change prompts.
 
-## Latest Comparable Results
+## Earlier Smoke Results
 
 Source: `logs/benchmarks/2026-09-28-relative-react.json`, 3 tasks x 3 repetitions
 per model, identical relative-path prompt. Times include failed attempts.
@@ -145,7 +148,7 @@ for overall and per-task metrics; retain `results` for inspection and re-scoring
 - [x] Record paired smoke results, latency, calls, accuracy and false completion.
 - [x] Persist explicit overall/per-task summaries and individual tool timings.
 - [x] Expand the frozen task suite to 20 tasks with independently tested validators.
-- [~] Run 60 attempts per model in alternating paired order and assess speed versus accuracy.
+- [x] Run 60 attempts per model in alternating paired order and assess speed versus accuracy.
 
 Progress log:
 - 2026-09-28: Completed initial and corrected-prompt large/small runs.
@@ -156,3 +159,6 @@ Progress log:
   Expected outputs are confined to the offline evaluator. Both arms receive
   the same inputs and fault schedule. Suite hash and all 120 scheduled attempts
   are recorded. Prompt and limits are frozen before inference.
+- 2026-09-29: Finished 120 attempts. Both arms passed 57/60; local was 4.05x
+  faster on 54 matched successful pairs. Published measurements and separate
+  failure analysis in the dated results report. Nine offline tests pass.

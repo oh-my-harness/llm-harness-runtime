@@ -194,3 +194,25 @@ test("expanded run preserves scoring and injects exactly one recoverable fault p
   }
   assert.equal(report.suite.sha256.length, 64);
 });
+
+test("analysis computes speed only on matched attempts that both models passed", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "analysis-test-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const row = (taskId, success, totalMs) => ({ taskId, run: 0, category: "test", success, totalMs, llmMs: totalMs, llmCalls: 1, toolMs: 0, toolCalls: 0, termination: "done", injectedFaults: 0 });
+  const input = join(dir, "input.json");
+  const output = join(dir, "output.json");
+  writeFileSync(input, JSON.stringify({ finishedAt: "2026-09-29", schedule: [1, 2, 3, 4], results: {
+    large: [row("a", true, 100), row("b", false, 500)],
+    small: [row("a", true, 25), row("b", true, 50)],
+  } }));
+  const child = spawn(process.execPath, ["scripts/analyze_agent_benchmark.mjs", input, output]);
+  child.stdout.resume();
+  child.stderr.resume();
+  assert.equal(await new Promise((resolve, reject) => { child.on("exit", resolve); child.on("error", reject); }), 0);
+  const artifact = JSON.parse(readFileSync(output, "utf8"));
+  assert.equal(artifact.paired.bothPassed, 1);
+  assert.equal(artifact.paired.onlySmallPassed, 1);
+  assert.equal(artifact.paired.jointSuccessTimeRatio, 4);
+  assert.equal(artifact.summary.large.overall.accuracy, 0.5);
+  assert.equal(artifact.summary.large.overall.totalElapsedMs, 600);
+});
