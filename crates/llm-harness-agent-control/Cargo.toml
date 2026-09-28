@@ -29,5 +29,6 @@ uuid.workspace = true
 [dev-dependencies]
 llm-harness-agent = { workspace = true, features = ["test-utils"] }
 llm-harness-loop.workspace = true
+http-body-util = "0.1"
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }

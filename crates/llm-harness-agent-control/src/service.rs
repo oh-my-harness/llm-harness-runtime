@@ -28,6 +28,20 @@ pub enum ControlEvent {
     SessionClosed { reason: String },
 }
 
+impl ControlEvent {
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::TextDelta { .. } => "text_delta",
+            Self::ToolStarted { .. } => "tool_started",
+            Self::ToolFinished { .. } => "tool_finished",
+            Self::RunFinished => "run_finished",
+            Self::Failed { .. } => "failed",
+            Self::Aborted => "aborted",
+            Self::SessionClosed { .. } => "session_closed",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ControlServiceError {
     #[error("sandbox session {0} does not exist")]

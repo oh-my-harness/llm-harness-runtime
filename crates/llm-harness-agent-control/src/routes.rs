@@ -134,11 +134,15 @@ async fn session_events(
 ) -> Response {
     match state.subscribe_session(&principal.0, &session_id) {
         Ok(events) => {
-            let stream = BroadcastStream::new(events).map(|event| match event {
-                Ok(event) => Ok::<_, std::convert::Infallible>(sse_event(event)),
-                Err(error) => Ok(sse_event(ControlEvent::Failed {
-                    message: format!("event stream error: {error}"),
-                })),
+            let sid = session_id.clone();
+            let stream = BroadcastStream::new(events).map(move |event| match event {
+                Ok(event) => Ok::<_, std::convert::Infallible>(sse_event(event, &sid)),
+                Err(error) => Ok(sse_event(
+                    ControlEvent::Failed {
+                        message: format!("event stream error: {error}"),
+                    },
+                    "unknown",
+                )),
             });
             Sse::new(stream).into_response()
         }
@@ -161,9 +165,20 @@ fn error_response(error: ControlServiceError) -> Response {
         .into_response()
 }
 
-fn sse_event(event: ControlEvent) -> axum::response::sse::Event {
-    let json = serde_json::to_string(&event).expect("serialize control event");
-    axum::response::sse::Event::default().data(json)
+fn sse_event(event: ControlEvent, session_id: &str) -> axum::response::sse::Event {
+    let mut event_value = serde_json::to_value(&event).expect("serialize control event");
+    let event_type = event_value
+        .as_object_mut()
+        .and_then(|obj| obj.remove("type"))
+        .and_then(|v| v.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| event.event_type().to_owned());
+    let json = serde_json::json!({
+        "type": event_type,
+        "session_id": session_id,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "data": event_value,
+    });
+    axum::response::sse::Event::default().data(json.to_string())
 }
 
 #[cfg(test)]
