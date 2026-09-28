@@ -116,21 +116,13 @@ pub fn pending_traffic(team: &AgentTeam, member_ids: &[String]) -> serde_json::V
         ids.push("operator");
         for id in ids {
             let agent = AgentId::new(id);
-            for msg in ctx.drain_inbox(&agent) {
-                // Draining mutates; returning them keeps state intact.
+            for msg in ctx.peek_inbox(&agent) {
                 pending.push(serde_json::json!({
                     "to": id,
                     "from": msg.from.as_str(),
                     "type": format!("{:?}", msg.message_type).to_lowercase(),
                     "body": msg.body,
                 }));
-                if let Err(error) = ctx.push_message(msg.clone()) {
-                    ctx.return_messages(&agent, vec![msg]);
-                    pending.push(serde_json::json!({
-                        "to": id,
-                        "error": error.to_string(),
-                    }));
-                }
             }
         }
     }
@@ -204,15 +196,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_traffic_drains_without_loss() {
+    async fn pending_traffic_is_read_only() {
         let mut team = built_team().await;
         team.submit("planner", "fix the bug").unwrap();
         let members = built_members();
+        let history_before = team
+            .social_context()
+            .unwrap()
+            .chat_history(&AgentId::new("planner"), 128);
         let v = pending_traffic(&team, &members);
         let pending = v["pending"].as_array().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0]["to"], "planner");
         assert!(pending[0]["body"].as_str().unwrap().contains("fix the bug"));
+        let repeat = pending_traffic(&team, &members);
+        assert_eq!(repeat, v, "pulse is a read-only projection");
+        let history_after = team
+            .social_context()
+            .unwrap()
+            .chat_history(&AgentId::new("planner"), 128);
+        assert_eq!(history_after.len(), history_before.len());
         team.shutdown();
     }
 
