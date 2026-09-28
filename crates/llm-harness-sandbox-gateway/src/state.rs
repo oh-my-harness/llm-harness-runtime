@@ -96,7 +96,7 @@ pub(crate) struct SandboxRecord {
 
 #[cfg(target_os = "linux")]
 pub(crate) enum GatewaySandbox {
-    Bwrap(Box<BwrapSandbox>),
+    Bwrap(BwrapSandbox),
     Firecracker(Box<FirecrackerSandbox>),
 }
 
@@ -149,42 +149,42 @@ impl Sandbox for GatewaySandbox {
 impl Sandbox for GatewaySandbox {
     fn start(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         match self {
-            GatewaySandbox::Bwrap(sandbox) => Sandbox::start(&**sandbox),
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::start(sandbox),
             GatewaySandbox::Firecracker(sandbox) => Box::pin(sandbox.start()),
         }
     }
 
     fn env(&self) -> Arc<dyn ExecutionEnv> {
         match self {
-            GatewaySandbox::Bwrap(sandbox) => Sandbox::env(&**sandbox),
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::env(sandbox),
             GatewaySandbox::Firecracker(sandbox) => FirecrackerSandbox::env(sandbox),
         }
     }
 
     fn reset(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         match self {
-            GatewaySandbox::Bwrap(sandbox) => Sandbox::reset(&**sandbox),
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::reset(sandbox),
             GatewaySandbox::Firecracker(sandbox) => Box::pin(sandbox.reset()),
         }
     }
 
     fn shutdown(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         match *self {
-            GatewaySandbox::Bwrap(sandbox) => Sandbox::shutdown(sandbox),
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::shutdown(Box::new(sandbox)),
             GatewaySandbox::Firecracker(sandbox) => Box::pin(sandbox.shutdown_owned()),
         }
     }
 
     fn config(&self) -> &SandboxConfig {
         match self {
-            GatewaySandbox::Bwrap(sandbox) => Sandbox::config(&**sandbox),
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::config(sandbox),
             GatewaySandbox::Firecracker(sandbox) => FirecrackerSandbox::config(sandbox),
         }
     }
 
     fn is_running(&self) -> bool {
         match self {
-            GatewaySandbox::Bwrap(sandbox) => Sandbox::is_running(&**sandbox),
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::is_running(sandbox),
             GatewaySandbox::Firecracker(sandbox) => FirecrackerSandbox::is_running(sandbox),
         }
     }
@@ -853,7 +853,7 @@ impl GatewayState {
         let sandbox =
             match BwrapSandbox::new_mapped(sandbox_config, work_dir, PathBuf::from(GUEST_WORK_DIR))
             {
-                Ok(sandbox) => GatewaySandbox::Bwrap(Box::new(sandbox)),
+                Ok(sandbox) => GatewaySandbox::Bwrap(sandbox),
                 Err(error) => {
                     let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
                     if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
@@ -1485,11 +1485,11 @@ fn restore_sandbox(
             .work_root()
             .join("sandboxes")
             .join(&persisted.sandbox_id);
-        let sandbox = GatewaySandbox::Bwrap(Box::new(BwrapSandbox::new_mapped(
+        let sandbox = GatewaySandbox::Bwrap(BwrapSandbox::new_mapped(
             sandbox_config,
             work_dir,
             PathBuf::from(GUEST_WORK_DIR),
-        )?));
+        )?);
         let env = sandbox.env();
         Ok(SandboxRecord {
             owner: Arc::clone(&principal.id),
