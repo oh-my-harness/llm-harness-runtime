@@ -134,6 +134,51 @@ impl Sandbox for GatewaySandbox {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl Sandbox for GatewaySandbox {
+    fn start(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        match self {
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::start(sandbox),
+            GatewaySandbox::Firecracker(sandbox) => Box::pin(sandbox.start()),
+        }
+    }
+
+    fn env(&self) -> Arc<dyn ExecutionEnv> {
+        match self {
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::env(sandbox),
+            GatewaySandbox::Firecracker(sandbox) => FirecrackerSandbox::env(sandbox),
+        }
+    }
+
+    fn reset(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        match self {
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::reset(sandbox),
+            GatewaySandbox::Firecracker(sandbox) => Box::pin(sandbox.reset()),
+        }
+    }
+
+    fn shutdown(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
+        match *self {
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::shutdown(Box::new(sandbox)),
+            GatewaySandbox::Firecracker(sandbox) => Box::pin(sandbox.shutdown_owned()),
+        }
+    }
+
+    fn config(&self) -> &SandboxConfig {
+        match self {
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::config(sandbox),
+            GatewaySandbox::Firecracker(sandbox) => FirecrackerSandbox::config(sandbox),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        match self {
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::is_running(sandbox),
+            GatewaySandbox::Firecracker(sandbox) => FirecrackerSandbox::is_running(sandbox),
+        }
+    }
+}
+
 /// Other non-Linux platforms: no sandbox backend is wired; construction
 /// paths fail closed before reaching this type.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
