@@ -9,7 +9,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use crate::auth::{AuthenticatedPrincipal, bearer_token};
 use crate::service::{
     ControlEvent, ControlServiceError, CreateAgentSessionRequest, PromptRequest,
-    SharedAgentControlManager, SteerRequest,
+    SessionEvent, SharedAgentControlManager, SteerRequest,
 };
 
 pub fn build_router(state: SharedAgentControlManager) -> Router {
@@ -138,10 +138,14 @@ async fn session_events(
             let stream = BroadcastStream::new(events).map(move |event| match event {
                 Ok(event) => Ok::<_, std::convert::Infallible>(sse_event(event, &sid)),
                 Err(error) => Ok(sse_event(
-                    ControlEvent::Failed {
-                        message: format!("event stream error: {error}"),
+                    SessionEvent {
+                        prompt_id: None,
+                        turn_id: None,
+                        event: ControlEvent::Failed {
+                            message: format!("event stream error: {error}"),
+                        },
                     },
-                    "unknown",
+                    &sid,
                 )),
             });
             Sse::new(stream).into_response()
@@ -165,16 +169,14 @@ fn error_response(error: ControlServiceError) -> Response {
         .into_response()
 }
 
-fn sse_event(event: ControlEvent, session_id: &str) -> axum::response::sse::Event {
-    let mut event_value = serde_json::to_value(&event).expect("serialize control event");
-    let event_type = event_value
-        .as_object_mut()
-        .and_then(|obj| obj.remove("type"))
-        .and_then(|v| v.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| event.event_type().to_owned());
+fn sse_event(event: SessionEvent, session_id: &str) -> axum::response::sse::Event {
+    let event_value = serde_json::to_value(&event.event).expect("serialize control event");
+    let event_type = event.event.event_type();
     let json = serde_json::json!({
         "type": event_type,
         "session_id": session_id,
+        "prompt_id": event.prompt_id,
+        "turn_id": event.turn_id,
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "data": event_value,
     });

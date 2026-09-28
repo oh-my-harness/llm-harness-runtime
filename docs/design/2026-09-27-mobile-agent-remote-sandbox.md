@@ -361,12 +361,12 @@ HAR-001 完成的条件是：
 
 HAR-002 完成的条件是：
 
-- [ ] control service 可以创建由 `RemoteSandbox` 支撑的 Agent session；
-- [ ] prompt、event streaming、steer 和 abort 可以端到端工作；
-- [ ] session 按已认证 principal 隔离；
-- [ ] session 删除会停止 Agent 并删除沙箱；
-- [ ] 重启 reconciliation 不会留下不可达但仍在运行的沙箱；
-- [ ] 集成测试覆盖移动端控制契约。
+- [x] control service 可以创建由 `RemoteSandbox` 支撑的 Agent session；
+- [x] prompt、event streaming、steer 和 abort 的控制契约有集成测试；真实 gateway E2E 已覆盖 create/prompt/delete；
+- [x] session 按已认证 principal 隔离；
+- [x] session 删除会停止 Agent 并删除沙箱；
+- [x] 重启 reconciliation 不会留下不可达但仍在运行的沙箱；
+- [x] 集成测试覆盖移动端控制契约。
 
 当脚本化客户端能完成完整流程时，组合 MVP 才算可用：
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -7,7 +7,7 @@ use axum::http::StatusCode;
 use llm_harness_agent::harness::{AgentHarness, AgentHarnessOptions};
 use llm_harness_platform::sandbox::Sandbox;
 use llm_harness_sandbox_remote::{RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig};
-use llm_harness_types::{AgentEvent, ExecutionEnv};
+use llm_harness_types::{AgentEvent, AgentMessage, ExecutionEnv, UserMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -16,10 +16,14 @@ use crate::auth::AuthenticatedPrincipal;
 use crate::config::ControlServiceConfig;
 use crate::persistence::SessionPersistence;
 
+const STEER_QUEUE_CAPACITY: usize = 16;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlEvent {
     TextDelta { text: String },
+    RunStarted,
+    TurnStarted { turn_id: String },
     ToolStarted { name: String },
     ToolFinished { name: String, summary: String },
     RunFinished,
@@ -28,10 +32,19 @@ pub enum ControlEvent {
     SessionClosed { reason: String },
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionEvent {
+    pub prompt_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub event: ControlEvent,
+}
+
 impl ControlEvent {
     pub fn event_type(&self) -> &'static str {
         match self {
             Self::TextDelta { .. } => "text_delta",
+            Self::RunStarted => "run_started",
+            Self::TurnStarted { .. } => "turn_started",
             Self::ToolStarted { .. } => "tool_started",
             Self::ToolFinished { .. } => "tool_finished",
             Self::RunFinished => "run_finished",
@@ -164,8 +177,16 @@ struct AgentSessionRecord {
     backend: String,
     sandbox: std::sync::Mutex<Option<Box<dyn AgentSandbox>>>,
     active_tools: std::sync::Mutex<HashMap<String, String>>,
-    events: broadcast::Sender<ControlEvent>,
+    events: broadcast::Sender<SessionEvent>,
     active_prompt: AtomicBool,
+    steer_queue: std::sync::Mutex<VecDeque<AgentMessage>>,
+    prompt_context: std::sync::Mutex<SessionPromptContext>,
+}
+
+#[derive(Debug, Default)]
+struct SessionPromptContext {
+    prompt_id: Option<String>,
+    turn_id: Option<String>,
 }
 
 impl AgentSessionRecord {
@@ -261,6 +282,8 @@ impl AgentControlManager {
             active_tools: std::sync::Mutex::new(HashMap::new()),
             events,
             active_prompt: AtomicBool::new(false),
+            steer_queue: std::sync::Mutex::new(VecDeque::new()),
+            prompt_context: std::sync::Mutex::new(SessionPromptContext::default()),
         });
         spawn_event_pump(Arc::clone(&record));
         if let Some(persistence) = &self.persistence {
@@ -290,7 +313,7 @@ impl AgentControlManager {
         &self,
         principal: &AuthenticatedPrincipal,
         session_id: &str,
-    ) -> Result<broadcast::Receiver<ControlEvent>, ControlServiceError> {
+    ) -> Result<broadcast::Receiver<SessionEvent>, ControlServiceError> {
         let session = self
             .find_owned_session(principal, session_id)?
             .ok_or_else(|| ControlServiceError::SessionNotFound(session_id.to_owned()))?;
@@ -319,13 +342,29 @@ impl AgentControlManager {
             return Err(ControlServiceError::Busy);
         }
         let prompt_id = Uuid::new_v4().to_string();
+        *session.prompt_context.lock().expect("prompt context lock") =
+            SessionPromptContext {
+                prompt_id: Some(prompt_id.clone()),
+                turn_id: None,
+            };
         let harness = Arc::clone(&session.harness);
         let events = session.events.clone();
         let record_for_task = Arc::clone(&session);
+        let prompt_id_for_task = prompt_id.clone();
+        let mut initial_messages = std::mem::take(
+            &mut *session.steer_queue.lock().expect("steer queue lock"),
+        );
+        initial_messages.push_back(user_message(&request.prompt));
         tokio::spawn(async move {
-            if let Err(error) = harness.prompt(request.prompt).await {
-                let _ = events.send(ControlEvent::Failed {
-                    message: error.to_string(),
+            if let Err(error) =
+                harness.prompt_with_messages(initial_messages.into()).await
+            {
+                let _ = events.send(SessionEvent {
+                    prompt_id: Some(prompt_id_for_task),
+                    turn_id: None,
+                    event: ControlEvent::Failed {
+                        message: error.to_string(),
+                    },
                 });
             }
             record_for_task.active_prompt.store(false, Ordering::SeqCst);
@@ -347,17 +386,18 @@ impl AgentControlManager {
         let session = self
             .find_owned_session(principal, session_id)?
             .ok_or_else(|| ControlServiceError::SessionNotFound(session_id.to_owned()))?;
-        session
-            .harness
-            .steer_message(llm_harness_types::AgentMessage::User(
-                llm_harness_types::UserMessage {
-                    content: vec![llm_harness_types::ContentBlock::Text {
-                        text: request.message,
-                    }],
-                    timestamp: chrono::Utc::now(),
-                },
-            ))
-            .map_err(|_| ControlServiceError::SteerQueueFull)?;
+        if session.active_prompt.load(Ordering::SeqCst) {
+            session
+                .harness
+                .steer_message(user_message(&request.message))
+                .map_err(|_| ControlServiceError::SteerQueueFull)?;
+        } else {
+            let mut steer_queue = session.steer_queue.lock().expect("steer queue lock");
+            if steer_queue.len() >= STEER_QUEUE_CAPACITY {
+                return Err(ControlServiceError::SteerQueueFull);
+            }
+            steer_queue.push_back(user_message(&request.message));
+        }
         Ok(session.status())
     }
 
@@ -388,8 +428,12 @@ impl AgentControlManager {
                 .remove(session_id);
         }
         session.harness.abort();
-        let _ = session.events.send(ControlEvent::SessionClosed {
-            reason: "session deleted".to_owned(),
+        let _ = session.events.send(SessionEvent {
+            prompt_id: None,
+            turn_id: None,
+            event: ControlEvent::SessionClosed {
+                reason: "session deleted".to_owned(),
+            },
         });
         let sandbox = session.sandbox.lock().expect("sandbox lock").take();
         if let Some(sandbox) = sandbox {
@@ -414,8 +458,12 @@ impl AgentControlManager {
         let mut failures = 0;
         for session in sessions.into_values() {
             session.harness.abort();
-            let _ = session.events.send(ControlEvent::SessionClosed {
-                reason: "control service stopped".to_owned(),
+            let _ = session.events.send(SessionEvent {
+                prompt_id: None,
+                turn_id: None,
+                event: ControlEvent::SessionClosed {
+                    reason: "control service stopped".to_owned(),
+                },
             });
             let sandbox = session.sandbox.lock().expect("sandbox lock").take();
             if let Some(sandbox) = sandbox
@@ -458,19 +506,46 @@ fn spawn_event_pump(session: Arc<AgentSessionRecord>) {
                 Ok(event) => event,
                 Err(broadcast::error::RecvError::Closed) => break,
                 Err(broadcast::error::RecvError::Lagged(count)) => {
-                    let _ = events.send(ControlEvent::Failed {
-                        message: format!("event stream lagged by {count} events"),
+                    let prompt_id = session
+                        .prompt_context
+                        .lock()
+                        .expect("prompt context lock")
+                        .prompt_id
+                        .clone();
+                    let _ = events.send(SessionEvent {
+                        prompt_id,
+                        turn_id: None,
+                        event: ControlEvent::Failed {
+                            message: format!("event stream lagged by {count} events"),
+                        },
                     });
                     continue;
                 }
             };
+            if let llm_harness_agent::harness::AgentHarnessEvent::Agent(agent_event) = event.as_ref()
+            {
+                let turn_id = match agent_event {
+                    AgentEvent::MessageUpdate { partial, .. } => Some(&partial.turn_id),
+                    AgentEvent::MessageEnd { message, .. } => Some(&message.turn_id),
+                    _ => None,
+                };
+                if let Some(turn_id) = turn_id {
+                    session.prompt_context.lock().expect("prompt context lock").turn_id =
+                        Some(turn_id.clone());
+                }
+            }
             let Some(control_event) = map_harness_event(
                 event.as_ref(),
                 &mut session.active_tools.lock().expect("active tool registry"),
             ) else {
                 continue;
             };
-            let _ = events.send(control_event);
+            let prompt_context = session.prompt_context.lock().expect("prompt context lock");
+            let _ = events.send(SessionEvent {
+                prompt_id: prompt_context.prompt_id.clone(),
+                turn_id: prompt_context.turn_id.clone(),
+                event: control_event,
+            });
         }
     });
 }
@@ -489,7 +564,9 @@ fn map_harness_event(
         return None;
     };
     match agent_event {
-        AgentEvent::TextDelta { text, .. } => Some(ControlEvent::TextDelta { text: text.clone() }),
+        AgentEvent::TextDelta { text, .. } => {
+            Some(ControlEvent::TextDelta { text: text.clone() })
+        }
         AgentEvent::ToolExecutionStart {
             tool_use_id,
             tool_name,
@@ -530,12 +607,28 @@ fn map_harness_event(
             };
             Some(ControlEvent::ToolFinished { name, summary })
         }
+        AgentEvent::MessageStart { .. } => Some(ControlEvent::RunStarted),
+        AgentEvent::MessageUpdate { partial, .. } => Some(ControlEvent::TurnStarted {
+            turn_id: partial.turn_id.clone(),
+        }),
+        AgentEvent::MessageEnd { message, .. } => Some(ControlEvent::TurnStarted {
+            turn_id: message.turn_id.clone(),
+        }),
         AgentEvent::AgentEnd { .. } => Some(ControlEvent::RunFinished),
         AgentEvent::Error(error) => Some(ControlEvent::Failed {
             message: error.to_string(),
         }),
         _ => None,
     }
+}
+
+fn user_message(text: &str) -> AgentMessage {
+    AgentMessage::User(UserMessage {
+        content: vec![llm_harness_types::ContentBlock::Text {
+            text: text.to_owned(),
+        }],
+        timestamp: chrono::Utc::now(),
+    })
 }
 
 fn parse_trust_profile(
@@ -819,7 +912,11 @@ mod tests {
 
         let mut saw_finished = false;
         for _ in 0..8 {
-            if let Ok(ControlEvent::RunFinished) = events.recv().await {
+            if let Ok(SessionEvent {
+                event: ControlEvent::RunFinished,
+                ..
+            }) = events.recv().await
+            {
                 saw_finished = true;
                 break;
             }
