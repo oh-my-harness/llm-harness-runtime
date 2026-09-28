@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { nextObservation } from "../benchmark_rules.mjs";
+import { summarizeResults } from "../benchmark_metrics.mjs";
 
 async function fixture(t, handler) {
   const server = createServer(async (req, res) => {
@@ -69,6 +69,11 @@ test("independent endpoints preserve API failure latency and successful file tas
     assert.ok(row.llmMs >= 25);
   }
   assert.ok(report.results.small.every((row) => row.success && row.termination === "done"));
+  assert.equal(report.summary.small.overall.accuracy, 1);
+  assert.equal(report.summary.large.overall.accuracy, 0);
+  assert.equal(report.summary.large.overall.apiFailures, 3);
+  assert.equal(report.summary.small.overall.llmCalls, 6);
+  assert.ok(report.results.small.every((row) => row.toolLatencies.length === row.toolCalls));
 });
 
 test("invalid decision JSON and out-of-workspace paths are recorded without crashing", async (t) => {
@@ -109,33 +114,23 @@ test("adding a comment must not erase the existing configuration", async (t) => 
   assert.equal(report.results.small.find((r) => r.taskId === "add_comment").falseCompletion, true);
 });
 
-test("rules provide observations but cannot claim completion from a successful write", async (t) => {
-  const endpoint = await fixture(t, (body, _req, res) => {
-    const observations = body.messages.filter((m) => m.content.startsWith("Runtime observation"));
-    assert.ok(observations.some((m) => m.content.includes("initial_inventory")));
-    if (observations.some((m) => m.content.includes("write_readback"))) {
-      return reply(res, { action: "done" });
-    }
-    reply(res, { action: "write_file", args: { path: "config.py", content: "# TODO: review\n" } });
-  });
-  const report = await run(t, ["--mode", "large", "--large-base-url", endpoint, "--policy", "rules"]);
-  for (const row of report.results.large) {
-    assert.equal(row.llmCalls, 2, "completion must still be a model decision");
-    assert.equal(row.success, false);
-    assert.equal(row.falseCompletion, true);
-    assert.ok(row.trace.some((event) => event.source === "rule" && event.reason === "write_readback"));
-  }
-});
-
-test("generic observation scheduler bounds reads and exhausts without a done action", () => {
-  const state = { initialized: false, pending: [], files: [
-    { path: "too-large", size: 8193 },
-    ...Array.from({ length: 12 }, (_, i) => ({ path: `file-${i}`, size: 10 })),
-  ] };
-  const actions = [];
-  let action;
-  while ((action = nextObservation(state))) actions.push(action);
-  assert.equal(actions.length, 9);
-  assert.equal(actions[0].action, "list_files");
-  assert.ok(!actions.some((a) => a.action === "done" || a.args.path === "too-large"));
+test("summary includes failures and uses weighted per-call latency", () => {
+  const rows = [
+    { taskId: "a", success: true, termination: "done", totalMs: 100, llmMs: 80, llmCalls: 2, toolMs: 10, toolCalls: 1 },
+    { taskId: "a", success: false, termination: "done", totalMs: 300, llmMs: 270, llmCalls: 1, toolMs: 20, toolCalls: 2 },
+    { taskId: "b", success: false, termination: "api_error", totalMs: 600, llmMs: 600, llmCalls: 1, toolMs: 0, toolCalls: 0 },
+  ];
+  const result = summarizeResults(rows);
+  assert.equal(result.overall.accuracy, 1 / 3);
+  assert.equal(result.overall.totalElapsedMs, 1000);
+  assert.equal(result.overall.meanSuccessfulElapsedMs, 100);
+  assert.equal(result.overall.meanFailedElapsedMs, 450);
+  assert.equal(result.overall.meanLlmCallMs, 950 / 4);
+  assert.equal(result.overall.medianElapsedMs, 300);
+  assert.equal(result.overall.p95ElapsedMs, 600);
+  assert.equal(result.overall.falseCompletions, 1);
+  assert.equal(result.byTask.a.accuracy, 0.5);
+  assert.equal(result.byTask.a.medianElapsedMs, 200);
+  assert.equal(result.byTask.b.meanSuccessfulElapsedMs, null);
+  assert.equal(summarizeResults([]).overall.accuracy, null);
 });

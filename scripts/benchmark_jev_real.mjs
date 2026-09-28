@@ -2,18 +2,18 @@
 "use strict";
 
 /**
- * Proper benchmark: small model with JSON mode (Jev-style constrained decisions)
- * vs large model (72B) — real API calls, real latency, real success rate.
+ * Compare large and small models in the same ReAct loop:
+ * real API latency, call counts, and independently verified task accuracy.
  *
  * Independent endpoints, identical prompts/tools, and recorded warmup timings.
  *
  * Usage:
- *   node scripts/benchmark_jev_real.mjs --api-key sk-... [--runs 3]
+ *   Set LARGE_API_KEY in the environment, then run with --mode both.
  */
 
 import { OpenAI } from "openai";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, mkdirSync, statSync } from "node:fs";
-import { nextObservation } from "./benchmark_rules.mjs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, mkdirSync } from "node:fs";
+import { summarizeResults } from "./benchmark_metrics.mjs";
 import { join, resolve, relative, isAbsolute, dirname } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -31,8 +31,7 @@ const TIMEOUT = Number(arg("timeout-ms", "60000"));
 const WARMUPS = Number(arg("warmups", "1"));
 const OUTPUT = resolve(arg("output", `logs/benchmarks/jev-${Date.now()}.json`));
 const MODE = arg("mode", "both");
-const POLICY = arg("policy", "react");
-if (!["react", "rules"].includes(POLICY)) throw new Error("Invalid --policy");
+if (args.includes("--policy")) throw new Error("--policy is no longer supported; this benchmark compares large and small models in the same ReAct loop");
 if (!["both", "large", "small"].includes(MODE)) throw new Error("Invalid --mode");
 if (!Number.isInteger(RUNS) || RUNS < 1 || !Number.isInteger(WARMUPS) || WARMUPS < 0 || !Number.isFinite(TIMEOUT) || TIMEOUT <= 0) throw new Error("Invalid runs, warmups, or timeout");
 const configs = Object.entries({ large: LARGE_MODEL, small: SMALL_MODEL })
@@ -122,7 +121,7 @@ Set action="done" when finished. Call exactly one tool per turn.`;
 }
 
 function newMetrics(model) {
-  return { model, totalMs: 0, llmCalls: 0, llmMs: 0, llmLatencies: [], toolCalls: 0, toolMs: 0, steps: 0, formatErrors: 0, toolErrors: 0, success: false, taskId: "", run: 0, termination: "max_steps", trace: [] };
+  return { model, totalMs: 0, llmCalls: 0, llmMs: 0, llmLatencies: [], toolCalls: 0, toolMs: 0, toolLatencies: [], steps: 0, formatErrors: 0, toolErrors: 0, success: false, taskId: "", run: 0, termination: "max_steps", trace: [] };
 }
 
 async function runAgent(config, task, ws, metrics) {
@@ -131,29 +130,6 @@ async function runAgent(config, task, ws, metrics) {
     { role: "system", content: system },
     { role: "user", content: `Task: ${task.prompt}` },
   ];
-  const state = { initialized: false, pending: [], files: [] };
-  const observe = () => {
-    const start = performance.now();
-    if (!state.initialized) {
-      state.files = readdirSync(ws, { withFileTypes: true }).filter((f) => f.isFile()).map((f) => ({ path: f.name, size: statSync(join(ws, f.name)).size }));
-    }
-    let observation;
-    while ((observation = nextObservation(state))) {
-      const toolStart = performance.now();
-      const result = executeTool(observation.action, observation.args, ws);
-      const elapsedMs = performance.now() - toolStart;
-      metrics.toolCalls++;
-      metrics.ruleActions++;
-      metrics.toolMs += elapsedMs;
-      if (result.startsWith("error:")) metrics.toolErrors++;
-      metrics.trace.push({ source: "rule", ...observation, toolResult: result, elapsedMs });
-      messages.push({ role: "user", content: `Runtime observation (${observation.reason}, ${JSON.stringify(observation.args)}):\n${result}` });
-    }
-    metrics.ruleMs += performance.now() - start;
-  };
-  metrics.ruleActions = 0;
-  metrics.ruleMs = 0;
-  if (POLICY === "rules") observe();
 
   for (let step = 0; step < MAX_STEPS; step++) {
     metrics.steps++;
@@ -209,13 +185,11 @@ async function runAgent(config, task, ws, metrics) {
     const t3 = performance.now();
     metrics.toolCalls++;
     metrics.toolMs += t3 - t2;
+    metrics.toolLatencies.push(t3 - t2);
+    metrics.trace.at(-1).toolElapsedMs = t3 - t2;
 
     messages.push({ role: "assistant", content: text });
     messages.push({ role: "user", content: `Tool result:\n${result}` });
-    if (POLICY === "rules" && action === "write_file" && !result.startsWith("error:")) {
-      state.pending.push({ action: "read_file", args: { path: args.path }, reason: "write_readback" });
-      observe();
-    }
   }
   return metrics;
 }
@@ -227,9 +201,12 @@ async function runAgent(config, task, ws, metrics) {
 async function main() {
   console.log(`\n=== Real API Benchmark: ${SMALL_MODEL} vs ${LARGE_MODEL} ===`);
   const results = {};
-  const report = { schemaVersion: 3, promptVersion: "relative-paths-v2", policy: POLICY, ruleLimits: { files: 8, bytesPerFile: 8192 }, startedAt: new Date().toISOString(), node: process.version, platform: process.platform, runs: RUNS, timeoutMs: TIMEOUT, maxSteps: MAX_STEPS, maxTokens: 256, temperature: 0, toolPolicy: "workspace-files-only", configs: configs.map(({ client, ...config }) => config), warmups: [], results };
+  const report = { schemaVersion: 4, objective: "Compare end-to-end latency and independently verified task success of large and small models in the same ReAct loop", promptVersion: "relative-paths-v2", startedAt: new Date().toISOString(), node: process.version, platform: process.platform, runs: RUNS, timeoutMs: TIMEOUT, maxSteps: MAX_STEPS, maxTokens: 256, temperature: 0, toolPolicy: "workspace-files-only", configs: configs.map(({ client, ...config }) => config), warmups: [], results };
   mkdirSync(dirname(OUTPUT), { recursive: true });
-  const save = () => writeFileSync(OUTPUT, JSON.stringify(report, null, 2));
+  const save = () => {
+    report.summary = Object.fromEntries(Object.entries(results).map(([label, rows]) => [label, summarizeResults(rows)]));
+    writeFileSync(OUTPUT, JSON.stringify(report, null, 2));
+  };
   save();
 
   for (const config of configs) {
@@ -282,6 +259,8 @@ async function main() {
   save();
   console.log(`Raw results: ${OUTPUT}`);
   for (const { label } of configs) {
+    const overall = report.summary[label].overall;
+    console.log(`${label}: accuracy ${overall.successes}/${overall.attempts}, model calls ${overall.llmCalls}, tool calls ${overall.toolCalls}, mean elapsed ${overall.meanElapsedMs.toFixed(0)}ms, false completions ${overall.falseCompletions}`);
     const byTask = {};
     for (const r of results[label]) { (byTask[r.taskId] ??= []).push(r); }
     for (const [taskId, runs] of Object.entries(byTask)) {

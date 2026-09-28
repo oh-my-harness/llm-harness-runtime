@@ -1,277 +1,153 @@
-# Local Decision-Model Benchmark
-
-## Current Experiment Progress
+# Large vs Small Model Agent-Loop Experiment
 
 Updated: 2026-09-28, Asia/Shanghai.
-
-- [x] Define a task-independent observation-only rule policy.
-- [x] Remove the absolute workspace prompt and repeat cloud/local ReAct runs.
-- [x] Measure rules plus large model under the same corrected prompt and validators.
-- [x] Compare quality, false completion, calls, latency and rule overhead; record limitations.
-
-Progress log:
-- 2026-09-28: Started the next experiment. Rules may inventory/read bounded files
-  and read back successful writes, but cannot inspect task expectations or
-  determine completion. Small-model routing and broader tasks remain later
-  experiments, contingent on evidence from this control.
-- 2026-09-28: Completed 27 measured tasks across corrected-prompt large/small
-  ReAct and rules plus large. Six regression tests passed. Results below retain
-  failures and distinguish successful-task latency from all-attempt latency.
-
 Research issue: https://github.com/oh-my-harness/llm-harness-runtime/issues/259
 
-## Question
+## Objective
 
-Can a local small model reduce full agent-task latency while preserving task
-success, compared with cloud Qwen2.5-72B? The previous simulated 8-13x speedup
-does not establish real model performance. JSON-object mode also does not
-implement a trained finite-choice decision model or a large-model escalation
-policy.
+Measure whether a local small model completes the same agent tasks faster than
+a cloud large model, and how task accuracy changes. Both models use the same
+sequential ReAct loop, prompts, tools, task inputs, budgets and final-state
+validators. The two experiment arms are:
+
+- Large: SiliconFlow `Qwen/Qwen2.5-72B-Instruct`.
+- Small: local Ollama `qwen3.5:4b` on RTX 5070 Ti.
+
+Primary outcomes are elapsed task time and independently verified task success.
+Model/tool call counts and timings explain the observed speed. A model claiming
+completion is not evidence of success. Faster failure is not successful speedup.
+This compares deployment options, including network and inference backends; it
+does not isolate parameter count as the cause of a difference.
 
 ## Environment
 
-- Windows, RTX 5070 Ti, 16303 MiB VRAM, NVIDIA driver 591.86.
-- Node 24.14.1, OpenAI JavaScript SDK pinned to 7.23.0.
-- Ollama portable 0.34.4 downloaded from the official GitHub release.
-- Archive SHA256: `535193f38f3344e5b08f5d1c171c31ce11aa17f0124ff69ae26d8ec7fe06fa62`.
-- Local model: `qwen3.5:4b`, Q4_K_M, metadata parameter size 4.7B.
+- Windows, RTX 5070 Ti, 16303 MiB VRAM, driver 591.86.
+- Node 24.14.1, OpenAI JavaScript SDK 7.23.0, Ollama 0.34.4.
+- Local model: Q4_K_M, metadata parameter size 4.7B, context length 4096.
 - Model digest: `2a654d98e6fba55d452b7043684e9b57a947e393bbffa62485a7aac05ee4eefd`.
-- Ollama reports model size and GPU-resident size both 3,128,038,521 bytes,
-  context length 4096. CUDA detected the RTX 5070 Ti.
-- Ollama files live in the sibling `benchmark/tools/ollama` directory; models
-  belong in `benchmark/models`, outside the source repository.
+- Ollama reported model and GPU-resident size both 3,128,038,521 bytes.
+- Cloud inference precision is unknown. Local thinking is explicitly disabled;
+  cloud thinking uses its default. Other backend sampling defaults may differ.
+- Portable server and models are in sibling `benchmark/tools/ollama` and
+  `benchmark/models`. Service address: `127.0.0.1:11434`.
 
-Official references:
-[Windows portable distribution](https://docs.ollama.com/windows),
-[OpenAI-compatible endpoint](https://docs.ollama.com/api/openai-compatibility),
-[Qwen3.5 model catalog](https://ollama.com/library/qwen3.5).
+## Measurement Contract
 
-## Protocol Changes
+- Accuracy = independently passed attempts / all measured attempts, including
+  timeouts, API failures, exhausted budgets and incorrect results in the denominator.
+- Record every task's elapsed time, cumulative model/tool time, individual call
+  latencies, model/tool call counts, steps, termination reason, errors, final
+  files, and model/tool trace. Model calls include failed requests and `done`.
+- Count false completion when the model returns `done` but final-state validation fails.
+- Persist overall and per-task summaries: accuracy, total/mean/median/p95 elapsed,
+  success-only and failure-only mean elapsed, request counts and weighted mean
+  per-call latency. Undefined means are null, not zero.
+- All-attempt elapsed includes failures. Success-only means can have different
+  task mixes, so compare paired task classes with success rates alongside speed.
+- Warmup is timed separately; setup and cleanup are excluded from task timing.
+  A previous local cold-load probe took 61.202 seconds; do not mix it into warm
+  task latency or assume this is the cold-start time on every launch.
+- No hidden SDK retries. Request timeout 60 seconds, 10 model steps, 256 output
+  tokens, temperature zero, one warmup and three measured repetitions per task.
+- Fresh temporary workspace per attempt. Tools are read/write/list/grep; all
+  paths are relative and confined to that workspace. No shell execution.
+- Rename/comment validators preserve original content and normalize CRLF and one
+  optional final newline. README validation checks the required phrase.
+- `formatErrors` measures JSON parsing and unknown actions, not full argument
+  schema compliance. Tool errors, trace and final-state validation capture the
+  currently observed malformed argument cases.
 
-- Separate large/small endpoints and environment-based credentials.
-- One separately recorded warmup per endpoint; three measured runs per task.
-- Identical prompt and tools across arms; 10 steps, 256 output tokens,
-  temperature zero, 60-second request timeout, no automatic SDK retries.
-- File-only tools confined to a fresh temporary workspace; no shell tool.
-- Rename/comment validators require preserved source content, not just a
-  matching substring. CRLF and one optional final newline are normalized.
-  README retains the original phrase-presence check.
-- Failed API requests retain elapsed latency and earlier completed steps.
-- Raw JSON is saved after each task, including decision text, tool results,
-  usage, termination reason, errors, and timings; credentials are excluded.
-- Warmup time is excluded from task latency. Task setup/cleanup are excluded.
-- Endpoint arms run sequentially, not randomly interleaved. Network load and
-  provider scheduling remain potential confounders.
-- Three tiny tasks are a smoke benchmark, not evidence of general coding
-  competence or production readiness. Updated tool/validator conditions make
-  these runs a new baseline, not directly comparable to historical numbers.
+Schema 4 adds persisted summaries and per-tool-call latencies. Existing schema-3
+two-model results below are retained without rewriting raw measurements; their
+aggregate tool timings are available but individual tool timings were not saved.
+Prompt version remains `relative-paths-v2`; metric changes do not change prompts.
+
+## Latest Comparable Results
+
+Source: `logs/benchmarks/2026-09-28-relative-react.json`, 3 tasks x 3 repetitions
+per model, identical relative-path prompt. Times include failed attempts.
+
+| Task | Large accuracy | Large mean time | Large calls/attempt | Small accuracy | Small mean time | Small calls/attempt |
+| --- | --- | --- | --- | --- | --- | --- |
+| rename_function | 3/3 | 3.81 s | 4 | 3/3 | 0.88 s | 4 |
+| add_comment | 0/3 | 2.03 s | 2 | 3/3 | 0.60 s | 3 |
+| create_readme | 3/3 | 2.31 s | 3 | 0/3 | 1.22 s | 4 |
+
+| Metric, across nine attempts | Large | Small |
+| --- | --- | --- |
+| Accuracy | 6/9 (66.7%) | 6/9 (66.7%) |
+| False completion | 3/9 | 3/9 |
+| Total model calls | 27 | 33 |
+| Total tool calls | 18 | 24 |
+| Total task elapsed | 24.446 s | 8.113 s |
+| Weighted mean model-call time | 904.69 ms | 245.43 ms |
+| Mean elapsed | 2.716 s | 0.901 s |
+| Median elapsed | 2.527 s | 0.875 s |
+| Empirical p95 elapsed | 4.007 s | 1.235 s |
+| Mean tool time per task | 1.52 ms | 1.02 ms |
+
+Machine-readable summaries derived from the unchanged raw record are saved in
+`logs/benchmarks/2026-09-28-relative-react-summary.json`. This is re-aggregation
+of existing measurements, not a new inference run.
+
+Large-model comment edits erased existing content. Small-model README calls
+placed arguments outside `args`, failed, and then falsely claimed completion.
+Only rename succeeded for both arms in this run; on that task the small model
+was about 4.3x faster. Equal aggregate accuracy does not mean equal capability,
+since different tasks failed. Do not describe the overall 3x time ratio as
+quality-preserving speedup.
+
+These are three task types, not nine independent task types. Nearest-rank p95
+with nine samples equals the maximum. Fixed arm order, caching, deployment and
+sampling differences remain limitations. This smoke suite cannot establish
+general coding accuracy or production readiness.
+
+## Earlier Measurements
+
+The following local files use an earlier prompt and must not be pooled with the
+latest run:
+
+- `2026-09-28-cloud-72b-v2.json`: cloud 9/9, mean task times 4.35/3.14/2.69 s.
+- `2026-09-28-local-qwen35-4b.json`: local 6/9, mean times 0.73/0.60/0.54 s;
+  comment failures used absolute paths and falsely claimed completion.
+- `2026-09-28-cloud-72b.json`: diagnostic schema-1 run with a faulty final-newline
+  validator. Its success fields are not valid corrected scores. Trace inspection
+  also found one genuine timeout and one destructive comment edit.
+
+All raw files are under ignored `logs/benchmarks/`; credentials are never part
+of reports or commits. Simulated timings are not evidence for the real-model
+speed or accuracy question.
 
 ## Reproduction
-
-Install benchmark dependencies and run regression tests from the repository:
 
 ```powershell
 npm ci --ignore-scripts
 npm test
-```
-
-Start the prepared local server in a terminal (keep it open):
-
-```powershell
+# Start only if the local server is not already running:
 ./scripts/start-benchmark-ollama.ps1
 ```
 
-In another terminal, download the model and inspect the installed model metadata:
+In another terminal, with `LARGE_API_KEY` securely provisioned in the environment:
 
 ```powershell
-Invoke-RestMethod -Method Post http://127.0.0.1:11434/api/pull `
-  -ContentType application/json -Body '{"model":"qwen3.5:4b","stream":false}' `
-  -TimeoutSec 1800
-Invoke-RestMethod http://127.0.0.1:11434/api/tags
+node scripts/benchmark_jev_real.mjs --mode both --runs 3 `
+  --small-model qwen3.5:4b --small-base-url http://127.0.0.1:11434/v1 `
+  --small-thinking off --output logs/benchmarks/paired-new-run.json
 ```
 
-Run the local arm; `reasoning_effort=none` requests disabled thinking through
-the compatible endpoint. Verify the server accepts it and inspect traces before
-interpreting results. Record model digest, quantization, and GPU residency.
+Use a unique output path. Localhost needs no real API credential. For small-only
+checks use `--mode small`. Read `summary.large` and `summary.small` in the JSON
+for overall and per-task metrics; retain `results` for inspection and re-scoring.
 
-```powershell
-node scripts/benchmark_jev_real.mjs --mode small --small-model qwen3.5:4b `
-  --small-base-url http://127.0.0.1:11434/v1 --small-thinking off `
-  --runs 3 --output logs/benchmarks/local-qwen35-4b.json
-```
+## Progress
 
-For a two-arm run, provision `LARGE_API_KEY` securely in the process environment,
-then omit `--mode small`. The large endpoint defaults to SiliconFlow and model
-to `Qwen/Qwen2.5-72B-Instruct`. `SMALL_API_KEY` is optional for localhost.
-Do not put credentials into commands, result files, or version control.
+- [x] Deploy local model and run the same ReAct loop against both endpoints.
+- [x] Record paired smoke results, latency, calls, accuracy and false completion.
+- [x] Persist explicit overall/per-task summaries and individual tool timings.
+- [ ] Expand the frozen task suite with more task types and unseen inputs.
+- [ ] Repeat both arms in counterbalanced order and assess speed versus accuracy.
 
-## Status
-
-The initial automated background launch was rejected by execution policy.
-After the user explicitly authorized startup, a retry succeeded. Ollama 0.34.4
-is listening on `127.0.0.1:11434`, with cloud features disabled. The local model
-download, cold-load check, and measured task runs have completed.
-
-Cloud baseline measurement completed with schema version 2:
-
-| Task | Success | Mean task time | Mean API call | Calls/task |
-| --- | --- | --- | --- | --- |
-| rename_function | 3/3 | 4.35 s | 1086 ms | 4 |
-| add_comment | 3/3 | 3.14 s | 1045 ms | 3 |
-| create_readme | 3/3 | 2.69 s | 894 ms | 3 |
-
-Raw result: `logs/benchmarks/2026-09-28-cloud-72b-v2.json`. There were no format
-errors in this nine-task run. This sample does not establish a reliable success
-rate or local-vs-cloud speedup.
-
-The initial diagnostic run is preserved as
-`logs/benchmarks/2026-09-28-cloud-72b.json`. Its schema-1 validator mistakenly
-required a final newline and therefore reported false failures. Trace inspection
-also identified two genuine failures: one approximately 60-second API timeout
-and one comment edit that erased `DEBUG = True`. The remaining seven outputs
-satisfy the corrected content rules. Do not treat schema-1's raw success field as
-the corrected success rate, or pool the two runs without explicit re-scoring.
-The subsequent run did not change the prompt/tools, only validation, error-type
-reporting and final-file recording. Both raw runs remain local and ignored by Git.
-
-Validation: four HTTP-fixture regression tests passed (endpoint routing,
-failure/timeout accounting, invalid decisions/path confinement, and preservation
-of existing content). JavaScript and PowerShell syntax checks passed. The Rust
-workspace was not modified, and its full test suite was not run for this change.
-
-## Local Results
-
-Raw result: `logs/benchmarks/2026-09-28-local-qwen35-4b.json`, schema version 2.
-The explicit cold-load JSON probe took 61.202 seconds and returned valid JSON
-without a reasoning field. The subsequent benchmark warmup took 158 ms. Cold
-loading and initialization are excluded from the following task measurements.
-
-| Task | Success | Mean task time | Mean API call | Calls/task | Cloud/local time ratio |
-| --- | --- | --- | --- | --- | --- |
-| rename_function | 3/3 | 0.73 s | 244 ms | 3 | 5.9x |
-| add_comment | 0/3 | 0.60 s | 299 ms | 2 | Not a successful-task speedup |
-| create_readme | 3/3 | 0.54 s | 181 ms | 3 | 4.9x |
-
-All three comment-task failures followed the same pattern: the model supplied
-an absolute path despite the relative-path instruction, the file tool rejected
-it, and the model then declared completion without editing the file. The saved
-final file remained `DEBUG = True`. JSON formatting succeeded in all runs, but
-valid JSON did not imply valid actions or task completion.
-
-On this small smoke suite, local success is 6/9 versus cloud 9/9, below the
-experiment's target of 85% of baseline success. The successful task classes are
-approximately 5-6x faster. This does not validate a 7-10x quality-preserving
-speedup, nor does it establish a general failure rate from only three tasks.
-Rename also uses fewer calls locally (3 versus 4), so its task-level speedup is
-not solely a per-call latency effect; the current verifier checks final content,
-not whether the requested verification tool step was performed.
-
-The local arm requested `reasoning_effort=none`; cloud used its default. Ollama's
-model defaults include presence penalty 1.5, while the benchmark specifies only
-temperature zero. Quantization, inference backend, caching and unspecified
-sampling defaults differ between endpoints, so this is a deployment comparison,
-not an isolated experiment on parameter count. A follow-up should explicitly
-control supported sampling parameters and re-run both arms.
-
-Next experiment: remove the irrelevant absolute workspace path from both arms'
-prompts (the tools require relative paths), then repeat the paired evaluation
-without changing the validators. Keep these original results as the baseline;
-any prompt change defines a new condition. Expand the task suite only after
-checking error recovery and false completion behavior.
-
-## Relative-Path and Generic-Observation Experiment
-
-The next experiment above is now complete. The only prompt change in the two
-ReAct arms was removal of the absolute `Workspace:` prefix. Both still receive
-the same relative-path instruction, tool schema, task text and validators.
-Sampling defaults and model versions remain unchanged from the preceding run.
-
-The rules arm uses that corrected prompt with large-model generation. Its
-task-independent scheduler is `scripts/benchmark_rules.mjs`:
-
-1. List workspace files and automatically read at most eight regular files of
-   at most 8192 bytes each, in stable filename order.
-2. After a successful model-requested write, automatically read that path back.
-3. Return all observations to the model. The model still generates changes and
-   decides when to stop. The final-state evaluator is never exposed to the rules.
-
-Rules intentionally add observations and some tool calls. They do not cache
-model answers, repair output schemas, supply expected edits, or stop after a
-write. Rule time includes its tool time, so it must not be added to `toolMs`.
-The 10-step budget bounds model decisions; automatic observations are extra
-bounded operations, recorded separately. Initial reads are metadata-bounded;
-write readbacks are bounded indirectly by the model output-token budget.
-
-### Measured Results
-
-Three runs per task and arm, one excluded warmup per endpoint. Times below are
-means over all three attempts, including failures.
-
-| Task | Large ReAct success / time / calls | Small ReAct success / time / calls | Rules + large success / time / calls |
-| --- | --- | --- | --- |
-| rename_function | 3/3 / 3.81 s / 4 | 3/3 / 0.88 s / 4 | 3/3 / 2.90 s / 3 |
-| add_comment | 0/3 / 2.03 s / 2 | 3/3 / 0.60 s / 3 | 3/3 / 2.04 s / 2 |
-| create_readme | 3/3 / 2.31 s / 3 | 0/3 / 1.22 s / 4 | 3/3 / 1.75 s / 2 |
-
-| Across all nine attempts | Large ReAct | Small ReAct | Rules + large |
-| --- | --- | --- | --- |
-| Success | 6/9 | 6/9 | 9/9 |
-| False completion | 3/9 | 3/9 | 0/9 |
-| Total model requests | 27 | 33 | 21 |
-| Mean elapsed | 2.716 s | 0.901 s | 2.228 s |
-| Median elapsed | 2.527 s | 0.875 s | 2.030 s |
-| Empirical p95 elapsed | 4.007 s | 1.235 s | 2.936 s |
-| Mean tool time | 1.52 ms | 1.02 ms | 1.79 ms |
-| Mean rule time (including automatic tools) | 0 | 0 | 1.13 ms |
-
-With nine samples, nearest-rank p95 is simply the maximum; it is not a robust
-tail estimate. Model requests account for over 99.8% of task elapsed time in
-all three arms. Calls include the model's final `done` decision.
-
-Raw artifacts (ignored by Git):
-- `logs/benchmarks/2026-09-28-relative-react.json`
-- `logs/benchmarks/2026-09-28-relative-rules-large.json`
-
-Both use schema 3 and `promptVersion=relative-paths-v2`. Reproduce with the
-previous endpoint/model flags and `--policy react` (default), followed by
-`--mode large --policy rules`; use unique output filenames.
-
-### Interpretation
-
-- Removing the absolute path fixed the small model's comment failures but did
-  not improve overall success. Its README outputs placed `path` and `content`
-  outside `args`; it then claimed completion after tool errors. Valid JSON is
-  not schema compliance. The existing `formatErrors` counter covers JSON parse
-  and unknown-action errors, not all argument-shape errors; these failures are
-  visible in tool errors, traces, final files and false-completion metrics.
-- Large ReAct overwrote the original config in all three comment runs. The
-  rules arm supplied the existing content before the model acted and preserved
-  it. This is evidence for supplying cheap observations, not evidence that the
-  rules can evaluate task correctness.
-- Rules plus large used 22.2% fewer model requests. All-attempt mean time fell
-  18.0%, but the success distributions differ, so this is not an equal-quality
-  aggregate speedup. In the two task classes both arms completed correctly,
-  each saved one call and about 24% of elapsed time (about 1.32x speedup).
-- The local model remains much faster per request, but it used more requests
-  than the large model and had different failures. Neither direct substitution
-  nor a 7-10x reliable speedup has been established.
-
-The two rules were tested together; their individual contributions have not
-been isolated. Fixed arm order, only three unique tasks, provider caching,
-quantization and sampling defaults limit causal and general conclusions. The
-cloud's earlier 9/9 run is a different prompt condition, not a contradiction or
-a reason to discard this run. Repeated near-identical trials are not nine
-independent task types.
-
-### Research Decision
-
-Continue investigating task-independent state handling before introducing a
-small-model router. The useful demonstrated mechanism is replacing mechanical
-observation decisions, not replacing semantic reasoning with canned answers.
-Next, freeze a broader task suite with unseen file names/content, missing files,
-recoverable tool errors and multi-file edits, then compare inventory-only,
-readback-only and combined rules against ReAct in counterbalanced order. Add
-explicit schema validation as a separately versioned condition shared by all
-arms. Only after this stronger control should a rules + small-router + large
-generator arm test the incremental value of model-based routing. This round
-does not implement or claim results for that hybrid routing architecture.
+Progress log:
+- 2026-09-28: Completed initial and corrected-prompt large/small runs.
+- 2026-09-28: User clarified the scope as two-model speed and quality comparison;
+  consolidated documentation and measurement definitions accordingly.

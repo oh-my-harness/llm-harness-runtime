@@ -1,4 +1,4 @@
 # Research Notes
 
-- [Local decision-model benchmark handoff](2026-09-28-local-decision-benchmark.md):
-  revised measurement protocol, reproducible commands, and experiment status.
+- [Large vs small model agent-loop experiment](2026-09-28-local-decision-benchmark.md):
+  task accuracy, elapsed time, call counts, raw measurements and reproduction.
