@@ -152,3 +152,18 @@ A general small LLM (Qwen3.5-4B) still generates free-form tool calls and argume
 Pre-defined choices (mock Jev, simulated 100ms decision latency per step, **zero LLM calls**) are **10-57x faster** than the large LLM baseline. The add_comment task went from partial success to 100% because deterministic pre-defined choices eliminate format errors entirely.
 
 This validates the core Jev hypothesis: when decisions can be constrained to pre-defined options, removing LLM from the decision loop eliminates the dominant latency source.
+---
+
+## State-Based Jev Benchmark Results (2026-09-28)
+
+| Task | LLM 72B | State Jev | Speedup | Success |
+|------|---------|-----------|---------|---------|
+| rename_function | 4.23s, 4 LLM | **0.33s**, 0 LLM | **12.8x** | 100% / 100% |
+| add_comment | 2.72s, 3 LLM | **0.22s**, 0 LLM | **12.4x** | 100% / 100% |
+| create_readme | 1.79s, 2 LLM | **0.22s**, 0 LLM | **8.1x** | 100% / 100% |
+
+### Key Finding
+
+State-based rule decisions (not hardcoded, inspects actual workspace state each step, simulated ~100ms decision latency, zero LLM calls) achieve **8-13x speedup** with 100% success rate across all tasks.
+
+The state-based approach is closer to a real Jev model: it looks at the current state, selects from pre-defined options, and adapts based on previous tool results. Unlike the hardcoded mock, it can handle different initial states.
