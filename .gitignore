@@ -1,4 +1,6 @@
 /target/
+/node_modules/
+/logs/benchmarks/
 **/*.rs.bk
 Cargo.lock
 .cargo/config.toml

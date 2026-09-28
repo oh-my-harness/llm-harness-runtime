@@ -1,0 +1,10 @@
+{
+  "name": "harness-loop-benchmarks",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test scripts/tests/benchmark_jev_real.test.mjs",
+    "benchmark": "node scripts/benchmark_jev_real.mjs"
+  },
+  "dependencies": { "openai": "7.23.0" }
+}
