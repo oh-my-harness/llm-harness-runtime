@@ -1,115 +1,159 @@
-# Large vs Small Model: 20-Task Paired Experiment
+# 大小模型对照实验：20 个任务的速度与准确率
 
-Date: 2026-09-29, Asia/Shanghai.
+实验日期：2026-09-29，时区 Asia/Shanghai。
+实际运行时间：北京时间 00:33:55.598 至 00:38:17.769，共约 262.17 秒，包含预热、任务准备、运行和结果落盘。
 
-## Outcome
+## 实验目的与结论
 
-On this fixed synthetic file-task suite, both deployments passed 57/60 attempts
-(95%). The local small model was 4.05x faster on the 54 matched attempts both
-models completed correctly. This supports faster local execution for these
-tasks, not a general equivalence claim about coding quality.
+在相同 ReAct 循环、任务、工具和验收条件下，比较云端大模型与本地小模型完成任务的速度和准确率。
 
-| Metric | Cloud Qwen2.5-72B | Local Qwen3.5-4B |
+本轮两组均通过 57/60 次（95%）。在双方都正确完成的 54 对任务上，本地小模型约快 **4.05 倍**。这说明小模型在这批短文件任务上有速度优势，不代表两种模型的一般编程能力相同。
+
+## 实验环境
+
+| 项目 | 云端大模型组 | 本地小模型组 |
 | --- | --- | --- |
-| Correct attempts | 57/60 (95%) | 57/60 (95%) |
-| Task types passed in all repetitions | 19/20 | 19/20 |
-| Mean task time, all attempts | 3.452 s | 0.831 s |
-| Median task time | 3.240 s | 0.790 s |
-| Empirical p95 task time | 5.404 s | 1.198 s |
-| Total task elapsed, all attempts | 207.127 s | 49.888 s |
-| Model requests | 210 | 207 |
-| Mean requests per attempt | 3.50 | 3.45 |
-| Weighted mean request latency | 985.60 ms | 240.31 ms |
-| Tool calls | 150 | 147 |
-| Total tool time | 95.60 ms | 89.84 ms |
-| API failures | 0 | 0 |
-| Failed attempts ending in `done` | 3 | 3 |
+| 模型来源 | 通义千问，硅基流动托管推理 | 通义千问，Ollama 本地推理 |
+| 请求模型标识 | `Qwen/Qwen2.5-72B-Instruct` | `qwen3.5:4b` |
+| 参数规模 | 标称 72B | 标签 4B，Ollama 元数据标注 4.7B |
+| 接口地址 | `https://api.siliconflow.cn/v1` | `http://127.0.0.1:11434/v1` |
+| 推理硬件 | 未取得云端硬件信息 | NVIDIA GeForce RTX 5070 Ti |
+| 显存 | 未知 | 16303 MiB，约 16 GiB |
+| 模型精度 | 云端部署精度未确认 | Q4_K_M 量化 |
+| 推理服务 | SiliconFlow，服务端版本未知 | Ollama 0.34.4 |
+| 思考模式 | 未覆盖服务默认值 | `reasoning_effort=none` |
+| 上下文配置 | 服务默认值未确认 | 4096 token |
+| 连接方式 | 网络请求，包含网络和云端服务耗时 | 本机回环接口 |
 
-For matched successful pairs only: 54 pairs, mean large time 3.454 s versus
-small time 0.853 s, ratio 4.047. The remaining pairs are three large-only
-successes and three small-only successes; none failed for both. The all-attempt
-mean ratio is about 4.15, but includes failures and is not the primary successful
-speedup claim. Model requests account for over 99.7% of measured task time in
-both arms; tool time is negligible in this particular suite.
+两组客户端和文件工具均在同一台 Windows 主机执行：
 
-## Per-Task Results
+- 系统：Microsoft Windows 11 专业版，版本 10.0.26200，构建 26200。
+- CPU：AMD Ryzen 7 9800X3D，8 核。
+- 内存：系统报告 33,454,723,072 字节，约 31.16 GiB。
+- 软件：Node.js 24.14.1、OpenAI JavaScript SDK 7.23.0；NVIDIA 驱动 591.86。
+- 系统、CPU、内存为撰写本报告时在同一主机补查的数据；其他版本及 GPU 配置来自实验环境记录。未保存实验全过程的 CPU/GPU 利用率、温度、功耗和后台负载。
+- 实测确认模型在 GPU 上驻留：Ollama 报告模型大小与显存驻留大小均为 3,128,038,521 字节。该值不是整机显存总占用。
+- 本地模型摘要：`2a654d98e6fba55d452b7043684e9b57a947e393bbffa62485a7aac05ee4eefd`。
+- 本地服务配置：`OLLAMA_CONTEXT_LENGTH=4096`、`OLLAMA_KEEP_ALIVE=30m`、`OLLAMA_NO_CLOUD=1`，监听 `127.0.0.1:11434`。
+- 没有单独测量云端网络 RTT、排队时间、带宽或服务端吞吐。模型请求计时包含这些因素，因此比较的是两套实际部署方案，不能把差异全部归因于参数规模。
+- 仅显式统一了下面列出的请求参数。其余采样默认值未统一；本地模型元数据含 `presence_penalty=1.5`，云端对应值未知。缓存也未关闭或统一控制。
 
-Times are means across three attempts, including failures; calls include the
-final model `done` action. Each arm sees identical initial files.
+## 任务与运行条件
 
-| Task | Large correct | Large seconds | Large calls | Small correct | Small seconds | Small calls |
+| 条件 | 设置 |
+| --- | --- |
+| 任务集 | `paired-files-v1`，20 个手工构造的短文件任务 |
+| 重复次数 | 每题每个模型 3 次，共 120 次任务执行 |
+| 循环方式 | 相同的串行 ReAct 循环，每轮模型选择一个动作 |
+| 提示词版本 | `relative-paths-v2` |
+| 实验语言 | 系统提示词及任务描述均为英文；本次中文化仅修改说明文档，不改变已冻结的实验输入 |
+| 工具 | `read_file`、`write_file`、`list_files`、`grep`，以及结束动作 `done` |
+| 文件环境 | 每次创建独立临时工作区；两组初始文件完全一致；仅允许工作区内相对路径 |
+| 输出格式 | `response_format={"type":"json_object"}`，不等同于严格参数 schema 约束 |
+| 温度 | `temperature=0` |
+| 单次输出上限 | `max_tokens=256` |
+| 每题预算 | 最多 10 次模型决策 |
+| 请求超时 | 60 秒 |
+| SDK 自动重试 | 关闭，`maxRetries=0` |
+| 预热 | 每个接口先执行 1 次独立计时的预热请求 |
+| 运行顺序 | 每道题的大小模型依次运行；按题目和重复轮次交替先后顺序 |
+| 并发 | 不并发执行两个实验组；60 对任务中各有 30 对由大模型先运行 |
+| 任务顺序 | 题目顺序固定，未随机打乱 |
+| 验收 | 循环结束后由独立验收器检查最终文件，模型不能读取预期答案 |
+
+任务覆盖信息提取、单文件修改、多文件一致性、文件不存在时的回退，以及一次性读写失败后的恢复。任务定义见 `scripts/benchmarks/tasks-v1.json`。
+
+故障恢复题在指定操作第一次发生时注入一次临时读或写错误；之后同一操作可正常执行。框架不会替模型重试。每组应有 6 次注入，实测均发生。
+
+验收要求文件集合与预期一致，检查修改结果和未要求修改的内容。文本统一换行符并允许一个末尾换行差异；JSON 按解析后的值比较。验收器不执行 Python 代码，因此这是文件状态验收，不能视为真实仓库功能测试。精确文本要求也可能拒绝语义等价但写法不同的结果。
+
+## 指标与计时口径
+
+- 准确率 = 独立验收通过次数 / 全部测量次数。失败、超时和耗尽预算都计入分母。
+- 任务耗时从工作区准备完毕后开始，覆盖 agent 循环及紧随其后的最终验收；不包含临时文件准备、清理、结果落盘和预热。
+- 请求耗时覆盖完整模型请求，包含网络与服务等待；调用次数包括返回 `done` 的请求及失败请求。
+- 工具耗时与调用次数单独记录，`done` 不计作工具调用。
+- “双方均成功的加速比”只使用同题、同重复轮次、两组均通过的配对，计算两组平均耗时之比。
+- 预热请求：云端 0.652 秒，本地 3.894 秒；它们是实际初始化请求耗时，不是受控的全新进程或整机冷启动测量。
+- 同时保存所有尝试、仅成功尝试、仅失败尝试的耗时。失败结束得更快不能算作成功提速。
+- p95 使用最近秩方法计算。仅 60 次重复观测，尾部延迟估计仍不稳定。
+
+## 总体结果
+
+| 指标 | 云端 Qwen2.5-72B | 本地 Qwen3.5-4B |
+| --- | --- | --- |
+| 正确完成次数 | 57/60（95%） | 57/60（95%） |
+| 三遍全部通过的题目数 | 19/20 | 19/20 |
+| 平均任务耗时，含失败 | 3.452 秒 | 0.831 秒 |
+| 任务耗时中位数 | 3.240 秒 | 0.790 秒 |
+| 任务耗时 p95 | 5.404 秒 | 1.198 秒 |
+| 全部任务累计耗时 | 207.127 秒 | 49.888 秒 |
+| 模型请求总数 | 210 | 207 |
+| 每次任务平均请求数 | 3.50 | 3.45 |
+| 单次模型请求加权平均耗时 | 985.60 毫秒 | 240.31 毫秒 |
+| 工具调用总数 | 150 | 147 |
+| 工具累计耗时 | 95.60 毫秒 | 89.84 毫秒 |
+| API 失败次数 | 0 | 0 |
+| 返回 `done` 但验收失败 | 3 | 3 |
+
+双方均成功的 54 对任务中，大模型平均 3.454 秒，小模型平均 0.853 秒，加速比为 4.047。其余配对中，只有大模型成功 3 对，只有小模型成功 3 对，没有双方同时失败的配对。
+
+含失败的全部任务平均耗时比约 4.15，但不把它作为同等正确性下的主要加速结论。两组模型请求均占任务耗时的 99.7% 以上，工具耗时在本任务集中很小。
+
+## 逐题结果
+
+耗时为三次尝试的平均值，包含失败；调用数为每次任务的平均模型请求数。
+
+| 任务（标识） | 大模型通过 | 大模型秒数 | 大模型调用 | 小模型通过 | 小模型秒数 | 小模型调用 |
 | --- | --- | --- | --- | --- | --- | --- |
-| rename_function | 3/3 | 3.43 | 3 | 3/3 | 0.88 | 3 |
-| prepend_comment | 3/3 | 3.14 | 3 | 3/3 | 0.72 | 3 |
-| create_readme | 3/3 | 1.70 | 2 | 3/3 | 0.50 | 2 |
-| lookup_port | 3/3 | 2.73 | 3 | 3/3 | 0.68 | 3 |
-| sum_csv | 3/3 | 2.68 | 3 | 3/3 | 0.72 | 3 |
-| filter_json | 3/3 | 2.74 | 3 | 3/3 | 0.76 | 3 |
-| sort_unique | 3/3 | 3.03 | 3 | 3/3 | 0.73 | 3 |
-| toggle_json | 3/3 | 3.14 | 3 | 3/3 | 0.73 | 3 |
-| nested_json | 3/3 | 3.29 | 3 | 3/3 | 0.86 | 3 |
-| section_ini | 3/3 | 3.63 | 3 | 3/3 | 0.83 | 3 |
-| append_changelog | 0/3 | 2.54 | 2 | 3/3 | 0.84 | 3 |
-| targeted_replace | 3/3 | 3.18 | 3 | 3/3 | 0.80 | 3 |
-| rename_two_files | 3/3 | 4.84 | 5 | 3/3 | 1.25 | 5 |
-| sync_version | 3/3 | 5.69 | 6 | 3/3 | 1.33 | 6 |
-| split_lines | 3/3 | 3.94 | 4 | 3/3 | 0.91 | 4 |
-| merge_config | 3/3 | 3.78 | 4 | 3/3 | 0.92 | 4 |
-| missing_fallback | 3/3 | 3.28 | 4 | 3/3 | 0.89 | 4 |
-| transient_read | 3/3 | 4.34 | 4 | 0/3 | 0.43 | 2 |
-| transient_write | 3/3 | 4.27 | 5 | 3/3 | 0.92 | 5 |
-| conditional_update | 3/3 | 3.71 | 4 | 3/3 | 0.95 | 4 |
+| 函数重命名（rename_function） | 3/3 | 3.43 | 3 | 3/3 | 0.88 | 3 |
+| 前插注释（prepend_comment） | 3/3 | 3.14 | 3 | 3/3 | 0.72 | 3 |
+| 创建说明文件（create_readme） | 3/3 | 1.70 | 2 | 3/3 | 0.50 | 2 |
+| 查找端口（lookup_port） | 3/3 | 2.73 | 3 | 3/3 | 0.68 | 3 |
+| CSV 求和（sum_csv） | 3/3 | 2.68 | 3 | 3/3 | 0.72 | 3 |
+| JSON 筛选（filter_json） | 3/3 | 2.74 | 3 | 3/3 | 0.76 | 3 |
+| 去重排序（sort_unique） | 3/3 | 3.03 | 3 | 3/3 | 0.73 | 3 |
+| 修改开关（toggle_json） | 3/3 | 3.14 | 3 | 3/3 | 0.73 | 3 |
+| 修改嵌套配置（nested_json） | 3/3 | 3.29 | 3 | 3/3 | 0.86 | 3 |
+| 指定配置段修改（section_ini） | 3/3 | 3.63 | 3 | 3/3 | 0.83 | 3 |
+| 追加日志（append_changelog） | 0/3 | 2.54 | 2 | 3/3 | 0.84 | 3 |
+| 定向替换（targeted_replace） | 3/3 | 3.18 | 3 | 3/3 | 0.80 | 3 |
+| 跨文件重命名（rename_two_files） | 3/3 | 4.84 | 5 | 3/3 | 1.25 | 5 |
+| 同步版本（sync_version） | 3/3 | 5.69 | 6 | 3/3 | 1.33 | 6 |
+| 按行分类（split_lines） | 3/3 | 3.94 | 4 | 3/3 | 0.91 | 4 |
+| 合并配置（merge_config） | 3/3 | 3.78 | 4 | 3/3 | 0.92 | 4 |
+| 缺失文件回退（missing_fallback） | 3/3 | 3.28 | 4 | 3/3 | 0.89 | 4 |
+| 临时读错误恢复（transient_read） | 3/3 | 4.34 | 4 | 0/3 | 0.43 | 2 |
+| 临时写错误恢复（transient_write） | 3/3 | 4.27 | 5 | 3/3 | 0.92 | 5 |
+| 按条件更新（conditional_update） | 3/3 | 3.71 | 4 | 3/3 | 0.95 | 4 |
 
-## Failure Analysis
+## 失败分析
 
-- Large model: all three `append_changelog` attempts overwrote the original
-  changelog with only the new line, then incorrectly claimed the old content
-  was preserved. The validator correctly rejected the lost content.
-- Small model: all three `transient_read` attempts encountered the injected
-  one-shot read error and returned `done` asking the user to try again, instead
-  of retrying the operation. No output file was created. This is premature
-  termination, not a textual claim of successful completion.
-- The existing JSON field `falseCompletions` counts `done` plus failed validation.
-  It therefore includes both cases above; it does not distinguish an explicit
-  admission of failure from an incorrect claim of success.
-- Both models recovered from the injected write failure and missing-file
-  fallback in every attempt. No JSON parse or unknown-action errors occurred.
+- 大模型：同一道“追加日志”题三遍都覆盖了原内容，只保留新增行，却声称已保留原内容。验收器将其判为失败。
+- 小模型：同一道“临时读错误恢复”题三遍都在收到一次性读取错误后返回 `done`，要求用户重试，没有自行重试，也未创建输出文件。这是提前退出，不是文字上谎称成功。
+- 因此两组各失败三次，但失败的题目不同；不是各有三道不同的题目失败。其余 18 道题的全部重复均通过。
+- 现有 JSON 字段 `falseCompletions` 统计“返回 done 且验收失败”，同时包含承认失败后退出和错误声称成功两种情况。
+- 临时写错误和缺失文件回退，两组均全部通过。未出现 JSON 解析失败或未知动作错误。
 
-## Protocol and Provenance
+## 版本与数据
 
-- Inference code commit: `a668a68ba64a42398c91a9b4d8a4a3cf6f00d818`, pushed before
-  measurement. Prompt/task definitions and validators were not tuned during runs.
-- Task file: `scripts/benchmarks/tasks-v1.json`, version `paired-files-v1`.
-- Recorded suite-byte SHA256:
-  `586c089ae75b5cb56d5c9526eb6beefc5b8404beda90659b4a4050c367a4a91d`.
-- Twenty tasks, three repetitions, two models: 120 measured attempts. Each pair
-  runs sequentially; first-model order alternates by task and repetition. Each
-  model runs first in 30 of the 60 pairs. Task order itself is fixed.
-- Same ReAct prompt, tools, 10-step limit, 256 output-token limit, temperature
-  zero and 60-second request timeout. No SDK retries. Rules/routing are absent.
-- Fault recovery injects exactly one read or write error in the designated task
-  for each model/attempt. The scheduler does not retry for the model. All six
-  intended injections per model occurred.
-- Only prompts, initial workspace content and tool results reach model context.
-  Expected files are used by the offline evaluator after the loop ends.
-- Validators require the exact expected file set, normalized text content or
-  parsed JSON values. They check collateral changes. They do not run Python
-  code, and exact-text tasks may reject alternative but semantically valid edits.
-- Setup, cleanup and warmup are outside task timing. Warmup requests were
-  0.652 s cloud and 3.894 s local; these are observed initialization requests,
-  not a controlled measurement of fresh machine/server cold startup.
-- Local server: Ollama 0.34.4, RTX 5070 Ti, Q4_K_M, 4096 context, thinking off.
-  Model digest `2a654d98e6fba55d452b7043684e9b57a947e393bbffa62485a7aac05ee4eefd`.
-  GPU residency was verified. Cloud precision and server defaults remain unknown.
+- 实验代码提交：`a668a68ba64a42398c91a9b4d8a4a3cf6f00d818`，测量前已推送；运行中未调整题目、提示词或验收器。
+- 记录的任务文件字节 SHA256：`586c089ae75b5cb56d5c9526eb6beefc5b8404beda90659b4a4050c367a4a91d`。
+- 已提交的[测量数据](data/2026-09-29-paired-files-v1.json)包含整体、逐题、分类指标，逐次耗时、调用次数、失败后的文件内容、预热及原始 JSON 哈希。
+- 完整本地轨迹位于被 Git 忽略的 `logs/benchmarks/2026-09-29-paired-files-v1.json`。
+- 9 个离线测试通过，覆盖验收器错误样本、配对顺序、故障注入、失败计时和双方成功配对的加速计算。
 
-## Data and Reproduction
+## 复现命令
 
-The checked-in [measurement artifact](data/2026-09-29-paired-files-v1.json)
-contains overall/per-task/per-category metrics, each attempt's timings and
-counts, failed final files, warmups, and the source JSON hash. Full local traces
-are in ignored `logs/benchmarks/2026-09-29-paired-files-v1.json`.
+安装依赖并运行测试。若本地服务尚未启动，在独立终端运行启动脚本：
 
-With the local server running and `LARGE_API_KEY` securely provisioned:
+```powershell
+npm ci --ignore-scripts
+npm test
+./scripts/start-benchmark-ollama.ps1
+```
+
+确保本地已有 `qwen3.5:4b`，并通过进程环境安全提供 `LARGE_API_KEY`，不要把密钥写进命令、报告或仓库。执行：
 
 ```powershell
 node scripts/benchmark_jev_real.mjs --suite expanded --mode both --runs 3 `
@@ -120,20 +164,12 @@ node scripts/analyze_agent_benchmark.mjs `
   logs/benchmarks/paired-files-new-run-summary.json
 ```
 
-Nine offline tests pass, including validator mutations, paired order, fault
-recovery, failure-inclusive metrics and successful-pair speed calculations.
+每轮使用新的输出文件名，避免覆盖已有记录。
 
-## Scope of the Conclusion
+## 结论边界与下一步
 
-The experiment answers speed and accuracy for these 20 short, hand-authored
-tasks. Three repeats do not create 60 independent task types. They show stable
-behavior here, not a confidence interval for general coding capability.
-This suite is not a standard coding benchmark or a formal held-out dataset.
-Quantization, server defaults, thinking settings, network and caching differ;
-the result compares deployments, not only model size. A 100 ms request latency
-or 7-10x speedup was not observed: mean local request latency was 240 ms.
+这 20 个任务较短、由人工构造，不是标准编程基准或正式留出集。每题重复三次不等于 60 种独立任务，不能据此断言两种模型的一般能力相同。
 
-The next useful validation is a fresh, frozen set of longer repository tasks
-with execution-based tests and more recovery cases. Keep this run as-is and
-report its 95%/95% result with the different failure profiles, rather than
-claiming the two models are interchangeable.
+网络、量化、服务端默认参数、思考设置和缓存均可能影响结果。本轮没有观察到 100 毫秒平均请求延迟或 7–10 倍提速：小模型平均请求耗时约 240 毫秒。
+
+下一步应使用一套新固定的、更长的仓库任务，加入可执行测试和更多错误恢复场景，继续比较速度和准确率。本轮 95%/95% 的结果及不同失败类型保持原样。

@@ -1,7 +1,4 @@
-# Research Notes
+# 研究文档索引
 
-- [20-task paired results (2026-09-29)](2026-09-29-paired-files-results.md):
-  120 measured attempts, speed, accuracy, call counts, failure analysis and data.
-
-- [Large vs small model agent-loop experiment](2026-09-28-local-decision-benchmark.md):
-  task accuracy, elapsed time, call counts, raw measurements and reproduction.
+- [20 个任务的大小模型对照结果（2026-09-29）](2026-09-29-paired-files-results.md)：实验环境与条件、120 次实测、速度、准确率、调用次数、失败分析和数据。
+- [实验目的、统计口径与早期记录](2026-09-28-local-decision-benchmark.md)：通用测量定义、历史三题结果和进度记录。

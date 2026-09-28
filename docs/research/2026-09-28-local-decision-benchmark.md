@@ -1,164 +1,98 @@
-# Large vs Small Model Agent-Loop Experiment
+# 大小模型 Agent 循环实验：目的、口径与早期记录
 
-Updated: 2026-09-29, Asia/Shanghai.
-Research issue: https://github.com/oh-my-harness/llm-harness-runtime/issues/259
+更新日期：2026-09-29，时区 Asia/Shanghai。
+研究任务：[GitHub issue #259](https://github.com/oh-my-harness/llm-harness-runtime/issues/259)。
 
-Latest experiment: [20-task paired results, 2026-09-29](2026-09-29-paired-files-results.md).
-The smoke results below are earlier measurements, not the latest accuracy estimate.
+最新完整实验见 [20 个任务的对照结果](2026-09-29-paired-files-results.md)，其中包含硬件、软件、模型、参数、运行顺序和计时条件。本文保留通用口径与早期三题记录，不能把早期结果当作最新准确率。
 
-## Objective
+## 实验目的
 
-Measure whether a local small model completes the same agent tasks faster than
-a cloud large model, and how task accuracy changes. Both models use the same
-sequential ReAct loop, prompts, tools, task inputs, budgets and final-state
-validators. The two experiment arms are:
+比较云端大模型与本地小模型在相同 ReAct 循环、任务、提示词、工具、预算和独立验收条件下的速度与准确率。
 
-- Large: SiliconFlow `Qwen/Qwen2.5-72B-Instruct`.
-- Small: local Ollama `qwen3.5:4b` on RTX 5070 Ti.
+- 大模型：硅基流动 `Qwen/Qwen2.5-72B-Instruct`。
+- 小模型：RTX 5070 Ti 上通过 Ollama 运行的 `qwen3.5:4b`。
 
-Primary outcomes are elapsed task time and independently verified task success.
-Model/tool call counts and timings explain the observed speed. A model claiming
-completion is not evidence of success. Faster failure is not successful speedup.
-This compares deployment options, including network and inference backends; it
-does not isolate parameter count as the cause of a difference.
+主要指标是任务耗时与独立验收成功率；模型和工具调用次数、耗时用于解释速度差异。模型自行声称完成不等于成功，快速失败也不算成功加速。比较包含网络与推理服务的实际部署差异，不能只归因于模型大小。
 
-## Environment
+## 统一记录口径
 
-- Windows, RTX 5070 Ti, 16303 MiB VRAM, driver 591.86.
-- Node 24.14.1, OpenAI JavaScript SDK 7.23.0, Ollama 0.34.4.
-- Local model: Q4_K_M, metadata parameter size 4.7B, context length 4096.
-- Model digest: `2a654d98e6fba55d452b7043684e9b57a947e393bbffa62485a7aac05ee4eefd`.
-- Ollama reported model and GPU-resident size both 3,128,038,521 bytes.
-- Cloud inference precision is unknown. Local thinking is explicitly disabled;
-  cloud thinking uses its default. Other backend sampling defaults may differ.
-- Portable server and models are in sibling `benchmark/tools/ollama` and
-  `benchmark/models`. Service address: `127.0.0.1:11434`.
+- 准确率 = 验收通过次数 / 全部尝试次数。超时、API 错误、预算耗尽和错误输出均计入分母。
+- 每次保存任务耗时、模型和工具累计耗时、单次调用耗时、调用次数、步数、结束原因、错误、最终文件及执行轨迹。
+- 模型调用次数包含失败请求和返回 `done` 的请求；`done` 不计作工具调用。
+- `falseCompletions` 定义为返回 `done` 但验收失败；这个字段也包含承认失败后提前退出，不专指谎称成功。
+- 整体与逐题汇总包括准确率、累计/平均/中位数/p95 耗时、仅成功与仅失败的平均耗时、调用次数、按总调用数加权的单次调用平均耗时。无样本时用 null，不用零。
+- 比较加速时优先选择同题、同轮次、双方均通过的配对，避免成功任务组成不同造成误判。
+- 预热单独计时。任务计时从工作区准备后开始，包括循环与紧随其后的最终验收，不含准备、清理和结果落盘。
+- 早期一次本地冷加载探测耗时 61.202 秒，仅代表那次观测，不作为每次冷启动的固定值，也不混入预热后的任务耗时。
+- 请求超时 60 秒、最多 10 次模型决策、每次输出最多 256 token、温度零；SDK 不自动重试。每个接口一次预热，每题重复三遍。
+- 每次任务使用独立临时工作区，仅提供相对路径的读、写、列文件和搜索工具，不执行 shell。
+- `formatErrors` 只统计 JSON 解析和未知动作错误，不覆盖所有参数结构错误；这些问题还需结合工具错误、轨迹和验收结果判断。
 
-## Measurement Contract
+schema 4 新增持久化汇总和逐次工具耗时。早期 schema 3 数据只含工具累计耗时，没有补造逐次耗时。提示词版本保持 `relative-paths-v2`。
 
-- Accuracy = independently passed attempts / all measured attempts, including
-  timeouts, API failures, exhausted budgets and incorrect results in the denominator.
-- Record every task's elapsed time, cumulative model/tool time, individual call
-  latencies, model/tool call counts, steps, termination reason, errors, final
-  files, and model/tool trace. Model calls include failed requests and `done`.
-- Count false completion when the model returns `done` but final-state validation fails.
-- Persist overall and per-task summaries: accuracy, total/mean/median/p95 elapsed,
-  success-only and failure-only mean elapsed, request counts and weighted mean
-  per-call latency. Undefined means are null, not zero.
-- All-attempt elapsed includes failures. Success-only means can have different
-  task mixes, so compare paired task classes with success rates alongside speed.
-- Warmup is timed separately; setup and cleanup are excluded from task timing.
-  A previous local cold-load probe took 61.202 seconds; do not mix it into warm
-  task latency or assume this is the cold-start time on every launch.
-- No hidden SDK retries. Request timeout 60 seconds, 10 model steps, 256 output
-  tokens, temperature zero, one warmup and three measured repetitions per task.
-- Fresh temporary workspace per attempt. Tools are read/write/list/grep; all
-  paths are relative and confined to that workspace. No shell execution.
-- Rename/comment validators preserve original content and normalize CRLF and one
-  optional final newline. README validation checks the required phrase.
-- `formatErrors` measures JSON parsing and unknown actions, not full argument
-  schema compliance. Tool errors, trace and final-state validation capture the
-  currently observed malformed argument cases.
+## 早期三题结果
 
-Schema 4 adds persisted summaries and per-tool-call latencies. Existing schema-3
-two-model results below are retained without rewriting raw measurements; their
-aggregate tool timings are available but individual tool timings were not saved.
-Prompt version remains `relative-paths-v2`; metric changes do not change prompts.
+来源：`logs/benchmarks/2026-09-28-relative-react.json`。每个模型三个任务、每题三遍，耗时包含失败。
 
-## Earlier Smoke Results
-
-Source: `logs/benchmarks/2026-09-28-relative-react.json`, 3 tasks x 3 repetitions
-per model, identical relative-path prompt. Times include failed attempts.
-
-| Task | Large accuracy | Large mean time | Large calls/attempt | Small accuracy | Small mean time | Small calls/attempt |
+| 任务 | 大模型通过 | 大模型平均秒数 | 大模型调用/次 | 小模型通过 | 小模型平均秒数 | 小模型调用/次 |
 | --- | --- | --- | --- | --- | --- | --- |
-| rename_function | 3/3 | 3.81 s | 4 | 3/3 | 0.88 s | 4 |
-| add_comment | 0/3 | 2.03 s | 2 | 3/3 | 0.60 s | 3 |
-| create_readme | 3/3 | 2.31 s | 3 | 0/3 | 1.22 s | 4 |
+| 函数重命名（rename_function） | 3/3 | 3.81 | 4 | 3/3 | 0.88 | 4 |
+| 添加注释（add_comment） | 0/3 | 2.03 | 2 | 3/3 | 0.60 | 3 |
+| 创建说明（create_readme） | 3/3 | 2.31 | 3 | 0/3 | 1.22 | 4 |
 
-| Metric, across nine attempts | Large | Small |
+| 九次尝试汇总 | 大模型 | 小模型 |
 | --- | --- | --- |
-| Accuracy | 6/9 (66.7%) | 6/9 (66.7%) |
-| False completion | 3/9 | 3/9 |
-| Total model calls | 27 | 33 |
-| Total tool calls | 18 | 24 |
-| Total task elapsed | 24.446 s | 8.113 s |
-| Weighted mean model-call time | 904.69 ms | 245.43 ms |
-| Mean elapsed | 2.716 s | 0.901 s |
-| Median elapsed | 2.527 s | 0.875 s |
-| Empirical p95 elapsed | 4.007 s | 1.235 s |
-| Mean tool time per task | 1.52 ms | 1.02 ms |
+| 准确率 | 6/9（66.7%） | 6/9（66.7%） |
+| done 后验收失败 | 3/9 | 3/9 |
+| 模型调用总数 | 27 | 33 |
+| 工具调用总数 | 18 | 24 |
+| 任务累计耗时 | 24.446 秒 | 8.113 秒 |
+| 单次模型调用加权平均耗时 | 904.69 毫秒 | 245.43 毫秒 |
+| 平均任务耗时 | 2.716 秒 | 0.901 秒 |
+| 任务耗时中位数 | 2.527 秒 | 0.875 秒 |
+| 任务耗时 p95 | 4.007 秒 | 1.235 秒 |
+| 每题平均工具耗时 | 1.52 毫秒 | 1.02 毫秒 |
 
-Machine-readable summaries derived from the unchanged raw record are saved in
-`logs/benchmarks/2026-09-28-relative-react-summary.json`. This is re-aggregation
-of existing measurements, not a new inference run.
+衍生汇总保存于 `logs/benchmarks/2026-09-28-relative-react-summary.json`，只是对原数据重新汇总，不是新一次推理实验。
 
-Large-model comment edits erased existing content. Small-model README calls
-placed arguments outside `args`, failed, and then falsely claimed completion.
-Only rename succeeded for both arms in this run; on that task the small model
-was about 4.3x faster. Equal aggregate accuracy does not mean equal capability,
-since different tasks failed. Do not describe the overall 3x time ratio as
-quality-preserving speedup.
+大模型在注释题覆盖了原文件；小模型在 README 题把参数放在 `args` 外，调用失败后声称完成。只有重命名题双方全部通过，小模型在该题约快 4.3 倍。总体准确率相同，但失败题目不同，不能把全部尝试的约三倍耗时比称为同等质量加速。
 
-These are three task types, not nine independent task types. Nearest-rank p95
-with nine samples equals the maximum. Fixed arm order, caching, deployment and
-sampling differences remain limitations. This smoke suite cannot establish
-general coding accuracy or production readiness.
+此轮只有三个题型，九次观测的最近秩 p95 就是最大值，且模型组固定先后运行。它不能建立一般编程准确率或生产可用性的结论。
 
-## Earlier Measurements
+## 更早的测量记录
 
-The following local files use an earlier prompt and must not be pooled with the
-latest run:
+以下文件位于本地 `logs/benchmarks/`，使用更早的提示词，不与上述结果或新 20 题结果混合统计：
 
-- `2026-09-28-cloud-72b-v2.json`: cloud 9/9, mean task times 4.35/3.14/2.69 s.
-- `2026-09-28-local-qwen35-4b.json`: local 6/9, mean times 0.73/0.60/0.54 s;
-  comment failures used absolute paths and falsely claimed completion.
-- `2026-09-28-cloud-72b.json`: diagnostic schema-1 run with a faulty final-newline
-  validator. Its success fields are not valid corrected scores. Trace inspection
-  also found one genuine timeout and one destructive comment edit.
+- `2026-09-28-cloud-72b-v2.json`：云端 9/9，三个任务平均 4.35、3.14、2.69 秒。
+- `2026-09-28-local-qwen35-4b.json`：本地 6/9，三个任务平均 0.73、0.60、0.54 秒；注释题使用绝对路径而失败。
+- `2026-09-28-cloud-72b.json`：schema 1 诊断运行，验收器曾错误要求末尾换行，不能直接使用原 success 字段作为修正后的分数；轨迹另发现一次真实超时和一次覆盖原内容的注释编辑。
 
-All raw files are under ignored `logs/benchmarks/`; credentials are never part
-of reports or commits. Simulated timings are not evidence for the real-model
-speed or accuracy question.
+原始日志由 Git 忽略，密钥不进入报告或提交。模拟耗时不能用作真实模型速度与准确率的证据。
 
-## Reproduction
+## 复现早期三题实验
+
+使用最新版完整实验的环境准备说明，并通过环境变量安全提供 `LARGE_API_KEY`：
 
 ```powershell
-npm ci --ignore-scripts
-npm test
-# Start only if the local server is not already running:
-./scripts/start-benchmark-ollama.ps1
-```
-
-In another terminal, with `LARGE_API_KEY` securely provisioned in the environment:
-
-```powershell
-node scripts/benchmark_jev_real.mjs --mode both --runs 3 `
+node scripts/benchmark_jev_real.mjs --suite smoke --mode both --runs 3 `
   --small-model qwen3.5:4b --small-base-url http://127.0.0.1:11434/v1 `
-  --small-thinking off --output logs/benchmarks/paired-new-run.json
+  --small-thinking off --output logs/benchmarks/smoke-new-run.json
 ```
 
-Use a unique output path. Localhost needs no real API credential. For small-only
-checks use `--mode small`. Read `summary.large` and `summary.small` in the JSON
-for overall and per-task metrics; retain `results` for inspection and re-scoring.
+每次使用新的输出路径；只测本地时使用 `--mode small`。JSON 中的 `summary.large`、`summary.small` 包含整体和逐题统计，`results` 保留原始结果以供复核。
 
-## Progress
+## 进度记录
 
-- [x] Deploy local model and run the same ReAct loop against both endpoints.
-- [x] Record paired smoke results, latency, calls, accuracy and false completion.
-- [x] Persist explicit overall/per-task summaries and individual tool timings.
-- [x] Expand the frozen task suite to 20 tasks with independently tested validators.
-- [x] Run 60 attempts per model in alternating paired order and assess speed versus accuracy.
+- [x] 部署本地模型，用同一 ReAct 循环调用两个接口。
+- [x] 保存早期配对结果、耗时、调用次数、准确率及失败情况。
+- [x] 增加整体/逐题汇总和单次工具耗时。
+- [x] 固定 20 个任务及独立测试过的验收器。
+- [x] 每组运行 60 次，交替先后顺序，完成速度与准确率对照。
 
-Progress log:
-- 2026-09-28: Completed initial and corrected-prompt large/small runs.
-- 2026-09-28: User clarified the scope as two-model speed and quality comparison;
-  consolidated documentation and measurement definitions accordingly.
-- 2026-09-29: Added `paired-files-v1`, with input extraction, edits, multi-file
-  consistency, missing-file fallback and one-shot read/write fault recovery.
-  Expected outputs are confined to the offline evaluator. Both arms receive
-  the same inputs and fault schedule. Suite hash and all 120 scheduled attempts
-  are recorded. Prompt and limits are frozen before inference.
-- 2026-09-29: Finished 120 attempts. Both arms passed 57/60; local was 4.05x
-  faster on 54 matched successful pairs. Published measurements and separate
-  failure analysis in the dated results report. Nine offline tests pass.
+进度日志：
+
+- 2026-09-28：完成初始和相对路径提示词两轮大小模型测量。
+- 2026-09-28：明确仅比较两个模型的速度和质量，统一实验口径。
+- 2026-09-29：固定 `paired-files-v1`，覆盖提取、编辑、多文件一致性和错误恢复；预期答案仅用于离线验收，记录任务集哈希和全部 120 次运行顺序。
+- 2026-09-29：完成 120 次实测，两组各 57/60；双方成功的 54 对任务上本地快 4.05 倍，9 个离线测试通过。
+- 2026-09-29：文档改为中文，并补查、补充实验环境与条件。
