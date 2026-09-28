@@ -11,8 +11,6 @@ cargo build --release -p llm-harness-sandbox-gateway --bin sandbox-gateway
 ./target/release/sandbox-gateway gateway.json
 ```
 
-可复制的生产模板和 systemd 单元见 [`deploy/README.md`](../deploy/README.md)。
-
 gateway 默认绑定 `127.0.0.1:7080`。生产部署应继续绑定内网地址，由 Caddy、Nginx、Cloudflare Tunnel 或 Tailscale Funnel 终止 TLS。
 
 ## 配置
@@ -132,49 +130,6 @@ credential store 写入失败时，gateway 保持内存凭证不变，并返回 
 ## 探活和日志
 
 `/healthz` 和 `/readyz` 是公开端点，返回 backend 和状态，可用于 reverse proxy 或容器编排器探活。业务路由仍要求 bearer token。
-
-`/metrics` 返回 Prometheus 文本格式，包含按 method/route/principal/status 统计的请求总量和耗时、活跃 sandbox 数。它需要 bearer token，不要暴露到公网；建议只让内网监控进程或本地 exporter 拉取。
-
-## 反向代理和 TLS
-
-gateway 本身不做 TLS 终止。下面是最小 Caddy 示例；把它放在 gateway 前面，只暴露 HTTPS 入口：
-
-```caddyfile
-gateway.example.com {
-    reverse_proxy 127.0.0.1:7080
-}
-```
-
-Nginx 的对应示例：
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name gateway.example.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:7080;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_read_timeout 3600s;
-    }
-}
-```
-
-没有公网 IP 或不想开放端口时，可以用 Cloudflare Tunnel：
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:7080
-```
-
-Tailscale Funnel 也适合个人或小团队部署：
-
-```bash
-tailscale funnel 7080
-```
-
-无论选择哪种入口，都不要把 gateway 直接暴露为公网 plain HTTP。Agent control service 连接非 loopback gateway 时也应使用 HTTPS；只有 loopback 的测试环境才允许 `allow_insecure_http`。
 
 日志级别通过 `RUST_LOG` 控制，例如：
 
