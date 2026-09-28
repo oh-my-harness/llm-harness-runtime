@@ -15,6 +15,7 @@
 
 use llm_harness_agent::AgentHarness;
 use llm_harness_types::RunRequest;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::task::{AbortHandle, JoinHandle};
 use tracing::{debug, error, warn};
@@ -152,6 +153,48 @@ fn final_no_response_entry(entries: &[SessionEntry]) -> Option<EntryId> {
     } else {
         None
     }
+}
+
+/// Return the newest plain assistant text added during a run.
+fn final_plain_text(entries: &[SessionEntry]) -> Option<String> {
+    entries.iter().rev().find_map(|entry| {
+        let SessionEntryPayload::Message(AgentMessage::Assistant(message)) = &entry.payload else {
+            return None;
+        };
+        let has_tool_call = message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }));
+        if has_tool_call {
+            return None;
+        }
+        let text = message.text_content().trim().to_string();
+        (!text.trim().is_empty() && text.trim() != NO_RESPONSE).then_some(text)
+    })
+}
+
+/// Whether the run already delivered a public reply through a social tool.
+fn public_reply_was_sent(entries: &[SessionEntry]) -> bool {
+    entries.iter().any(|entry| {
+        let SessionEntryPayload::Message(AgentMessage::Assistant(message)) = &entry.payload else {
+            return false;
+        };
+        message.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::ToolUse { name, .. }
+                    if name == "broadcast" || name == "send_message"
+            )
+        })
+    })
+}
+
+async fn prior_entry_ids(harness: &AgentHarness) -> HashSet<EntryId> {
+    harness
+        .read_active_path()
+        .await
+        .map(|entries| entries.into_iter().map(|entry| entry.id).collect())
+        .unwrap_or_default()
 }
 
 /// Remove a just-created sentinel response and report whether it was removed.
@@ -588,7 +631,14 @@ impl AgentRunner {
                     .all(|m| m.message_type == crate::inbox::MessageType::ReflectionTrigger);
                 let text = format_inbox_messages(&messages);
                 let mut request = RunRequest::from_text(text);
-                if let Some(group) = group_reply_context(&messages) {
+                let group_context = group_reply_context(&messages);
+                let is_group_reply = group_context.is_some();
+                let prior_entries = if group_context.is_some() {
+                    prior_entry_ids(&harness).await
+                } else {
+                    HashSet::new()
+                };
+                if let Some(group) = group_context {
                     request = request.with_extension(group);
                 }
                 if let Some(access) = &knowledge_access {
@@ -636,6 +686,19 @@ impl AgentRunner {
                             consecutive_failures = 0;
                             if !is_reflection_run {
                                 no_response_run = discard_no_response_entry(&harness).await;
+                            }
+                            if is_group_reply {
+                                if let Ok(entries) = harness.read_active_path().await {
+                                    let new_entries = entries
+                                        .into_iter()
+                                        .filter(|entry| !prior_entries.contains(&entry.id))
+                                        .collect::<Vec<_>>();
+                                    if !public_reply_was_sent(&new_entries)
+                                        && let Some(body) = final_plain_text(&new_entries)
+                                    {
+                                        let _ = ctx.broadcast(&agent_id, &body);
+                                    }
+                                }
                             }
                             ctx.ack_inbox_messages(&messages);
                         }
@@ -1643,6 +1706,49 @@ mod tests {
             )),
             "the triggering group message should remain in context"
         );
+        assert!(
+            !ctx.group_history(10)
+                .iter()
+                .any(|message| message.body == NO_RESPONSE),
+            "sentinel reply must not enter public chat history"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_final_answer_to_broadcast_becomes_public_reply() {
+        let harness = Arc::new(
+            AgentHarness::new_in_memory(
+                Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![
+                    llm_harness_loop::test_utils::MockResponse::text("plain final answer"),
+                ])) as std::sync::Arc<dyn llm_harness_loop::LlmClient>,
+                Arc::new(llm_harness_loop::test_utils::NoOpEnv),
+                llm_harness_agent::AgentHarnessOptions::new("test-model"),
+            )
+            .await,
+        );
+        let ctx = SocialContext::new(10);
+        let alice = AgentId::new("alice");
+        ctx.register_agent(alice.clone(), "rust");
+        ctx.register_agent(AgentId::new("operator"), "operator");
+        ctx.push_message(broadcast_message("please answer"));
+
+        let runner = AgentRunner::new(alice.clone(), harness.clone(), ctx.clone(), None, None);
+        let task = runner.spawn();
+        for _ in 0..200 {
+            if ctx.get_agent_info(&alice).map(|info| info.status) == Some(AgentStatus::Idle)
+                && !ctx.has_messages(&alice)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            ctx.group_history(10)
+                .iter()
+                .any(|message| message.from == alice && message.body == "plain final answer")
+        );
+        task.abort();
     }
 
     #[tokio::test]
