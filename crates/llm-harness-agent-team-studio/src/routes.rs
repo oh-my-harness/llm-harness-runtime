@@ -629,8 +629,14 @@ async fn pulse(State(state): State<AppState>, Query(q): Query<PulseQuery>) -> Re
             StatusCode::NOT_FOUND,
         );
     };
-    let mut snap = crate::pulse::snapshot(&project.team).await;
-    snap["pending"] = crate::pulse::pending_traffic(&project.team)["pending"].clone();
+    let member_ids = project
+        .spec
+        .members
+        .iter()
+        .map(|member| member.id.clone())
+        .collect::<Vec<_>>();
+    let mut snap = crate::pulse::snapshot(&project.team, &member_ids).await;
+    snap["pending"] = crate::pulse::pending_traffic(&project.team, &member_ids)["pending"].clone();
     snap["timers"] = serde_json::json!({ "pending": crate::pulse::pending_timers(&project.team) });
     snap["issues"] = {
         let list = project.issues.list().unwrap_or_default();

@@ -8,8 +8,6 @@
 
 use llm_harness_agent_team::{AgentId, AgentTeam, SocialContext};
 
-use crate::roles::ROLE_IDS;
-
 /// One member's current situation.
 async fn agent_pulse(team: &AgentTeam, id: &str) -> serde_json::Value {
     let agent_id = AgentId::new(id);
@@ -53,7 +51,7 @@ async fn agent_pulse(team: &AgentTeam, id: &str) -> serde_json::Value {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
-                if !text.is_empty() {
+                if !text.is_empty() && text.trim() != "Your todolist is empty." {
                     task = Some(text.chars().take(120).collect());
                 }
             }
@@ -96,13 +94,9 @@ async fn agent_pulse(team: &AgentTeam, id: &str) -> serde_json::Value {
 }
 
 /// The pulse snapshot for one project's team.
-pub async fn snapshot(team: &AgentTeam) -> serde_json::Value {
+pub async fn snapshot(team: &AgentTeam, member_ids: &[String]) -> serde_json::Value {
     let mut agents = Vec::new();
-    // The operator has no harness; skip it here (its pending inbox is
-    // surfaced separately as operator traffic).
-    let mut members: Vec<&str> = ROLE_IDS.to_vec();
-    members.push(crate::scout::SCOUT_ID);
-    for id in members {
+    for id in member_ids {
         agents.push(agent_pulse(team, id).await);
     }
     serde_json::json!({ "agents": agents })
@@ -115,13 +109,12 @@ pub async fn snapshot(team: &AgentTeam) -> serde_json::Value {
 /// design; instead we snapshot what is *pending* per agent plus what the
 /// inspector already streams. The panel combines this with its live WS
 /// feed, so nothing is lost.
-pub fn pending_traffic(team: &AgentTeam) -> serde_json::Value {
+pub fn pending_traffic(team: &AgentTeam, member_ids: &[String]) -> serde_json::Value {
     let mut pending = Vec::new();
     if let Some(ctx) = team.social_context() {
-        let mut members: Vec<&str> = ROLE_IDS.to_vec();
-        members.push(crate::scout::SCOUT_ID);
-        members.push("operator");
-        for id in members {
+        let mut ids = member_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        ids.push("operator");
+        for id in ids {
             let agent = AgentId::new(id);
             for msg in ctx.drain_inbox(&agent) {
                 // Draining mutates; returning them keeps state intact.
@@ -196,10 +189,11 @@ mod tests {
     #[tokio::test]
     async fn snapshot_lists_all_members_with_activity_shape() {
         let mut team = built_team().await;
-        let snap = snapshot(&team).await;
+        let members = built_members();
+        let snap = snapshot(&team, &members).await;
         let agents = snap["agents"].as_array().unwrap();
         let ids: Vec<&str> = agents.iter().map(|a| a["id"].as_str().unwrap()).collect();
-        assert_eq!(ids.len(), ROLE_IDS.len() + 1); // roles + scout (operator excluded)
+        assert_eq!(ids.len(), members.len()); // operator excluded
         assert!(ids.contains(&"planner"));
         assert!(!ids.contains(&"operator"), "operator has no harness");
         for a in agents {
@@ -213,12 +207,26 @@ mod tests {
     async fn pending_traffic_drains_without_loss() {
         let mut team = built_team().await;
         team.submit("planner", "fix the bug").unwrap();
-        let v = pending_traffic(&team);
+        let members = built_members();
+        let v = pending_traffic(&team, &members);
         let pending = v["pending"].as_array().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0]["to"], "planner");
         assert!(pending[0]["body"].as_str().unwrap().contains("fix the bug"));
         team.shutdown();
+    }
+
+    fn built_members() -> Vec<String> {
+        let tier = ModelTier {
+            strong: "m".into(),
+            main: "m".into(),
+            cheap: "m".into(),
+        };
+        crate::roles::RoleSet::standard(&tier)
+            .specs
+            .iter()
+            .map(|spec| spec.id().as_str().to_string())
+            .collect()
     }
 
     #[tokio::test]
