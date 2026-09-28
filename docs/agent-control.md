@@ -90,7 +90,20 @@ cargo run -p llm-harness-agent-control --bin agent-control -- agent-control.json
 
 ## SSE 事件
 
-`/events` 返回的事件类型包括：
+`/events` 返回的每个事件的 `data` 是一行 JSON，格式为设计文档中定义的信封结构：
+
+```json
+{
+  "type": "text_delta",
+  "session_id": "...",
+  "timestamp": "...",
+  "data": {
+    "text": "..."
+  }
+}
+```
+
+事件类型包括：
 
 - `text_delta`：模型输出的增量文本；
 - `tool_started` / `tool_finished`：工具开始和结束；
@@ -99,7 +112,7 @@ cargo run -p llm-harness-agent-control --bin agent-control -- agent-control.json
 - `aborted`：请求中止；
 - `session_closed`：session 已删除或服务正在停止。
 
-每个事件的 `data` 是一行 JSON。为了避免中间断线后丢失所有内容，MVP 使用有界的 broadcast 队列；客户端连接较慢时可能收到 `failed` 事件，提示已经落后了多少条事件。
+顶层 `data` 字段包含事件负载。为了避免中间断线后丢失所有内容，MVP 使用有界的 broadcast 队列；客户端连接较慢时可能收到 `failed` 事件，提示已经落后了多少条事件。
 
 ## 安全边界
 
