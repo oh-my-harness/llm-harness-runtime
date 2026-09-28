@@ -1,6 +1,6 @@
 # Large vs Small Model Agent-Loop Experiment
 
-Updated: 2026-09-28, Asia/Shanghai.
+Updated: 2026-09-29, Asia/Shanghai.
 Research issue: https://github.com/oh-my-harness/llm-harness-runtime/issues/259
 
 ## Objective
@@ -144,10 +144,15 @@ for overall and per-task metrics; retain `results` for inspection and re-scoring
 - [x] Deploy local model and run the same ReAct loop against both endpoints.
 - [x] Record paired smoke results, latency, calls, accuracy and false completion.
 - [x] Persist explicit overall/per-task summaries and individual tool timings.
-- [ ] Expand the frozen task suite with more task types and unseen inputs.
-- [ ] Repeat both arms in counterbalanced order and assess speed versus accuracy.
+- [x] Expand the frozen task suite to 20 tasks with independently tested validators.
+- [~] Run 60 attempts per model in alternating paired order and assess speed versus accuracy.
 
 Progress log:
 - 2026-09-28: Completed initial and corrected-prompt large/small runs.
 - 2026-09-28: User clarified the scope as two-model speed and quality comparison;
   consolidated documentation and measurement definitions accordingly.
+- 2026-09-29: Added `paired-files-v1`, with input extraction, edits, multi-file
+  consistency, missing-file fallback and one-shot read/write fault recovery.
+  Expected outputs are confined to the offline evaluator. Both arms receive
+  the same inputs and fault schedule. Suite hash and all 120 scheduled attempts
+  are recorded. Prompt and limits are frozen before inference.

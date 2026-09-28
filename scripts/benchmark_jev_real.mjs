@@ -14,6 +14,7 @@
 import { OpenAI } from "openai";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, mkdirSync } from "node:fs";
 import { summarizeResults } from "./benchmark_metrics.mjs";
+import { expandedTasks, suiteHash, suiteDefinition, buildSchedule } from "./benchmark_suite.mjs";
 import { join, resolve, relative, isAbsolute, dirname } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -31,6 +32,8 @@ const TIMEOUT = Number(arg("timeout-ms", "60000"));
 const WARMUPS = Number(arg("warmups", "1"));
 const OUTPUT = resolve(arg("output", `logs/benchmarks/jev-${Date.now()}.json`));
 const MODE = arg("mode", "both");
+const SUITE = arg("suite", "smoke");
+if (!["smoke", "expanded"].includes(SUITE)) throw new Error("Invalid --suite");
 if (args.includes("--policy")) throw new Error("--policy is no longer supported; this benchmark compares large and small models in the same ReAct loop");
 if (!["both", "large", "small"].includes(MODE)) throw new Error("Invalid --mode");
 if (!Number.isInteger(RUNS) || RUNS < 1 || !Number.isInteger(WARMUPS) || WARMUPS < 0 || !Number.isFinite(TIMEOUT) || TIMEOUT <= 0) throw new Error("Invalid runs, warmups, or timeout");
@@ -51,7 +54,7 @@ const configs = Object.entries({ large: LARGE_MODEL, small: SMALL_MODEL })
 // Tasks
 // ---------------------------------------------------------------------------
 
-const TASKS = [
+const SMOKE_TASKS = [
   {
     id: "rename_function",
     prompt: "Read app.py, rename 'old_name' to 'new_name' everywhere, then verify the change.",
@@ -71,6 +74,7 @@ const TASKS = [
     verify: (ws) => { try { return readFileSync(join(ws, "README.md"), "utf-8").includes("Hello World"); } catch { return false; } },
   },
 ];
+const TASKS = SUITE === "expanded" ? expandedTasks : SMOKE_TASKS;
 
 // ---------------------------------------------------------------------------
 // Tools
@@ -125,6 +129,8 @@ function newMetrics(model) {
 }
 
 async function runAgent(config, task, ws, metrics) {
+  let faultPending = Boolean(task.fault);
+  metrics.injectedFaults = 0;
   const system = buildSystemPrompt();
   const messages = [
     { role: "system", content: system },
@@ -179,7 +185,9 @@ async function runAgent(config, task, ws, metrics) {
     }
 
     const t2 = performance.now();
-    const result = executeTool(action, args, ws);
+    const injectFault = faultPending && task.fault.action === action && task.fault.path === args.path;
+    const result = injectFault ? "error: temporary I/O failure; retry this operation" : executeTool(action, args, ws);
+    if (injectFault) { faultPending = false; metrics.injectedFaults++; }
     metrics.trace.at(-1).toolResult = result;
     if (result.startsWith("error:")) metrics.toolErrors++;
     const t3 = performance.now();
@@ -202,6 +210,9 @@ async function main() {
   console.log(`\n=== Real API Benchmark: ${SMALL_MODEL} vs ${LARGE_MODEL} ===`);
   const results = {};
   const report = { schemaVersion: 4, objective: "Compare end-to-end latency and independently verified task success of large and small models in the same ReAct loop", promptVersion: "relative-paths-v2", startedAt: new Date().toISOString(), node: process.version, platform: process.platform, runs: RUNS, timeoutMs: TIMEOUT, maxSteps: MAX_STEPS, maxTokens: 256, temperature: 0, toolPolicy: "workspace-files-only", configs: configs.map(({ client, ...config }) => config), warmups: [], results };
+  const schedule = buildSchedule(configs, TASKS, RUNS);
+  report.suite = SUITE === "expanded" ? { version: suiteDefinition.version, sha256: suiteHash, tasks: TASKS.map(({ id, category }) => ({ id, category })) } : { version: "smoke-v1" };
+  report.schedule = schedule.map(({ config, task, run }) => ({ label: config.label, taskId: task.id, run }));
   mkdirSync(dirname(OUTPUT), { recursive: true });
   const save = () => {
     report.summary = Object.fromEntries(Object.entries(results).map(([label, rows]) => [label, summarizeResults(rows)]));
@@ -222,12 +233,15 @@ async function main() {
       report.warmups.push({ label, elapsedMs: performance.now() - start, status });
       save();
     }
-    for (const task of TASKS) {
-      for (let i = 0; i < RUNS; i++) {
+  }
+  for (const [sequence, { config, task, run: i }] of schedule.entries()) {
+        const { label, model } = config;
         const ws = mkdtempSync(join(tmpdir(), "jev_real_"));
         const m = newMetrics(model);
         m.taskId = task.id;
         m.run = i;
+        m.sequence = sequence;
+        m.category = task.category || "smoke";
         task.setup(ws);
         const start = performance.now();
         try {
@@ -242,11 +256,9 @@ async function main() {
           m.finalFiles = Object.fromEntries(readdirSync(ws, { withFileTypes: true }).filter((f) => f.isFile()).map((f) => [f.name, readFileSync(join(ws, f.name), "utf8")]));
           results[label].push(m);
           save();
-          console.log(`  ${task.id} #${i + 1}: ${m.success ? "PASS" : "FAIL"} ${m.totalMs.toFixed(0)}ms (${m.llmCalls} calls, ${m.termination})`);
+          console.log(`  [${sequence + 1}/${schedule.length}] ${label} ${task.id} #${i + 1}: ${m.success ? "PASS" : "FAIL"} ${m.totalMs.toFixed(0)}ms (${m.llmCalls} calls, ${m.termination})`);
           try { rmSync(ws, { recursive: true, force: true }); } catch {}
         }
-      }
-    }
   }
 
   // Summary

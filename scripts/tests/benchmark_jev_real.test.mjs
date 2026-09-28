@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { suiteDefinition, writeFixture, verifyFixture, buildSchedule } from "../benchmark_suite.mjs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { summarizeResults } from "../benchmark_metrics.mjs";
@@ -133,4 +134,63 @@ test("summary includes failures and uses weighted per-call latency", () => {
   assert.equal(result.byTask.a.medianElapsedMs, 200);
   assert.equal(result.byTask.b.meanSuccessfulElapsedMs, null);
   assert.equal(summarizeResults([]).overall.accuracy, null);
+});
+
+test("twenty validators reject unchanged inputs, missing files and corrupted output", (t) => {
+  assert.equal(suiteDefinition.tasks.length, 20);
+  assert.equal(new Set(suiteDefinition.tasks.map((task) => task.id)).size, 20);
+  for (const task of suiteDefinition.tasks) {
+    const ws = mkdtempSync(join(tmpdir(), "suite-test-"));
+    t.after(() => rmSync(ws, { recursive: true, force: true }));
+    writeFixture(ws, task.initial);
+    assert.equal(verifyFixture(ws, task.expected), false, task.id);
+    writeFixture(ws, task.expected);
+    assert.equal(verifyFixture(ws, task.expected), true, task.id);
+    for (const path of Object.keys(task.expected)) {
+      rmSync(join(ws, path));
+      assert.equal(verifyFixture(ws, task.expected), false, `${task.id}: missing ${path}`);
+      writeFileSync(join(ws, path), "incorrect output");
+      assert.equal(verifyFixture(ws, task.expected), false, `${task.id}: wrong ${path}`);
+      writeFixture(ws, task.expected);
+    }
+    writeFileSync(join(ws, "unrequested.txt"), "extra");
+    assert.equal(verifyFixture(ws, task.expected), false, `${task.id}: extra file`);
+  }
+});
+
+test("paired schedule balances first position and reverses it across repetitions", () => {
+  const configs = [{ label: "large" }, { label: "small" }];
+  const schedule = buildSchedule(configs, suiteDefinition.tasks, 3);
+  assert.equal(schedule.length, 120);
+  const first = schedule.filter((_, index) => index % 2 === 0);
+  assert.equal(first.filter((item) => item.config.label === "large").length, 30);
+  assert.notEqual(schedule[0].config.label, schedule[40].config.label);
+  for (let i = 0; i < schedule.length; i += 2) {
+    assert.equal(schedule[i].task.id, schedule[i + 1].task.id);
+    assert.equal(schedule[i].run, schedule[i + 1].run);
+    assert.notEqual(schedule[i].config.label, schedule[i + 1].config.label);
+  }
+});
+
+test("expanded run preserves scoring and injects exactly one recoverable fault per targeted task", async (t) => {
+  const endpoint = await fixture(t, (body, _req, res) => {
+    const candidates = suiteDefinition.tasks.filter((candidate) => body.messages[1].content === `Task: ${candidate.prompt}`);
+    const task = candidates.length > 1 && body.messages.some((m) => m.content.includes("write recovery payload"))
+      ? candidates.find((candidate) => candidate.id === "transient_write") : candidates[0];
+    assert.ok(task);
+    const commands = [
+      { action: "read_file", args: { path: Object.keys(task.initial)[0] } },
+      ...Object.entries(task.expected).map(([path, value]) => ({ action: "write_file", args: { path, content: typeof value === "string" ? value : JSON.stringify(value) } })),
+      { action: "done" },
+    ];
+    const completed = body.messages.filter((m) => m.content.startsWith("Tool result:\n") && !m.content.startsWith("Tool result:\nerror:")).length;
+    reply(res, commands[completed]);
+  });
+  const report = await run(t, ["--mode", "small", "--small-base-url", endpoint, "--suite", "expanded"]);
+  assert.equal(report.results.small.length, 20);
+  assert.equal(report.summary.small.overall.accuracy, 1);
+  for (const row of report.results.small) {
+    assert.equal(row.injectedFaults, row.taskId.startsWith("transient_") ? 1 : 0);
+  }
+  assert.equal(report.suite.sha256.length, 64);
 });
