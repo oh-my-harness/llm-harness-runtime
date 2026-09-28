@@ -1,4 +1,4 @@
-﻿# Experiment: Jev-Style Fast Decision Model in Agent Loop
+# Experiment: Jev-Style Fast Decision Model in Agent Loop
 
 ## Goal
 
@@ -103,3 +103,37 @@ Two implementations:
 2. Prepare task suite.
 3. Run and collect results.
 4. Decide whether to adopt decision-model routing in production.
+
+---
+
+## Benchmark Results (2026-09-28, SiliconFlow)
+
+| Task | Baseline Qwen2.5-72B | Fast Qwen3.5-4B | Finding |
+|------|---------------------|-----------------|---------|
+| rename_function | 100% success, 5.8s, 5 LLM calls | 100% success, 106s, 9 LLM calls | Small model makes more errors, wastes turns on retries |
+| add_comment | partial, 11.8s | partial, 35s | Same pattern: more steps, more time |
+| create_readme | 100% success, 2.9s, 3 LLM calls | 100% success, 36s, 6.7 LLM calls | 12x slower despite smaller model |
+
+### Key Finding
+
+**Using a general-purpose small model (4B) as a replacement for a large model in the agent loop is counterproductive.** The small model:
+
+1. Has higher per-step decision error rate (tries `cat`, `sed`, etc. on Windows)
+2. Requires more steps (5 -> 9) to complete the same task
+3. Results in longer total wall-clock time despite potentially faster per-call latency
+
+### Implication for Jev-Style Architecture
+
+The real Jev value proposition is NOT "use a smaller model" but rather:
+
+- **Pre-defined choice options**: Jev doesn't generate free-form tool calls; it selects from a menu the developer has designed
+- **Specialized training**: Jev is trained for structured decision-making, not general chat
+- **No free-form text generation**: eliminates format errors and irrelevant commands
+
+A general small LLM (Qwen3.5-4B) still generates free-form tool calls and arguments, which leads to more mistakes. A Jev-style model would constrain outputs to valid options, potentially eliminating the error-retry overhead that makes small general models slower.
+
+### Next Steps
+
+1. Test with Qwen3.5-9B or 14B to find the quality-speed sweet spot
+2. Experiment with pre-defined choice menus instead of free-form tool selection
+3. Consider implementing a mock "decision provider" that constrains outputs to valid choices
