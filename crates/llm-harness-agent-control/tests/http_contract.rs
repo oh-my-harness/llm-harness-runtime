@@ -294,12 +294,9 @@ async fn steer_returns_202() {
         )
         .await
         .unwrap();
-    // The mock prompt completes before the steer arrives, so the session is
-    // idle and steer returns 409 Conflict. Steering during an active turn
-    // returns 202 (verified at the manager level in integration.rs).
     assert_eq!(
         response.status(),
-        409,
-        "steer on idle session should return 409"
+        202,
+        "steer on idle session should be queued for the next turn"
     );
 }

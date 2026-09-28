@@ -13,8 +13,8 @@ pub use routes::build_router;
 pub use service::{
     AgentControlManager, AgentSandbox, AgentSessionComponents, AgentSessionFactory,
     AgentSessionStatus, ControlEvent, ControlServiceError, CreateAgentSessionRequest,
-    PromptRequest, RemoteSandboxResource, RemoteSandboxSessionFactory, SharedAgentControlManager,
-    SteerRequest,
+    PromptRequest, RemoteSandboxResource, RemoteSandboxSessionFactory, SessionEvent,
+    SharedAgentControlManager, SteerRequest,
 };
 
 /// Shared control-service state.

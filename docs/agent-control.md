@@ -6,7 +6,7 @@
 
 - 创建一个由远程沙箱支撑的 Agent session；
 - 以异步方式提交 prompt，并继续接收 SSE 事件；
-- 支持 steer、abort、查询状态和删除 session；
+- 支持 steer、abort、查询状态和删除 session；运行中 steer 直接注入当前 turn，idle steer 进入下一 turn 的有界队列；
 - 按 principal 隔离 session，并限制每个 principal 可创建的 session 数量；
 - 服务关闭时停止 Agent，并关闭所有仍在该进程内的沙箱。
 
@@ -86,7 +86,7 @@ cargo run -p llm-harness-agent-control --bin agent-control -- agent-control.json
 }
 ```
 
-服务返回 `202 Accepted` 和一个 `prompt_id`。这个 ID 当前只用于 API 响应关联；SSE 事件还没有携带它。
+服务返回 `202 Accepted` 和一个 `prompt_id`。SSE 事件的外层信封会携带这个 `prompt_id`；从 assistant message 可读取到底层 turn 标识后，`turn_id` 也会随之填充。早期 run 事件可能还没有 `turn_id`。
 
 ## SSE 事件
 
@@ -96,6 +96,8 @@ cargo run -p llm-harness-agent-control --bin agent-control -- agent-control.json
 {
   "type": "text_delta",
   "session_id": "...",
+  "prompt_id": "...",
+  "turn_id": null,
   "timestamp": "...",
   "data": {
     "text": "..."
@@ -107,7 +109,7 @@ cargo run -p llm-harness-agent-control --bin agent-control -- agent-control.json
 
 - `text_delta`：模型输出的增量文本；
 - `tool_started` / `tool_finished`：工具开始和结束；
-- `run_finished`：当前 turn 完成；
+- `run_started` / `turn_started` / `run_finished`：当前 run 开始、底层 turn 标识出现和完成；
 - `failed`：Agent 或事件流出错；
 - `aborted`：请求中止；
 - `session_closed`：session 已删除或服务正在停止。
@@ -142,4 +144,4 @@ cargo run -p llm-harness-agent-control --bin agent-control -- agent-control.json
 cargo test -p llm-harness-agent-control
 ```
 
-测试覆盖 manager 层的创建、查询、prompt 事件流、session 数量限制和删除；也覆盖路由的 health 探活和未鉴权拒绝。
+测试覆盖 manager 层的创建、查询、prompt 事件流、session 数量限制和删除；也覆盖路由的 health 探活和未鉴权拒绝。另有 idle/active steer、SSE 关联字段、持久化和真实 gateway（Linux + Bwrap）E2E 测试。

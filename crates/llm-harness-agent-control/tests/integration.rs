@@ -12,7 +12,7 @@ use llm_harness_types::{ExecutionEnv, Tool, ToolContext, ToolFailure, ToolResult
 use llm_harness_agent_control::{
     AgentControlManager, AgentSandbox, AgentSessionComponents, AgentSessionFactory, ControlEvent,
     ControlServiceConfig, ControlServiceError, CreateAgentSessionRequest, GatewayConfig, LlmConfig,
-    PrincipalConfig, PromptRequest,
+    PrincipalConfig, PromptRequest, SessionEvent, SteerRequest,
 };
 
 struct FakeSandbox {
@@ -74,6 +74,30 @@ impl Tool for BlockingTool {
 struct TextFactory {
     shutdown: Arc<AtomicBool>,
     create_count: AtomicUsize,
+}
+
+struct RecordedTextFactory {
+    shutdown: Arc<AtomicBool>,
+    client: Arc<MockLlmClient>,
+}
+
+#[async_trait]
+impl AgentSessionFactory for RecordedTextFactory {
+    async fn create(
+        &self,
+        _request: &CreateAgentSessionRequest,
+    ) -> anyhow::Result<AgentSessionComponents> {
+        let client: Arc<dyn LlmClient> = self.client.clone();
+        let env: Arc<dyn ExecutionEnv> = Arc::new(NoOpEnv);
+        let harness =
+            AgentHarness::new_in_memory(client, env, AgentHarnessOptions::new("test-model")).await;
+        Ok(AgentSessionComponents {
+            harness: Arc::new(harness),
+            sandbox: Box::new(FakeSandbox {
+                shutdown: Arc::clone(&self.shutdown),
+            }),
+        })
+    }
 }
 
 #[async_trait]
@@ -182,7 +206,7 @@ async fn full_flow_create_prompt_events_delete() {
         .subscribe_session(&principal(16), &status.id)
         .unwrap();
 
-    let (_, prompt_status) = manager
+    let (prompt_id, prompt_status) = manager
         .prompt(
             &principal(16),
             &status.id,
@@ -195,12 +219,42 @@ async fn full_flow_create_prompt_events_delete() {
 
     let mut saw_text = false;
     let mut saw_finished = false;
-    for _ in 0..16 {
+    let mut saw_turn_id = false;
+    for _ in 0..32 {
         match events.recv().await {
-            Ok(ControlEvent::TextDelta { .. }) => saw_text = true,
-            Ok(ControlEvent::RunFinished) => {
+            Ok(SessionEvent {
+                prompt_id: Some(event_prompt_id),
+                event: ControlEvent::TextDelta { .. },
+                ..
+            }) => {
+                assert_eq!(event_prompt_id, prompt_id);
+                saw_text = true;
+            }
+            Ok(SessionEvent {
+                prompt_id: Some(event_prompt_id),
+                event: ControlEvent::RunFinished,
+                ..
+            }) => {
+                assert_eq!(event_prompt_id, prompt_id);
                 saw_finished = true;
                 break;
+            }
+            Ok(SessionEvent {
+                prompt_id: Some(event_prompt_id),
+                event: ControlEvent::TurnStarted { turn_id: event_turn_id },
+                turn_id,
+            }) => {
+                assert_eq!(event_prompt_id, prompt_id);
+                assert_eq!(turn_id.as_deref(), Some(event_turn_id.as_str()));
+                assert!(!event_turn_id.is_empty());
+                saw_turn_id = true;
+            }
+            Ok(SessionEvent {
+                prompt_id: Some(event_prompt_id),
+                event: ControlEvent::RunStarted,
+                ..
+            }) => {
+                assert_eq!(event_prompt_id, prompt_id);
             }
             Ok(other) => panic!("unexpected event: {other:?}"),
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -209,6 +263,7 @@ async fn full_flow_create_prompt_events_delete() {
     }
     assert!(saw_text, "should receive text delta");
     assert!(saw_finished, "should receive run finished");
+    assert!(saw_turn_id, "assistant events should carry a turn id");
 
     let idle = manager.get_session(&principal(16), &status.id).unwrap();
     assert_eq!(idle.state, "idle");
@@ -222,6 +277,96 @@ async fn full_flow_create_prompt_events_delete() {
         manager.get_session(&principal(16), &status.id),
         Err(ControlServiceError::SessionNotFound(_))
     ));
+}
+
+#[tokio::test]
+async fn idle_steer_is_queued_for_next_prompt() {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let client = Arc::new(MockLlmClient::with_single(MockResponse::text("ok")));
+    let factory = Arc::new(RecordedTextFactory {
+        shutdown: Arc::clone(&shutdown),
+        client: Arc::clone(&client),
+    });
+    let manager = AgentControlManager::new(config(None), factory).unwrap();
+    let status = manager
+        .create_session(principal(16), CreateAgentSessionRequest::default())
+        .await
+        .unwrap();
+
+    manager
+        .steer(
+            &principal(16),
+            &status.id,
+            SteerRequest {
+                message: "queued instruction".to_owned(),
+            },
+        )
+        .unwrap();
+    manager
+        .prompt(
+            &principal(16),
+            &status.id,
+            PromptRequest {
+                prompt: "main prompt".to_owned(),
+            },
+        )
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        client.call_count.load(Ordering::SeqCst),
+        1,
+        "prompt should execute once"
+    );
+    let captured = client.captured_requests.lock().pop().unwrap();
+    let request = format!("{captured:?}");
+    assert!(request.contains("queued instruction"));
+    assert!(request.contains("main prompt"));
+}
+
+#[tokio::test]
+async fn active_steer_is_forwarded_to_harness() {
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let manager = AgentControlManager::new(
+        config(None),
+        Arc::new(BlockingToolFactory {
+            ready: Arc::clone(&ready),
+            shutdown: Arc::clone(&shutdown),
+        }),
+    )
+    .unwrap();
+    let status = manager
+        .create_session(principal(16), CreateAgentSessionRequest::default())
+        .await
+        .unwrap();
+
+    manager
+        .prompt(
+            &principal(16),
+            &status.id,
+            PromptRequest {
+                prompt: "call blocking".to_owned(),
+            },
+        )
+        .unwrap();
+    ready.notified().await;
+    let status = manager
+        .steer(
+            &principal(16),
+            &status.id,
+            SteerRequest {
+                message: "change direction".to_owned(),
+            },
+        )
+        .unwrap();
+    assert_eq!(status.state, "running");
+
+    manager.abort(&principal(16), &status.id).unwrap();
+    manager
+        .delete_session(&principal(16), &status.id)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -261,7 +406,7 @@ async fn abort_emits_aborted_event_and_clears_active_prompt() {
     let mut saw_aborted = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
-        if matches!(event, ControlEvent::Aborted) {
+        if matches!(event.event, ControlEvent::Aborted) {
             saw_aborted = true;
             break;
         }
