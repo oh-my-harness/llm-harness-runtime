@@ -2241,6 +2241,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "llm-harness-agent-control"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "futures",
+ "llm-harness-agent",
+ "llm-harness-loop",
+ "llm-harness-platform",
+ "llm-harness-sandbox-remote",
+ "llm-harness-tools",
+ "llm-harness-types",
+ "llm_adapter",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "llm-harness-agent-team"
 version = "0.5.0"
 dependencies = [
@@ -5161,6 +5189,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

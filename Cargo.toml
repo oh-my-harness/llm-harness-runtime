@@ -11,6 +11,7 @@ members = [
     "crates/llm-harness-sandbox",
     "crates/llm-harness-sandbox-remote",
     "crates/llm-harness-sandbox-gateway",
+    "crates/llm-harness-agent-control",
     "crates/llm-harness-vm-agent-protocol",
     "crates/llm-harness-vm-agent-transport",
     "crates/llm-harness-vm-agent-env",
