@@ -6,12 +6,13 @@ mod routes;
 mod service;
 
 pub use auth::AuthenticatedPrincipal;
-pub use config::ControlServiceConfig;
+pub use config::{ControlServiceConfig, GatewayConfig, LlmConfig, PrincipalConfig};
 pub use routes::build_router;
 pub use service::{
-    AgentControlManager, AgentSandbox, AgentSessionComponents, AgentSessionFactory, ControlEvent,
-    ControlServiceError, RemoteSandboxResource, RemoteSandboxSessionFactory,
-    SharedAgentControlManager,
+    AgentControlManager, AgentSandbox, AgentSessionComponents, AgentSessionFactory,
+    AgentSessionStatus, ControlEvent, ControlServiceError, CreateAgentSessionRequest,
+    PromptRequest, RemoteSandboxResource, RemoteSandboxSessionFactory, SharedAgentControlManager,
+    SteerRequest,
 };
 
 /// Shared control-service state.
