@@ -66,19 +66,15 @@ const TASKS = [
     setup: (ws) => writeFileSync(join(ws, "app.py"), "def old_name(x):\n    return x * 2\n\nprint(old_name(5))\n"),
     verify: (ws) => { try { const c = readFileSync(join(ws, "app.py"), "utf-8"); return !c.includes("old_name") && c.includes("new_name"); } catch { return false; } },
 
-    // State-based decision rules
     decide: (ws, lastResult) => {
       const path = join(ws, "app.py");
       if (!existsSync(path)) return { done: true, reason: "file missing" };
       const content = readFileSync(path, "utf-8");
-      if (content.includes("old_name")) return { action: "read_file", args: { path: "app.py" } };
       if (content.includes("new_name") && !content.includes("old_name")) return { done: true };
-      // If we just read and content still has old_name, write replacement
       if (lastResult && typeof lastResult === "string" && lastResult.includes("old_name")) {
         return { action: "write_file", args: { path: "app.py", content: lastResult.replace(/old_name/g, "new_name") } };
       }
-      // If content already has new_name, verify
-      return { action: "grep", args: { pattern: "new_name" } };
+      return { action: "read_file", args: { path: "app.py" } };
     },
   },
   {
