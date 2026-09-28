@@ -1,5 +1,23 @@
 # Local Decision-Model Benchmark
 
+## Current Experiment Progress
+
+Updated: 2026-09-28, Asia/Shanghai.
+
+- [x] Define a task-independent observation-only rule policy.
+- [x] Remove the absolute workspace prompt and repeat cloud/local ReAct runs.
+- [x] Measure rules plus large model under the same corrected prompt and validators.
+- [x] Compare quality, false completion, calls, latency and rule overhead; record limitations.
+
+Progress log:
+- 2026-09-28: Started the next experiment. Rules may inventory/read bounded files
+  and read back successful writes, but cannot inspect task expectations or
+  determine completion. Small-model routing and broader tasks remain later
+  experiments, contingent on evidence from this control.
+- 2026-09-28: Completed 27 measured tasks across corrected-prompt large/small
+  ReAct and rules plus large. Six regression tests passed. Results below retain
+  failures and distinguish successful-task latency from all-attempt latency.
+
 Research issue: https://github.com/oh-my-harness/llm-harness-runtime/issues/259
 
 ## Question
@@ -160,3 +178,100 @@ prompts (the tools require relative paths), then repeat the paired evaluation
 without changing the validators. Keep these original results as the baseline;
 any prompt change defines a new condition. Expand the task suite only after
 checking error recovery and false completion behavior.
+
+## Relative-Path and Generic-Observation Experiment
+
+The next experiment above is now complete. The only prompt change in the two
+ReAct arms was removal of the absolute `Workspace:` prefix. Both still receive
+the same relative-path instruction, tool schema, task text and validators.
+Sampling defaults and model versions remain unchanged from the preceding run.
+
+The rules arm uses that corrected prompt with large-model generation. Its
+task-independent scheduler is `scripts/benchmark_rules.mjs`:
+
+1. List workspace files and automatically read at most eight regular files of
+   at most 8192 bytes each, in stable filename order.
+2. After a successful model-requested write, automatically read that path back.
+3. Return all observations to the model. The model still generates changes and
+   decides when to stop. The final-state evaluator is never exposed to the rules.
+
+Rules intentionally add observations and some tool calls. They do not cache
+model answers, repair output schemas, supply expected edits, or stop after a
+write. Rule time includes its tool time, so it must not be added to `toolMs`.
+The 10-step budget bounds model decisions; automatic observations are extra
+bounded operations, recorded separately. Initial reads are metadata-bounded;
+write readbacks are bounded indirectly by the model output-token budget.
+
+### Measured Results
+
+Three runs per task and arm, one excluded warmup per endpoint. Times below are
+means over all three attempts, including failures.
+
+| Task | Large ReAct success / time / calls | Small ReAct success / time / calls | Rules + large success / time / calls |
+| --- | --- | --- | --- |
+| rename_function | 3/3 / 3.81 s / 4 | 3/3 / 0.88 s / 4 | 3/3 / 2.90 s / 3 |
+| add_comment | 0/3 / 2.03 s / 2 | 3/3 / 0.60 s / 3 | 3/3 / 2.04 s / 2 |
+| create_readme | 3/3 / 2.31 s / 3 | 0/3 / 1.22 s / 4 | 3/3 / 1.75 s / 2 |
+
+| Across all nine attempts | Large ReAct | Small ReAct | Rules + large |
+| --- | --- | --- | --- |
+| Success | 6/9 | 6/9 | 9/9 |
+| False completion | 3/9 | 3/9 | 0/9 |
+| Total model requests | 27 | 33 | 21 |
+| Mean elapsed | 2.716 s | 0.901 s | 2.228 s |
+| Median elapsed | 2.527 s | 0.875 s | 2.030 s |
+| Empirical p95 elapsed | 4.007 s | 1.235 s | 2.936 s |
+| Mean tool time | 1.52 ms | 1.02 ms | 1.79 ms |
+| Mean rule time (including automatic tools) | 0 | 0 | 1.13 ms |
+
+With nine samples, nearest-rank p95 is simply the maximum; it is not a robust
+tail estimate. Model requests account for over 99.8% of task elapsed time in
+all three arms. Calls include the model's final `done` decision.
+
+Raw artifacts (ignored by Git):
+- `logs/benchmarks/2026-09-28-relative-react.json`
+- `logs/benchmarks/2026-09-28-relative-rules-large.json`
+
+Both use schema 3 and `promptVersion=relative-paths-v2`. Reproduce with the
+previous endpoint/model flags and `--policy react` (default), followed by
+`--mode large --policy rules`; use unique output filenames.
+
+### Interpretation
+
+- Removing the absolute path fixed the small model's comment failures but did
+  not improve overall success. Its README outputs placed `path` and `content`
+  outside `args`; it then claimed completion after tool errors. Valid JSON is
+  not schema compliance. The existing `formatErrors` counter covers JSON parse
+  and unknown-action errors, not all argument-shape errors; these failures are
+  visible in tool errors, traces, final files and false-completion metrics.
+- Large ReAct overwrote the original config in all three comment runs. The
+  rules arm supplied the existing content before the model acted and preserved
+  it. This is evidence for supplying cheap observations, not evidence that the
+  rules can evaluate task correctness.
+- Rules plus large used 22.2% fewer model requests. All-attempt mean time fell
+  18.0%, but the success distributions differ, so this is not an equal-quality
+  aggregate speedup. In the two task classes both arms completed correctly,
+  each saved one call and about 24% of elapsed time (about 1.32x speedup).
+- The local model remains much faster per request, but it used more requests
+  than the large model and had different failures. Neither direct substitution
+  nor a 7-10x reliable speedup has been established.
+
+The two rules were tested together; their individual contributions have not
+been isolated. Fixed arm order, only three unique tasks, provider caching,
+quantization and sampling defaults limit causal and general conclusions. The
+cloud's earlier 9/9 run is a different prompt condition, not a contradiction or
+a reason to discard this run. Repeated near-identical trials are not nine
+independent task types.
+
+### Research Decision
+
+Continue investigating task-independent state handling before introducing a
+small-model router. The useful demonstrated mechanism is replacing mechanical
+observation decisions, not replacing semantic reasoning with canned answers.
+Next, freeze a broader task suite with unseen file names/content, missing files,
+recoverable tool errors and multi-file edits, then compare inventory-only,
+readback-only and combined rules against ReAct in counterbalanced order. Add
+explicit schema validation as a separately versioned condition shared by all
+arms. Only after this stronger control should a rules + small-router + large
+generator arm test the incremental value of model-based routing. This round
+does not implement or claim results for that hybrid routing architecture.

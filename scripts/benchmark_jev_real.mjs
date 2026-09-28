@@ -12,7 +12,8 @@
  */
 
 import { OpenAI } from "openai";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync, mkdirSync, statSync } from "node:fs";
+import { nextObservation } from "./benchmark_rules.mjs";
 import { join, resolve, relative, isAbsolute, dirname } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -30,6 +31,8 @@ const TIMEOUT = Number(arg("timeout-ms", "60000"));
 const WARMUPS = Number(arg("warmups", "1"));
 const OUTPUT = resolve(arg("output", `logs/benchmarks/jev-${Date.now()}.json`));
 const MODE = arg("mode", "both");
+const POLICY = arg("policy", "react");
+if (!["react", "rules"].includes(POLICY)) throw new Error("Invalid --policy");
 if (!["both", "large", "small"].includes(MODE)) throw new Error("Invalid --mode");
 if (!Number.isInteger(RUNS) || RUNS < 1 || !Number.isInteger(WARMUPS) || WARMUPS < 0 || !Number.isFinite(TIMEOUT) || TIMEOUT <= 0) throw new Error("Invalid runs, warmups, or timeout");
 const configs = Object.entries({ large: LARGE_MODEL, small: SMALL_MODEL })
@@ -126,8 +129,31 @@ async function runAgent(config, task, ws, metrics) {
   const system = buildSystemPrompt();
   const messages = [
     { role: "system", content: system },
-    { role: "user", content: `Workspace: ${ws}\nTask: ${task.prompt}` },
+    { role: "user", content: `Task: ${task.prompt}` },
   ];
+  const state = { initialized: false, pending: [], files: [] };
+  const observe = () => {
+    const start = performance.now();
+    if (!state.initialized) {
+      state.files = readdirSync(ws, { withFileTypes: true }).filter((f) => f.isFile()).map((f) => ({ path: f.name, size: statSync(join(ws, f.name)).size }));
+    }
+    let observation;
+    while ((observation = nextObservation(state))) {
+      const toolStart = performance.now();
+      const result = executeTool(observation.action, observation.args, ws);
+      const elapsedMs = performance.now() - toolStart;
+      metrics.toolCalls++;
+      metrics.ruleActions++;
+      metrics.toolMs += elapsedMs;
+      if (result.startsWith("error:")) metrics.toolErrors++;
+      metrics.trace.push({ source: "rule", ...observation, toolResult: result, elapsedMs });
+      messages.push({ role: "user", content: `Runtime observation (${observation.reason}, ${JSON.stringify(observation.args)}):\n${result}` });
+    }
+    metrics.ruleMs += performance.now() - start;
+  };
+  metrics.ruleActions = 0;
+  metrics.ruleMs = 0;
+  if (POLICY === "rules") observe();
 
   for (let step = 0; step < MAX_STEPS; step++) {
     metrics.steps++;
@@ -152,7 +178,7 @@ async function runAgent(config, task, ws, metrics) {
     }
 
     const text = resp.choices?.[0]?.message?.content?.trim() || "";
-    metrics.trace.push({ step, text, usage: resp.usage, finishReason: resp.choices?.[0]?.finish_reason });
+    metrics.trace.push({ source: "model", step, text, usage: resp.usage, finishReason: resp.choices?.[0]?.finish_reason });
     let decision;
     try {
       decision = JSON.parse(text);
@@ -186,6 +212,10 @@ async function runAgent(config, task, ws, metrics) {
 
     messages.push({ role: "assistant", content: text });
     messages.push({ role: "user", content: `Tool result:\n${result}` });
+    if (POLICY === "rules" && action === "write_file" && !result.startsWith("error:")) {
+      state.pending.push({ action: "read_file", args: { path: args.path }, reason: "write_readback" });
+      observe();
+    }
   }
   return metrics;
 }
@@ -197,7 +227,7 @@ async function runAgent(config, task, ws, metrics) {
 async function main() {
   console.log(`\n=== Real API Benchmark: ${SMALL_MODEL} vs ${LARGE_MODEL} ===`);
   const results = {};
-  const report = { schemaVersion: 2, startedAt: new Date().toISOString(), node: process.version, platform: process.platform, runs: RUNS, timeoutMs: TIMEOUT, maxSteps: MAX_STEPS, maxTokens: 256, temperature: 0, toolPolicy: "workspace-files-only", configs: configs.map(({ client, ...config }) => config), warmups: [], results };
+  const report = { schemaVersion: 3, promptVersion: "relative-paths-v2", policy: POLICY, ruleLimits: { files: 8, bytesPerFile: 8192 }, startedAt: new Date().toISOString(), node: process.version, platform: process.platform, runs: RUNS, timeoutMs: TIMEOUT, maxSteps: MAX_STEPS, maxTokens: 256, temperature: 0, toolPolicy: "workspace-files-only", configs: configs.map(({ client, ...config }) => config), warmups: [], results };
   mkdirSync(dirname(OUTPUT), { recursive: true });
   const save = () => writeFileSync(OUTPUT, JSON.stringify(report, null, 2));
   save();
@@ -231,6 +261,7 @@ async function main() {
           m.error = e.status ? `http_${e.status}` : e.constructor.name;
         } finally {
           m.totalMs = performance.now() - start;
+          m.falseCompletion = m.termination === "done" && !m.success;
           m.finalFiles = Object.fromEntries(readdirSync(ws, { withFileTypes: true }).filter((f) => f.isFile()).map((f) => [f.name, readFileSync(join(ws, f.name), "utf8")]));
           results[label].push(m);
           save();

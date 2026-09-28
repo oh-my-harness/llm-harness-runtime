@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { nextObservation } from "../benchmark_rules.mjs";
 
 async function fixture(t, handler) {
   const server = createServer(async (req, res) => {
@@ -52,6 +53,7 @@ test("independent endpoints preserve API failure latency and successful file tas
     const messages = body.messages;
     if (messages.length > 2) return reply(res, { action: "done" });
     const prompt = messages[1].content;
+    assert.ok(!prompt.includes("Workspace:"));
     const [path, content] = prompt.includes("rename")
       ? ["app.py", "def new_name(x):\n    return x * 2\n\nprint(new_name(5))"]
       : prompt.includes("comment") ? ["config.py", "# TODO: review\r\nDEBUG = True\r\n"] : ["README.md", "Hello World"];
@@ -104,4 +106,36 @@ test("adding a comment must not erase the existing configuration", async (t) => 
   });
   const report = await run(t, ["--mode", "small", "--small-base-url", endpoint]);
   assert.equal(report.results.small.find((r) => r.taskId === "add_comment").success, false);
+  assert.equal(report.results.small.find((r) => r.taskId === "add_comment").falseCompletion, true);
+});
+
+test("rules provide observations but cannot claim completion from a successful write", async (t) => {
+  const endpoint = await fixture(t, (body, _req, res) => {
+    const observations = body.messages.filter((m) => m.content.startsWith("Runtime observation"));
+    assert.ok(observations.some((m) => m.content.includes("initial_inventory")));
+    if (observations.some((m) => m.content.includes("write_readback"))) {
+      return reply(res, { action: "done" });
+    }
+    reply(res, { action: "write_file", args: { path: "config.py", content: "# TODO: review\n" } });
+  });
+  const report = await run(t, ["--mode", "large", "--large-base-url", endpoint, "--policy", "rules"]);
+  for (const row of report.results.large) {
+    assert.equal(row.llmCalls, 2, "completion must still be a model decision");
+    assert.equal(row.success, false);
+    assert.equal(row.falseCompletion, true);
+    assert.ok(row.trace.some((event) => event.source === "rule" && event.reason === "write_readback"));
+  }
+});
+
+test("generic observation scheduler bounds reads and exhausts without a done action", () => {
+  const state = { initialized: false, pending: [], files: [
+    { path: "too-large", size: 8193 },
+    ...Array.from({ length: 12 }, (_, i) => ({ path: `file-${i}`, size: 10 })),
+  ] };
+  const actions = [];
+  let action;
+  while ((action = nextObservation(state))) actions.push(action);
+  assert.equal(actions.length, 9);
+  assert.equal(actions[0].action, "list_files");
+  assert.ok(!actions.some((a) => a.action === "done" || a.args.path === "too-large"));
 });
