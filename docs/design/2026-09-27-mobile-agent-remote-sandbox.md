@@ -106,7 +106,7 @@ HAR-001 应该增加一个可运行的 gateway binary，并提供显式配置项
 - 执行和请求限制；
 - logging level。
 
-使用简单的 TOML 或环境变量配置即可。具体格式应优先保证可复现性，并避免把 secret 泄漏到进程参数或日志中。
+第一版 gateway 配置使用 JSON，方便运维复制和校验。bearer token 只保存引用名，实际值从环境变量读取。这样既保持配置文件可审查，也避免把 secret 写进磁盘上的明文配置或进程参数。后续如需要，可在不改变安全边界的前提下增加环境变量覆盖或 TOML 展开层。
 
 ### 运行行为
 
@@ -118,6 +118,8 @@ gateway 进程应该：
 - 在 SIGTERM/Ctrl-C 时优雅关闭；
 - 根据现有 gateway recovery 语义停止或恢复沙箱；
 - 输出结构化 lifecycle 事件。
+
+`/healthz` 和 `/readyz` 保持无鉴权，方便反向代理和编排器探测。这两个端点只返回 backend 和状态，不暴露 principal、文件路径或内部配置。业务路由继续走原有 bearer-token 鉴权。
 
 ### TLS
 

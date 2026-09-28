@@ -16,8 +16,9 @@ libc.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tracing-subscriber.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
