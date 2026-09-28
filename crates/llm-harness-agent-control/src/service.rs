@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthenticatedPrincipal;
 use crate::config::ControlServiceConfig;
+use crate::persistence::SessionPersistence;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -171,6 +172,7 @@ pub struct AgentControlManager {
     config: Arc<ControlServiceConfig>,
     factory: Arc<dyn AgentSessionFactory>,
     sessions: Arc<std::sync::Mutex<HashMap<String, Arc<AgentSessionRecord>>>>,
+    persistence: Option<SessionPersistence>,
 }
 
 pub type SharedAgentControlManager = Arc<AgentControlManager>;
@@ -188,10 +190,15 @@ impl AgentControlManager {
                 anyhow::bail!("control-service principal id must not be empty");
             }
         }
+        let persistence = config
+            .persistence_path
+            .as_ref()
+            .map(SessionPersistence::new);
         Ok(Self {
             config: Arc::new(config),
             factory,
             sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            persistence,
         })
     }
 
@@ -242,6 +249,11 @@ impl AgentControlManager {
             active_prompt: AtomicBool::new(false),
         });
         spawn_event_pump(Arc::clone(&record));
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .add_sandbox(record.sandbox_id.as_str())
+                .map_err(ControlServiceError::Sandbox)?;
+        }
         self.sessions
             .lock()
             .expect("agent session registry")
@@ -372,6 +384,11 @@ impl AgentControlManager {
                 .await
                 .map_err(ControlServiceError::Sandbox)?;
         }
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .remove_sandbox(session.sandbox_id.as_str())
+                .map_err(ControlServiceError::Sandbox)?;
+        }
         Ok(())
     }
 
@@ -394,6 +411,9 @@ impl AgentControlManager {
             }
         }
         if failures == 0 {
+            if let Some(persistence) = &self.persistence {
+                persistence.clear()?;
+            }
             Ok(())
         } else {
             Err(anyhow::anyhow!(
@@ -691,6 +711,7 @@ mod tests {
                 max_trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
                 max_sessions,
             }],
+            persistence_path: None,
         }
     }
 

@@ -10,6 +10,8 @@ pub struct ControlServiceConfig {
     pub gateway: GatewayConfig,
     pub llm: LlmConfig,
     pub principals: Vec<PrincipalConfig>,
+    #[serde(default)]
+    pub persistence_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

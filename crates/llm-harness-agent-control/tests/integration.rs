@@ -148,6 +148,7 @@ fn config(max_sessions: Option<usize>) -> ControlServiceConfig {
             max_trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
             max_sessions,
         }],
+        persistence_path: None,
     }
 }
 
