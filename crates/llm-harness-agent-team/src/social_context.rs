@@ -977,6 +977,28 @@ impl SocialContext {
         messages
     }
 
+    /// Copy pending messages for read-only observers without consuming them.
+    ///
+    /// This applies the same late-reply filtering as `drain_inbox`, but does
+    /// not consume timeout notifications or clear their fired marks: a
+    /// projection must not change delivery state as a side effect.
+    pub fn peek_inbox(&self, agent_id: &AgentId) -> Vec<InboxMessage> {
+        self.inboxes
+            .peek_all(agent_id)
+            .into_iter()
+            .filter(|msg| {
+                if matches!(
+                    msg.message_type,
+                    MessageType::Timeout | MessageType::SelfReminder
+                ) {
+                    return true;
+                }
+                let key = msg.task_id.as_ref().or(msg.broadcast_id.as_ref());
+                key.is_none_or(|key| !self.is_key_fired(agent_id, key))
+            })
+            .collect()
+    }
+
     /// Whether an agent has any pending messages.
     pub fn has_messages(&self, agent_id: &AgentId) -> bool {
         self.inboxes.has_messages(agent_id)
@@ -1395,6 +1417,44 @@ mod tests {
 
         // Inbox is drained.
         assert!(!ctx.has_messages(&bob));
+    }
+
+    #[test]
+    fn peek_inbox_is_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let chat_journal = Arc::new(
+            crate::chat_history_journal::ChatHistoryJournal::open(temp.path().join("chat.sqlite3"))
+                .unwrap(),
+        );
+        let ctx = SocialContext::with_journals(10, None, None, Some(chat_journal)).unwrap();
+        let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
+        ctx.register_agent(alice.clone(), "rust");
+        ctx.register_agent(bob.clone(), "python");
+
+        ctx.send_direct(&alice, &bob, "hello", 0);
+        let first = ctx.peek_inbox(&bob);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].body, "hello");
+        assert!(ctx.has_messages(&bob));
+
+        let second = ctx.peek_inbox(&bob);
+        assert_eq!(second.len(), first.len());
+        assert_eq!(
+            second
+                .iter()
+                .map(|msg| msg.body.as_str())
+                .collect::<Vec<_>>(),
+            first
+                .iter()
+                .map(|msg| msg.body.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ctx.chat_history(&bob, 10).len(),
+            1,
+            "projection must not duplicate transcript history"
+        );
     }
 
     #[test]
