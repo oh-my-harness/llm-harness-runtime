@@ -16,7 +16,10 @@ policy.
 - Node 24.14.1, OpenAI JavaScript SDK pinned to 7.23.0.
 - Ollama portable 0.34.4 downloaded from the official GitHub release.
 - Archive SHA256: `535193f38f3344e5b08f5d1c171c31ce11aa17f0124ff69ae26d8ec7fe06fa62`.
-- Intended local model: `qwen3.5:4b`; model download and GPU execution are pending.
+- Local model: `qwen3.5:4b`, Q4_K_M, metadata parameter size 4.7B.
+- Model digest: `2a654d98e6fba55d452b7043684e9b57a947e393bbffa62485a7aac05ee4eefd`.
+- Ollama reports model size and GPU-resident size both 3,128,038,521 bytes,
+  context length 4096. CUDA detected the RTX 5070 Ti.
 - Ollama files live in the sibling `benchmark/tools/ollama` directory; models
   belong in `benchmark/models`, outside the source repository.
 
@@ -86,10 +89,10 @@ Do not put credentials into commands, result files, or version control.
 
 ## Status
 
-The automated background server launch was rejected by the execution policy
-with `blocked by policy`. No local model was downloaded or measured. The
-foreground launcher is provided for a user-controlled startup; it was not
-executed to work around the rejection.
+The initial automated background launch was rejected by execution policy.
+After the user explicitly authorized startup, a retry succeeded. Ollama 0.34.4
+is listening on `127.0.0.1:11434`, with cloud features disabled. The local model
+download, cold-load check, and measured task runs have completed.
 
 Cloud baseline measurement completed with schema version 2:
 
@@ -117,3 +120,43 @@ Validation: four HTTP-fixture regression tests passed (endpoint routing,
 failure/timeout accounting, invalid decisions/path confinement, and preservation
 of existing content). JavaScript and PowerShell syntax checks passed. The Rust
 workspace was not modified, and its full test suite was not run for this change.
+
+## Local Results
+
+Raw result: `logs/benchmarks/2026-09-28-local-qwen35-4b.json`, schema version 2.
+The explicit cold-load JSON probe took 61.202 seconds and returned valid JSON
+without a reasoning field. The subsequent benchmark warmup took 158 ms. Cold
+loading and initialization are excluded from the following task measurements.
+
+| Task | Success | Mean task time | Mean API call | Calls/task | Cloud/local time ratio |
+| --- | --- | --- | --- | --- | --- |
+| rename_function | 3/3 | 0.73 s | 244 ms | 3 | 5.9x |
+| add_comment | 0/3 | 0.60 s | 299 ms | 2 | Not a successful-task speedup |
+| create_readme | 3/3 | 0.54 s | 181 ms | 3 | 4.9x |
+
+All three comment-task failures followed the same pattern: the model supplied
+an absolute path despite the relative-path instruction, the file tool rejected
+it, and the model then declared completion without editing the file. The saved
+final file remained `DEBUG = True`. JSON formatting succeeded in all runs, but
+valid JSON did not imply valid actions or task completion.
+
+On this small smoke suite, local success is 6/9 versus cloud 9/9, below the
+experiment's target of 85% of baseline success. The successful task classes are
+approximately 5-6x faster. This does not validate a 7-10x quality-preserving
+speedup, nor does it establish a general failure rate from only three tasks.
+Rename also uses fewer calls locally (3 versus 4), so its task-level speedup is
+not solely a per-call latency effect; the current verifier checks final content,
+not whether the requested verification tool step was performed.
+
+The local arm requested `reasoning_effort=none`; cloud used its default. Ollama's
+model defaults include presence penalty 1.5, while the benchmark specifies only
+temperature zero. Quantization, inference backend, caching and unspecified
+sampling defaults differ between endpoints, so this is a deployment comparison,
+not an isolated experiment on parameter count. A follow-up should explicitly
+control supported sampling parameters and re-run both arms.
+
+Next experiment: remove the irrelevant absolute workspace path from both arms'
+prompts (the tools require relative paths), then repeat the paired evaluation
+without changing the validators. Keep these original results as the baseline;
+any prompt change defines a new condition. Expand the task suite only after
+checking error recovery and false completion behavior.
