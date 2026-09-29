@@ -10,6 +10,7 @@ import { QwenClient, QWEN_MODEL, textValue } from '../../benchmarks/jev_browser/
 import { makePolicy, fieldContext } from '../../benchmarks/jev_browser/policy.mjs';
 import { prepareAcceptance } from '../../benchmarks/jev_browser/acceptance.mjs';
 import { runAttempt } from '../../benchmarks/jev_browser/attempt.mjs';
+import { captureTask, digest } from '../../benchmarks/jev_browser/capture-inputs.mjs';
 
 const config = { model: QWEN_MODEL, endpoint: 'https://api.siliconflow.cn/v1/chat/completions',
   temperature: 0, max_tokens: 256, max_attempts: 2, timeout_ms: 5000 };
@@ -65,6 +66,24 @@ function observation() {
 test('source is the approved seven journeys, live runs remain disabled', () => {
   assert.equal(upstream.journeys.length, 7);
   assert.equal(upstream.config.live_run.enabled, false);
+});
+test('input capture observes upstream state without model decisions or acceptance answers', async () => {
+  const task = upstream.journeys[0];
+  const row = await captureTask(upstream, browser, task, local.port, foreign.port);
+  assert.equal(row.status, 'captured');
+  assert.equal(row.model_calls, 0); assert.equal(row.model_executed_actions, 0);
+  assert.equal(row.request_sha256, digest(row.request));
+  assert.deepEqual(Object.keys(row.request), ['model', 'state', 'questions']);
+  assert.equal(row.request.state.recent_actions.length, 0);
+  assert.ok(row.request.state.page.text.includes('unsubmitted'));
+  assert.ok(!Object.hasOwn(row.request.state, 'acceptance'));
+});
+test('failed initial pages stay in the capture manifest, not a fake token audit', async () => {
+  const task = { ...upstream.journeys[0], url: () => `http://localhost:${local.port}/nonexistent-fixture.html` };
+  const row = await captureTask(upstream, browser, task, local.port, foreign.port);
+  assert.equal(row.status, 'http_error');
+  assert.equal(row.http_status, 404);
+  assert.equal(row.request, undefined);
 });
 test('A combines selection and field text in one real transport attempt', async () => {
   const trace = new Trace(), seen = observation();

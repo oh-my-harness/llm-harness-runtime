@@ -36,6 +36,49 @@
     "public_site_model_runs": 0,
     "real_model_validation_complete": false
   },
+  "input_audit": {
+    "report": "docs/research/jev-browser-input-audit-20260929.md",
+    "scope": "two_initial_snapshots_per_task_not_full_trajectories",
+    "captured_tasks_per_snapshot": 7,
+    "raw_lossless_tasks_per_snapshot": 6,
+    "compact_state_lossless_tasks_per_snapshot": 7,
+    "compact_state_applied_to_live_policy": false,
+    "model_calls": 0
+  },
+  "development_proposal": {
+    "approval": "awaiting_lqj_confirmation",
+    "repetitions": 1,
+    "concurrency": 1,
+    "order": "alternate_AB_BA_by_task_index",
+    "timeout_seconds": 180,
+    "max_actions": 30,
+    "max_decisions": 60,
+    "browser_timeout_ms": 15000,
+    "session_timeout_seconds": 3600,
+    "qwen_max_http_attempts_total_including_preflight": 120,
+    "qwen": {
+      "temperature": 0,
+      "max_tokens": 1024,
+      "timeout_ms": 45000,
+      "max_attempts": 2,
+      "preflight_max_http_attempts": 2
+    },
+    "laya": {
+      "model": "convaiinnovations/laya",
+      "revision": "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851",
+      "code_revision": "9d955671415fc19f069b9cc998928075c1f255ec",
+      "state_encoding": "lossless_compact_json_string",
+      "max_len": 8192,
+      "head_max_len": 4096,
+      "precision": "bf16",
+      "load_timeout_ms": 180000,
+      "request_timeout_ms": 45000,
+      "warmup_calls": 1,
+      "preflight_max_initial_states": 7,
+      "automatic_fallback": false
+    },
+    "quality_policy": "descriptive_development_results_no_equivalence_claim"
+  },
   "live_run": {
     "enabled": false,
     "repetitions": null,

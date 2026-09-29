@@ -27,4 +27,6 @@ python -m unittest discover -s scripts/tests -p test_jev_browser_worker.py -v
 
 准备清单的 `live_run.enabled` 保持关闭。没有提供绕过确认的 live CLI；不能用上游 `examples/journeys.ts` 代替本方案。
 
-后续需核查 7 任务真实输入的完整性，冻结验收、模型/SDK 版本和预算，再实现已获批条件下的整场配对调度、预算执行、逐次落盘和环境记录。不要直接沿用旧预检的上下文长度或输出预算。Qwen 与 Laya 的真实服务能力仍需实测，不以替身测试证明。
+已完成 7 任务两轮初态分词审计，详见[输入审计与提案](../../../docs/research/jev-browser-input-audit-20260929.md)。`capture-inputs.mjs` 仅观测，`audit_inputs.py` 仅调用固定 SDK 的 tokenizer/序列构造；无损紧凑 state 目前只作审计候选，未应用到 `policy.mjs` / worker。
+
+后续需确认验收、格式适配和预算，再实现已获批条件下的整场配对调度、预算执行、逐次落盘和环境记录。初态能容纳不代表轨迹始终能容纳；逐步输入审计必须保留。不要直接沿用旧预检的上下文长度或输出预算。Qwen 与 Laya 的真实服务能力仍需实测，不以替身测试证明。

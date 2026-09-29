@@ -1,5 +1,6 @@
 # 研究文档索引
 
+- [jev-browser 初始输入审计与开发试跑提案](jev-browser-input-audit-20260929.md)：7 任务两轮真实初态分词审计，定位 Hacker News 原样超长，验证保留全部内容的紧凑编码；14 次开发尝试提案待确认，未调用真实模型。
 - [jev-browser 复现计划](../experiment-fast-model-agent-loop.md)：当前唯一实验主线。核查公开的 Jev 决策 + LLM 按需生成实现及同引擎对照，沿用已确认的研究目标；处于材料审计和复现准备阶段，尚未运行新模型实验。
 - [jev-browser 环境准备与来源核查](jev-browser-preparation-20260929.md)：公开 7 任务的同引擎适配、单次计量和独立验收已实现；新增 33 项 Node、8 项 Python 离线测试通过，保留上游工程验证记录。真实模型和 7 任务输入预算尚未验证，不是模型速度或质量结果。
 
