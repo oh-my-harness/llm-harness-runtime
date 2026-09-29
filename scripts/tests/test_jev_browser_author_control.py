@@ -19,6 +19,16 @@ import audit_author_run
 
 
 class ControlTests(unittest.TestCase):
+    def test_audit_checks_actual_backend_identity_and_mode(self):
+        manifest = {"text_model": "deepseek-flash", "network": {"qwen_proxy": "http://127.0.0.1:7890"},
+                    "common_qwen_parameters": {"temperature": 0, "thinking": {"type": "disabled"}}}
+        event = {"network_route": "http://127.0.0.1:7890",
+                 "request_body": {"model": "deepseek-flash", "temperature": 0, "thinking": {"type": "disabled"}}}
+        audit_author_run.validate_text_request(manifest, event)
+        for change in ({"model": "qwen"}, {"thinking": {"type": "enabled"}}):
+            with self.assertRaises(ValueError):
+                audit_author_run.validate_text_request(manifest, {**event, "request_body": {**event["request_body"], **change}})
+
     def test_null_guard_preserves_exclusions(self):
         agent = SimpleNamespace(state={"page": {"actions": [{"id": "e1"}, {"id": "e2"}]},
                                        "excluded": {"e1"}}, _undo_guard=lambda: None)

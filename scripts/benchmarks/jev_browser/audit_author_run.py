@@ -12,6 +12,17 @@ COMPONENTS = {"qwen_http": "qwen_http", "laya_rpc": "laya_rpc", "laya_predict": 
               "laya_forward": "laya_forward", "tools": "tool"}
 
 
+def validate_text_request(manifest, event):
+    if event.get("network_route") != manifest["network"]["qwen_proxy"]:
+        raise ValueError("Text-model proxy drift")
+    body = event.get("request_body", {})
+    if any(body.get(k) != v for k, v in manifest["common_qwen_parameters"].items()):
+        raise ValueError("Text-model parameter drift")
+    expected_model = manifest.get("text_model", manifest.get("qwen"))
+    if expected_model and body.get("model") != expected_model:
+        raise ValueError("Text-model identity drift")
+
+
 def usage_summary(events):
     requests = [e for e in events if e["component"] == "qwen_http"]
     result = {"requests": len(requests)}
@@ -64,7 +75,7 @@ def audit(directory):
             if row["counts"][key] != sum(e["component"] == component for e in attempt):
                 raise ValueError(f"Counter mismatch: {row['task']} {row['arm']} {key}")
         if row["arm"] == "A" and row["counts"]["laya_forward"]:
-            raise ValueError("Pure Qwen arm used Laya")
+            raise ValueError("Pure text-model arm used Laya")
     for key, component in COMPONENTS.items():
         if report["counts_including_warmup"][key] != sum(e["component"] == component for e in events):
             raise ValueError(f"Session counter mismatch: {key}")
@@ -75,11 +86,7 @@ def audit(directory):
         for event in events:
             if event["component"] != "qwen_http":
                 continue
-            if event.get("network_route") != manifest["network"]["qwen_proxy"]:
-                raise ValueError("Qwen proxy drift")
-            body = event.get("request_body", {})
-            if any(body.get(k) != v for k, v in manifest["common_qwen_parameters"].items()):
-                raise ValueError("Qwen parameter drift")
+            validate_text_request(manifest, event)
     recalculated = compare(rows)
     if recalculated != report["comparison"]:
         raise ValueError("Comparison mismatch")
@@ -93,6 +100,7 @@ def audit(directory):
             matched_initial.append(row["task"] if "repeat" not in row else {"task": row["task"], "repeat": row["repeat"]})
     sensitivity = compare([r for r in rows if r["task"] != manifest["order"][0]["task"]])
     return {"counters_and_comparison_verified": True, "completed": len(rows),
+            "text_model": manifest.get("text_model", manifest.get("qwen")),
             "round_analysis": complete_round_analysis(rows, events, manifest["tasks"]),
             "token_usage_from_events": {arm: usage_summary([e for e in events if e.get("arm") == arm]) for arm in ("A", "B")},
             "matching_initial_tasks": matched_initial,

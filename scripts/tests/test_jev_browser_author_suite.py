@@ -14,6 +14,35 @@ SPEC.loader.exec_module(suite)
 
 
 class AuthorSuiteTests(unittest.TestCase):
+    def test_backend_profiles_keep_qwen_and_pin_official_deepseek(self):
+        self.assertEqual(suite.TEXT_BACKENDS["qwen"],
+                         {"model": suite.QWEN, "base_url": suite.QWEN_BASE,
+                          "key_env": "SILICONFLOW_API_KEY", "extra_body": {}})
+        self.assertEqual(suite.TEXT_BACKENDS["deepseek-flash"],
+                         {"model": "deepseek-flash", "base_url": "https://api.deepseek.com",
+                          "key_env": "DEEPSEEK_API_KEY", "extra_body": {"thinking": {"type": "disabled"}}})
+
+    def test_alternative_backend_requires_controlled_mode_before_creating_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "unused"
+            for backend in ("deepseek-flash", "unknown"):
+                with self.assertRaisesRegex(ValueError, "backend"):
+                    suite.run(output, text_backend=backend)
+                self.assertFalse(output.exists())
+
+    def test_deepseek_only_adds_provider_mode_to_unchanged_common_request(self):
+        calls = []
+        def post(url, **kwargs):
+            calls.append((url, kwargs))
+            return SimpleNamespace(status_code=200, headers={}, is_error=False, json=lambda: {"ok": True})
+        body = {"model": "deepseek-flash", "messages": [{"role": "user", "content": "original JSON prompt"}]}
+        suite.controlled_qwen_post(SimpleNamespace(post=post), "https://api.deepseek.com/chat/completions",
+                                   "test-only", body, lambda *args: self.fail("Unexpected retry"),
+                                   suite.TEXT_BACKENDS["deepseek-flash"]["extra_body"])
+        self.assertEqual(calls[0][0], "https://api.deepseek.com/chat/completions")
+        self.assertEqual(calls[0][1]["json"], {**suite.common_qwen_body(body), "thinking": {"type": "disabled"}})
+        self.assertNotIn("thinking", body)
+
     def test_shared_429_backoff_counts_all_requests_without_changing_messages(self):
         calls, waits = [], []
         responses = iter([SimpleNamespace(status_code=429, headers={}, is_error=True),

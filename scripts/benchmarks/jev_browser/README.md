@@ -49,6 +49,16 @@ python scripts/benchmarks/jev_browser/author_suite.py --paired --controlled --re
 
 实测范围及结论见[固定条件重跑报告](../../../docs/research/laya-browser-controlled-comparison-20260929.md)：当前 89/96 次，预算停止。只读审计输出 `round_analysis`，按任务覆盖度提取完整轮次，并列给出全部成功配对与无 HTTP 失败成功配对，不从原始文件删除记录。
 
+### DeepSeek Flash 同条件替换
+
+按 lqj 授权，以 `--text-backend deepseek-flash` 只替换两组的远端文本模型，保持上述作者模型、任务、提示、执行器和验收不变。密钥从 `DEEPSEEK_API_KEY` 读取；仅使用官方 `https://api.deepseek.com`，两组均显式 `thinking.type=disabled`，其余受控请求参数、代理和重试不变。原 Qwen 模式仍是默认值。
+
+```powershell
+python scripts/benchmarks/jev_browser/author_suite.py --paired --controlled --text-backend deepseek-flash --repeats 2 --qwen-http-limit 237 --proxy http://127.0.0.1:7890 --output logs/benchmarks/NEW_FLASH_RUN --chromium $env:CHROMIUM_EXECUTABLE
+```
+
+为避免修改旧分析和原始文件，`qwen_http`、`qwen_*_tokens`、`A_qwen` 等历史计数字段暂沿用，含义为所选文本模型的请求/用量；`text_model`、`text_api_base` 与实际请求体才标识本轮模型，不能在报告中将 Flash 请求写成 Qwen。只读审计同时核对模型名与模式，旧 Qwen 数据仍可复算；计数不含连通性诊断，模型预热另列。
+
 以下章节为上一轮 TypeScript 7 任务适配的历史用法。
 
 ## 已接入的职责

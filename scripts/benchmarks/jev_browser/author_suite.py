@@ -22,6 +22,11 @@ SNAPSHOT = ROOT.parent / "benchmark/models/huggingface/hub/models--cklxx--laya-b
 ENGINE = ROOT.parent / "benchmark/sources/jev-ultrafast"
 QWEN = "Qwen/Qwen2.5-72B-Instruct"
 QWEN_BASE = "https://api.siliconflow.cn/v1"
+TEXT_BACKENDS = {
+    "qwen": {"model": QWEN, "base_url": QWEN_BASE, "key_env": "SILICONFLOW_API_KEY", "extra_body": {}},
+    "deepseek-flash": {"model": "deepseek-flash", "base_url": "https://api.deepseek.com",
+                       "key_env": "DEEPSEEK_API_KEY", "extra_body": {"thinking": {"type": "disabled"}}},
+}
 SOURCE_HASHES = {
     "code/apps/browser_suite.py": "71359e9c9e53d0ce2fafda2fba8a98d559010f1052cccfc92a99ae018150ae7e",
     "code/jev-ultrafast.patch": "d9783e50962daf6823e49478e6ddab49c50871965a74e429408550b522270373",
@@ -80,11 +85,12 @@ def common_qwen_body(body):
             "response_format": {"type": "json_object"}}
 
 
-def controlled_qwen_post(client, url, key, body, wait):
+def controlled_qwen_post(client, url, key, body, wait, extra_body=None):
     import httpx
     for attempt in range(3):
         try:
-            response = client.post(url, json=common_qwen_body(body), headers={"Authorization": f"Bearer {key}"})
+            response = client.post(url, json=common_qwen_body({**body, **(extra_body or {})}),
+                                   headers={"Authorization": f"Bearer {key}"})
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in (429, 503, 529) and attempt < 2:
@@ -113,17 +119,22 @@ def validate_run_options(paired, repeats, controlled, proxy):
             raise ValueError("Proxy must be a local HTTP endpoint without credentials")
 
 
-def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=None, qwen_http_limit=None):
+def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=None, qwen_http_limit=None,
+        text_backend="qwen"):
     validate_run_options(paired, repeats, controlled, proxy)
+    if text_backend not in TEXT_BACKENDS or (text_backend != "qwen" and not controlled):
+        raise ValueError("Use a supported text backend; alternative models require controlled mode")
+    backend = TEXT_BACKENDS[text_backend]
+    text_model, text_base = backend["model"], backend["base_url"]
     qwen_limit = qwen_http_limit if qwen_http_limit is not None else 120 * repeats
     if not 1 <= qwen_limit <= 360:
-        raise ValueError("Qwen HTTP limit must be between 1 and 360")
+        raise ValueError("Text-model HTTP limit must be between 1 and 360")
     output.mkdir(parents=True, exist_ok=False)
     (output / "runner-source.py").write_bytes(Path(__file__).read_bytes())
     os.environ.update(PYTHONUTF8="1", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
-    key = os.environ.pop("SILICONFLOW_API_KEY", None)
+    key = os.environ.pop(backend["key_env"], None)
     if not key:
-        raise ValueError("SILICONFLOW_API_KEY is required")
+        raise ValueError(f"{backend['key_env']} is required")
     if proxy:
         os.environ.update(HTTP_PROXY=proxy, HTTPS_PROXY=proxy, NO_PROXY="localhost,127.0.0.1,::1")
         os.environ.pop("ALL_PROXY", None)
@@ -147,16 +158,17 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
     if proxy:
         import httpx
         model_module.CLIENT.close()
+        origin = urlparse(text_base)
         model_module.CLIENT = httpx.Client(http2=True, timeout=25, trust_env=False,
-            mounts={"https://api.siliconflow.cn": httpx.HTTPTransport(proxy=proxy, http2=True, trust_env=False)})
+            mounts={f"{origin.scheme}://{origin.netloc}": httpx.HTTPTransport(proxy=proxy, http2=True, trust_env=False)})
     if controlled:
         original_post = model_module.post_json
         def provider_wait(delay, status):
             with measured("provider_backoff", http_status=status, requested_seconds=delay):
                 time.sleep(delay)
         def controlled_post(url, token, body):
-            if url.startswith(QWEN_BASE):
-                return controlled_qwen_post(model_module.CLIENT, url, token, body, provider_wait)
+            if url == text_base + "/chat/completions":
+                return controlled_qwen_post(model_module.CLIENT, url, token, body, provider_wait, backend["extra_body"])
             return original_post(url, token, body)
         model_module.post_json = controlled_post
     if paired:
@@ -166,8 +178,8 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
     cdp_port, model_port = free_port(), free_port()
     model_url = f"http://127.0.0.1:{model_port}"
     os.environ.update(BU_CDP_URL=f"http://127.0.0.1:{cdp_port}", TYPESAFE_BASE_URL=model_url,
-                      TYPESAFE_API_KEY="local", TEXT_MODEL_BASE_URL=QWEN_BASE, TEXT_MODEL=QWEN,
-                      TEXT_MODEL_EXTRA_JSON="{}")
+                      TYPESAFE_API_KEY="local", TEXT_MODEL_BASE_URL=text_base, TEXT_MODEL=text_model,
+                      TEXT_MODEL_EXTRA_JSON=json.dumps(backend["extra_body"]))
     os.environ.pop("TEXT_MODEL_API_KEY", None)
     events = (output / "events.jsonl").open("x", encoding="utf-8")
     lock = threading.Lock()
@@ -250,12 +262,12 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
         send = model_module.CLIENT.send
         def observed_send(request, *args, **kwargs):
             destination = str(request.url)
-            if destination not in (model_url + "/v1/systemone", QWEN_BASE + "/chat/completions"):
+            if destination not in (model_url + "/v1/systemone", text_base + "/chat/completions"):
                 raise RuntimeError("Unexpected model destination")
-            remote = destination.startswith(QWEN_BASE)
+            remote = destination == text_base + "/chat/completions"
             if remote:
                 if counts["qwen_http"] >= qwen_limit:
-                    raise BudgetExhausted("Qwen HTTP budget exhausted")
+                    raise BudgetExhausted("Text-model HTTP budget exhausted")
                 counts["qwen_http"] += 1
             with measured("qwen_http" if remote else "decision_http", purpose=task["purpose"]) as record:
                 if remote:
@@ -333,13 +345,16 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                     for t, arm in (author_control.schedule(suite.TASKS, rep - 1) if paired else [(t, "B") for t in suite.TASKS])]
         manifest = {"source": REVISION, "engine": expected, "suite": "A", "repeats": repeats,
                     "paired": paired, "order": [{"task": t[0], "arm": arm, "repeat": rep} for t, arm, rep in schedule],
-                    "controlled": controlled, "common_qwen_parameters": common_qwen_body({}) if controlled else None,
+                    "controlled": controlled,
+                    "common_qwen_parameters": common_qwen_body(backend["extra_body"]) if controlled else None,
+                    "text_backend": text_backend, "text_model": text_model, "text_api_base": text_base,
+                    "legacy_counter_prefix": "qwen",
                     "network": {"browser_proxy": proxy, "qwen_proxy": proxy, "local_services": "direct" if proxy else "inherited",
                                 "httpx_trust_env": not bool(proxy), "qwen_timeout_seconds": 25},
                     "qwen_429_backoff_seconds": [30, 60] if controlled else [.5, 1],
                     "shared_null_guard_fix": paired, "isolated_browser_contexts": paired,
                     "cooperative_attempt_seconds": 180 if paired else None,
-                    "tasks": [row[0] for row in suite.TASKS], "qwen": QWEN, "qwen_http_limit": qwen_limit,
+                    "tasks": [row[0] for row in suite.TASKS], "qwen": text_model, "qwen_http_limit": qwen_limit,
                     "max_len": 1024, "head_max_len": 768, "fast": False, "device": str(lb.agent.device),
                     "python": sys.version, "torch": torch.__version__,
                     "packages": {n: importlib.metadata.version(n) for n in ("laya", "transformers", "browser-harness")},
@@ -419,10 +434,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--chromium", type=Path)
-    parser.add_argument("--paired", action="store_true", help="Run the local Qwen control and Laya arm with the shared null-guard fix")
+    parser.add_argument("--paired", action="store_true", help="Run the text-model control and Laya arm with the shared null-guard fix")
     parser.add_argument("--repeats", type=int, choices=(1, 2, 3), default=1)
-    parser.add_argument("--controlled", action="store_true", help="Unify common Qwen sampling parameters")
-    parser.add_argument("--proxy", help="Explicit local HTTP proxy for the browser and Qwen; local services bypass it")
+    parser.add_argument("--controlled", action="store_true", help="Unify common text-model sampling parameters")
+    parser.add_argument("--proxy", help="Explicit local HTTP proxy for the browser and text model; local services bypass it")
     parser.add_argument("--qwen-http-limit", type=int, help="Session HTTP cap, at most 360, including retries")
+    parser.add_argument("--text-backend", choices=tuple(TEXT_BACKENDS), default="qwen")
     args = parser.parse_args()
-    run(args.output.resolve(), args.chromium, args.paired, args.repeats, args.controlled, args.proxy, args.qwen_http_limit)
+    run(args.output.resolve(), args.chromium, args.paired, args.repeats, args.controlled, args.proxy,
+        args.qwen_http_limit, args.text_backend)
