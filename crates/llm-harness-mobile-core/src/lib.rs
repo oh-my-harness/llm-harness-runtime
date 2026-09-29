@@ -14,13 +14,38 @@ use llm_harness_sandbox_remote::{RemoteSandbox, RemoteSandboxClient, RemoteSandb
 use llm_harness_tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 
 mod events;
+pub mod manager;
 
 pub use events::{MobileEvent, map_agent_event, map_event};
+pub use manager::{MobileSessionManager, SessionSummary};
 /// Public wrapper for integration tests; FFI surface uses it via connect.
 pub fn parse_trust_profile_pub(
     value: &str,
 ) -> anyhow::Result<llm_harness_platform::trust::TrustProfile> {
     parse_trust_profile(value)
+}
+
+/// Connect a fresh remote sandbox for `config` (shared by connect + resume).
+pub(crate) async fn connect_sandbox(config: &MobileConfig) -> anyhow::Result<Arc<RemoteSandbox>> {
+    let client_config = if config.allow_insecure_http {
+        RemoteSandboxClientConfig::new_insecure(
+            config.gateway_url.clone(),
+            config.gateway_token.clone(),
+        )
+    } else {
+        RemoteSandboxClientConfig::new(config.gateway_url.clone(), config.gateway_token.clone())
+    }
+    .context("invalid gateway client config")?;
+    let client = Arc::new(RemoteSandboxClient::new(client_config)?);
+    let sandbox = Arc::new(
+        RemoteSandbox::connect(
+            sandbox_config(parse_trust_profile(&config.trust_profile)?),
+            client,
+        )
+        .await
+        .context("connect to gateway sandbox")?,
+    );
+    Ok(sandbox)
 }
 
 uniffi::setup_scaffolding!();
@@ -56,30 +81,25 @@ pub struct MobileConfig {
 pub struct MobileSession {
     harness: Arc<AgentHarness>,
     sandbox: Arc<RemoteSandbox>,
+    session_id: Option<String>,
     queue: Mutex<Vec<MobileEvent>>,
 }
 
 impl MobileSession {
     pub(crate) async fn new(config: MobileConfig) -> anyhow::Result<Arc<Self>> {
+        let sandbox = crate::connect_sandbox(&config).await?;
+        Self::assemble(config, sandbox, None).await
+    }
+
+    /// Assemble a session around an already-connected sandbox. `session_id`
+    /// attaches the session to a persisted `Session` (resume); `None` creates
+    /// an in-memory session (MVP path).
+    pub(crate) async fn assemble(
+        config: MobileConfig,
+        sandbox: Arc<RemoteSandbox>,
+        session_id: Option<String>,
+    ) -> anyhow::Result<Arc<Self>> {
         ensure_runtime();
-        let client_config = if config.allow_insecure_http {
-            RemoteSandboxClientConfig::new_insecure(
-                config.gateway_url.clone(),
-                config.gateway_token.clone(),
-            )
-        } else {
-            RemoteSandboxClientConfig::new(config.gateway_url.clone(), config.gateway_token.clone())
-        }
-        .context("invalid gateway client config")?;
-        let client = Arc::new(RemoteSandboxClient::new(client_config)?);
-        let sandbox = Arc::new(
-            RemoteSandbox::connect(
-                sandbox_config(parse_trust_profile(&config.trust_profile)?),
-                client,
-            )
-            .await
-            .context("connect to gateway sandbox")?,
-        );
         let llm_client: Arc<dyn llm_adapter::Provider> = match config.provider.as_str() {
             "openai" => {
                 let mut builder = llm_adapter::openai::OpenAIProvider::builder(config.api_key);
@@ -117,11 +137,23 @@ impl MobileSession {
                 .to_owned(),
         );
 
-        let harness = Arc::new(AgentHarness::new_in_memory(llm_client, env, opts).await);
+        let harness = Arc::new(match session_id.as_deref() {
+            Some(id) => {
+                let storage = crate::manager::open_storage(&id).await?;
+                AgentHarness::with_session(
+                    llm_client,
+                    env,
+                    llm_harness_agent::session::Session::new(storage),
+                    opts,
+                )
+            }
+            None => AgentHarness::new_in_memory(llm_client, env, opts).await,
+        });
 
         let session = Arc::new(Self {
             harness,
             sandbox,
+            session_id,
             queue: Mutex::new(Vec::new()),
         });
 

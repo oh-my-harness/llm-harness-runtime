@@ -14,9 +14,13 @@ llm-harness-types.workspace = true
 llm-harness-platform.workspace = true
 llm_adapter.workspace = true
 llm-harness-tools.workspace = true
-anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+anyhow.workspace = true
 tokio = { workspace = true, features = ["sync", "macros", "rt"] }
 tokio-util.workspace = true
 uniffi = { version = "0.29", features = ["cli"] }
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
