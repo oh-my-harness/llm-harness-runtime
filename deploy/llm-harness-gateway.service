@@ -1,0 +1,33 @@
+[Unit]
+Description=LLM Harness sandbox gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=llm-harness
+Group=llm-harness
+EnvironmentFile=/etc/llm-harness/gateway.env
+ExecStart=/usr/local/bin/llm-harness-sandbox-gateway /etc/llm-harness/gateway.json
+StateDirectory=llm-harness/gateway/work
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/llm-harness/gateway/work
+UMask=0077
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

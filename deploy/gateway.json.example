@@ -1,0 +1,21 @@
+{
+  "bind": "127.0.0.1",
+  "port": 7080,
+  "work_root": "/var/lib/llm-harness/gateway/work",
+  "backend": {
+    "type": "bwrap"
+  },
+  "principals": [
+    {
+      "principal": "control-service",
+      "token_env": "LLM_HARNESS_GATEWAY_TOKEN",
+      "fs_allowlist": ["/workspace"],
+      "max_trust_profile": "restricted"
+    }
+  ],
+  "max_sandboxes": 32,
+  "default_exec_timeout_ms": 60000,
+  "max_exec_timeout_ms": 900000,
+  "max_output_bytes": 1048576,
+  "max_request_bytes": 67108864
+}
