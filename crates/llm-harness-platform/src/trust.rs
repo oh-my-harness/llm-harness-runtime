@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 /// Ordering matters: `Restricted < TrustedLan < TrustedFull`. Principals
 /// declare a maximum profile they are willing to grant; requests above the
 /// cap are rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustProfile {
     /// No network, work_dir + explicit allowlist only. Third-party code and
     /// sensitive-data workloads.
+    #[default]
     Restricted,
     /// Network allowed; host project directories bound read-write; system
     /// areas and credential floors still denied.
@@ -29,11 +30,5 @@ impl TrustProfile {
             TrustProfile::TrustedLan => "trusted-lan",
             TrustProfile::TrustedFull => "trusted-full",
         }
-    }
-}
-
-impl Default for TrustProfile {
-    fn default() -> Self {
-        TrustProfile::Restricted
     }
 }

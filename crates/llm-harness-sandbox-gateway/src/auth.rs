@@ -74,6 +74,7 @@ struct PrincipalSecret {
 pub(crate) struct AuthenticatedPrincipal {
     pub(crate) id: Arc<str>,
     pub(crate) fs_allowlist: Arc<[PathBuf]>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) host_project_dirs: Arc<[PathBuf]>,
     pub(crate) max_trust_profile: llm_harness_platform::trust::TrustProfile,
 }
