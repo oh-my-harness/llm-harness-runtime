@@ -54,6 +54,14 @@ class ControlTests(unittest.TestCase):
                                       {"SELECT": {"1:2": action}}, {})
         self.assertIs(parsed[3], action)
 
+    def test_integer_targets_normalize_without_guessing(self):
+        targets = {"CLICK": {"1": {"id": "e1"}}}
+        parsed = control.parse_output('{"operation":"CLICK","target":1,"text":null}', targets, {})
+        self.assertEqual(parsed[1], "1")
+        for value in (True, 1.0, "e1", "button", 9):
+            with self.assertRaises(ValueError):
+                control.parse_output(json.dumps({"operation": "CLICK", "target": value, "text": None}), targets, {})
+
     def test_combined_text_uses_one_http_and_no_helper_call(self):
         calls = []
         action = {"id": "field", "kind": "fill", "label": "Search"}
@@ -74,6 +82,9 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(text, "book")
         self.assertTrue(meta["merged"])
         self.assertEqual(result["choice"], "field")
+        body = calls[0][2]
+        payload = json.loads(body["messages"][1]["content"])
+        self.assertEqual(payload["valid_targets"], {"TYPE_TEXT": ["1"]})
         with self.assertRaises(ValueError):
             policy.field_text({"different": "context"})
 
@@ -82,6 +93,22 @@ class ControlTests(unittest.TestCase):
         schedule = control.schedule(tasks)
         self.assertEqual([arm for _, arm in schedule], ["A", "B", "B", "A", "A", "B", "B", "A"])
         self.assertEqual(len(schedule), 8)
+
+    def test_next_repeat_reverses_every_pairs_order(self):
+        tasks = [("one",), ("two",)]
+        self.assertEqual([arm for _, arm in control.schedule(tasks, 1)], ["B", "A", "A", "B"])
+
+    def test_repeats_remain_separate_pairs(self):
+        rows = [dict(task="one", arm=arm, repeat=rep, **{"pass": rep == 1 or arm == "A"},
+                     attempt_wall_seconds=2 if arm == "A" else 1, counts={"qwen_http": 1})
+                for rep in (1, 2) for arm in ("A", "B")]
+        result = control.compare(rows)
+        self.assertEqual(result["quality_pairs"]["both_pass"], 1)
+        self.assertEqual(result["quality_pairs"]["only_A"], 1)
+        self.assertEqual(result["both_success"][0]["repeat"], 1)
+        self.assertEqual(result["paired_speed_ratio_A_over_B"], 2)
+        with self.assertRaises(ValueError):
+            control.compare(rows + [rows[0]])
 
     def test_checkbox_false_and_runtime_errors_fail(self):
         self.assertFalse(control.accepted(True, "done", "internet-checkbox", {"actions": [{"role": "checkbox", "checked": "false"}]}))

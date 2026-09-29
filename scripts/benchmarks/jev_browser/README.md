@@ -33,6 +33,18 @@ python -m unittest discover -s scripts/tests -p 'test_jev_browser_author*.py' -v
 
 首轮实测见[中文对照报告](../../../docs/research/laya-browser-paired-control-20260929.md)。`audit_author_run.py RUN_DIRECTORY` 只读重算逐次计数、配对统计、按组 token 和敏感性结果，不加载模型、不调用远端 API、不修改原始日志。工程测试必须在计时实验之前完成，不与真实实验同时运行。
 
+### 固定条件的三轮重跑
+
+`--controlled --repeats 3 --proxy http://127.0.0.1:7890` 在同一 16 题上运行 48 对、96 次尝试，轮次翻转先后顺序；请求上限为 360。浏览器显式使用本地代理，Qwen 使用显式 HTTPX transport，本地模型与 CDP 绕过代理。两组全部 Qwen 请求统一 temperature=0、top_p=1、max_tokens=1024 和 JSON 输出；不改变作者 Laya 预处理或 helper 提示。
+
+A 的协议明确合法操作/目标，并仅允许整数目标按同值字符串正规化，仍禁止猜测和越界目标。完整请求体、响应原文及异常栈在本地日志记录，凭据脱敏。相同任务的不同轮次分别配对；只读审计同时检查公共参数和 Qwen 路由没有漂移。工程测试须先全部结束再运行：
+
+```powershell
+python scripts/benchmarks/jev_browser/author_suite.py --paired --controlled --repeats 3 --proxy http://127.0.0.1:7890 --output logs/benchmarks/NEW_CONTROLLED_RUN --chromium $env:CHROMIUM_EXECUTABLE
+```
+
+这仍是作者方案与合理纯 Qwen 基线的整体部署比较，不是最终输入完全相同的模型消融；原任务和旧结果均不覆盖。
+
 以下章节为上一轮 TypeScript 7 任务适配的历史用法。
 
 ## 已接入的职责

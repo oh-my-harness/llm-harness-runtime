@@ -25,6 +25,8 @@ def parse_output(content, targets, controls, exclude_ops=()):
     if not isinstance(value, dict) or set(value) != {"operation", "target", "text"}:
         raise ValueError("Invalid Qwen control response")
     operation, target, text = value["operation"], value["target"], value["text"]
+    if type(target) is int:
+        target = str(target)
     allowed = (set(targets) | set(controls) | {"DONE", "BLOCKED"}) - set(exclude_ops)
     if not isinstance(operation, str) or operation not in allowed:
         raise ValueError("Qwen chose an unavailable operation")
@@ -53,14 +55,18 @@ class QwenControl:
         self.pending = None
         elements, targets, controls = self.model.action_space(page["actions"])
         operations = sorted((set(targets) | set(controls) | {"DONE", "BLOCKED"}) - set(exclude_ops))
-        instructions = (self.rules + '\nReturn exactly JSON {"operation":"...","target":"index or null",'
-                        '"text":"field value or null"}. For TYPE_TEXT, supply the exact field text in this same '
+        instructions = (self.rules + '\nReturn one JSON object with exactly three keys: operation, target, text. '
+                        'operation must be an exact offered operation name. target must be an exact string index '
+                        'from valid_targets[operation], or the JSON literal null for a control operation. '
+                        'Never use a label, element id, boolean, or the string "null" as target. '
+                        'For TYPE_TEXT, supply the exact field text in this same '
                         'response. For SELECT choose an observed option index, not just its field. For controls, '
                         'DONE and BLOCKED use target=null. For every operation except TYPE_TEXT use text=null. '
                         'Only use offered operations and target indices. Never invent personal information, '
                         'selectors, code or unavailable values. If a required value is unknown, do not fill it.')
         payload = {"goal": goal, "page": {k: page[k] for k in ("url", "title", "text")},
                    "operations": operations, "elements": elements,
+                   "valid_targets": {op: list(values) for op, values in targets.items() if op in operations},
                    "controls": {k: v["label"] for k, v in controls.items()},
                    "field_hints": {k: self.model.field_context(goal, a, page, history)["field"]
                                    for k, a in targets.get("TYPE_TEXT", {}).items()},
@@ -72,7 +78,7 @@ class QwenControl:
             "model": os.environ["TEXT_MODEL"], "temperature": 0, "max_tokens": 1024,
             "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": instructions},
-                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]})
+                         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}]})
         op, target, text, action = parse_output(result["choices"][0]["message"]["content"], targets, controls, exclude_ops)
         choice = action["id"] if action is not None else op
         latency = (time.perf_counter() - started) * 1000
@@ -132,8 +138,9 @@ def install(agent_module, model_module, state, emit):
     return PairedAgent
 
 
-def schedule(tasks):
-    return [(task, arm) for index, task in enumerate(tasks) for arm in (("A", "B") if index % 2 == 0 else ("B", "A"))]
+def schedule(tasks, repeat_index=0):
+    return [(task, arm) for index, task in enumerate(tasks)
+            for arm in (("A", "B") if (index + repeat_index) % 2 == 0 else ("B", "A"))]
 
 
 def accepted(author_pass, status, task, page):
@@ -165,10 +172,14 @@ def compare(rows):
                        "failure_wall": distribution([r["attempt_wall_seconds"] for r in group if not r["pass"]])}
     pairs = {}
     for row in rows:
-        pairs.setdefault(row["task"], {})[row["arm"]] = row
+        key = (row["task"], row.get("repeat", 1))
+        pair = pairs.setdefault(key, {})
+        if row["arm"] in pair:
+            raise ValueError("Duplicate task/repeat/arm")
+        pair[row["arm"]] = row
     matrix = {"both_pass": 0, "only_A": 0, "only_B": 0, "both_fail": 0, "incomplete": 0}
     matched = []
-    for task, pair in pairs.items():
+    for (task, repeat), pair in pairs.items():
         if set(pair) != {"A", "B"}:
             matrix["incomplete"] += 1
             continue
@@ -177,6 +188,8 @@ def compare(rows):
         if a["pass"] and b["pass"]:
             matched.append({"task": task, "A_seconds": a["attempt_wall_seconds"], "B_seconds": b["attempt_wall_seconds"],
                             "A_qwen": a["counts"]["qwen_http"], "B_qwen": b["counts"]["qwen_http"]})
+            if "repeat" in a:
+                matched[-1]["repeat"] = repeat
     total_a = sum(p["A_seconds"] for p in matched)
     total_b = sum(p["B_seconds"] for p in matched)
     return {"groups": groups, "quality_pairs": matrix, "both_success": matched,

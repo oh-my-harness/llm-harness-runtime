@@ -30,12 +30,14 @@ def audit(directory):
     rows = report["rows"]
     if len(rows) != report["completed"] or report["completed"] + report["unstarted"] != len(manifest["order"]):
         raise ValueError("Attempt count mismatch")
-    if [{"task": r["task"], "arm": r["arm"]} for r in rows] != manifest["order"][:len(rows)]:
+    keys = ("task", "arm", "repeat") if "repeat" in manifest["order"][0] else ("task", "arm")
+    if [{k: r[k] for k in keys} for r in rows] != manifest["order"][:len(rows)]:
         raise ValueError("Attempt order mismatch")
-    if len({(r["task"], r["arm"]) for r in rows}) != len(rows):
+    if len({(r["task"], r["arm"], r.get("repeat", 1)) for r in rows}) != len(rows):
         raise ValueError("Duplicate attempt")
     for row in rows:
-        attempt = [e for e in events if e["task"] == row["task"] and e.get("arm") == row["arm"]]
+        attempt = [e for e in events if e["task"] == row["task"] and e.get("arm") == row["arm"]
+                   and e.get("repeat", 1) == row.get("repeat", 1)]
         for key, component in COMPONENTS.items():
             if row["counts"][key] != sum(e["component"] == component for e in attempt):
                 raise ValueError(f"Counter mismatch: {row['task']} {row['arm']} {key}")
@@ -47,6 +49,15 @@ def audit(directory):
     for arm in ("A", "B"):
         if any(e.get("device") != "cuda:0" for e in events if e.get("arm") == arm and e["component"] == "laya_forward"):
             raise ValueError("Unexpected forward device")
+    if manifest.get("controlled"):
+        for event in events:
+            if event["component"] != "qwen_http":
+                continue
+            if event.get("network_route") != manifest["network"]["qwen_proxy"]:
+                raise ValueError("Qwen proxy drift")
+            body = event.get("request_body", {})
+            if any(body.get(k) != v for k, v in manifest["common_qwen_parameters"].items()):
+                raise ValueError("Qwen parameter drift")
     recalculated = compare(rows)
     if recalculated != report["comparison"]:
         raise ValueError("Comparison mismatch")
@@ -54,9 +65,10 @@ def audit(directory):
     for row in rows:
         if row["arm"] != "A":
             continue
-        other = next((r for r in rows if r["task"] == row["task"] and r["arm"] == "B"), None)
+        other = next((r for r in rows if r["task"] == row["task"] and r["arm"] == "B"
+                      and r.get("repeat", 1) == row.get("repeat", 1)), None)
         if other and row["initial_observation_sha256"] is not None and row["initial_observation_sha256"] == other["initial_observation_sha256"]:
-            matched_initial.append(row["task"])
+            matched_initial.append(row["task"] if "repeat" not in row else {"task": row["task"], "repeat": row["repeat"]})
     sensitivity = compare([r for r in rows if r["task"] != manifest["order"][0]["task"]])
     return {"counters_and_comparison_verified": True, "completed": len(rows),
             "token_usage_from_events": {arm: usage_summary([e for e in events if e.get("arm") == arm]) for arm in ("A", "B")},

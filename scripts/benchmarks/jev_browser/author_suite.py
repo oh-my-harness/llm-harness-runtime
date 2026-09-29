@@ -12,7 +12,9 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.request
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[3]
 REVISION = "645cf366a2ae35f1086e8c20eff48f909bb49206"
@@ -73,13 +75,35 @@ class BudgetExhausted(BaseException):
     pass
 
 
-def run(output, chromium=None, paired=False):
+def common_qwen_body(body):
+    return {**body, "temperature": 0, "top_p": 1, "max_tokens": 1024,
+            "response_format": {"type": "json_object"}}
+
+
+def validate_run_options(paired, repeats, controlled, proxy):
+    if repeats not in (1, 2, 3) or (repeats != 1 and not paired):
+        raise ValueError("Use one to three paired repetitions")
+    if controlled and (not paired or not proxy):
+        raise ValueError("Controlled runs require paired mode and an explicit local proxy")
+    if proxy:
+        parsed = urlparse(proxy)
+        if (parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost")
+                or not parsed.port or parsed.username or parsed.password or parsed.path not in ("", "/")
+                or parsed.query or parsed.fragment):
+            raise ValueError("Proxy must be a local HTTP endpoint without credentials")
+
+
+def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=None):
+    validate_run_options(paired, repeats, controlled, proxy)
     output.mkdir(parents=True, exist_ok=False)
     (output / "runner-source.py").write_bytes(Path(__file__).read_bytes())
     os.environ.update(PYTHONUTF8="1", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     key = os.environ.pop("SILICONFLOW_API_KEY", None)
     if not key:
         raise ValueError("SILICONFLOW_API_KEY is required")
+    if proxy:
+        os.environ.update(HTTP_PROXY=proxy, HTTPS_PROXY=proxy, NO_PROXY="localhost,127.0.0.1,::1")
+        os.environ.pop("ALL_PROXY", None)
     expected = "1231850a0bf1a0c0341fe408ef1668dbbfdfac46"
     if subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ENGINE, text=True).strip() != expected:
         raise ValueError("Engine revision mismatch")
@@ -97,6 +121,16 @@ def run(output, chromium=None, paired=False):
     from browser_harness import admin
     from laya_browser import LayaBrowser
     import torch
+    if proxy:
+        import httpx
+        model_module.CLIENT.close()
+        model_module.CLIENT = httpx.Client(http2=True, timeout=25, trust_env=False,
+            mounts={"https://api.siliconflow.cn": httpx.HTTPTransport(proxy=proxy, http2=True, trust_env=False)})
+    if controlled:
+        original_post = model_module.post_json
+        def controlled_post(url, token, body):
+            return original_post(url, token, common_qwen_body(body) if url.startswith(QWEN_BASE) else body)
+        model_module.post_json = controlled_post
     if paired:
         import author_control
         (output / "control-source.py").write_bytes(Path(author_control.__file__).read_bytes())
@@ -109,15 +143,16 @@ def run(output, chromium=None, paired=False):
     os.environ.pop("TEXT_MODEL_API_KEY", None)
     events = (output / "events.jsonl").open("x", encoding="utf-8")
     lock = threading.Lock()
-    task = {"name": "setup", "purpose": None, "arm": None, "deadline": float("inf"), "initial": None,
+    task = {"name": "setup", "purpose": None, "arm": None, "repeat": None, "deadline": float("inf"), "initial": None,
             "tokens": {"qwen_input_tokens": 0, "qwen_output_tokens": 0}}
     counts = {"qwen_http": 0, "laya_rpc": 0, "laya_predict": 0, "laya_forward": 0,
               "tools": 0, "qwen_input_tokens": 0, "qwen_output_tokens": 0}
 
     def emit(component, **data):
         with lock:
-            events.write(json.dumps({"utc": time.time(), "task": task["name"], "arm": task["arm"], "component": component,
-                                     **data}, ensure_ascii=True) + "\n")
+            line = json.dumps({"utc": time.time(), "task": task["name"], "arm": task["arm"], "repeat": task["repeat"],
+                               "component": component, **data}, ensure_ascii=True)
+            events.write(line.replace(key, "[REDACTED]") + "\n")
             events.flush()
 
     @contextmanager
@@ -128,6 +163,8 @@ def run(output, chromium=None, paired=False):
             data["status"] = "ok"
         except BaseException as error:
             data.update(status="error", error_type=type(error).__name__)
+            data["frames"] = [{"file": f.filename, "line": f.lineno, "function": f.name}
+                              for f in traceback.extract_tb(error.__traceback__)]
             raise
         finally:
             emit(component, elapsed_ms=(time.perf_counter() - start) * 1000, **data)
@@ -135,7 +172,8 @@ def run(output, chromium=None, paired=False):
     browser = None
     started = time.perf_counter()
     rows = []
-    planned = len(suite.TASKS) * (2 if paired else 1)
+    planned = len(suite.TASKS) * (2 if paired else 1) * repeats
+    qwen_limit = 120 * repeats
     try:
         with measured("model_load"):
             lb = LayaBrowser.from_pretrained(str(SNAPSHOT), device="cuda", fast=False)
@@ -173,7 +211,8 @@ def run(output, chromium=None, paired=False):
         executable = str(chromium) if chromium else subprocess.check_output(["node", "-e",
             "console.log(require('../benchmark/sources/jev-browser/node_modules/playwright').chromium.executablePath())"],
             cwd=ROOT, text=True).strip()
-        browser = subprocess.Popen([executable, "--headless=new", f"--remote-debugging-port={cdp_port}",
+        proxy_args = [f"--proxy-server={proxy}", "--proxy-bypass-list=localhost;127.0.0.1;[::1]"] if proxy else []
+        browser = subprocess.Popen([executable, *proxy_args, "--headless=new", f"--remote-debugging-port={cdp_port}",
                                     "--remote-debugging-address=127.0.0.1", "--no-first-run",
                                     f"--user-data-dir={output / 'browser-profile'}", "about:blank"],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -188,10 +227,13 @@ def run(output, chromium=None, paired=False):
                 raise RuntimeError("Unexpected model destination")
             remote = destination.startswith(QWEN_BASE)
             if remote:
-                if counts["qwen_http"] >= 120:
+                if counts["qwen_http"] >= qwen_limit:
                     raise BudgetExhausted("Qwen HTTP budget exhausted")
                 counts["qwen_http"] += 1
             with measured("qwen_http" if remote else "decision_http", purpose=task["purpose"]) as record:
+                if remote:
+                    record["request_body"] = json.loads(request.content)
+                    record["network_route"] = proxy or "inherited"
                 try:
                     response = send(request, *args, **kwargs)
                 except Exception:
@@ -222,6 +264,11 @@ def run(output, chromium=None, paired=False):
             setattr(agent_module, name, call)
         for name in ("field_text", "select_option", "make_plan", "subgoal_satisfied"):
             observe_helper(name)
+        browser_init = agent_module.Browser.__init__
+        def observed_browser_init(self, *args, **kwargs):
+            with measured("browser_start"):
+                browser_init(self, *args, **kwargs)
+        agent_module.Browser.__init__ = observed_browser_init
         act = agent_module.Browser.act
         def observed_act(self, action, *args, **kwargs):
             counts["tools"] += 1
@@ -250,12 +297,16 @@ def run(output, chromium=None, paired=False):
                     params["browserContextId"] = context["id"]
                 return raw_cdp(method, **params)
             browser_module.cdp = isolated_cdp
-        schedule = author_control.schedule(suite.TASKS) if paired else [(t, "B") for t in suite.TASKS]
-        manifest = {"source": REVISION, "engine": expected, "suite": "A", "repeats": 1,
-                    "paired": paired, "order": [{"task": t[0], "arm": arm} for t, arm in schedule],
+        schedule = [(t, arm, rep) for rep in range(1, repeats + 1)
+                    for t, arm in (author_control.schedule(suite.TASKS, rep - 1) if paired else [(t, "B") for t in suite.TASKS])]
+        manifest = {"source": REVISION, "engine": expected, "suite": "A", "repeats": repeats,
+                    "paired": paired, "order": [{"task": t[0], "arm": arm, "repeat": rep} for t, arm, rep in schedule],
+                    "controlled": controlled, "common_qwen_parameters": common_qwen_body({}) if controlled else None,
+                    "network": {"browser_proxy": proxy, "qwen_proxy": proxy, "local_services": "direct" if proxy else "inherited",
+                                "httpx_trust_env": not bool(proxy), "qwen_timeout_seconds": 25},
                     "shared_null_guard_fix": paired, "isolated_browser_contexts": paired,
                     "cooperative_attempt_seconds": 180 if paired else None,
-                    "tasks": [row[0] for row in suite.TASKS], "qwen": QWEN, "qwen_http_limit": 120,
+                    "tasks": [row[0] for row in suite.TASKS], "qwen": QWEN, "qwen_http_limit": qwen_limit,
                     "max_len": 1024, "head_max_len": 768, "fast": False, "device": str(lb.agent.device),
                     "python": sys.version, "torch": torch.__version__,
                     "packages": {n: importlib.metadata.version(n) for n in ("laya", "transformers", "browser-harness")},
@@ -266,8 +317,8 @@ def run(output, chromium=None, paired=False):
                                 "planner": False, "escalate": False, "verify_done": False, "macros": False},
                     "warmup_counts": dict(counts)}
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        for original_task, arm in schedule:
-            task.update(name=original_task[0], arm=arm, initial=None,
+        for original_task, arm, repeat in schedule:
+            task.update(name=original_task[0], arm=arm, repeat=repeat, initial=None,
                         tokens={"qwen_input_tokens": 0, "qwen_output_tokens": 0})
             last_page.clear()
             if paired:
@@ -284,7 +335,7 @@ def run(output, chromium=None, paired=False):
                 wall, final = time.perf_counter() - attempt_started, last_page.get("url", "")
                 exhausted = True
             passed = author_control.accepted(ok, status, task["name"], last_page) if paired else ok
-            row = {"task": task["name"], "arm": arm, "pass": passed, "author_pass": ok,
+            row = {"task": task["name"], "arm": arm, "repeat": repeat, "pass": passed, "author_pass": ok,
                    "steps": steps, "status": status, "wall_seconds": wall,
                    "attempt_wall_seconds": time.perf_counter() - attempt_started, "initial_observation_sha256": task["initial"],
                    "final_url": final, "counts": {k: None if v is None or before[k] is None else v - before[k]
@@ -335,5 +386,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--chromium", type=Path)
     parser.add_argument("--paired", action="store_true", help="Run the local Qwen control and Laya arm with the shared null-guard fix")
+    parser.add_argument("--repeats", type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument("--controlled", action="store_true", help="Unify common Qwen sampling parameters")
+    parser.add_argument("--proxy", help="Explicit local HTTP proxy for the browser and Qwen; local services bypass it")
     args = parser.parse_args()
-    run(args.output.resolve(), args.chromium, args.paired)
+    run(args.output.resolve(), args.chromium, args.paired, args.repeats, args.controlled, args.proxy)

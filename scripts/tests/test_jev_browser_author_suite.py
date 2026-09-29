@@ -13,6 +13,24 @@ SPEC.loader.exec_module(suite)
 
 
 class AuthorSuiteTests(unittest.TestCase):
+    def test_controlled_parameters_do_not_mutate_input_or_prompt(self):
+        body = {"model": "qwen", "temperature": .7, "max_tokens": 60, "messages": [{"content": "original"}]}
+        result = suite.common_qwen_body(body)
+        self.assertEqual(result["temperature"], 0)
+        self.assertEqual(result["top_p"], 1)
+        self.assertEqual(result["max_tokens"], 1024)
+        self.assertEqual(result["messages"], body["messages"])
+        self.assertEqual(body["max_tokens"], 60)
+
+    def test_run_options_require_bounded_repeats_and_local_proxy(self):
+        suite.validate_run_options(True, 3, True, "http://127.0.0.1:7890")
+        suite.validate_run_options(False, 1, False, None)
+        for args in ((False, 3, True, None), (True, 4, True, "http://127.0.0.1:7890"),
+                     (True, 3, True, None), (True, 3, True, "http://example.invalid:7890"),
+                     (True, 3, True, "http://user:password@127.0.0.1:7890")):
+            with self.assertRaises(ValueError):
+                suite.validate_run_options(*args)
+
     def test_source_validation_rejects_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
