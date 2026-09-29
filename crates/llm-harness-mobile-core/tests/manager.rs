@@ -195,7 +195,10 @@ async fn manager_create_and_resume_roundtrip() {
         .open_session(config, session_id.clone())
         .await
         .expect("resume session");
-    assert!(resumed.sandbox_recreated(), "conservative resume always recreates");
+    assert!(
+        resumed.sandbox_recreated(),
+        "conservative resume always recreates"
+    );
     let history = resumed.history().await.expect("history");
     assert!(
         history.iter().any(|m| m.role == "user"),

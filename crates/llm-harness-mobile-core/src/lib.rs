@@ -352,17 +352,24 @@ pub async fn connect(config: MobileConfig) -> Result<Arc<MobileSession>, MobileE
     Ok(session)
 }
 
-/// Install a global multi-thread tokio runtime exactly once.
+/// Install a global multi-thread tokio runtime exactly once and enter it.
 ///
 /// uniffi drives its async entry points on the foreign side, so the Rust
-/// futures need a live runtime context for `tokio::spawn` and IO resources.
-/// The handle leaks deliberately: the runtime must live for the whole process.
+/// futures need a live runtime *context* (reactor + spawn handle) for
+/// `tokio::fs`/`tokio::spawn` even though polling happens on a foreign
+/// thread. The runtime leaks deliberately: it must live for the process.
 fn ensure_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    RUNTIME.get_or_init(|| {
+    let runtime = RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("build tokio runtime")
-    })
+    });
+    // Enter without a stored guard: the thread-local context is retained by
+    // leaking the guard once per thread. Entering is idempotent for our
+    // multi-thread runtime and uniffi entry points are the only callers.
+    let guard = runtime.enter();
+    std::mem::forget(guard);
+    runtime
 }

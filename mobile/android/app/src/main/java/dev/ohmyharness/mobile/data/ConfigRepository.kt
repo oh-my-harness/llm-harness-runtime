@@ -59,7 +59,34 @@ class ConfigRepository(private val context: android.content.Context) {
         )
     }
 
-    suspend fun current(): AppConfig = config.first()
+    suspend fun current(): AppConfig {
+        val saved = config.first()
+        if (saved.isComplete()) return saved
+        // First boot: seed from bundled defaults (test-phase full plaintext).
+        // First boot: seed from bundled defaults (api key still manual).
+        val defaults = seedDefaults() ?: return saved
+        if (saved.gatewayUrl.isBlank() && defaults.gatewayUrl.isNotBlank()) {
+            save(defaults)
+            return defaults
+        }
+        return saved
+    }
+
+    /** Merge bundled defaults.json over the current values (key never seeded). */
+    private suspend fun seedDefaults(): AppConfig? = runCatching {
+        val json = context.assets.open("defaults.json").bufferedReader().use { it.readText() }
+        val obj = org.json.JSONObject(json)
+        AppConfig(
+            gatewayUrl = obj.optString("gatewayUrl"),
+            gatewayToken = obj.optString("gatewayToken"),
+            apiKey = obj.optString("apiKey"),
+            model = obj.optString("model"),
+            llmBaseUrl = obj.optString("llmBaseUrl"),
+            provider = obj.optString("provider", "openai"),
+            allowInsecureHttp = obj.optBoolean("allowInsecureHttp", false),
+            trustProfile = obj.optString("trustProfile", "restricted"),
+        )
+    }.getOrNull()
 
     suspend fun save(config: AppConfig) {
         context.configStore.edit { prefs ->

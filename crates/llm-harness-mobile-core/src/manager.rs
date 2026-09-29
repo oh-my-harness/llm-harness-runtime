@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::{MobileConfig, MobileError, MobileSession};
+use crate::{MobileConfig, MobileError, MobileSession, ensure_runtime};
 use llm_harness_agent::session::SessionRepo;
 use llm_harness_sandbox_remote::RemoteSandbox;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -171,6 +171,10 @@ fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Process-wide root for persisted sessions. Set once by the first
+/// `MobileSessionManager::new` (or by `OHM_MOBILE_DATA_DIR` on desktop).
+static SESSION_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 fn session_repo() -> anyhow::Result<Arc<llm_harness_agent::session::JsonlSessionRepo>> {
     let root = dirs_data_root()?;
     let sessions_dir = root.join("sessions");
@@ -180,17 +184,20 @@ fn session_repo() -> anyhow::Result<Arc<llm_harness_agent::session::JsonlSession
     )))
 }
 
-/// Root for persisted state: `dirs::data_dir()/ohmyharness-mobile` on desktop,
-/// app-private internal storage equivalent on Android via `XDG`-less fallback.
 fn dirs_data_root() -> anyhow::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("OHM_MOBILE_DATA_DIR") {
-        return Ok(PathBuf::from(dir));
+        let path = PathBuf::from(dir);
+        let _ = SESSION_ROOT.set(path.clone());
+        return Ok(path);
+    }
+    if let Some(path) = SESSION_ROOT.get() {
+        return Ok(path.clone());
     }
     #[cfg(target_os = "android")]
     {
-        // On Android the FFI host passes OHM_MOBILE_DATA_DIR; without it we
-        // cannot know the app-private dir.
-        anyhow::bail!("OHM_MOBILE_DATA_DIR must be set on Android")
+        anyhow::bail!(
+            "session data dir was never initialized (MobileSessionManager::new not called)"
+        )
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -205,9 +212,9 @@ fn dirs_data_root() -> anyhow::Result<PathBuf> {
 impl MobileSessionManager {
     #[uniffi::constructor]
     pub fn new(data_dir: String) -> Arc<Self> {
-        Arc::new(Self {
-            data_dir: PathBuf::from(data_dir),
-        })
+        let path = PathBuf::from(&data_dir);
+        let _ = SESSION_ROOT.set(path.clone());
+        Arc::new(Self { data_dir: path })
     }
 
     pub async fn create_session(
@@ -215,12 +222,14 @@ impl MobileSessionManager {
         config: MobileConfig,
         name: String,
     ) -> Result<Arc<MobileSession>, MobileError> {
+        ensure_runtime();
         self.create_session_inner(config, name)
             .await
             .map_err(MobileError::from)
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, MobileError> {
+        ensure_runtime();
         self.list_sessions_inner().await.map_err(MobileError::from)
     }
 
@@ -229,12 +238,14 @@ impl MobileSessionManager {
         config: MobileConfig,
         session_id: String,
     ) -> Result<Arc<MobileSession>, MobileError> {
+        ensure_runtime();
         self.open_session_inner(config, session_id)
             .await
             .map_err(MobileError::from)
     }
 
     pub async fn delete_session(&self, session_id: String) -> Result<(), MobileError> {
+        ensure_runtime();
         self.delete_session_inner(session_id)
             .await
             .map_err(MobileError::from)

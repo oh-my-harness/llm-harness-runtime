@@ -1,0 +1,10 @@
+{
+  "gatewayUrl": "http://10.0.13.115:7080",
+  "gatewayToken": "mvp-smoke-token-0123456789abcdef",
+  "apiKey": "sk-owhsbodinupygpqweapwaixkcohzwbtzdhsqceietbxtsqdl",
+  "model": "zai-org/GLM-5.2",
+  "llmBaseUrl": "https://api.siliconflow.cn",
+  "provider": "openai",
+  "allowInsecureHttp": true,
+  "trustProfile": "trusted-lan"
+}

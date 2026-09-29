@@ -152,13 +152,14 @@ class AppViewModel(
     private suspend fun connectWith(config: AppConfig) {
         _uiState.update { it.copy(connection = ConnectionState.Connecting) }
         try {
-            val session = uniffi.llm_harness_mobile_core.connect(config.toMobileConfig())
-            val id = session.sessionId()
-            if (id != null) {
-                live[id] = session
-                startPump(id, session)
-                replayHistory(id, session)
-            }
+            // The chat UI needs a persisted session (active id + history);
+            // the bare connect() FFI creates an ad-hoc in-memory session.
+            val session = manager.createSession(config.toMobileConfig(), "Session 1")
+            val id = session.sessionId() ?: error("persisted session has no id")
+            live[id] = session
+            startPump(id, session)
+            replayHistory(id, session)
+            refreshSessions()
             _uiState.update { it.copy(activeSessionId = id) }
             _uiState.update { it.copy(connection = ConnectionState.Connected(config.trustProfile)) }
         } catch (e: Exception) {
