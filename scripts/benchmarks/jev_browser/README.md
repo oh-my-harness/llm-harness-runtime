@@ -47,6 +47,8 @@ python scripts/benchmarks/jev_browser/author_suite.py --paired --controlled --re
 
 这仍是作者方案与合理纯 Qwen 基线的整体部署比较，不是最终输入完全相同的模型消融；原任务和旧结果均不覆盖。
 
+实测范围及结论见[固定条件重跑报告](../../../docs/research/laya-browser-controlled-comparison-20260929.md)：当前 89/96 次，预算停止。只读审计输出 `round_analysis`，按任务覆盖度提取完整轮次，并列给出全部成功配对与无 HTTP 失败成功配对，不从原始文件删除记录。
+
 以下章节为上一轮 TypeScript 7 任务适配的历史用法。
 
 ## 已接入的职责

@@ -23,6 +23,28 @@ def usage_summary(events):
     return result
 
 
+def paired_totals(pairs):
+    a, b = (sum(p[f"{arm}_seconds"] for p in pairs) for arm in ("A", "B"))
+    return {"pairs": len(pairs), "A_seconds": a, "B_seconds": b, "speed_ratio_A_over_B": a / b if b else None,
+            "A_qwen": sum(p["A_qwen"] for p in pairs), "B_qwen": sum(p["B_qwen"] for p in pairs)}
+
+
+def complete_round_analysis(rows, events, tasks):
+    expected = {(task, arm) for task in tasks for arm in ("A", "B")}
+    repeats = sorted({r.get("repeat", 1) for r in rows})
+    complete = [rep for rep in repeats if {(r["task"], r["arm"]) for r in rows if r.get("repeat", 1) == rep} == expected]
+    selected = [r for r in rows if r.get("repeat", 1) in complete]
+    failed_http_pairs = {(e["task"], e.get("repeat", 1)) for e in events
+                         if e["component"] == "qwen_http" and (e.get("http_status") != 200 or e.get("status") != "ok")}
+    def describe(group):
+        c = compare(group)
+        clean = [p for p in c["both_success"] if (p["task"], p.get("repeat", 1)) not in failed_http_pairs]
+        return {"groups": c["groups"], "quality_pairs": c["quality_pairs"],
+                "both_success": paired_totals(c["both_success"]), "no_http_failure_both_success": paired_totals(clean)}
+    return {"complete_repeats": complete, "complete_rounds": describe(selected),
+            "per_repeat": {str(rep): describe([r for r in rows if r.get("repeat", 1) == rep]) for rep in repeats}}
+
+
 def audit(directory):
     report = json.loads((directory / "report.json").read_text(encoding="utf-8"))
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
@@ -71,6 +93,7 @@ def audit(directory):
             matched_initial.append(row["task"] if "repeat" not in row else {"task": row["task"], "repeat": row["repeat"]})
     sensitivity = compare([r for r in rows if r["task"] != manifest["order"][0]["task"]])
     return {"counters_and_comparison_verified": True, "completed": len(rows),
+            "round_analysis": complete_round_analysis(rows, events, manifest["tasks"]),
             "token_usage_from_events": {arm: usage_summary([e for e in events if e.get("arm") == arm]) for arm in ("A", "B")},
             "matching_initial_tasks": matched_initial,
             "exclude_first_pair_speed_ratio": sensitivity["paired_speed_ratio_A_over_B"],

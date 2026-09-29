@@ -140,6 +140,27 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(audit_author_run.usage_summary(b)["prompt_tokens"]["total"], 3)
         self.assertEqual(audit_author_run.usage_summary([])["prompt_tokens"]["total"], 0)
 
+    def test_complete_round_analysis_uses_coverage_not_passes(self):
+        rows = [dict(task="one", arm=arm, repeat=rep, **{"pass": rep == 1},
+                     attempt_wall_seconds=2 if arm == "A" else 1, counts={"qwen_http": 1})
+                for rep in (1, 2) for arm in ("A", "B")]
+        rows.append(dict(task="one", arm="A", repeat=3, **{"pass": True},
+                         attempt_wall_seconds=2, counts={"qwen_http": 1}))
+        result = audit_author_run.complete_round_analysis(rows, [], ["one"])
+        self.assertEqual(result["complete_repeats"], [1, 2])
+        self.assertEqual(result["complete_rounds"]["quality_pairs"]["both_fail"], 1)
+        self.assertEqual(result["complete_rounds"]["groups"]["A"]["completed"], 2)
+
+    def test_http_failure_sensitivity_excludes_whole_pair_only(self):
+        rows = [dict(task="one", arm=arm, repeat=rep, **{"pass": True},
+                     attempt_wall_seconds=2 if arm == "A" else 1, counts={"qwen_http": 1})
+                for rep in (1, 2) for arm in ("A", "B")]
+        events = [{"task": "one", "repeat": 1, "arm": "B", "component": "qwen_http", "http_status": 429, "status": "ok"}]
+        result = audit_author_run.complete_round_analysis(rows, events, ["one"])["complete_rounds"]
+        self.assertEqual(result["both_success"]["pairs"], 2)
+        self.assertEqual(result["no_http_failure_both_success"]["pairs"], 1)
+        self.assertEqual(result["no_http_failure_both_success"]["speed_ratio_A_over_B"], 2)
+
     def test_real_author_loop_consumes_merged_text_without_extra_http(self):
         engine = SCRIPT.parents[4] / "benchmark/sources/jev-ultrafast"
         if not engine.exists():
