@@ -78,11 +78,11 @@ class Qwen:
 
 
 class Laya:
-    def __init__(self, config):
+    def __init__(self, config, *, input_verification_only=False):
         import laya
         import torch
 
-        if config["selection_status"] != "approved":
+        if config["selection_status"] != "approved" and not input_verification_only:
             raise ValueError("The proposed checkpoint is awaiting user confirmation")
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA unavailable; CPU fallback is not allowed")
@@ -101,6 +101,7 @@ class Laya:
             lambda model, args: self.forwards.append(str(next(model.parameters()).device))
         )
         self.setup = {
+            "scope": "input_verification_only" if input_verification_only else "approved_run",
             "load_ms": (time.perf_counter_ns() - start) / 1e6,
             "model": config["model"], "revision": self.agent.revision,
             "gpu": torch.cuda.get_device_name(), "torch": torch.__version__,

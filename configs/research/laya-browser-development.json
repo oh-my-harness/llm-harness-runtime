@@ -21,8 +21,8 @@
     "model": "convaiinnovations/laya",
     "revision": "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851",
     "code_revision": "9d955671415fc19f069b9cc998928075c1f255ec",
-    "max_len": 512,
-    "head_max_len": 192,
+    "max_len": 1024,
+    "head_max_len": 512,
     "warmup_calls": 1,
     "automatic_fallback": false
   }
