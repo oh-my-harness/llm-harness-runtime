@@ -57,9 +57,7 @@ fn state_sidecar_updates_last_active() {
 
 mod history_mapping {
     use llm_harness_types::{
-        AgentMessage, AssistantMessage, AssistantMessageKind, ContentBlock, DataBlock,
-        PersistedToolProjection, ProjectionMetadata, StopReason, ToolProjectionKind,
-        ToolResultMessage, UserMessage,
+        AgentMessage, AssistantMessage, AssistantMessageKind, ContentBlock, StopReason, UserMessage,
     };
 
     fn user_msg(text: &str) -> AgentMessage {
