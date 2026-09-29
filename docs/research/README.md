@@ -1,5 +1,7 @@
 # 研究文档索引
 
+- [Laya 决策契约与浏览器权重核查](jev-browser-laya-contract-audit-20260929.md)：离线复核 12 次实际决策与 40 个选择头，未发现 choice/policy 映射错误；核实官方文档引用的社区浏览器权重及输入、框架差异，提出下一版候选，未新增模型调用或静默换模型。
+
 - [jev-browser 开发运行记录](jev-browser-development-20260929.md)：修复首轮编码故障后完成 14 次真实 A/B，Qwen 7/7、Laya+Qwen 0/7；全场 46 次 Qwen 请求，无有效成功配对，不支持当前适配保持相近质量。附环境、耗时、调用、逐题失败与证据局限。
 
 - [jev-browser 初始输入审计与开发试跑提案](jev-browser-input-audit-20260929.md)：7 任务两轮真实初态分词审计，定位 Hacker News 原样超长，验证保留全部内容的紧凑编码；提案随后获 lqj 批准，审计本身不包含模型推理。
