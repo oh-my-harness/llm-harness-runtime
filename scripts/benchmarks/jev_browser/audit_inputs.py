@@ -29,7 +29,7 @@ def compact_state_request(request):
     return {**request, "state": state}
 
 
-def load_tokenizer_only():
+def load_tokenizer_only(*, model=MODEL, revision=REVISION):
     os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     from laya.agent import Agent
     from transformers import AutoTokenizer
@@ -47,13 +47,13 @@ def load_tokenizer_only():
         if expected != actual:
             raise ValueError("Installed SDK source mismatch")
         verified[name] = hashlib.sha256(actual).hexdigest()
-    snapshot = ROOT.parent / "benchmark/models/huggingface/hub/models--convaiinnovations--laya/snapshots" / REVISION
+    snapshot = ROOT.parent / "benchmark/models/huggingface/hub" / ("models--" + model.replace("/", "--")) / "snapshots" / revision
     config = json.loads((snapshot / "rl_agent_config.json").read_text())
     encoder = json.loads((snapshot / "encoder/config.json").read_text())
-    tok = AutoTokenizer.from_pretrained(str(snapshot / "tokenizer"), local_files_only=True)
+    tok = AutoTokenizer.from_pretrained(str(snapshot / "tokenizer"), local_files_only=True, trust_remote_code=False)
     # Only static validation and serializer methods are bound, not Agent.__init__/load/predict.
     view = SimpleNamespace(tok=tok, _check_question=Agent._check_question, _to_internal=Agent._to_internal)
-    metadata = {"model": MODEL, "revision": REVISION, "code_revision": CODE_REVISION,
+    metadata = {"model": model, "revision": revision, "code_revision": CODE_REVISION,
                 "sdk_sha256": verified, "encoder_max_position_embeddings": encoder["max_position_embeddings"],
                 "checkpoint_max_len": config["max_len"], "checkpoint_head_max_len": config["head_max_len"],
                 "tokenizer_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()

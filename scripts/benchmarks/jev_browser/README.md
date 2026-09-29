@@ -25,6 +25,8 @@ python -m unittest discover -s scripts/tests -p test_jev_browser_worker.py -v
 
 已完成运行的 B 轨迹可用 `node scripts/benchmarks/jev_browser/audit-traces.mjs RUN_DIRECTORY` 只读复核：请求散列、全部选择头的概率与键、输入审计记录及 policy 选择一致性。当前支持未缓存且成功返回的 B 决策；不加载模型，不重新判定 DOM 或任务成功。
 
+浏览器专用候选的离线 tokenizer/格式检查入口为 `audit_browser_checkpoint.py`，具体命令与固定下载范围见[核查报告](../../../docs/research/jev-browser-laya-contract-audit-20260929.md)。它不改变下方 live 入口的基座权重与行为；不得把格式检查结果当作已加载新模型或已验证决策质量。
+
 ## 获批的真实运行
 
 已批准公开 7 任务各一对，共 14 次；顺序按任务交替 A/B、B/A，单次 180 秒、30 动作、60 决策，整场 3,600 秒。Qwen 全场实际 HTTP 上限 120，含最多 2 次预检请求与全部重试，这不是金额上限。只作开发描述，不声称质量等价。
