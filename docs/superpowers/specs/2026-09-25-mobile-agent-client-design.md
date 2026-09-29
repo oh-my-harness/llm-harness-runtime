@@ -96,6 +96,18 @@ MVP 端到端已在模拟器验证通过（手机 → gateway(Seatbelt) → GLM-
 4. **LAN 明文 HTTP 端到端**：代码就绪（`new_insecure` + UI 开关 + `GATEWAY_BIND`），因测试机 UniVPN 全局路由劫持未完成端到端验证；需无 VPN 环境或分流规则排除 `192.168.0.0/16` 后复测。
 5. **真机验证项**（未做）：熄屏长任务、WiFi↔5G 切换、国产 ROM 后台策略。
 
+## 真机端到端实测（2026-09-29 补录）
+
+真机（小米 2407FRK8EC / 澎湃OS / Android 16，arm64）端到端验证通过：手机 → gateway(Seatbelt, Mac LAN IP) → GLM-5.2(SiliconFlow) → 沙箱内 `ls -LA` 执行 → 工具状态与最终回答流式回屏。同时闭环了上一轮的遗留项：
+
+1. **LAN 明文 HTTP 跨网段可用**：手机 10.0.12.x → Mac 10.0.13.x（跨 /24 子网、宿主疑似 VPN 分流、RTT ~145ms）下 `allow_insecure_http` 链路正常，功能不受影响；RTT 偏大提示流量可能仍绕 VPN，SSE 长流体验待复测。
+2. **国产 ROM 安装限制**：MIUI/澎湃"USB 安装"要求插 SIM 卡（无 SIM 无法开启）；绕过方式为 `adb push` APK 到 Download 后文件管理器手动安装（需允许"安装未知应用"+"仍然安装"）。
+3. **MIUI 禁止 adb 注入输入事件**（INJECT_EVENTS 拒绝）：无法 adb 远程操作 UI，界面配置需手填；uiautomator dump 可用（读 UI 状态 OK）。
+4. **gateway work_root 必须 canonical 绝对路径**：`/tmp` 是 `/private/tmp` 的符号链接，配置须写 `/private/tmp/...`（macOS）。
+5. **FFI 错误链必须完整透传**：MobileError 只取 anyhow 最外层 context 时，真机上只见 "connect to gateway sandbox" 而看不到底层原因（超时/401/422），排查全靠盲猜；已修为 `format!("{error:#}")` 全链输出（8b7ee6d）。教训：FFI 错误文案是唯一可观测面，必须自带完整原因链。
+6. **gateway 独立进程配置**（服务外壳 b353776 首次实战）：token 走环境变量引用（配置文件不落明文）；principal `max_trust_profile` 上限生效；`/healthz` 无鉴权供探测。
+7. **待验证**（承接上轮）：熄屏长任务、WiFi↔5G 切换、restricted 沙箱内工具空输出在 UI 上易被误读（"(no output)" + 空目录场景），可考虑 UI 文案优化。
+
 ## 后续流程
 
 1. 本 spec 评审通过后，进 writing-plans 出一期实施计划（core 骨架 → gateway 链路 → 最小 UI → 前台服务 → 语音 → 真机验证）。
