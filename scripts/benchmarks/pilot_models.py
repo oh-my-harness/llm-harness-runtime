@@ -9,6 +9,41 @@ import urllib.request
 from preflight_laya_qwen import NoRedirect
 
 
+class InputBudgetError(ValueError):
+    """The pinned encoder would lose decision information before inference."""
+
+
+def audit_laya_input(agent, state, questions, max_len, head_max_len):
+    # Use the pinned SDK's serializer and sequence builder, not an estimated token count.
+    from laya.common import build_sequence, encode_text, render_options, serialize_state
+
+    tok = agent.tok
+    ids = encode_text(tok, serialize_state(state).replace(tok.mask_token, " "),
+                      add_special_tokens=False)["input_ids"]
+    audit = {}
+    for name, question in questions.items():
+        agent._check_question(name, question)
+        internal = agent._to_internal(question)
+        empty, markers, stats = build_sequence(
+            tok, "", internal, max_len, head_max_len, state_ids=[], return_stats=True,
+        )
+        # With ample head space the SDK keeps the whole instruction, but still caps each option at 48.
+        full, _, _ = build_sequence(tok, "", internal, 1000000, 1000000,
+                                     state_ids=[], return_stats=True)
+        options = render_options(internal)
+        option_tokens = [len(encode_text(tok, " " + option.replace(tok.mask_token, " "),
+                                        add_special_tokens=False)["input_ids"]) for option in options]
+        room = max(0, max_len - len(empty))
+        audit[name] = {
+            "state_tokens": len(ids), "state_room": room,
+            "state_tokens_dropped": max(0, len(ids) - room),
+            "head_tokens_dropped": max(0, len(full) - len(empty)),
+            "option_tokens_dropped_at_48": sum(max(0, n - 48) for n in option_tokens),
+            "markers": len(markers), **stats,
+        }
+    return audit
+
+
 class Qwen:
     def __init__(self, config):
         if config["endpoint"] != "https://api.siliconflow.cn/v1/chat/completions":
@@ -75,25 +110,23 @@ class Laya:
         for _ in range(config["warmup_calls"]):
             event = {}
             start = time.perf_counter_ns()
-            self.choose("Deployment warmup only.", [{"id": "a", "description": "Warm up"},
-                                                   {"id": "b", "description": "Wait"}], event)
+            self.predict("Deployment warmup only.", {"warmup": {
+                "type": "choice", "instructions": "Choose a warmup action.",
+                "criteria": {"a": "Warm up", "b": "Wait"},
+            }}, event)
             event["elapsed_ms"] = (time.perf_counter_ns() - start) / 1e6
             self.setup["warmup"].append(event)
 
-    def choose(self, state, candidates, event):
+    def predict(self, state, questions, event):
         event.update(actual_calls=0, forward_attempts=0, retry_index=0, usage=None)
-        tokens = self.agent.tok(state, add_special_tokens=False)["input_ids"]
-        event["state_tokens"] = len(tokens)
-        event["state_truncated"] = False
-        if len(tokens) > self.config["max_len"] - self.config["head_max_len"] - 16:
-            raise ValueError("Laya state exceeds frozen budget; no silent truncation")
-        mapping = {"C" + str(index): candidate for index, candidate in enumerate(candidates)}
-        # Candidate descriptions also exist in the full state. Short head labels remain distinct.
-        questions = {"action": {
-            "type": "choice",
-            "instructions": "Which next action best advances the user task given the observations?",
-            "criteria": {key: candidate["description"] for key, candidate in mapping.items()},
-        }}
+        event["decision_questions"] = len(questions)
+        event["input_audit"] = audit_laya_input(
+            self.agent, state, questions, self.config["max_len"], self.config["head_max_len"],
+        )
+        if any(a["state_tokens_dropped"] or a["head_tokens_dropped"]
+               or a["option_tokens_dropped_at_48"] or a["markers"] != a["options"]
+               or a["options_distinct"] != a["options"] for a in event["input_audit"].values()):
+            raise InputBudgetError("Pinned Laya budgets lose state, instructions, or candidate content")
         before = len(self.forwards)
         self.torch.cuda.synchronize()
         event["actual_calls"] = 1
@@ -105,8 +138,8 @@ class Laya:
             event["usage"] = response.get("usage")
             if response.get("usage", {}).get("options"):
                 raise ValueError("Laya candidate descriptions collapsed under the head budget")
-            event["answer"] = response["answers"]["action"]
-            return mapping[event["answer"]["choice"]]["id"]
+            event["answers"] = response["answers"]
+            return response["answers"]
         finally:
             self.torch.cuda.synchronize()
             event["forward_devices"] = self.forwards[before:]

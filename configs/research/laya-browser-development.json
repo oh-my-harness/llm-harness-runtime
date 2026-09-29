@@ -1,0 +1,29 @@
+{
+  "scope": "development_only",
+  "run_status": "awaiting_task_and_checkpoint_confirmation",
+  "reference_commit": "1231850a0bf1a0c0341fe408ef1668dbbfdfac46",
+  "repetitions": 1,
+  "order_seed": 20260929,
+  "max_actions": 60,
+  "max_decisions": 120,
+  "task_timeout_seconds": 240,
+  "automatic_retries": 0,
+  "qwen": {
+    "model": "Qwen/Qwen2.5-72B-Instruct",
+    "endpoint": "https://api.siliconflow.cn/v1/chat/completions",
+    "api_key_env": "SILICONFLOW_API_KEY",
+    "temperature": 0,
+    "max_tokens": 1024,
+    "timeout_seconds": 45
+  },
+  "laya": {
+    "selection_status": "deployment_checkpoint_only_not_browser_approved",
+    "model": "convaiinnovations/laya",
+    "revision": "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851",
+    "code_revision": "9d955671415fc19f069b9cc998928075c1f255ec",
+    "max_len": 512,
+    "head_max_len": 192,
+    "warmup_calls": 1,
+    "automatic_fallback": false
+  }
+}
