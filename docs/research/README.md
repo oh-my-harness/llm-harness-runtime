@@ -1,5 +1,7 @@
 # 研究文档索引
 
+- [Suite A 纯 Qwen 与 Laya+Qwen 开发对照](laya-browser-paired-control-20260929.md)：最新结果。32 次尝试全部完成，主要验收 A 10/16、B 12/16；9 对共同成功任务速度比 1.591，Qwen 全量请求 49 对 5。披露协议失败、站点/超时、计时资源重叠及弱验收，不宣称正式质量等价。
+
 - [Laya 作者方案首轮实际复现](laya-browser-author-reproduction-20260929.md)：当前执行基准。按固定 v19s 权重、原始包装器/补丁/Suite A 完成 16 题，13/16 通过；Qwen 5 次 HTTP、Laya 50 次前向。原始失败、用时口径和环境差异完整披露；单组结果尚不能证明相对 Qwen 更快且质量相近。
 
 - [Laya 决策契约与浏览器权重核查](jev-browser-laya-contract-audit-20260929.md)：历史离线审计，未发现 choice/policy 映射错误；自拟完整输入加候选分块提案已撤回。后续以作者实现为基准，不将输入完整性检查当模型成绩。

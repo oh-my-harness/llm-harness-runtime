@@ -73,8 +73,9 @@ class BudgetExhausted(BaseException):
     pass
 
 
-def run(output, chromium=None):
+def run(output, chromium=None, paired=False):
     output.mkdir(parents=True, exist_ok=False)
+    (output / "runner-source.py").write_bytes(Path(__file__).read_bytes())
     os.environ.update(PYTHONUTF8="1", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     key = os.environ.pop("SILICONFLOW_API_KEY", None)
     if not key:
@@ -96,6 +97,9 @@ def run(output, chromium=None):
     from browser_harness import admin
     from laya_browser import LayaBrowser
     import torch
+    if paired:
+        import author_control
+        (output / "control-source.py").write_bytes(Path(author_control.__file__).read_bytes())
 
     cdp_port, model_port = free_port(), free_port()
     model_url = f"http://127.0.0.1:{model_port}"
@@ -105,13 +109,14 @@ def run(output, chromium=None):
     os.environ.pop("TEXT_MODEL_API_KEY", None)
     events = (output / "events.jsonl").open("x", encoding="utf-8")
     lock = threading.Lock()
-    task = {"name": "setup", "purpose": None}
+    task = {"name": "setup", "purpose": None, "arm": None, "deadline": float("inf"), "initial": None,
+            "tokens": {"qwen_input_tokens": 0, "qwen_output_tokens": 0}}
     counts = {"qwen_http": 0, "laya_rpc": 0, "laya_predict": 0, "laya_forward": 0,
               "tools": 0, "qwen_input_tokens": 0, "qwen_output_tokens": 0}
 
     def emit(component, **data):
         with lock:
-            events.write(json.dumps({"utc": time.time(), "task": task["name"], "component": component,
+            events.write(json.dumps({"utc": time.time(), "task": task["name"], "arm": task["arm"], "component": component,
                                      **data}, ensure_ascii=True) + "\n")
             events.flush()
 
@@ -130,6 +135,7 @@ def run(output, chromium=None):
     browser = None
     started = time.perf_counter()
     rows = []
+    planned = len(suite.TASKS) * (2 if paired else 1)
     try:
         with measured("model_load"):
             lb = LayaBrowser.from_pretrained(str(SNAPSHOT), device="cuda", fast=False)
@@ -191,14 +197,18 @@ def run(output, chromium=None):
                 except Exception:
                     if remote:
                         add_usage(counts, None)
+                        add_usage(task["tokens"], None)
                     raise
                 record["http_status"] = response.status_code
                 if remote and response.is_success:
                     payload = response.json()
                     record.update(usage=payload.get("usage"), model=payload.get("model"))
+                    record["response_content"] = [choice.get("message", {}).get("content") for choice in payload.get("choices", [])]
                     add_usage(counts, payload.get("usage"))
+                    add_usage(task["tokens"], payload.get("usage"))
                 elif remote:
                     add_usage(counts, None)
+                    add_usage(task["tokens"], None)
                 return response
         model_module.CLIENT.send = observed_send
         def observe_helper(name):
@@ -224,35 +234,74 @@ def run(output, chromium=None):
             page = observe(self, *args, **kwargs)
             last_page.clear()
             last_page.update(page)
+            if task["initial"] is None:
+                task["initial"] = hashlib.sha256(json.dumps({k: page.get(k) for k in ("url", "title", "text", "actions")},
+                                                            sort_keys=True).encode()).hexdigest()
             emit("observation", page={k: page.get(k) for k in ("url", "title", "text", "actions")})
             return page
         agent_module.Browser.observe = observed_page
+        context = {"id": None}
+        if paired:
+            suite.Agent = author_control.install(agent_module, model_module, task, emit)
+            import jev_ultrafast.browser as browser_module
+            raw_cdp = browser_module.cdp
+            def isolated_cdp(method, **params):
+                if method == "Target.createTarget" and context["id"] is not None:
+                    params["browserContextId"] = context["id"]
+                return raw_cdp(method, **params)
+            browser_module.cdp = isolated_cdp
+        schedule = author_control.schedule(suite.TASKS) if paired else [(t, "B") for t in suite.TASKS]
         manifest = {"source": REVISION, "engine": expected, "suite": "A", "repeats": 1,
+                    "paired": paired, "order": [{"task": t[0], "arm": arm} for t, arm in schedule],
+                    "shared_null_guard_fix": paired, "isolated_browser_contexts": paired,
+                    "cooperative_attempt_seconds": 180 if paired else None,
                     "tasks": [row[0] for row in suite.TASKS], "qwen": QWEN, "qwen_http_limit": 120,
                     "max_len": 1024, "head_max_len": 768, "fast": False, "device": str(lb.agent.device),
                     "python": sys.version, "torch": torch.__version__,
                     "packages": {n: importlib.metadata.version(n) for n in ("laya", "transformers", "browser-harness")},
                     "author_files_sha256": {p: sha(SNAPSHOT / p) for p in SOURCE_HASHES},
                     "runner_sha256": sha(Path(__file__)), "chromium": executable,
+                    "control_sha256": sha(Path(author_control.__file__)) if paired else None,
                     "enabled": {"undo_guard": True, "select_llm": True, "safe": False,
                                 "planner": False, "escalate": False, "verify_done": False, "macros": False},
                     "warmup_counts": dict(counts)}
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        for original_task in suite.TASKS:
-            task["name"] = original_task[0]
+        for original_task, arm in schedule:
+            task.update(name=original_task[0], arm=arm, initial=None,
+                        tokens={"qwen_input_tokens": 0, "qwen_output_tokens": 0})
+            last_page.clear()
+            if paired:
+                with measured("context_setup"):
+                    context["id"] = raw_cdp("Target.createBrowserContext", disposeOnDetach=True)["browserContextId"]
             before = dict(counts)
             attempt_started = time.perf_counter()
-            ok, steps, status, wall, final = suite.run(*original_task)
-            row = {"task": task["name"], "pass": ok, "steps": steps, "status": status, "wall_seconds": wall,
-                   "attempt_wall_seconds": time.perf_counter() - attempt_started,
+            task["deadline"] = attempt_started + 180 if paired else float("inf")
+            exhausted = False
+            try:
+                ok, steps, status, wall, final = suite.run(*original_task)
+            except BudgetExhausted:
+                ok, steps, status = False, None, "error:BudgetExhausted"
+                wall, final = time.perf_counter() - attempt_started, last_page.get("url", "")
+                exhausted = True
+            passed = author_control.accepted(ok, status, task["name"], last_page) if paired else ok
+            row = {"task": task["name"], "arm": arm, "pass": passed, "author_pass": ok,
+                   "steps": steps, "status": status, "wall_seconds": wall,
+                   "attempt_wall_seconds": time.perf_counter() - attempt_started, "initial_observation_sha256": task["initial"],
                    "final_url": final, "counts": {k: None if v is None or before[k] is None else v - before[k]
                                                    for k, v in counts.items()}}
+            row["counts"].update(task["tokens"])
             rows.append(row)
             if task["name"] == "internet-checkbox":
                 row["independent_first_checkbox_checked"] = first_checkbox_checked(last_page)
             with (output / "attempts.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row) + "\n")
             print(json.dumps(row), flush=True)
+            if paired:
+                with measured("context_cleanup"):
+                    raw_cdp("Target.disposeBrowserContext", browserContextId=context["id"])
+                    context["id"] = None
+            if exhausted:
+                break
         return rows
     finally:
         task["name"] = "cleanup"
@@ -272,9 +321,11 @@ def run(output, chromium=None):
                 admin.restart_daemon(name=os.environ["BU_NAME"])
             except Exception as error:
                 emit("cleanup_error", error_type=type(error).__name__)
-        report = {"completed": len(rows), "unstarted": len(suite.TASKS) - len(rows),
+        report = {"completed": len(rows), "unstarted": planned - len(rows),
                   "passed": sum(row["pass"] for row in rows), "counts_including_warmup": counts,
                   "session_wall_seconds": time.perf_counter() - started, "rows": rows}
+        if paired:
+            report["comparison"] = author_control.compare(rows)
         (output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         events.close()
 
@@ -283,5 +334,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--chromium", type=Path)
+    parser.add_argument("--paired", action="store_true", help="Run the local Qwen control and Laya arm with the shared null-guard fix")
     args = parser.parse_args()
-    run(args.output.resolve(), args.chromium)
+    run(args.output.resolve(), args.chromium, args.paired)
