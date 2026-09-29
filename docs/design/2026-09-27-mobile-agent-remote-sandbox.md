@@ -142,6 +142,8 @@ MVP API 应该使用 JSON 执行控制操作，使用 SSE 做流式事件。
 | `POST /v1/agent-sessions/{id}/prompt` | `202` | 异步启动一个 Agent turn |
 | `POST /v1/agent-sessions/{id}/steer` | `202` | 向当前或下一个 turn 注入指引 |
 | `POST /v1/agent-sessions/{id}/abort` | `204` | 中止当前 turn |
+| `POST /v1/agent-sessions/{id}/files/upload` | `200` | 批量上传文本或 Base64 文件到 session 沙箱 |
+| `POST /v1/agent-sessions/{id}/files/read` | `200` | 按文本或 Base64 读取 session 沙箱文件 |
 | `GET /v1/agent-sessions/{id}/events` | `200` + SSE | 流式输出 Agent 事件 |
 | `DELETE /v1/agent-sessions/{id}` | `204` | 停止 Agent 并删除沙箱 |
 
@@ -294,6 +296,8 @@ Bwrap 是 MVP 的默认后端。它提供 namespace 和 capability 隔离，并�
 - 不支持的策略字段 fail closed；
 - Shell 执行有 timeout 和 output limit；
 - 每个沙箱都有显式 owner。
+
+文件访问是移动端与 Agent 共享工作区产物的补充通道。上传和读取都只作用于 owning principal 的 session；路径仍由 sandbox gateway 的 allowlist/denylist 校验。批量上传默认一次最多 32 个文件，控制服务请求体默认上限为 8 MiB；单个读取文件默认上限也是 8 MiB。二进制内容使用 standard Base64，服务端在解析失败或路径越界时返回明确错误。
 
 Firecracker 可以作为显式 opt-in 后端保留。在真实 Linux/KVM 部署验证之前，MVP 不应宣称其具备生产级 VM 隔离能力。
 
