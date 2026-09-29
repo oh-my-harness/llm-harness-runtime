@@ -164,6 +164,8 @@ VM-level backend selection and threat model are defined separately in
 
 该 gateway 的 `serve` 只提供 HTTP listener；生产部署必须由 sidecar、ingress 或服务网格终止 TLS，并以最小权限 OS 用户运行。
 
+Linux systemd 部署模板见 [`deploy/README.md`](../../../deploy/README.md)。
+
 ### 仍不满足的完整生产要求
 
 - 本机是 cgroup v1，`max_cpus` / `max_processes` / `max_memory_mb` 的 cgroup v2 执行路径无法在本环境完成部署级验证。

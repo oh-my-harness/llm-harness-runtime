@@ -1,0 +1,23 @@
+{
+  "bind": "127.0.0.1",
+  "port": 7090,
+  "default_model": "claude-sonnet-4-5",
+  "gateway": {
+    "base_url": "http://127.0.0.1:7080",
+    "token_env": "LLM_HARNESS_GATEWAY_TOKEN",
+    "allow_insecure_http": true
+  },
+  "llm": {
+    "provider": "anthropic",
+    "api_key_env": "LLM_HARNESS_ANTHROPIC_API_KEY"
+  },
+  "principals": [
+    {
+      "principal": "phone",
+      "token_env": "LLM_HARNESS_PHONE_TOKEN",
+      "max_trust_profile": "restricted",
+      "max_sessions": 4
+    }
+  ],
+  "persistence_path": "/var/lib/llm-harness/agent-control/sessions.json"
+}
