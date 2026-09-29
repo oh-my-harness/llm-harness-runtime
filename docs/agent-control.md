@@ -8,6 +8,7 @@
 - 以异步方式提交 prompt，并继续接收 SSE 事件；
 - 支持 steer、abort、查询状态和删除 session；运行中 steer 直接注入当前 turn，idle steer 进入下一 turn 的有界队列；
 - 支持向 session 所属沙箱批量上传文本或二进制文件；
+- 支持按文本或 Base64 二进制读取 session 沙箱中的文件；
 - 按 principal 隔离 session，并限制每个 principal 可创建的 session 数量；
 - 服务关闭时停止 Agent，并关闭所有仍在该进程内的沙箱。
 
@@ -67,6 +68,7 @@ Linux 服务器生产部署可使用 [`deploy/README.md`](../deploy/README.md) �
 | `POST` | `/v1/agent-sessions/{id}/steer` | 向 Agent 注入一条指引 |
 | `POST` | `/v1/agent-sessions/{id}/abort` | 中止当前 Agent turn |
 | `POST` | `/v1/agent-sessions/{id}/files/upload` | 批量上传文件到 session 沙箱 |
+| `POST` | `/v1/agent-sessions/{id}/files/read` | 读取 session 沙箱中的文件 |
 | `GET` | `/v1/agent-sessions/{id}/events` | 订阅 SSE 事件 |
 | `DELETE` | `/v1/agent-sessions/{id}` | 停止 Agent 并关闭沙箱 |
 
@@ -110,6 +112,17 @@ Linux 服务器生产部署可使用 [`deploy/README.md`](../deploy/README.md) �
 ```
 
 请求会返回每个已写入文件的 guest path 和字节数。一次最多 32 个路径唯一的文件，文件会被覆盖；写入按请求顺序执行，失败时已写入的文件不会回滚。控制服务自身默认接受最多 8 MiB 的 JSON 请求体；沙箱路径仍由 gateway 的 allowlist/denylist 校验。
+
+读取文件：
+
+```json
+{
+  "path": "/workspace/result.txt",
+  "binary": false
+}
+```
+
+文本文件返回 `content.value`；`binary: true` 时返回 standard Base64。单个文件默认最大 8 MiB，目录会被拒绝。手机端仍然只能读取自己创建的 session 中的文件，路径校验和沙箱边界继续由 gateway 执行。
 
 ## SSE 事件
 

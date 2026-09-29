@@ -27,6 +27,10 @@ pub fn build_router(state: SharedAgentControlManager) -> Router {
             "/v1/agent-sessions/{id}/files/upload",
             post(upload_session_files),
         )
+        .route(
+            "/v1/agent-sessions/{id}/files/read",
+            post(read_session_file),
+        )
         .route("/v1/agent-sessions/{id}/events", get(session_events))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -129,6 +133,18 @@ async fn upload_session_files(
     axum::Json(request): axum::Json<llm_harness_sandbox_remote::protocol::UploadFilesRequest>,
 ) -> Response {
     match state.upload_files(&principal.0, &session_id, request).await {
+        Ok(response) => (StatusCode::OK, axum::Json(response)).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+async fn read_session_file(
+    State(state): State<SharedAgentControlManager>,
+    principal: axum::Extension<AuthenticatedPrincipal>,
+    Path(session_id): Path<String>,
+    axum::Json(request): axum::Json<llm_harness_sandbox_remote::protocol::ReadFileRequest>,
+) -> Response {
+    match state.read_file(&principal.0, &session_id, request).await {
         Ok(response) => (StatusCode::OK, axum::Json(response)).into_response(),
         Err(error) => error_response(error),
     }
