@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "purpose": "preparation_only_not_an_executable_run_config",
+  "upstream": {
+    "repository": "https://github.com/dennisonbertram/jev-browser",
+    "revision": "990005a1b9c21258682d6da8cced4c7a9a5bc2da",
+    "lockfile_sha256": "b01237fdf942a9b32147e726fcbef97bc7a082d7aacfa2a2b65c28097d96ef0a",
+    "lockfile_hash_normalization": "CRLF_to_LF",
+    "windows_test_patch": "configs/research/jev-browser-windows-tests.patch"
+  },
+  "task_set": {
+    "approval": "confirmed_by_lqj_2026-09-29_for_preparation",
+    "source": "examples/journeys.ts",
+    "ids": [
+      "shadow-dom",
+      "nested-scroll",
+      "cross-origin-iframe",
+      "select",
+      "wikipedia",
+      "hacker-news",
+      "mdn"
+    ],
+    "result_label": "Qwen-Laya adaptation of the public seven journeys, not the original nine-journey Jev result"
+  },
+  "models": {
+    "baseline_and_text_model": "Qwen/Qwen2.5-72B-Instruct",
+    "provider": "SiliconFlow",
+    "decision_model_family": "Laya",
+    "automatic_model_switching": false
+  },
+  "live_run": {
+    "enabled": false,
+    "repetitions": null,
+    "timeout_seconds": null,
+    "max_actions": null,
+    "max_decisions": null,
+    "quality_margin_percentage_points": null,
+    "cost_budget": null
+  }
+}
