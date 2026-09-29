@@ -144,3 +144,62 @@ mod history_mapping {
         assert_eq!(out[0].text, "final answer");
     }
 }
+
+/// Live round-trip against a real gateway + LLM. Requires:
+///   OHM_MOBILE_DATA_DIR=<tmp writable dir>
+///   MOBILE_E2E_GATEWAY_URL / MOBILE_E2E_GATEWAY_TOKEN / MOBILE_E2E_API_KEY
+/// Run: cargo test -p llm-harness-mobile-core --test manager -- --ignored
+#[tokio::test]
+#[ignore = "requires live gateway and LLM credentials"]
+async fn manager_create_and_resume_roundtrip() {
+    let gateway_url = std::env::var("MOBILE_E2E_GATEWAY_URL").expect("gateway url");
+    let gateway_token = std::env::var("MOBILE_E2E_GATEWAY_TOKEN").expect("gateway token");
+    let api_key = std::env::var("MOBILE_E2E_API_KEY").expect("llm api key");
+    let data_dir = std::env::var("OHM_MOBILE_DATA_DIR").expect("data dir");
+
+    let config = llm_harness_mobile_core::MobileConfig {
+        gateway_url,
+        gateway_token,
+        api_key,
+        model: "zai-org/GLM-5.2".to_owned(),
+        llm_base_url: "https://api.siliconflow.cn/v1".to_owned(),
+        provider: "openai".to_owned(),
+        allow_insecure_http: true,
+        trust_profile: "restricted".to_owned(),
+    };
+    let manager = llm_harness_mobile_core::MobileSessionManager::new(
+        std::env::var("OHM_MOBILE_DATA_DIR").unwrap(),
+    );
+
+    let session = manager
+        .create_session(config.clone(), "e2e-smoke".to_owned())
+        .await
+        .expect("create session");
+    let session_id = session
+        .session_id()
+        .expect("persisted session has id")
+        .clone();
+    session.clone().send("say exactly: ok".to_owned());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match session.clone().poll_event() {
+            Some(llm_harness_mobile_core::MobileEvent::RunFinished) => break,
+            Some(_) => {}
+            None => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting");
+    }
+    session.shutdown().await.expect("shutdown");
+
+    let resumed = manager
+        .open_session(config, session_id.clone())
+        .await
+        .expect("resume session");
+    assert!(resumed.sandbox_recreated(), "conservative resume always recreates");
+    let history = resumed.history().await.expect("history");
+    assert!(
+        history.iter().any(|m| m.role == "user"),
+        "history should contain the user turn"
+    );
+    resumed.shutdown().await.expect("shutdown");
+}

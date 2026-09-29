@@ -729,6 +729,26 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -746,11 +766,29 @@ internal interface IntegrityCheckingUniffiLib : Library {
     // Integrity check functions only
     fun uniffi_llm_harness_mobile_core_checksum_func_connect(
 ): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_history(
+): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_pollevent(
+): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sandboxid(
+): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sandboxrecreated(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_send(
 ): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sessionid(
+): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_shutdown(
+): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_create_session(
+): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_delete_session(
+): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_list_sessions(
+): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_open_session(
+): Short
+fun uniffi_llm_harness_mobile_core_checksum_constructor_mobilesessionmanager_new(
 ): Short
 fun ffi_llm_harness_mobile_core_uniffi_contract_version(
 ): Int
@@ -805,11 +843,33 @@ internal interface UniffiLib : Library {
 ): Pointer
 fun uniffi_llm_harness_mobile_core_fn_free_mobilesession(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_history(`ptr`: Pointer,
+): Long
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_pollevent(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_sandboxid(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_sandboxrecreated(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Byte
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_send(`ptr`: Pointer,`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_sessionid(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_shutdown(`ptr`: Pointer,
+): Long
+fun uniffi_llm_harness_mobile_core_fn_clone_mobilesessionmanager(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Pointer
+fun uniffi_llm_harness_mobile_core_fn_free_mobilesessionmanager(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_llm_harness_mobile_core_fn_constructor_mobilesessionmanager_new(`dataDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Pointer
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_create_session(`ptr`: Pointer,`config`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,
+): Long
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_delete_session(`ptr`: Pointer,`sessionId`: RustBuffer.ByValue,
+): Long
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_list_sessions(`ptr`: Pointer,
+): Long
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_open_session(`ptr`: Pointer,`config`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,
 ): Long
 fun uniffi_llm_harness_mobile_core_fn_func_connect(`config`: RustBuffer.ByValue,
 ): Long
@@ -942,13 +1002,40 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_llm_harness_mobile_core_checksum_func_connect() != 34237.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_history() != 47669.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_pollevent() != 5697.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sandboxid() != 55365.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sandboxrecreated() != 24841.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_send() != 49766.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sessionid() != 7065.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_shutdown() != 37921.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_create_session() != 3326.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_delete_session() != 18108.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_list_sessions() != 40462.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_open_session() != 4661.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_constructor_mobilesessionmanager_new() != 24743.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1132,6 +1219,29 @@ private class JavaLangRefCleanable(
     val cleanable: java.lang.ref.Cleaner.Cleanable
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterULong: FfiConverter<ULong, Long> {
+    override fun lift(value: Long): ULong {
+        return value.toULong()
+    }
+
+    override fun read(buf: ByteBuffer): ULong {
+        return lift(buf.getLong())
+    }
+
+    override fun lower(value: ULong): Long {
+        return value.toLong()
+    }
+
+    override fun allocationSize(value: ULong) = 8UL
+
+    override fun write(value: ULong, buf: ByteBuffer) {
+        buf.putLong(value.toLong())
+    }
 }
 
 /**
@@ -1323,9 +1433,22 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
 public interface MobileSessionInterface {
     
     /**
+     * Replay persisted history (read-only bubbles; new events continue from
+     * here). Empty for ad-hoc sessions.
+     */
+    suspend fun `history`(): List<MobileHistoryMessage>
+    
+    /**
      * Poll one buffered UI event, oldest first. `None` when idle.
      */
     fun `pollEvent`(): MobileEvent?
+    
+    fun `sandboxId`(): kotlin.String
+    
+    /**
+     * True when resume had to create a fresh sandbox (old one unavailable).
+     */
+    fun `sandboxRecreated`(): kotlin.Boolean
     
     /**
      * Send a user message; returns immediately, results flow as events.
@@ -1333,6 +1456,11 @@ public interface MobileSessionInterface {
      * route failures into this session's event queue.
      */
     fun `send`(`text`: kotlin.String)
+    
+    /**
+     * Persisted session id; `None` for ad-hoc (non-resumed) sessions.
+     */
+    fun `sessionId`(): kotlin.String?
     
     suspend fun `shutdown`()
     
@@ -1430,12 +1558,64 @@ open class MobileSession: Disposable, AutoCloseable, MobileSessionInterface
 
     
     /**
+     * Replay persisted history (read-only bubbles; new events continue from
+     * here). Empty for ad-hoc sessions.
+     */
+    @Throws(MobileException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `history`() : List<MobileHistoryMessage> {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_history(
+                thisPtr,
+                
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterSequenceTypeMobileHistoryMessage.lift(it) },
+        // Error FFI converter
+        MobileException.ErrorHandler,
+    )
+    }
+
+    
+    /**
      * Poll one buffered UI event, oldest first. `None` when idle.
      */override fun `pollEvent`(): MobileEvent? {
             return FfiConverterOptionalTypeMobileEvent.lift(
     callWithPointer {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_pollevent(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    override fun `sandboxId`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_sandboxid(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * True when resume had to create a fresh sandbox (old one unavailable).
+     */override fun `sandboxRecreated`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_sandboxrecreated(
         it, _status)
 }
     }
@@ -1457,6 +1637,21 @@ open class MobileSession: Disposable, AutoCloseable, MobileSessionInterface
 }
     }
     
+    
+
+    
+    /**
+     * Persisted session id; `None` for ad-hoc (non-resumed) sessions.
+     */override fun `sessionId`(): kotlin.String? {
+            return FfiConverterOptionalString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_sessionid(
+        it, _status)
+}
+    }
+    )
+    }
     
 
     
@@ -1511,6 +1706,340 @@ public object FfiConverterTypeMobileSession: FfiConverter<MobileSession, Pointer
     override fun allocationSize(value: MobileSession) = 8UL
 
     override fun write(value: MobileSession, buf: ByteBuffer) {
+        // The Rust code always expects pointers written as 8 bytes,
+        // and will fail to compile if they don't fit.
+        buf.putLong(Pointer.nativeValue(lower(value)))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a Pointer/Arc<T>
+// to the live Rust struct on the other side of the FFI.
+//
+// Each instance implements core operations for working with the Rust `Arc<T>` and the
+// Kotlin Pointer to work with the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque pointer to the underlying Rust struct.
+//     Method calls need to read this pointer from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its pointer should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the pointer, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the pointer, but is interrupted
+//      before it can pass the pointer over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read pointer value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * Creates, lists and resumes persisted mobile sessions.
+ * Session entries live under `<data_dir>/<session-id>/entries.jsonl`
+ * (`JsonlSessionRepo` layout); the sidecar `state.json` in the same directory
+ * tracks sandbox identity for resume.
+ */
+public interface MobileSessionManagerInterface {
+    
+    suspend fun `createSession`(`config`: MobileConfig, `name`: kotlin.String): MobileSession
+    
+    suspend fun `deleteSession`(`sessionId`: kotlin.String)
+    
+    suspend fun `listSessions`(): List<SessionSummary>
+    
+    suspend fun `openSession`(`config`: MobileConfig, `sessionId`: kotlin.String): MobileSession
+    
+    companion object
+}
+
+/**
+ * Creates, lists and resumes persisted mobile sessions.
+ * Session entries live under `<data_dir>/<session-id>/entries.jsonl`
+ * (`JsonlSessionRepo` layout); the sidecar `state.json` in the same directory
+ * tracks sandbox identity for resume.
+ */
+open class MobileSessionManager: Disposable, AutoCloseable, MobileSessionManagerInterface
+{
+
+    constructor(pointer: Pointer) {
+        this.pointer = pointer
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    /**
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noPointer: NoPointer) {
+        this.pointer = null
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+    constructor(`dataDir`: kotlin.String) :
+        this(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_constructor_mobilesessionmanager_new(
+        FfiConverterString.lower(`dataDir`),_status)
+}
+    )
+
+    protected val pointer: Pointer?
+    protected val cleanable: UniffiCleaner.Cleanable
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithPointer(block: (ptr: Pointer) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the pointer being freed concurrently.
+        try {
+            return block(this.uniffiClonePointer())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
+        override fun run() {
+            pointer?.let { ptr ->
+                uniffiRustCall { status ->
+                    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_free_mobilesessionmanager(ptr, status)
+                }
+            }
+        }
+    }
+
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
+            UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_clone_mobilesessionmanager(pointer!!, status)
+        }
+    }
+
+    
+    @Throws(MobileException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `createSession`(`config`: MobileConfig, `name`: kotlin.String) : MobileSession {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_create_session(
+                thisPtr,
+                FfiConverterTypeMobileConfig.lower(`config`),FfiConverterString.lower(`name`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_poll_pointer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_complete_pointer(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_free_pointer(future) },
+        // lift function
+        { FfiConverterTypeMobileSession.lift(it) },
+        // Error FFI converter
+        MobileException.ErrorHandler,
+    )
+    }
+
+    
+    @Throws(MobileException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `deleteSession`(`sessionId`: kotlin.String) {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_delete_session(
+                thisPtr,
+                FfiConverterString.lower(`sessionId`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_free_void(future) },
+        // lift function
+        { Unit },
+        
+        // Error FFI converter
+        MobileException.ErrorHandler,
+    )
+    }
+
+    
+    @Throws(MobileException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `listSessions`() : List<SessionSummary> {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_list_sessions(
+                thisPtr,
+                
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_poll_rust_buffer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_complete_rust_buffer(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_free_rust_buffer(future) },
+        // lift function
+        { FfiConverterSequenceTypeSessionSummary.lift(it) },
+        // Error FFI converter
+        MobileException.ErrorHandler,
+    )
+    }
+
+    
+    @Throws(MobileException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `openSession`(`config`: MobileConfig, `sessionId`: kotlin.String) : MobileSession {
+        return uniffiRustCallAsync(
+        callWithPointer { thisPtr ->
+            UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_open_session(
+                thisPtr,
+                FfiConverterTypeMobileConfig.lower(`config`),FfiConverterString.lower(`sessionId`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_poll_pointer(future, callback, continuation) },
+        { future, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_complete_pointer(future, continuation) },
+        { future -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_free_pointer(future) },
+        // lift function
+        { FfiConverterTypeMobileSession.lift(it) },
+        // Error FFI converter
+        MobileException.ErrorHandler,
+    )
+    }
+
+    
+
+    
+    
+    companion object
+    
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileSessionManager: FfiConverter<MobileSessionManager, Pointer> {
+
+    override fun lower(value: MobileSessionManager): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): MobileSessionManager {
+        return MobileSessionManager(value)
+    }
+
+    override fun read(buf: ByteBuffer): MobileSessionManager {
+        // The Rust code always writes pointers as 8 bytes, and will
+        // fail to compile if they don't fit.
+        return lift(Pointer(buf.getLong()))
+    }
+
+    override fun allocationSize(value: MobileSessionManager) = 8UL
+
+    override fun write(value: MobileSessionManager, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))
@@ -1598,6 +2127,97 @@ public object FfiConverterTypeMobileConfig: FfiConverterRustBuffer<MobileConfig>
             FfiConverterString.write(value.`provider`, buf)
             FfiConverterBoolean.write(value.`allowInsecureHttp`, buf)
             FfiConverterString.write(value.`trustProfile`, buf)
+    }
+}
+
+
+
+/**
+ * One replayed history message for the resume screen.
+ */
+data class MobileHistoryMessage (
+    /**
+     * `user` | `assistant` | `tool`.
+     */
+    var `role`: kotlin.String, 
+    /**
+     * Text content (first line for tool results).
+     */
+    var `text`: kotlin.String, 
+    /**
+     * Tool failures only.
+     */
+    var `isError`: kotlin.Boolean
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileHistoryMessage: FfiConverterRustBuffer<MobileHistoryMessage> {
+    override fun read(buf: ByteBuffer): MobileHistoryMessage {
+        return MobileHistoryMessage(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileHistoryMessage) = (
+            FfiConverterString.allocationSize(value.`role`) +
+            FfiConverterString.allocationSize(value.`text`) +
+            FfiConverterBoolean.allocationSize(value.`isError`)
+    )
+
+    override fun write(value: MobileHistoryMessage, buf: ByteBuffer) {
+            FfiConverterString.write(value.`role`, buf)
+            FfiConverterString.write(value.`text`, buf)
+            FfiConverterBoolean.write(value.`isError`, buf)
+    }
+}
+
+
+
+/**
+ * Summary of a persisted session for the sessions list screen.
+ */
+data class SessionSummary (
+    var `id`: kotlin.String, 
+    var `name`: kotlin.String, 
+    var `createdAtMs`: kotlin.ULong, 
+    var `lastActiveAtMs`: kotlin.ULong
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeSessionSummary: FfiConverterRustBuffer<SessionSummary> {
+    override fun read(buf: ByteBuffer): SessionSummary {
+        return SessionSummary(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: SessionSummary) = (
+            FfiConverterString.allocationSize(value.`id`) +
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterULong.allocationSize(value.`createdAtMs`) +
+            FfiConverterULong.allocationSize(value.`lastActiveAtMs`)
+    )
+
+    override fun write(value: SessionSummary, buf: ByteBuffer) {
+            FfiConverterString.write(value.`id`, buf)
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterULong.write(value.`createdAtMs`, buf)
+            FfiConverterULong.write(value.`lastActiveAtMs`, buf)
     }
 }
 
@@ -1733,17 +2353,16 @@ sealed class MobileEvent {
     }
     
     /**
-     * A tool finished; `summary` is a one-line UI hint.
+     * A tool finished; `summary` is a one-line UI hint and `full_output`
+     * carries the complete (untruncated) tool result for expandable cards.
      */
     data class ToolFinished(
         val `name`: kotlin.String, 
-        val `summary`: kotlin.String) : MobileEvent() {
+        val `summary`: kotlin.String, 
+        val `fullOutput`: kotlin.String) : MobileEvent() {
         companion object
     }
     
-    /**
-     * The current run finished.
-     */
     object RunFinished : MobileEvent()
     
     
@@ -1773,6 +2392,7 @@ public object FfiConverterTypeMobileEvent : FfiConverterRustBuffer<MobileEvent>{
                 FfiConverterString.read(buf),
                 )
             3 -> MobileEvent.ToolFinished(
+                FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
@@ -1805,6 +2425,7 @@ public object FfiConverterTypeMobileEvent : FfiConverterRustBuffer<MobileEvent>{
                 4UL
                 + FfiConverterString.allocationSize(value.`name`)
                 + FfiConverterString.allocationSize(value.`summary`)
+                + FfiConverterString.allocationSize(value.`fullOutput`)
             )
         }
         is MobileEvent.RunFinished -> {
@@ -1838,6 +2459,7 @@ public object FfiConverterTypeMobileEvent : FfiConverterRustBuffer<MobileEvent>{
                 buf.putInt(3)
                 FfiConverterString.write(value.`name`, buf)
                 FfiConverterString.write(value.`summary`, buf)
+                FfiConverterString.write(value.`fullOutput`, buf)
                 Unit
             }
             is MobileEvent.RunFinished -> {
@@ -1854,6 +2476,38 @@ public object FfiConverterTypeMobileEvent : FfiConverterRustBuffer<MobileEvent>{
 }
 
 
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalString: FfiConverterRustBuffer<kotlin.String?> {
+    override fun read(buf: ByteBuffer): kotlin.String? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterString.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.String?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterString.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.String?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterString.write(value, buf)
+        }
+    }
+}
 
 
 
@@ -1883,6 +2537,62 @@ public object FfiConverterOptionalTypeMobileEvent: FfiConverterRustBuffer<Mobile
         } else {
             buf.put(1)
             FfiConverterTypeMobileEvent.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeMobileHistoryMessage: FfiConverterRustBuffer<List<MobileHistoryMessage>> {
+    override fun read(buf: ByteBuffer): List<MobileHistoryMessage> {
+        val len = buf.getInt()
+        return List<MobileHistoryMessage>(len) {
+            FfiConverterTypeMobileHistoryMessage.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<MobileHistoryMessage>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeMobileHistoryMessage.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<MobileHistoryMessage>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeMobileHistoryMessage.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeSessionSummary: FfiConverterRustBuffer<List<SessionSummary>> {
+    override fun read(buf: ByteBuffer): List<SessionSummary> {
+        val len = buf.getInt()
+        return List<SessionSummary>(len) {
+            FfiConverterTypeSessionSummary.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<SessionSummary>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeSessionSummary.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<SessionSummary>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeSessionSummary.write(it, buf)
         }
     }
 }
