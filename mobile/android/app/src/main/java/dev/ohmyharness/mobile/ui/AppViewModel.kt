@@ -43,7 +43,7 @@ class AppViewModel(
         viewModelScope.launch {
             val cfg = configRepository.current()
             configCache = cfg
-            _uiState.value = _uiState.value.copy(configComplete = cfg.isComplete())
+            _uiState.value = _uiState.value.copy(configComplete = cfg.isComplete(), config = cfg)
             if (cfg.isComplete()) {
                 refreshSessions()
                 connectWith(cfg)
@@ -61,7 +61,7 @@ class AppViewModel(
         viewModelScope.launch {
             configRepository.save(config)
             configCache = config
-            _uiState.value = _uiState.value.copy(configComplete = config.isComplete())
+            _uiState.value = _uiState.value.copy(configComplete = config.isComplete(), config = config)
             if (config.isComplete()) {
                 refreshSessions()
                 connectWith(config)

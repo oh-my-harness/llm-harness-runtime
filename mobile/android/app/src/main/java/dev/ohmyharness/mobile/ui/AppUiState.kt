@@ -6,8 +6,11 @@ import uniffi.llm_harness_mobile_core.SessionSummary
  * Immutable UI state for the whole app. The ViewModel is the single source of
  * truth; screens render from this and call back into [AppViewModel] intents.
  */
+import dev.ohmyharness.mobile.data.AppConfig
+
 data class AppUiState(
     val configComplete: Boolean = false,
+    val config: AppConfig = AppConfig(),
     val connection: ConnectionState = ConnectionState.Idle,
     val sessions: List<SessionSummary> = emptyList(),
     val activeSessionId: String? = null,
