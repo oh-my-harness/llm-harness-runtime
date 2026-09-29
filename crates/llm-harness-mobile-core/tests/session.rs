@@ -82,6 +82,35 @@ fn tool_finished_summary_is_first_line_truncated() {
 }
 
 #[test]
+fn tool_finished_carries_full_output() {
+    let text = "line one\nline two\nline three";
+    let result = ToolResult::full(
+        vec![DataBlock::Text {
+            text: text.to_owned(),
+            mime_type: None,
+        }],
+        serde_json::json!({}),
+        false,
+    );
+    let mobile = map_agent_event(&AgentEvent::ToolExecutionEnd {
+        tool_use_id: "t1".to_owned(),
+        result: Ok(result),
+    })
+    .expect("tool end must map");
+    match mobile {
+        MobileEvent::ToolFinished {
+            summary,
+            full_output,
+            ..
+        } => {
+            assert_eq!(summary, "line one");
+            assert_eq!(full_output, text);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+}
+
+#[test]
 fn parses_trust_profile_strings() {
     use llm_harness_platform::trust::TrustProfile;
     assert_eq!(

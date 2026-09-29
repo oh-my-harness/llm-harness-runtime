@@ -10,15 +10,25 @@ use llm_harness_types::AgentEvent;
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum MobileEvent {
     /// Assistant text delta (streaming reply).
-    TextDelta { text: String },
+    TextDelta {
+        text: String,
+    },
     /// A tool started executing in the sandbox.
-    ToolStarted { name: String },
-    /// A tool finished; `summary` is a one-line UI hint.
-    ToolFinished { name: String, summary: String },
-    /// The current run finished.
+    ToolStarted {
+        name: String,
+    },
+    /// A tool finished; `summary` is a one-line UI hint and `full_output`
+    /// carries the complete (untruncated) tool result for expandable cards.
+    ToolFinished {
+        name: String,
+        summary: String,
+        full_output: String,
+    },
     RunFinished,
     /// The run failed; message is display-ready.
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
 }
 
 /// Map one harness event to zero or one mobile event.
@@ -37,7 +47,7 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<MobileEvent> {
             name: tool_name.clone(),
         }),
         AgentEvent::ToolExecutionEnd { result, .. } => {
-            let (name, summary) = match result {
+            let (name, summary, full_output) = match result {
                 Ok(tool_result) => {
                     let text = tool_result
                         .model_content
@@ -54,11 +64,19 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<MobileEvent> {
                     } else {
                         summary
                     };
-                    ("tool".to_owned(), summary)
+                    ("tool".to_owned(), summary, text.to_owned())
                 }
-                Err(failure) => ("tool".to_owned(), failure.model_message.clone()),
+                Err(failure) => (
+                    "tool".to_owned(),
+                    failure.model_message.clone(),
+                    String::new(),
+                ),
             };
-            Some(MobileEvent::ToolFinished { name, summary })
+            Some(MobileEvent::ToolFinished {
+                name,
+                summary,
+                full_output,
+            })
         }
         AgentEvent::AgentEnd { .. } => Some(MobileEvent::RunFinished),
         AgentEvent::Error(error) => Some(MobileEvent::Failed {
