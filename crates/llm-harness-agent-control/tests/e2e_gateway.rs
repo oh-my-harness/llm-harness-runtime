@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_platform::sandbox::Sandbox;
 use llm_harness_sandbox_gateway::{GatewayConfig, GatewayPrincipalConfig, SandboxGateway};
+use llm_harness_sandbox_remote::protocol::{FileContent, UploadFile, UploadFilesRequest};
 use llm_harness_sandbox_remote::{RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig};
 use llm_harness_types::ExecutionEnv;
 
@@ -30,6 +31,122 @@ fn gateway_config(work_root: PathBuf) -> GatewayConfig {
     }])
     .unwrap()
     .with_work_root(work_root)
+}
+
+#[tokio::test]
+async fn upload_session_files_through_control_service() {
+    unsafe {
+        std::env::set_var(
+            "E2E_GATEWAY_TOKEN",
+            "gateway-e2e-test-token-0123456789abcdef",
+        );
+        std::env::set_var("E2E_PHONE_TOKEN", "phone-e2e-test-token-0123456789abcdef");
+        std::env::set_var("E2E_LLM_KEY", "e2e-test-llm-key");
+    }
+
+    let work_root = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(work_root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let gateway = SandboxGateway::new(gateway_config(work_root.path().to_path_buf())).unwrap();
+    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_port = gateway_listener.local_addr().unwrap().port();
+    let gateway_task = tokio::spawn(async move {
+        axum::serve(gateway_listener, gateway.router())
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let config = control_config(gateway_port);
+    let llm_client = Arc::new(MockLlmClient::with_single(MockResponse::text("ok")));
+    let factory = Arc::new(RemoteMockLlmFactory {
+        config: config.clone(),
+        llm_client,
+    });
+    let manager =
+        Arc::new(llm_harness_agent_control::AgentControlManager::new(config, factory).unwrap());
+    let app = llm_harness_agent_control::build_router(Arc::clone(&manager));
+    let auth = (
+        "authorization",
+        "Bearer phone-e2e-test-token-0123456789abcdef",
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/agent-sessions")
+                .header("content-type", "application/json")
+                .header(auth.0, auth.1)
+                .body(Body::from(r#"{"trust_profile": "restricted"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let created = read_json(response).await;
+    let session_id = created["id"].as_str().unwrap().to_owned();
+
+    let request = UploadFilesRequest {
+        files: vec![
+            UploadFile {
+                path: "/workspace/notes.txt".to_owned(),
+                content: FileContent::Text {
+                    value: "uploaded by phone\n".to_owned(),
+                },
+            },
+            UploadFile {
+                path: "/workspace/payload.bin".to_owned(),
+                content: FileContent::Binary {
+                    base64: "AAEC".to_owned(),
+                },
+            },
+        ],
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/v1/agent-sessions/{session_id}/files/upload"))
+                .header("content-type", "application/json")
+                .header(auth.0, auth.1)
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let uploaded = read_json(response).await;
+    assert_eq!(
+        uploaded["files"][0]["path"],
+        serde_json::json!("/workspace/notes.txt")
+    );
+    assert_eq!(uploaded["files"][0]["bytes"], 18);
+    assert_eq!(
+        uploaded["files"][1]["path"],
+        serde_json::json!("/workspace/payload.bin")
+    );
+    assert_eq!(uploaded["files"][1]["bytes"], 3);
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/agent-sessions/{session_id}"))
+                .header(auth.0, auth.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    gateway_task.abort();
 }
 
 fn control_config(gateway_port: u16) -> llm_harness_agent_control::ControlServiceConfig {

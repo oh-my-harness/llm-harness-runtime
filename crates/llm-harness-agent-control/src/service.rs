@@ -4,12 +4,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use axum::http::StatusCode;
+use base64::Engine;
 use llm_harness_agent::harness::{AgentHarness, AgentHarnessOptions};
 use llm_harness_platform::sandbox::Sandbox;
+use llm_harness_sandbox_remote::protocol::{
+    FileContent, UploadFilesRequest, UploadFilesResponse, UploadedFile,
+};
 use llm_harness_sandbox_remote::{RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig};
 use llm_harness_types::{AgentEvent, AgentMessage, ExecutionEnv, UserMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::auth::AuthenticatedPrincipal;
@@ -59,6 +64,15 @@ impl ControlEvent {
 pub enum ControlServiceError {
     #[error("sandbox session {0} does not exist")]
     SessionNotFound(String),
+    #[error("sandbox session is no longer available")]
+    SandboxUnavailable,
+    #[error("invalid upload: {0}")]
+    InvalidUpload(String),
+    #[error("upload failed for {path}: {source}")]
+    UploadFailed {
+        path: String,
+        source: llm_harness_types::EnvError,
+    },
     #[error("principal has reached its sandbox session limit")]
     LimitReached,
     #[error("agent is already running; prompt or abort first")]
@@ -73,6 +87,13 @@ impl ControlServiceError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::SessionNotFound(_) => StatusCode::NOT_FOUND,
+            Self::SandboxUnavailable => StatusCode::CONFLICT,
+            Self::InvalidUpload(_) => StatusCode::BAD_REQUEST,
+            Self::UploadFailed { source, .. } => match source {
+                llm_harness_types::EnvError::NotFound(_) => StatusCode::NOT_FOUND,
+                llm_harness_types::EnvError::PermissionDenied(_) => StatusCode::FORBIDDEN,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            },
             Self::LimitReached => StatusCode::TOO_MANY_REQUESTS,
             Self::Busy | Self::SteerQueueFull => StatusCode::CONFLICT,
             Self::Sandbox(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -82,6 +103,9 @@ impl ControlServiceError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::SessionNotFound(_) => "agent_session_not_found",
+            Self::SandboxUnavailable => "sandbox_unavailable",
+            Self::InvalidUpload(_) => "invalid_upload",
+            Self::UploadFailed { .. } => "upload_failed",
             Self::LimitReached => "agent_session_limit_reached",
             Self::Busy => "agent_busy",
             Self::SteerQueueFull => "steer_queue_full",
@@ -320,6 +344,58 @@ impl AgentControlManager {
         Ok(session.events.subscribe())
     }
 
+    pub async fn upload_files(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        session_id: &str,
+        request: UploadFilesRequest,
+    ) -> Result<UploadFilesResponse, ControlServiceError> {
+        if request.files.len() > MAX_UPLOAD_FILES {
+            return Err(ControlServiceError::InvalidUpload(format!(
+                "batch upload accepts at most {MAX_UPLOAD_FILES} files"
+            )));
+        }
+        let session = self
+            .find_owned_session(principal, session_id)?
+            .ok_or_else(|| ControlServiceError::SessionNotFound(session_id.to_owned()))?;
+
+        let mut seen_paths = std::collections::HashSet::with_capacity(request.files.len());
+        let mut files = Vec::with_capacity(request.files.len());
+        for file in &request.files {
+            if !seen_paths.insert(file.path.as_str()) {
+                return Err(ControlServiceError::InvalidUpload(
+                    "batch upload paths must be unique".to_owned(),
+                ));
+            }
+            let content = decode_upload_content(&file.content)?;
+            files.push((file.path.clone(), content));
+        }
+
+        let environment = {
+            let sandbox = session.sandbox.lock().expect("sandbox lock");
+            sandbox
+                .as_ref()
+                .ok_or(ControlServiceError::SandboxUnavailable)?
+                .env()
+        };
+        let mut uploaded = Vec::with_capacity(files.len());
+        for (requested_path, bytes) in files {
+            let path = std::path::PathBuf::from(&requested_path);
+            environment
+                .write_file(&path, &bytes, CancellationToken::new())
+                .await
+                .map_err(|source| ControlServiceError::UploadFailed {
+                    path: requested_path.clone(),
+                    source,
+                })?;
+            uploaded.push(UploadedFile {
+                path: requested_path,
+                bytes: bytes.len() as u64,
+            });
+        }
+        Ok(UploadFilesResponse { files: uploaded })
+    }
+
     pub fn prompt(
         &self,
         principal: &AuthenticatedPrincipal,
@@ -490,6 +566,17 @@ impl AgentControlManager {
             .get(session_id)
             .filter(|session| session.principal == principal.id)
             .cloned())
+    }
+}
+
+const MAX_UPLOAD_FILES: usize = 32;
+
+fn decode_upload_content(content: &FileContent) -> Result<Vec<u8>, ControlServiceError> {
+    match content {
+        FileContent::Text { value } => Ok(value.clone().into_bytes()),
+        FileContent::Binary { base64 } => base64::engine::general_purpose::STANDARD
+            .decode(base64)
+            .map_err(|error| ControlServiceError::InvalidUpload(error.to_string())),
     }
 }
 

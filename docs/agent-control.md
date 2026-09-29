@@ -7,6 +7,7 @@
 - 创建一个由远程沙箱支撑的 Agent session；
 - 以异步方式提交 prompt，并继续接收 SSE 事件；
 - 支持 steer、abort、查询状态和删除 session；运行中 steer 直接注入当前 turn，idle steer 进入下一 turn 的有界队列；
+- 支持向 session 所属沙箱批量上传文本或二进制文件；
 - 按 principal 隔离 session，并限制每个 principal 可创建的 session 数量；
 - 服务关闭时停止 Agent，并关闭所有仍在该进程内的沙箱。
 
@@ -65,6 +66,7 @@ Linux 服务器生产部署可使用 [`deploy/README.md`](../deploy/README.md) �
 | `POST` | `/v1/agent-sessions/{id}/prompt` | 异步开始一个 Agent turn |
 | `POST` | `/v1/agent-sessions/{id}/steer` | 向 Agent 注入一条指引 |
 | `POST` | `/v1/agent-sessions/{id}/abort` | 中止当前 Agent turn |
+| `POST` | `/v1/agent-sessions/{id}/files/upload` | 批量上传文件到 session 沙箱 |
 | `GET` | `/v1/agent-sessions/{id}/events` | 订阅 SSE 事件 |
 | `DELETE` | `/v1/agent-sessions/{id}` | 停止 Agent 并关闭沙箱 |
 
@@ -89,6 +91,25 @@ Linux 服务器生产部署可使用 [`deploy/README.md`](../deploy/README.md) �
 ```
 
 服务返回 `202 Accepted` 和一个 `prompt_id`。SSE 事件的外层信封会携带这个 `prompt_id`；从 assistant message 可读取到底层 turn 标识后，`turn_id` 也会随之填充。早期 run 事件可能还没有 `turn_id`。
+
+批量上传：
+
+```json
+{
+  "files": [
+    {
+      "path": "/workspace/notes.txt",
+      "content": {"kind": "text", "value": "hello"}
+    },
+    {
+      "path": "/workspace/data.bin",
+      "content": {"kind": "binary", "base64": "AAEC"}
+    }
+  ]
+}
+```
+
+请求会返回每个已写入文件的 guest path 和字节数。一次最多 32 个路径唯一的文件，文件会被覆盖；写入按请求顺序执行，失败时已写入的文件不会回滚。控制服务自身默认接受最多 8 MiB 的 JSON 请求体；沙箱路径仍由 gateway 的 allowlist/denylist 校验。
 
 ## SSE 事件
 
@@ -124,6 +145,7 @@ Linux 服务器生产部署可使用 [`deploy/README.md`](../deploy/README.md) �
 - token 通过环境变量配置，服务启动后读取；不要把明文 token 写入仓库。
 - session 只能被创建它的 principal 查询、prompt、steer、abort 或删除。
 - 未知请求字段会被拒绝。
+- 手机端只能操作自己创建的 session；文件上传会先经过控制服务鉴权，再进入远程沙箱的安全边界。
 - 沙箱仍由 gateway 和 platform sandbox 策略约束；control service 不绕过这些限制。
 
 ## 重启与孤儿沙箱清理
