@@ -17,7 +17,7 @@ mod events;
 pub mod manager;
 
 pub use events::{MobileEvent, map_agent_event, map_event};
-pub use manager::{MobileSessionManager, SessionSummary};
+pub use manager::{MobileHistoryMessage, MobileSessionManager, SessionSummary};
 /// Public wrapper for integration tests; FFI surface uses it via connect.
 pub fn parse_trust_profile_pub(
     value: &str,
@@ -82,13 +82,14 @@ pub struct MobileSession {
     harness: Arc<AgentHarness>,
     sandbox: Arc<RemoteSandbox>,
     session_id: Option<String>,
+    sandbox_recreated: bool,
     queue: Mutex<Vec<MobileEvent>>,
 }
 
 impl MobileSession {
     pub(crate) async fn new(config: MobileConfig) -> anyhow::Result<Arc<Self>> {
         let sandbox = crate::connect_sandbox(&config).await?;
-        Self::assemble(config, sandbox, None).await
+        Self::assemble(config, sandbox, None, false).await
     }
 
     /// Assemble a session around an already-connected sandbox. `session_id`
@@ -98,6 +99,7 @@ impl MobileSession {
         config: MobileConfig,
         sandbox: Arc<RemoteSandbox>,
         session_id: Option<String>,
+        sandbox_recreated: bool,
     ) -> anyhow::Result<Arc<Self>> {
         ensure_runtime();
         let llm_client: Arc<dyn llm_adapter::Provider> = match config.provider.as_str() {
@@ -154,6 +156,7 @@ impl MobileSession {
             harness,
             sandbox,
             session_id,
+            sandbox_recreated,
             queue: Mutex::new(Vec::new()),
         });
 
@@ -197,6 +200,45 @@ impl MobileSession {
             }
             queue.push(event);
         }
+    }
+}
+
+#[uniffi::export]
+impl MobileSession {
+    /// Persisted session id; `None` for ad-hoc (non-resumed) sessions.
+    #[uniffi::method(name = "sessionId")]
+    pub fn session_id(&self) -> Option<String> {
+        self.session_id.clone()
+    }
+
+    #[uniffi::method(name = "sandboxId")]
+    pub fn sandbox_id(&self) -> String {
+        self.sandbox.sandbox_id().to_owned()
+    }
+
+    /// True when resume had to create a fresh sandbox (old one unavailable).
+    #[uniffi::method(name = "sandboxRecreated")]
+    pub fn sandbox_recreated(&self) -> bool {
+        self.sandbox_recreated
+    }
+
+    /// Replay persisted history (read-only bubbles; new events continue from
+    /// here). Empty for ad-hoc sessions.
+    pub async fn history(&self) -> Result<Vec<crate::manager::MobileHistoryMessage>, MobileError> {
+        let Some(id) = self.session_id.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let storage = crate::manager::open_storage(id)
+            .await
+            .map_err(MobileError::from)?;
+        let session = llm_harness_agent::session::Session::new(storage);
+        let context = session
+            .build_context()
+            .await
+            .map_err(|e| MobileError::Internal {
+                detail: format!("read session history: {e}"),
+            })?;
+        Ok(crate::manager::history_to_mobile(&context.messages))
     }
 }
 

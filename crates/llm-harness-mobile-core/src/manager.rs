@@ -57,8 +57,89 @@ pub struct SessionSummary {
     pub last_active_at_ms: u64,
 }
 
+/// Map persisted agent messages to mobile replay bubbles. Progress assistant
+/// messages are skipped (replay shows durable turns); non-text blocks are
+/// ignored; tool results map to a one-line `tool` entry with an error flag.
+pub fn history_to_mobile(
+    messages: &[llm_harness_types::AgentMessage],
+) -> Vec<MobileHistoryMessage> {
+    use llm_harness_types::{AgentMessage, AssistantMessageKind, ContentBlock, DataBlock};
+    let mut out = Vec::new();
+    for message in messages {
+        match message {
+            AgentMessage::User(user) => {
+                let text = user
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    out.push(MobileHistoryMessage {
+                        role: "user".to_owned(),
+                        text,
+                        is_error: false,
+                    });
+                }
+            }
+            AgentMessage::Assistant(assistant) => {
+                if assistant.kind == AssistantMessageKind::Progress {
+                    continue;
+                }
+                let text = assistant
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    out.push(MobileHistoryMessage {
+                        role: "assistant".to_owned(),
+                        text,
+                        is_error: false,
+                    });
+                }
+            }
+            AgentMessage::ToolResult(result) => {
+                let text = result
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        DataBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                out.push(MobileHistoryMessage {
+                    role: "tool".to_owned(),
+                    text: text.lines().next().unwrap_or_default().to_owned(),
+                    is_error: result.is_error,
+                });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One replayed history message for the resume screen.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileHistoryMessage {
+    /// `user` | `assistant` | `tool`.
+    pub role: String,
+    /// Text content (first line for tool results).
+    pub text: String,
+    /// Tool failures only.
+    pub is_error: bool,
+}
+
 /// Creates, lists and resumes persisted mobile sessions.
-///
 /// Session entries live under `<data_dir>/<session-id>/entries.jsonl`
 /// (`JsonlSessionRepo` layout); the sidecar `state.json` in the same directory
 /// tracks sandbox identity for resume.
@@ -181,7 +262,7 @@ impl MobileSessionManager {
         let session_id = storage.metadata().await?.id;
         let sandbox = crate::connect_sandbox(&config).await?;
         self.persist_state(&session_id, &sandbox, &config)?;
-        MobileSession::assemble(config, sandbox, Some(session_id)).await
+        MobileSession::assemble(config, sandbox, Some(session_id), false).await
     }
 
     async fn list_sessions_inner(&self) -> anyhow::Result<Vec<SessionSummary>> {
@@ -214,7 +295,7 @@ impl MobileSessionManager {
         open_storage(&session_id).await?;
         let sandbox = crate::connect_sandbox(&config).await?;
         self.persist_state(&session_id, &sandbox, &config)?;
-        MobileSession::assemble(config, sandbox, Some(session_id)).await
+        MobileSession::assemble(config, sandbox, Some(session_id), true).await
     }
 
     async fn delete_session_inner(&self, session_id: String) -> anyhow::Result<()> {
