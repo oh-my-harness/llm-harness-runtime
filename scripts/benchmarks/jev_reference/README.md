@@ -1,5 +1,7 @@
 # 公开实现来源与本地改动
 
+状态（2026-09-29）：本目录是此前基于 `browser-use/jev-ultrafast` 的通用适配与来源记录，不是新主线 `dennisonbertram/jev-browser` 的实现。仅保留作为已验证组件；当前准备与运行门槛以[复现计划](../../../docs/experiment-fast-model-agent-loop.md)为准，不沿用旧实验授权。
+
 来源：[browser-use/jev-ultrafast](https://github.com/browser-use/jev-ultrafast/tree/1231850a0bf1a0c0341fe408ef1668dbbfdfac46)，固定提交 `1231850a0bf1a0c0341fe408ef1668dbbfdfac46`，核查日期 2026-09-29。保留原 MIT 许可证及 Browser Use 版权声明。
 
 这是使用 Jev 的公开浏览器 Agent，不是 Jev 模型权重。这里不包含 TypeSafe 客户端、密钥或 Jev 推理实现，不声称 Laya 与 Jev 在接口性能、输出或质量上等价。

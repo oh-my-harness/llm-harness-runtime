@@ -15,29 +15,19 @@ from browser_policy import Policy
 from experiment_metrics import Trace, dump, summarize
 from isolated_browser import IsolatedBrowser, evaluate, origin, validate_acceptance
 from jev_reference.browser import StalePage
-from jev_reference.protocol import build_request
 from pilot_models import Laya, Qwen
 from verify_jev_reference import REVISION
 
 
-def run_attempt(task, repetition, arm, config, run_root, qwen, laya, *, environment=None):
+def run_attempt(task, repetition, arm, config, run_root, qwen, laya):
     attempt_id = f"{task['id']}-r{repetition}-{arm}"
     trace = Trace(run_root / (attempt_id + ".jsonl"), qwen.key)
     result = {"id": attempt_id, "task_id": task["id"], "repetition": repetition, "arm": arm,
               "success": False, "evaluation": None, "termination": "setup_error", "stale_decisions": 0}
-    if environment is not None:
-        result.update(task_family=task["family"], seed=task["seed"])
     browser, task_start = None, None
     start = time.perf_counter_ns()
     try:
         browser = IsolatedBrowser(task["url"], task["allowed_origins"])
-        goal = task["goal"]
-        if environment is not None:
-            with trace.event("setup", -1, "benchmark_reset") as event:
-                result["environment_setup"] = environment.prepare(browser)
-                event["result"] = result["environment_setup"]
-                goal = result["environment_setup"]["goal"]
-        result["goal"] = goal
         result["setup_ms"] = (time.perf_counter_ns() - start) / 1e6
         result["browser_version"] = browser.chrome.version
         result["setup_agent_cdp_calls"] = dict(browser.session.calls)
@@ -59,33 +49,17 @@ def run_attempt(task, repetition, arm, config, run_root, qwen, laya, *, environm
                 event["fingerprint"] = page["fingerprint"]
                 return page
 
-        def environment_done(step):
-            if environment is None:
-                return False
-            with trace.event("environment", step, "terminal_status_only") as event:
-                event["done"] = environment.terminated(browser)
-                return event["done"]
-
         try:
             page = observe(-1)
-            initial = build_request(page, goal, [])
-            result["initial_request_sha256"] = hashlib.sha256(
-                json.dumps(initial, ensure_ascii=True, separators=(",", ":")).encode()).hexdigest()
-            if (task.get("expected_initial_request_sha256") is not None
-                    and result["initial_request_sha256"] != task["expected_initial_request_sha256"]):
-                raise ValueError("Initial policy input differs from the frozen task observation")
             result["termination"] = "decision_limit"
             for step in range(config["max_decisions"]):
                 remaining()
-                if environment_done(step):
-                    result["termination"] = "environment_done"
-                    break
                 try:
                     with trace.event("tool", step, "fresh_before_decision"):
                         fresh = browser.fresh(page)
                     if not fresh:
                         page = observe(step)
-                    decision, action = policy.decide(page, goal, history, step, remaining)
+                    decision, action = policy.decide(page, task["goal"], history, step, remaining)
                     remaining()
                     operation = decision["operation"]
                     if operation in {"DONE", "BLOCKED"}:
@@ -102,7 +76,7 @@ def run_attempt(task, repetition, arm, config, run_root, qwen, laya, *, environm
                         with trace.event("tool", step, "fresh_before_text"):
                             if not browser.fresh(page):
                                 raise StalePage("Text target belongs to a stale page")
-                        value = policy.text(decision, action, page, goal, history, step, remaining)
+                        value = policy.text(decision, action, page, task["goal"], history, step, remaining)
                     remaining()
                     with trace.event("tool", step, "act", decision=decision, action=action, text=value) as event:
                         event["result"] = browser.act(action, page, text=value)
@@ -110,9 +84,6 @@ def run_attempt(task, repetition, arm, config, run_root, qwen, laya, *, environm
                     history.append({"action": action["label"], "kind": action["kind"], "text": value,
                                     "operation": operation, "target": decision["target"], "page_changed": None})
                     policy.executed()
-                    if environment_done(step):
-                        result["termination"] = "environment_done"
-                        break
                     old_fingerprint = page["fingerprint"]
                     page = observe(step)
                     history[-1]["page_changed"] = page["fingerprint"] != old_fingerprint
@@ -127,12 +98,10 @@ def run_attempt(task, repetition, arm, config, run_root, qwen, laya, *, environm
             result.update(termination="agent_error", error_type=type(error).__name__)
         with trace.event("evaluation", -1, "independent_acceptance") as event:
             # The checker is terminal. Its fields and outcome never enter policy state or history.
-            result["evaluation"] = (environment.evaluate(browser) if environment is not None
-                                    else evaluate(browser.page, task["acceptance"]))
+            result["evaluation"] = evaluate(browser.page, task["acceptance"])
             event["result"] = result["evaluation"]
         result["timed_out"] = time.perf_counter() > deadline
-        terminal = result["termination"] == "done" or (environment is not None and result["termination"] == "environment_done")
-        result["success"] = bool(terminal and result["evaluation"]["success"]
+        result["success"] = bool(result["termination"] == "done" and result["evaluation"]["success"]
                                  and not result["timed_out"])
         result["actions_executed"] = len(history)
     except Exception as error:
@@ -165,7 +134,7 @@ def run_attempt(task, repetition, arm, config, run_root, qwen, laya, *, environm
         result["tool_calls"] = sum(e["component"] == "tool" for e in trace.events)
         result["execution_failures"] = sum(e["purpose"] == "act" and e["status"] == "error" for e in trace.events)
         result["component_ms"] = {name: sum(e["elapsed_ms"] for e in trace.events if e["component"] == name)
-                                  for name in ("qwen", "laya", "tool", "framework", "environment", "evaluation")}
+                                  for name in ("qwen", "laya", "tool", "framework", "evaluation")}
         trace.write({"phase": "task_end", "result": result})
         trace.close()
     dump(run_root / (attempt_id + "-result.json"), result)
