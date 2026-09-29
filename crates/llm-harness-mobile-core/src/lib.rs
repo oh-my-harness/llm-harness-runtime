@@ -262,18 +262,13 @@ pub enum MobileError {
 impl From<anyhow::Error> for MobileError {
     fn from(error: anyhow::Error) -> Self {
         let remote = error.downcast_ref::<llm_harness_sandbox_remote::RemoteSandboxError>();
+        let detail = format!("{error:#}");
         match remote {
             Some(llm_harness_sandbox_remote::RemoteSandboxError::InvalidConfig(_)) => {
-                MobileError::InvalidConfig {
-                    detail: error.to_string(),
-                }
+                MobileError::InvalidConfig { detail }
             }
-            Some(_) => MobileError::Connect {
-                detail: error.to_string(),
-            },
-            None => MobileError::Internal {
-                detail: error.to_string(),
-            },
+            Some(_) => MobileError::Connect { detail },
+            None => MobileError::Internal { detail },
         }
     }
 }
