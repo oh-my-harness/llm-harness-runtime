@@ -26,6 +26,7 @@ fn gateway_config(work_root: PathBuf) -> GatewayConfig {
         fs_allowlist: vec![PathBuf::from("/workspace")],
         host_project_dirs: vec![],
         max_trust_profile: llm_harness_platform::trust::TrustProfile::TrustedLan,
+        requests_per_minute: None,
     }])
     .unwrap()
     .with_work_root(work_root)

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE, header::RETRY_AFTER};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::auth::{AuthenticatedPrincipal, bearer_token, unauthorized};
+use crate::observability::PrincipalId;
 use crate::state::{GUEST_WORK_DIR, GatewayStateError, SharedState};
 
 pub async fn serve(
@@ -58,11 +59,15 @@ pub(crate) fn build_router(state: SharedState) -> Router {
             "/v1/sandboxes/{id}/fs/create-temp-dir",
             post(create_temp_dir),
         )
+        .route("/metrics", get(metrics))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,
         ))
-        .layer(axum::middleware::from_fn(log_request))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            log_request,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(
             state.config().max_request_bytes,
         ))
@@ -85,8 +90,22 @@ async fn authenticate(
     let Some(principal) = principal else {
         return unauthorized();
     };
+    if let Some(retry_after) = state.check_rate_limit(&principal.id, principal.requests_per_minute)
+    {
+        return rate_limited(principal.id.to_string(), retry_after);
+    }
+    let principal_id = PrincipalId(principal.id.clone());
     request.extensions_mut().insert(principal);
-    next.run(request).await
+    let mut response = next.run(request).await;
+    response.extensions_mut().insert(principal_id);
+    response
+}
+
+async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        state.render_metrics(),
+    )
 }
 
 #[derive(serde::Serialize)]
@@ -107,6 +126,7 @@ async fn readiness(State(state): State<SharedState>) -> Json<HealthResponse> {
 }
 
 async fn log_request(
+    State(state): State<SharedState>,
     request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
@@ -122,10 +142,23 @@ async fn log_request(
     let mut request = request;
     request.extensions_mut().insert(request_id.to_string());
     let response = next.run(request).await;
+    let principal = response
+        .extensions()
+        .get::<PrincipalId>()
+        .map(|principal| principal.0.to_string());
+    state.record_request(
+        method.as_str(),
+        &path,
+        principal.as_deref(),
+        response.status().as_u16(),
+        started.elapsed(),
+    );
     tracing::info!(
         request_id = %request_id,
         method = %method,
         path = %path,
+        principal = principal.as_deref().unwrap_or("anonymous"),
+        route = %crate::observability::metric_route(&path),
         status = response.status().as_u16(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "sandbox gateway request"
@@ -878,6 +911,25 @@ fn gateway_error(
         }),
     )
         .into_response()
+}
+
+fn rate_limited(principal: String, retry_after: std::time::Duration) -> Response {
+    let mut response = gateway_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limit_exceeded",
+        format!("principal {principal} request rate limit exceeded"),
+        None,
+    );
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        retry_after
+            .as_secs()
+            .max(1)
+            .to_string()
+            .parse()
+            .expect("retry-after header"),
+    );
+    response
 }
 
 fn state_error(error: GatewayStateError) -> Response {

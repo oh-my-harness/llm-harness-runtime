@@ -29,6 +29,7 @@ use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::AuthenticatedPrincipal;
+use crate::observability::{RateLimiter, RequestMetrics};
 
 pub(crate) const GUEST_WORK_DIR: &str = "/workspace";
 
@@ -43,6 +44,8 @@ pub(crate) struct GatewayState {
     sandboxes: std::sync::Mutex<HashMap<String, SandboxRecord>>,
     executions: std::sync::Mutex<HashMap<String, ExecutionRecord>>,
     lifecycle_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    metrics: RequestMetrics,
+    rate_limiter: RateLimiter,
 }
 
 #[derive(Debug)]
@@ -592,6 +595,8 @@ impl GatewayState {
             sandboxes: std::sync::Mutex::new(sandboxes),
             executions: std::sync::Mutex::new(HashMap::new()),
             lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
+            metrics: RequestMetrics::default(),
+            rate_limiter: RateLimiter::default(),
         })
     }
 
@@ -606,6 +611,38 @@ impl GatewayState {
             crate::auth::GatewayBackend::Seatbelt => "macos-seatbelt",
             crate::auth::GatewayBackend::Firecracker(_) => "linux-firecracker",
         }
+    }
+
+    pub(crate) fn record_request(
+        &self,
+        method: &str,
+        route: &str,
+        principal: Option<&str>,
+        status: u16,
+        duration: std::time::Duration,
+    ) {
+        self.metrics
+            .record(method, route, principal, status, duration);
+    }
+
+    pub(crate) fn render_metrics(&self) -> String {
+        self.metrics
+            .render(self.backend_label(), self.active_sandbox_count())
+    }
+
+    pub(crate) fn check_rate_limit(
+        &self,
+        principal: &str,
+        requests_per_minute: Option<usize>,
+    ) -> Option<std::time::Duration> {
+        self.rate_limiter.check(principal, requests_per_minute)
+    }
+
+    fn active_sandbox_count(&self) -> usize {
+        self.sandboxes
+            .lock()
+            .map(|sandboxes| sandboxes.len())
+            .unwrap_or(0)
     }
 
     /// Trust profile actually granted to a sandbox (from its stored config).

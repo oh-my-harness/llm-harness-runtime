@@ -95,6 +95,7 @@ fn principal(id: &str, token: &str) -> GatewayPrincipalConfig {
         fs_allowlist: Vec::new(),
         host_project_dirs: Vec::new(),
         max_trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
+        requests_per_minute: None,
     }
 }
 
