@@ -1,6 +1,24 @@
-# jev-browser 同引擎适配
+# jev-browser 研究入口
 
-当前提供已获 lqj 批准的开发运行入口，以及独立的离线验证入口。来源、任务和边界见[中文计划](../../../docs/experiment-fast-model-agent-loop.md)。唯一目标仍是比较速度与完整任务通过率，不替换成规则策略研究。
+当前按 lqj 要求以浏览器权重作者公布的方案为基准。来源、任务和边界见[中文计划](../../../docs/experiment-fast-model-agent-loop.md)。唯一目标仍是比较速度与完整任务通过率；旧 7 任务入口只作历史保留，不是当前默认运行路线。
+
+## 当前：作者 Suite A
+
+`author_suite.py` 直接加载 `cklxx/laya-browser@645cf366a2ae35f1086e8c20eff48f909bb49206` 的 `code/apps/laya_browser.py` 和 `browser_suite.py`，调用作者原始 16 项 `TASKS` / `run`。保留作者默认预处理、候选处理和 helper 分工，只适配本机服务与计量。生成模型仍为指定 Qwen2.5-72B，区别于作者 Qwen3-8B；这是单组复现，还没有同条件 Qwen-only 结果。
+
+前置条件：完整快照位于工作区 `benchmark/models/huggingface/hub/` 标准缓存目录；`benchmark/sources/jev-ultrafast` 为 `1231850a0bf1a0c0341fe408ef1668dbbfdfac46`，已应用快照内 `code/jev-ultrafast.patch`；Python 环境安装 Laya、torch、browser-harness、`httpx[http2]`。入口校验固定源码/模型散列，不下载或更新它们。作者工程声明 Python `<3.13`；本机使用既有 3.13.9 的差异已披露。
+
+从已授权的 `SILICONFLOW_API_KEY` 环境变量读取密钥，禁止写入命令参数、日志或版本库。运行前启用 UTF-8，并通过 `--chromium` 指定实际可启动的 headless shell；输出目录必须是新目录：
+
+```powershell
+$env:PYTHONUTF8='1'
+python scripts/benchmarks/jev_browser/author_suite.py --output logs/benchmarks/NEW_AUTHOR_RUN --chromium $env:CHROMIUM_EXECUTABLE
+python -m unittest discover -s scripts/tests -p test_jev_browser_author_suite.py -v
+```
+
+依次完成加载、原始样例三次预热和 Suite A 原顺序各一次；总 Qwen HTTP 上限 120，原任务停止条件不改。记录 `manifest.json`、`events.jsonl`、`attempts.jsonl`、`report.json`；字段 `pass` 保留作者判定，checkbox 另记独立核查值。Laya 请求、predict、前向分开计数，宽候选多阶段不能只算一次。结果与已知作者框架/验收局限见[中文报告](../../../docs/research/laya-browser-author-reproduction-20260929.md)。
+
+以下章节为上一轮 TypeScript 7 任务适配的历史用法。
 
 ## 已接入的职责
 
@@ -27,7 +45,7 @@ python -m unittest discover -s scripts/tests -p test_jev_browser_worker.py -v
 
 浏览器专用候选的离线 tokenizer/格式检查入口为 `audit_browser_checkpoint.py`，具体命令与固定下载范围见[核查报告](../../../docs/research/jev-browser-laya-contract-audit-20260929.md)。它不改变下方 live 入口的基座权重与行为；不得把格式检查结果当作已加载新模型或已验证决策质量。
 
-## 获批的真实运行
+## 历史：已结束的 7 任务真实运行
 
 已批准公开 7 任务各一对，共 14 次；顺序按任务交替 A/B、B/A，单次 180 秒、30 动作、60 决策，整场 3,600 秒。Qwen 全场实际 HTTP 上限 120，含最多 2 次预检请求与全部重试，这不是金额上限。只作开发描述，不声称质量等价。
 
