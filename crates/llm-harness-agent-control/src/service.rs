@@ -342,23 +342,19 @@ impl AgentControlManager {
             return Err(ControlServiceError::Busy);
         }
         let prompt_id = Uuid::new_v4().to_string();
-        *session.prompt_context.lock().expect("prompt context lock") =
-            SessionPromptContext {
-                prompt_id: Some(prompt_id.clone()),
-                turn_id: None,
-            };
+        *session.prompt_context.lock().expect("prompt context lock") = SessionPromptContext {
+            prompt_id: Some(prompt_id.clone()),
+            turn_id: None,
+        };
         let harness = Arc::clone(&session.harness);
         let events = session.events.clone();
         let record_for_task = Arc::clone(&session);
         let prompt_id_for_task = prompt_id.clone();
-        let mut initial_messages = std::mem::take(
-            &mut *session.steer_queue.lock().expect("steer queue lock"),
-        );
+        let mut initial_messages =
+            std::mem::take(&mut *session.steer_queue.lock().expect("steer queue lock"));
         initial_messages.push_back(user_message(&request.prompt));
         tokio::spawn(async move {
-            if let Err(error) =
-                harness.prompt_with_messages(initial_messages.into()).await
-            {
+            if let Err(error) = harness.prompt_with_messages(initial_messages.into()).await {
                 let _ = events.send(SessionEvent {
                     prompt_id: Some(prompt_id_for_task),
                     turn_id: None,
@@ -522,7 +518,8 @@ fn spawn_event_pump(session: Arc<AgentSessionRecord>) {
                     continue;
                 }
             };
-            if let llm_harness_agent::harness::AgentHarnessEvent::Agent(agent_event) = event.as_ref()
+            if let llm_harness_agent::harness::AgentHarnessEvent::Agent(agent_event) =
+                event.as_ref()
             {
                 let turn_id = match agent_event {
                     AgentEvent::MessageUpdate { partial, .. } => Some(&partial.turn_id),
@@ -530,8 +527,11 @@ fn spawn_event_pump(session: Arc<AgentSessionRecord>) {
                     _ => None,
                 };
                 if let Some(turn_id) = turn_id {
-                    session.prompt_context.lock().expect("prompt context lock").turn_id =
-                        Some(turn_id.clone());
+                    session
+                        .prompt_context
+                        .lock()
+                        .expect("prompt context lock")
+                        .turn_id = Some(turn_id.clone());
                 }
             }
             let Some(control_event) = map_harness_event(
@@ -564,9 +564,7 @@ fn map_harness_event(
         return None;
     };
     match agent_event {
-        AgentEvent::TextDelta { text, .. } => {
-            Some(ControlEvent::TextDelta { text: text.clone() })
-        }
+        AgentEvent::TextDelta { text, .. } => Some(ControlEvent::TextDelta { text: text.clone() }),
         AgentEvent::ToolExecutionStart {
             tool_use_id,
             tool_name,

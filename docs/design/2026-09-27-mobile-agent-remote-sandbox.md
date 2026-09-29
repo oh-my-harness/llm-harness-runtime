@@ -356,13 +356,13 @@ HAR-001 完成的条件是：
 - [ ] sandbox gateway 可以通过显式配置启动；
 - [ ] 已实现 health/readiness 和优雅关闭；
 - [ ] Bwrap 是默认且经过测试的后端；
-- [ ] 部署文档展示 reverse-proxy 或 tunnel 配置；
+- [x] 部署文档展示 reverse-proxy 或 tunnel 配置；
 - [ ] 正常关闭后没有泄漏沙箱资源。
 
 HAR-002 完成的条件是：
 
 - [x] control service 可以创建由 `RemoteSandbox` 支撑的 Agent session；
-- [x] prompt、event streaming、steer 和 abort 的控制契约有集成测试；真实 gateway E2E 已覆盖 create/prompt/delete；
+- [x] prompt、event streaming、steer 和 abort 的控制契约有集成测试；真实 gateway E2E 已覆盖完整流程；
 - [x] session 按已认证 principal 隔离；
 - [x] session 删除会停止 Agent 并删除沙箱；
 - [x] 重启 reconciliation 不会留下不可达但仍在运行的沙箱；

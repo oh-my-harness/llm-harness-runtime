@@ -241,7 +241,10 @@ async fn full_flow_create_prompt_events_delete() {
             }
             Ok(SessionEvent {
                 prompt_id: Some(event_prompt_id),
-                event: ControlEvent::TurnStarted { turn_id: event_turn_id },
+                event:
+                    ControlEvent::TurnStarted {
+                        turn_id: event_turn_id,
+                    },
                 turn_id,
             }) => {
                 assert_eq!(event_prompt_id, prompt_id);
