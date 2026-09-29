@@ -33,8 +33,10 @@
     "directory": "scripts/benchmarks/jev_browser",
     "offline_check": "node scripts/benchmarks/jev_browser/check.mjs",
     "acceptance_status": "frozen_for_development_same_private_terminal_checks_and_nonerror_document_HTTP",
-    "public_site_model_runs": 0,
-    "real_model_validation_complete": false
+    "public_site_model_runs": 6,
+    "real_model_validation_complete": true,
+    "development_result_report": "docs/research/jev-browser-development-20260929.md",
+    "validation_scope": "preflight_and_completed_development_matrix_not_quality_equivalence"
   },
   "input_audit": {
     "report": "docs/research/jev-browser-input-audit-20260929.md",

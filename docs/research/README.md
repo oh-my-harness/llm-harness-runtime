@@ -1,9 +1,9 @@
 # 研究文档索引
 
-- [jev-browser 开发运行记录](jev-browser-development-20260929.md)：首轮已调用真实 Laya，但预检因 Windows 管道编码错误中止，Qwen 0 请求、A/B 0 次；已定位并离线修复，尚无速度或任务通过率结论。
+- [jev-browser 开发运行记录](jev-browser-development-20260929.md)：修复首轮编码故障后完成 14 次真实 A/B，Qwen 7/7、Laya+Qwen 0/7；全场 46 次 Qwen 请求，无有效成功配对，不支持当前适配保持相近质量。附环境、耗时、调用、逐题失败与证据局限。
 
 - [jev-browser 初始输入审计与开发试跑提案](jev-browser-input-audit-20260929.md)：7 任务两轮真实初态分词审计，定位 Hacker News 原样超长，验证保留全部内容的紧凑编码；提案随后获 lqj 批准，审计本身不包含模型推理。
-- [jev-browser 复现计划](../experiment-fast-model-agent-loop.md)：当前唯一实验主线。已批准公开 7 任务、14 次 Qwen/Laya 开发尝试，先真实预检、通过再运行；沿用既定速度与完整任务通过率目标。
+- [jev-browser 复现计划](../experiment-fast-model-agent-loop.md)：当前唯一实验主线。公开 7 任务的 14 次尝试已完成，后续优先排查当前适配的决策质量；沿用既定速度与完整任务通过率目标。
 - [jev-browser 环境准备与来源核查](jev-browser-preparation-20260929.md)：公开 7 任务的同引擎适配、单次计量和独立验收已实现；新增 33 项 Node、8 项 Python 离线测试通过，保留上游工程验证记录。真实模型和 7 任务输入预算尚未验证，不是模型速度或质量结果。
 
 2026-09-29 清理：按 lqj 要求撤下版本库中的 MiniWoB++ 代码、配置、测试和报告。本机忽略目录中的专用产物及源码副本删除被执行策略阻断，待清理路径见计划，不再启用。此前大小生成模型替换、规则模拟和 AppWorld 路线仍不启用；旧结果不作为 jev-browser 复现成果。历史提交不重写，旧进度仅留在归档中。
