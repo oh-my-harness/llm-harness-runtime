@@ -18,7 +18,7 @@ use crate::protocol::{
     CreateSandboxRequest, CreateSandboxResponse, FileContent, FileInfoRequest, FileInfoResponse,
     FileInfoResponseValue, GatewayErrorResponse, ListDirRequest, ListDirResponse, ReadFileRequest,
     ReadFileResponse, RemoteExecEvent, RemoteSandboxStatus, ShellExecRequest, ShellExecResponse,
-    WriteFileRequest,
+    UploadFile, UploadFilesRequest, UploadFilesResponse, UploadedFile, WriteFileRequest,
 };
 use crate::sse::{SseDecoder, SseEvent};
 
@@ -196,6 +196,46 @@ impl RemoteSandboxClient {
         )
         .await?;
         Ok(())
+    }
+
+    /// Upload multiple files in one gateway request.
+    ///
+    /// Files are written in the supplied order. Existing files are replaced;
+    /// if an upload fails after earlier files have been written, those earlier
+    /// writes are not rolled back.
+    pub async fn upload_files(
+        &self,
+        sandbox_id: &str,
+        files: &[(&Path, &[u8])],
+    ) -> Result<Vec<UploadedFile>, RemoteSandboxError> {
+        let sandbox_id = path_segment(sandbox_id, "sandbox id")?;
+        let files = files
+            .iter()
+            .map(|(path, content)| {
+                let path = path_string(path)?;
+                let content = if let Ok(text) = std::str::from_utf8(content) {
+                    FileContent::Text {
+                        value: text.to_owned(),
+                    }
+                } else {
+                    FileContent::Binary {
+                        base64: base64::engine::general_purpose::STANDARD.encode(content),
+                    }
+                };
+                Ok(UploadFile { path, content })
+            })
+            .collect::<Result<Vec<_>, RemoteSandboxError>>()?;
+        let error_path = files.first().map(|file| file.path.clone());
+        let response: UploadFilesResponse = self
+            .request_json(
+                Method::POST,
+                &format!("v1/sandboxes/{sandbox_id}/fs/upload"),
+                Some(UploadFilesRequest { files }),
+                error_path,
+                StatusCode::OK,
+            )
+            .await?;
+        Ok(response.files)
     }
 
     /// Get file metadata.

@@ -102,6 +102,10 @@ sudo systemctl start llm-harness-gateway.service
 
 只在 gateway 停止后备份 work root，避免 registry 和 sandbox 文件系统出现不一致快照。
 
+## 3.1 文件批量上传
+
+`POST /v1/sandboxes/{id}/fs/upload` 复用 guest path、allowlist/denylist、Base64 和 `max_request_bytes` 限制。单次请求最多 32 个路径唯一的文件；gateway 先解码并校验全部条目，再按顺序写入，已写入文件不会自动回滚。生产部署应继续把 `max_request_bytes` 设置为实际需要的最小值，并确认反向代理放行同样大小。
+
 ## 4. 最小权限部署
 
 推荐使用 [`deploy/README.md`](../deploy/README.md) 中的 systemd 模板。关键项如下：

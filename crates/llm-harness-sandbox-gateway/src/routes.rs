@@ -15,7 +15,7 @@ use llm_harness_sandbox_remote::protocol::{
     CreateTempDirResponse, FileContent, FileInfoRequest, FileInfoResponse, FileInfoResponseValue,
     GatewayErrorResponse, ListDirRequest, ListDirResponse, ReadFileRequest, ReadFileResponse,
     RemoteExecEvent, RemoteSandboxState, RemoteSandboxStatus, RemoveRequest, ShellExecRequest,
-    ShellExecResponse, WriteFileRequest,
+    ShellExecResponse, UploadFilesRequest, UploadFilesResponse, UploadedFile, WriteFileRequest,
 };
 use llm_harness_types::{EnvError, FileInfo, ShellOptions};
 use tokio_stream::wrappers::ReceiverStream;
@@ -50,6 +50,7 @@ pub(crate) fn build_router(state: SharedState) -> Router {
         )
         .route("/v1/sandboxes/{id}/fs/read", post(read_file))
         .route("/v1/sandboxes/{id}/fs/write", post(write_file))
+        .route("/v1/sandboxes/{id}/fs/upload", post(upload_files))
         .route("/v1/sandboxes/{id}/fs/info", post(file_info))
         .route("/v1/sandboxes/{id}/fs/list", post(list_dir))
         .route("/v1/sandboxes/{id}/fs/exists", post(exists))
@@ -408,6 +409,77 @@ async fn write_file(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => fs_error(error, &request.path),
     }
+}
+
+async fn upload_files(
+    State(state): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<UploadFilesRequest>,
+) -> Response {
+    let Some(sandbox) = state.get_sandbox(&principal, &id) else {
+        return not_found(&id);
+    };
+    if request.files.len() > MAX_UPLOAD_FILES {
+        return gateway_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_many_files",
+            format!("batch upload accepts at most {MAX_UPLOAD_FILES} files"),
+            None,
+        );
+    }
+
+    let mut seen_paths = std::collections::HashSet::with_capacity(request.files.len());
+    let mut uploads = Vec::with_capacity(request.files.len());
+    for file in &request.files {
+        if !seen_paths.insert(file.path.as_str()) {
+            return gateway_error(
+                StatusCode::BAD_REQUEST,
+                "duplicate_path",
+                "batch upload paths must be unique".to_owned(),
+                Some(file.path.clone()),
+            );
+        }
+        let bytes = match decode_content(&file.content) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return gateway_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_base64",
+                    error,
+                    Some(file.path.clone()),
+                );
+            }
+        };
+        let path = match validate_guest_fs_path(&sandbox.config, &file.path) {
+            Ok(path) => path,
+            Err(response) => return *response,
+        };
+        uploads.push((file.path.clone(), path, bytes));
+    }
+
+    let mut uploaded = Vec::with_capacity(uploads.len());
+    for (requested_path, path, bytes) in uploads {
+        let byte_count = bytes.len() as u64;
+        match sandbox
+            .env
+            .write_file(&path, &bytes, CancellationToken::new())
+            .await
+        {
+            Ok(()) => {
+                uploaded.push(UploadedFile {
+                    path: requested_path,
+                    bytes: byte_count,
+                });
+            }
+            Err(error) => return fs_error(error, &requested_path),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(UploadFilesResponse { files: uploaded }),
+    )
+        .into_response()
 }
 
 async fn file_info(
@@ -809,6 +881,8 @@ fn validate_shell_request(state: &SharedState, request: &ShellExecRequest) -> Op
     }
     None
 }
+
+const MAX_UPLOAD_FILES: usize = 32;
 
 fn validate_guest_fs_path(
     config: &llm_harness_sandbox_remote::RemoteSandboxConfig,

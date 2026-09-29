@@ -74,6 +74,32 @@ pub struct WriteFileRequest {
     pub append: bool,
 }
 
+/// A single file in a batch upload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadFile {
+    pub path: String,
+    pub content: FileContent,
+}
+
+/// Request body for uploading multiple files at once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadFilesRequest {
+    pub files: Vec<UploadFile>,
+}
+
+/// A file successfully written by a batch upload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadedFile {
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// Response body for a batch upload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadFilesResponse {
+    pub files: Vec<UploadedFile>,
+}
+
 /// File or directory metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfoResponse {

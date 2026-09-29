@@ -7,7 +7,9 @@ use llm_harness_platform::sandbox::{NetRule, ResourceLimits, Sandbox, SandboxCon
 use llm_harness_sandbox_gateway::{
     FirecrackerBackendConfig, GatewayBackend, GatewayConfig, GatewayPrincipalConfig, SandboxGateway,
 };
-use llm_harness_sandbox_remote::protocol::RemoteSandboxState;
+use llm_harness_sandbox_remote::protocol::{
+    FileContent, RemoteSandboxState, UploadFile, UploadFilesRequest,
+};
 use llm_harness_sandbox_remote::{
     RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig, RemoteSandboxConfig,
     RemoteSandboxError, ResourceLimitsWire,
@@ -1217,6 +1219,93 @@ async fn bwrap_gateway_supports_files_shell_reset_and_delete() {
             .count(),
         0
     );
+}
+
+#[tokio::test]
+async fn gateway_uploads_a_batch_of_text_and_binary_files() {
+    if !bwrap_available() {
+        return;
+    }
+    let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+    let sandbox = client
+        .create_sandbox(sandbox_config())
+        .await
+        .expect("create sandbox");
+
+    let text_path = PathBuf::from(&sandbox.work_dir).join("notes.txt");
+    let binary_path = PathBuf::from(&sandbox.work_dir).join("payload.bin");
+    let uploaded = client
+        .upload_files(
+            &sandbox.sandbox_id,
+            &[
+                (text_path.as_path(), b"text file\n".as_slice()),
+                (binary_path.as_path(), [0_u8, 1, 255].as_slice()),
+            ],
+        )
+        .await
+        .expect("upload files");
+
+    assert_eq!(
+        uploaded,
+        [
+            llm_harness_sandbox_remote::protocol::UploadedFile {
+                path: text_path.to_string_lossy().into_owned(),
+                bytes: 10,
+            },
+            llm_harness_sandbox_remote::protocol::UploadedFile {
+                path: binary_path.to_string_lossy().into_owned(),
+                bytes: 3,
+            },
+        ]
+    );
+    assert_eq!(
+        client
+            .read_file(&sandbox.sandbox_id, &text_path, false)
+            .await
+            .expect("read uploaded text"),
+        b"text file\n"
+    );
+    assert_eq!(
+        client
+            .read_file(&sandbox.sandbox_id, &binary_path, true)
+            .await
+            .expect("read uploaded binary"),
+        [0_u8, 1, 255]
+    );
+
+    let duplicate = UploadFilesRequest {
+        files: vec![
+            UploadFile {
+                path: text_path.to_string_lossy().into_owned(),
+                content: FileContent::Text {
+                    value: "first".to_owned(),
+                },
+            },
+            UploadFile {
+                path: text_path.to_string_lossy().into_owned(),
+                content: FileContent::Text {
+                    value: "second".to_owned(),
+                },
+            },
+        ],
+    };
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sandboxes/{}/fs/upload",
+            gateway.base_url, sandbox.sandbox_id
+        ))
+        .header("Authorization", format!("Bearer {TOKEN_A}"))
+        .json(&duplicate)
+        .send()
+        .await
+        .expect("duplicate upload request");
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    client
+        .delete_sandbox(&sandbox.sandbox_id)
+        .await
+        .expect("delete sandbox");
 }
 
 #[tokio::test]
