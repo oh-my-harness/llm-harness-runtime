@@ -28,6 +28,10 @@ struct RemoteSandboxInner {
 }
 
 /// Runtime-side handle to a sandbox managed by a remote gateway.
+///
+/// Cloning shares the same underlying sandbox; remote resources are cleaned
+/// up when the last handle drops (or `shutdown` is called once).
+#[derive(Clone)]
 pub struct RemoteSandbox {
     inner: Arc<RemoteSandboxInner>,
 }
@@ -638,6 +642,8 @@ mod tests {
                 timeout: None,
             },
             work_dir: Some(PathBuf::from("/workspace")),
+            trust_profile: Default::default(),
+            host_binds: Vec::new(),
         }
     }
 
@@ -647,6 +653,7 @@ mod tests {
             work_dir: work_dir.to_owned(),
             backend: "test".to_owned(),
             state: crate::protocol::RemoteSandboxState::Running,
+            trust_profile: Default::default(),
         }
     }
 

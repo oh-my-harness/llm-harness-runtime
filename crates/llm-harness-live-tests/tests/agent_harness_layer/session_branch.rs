@@ -291,6 +291,8 @@ async fn jsonl_session_survives_reload() {
                 timeout: None,
             },
             work_dir: Some(tmp.path().to_path_buf()),
+            trust_profile: Default::default(),
+            host_binds: Vec::new(),
         };
         let sandbox = OsEnvSandbox::new(config);
         sandbox.start().await.unwrap();

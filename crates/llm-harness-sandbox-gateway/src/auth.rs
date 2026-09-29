@@ -13,7 +13,15 @@ use sha2::{Digest, Sha256};
 pub struct GatewayPrincipalConfig {
     pub principal: String,
     pub bearer_token: String,
+    /// Guest-coordinate allowlist (restricted profile). Must be `/workspace`
+    /// or a subpath.
     pub fs_allowlist: Vec<PathBuf>,
+    /// Host directories bound read-write into trusted-profile sandboxes,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub host_project_dirs: Vec<PathBuf>,
+    /// Highest profile this principal may request. Requests above the cap
+    /// are rejected. Default `restricted`.
+    pub max_trust_profile: llm_harness_platform::trust::TrustProfile,
 }
 
 /// Firecracker VM artifacts and VM defaults used by the gateway backend.
@@ -33,6 +41,9 @@ pub struct FirecrackerBackendConfig {
 #[derive(Clone)]
 pub enum GatewayBackend {
     Bwrap,
+    /// macOS `sandbox-exec` backend (Seatbelt). Only available on macOS.
+    #[cfg(target_os = "macos")]
+    Seatbelt,
     Firecracker(FirecrackerBackendConfig),
 }
 
@@ -54,6 +65,8 @@ struct PrincipalSecret {
     id: String,
     token_hash: [u8; 32],
     fs_allowlist: Vec<PathBuf>,
+    host_project_dirs: Vec<PathBuf>,
+    max_trust_profile: llm_harness_platform::trust::TrustProfile,
 }
 
 /// An authenticated principal attached to a request by the auth middleware.
@@ -61,6 +74,9 @@ struct PrincipalSecret {
 pub(crate) struct AuthenticatedPrincipal {
     pub(crate) id: Arc<str>,
     pub(crate) fs_allowlist: Arc<[PathBuf]>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) host_project_dirs: Arc<[PathBuf]>,
+    pub(crate) max_trust_profile: llm_harness_platform::trust::TrustProfile,
 }
 
 impl GatewayConfig {
@@ -93,10 +109,26 @@ impl GatewayConfig {
                 }
                 allowlist.push(std::path::PathBuf::from(root));
             }
+            let mut project_dirs = Vec::with_capacity(principal.host_project_dirs.len());
+            for dir in &principal.host_project_dirs {
+                if !dir.is_absolute() {
+                    anyhow::bail!(
+                        "gateway principal host_project_dirs entry {dir:?} must be absolute"
+                    );
+                }
+                if !dir.is_dir() {
+                    anyhow::bail!(
+                        "gateway principal host_project_dirs entry {dir:?} must exist and be a directory"
+                    );
+                }
+                project_dirs.push(dir.clone());
+            }
             secrets.push(PrincipalSecret {
                 id: principal.principal,
                 token_hash: Sha256::digest(principal.bearer_token.as_bytes()).into(),
                 fs_allowlist: allowlist,
+                host_project_dirs: project_dirs,
+                max_trust_profile: principal.max_trust_profile,
             });
         }
 
@@ -203,11 +235,14 @@ impl GatewayConfig {
         if self.max_output_bytes == 0 {
             anyhow::bail!("max_output_bytes must be positive");
         }
-        if self.max_request_bytes == 0 {
-            anyhow::bail!("max_request_bytes must be positive");
-        }
         match &self.backend {
             GatewayBackend::Bwrap => {}
+            #[cfg(target_os = "macos")]
+            GatewayBackend::Seatbelt => {
+                if !self.work_root.is_some() {
+                    anyhow::bail!("seatbelt backend requires an explicit work root");
+                }
+            }
             GatewayBackend::Firecracker(config) => {
                 validate_firecracker_backend(config, self.max_sandboxes)?
             }
@@ -223,6 +258,8 @@ impl GatewayConfig {
             .map(|principal| AuthenticatedPrincipal {
                 id: Arc::from(principal.id.as_str()),
                 fs_allowlist: Arc::from(principal.fs_allowlist.as_slice()),
+                host_project_dirs: Arc::from(principal.host_project_dirs.as_slice()),
+                max_trust_profile: principal.max_trust_profile,
             })
     }
 
@@ -233,9 +270,12 @@ impl GatewayConfig {
             .map(|principal| AuthenticatedPrincipal {
                 id: Arc::from(principal.id.as_str()),
                 fs_allowlist: Arc::from(principal.fs_allowlist.as_slice()),
+                host_project_dirs: Arc::from(principal.host_project_dirs.as_slice()),
+                max_trust_profile: principal.max_trust_profile,
             })
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn work_root(&self) -> &std::path::Path {
         self.work_root
             .as_deref()
@@ -341,6 +381,8 @@ impl std::fmt::Debug for GatewayConfig {
                 "backend",
                 &match self.backend {
                     GatewayBackend::Bwrap => "bwrap",
+                    #[cfg(target_os = "macos")]
+                    GatewayBackend::Seatbelt => "macos-seatbelt",
                     GatewayBackend::Firecracker(_) => "firecracker",
                 },
             )

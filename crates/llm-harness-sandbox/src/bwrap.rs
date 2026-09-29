@@ -696,11 +696,21 @@ impl BwrapEnv {
 
     /// Build the bwrap argument vector for a shell command invocation.
     fn build_bwrap_args(&self, cwd: &Path) -> Vec<String> {
+        use llm_harness_platform::trust::TrustProfile;
+        let trusted = matches!(
+            self.config.trust_profile,
+            TrustProfile::TrustedLan | TrustProfile::TrustedFull
+        );
         let mut args = vec![
             "--unshare-all".to_string(),
             "--die-with-parent".to_string(),
             "--new-session".to_string(),
         ];
+
+        // Trusted profiles keep the network: undo the net unshare.
+        if trusted {
+            args.push("--share-net".to_string());
+        }
 
         // Read-only system directories for executables and libraries.
         for (src, dest) in BwrapEnv::system_ro_binds() {
@@ -740,6 +750,11 @@ impl BwrapEnv {
         for path in &self.config.fs_allowlist {
             let destination = self.policy_destination(path);
             BwrapEnv::push_bind(&mut args, path, &destination);
+        }
+
+        // Trusted-profile host project binds (read-write at the guest path).
+        for bind in &self.config.host_binds {
+            BwrapEnv::push_bind(&mut args, &bind.host, &bind.guest);
         }
 
         for path in &self.config.fs_denylist {
@@ -1675,3 +1690,55 @@ enum CleanupMode {
 #[cfg(test)]
 #[path = "bwrap_tests.rs"]
 mod tests;
+
+/// Trust-profile arg assertions: pure unit tests (no bwrap binary needed).
+#[cfg(test)]
+mod trust_profile_args_tests {
+    use super::*;
+    use llm_harness_platform::sandbox::HostBind;
+    use llm_harness_platform::trust::TrustProfile;
+
+    fn config_for(profile: TrustProfile) -> SandboxConfig {
+        SandboxConfig {
+            trust_profile: profile,
+            host_binds: vec![HostBind {
+                host: PathBuf::from("/Users/tester/proj"),
+                guest: PathBuf::from("/workspace/proj"),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trusted_profile_args_share_net_and_bind_projects() {
+        for profile in [TrustProfile::TrustedLan, TrustProfile::TrustedFull] {
+            let env = BwrapEnv::new_owned(config_for(profile), PathBuf::from("/tmp/tw")).unwrap();
+            let args = env.build_bwrap_args(Path::new("/tmp/tw"));
+            assert!(
+                args.iter().any(|a| a == "--share-net"),
+                "{profile:?} args must share the network"
+            );
+            assert!(
+                args.windows(3).any(|w| w[0] == "--bind"
+                    && w[1] == "/Users/tester/proj"
+                    && w[2] == "/workspace/proj"),
+                "{profile:?} args must bind the project dir: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn restricted_profile_args_keep_net_unshared() {
+        let env = BwrapEnv::new_owned(
+            config_for(TrustProfile::Restricted),
+            PathBuf::from("/tmp/tw"),
+        )
+        .unwrap();
+        let args = env.build_bwrap_args(Path::new("/tmp/tw"));
+        assert!(!args.iter().any(|a| a == "--share-net"));
+        assert!(
+            !args.iter().any(|a| a == "/Users/tester/proj"),
+            "restricted must not bind host project dirs"
+        );
+    }
+}

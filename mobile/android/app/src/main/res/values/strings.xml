@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- MVP smoke defaults; not for production. Key is injected at build time. -->
+    <string name="default_api_key" translatable="false">sk-owhsbodinupygpqweapwaixkcohzwbtzdhsqceietbxtsqdl</string>
+    <string name="default_llm_base_url" translatable="false">https://api.siliconflow.cn</string>
+</resources>

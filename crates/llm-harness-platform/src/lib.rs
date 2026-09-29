@@ -9,5 +9,6 @@ pub mod prompt;
 pub mod sandbox;
 pub mod tracer;
 pub mod tracing_adapter;
+pub mod trust;
 
 pub use llm_harness_types::audit;

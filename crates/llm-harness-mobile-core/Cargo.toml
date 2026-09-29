@@ -1,0 +1,22 @@
+[package]
+name = "llm-harness-mobile-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+llm-harness-agent.workspace = true
+llm-harness-sandbox-remote.workspace = true
+llm-harness-types.workspace = true
+llm-harness-platform.workspace = true
+llm_adapter.workspace = true
+llm-harness-tools.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+tokio-util.workspace = true
+uniffi = { version = "0.29", features = ["cli"] }
+thiserror.workspace = true

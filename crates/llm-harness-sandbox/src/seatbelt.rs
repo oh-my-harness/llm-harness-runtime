@@ -27,6 +27,27 @@ use llm_harness_platform::sandbox::{Sandbox, SandboxConfig};
 use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
 
+/// Guest-coordinate work root used by gateway deployments.
+pub(crate) const GUEST_WORKSPACE: &str = "/workspace";
+
+/// Map a guest-coordinate policy path (`/workspace/...`) to its host path
+/// under `host_root`. Mirrors bwrap's `map_guest_policy_path`.
+pub(crate) fn map_guest_policy_path(
+    path: &Path,
+    guest_root: &Path,
+    host_root: &Path,
+) -> Result<PathBuf> {
+    let normalized = crate::lifecycle::lexical_normalize(path);
+    anyhow::ensure!(
+        normalized.starts_with(guest_root),
+        "policy path {path:?} is outside guest work directory {guest_root:?}"
+    );
+    let relative = normalized
+        .strip_prefix(guest_root)
+        .expect("guest prefix checked");
+    Ok(host_root.join(relative))
+}
+
 // ── Policy generation ─────────────────────────────────────────────────────
 
 /// Generate a seatbelt `.sb` policy string from the sandbox configuration.
@@ -48,10 +69,11 @@ use tokio_util::sync::CancellationToken;
 /// is responsible for canonicalizing `work_dir` and `allowlist` paths
 /// before passing them.
 pub(crate) fn generate_policy(
-    _config: &SandboxConfig,
+    config: &SandboxConfig,
     work_dir_canon: &Path,
     allowlist_canon: &[PathBuf],
 ) -> String {
+    use llm_harness_platform::trust::TrustProfile;
     let work_dir_str = work_dir_canon.to_string_lossy();
     let mut s = String::with_capacity(1024);
 
@@ -60,24 +82,42 @@ pub(crate) fn generate_policy(
     s.push_str("(allow default)\n");
     s.push('\n');
 
-    // Deny network entirely.
-    s.push_str(";; Deny network\n");
-    s.push_str("(deny network*)\n");
+    let trusted = matches!(
+        config.trust_profile,
+        TrustProfile::TrustedLan | TrustProfile::TrustedFull
+    );
+
+    // restricted: deny network entirely. trusted: allow (incl. DNS).
+    s.push_str(";; Network\n");
+    if trusted {
+        s.push_str("(allow network*)\n");
+    } else {
+        s.push_str("(deny network*)\n");
+    }
     s.push('\n');
 
-    // Deny reads to sensitive host paths. Both the symlink path (/etc)
-    // and the real path (/private/etc) are denied to prevent bypass.
-    s.push_str(";; Deny reads to sensitive host paths\n");
+    // Deny reads to sensitive host paths. IMPORTANT: /Library must NOT be
+    // blanket-denied — toolchain binaries (CLT python3/swift shims) resolve
+    // through it and seatbelt's deny beats subtree allows during exec-path
+    // resolution. Deny sensitive SUBDIRECTORIES instead. /etc and /var are
+    // denied via their real (/private/...) and symlink paths.
+    s.push_str(";; Deny reads to sensitive host paths (fine-grained)\n");
     for path in [
         "/etc",
-        "/var",
+        "/private/etc",
+        "/var/db",
+        "/private/var/db",
+        "/var/root",
+        "/private/var/root",
         "/root",
         "/Users",
-        "/Library",
+        "/Library/Keychains",
+        "/Library/Preferences",
+        "/Library/Application Support",
+        "/Library/Mail",
+        "/Library/Messages",
+        "/Library/Cookies",
         "/System",
-        "/private/etc",
-        "/private/var",
-        "/private/root",
         "/opt",
         "/srv",
         "/home",
@@ -103,6 +143,12 @@ pub(crate) fn generate_policy(
 
     // Allow /private/var/select (locale/sh setup, harmless system dir).
     s.push_str(r#"(allow file-read* (subpath "/private/var/select"))"#);
+
+    // CommandLineTools toolchain (python3/swift/... real binaries live under
+    // /usr/bin shims that forward here). Read-only: running and reading the
+    // toolchain is safe; it is not user data. /Library itself is NOT
+    // blanket-denied (see above) so no override is needed.
+    s.push_str(r#"(allow file-read* (subpath "/Library/Developer/CommandLineTools"))"#);
     s.push('\n');
 
     // Work_dir: read-write (overrides the /private/tmp deny via last-match-wins).
@@ -126,7 +172,73 @@ pub(crate) fn generate_policy(
         }
     }
 
+    // Trusted-profile host project binds: read-write at the real host path.
+    if trusted {
+        for bind in &config.host_binds {
+            let host = bind.host.to_string_lossy();
+            s.push_str(&format!(r#"(allow file-read* (subpath "{host}"))"#));
+            s.push('\n');
+            s.push_str(&format!(r#"(allow file-write* (subpath "{host}"))"#));
+            s.push('\n');
+        }
+    }
+    // Trusted profiles grant broad host read/write; the credential and
+    // system floors come LAST so last-match-wins keeps them denied no
+    // matter what was allowed above.
+    if trusted {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            s.push_str(&format!(r#"(allow file-read* (subpath "{home}"))"#));
+            s.push('\n');
+            if config.trust_profile == TrustProfile::TrustedFull {
+                s.push_str(&format!(r#"(allow file-write* (subpath "{home}"))"#));
+                s.push('\n');
+            }
+            for deny in credential_read_deny_paths(&home, work_dir_canon) {
+                s.push_str(&format!(
+                    r#"(deny file-read* (subpath "{}"))"#,
+                    deny.to_string_lossy()
+                ));
+                s.push('\n');
+            }
+            s.push_str(&format!(
+                r#"(deny file-read* (literal "{work_dir_str}/.env"))"#
+            ));
+            s.push('\n');
+        }
+    }
+
     s
+}
+
+/// Paths that hold credentials or trust anchors. Read-denied on every
+/// trusted profile, after any broad allows (last-match-wins).
+pub(crate) fn credential_read_deny_paths(home: &str, work_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![
+        PathBuf::from(format!("{home}/.ssh")),
+        PathBuf::from(format!("{home}/Library/Keychains")),
+        PathBuf::from(format!(
+            "{home}/Library/Application Support/Google/Chrome/Default/Cookies"
+        )),
+        PathBuf::from(format!(
+            "{home}/Library/Application Support/Google/Chrome/Default/Login Data"
+        )),
+        PathBuf::from(format!("{home}/.gnupg")),
+        PathBuf::from(format!("{home}/.aws")),
+        PathBuf::from(format!("{home}/.kube")),
+        // Work-dir-relative credential stores too: the agent controls its
+        // work_dir contents, so a task could drop keys there (its own or
+        // injected) — reading them back out is still an exfil channel.
+        work_dir.join(".env"),
+        work_dir.join(".ssh"),
+        work_dir.join(".gnupg"),
+        work_dir.join(".aws"),
+        work_dir.join(".kube"),
+        work_dir.join(".netrc"),
+    ];
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 // LifecycleState, SHUTDOWN_KILL_GRACE, and lexical_normalize are shared
@@ -187,6 +299,10 @@ impl Drop for TaintOnDrop {
 pub struct SeatbeltEnv {
     work_dir: PathBuf,
     work_dir_canon: PathBuf,
+    /// Guest→host path mappings, longest guest prefix wins. The first entry
+    /// is the main workspace (`/workspace` → work_dir_canon); trusted
+    /// profiles append host project binds.
+    guest_mappings: Vec<(PathBuf, PathBuf)>,
     allowlist_canon: Vec<PathBuf>,
     config: SandboxConfig,
     owned: bool,
@@ -200,6 +316,31 @@ impl SeatbeltEnv {
     pub(crate) fn new(
         work_dir: PathBuf,
         work_dir_canon: PathBuf,
+        guest_work_dir: Option<PathBuf>,
+        allowlist_canon: Vec<PathBuf>,
+        config: SandboxConfig,
+        owned: bool,
+        policy_path: PathBuf,
+    ) -> Self {
+        let guest_mappings = match guest_work_dir {
+            Some(root) => vec![(root, work_dir_canon.clone())],
+            None => Vec::new(),
+        };
+        Self::new_with_binds(
+            work_dir,
+            work_dir_canon,
+            guest_mappings,
+            allowlist_canon,
+            config,
+            owned,
+            policy_path,
+        )
+    }
+
+    pub(crate) fn new_with_binds(
+        work_dir: PathBuf,
+        work_dir_canon: PathBuf,
+        guest_mappings: Vec<(PathBuf, PathBuf)>,
         allowlist_canon: Vec<PathBuf>,
         config: SandboxConfig,
         owned: bool,
@@ -208,6 +349,7 @@ impl SeatbeltEnv {
         Self {
             work_dir,
             work_dir_canon,
+            guest_mappings,
             allowlist_canon,
             config,
             owned,
@@ -309,7 +451,46 @@ impl SeatbeltEnv {
     /// canonicalization and the actual open, but this is far narrower
     /// than unconditional symlink-following.
     fn resolve_path(&self, path: &Path) -> Result<PathBuf, EnvError> {
-        let resolved = if path.is_absolute() {
+        let resolved = if !self.guest_mappings.is_empty() {
+            // Guest coordinates: translate absolute guest paths via the
+            // longest-prefix mapping; relative paths are already
+            // work-dir-relative.
+            if path.is_absolute() {
+                let normalized_guest = lexical_normalize(path);
+                let mut best: Option<(PathBuf, PathBuf)> = None;
+                for (guest_root, host_root) in &self.guest_mappings {
+                    let guest_root_norm = lexical_normalize(guest_root);
+                    if normalized_guest == guest_root_norm
+                        || normalized_guest.starts_with(&guest_root_norm)
+                    {
+                        let better = best
+                            .as_ref()
+                            .map(|(prev, _)| {
+                                guest_root_norm.components().count() > prev.components().count()
+                            })
+                            .unwrap_or(true);
+                        if better {
+                            best = Some((guest_root_norm, host_root.clone()));
+                        }
+                    }
+                }
+                match best {
+                    Some((guest_root_norm, host_root)) => {
+                        if normalized_guest == guest_root_norm {
+                            host_root.clone()
+                        } else {
+                            let relative = normalized_guest
+                                .strip_prefix(&guest_root_norm)
+                                .expect("guest prefix checked");
+                            host_root.join(relative)
+                        }
+                    }
+                    None => return Err(EnvError::PermissionDenied(normalized_guest)),
+                }
+            } else {
+                self.work_dir_canon.join(path)
+            }
+        } else if path.is_absolute() {
             path.to_path_buf()
         } else {
             self.work_dir_canon.join(path)
@@ -323,7 +504,12 @@ impl SeatbeltEnv {
             || self
                 .allowlist_canon
                 .iter()
-                .any(|root| normalized == *root || normalized.starts_with(root));
+                .any(|root| normalized == *root || normalized.starts_with(root))
+            || self
+                .config
+                .host_binds
+                .iter()
+                .any(|bind| normalized == bind.host || normalized.starts_with(&bind.host));
         if !lex_ok {
             return Err(EnvError::PermissionDenied(normalized));
         }
@@ -334,9 +520,6 @@ impl SeatbeltEnv {
         let canonical = match std::fs::canonicalize(&normalized) {
             Ok(c) => c,
             Err(_) => {
-                // Path doesn't exist — canonicalize the parent and join
-                // the final component. This handles write_file/append_file
-                // creating new files.
                 let parent = normalized.parent();
                 let file_name = normalized.file_name();
                 match (parent, file_name) {
@@ -354,6 +537,11 @@ impl SeatbeltEnv {
         }
         for root in &self.allowlist_canon {
             if canonical == *root || canonical.starts_with(root) {
+                return Ok(canonical);
+            }
+        }
+        for bind in &self.config.host_binds {
+            if canonical == bind.host || canonical.starts_with(&bind.host) {
                 return Ok(canonical);
             }
         }
@@ -817,21 +1005,51 @@ impl SeatbeltSandbox {
         let work_dir_canon = std::fs::canonicalize(&work_dir)
             .map_err(|e| anyhow::anyhow!("failed to canonicalize work_dir: {e}"))?;
 
+        // Gateway deployments address the sandbox in guest coordinates
+        // (`/workspace` = the host work dir). Map them up front, mirroring
+        // `BwrapSandbox::new_mapped`.
+        let guest_root = PathBuf::from(GUEST_WORKSPACE);
         let allowlist_canon = config
             .fs_allowlist
             .iter()
             .map(|p| {
-                std::fs::canonicalize(p)
+                let mapped = map_guest_policy_path(p, &guest_root, &work_dir_canon)?;
+                if let Some(parent) = mapped.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        anyhow::anyhow!("fs_allowlist entry {p:?}: create parent: {e}")
+                    })?;
+                }
+                std::fs::create_dir_all(&mapped)
+                    .map_err(|e| anyhow::anyhow!("fs_allowlist entry {p:?}: create dir: {e}"))?;
+                std::fs::canonicalize(&mapped)
                     .map_err(|e| anyhow::anyhow!("fs_allowlist entry {:?}: {e}", p))
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // Trusted-profile host project binds: allow the real host directory
+        // in the policy and map it into guest coordinates for the env.
+        let mut guest_mappings: Vec<(PathBuf, PathBuf)> =
+            vec![(guest_root.clone(), work_dir_canon.clone())];
+        let mut bind_allows = Vec::new();
+        for bind in &config.host_binds {
+            if !bind.host.is_absolute() {
+                anyhow::bail!("host bind {:?} must be absolute", bind.host);
+            }
+            if !bind.guest.is_absolute() {
+                anyhow::bail!("host bind guest path {:?} must be absolute", bind.guest);
+            }
+            let host_canon = std::fs::canonicalize(&bind.host)
+                .map_err(|e| anyhow::anyhow!("host bind {:?}: {e}", bind.host))?;
+            bind_allows.push(host_canon.clone());
+            guest_mappings.push((bind.guest.clone(), host_canon));
+        }
+
         let policy_path =
             std::env::temp_dir().join(format!("seatbelt-{}.sb", uuid::Uuid::new_v4()));
-
-        let env = Arc::new(SeatbeltEnv::new(
+        let env = Arc::new(SeatbeltEnv::new_with_binds(
             work_dir,
             work_dir_canon,
+            guest_mappings,
             allowlist_canon,
             config.clone(),
             owned,

@@ -1,0 +1,35 @@
+[package]
+name = "llm-harness-agent-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+llm-harness-agent.workspace = true
+llm-harness-platform.workspace = true
+llm-harness-sandbox-remote.workspace = true
+llm-harness-types.workspace = true
+llm-harness-tools.workspace = true
+llm_adapter.workspace = true
+chrono.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+llm-harness-agent = { workspace = true, features = ["test-utils"] }
+llm-harness-loop.workspace = true
+llm-harness-sandbox-gateway = { workspace = true }
+http-body-util = "0.1"
+tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }

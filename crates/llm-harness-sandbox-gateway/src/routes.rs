@@ -33,7 +33,7 @@ pub async fn serve(
 }
 
 pub(crate) fn build_router(state: SharedState) -> Router {
-    Router::new()
+    let protected_routes = Router::new()
         .route("/v1/sandboxes", post(create_sandbox))
         .route(
             "/v1/sandboxes/{id}",
@@ -66,7 +66,14 @@ pub(crate) fn build_router(state: SharedState) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(
             state.config().max_request_bytes,
         ))
-        .with_state(state)
+        .with_state(state.clone());
+
+    let health_routes = Router::new()
+        .route("/healthz", get(health))
+        .route("/readyz", get(readiness))
+        .with_state(state);
+
+    protected_routes.merge(health_routes)
 }
 
 async fn authenticate(
@@ -80,6 +87,23 @@ async fn authenticate(
     };
     request.extensions_mut().insert(principal);
     next.run(request).await
+}
+
+#[derive(serde::Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    backend: &'static str,
+}
+
+async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        backend: state.backend_label(),
+    })
+}
+
+async fn readiness(State(state): State<SharedState>) -> Json<HealthResponse> {
+    health(State(state)).await
 }
 
 async fn log_request(
@@ -137,6 +161,7 @@ async fn create_sandbox(
         .map(|sandbox| sandbox.work_dir.to_string_lossy().into_owned())
         .unwrap_or_default();
     tracing::info!(sandbox_id = %sandbox_id, principal = %principal.id, "sandbox created");
+    let trust_profile = state.requested_profile(&sandbox_id);
     (
         StatusCode::CREATED,
         Json(CreateSandboxResponse {
@@ -144,6 +169,7 @@ async fn create_sandbox(
             work_dir,
             backend: state.backend_label().to_owned(),
             state: RemoteSandboxState::Running,
+            trust_profile,
         }),
     )
         .into_response()
