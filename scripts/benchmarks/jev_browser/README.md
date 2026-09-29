@@ -39,6 +39,8 @@ python -m unittest discover -s scripts/tests -p 'test_jev_browser_author*.py' -v
 
 A 的协议明确合法操作/目标，并仅允许整数目标按同值字符串正规化，仍禁止猜测和越界目标。完整请求体、响应原文及异常栈在本地日志记录，凭据脱敏。相同任务的不同轮次分别配对；只读审计同时检查公共参数和 Qwen 路由没有漂移。工程测试须先全部结束再运行：
 
+受控模式的 429 重试在两组统一等待 30/60 秒，最多三次 HTTP；有效 Retry-After 可延长至最多 120 秒，等待全部计入任务墙钟并记录为 `provider_backoff`。其他 503/529 沿用作者 0.5/1 秒重试。可用 `--qwen-http-limit` 显式收紧预算；本次在保留限流中止记录后，第二次完整运行只剩 237 次 HTTP 预算，不能静默扩额。
+
 ```powershell
 python scripts/benchmarks/jev_browser/author_suite.py --paired --controlled --repeats 3 --proxy http://127.0.0.1:7890 --output logs/benchmarks/NEW_CONTROLLED_RUN --chromium $env:CHROMIUM_EXECUTABLE
 ```

@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "benchmarks/jev_browser/author_suite.py"
@@ -13,6 +14,33 @@ SPEC.loader.exec_module(suite)
 
 
 class AuthorSuiteTests(unittest.TestCase):
+    def test_shared_429_backoff_counts_all_requests_without_changing_messages(self):
+        calls, waits = [], []
+        responses = iter([SimpleNamespace(status_code=429, headers={}, is_error=True),
+                          SimpleNamespace(status_code=429, headers={"retry-after": "65"}, is_error=True),
+                          SimpleNamespace(status_code=200, headers={}, is_error=False, json=lambda: {"ok": True})])
+        def post(*args, **kwargs):
+            calls.append(kwargs)
+            return next(responses)
+        body = {"messages": [{"content": "unchanged"}]}
+        result = suite.controlled_qwen_post(SimpleNamespace(post=post), "https://example.invalid", "test-only", body,
+                                           lambda delay, status: waits.append((delay, status)))
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(waits, [(30, 429), (65, 429)])
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(c["json"]["messages"] == body["messages"] and c["json"]["temperature"] == 0 for c in calls))
+
+    def test_rate_limit_stops_after_three_attempts(self):
+        calls, waits = [], []
+        def post(*args, **kwargs):
+            calls.append(1)
+            return SimpleNamespace(status_code=429, headers={}, is_error=True)
+        with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
+            suite.controlled_qwen_post(SimpleNamespace(post=post), "https://example.invalid", "test-only", {},
+                                      lambda delay, status: waits.append(delay))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(waits, [30, 60])
+
     def test_controlled_parameters_do_not_mutate_input_or_prompt(self):
         body = {"model": "qwen", "temperature": .7, "max_tokens": 60, "messages": [{"content": "original"}]}
         result = suite.common_qwen_body(body)

@@ -80,6 +80,26 @@ def common_qwen_body(body):
             "response_format": {"type": "json_object"}}
 
 
+def controlled_qwen_post(client, url, key, body, wait):
+    import httpx
+    for attempt in range(3):
+        try:
+            response = client.post(url, json=common_qwen_body(body), headers={"Authorization": f"Bearer {key}"})
+        except httpx.HTTPError:
+            raise RuntimeError("Model connection failed; no action executed.") from None
+        if response.status_code in (429, 503, 529) and attempt < 2:
+            delay = (30, 60)[attempt] if response.status_code == 429 else .5 * 2**attempt
+            try:
+                delay = max(delay, min(120, float(response.headers.get("retry-after", 0))))
+            except (TypeError, ValueError):
+                pass
+            wait(delay, response.status_code)
+            continue
+        if response.is_error:
+            raise RuntimeError(f"Model provider returned HTTP {response.status_code}; no action executed.")
+        return response.json()
+
+
 def validate_run_options(paired, repeats, controlled, proxy):
     if repeats not in (1, 2, 3) or (repeats != 1 and not paired):
         raise ValueError("Use one to three paired repetitions")
@@ -93,8 +113,11 @@ def validate_run_options(paired, repeats, controlled, proxy):
             raise ValueError("Proxy must be a local HTTP endpoint without credentials")
 
 
-def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=None):
+def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=None, qwen_http_limit=None):
     validate_run_options(paired, repeats, controlled, proxy)
+    qwen_limit = qwen_http_limit if qwen_http_limit is not None else 120 * repeats
+    if not 1 <= qwen_limit <= 360:
+        raise ValueError("Qwen HTTP limit must be between 1 and 360")
     output.mkdir(parents=True, exist_ok=False)
     (output / "runner-source.py").write_bytes(Path(__file__).read_bytes())
     os.environ.update(PYTHONUTF8="1", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
@@ -128,8 +151,13 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
             mounts={"https://api.siliconflow.cn": httpx.HTTPTransport(proxy=proxy, http2=True, trust_env=False)})
     if controlled:
         original_post = model_module.post_json
+        def provider_wait(delay, status):
+            with measured("provider_backoff", http_status=status, requested_seconds=delay):
+                time.sleep(delay)
         def controlled_post(url, token, body):
-            return original_post(url, token, common_qwen_body(body) if url.startswith(QWEN_BASE) else body)
+            if url.startswith(QWEN_BASE):
+                return controlled_qwen_post(model_module.CLIENT, url, token, body, provider_wait)
+            return original_post(url, token, body)
         model_module.post_json = controlled_post
     if paired:
         import author_control
@@ -173,7 +201,6 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
     started = time.perf_counter()
     rows = []
     planned = len(suite.TASKS) * (2 if paired else 1) * repeats
-    qwen_limit = 120 * repeats
     try:
         with measured("model_load"):
             lb = LayaBrowser.from_pretrained(str(SNAPSHOT), device="cuda", fast=False)
@@ -242,6 +269,10 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                         add_usage(task["tokens"], None)
                     raise
                 record["http_status"] = response.status_code
+                if remote:
+                    record["response_headers"] = {k: v for k, v in response.headers.items()
+                                                  if k.lower() in ("retry-after", "x-siliconcloud-trace-id")
+                                                  or k.lower().startswith("x-ratelimit-")}
                 if remote and response.is_success:
                     payload = response.json()
                     record.update(usage=payload.get("usage"), model=payload.get("model"))
@@ -251,6 +282,7 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                 elif remote:
                     add_usage(counts, None)
                     add_usage(task["tokens"], None)
+                    record["response_error_body"] = response.text
                 return response
         model_module.CLIENT.send = observed_send
         def observe_helper(name):
@@ -304,6 +336,7 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                     "controlled": controlled, "common_qwen_parameters": common_qwen_body({}) if controlled else None,
                     "network": {"browser_proxy": proxy, "qwen_proxy": proxy, "local_services": "direct" if proxy else "inherited",
                                 "httpx_trust_env": not bool(proxy), "qwen_timeout_seconds": 25},
+                    "qwen_429_backoff_seconds": [30, 60] if controlled else [.5, 1],
                     "shared_null_guard_fix": paired, "isolated_browser_contexts": paired,
                     "cooperative_attempt_seconds": 180 if paired else None,
                     "tasks": [row[0] for row in suite.TASKS], "qwen": QWEN, "qwen_http_limit": qwen_limit,
@@ -321,6 +354,7 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
             task.update(name=original_task[0], arm=arm, repeat=repeat, initial=None,
                         tokens={"qwen_input_tokens": 0, "qwen_output_tokens": 0})
             last_page.clear()
+            emit("attempt_start")
             if paired:
                 with measured("context_setup"):
                     context["id"] = raw_cdp("Target.createBrowserContext", disposeOnDetach=True)["browserContextId"]
@@ -389,5 +423,6 @@ if __name__ == "__main__":
     parser.add_argument("--repeats", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--controlled", action="store_true", help="Unify common Qwen sampling parameters")
     parser.add_argument("--proxy", help="Explicit local HTTP proxy for the browser and Qwen; local services bypass it")
+    parser.add_argument("--qwen-http-limit", type=int, help="Session HTTP cap, at most 360, including retries")
     args = parser.parse_args()
-    run(args.output.resolve(), args.chromium, args.paired, args.repeats, args.controlled, args.proxy)
+    run(args.output.resolve(), args.chromium, args.paired, args.repeats, args.controlled, args.proxy, args.qwen_http_limit)
