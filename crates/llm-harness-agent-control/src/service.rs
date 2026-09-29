@@ -8,7 +8,8 @@ use base64::Engine;
 use llm_harness_agent::harness::{AgentHarness, AgentHarnessOptions};
 use llm_harness_platform::sandbox::Sandbox;
 use llm_harness_sandbox_remote::protocol::{
-    FileContent, UploadFilesRequest, UploadFilesResponse, UploadedFile,
+    FileContent, ReadFileRequest, ReadFileResponse, UploadFilesRequest, UploadFilesResponse,
+    UploadedFile,
 };
 use llm_harness_sandbox_remote::{RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig};
 use llm_harness_types::{AgentEvent, AgentMessage, ExecutionEnv, UserMessage};
@@ -73,6 +74,19 @@ pub enum ControlServiceError {
         path: String,
         source: llm_harness_types::EnvError,
     },
+    #[error("invalid file request: {0}")]
+    InvalidFileRequest(String),
+    #[error("file {path} is {size} bytes; limit is {max_bytes} bytes")]
+    FileTooLarge {
+        path: String,
+        size: u64,
+        max_bytes: u64,
+    },
+    #[error("failed to read {path}: {source}")]
+    FileReadFailed {
+        path: String,
+        source: llm_harness_types::EnvError,
+    },
     #[error("principal has reached its sandbox session limit")]
     LimitReached,
     #[error("agent is already running; prompt or abort first")]
@@ -94,6 +108,14 @@ impl ControlServiceError {
                 llm_harness_types::EnvError::PermissionDenied(_) => StatusCode::FORBIDDEN,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             },
+            Self::InvalidFileRequest(_) => StatusCode::BAD_REQUEST,
+            Self::FileTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::FileReadFailed { source, .. } => match source {
+                llm_harness_types::EnvError::NotFound(_) => StatusCode::NOT_FOUND,
+                llm_harness_types::EnvError::PermissionDenied(_) => StatusCode::FORBIDDEN,
+                llm_harness_types::EnvError::InvalidUtf8(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            },
             Self::LimitReached => StatusCode::TOO_MANY_REQUESTS,
             Self::Busy | Self::SteerQueueFull => StatusCode::CONFLICT,
             Self::Sandbox(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -106,6 +128,9 @@ impl ControlServiceError {
             Self::SandboxUnavailable => "sandbox_unavailable",
             Self::InvalidUpload(_) => "invalid_upload",
             Self::UploadFailed { .. } => "upload_failed",
+            Self::InvalidFileRequest(_) => "invalid_file_request",
+            Self::FileTooLarge { .. } => "file_too_large",
+            Self::FileReadFailed { .. } => "file_read_failed",
             Self::LimitReached => "agent_session_limit_reached",
             Self::Busy => "agent_busy",
             Self::SteerQueueFull => "steer_queue_full",
@@ -396,6 +421,67 @@ impl AgentControlManager {
         Ok(UploadFilesResponse { files: uploaded })
     }
 
+    pub async fn read_file(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        session_id: &str,
+        request: ReadFileRequest,
+    ) -> Result<ReadFileResponse, ControlServiceError> {
+        let session = self
+            .find_owned_session(principal, session_id)?
+            .ok_or_else(|| ControlServiceError::SessionNotFound(session_id.to_owned()))?;
+        let environment = {
+            let sandbox = session.sandbox.lock().expect("sandbox lock");
+            sandbox
+                .as_ref()
+                .ok_or(ControlServiceError::SandboxUnavailable)?
+                .env()
+        };
+        let path = std::path::PathBuf::from(&request.path);
+        let info = environment
+            .file_info(&path, CancellationToken::new())
+            .await
+            .map_err(|source| ControlServiceError::FileReadFailed {
+                path: request.path.clone(),
+                source,
+            })?;
+        if info.is_dir {
+            return Err(ControlServiceError::InvalidFileRequest(
+                "path is a directory".to_owned(),
+            ));
+        }
+        if info.size > MAX_FILE_BYTES {
+            return Err(ControlServiceError::FileTooLarge {
+                path: request.path.clone(),
+                size: info.size,
+                max_bytes: MAX_FILE_BYTES,
+            });
+        }
+
+        let content = if request.binary {
+            let bytes = environment
+                .read_binary_file(&path, CancellationToken::new())
+                .await
+                .map_err(|source| ControlServiceError::FileReadFailed {
+                    path: request.path.clone(),
+                    source,
+                })?;
+            FileContent::Binary {
+                base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            }
+        } else {
+            let text = environment
+                .read_text_file(&path, CancellationToken::new())
+                .await
+                .map_err(|source| ControlServiceError::FileReadFailed {
+                    path: request.path.clone(),
+                    source,
+                })?;
+            FileContent::Text { value: text }
+        };
+        Ok(ReadFileResponse { content })
+    }
+
     pub fn prompt(
         &self,
         principal: &AuthenticatedPrincipal,
@@ -570,6 +656,7 @@ impl AgentControlManager {
 }
 
 const MAX_UPLOAD_FILES: usize = 32;
+const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 fn decode_upload_content(content: &FileContent) -> Result<Vec<u8>, ControlServiceError> {
     match content {

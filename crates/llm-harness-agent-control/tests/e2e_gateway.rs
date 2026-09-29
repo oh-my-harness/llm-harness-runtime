@@ -16,7 +16,9 @@ use async_trait::async_trait;
 use llm_harness_loop::test_utils::{MockLlmClient, MockResponse};
 use llm_harness_platform::sandbox::Sandbox;
 use llm_harness_sandbox_gateway::{GatewayConfig, GatewayPrincipalConfig, SandboxGateway};
-use llm_harness_sandbox_remote::protocol::{FileContent, UploadFile, UploadFilesRequest};
+use llm_harness_sandbox_remote::protocol::{
+    FileContent, ReadFileRequest, UploadFile, UploadFilesRequest,
+};
 use llm_harness_sandbox_remote::{RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig};
 use llm_harness_types::ExecutionEnv;
 
@@ -133,6 +135,54 @@ async fn upload_session_files_through_control_service() {
         serde_json::json!("/workspace/payload.bin")
     );
     assert_eq!(uploaded["files"][1]["bytes"], 3);
+
+    let text_read = ReadFileRequest {
+        path: "/workspace/notes.txt".to_owned(),
+        binary: false,
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/v1/agent-sessions/{session_id}/files/read"))
+                .header("content-type", "application/json")
+                .header(auth.0, auth.1)
+                .body(Body::from(serde_json::to_vec(&text_read).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let text_response = read_json(response).await;
+    assert_eq!(
+        text_response["content"]["value"],
+        serde_json::json!("uploaded by phone\n")
+    );
+
+    let binary_read = ReadFileRequest {
+        path: "/workspace/payload.bin".to_owned(),
+        binary: true,
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/v1/agent-sessions/{session_id}/files/read"))
+                .header("content-type", "application/json")
+                .header(auth.0, auth.1)
+                .body(Body::from(serde_json::to_vec(&binary_read).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let binary_response = read_json(response).await;
+    assert_eq!(
+        binary_response["content"]["base64"],
+        serde_json::json!("AAEC")
+    );
 
     let response = app
         .oneshot(
