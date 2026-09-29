@@ -6,7 +6,8 @@
     "revision": "990005a1b9c21258682d6da8cced4c7a9a5bc2da",
     "lockfile_sha256": "b01237fdf942a9b32147e726fcbef97bc7a082d7aacfa2a2b65c28097d96ef0a",
     "lockfile_hash_normalization": "CRLF_to_LF",
-    "windows_test_patch": "configs/research/jev-browser-windows-tests.patch"
+    "windows_test_patch": "configs/research/jev-browser-windows-tests.patch",
+    "model_hooks_patch": "configs/research/jev-browser-model-hooks.patch"
   },
   "task_set": {
     "approval": "confirmed_by_lqj_2026-09-29_for_preparation",
@@ -27,6 +28,13 @@
     "provider": "SiliconFlow",
     "decision_model_family": "Laya",
     "automatic_model_switching": false
+  },
+  "implementation": {
+    "directory": "scripts/benchmarks/jev_browser",
+    "offline_check": "node scripts/benchmarks/jev_browser/check.mjs",
+    "acceptance_status": "implemented_candidate_not_yet_frozen_for_live_run",
+    "public_site_model_runs": 0,
+    "real_model_validation_complete": false
   },
   "live_run": {
     "enabled": false,
