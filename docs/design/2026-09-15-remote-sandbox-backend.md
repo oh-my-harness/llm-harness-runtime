@@ -166,6 +166,8 @@ VM-level backend selection and threat model are defined separately in
 
 Linux systemd 部署模板见 [`deploy/README.md`](../../../deploy/README.md)。
 
+Linux 生产加固 Runbook 见 [`gateway-hardening.md`](../gateway-hardening.md)。
+
 ### 仍不满足的完整生产要求
 
 - 本机是 cgroup v1，`max_cpus` / `max_processes` / `max_memory_mb` 的 cgroup v2 执行路径无法在本环境完成部署级验证。
