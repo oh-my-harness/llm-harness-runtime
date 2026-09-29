@@ -7,6 +7,21 @@ export class ProtocolError extends Error {
   constructor() { super('Invalid structured model response'); this.name = 'ProtocolError'; }
 }
 
+export class BudgetError extends Error {
+  constructor() { super('Approved HTTP budget exhausted'); this.name = 'BudgetError'; }
+}
+
+export class HttpBudget {
+  constructor(limit) {
+    if (!Number.isInteger(limit) || limit <= 0) throw new Error('Invalid HTTP budget');
+    this.limit = limit; this.used = 0;
+  }
+  reserve() {
+    if (this.used >= this.limit) throw new BudgetError();
+    return ++this.used;
+  }
+}
+
 export function textValue(object) {
   if (!object || Array.isArray(object) || Object.keys(object).join(',') !== 'text'
     || typeof object.text !== 'string' || object.text.length >= 2000
@@ -15,13 +30,13 @@ export function textValue(object) {
 }
 
 export class QwenClient {
-  constructor(config, trace, { apiKey = process.env.SILICONFLOW_API_KEY, fetchImpl = fetch } = {}) {
+  constructor(config, trace, { apiKey = process.env.SILICONFLOW_API_KEY, fetchImpl = fetch, budget } = {}) {
     if (config.model !== QWEN_MODEL || config.endpoint !== ENDPOINT) throw new Error('Unapproved model or credential destination');
     for (const key of ['max_tokens', 'timeout_ms', 'max_attempts'])
       if (!Number.isInteger(config[key]) || config[key] <= 0) throw new Error(`Missing Qwen ${key}`);
     if (!Number.isFinite(config.temperature) || !apiKey) throw new Error('Missing Qwen parameters or credential');
     this.config = config; this.trace = trace; this.apiKey = apiKey; this.fetch = fetchImpl;
-    this.logical = 0;
+    this.logical = 0; this.budget = budget;
     trace.protect(apiKey);
   }
 
@@ -39,6 +54,7 @@ export class QwenClient {
           const bounded = AbortSignal.timeout(this.config.timeout_ms);
           const requestSignal = signal ? AbortSignal.any([signal, bounded]) : bounded;
           requestSignal.throwIfAborted();
+          event.session_http_index = this.budget?.reserve() ?? null;
           event.actual_calls = 1;
           this.trace.emit({ phase: 'http_start', id: event.id, logical_id: logicalId, retry_index: retry });
           const response = await this.fetch(ENDPOINT, { method: 'POST', redirect: 'error', signal: requestSignal,

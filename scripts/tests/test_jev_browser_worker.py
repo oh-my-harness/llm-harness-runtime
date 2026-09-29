@@ -45,6 +45,21 @@ def predict(state="page"):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_live_encoding_preserves_structured_state_and_all_candidates(self):
+        state = {"goal": "保留完整内容", "page": {"text": " a  b \n c "}}
+        request = init()
+        request["config"]["state_encoding"] = "lossless_compact_json_string"
+        seen = []
+        class Inspect(FakeLaya):
+            def predict(self, encoded, questions, event):
+                seen.append((encoded, questions))
+                return super().predict(encoded, questions, event)
+        result = invoke([request, predict(state)], Inspect)
+        self.assertTrue(result[-1]["ok"])
+        self.assertEqual(json.loads(seen[0][0]), state)
+        self.assertEqual(seen[0][1], {"operation": {}})
+        self.assertIn("encoded_request_sha256", result[-1]["metrics"])
+
     def test_no_implicit_loading(self):
         calls = []
         result = invoke([predict()], lambda *args: calls.append(args))

@@ -1,6 +1,6 @@
 # jev-browser 同引擎适配
 
-当前是准备组件和离线验证入口，不是已获准启动的模型实验。来源、任务和边界见[中文准备记录](../../../docs/research/jev-browser-preparation-20260929.md)。唯一目标仍是比较速度与完整任务通过率，不替换成规则策略研究。
+当前提供已获 lqj 批准的开发运行入口，以及独立的离线验证入口。来源、任务和边界见[中文计划](../../../docs/experiment-fast-model-agent-loop.md)。唯一目标仍是比较速度与完整任务通过率，不替换成规则策略研究。
 
 ## 已接入的职责
 
@@ -23,10 +23,18 @@ python -m unittest discover -s scripts/tests -p test_jev_browser_worker.py -v
 
 测试中的脚本化回答只用于检查调用契约；真实 Chromium 执行 4 个本地公开任务的两组路径。它们不加载 Laya 权重、不访问 Qwen 服务，不产生研究准确率或速度结论。
 
-## 真实运行前
+## 获批的真实运行
 
-准备清单的 `live_run.enabled` 保持关闭。没有提供绕过确认的 live CLI；不能用上游 `examples/journeys.ts` 代替本方案。
+已批准公开 7 任务各一对，共 14 次；顺序按任务交替 A/B、B/A，单次 180 秒、30 动作、60 决策，整场 3,600 秒。Qwen 全场实际 HTTP 上限 120，含最多 2 次预检请求与全部重试，这不是金额上限。只作开发描述，不声称质量等价。
 
-已完成 7 任务两轮初态分词审计，详见[输入审计与提案](../../../docs/research/jev-browser-input-audit-20260929.md)。`capture-inputs.mjs` 仅观测，`audit_inputs.py` 仅调用固定 SDK 的 tokenizer/序列构造；无损紧凑 state 目前只作审计候选，未应用到 `policy.mjs` / worker。
+从环境变量 `SILICONFLOW_API_KEY` 读取用户已授权的凭据，不放进参数、配置、日志或提交。输出目录必须不存在：
 
-后续需确认验收、格式适配和预算，再实现已获批条件下的整场配对调度、预算执行、逐次落盘和环境记录。初态能容纳不代表轨迹始终能容纳；逐步输入审计必须保留。不要直接沿用旧预检的上下文长度或输出预算。Qwen 与 Laya 的真实服务能力仍需实测，不以替身测试证明。
+```powershell
+node scripts/benchmarks/jev_browser/session.mjs --live --output logs/benchmarks/NEW_DEVELOPMENT_RUN
+```
+
+入口先验证固定源代码和批准参数，再加载本地 Laya、预热一次、测试已冻结的 7 个初态和 Qwen 连通性；预检任一失败即停止，不进入任务矩阵。worker 使用与输入审计相同的无损紧凑序列化，8192/4096，每次真实决策前仍审计全部输入，不删候选。CPU 前向被禁止；SDK 内部尝试设备回退也会记录为错误。
+
+`manifest.json` 记录代码散列、环境、模型、顺序和预算；`setup-events.jsonl` 单列加载、预热、预检；每次尝试单独事件文件，`attempts.jsonl` 即时落盘；`report.json` 保留失败分母、未开始项、逐题数据、双成功速度及调用量。任务计时包含初始导航、输入转换、审计、最终验收，上下文准备及清理另列；整场墙钟包含全部成本。未知 token/前向保持未知。
+
+开发结果不能直接视作原版 Jev 成绩；初态能容纳也不保证完整轨迹始终能容纳。不能用上游 `examples/journeys.ts` 代替本入口，更不能用旧 MiniWoB 产物补成绩。

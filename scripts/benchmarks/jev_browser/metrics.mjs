@@ -86,7 +86,7 @@ export function summarize(results) {
       success: distribution(passed.filter(r => Number.isFinite(r.elapsed_ms)).map(r => r.elapsed_ms)),
       failure: distribution(timed.filter(r => !r.success).map(r => r.elapsed_ms)),
       setup_failures: rows.filter(r => r.termination === 'setup_error').length,
-      amortized_ms_per_success: passed.length
+      amortized_ms_per_success: passed.length && rows.every(r => Number.isFinite(r.total_ms))
         ? rows.reduce((n, r) => n + r.total_ms, 0) / passed.length : null }];
   }));
   const pairs = new Map();

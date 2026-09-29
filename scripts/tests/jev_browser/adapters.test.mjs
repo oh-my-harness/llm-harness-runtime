@@ -63,9 +63,9 @@ function observation() {
     { id: 'wait', kind: 'wait', label: 'Wait' }] };
 }
 
-test('source is the approved seven journeys, live runs remain disabled', () => {
+test('source is the approved seven journeys with explicit development approval', () => {
   assert.equal(upstream.journeys.length, 7);
-  assert.equal(upstream.config.live_run.enabled, false);
+  assert.equal(upstream.config.development_proposal.approval, 'confirmed_by_lqj_2026-09-29_start');
 });
 test('input capture observes upstream state without model decisions or acceptance answers', async () => {
   const task = upstream.journeys[0];
@@ -279,4 +279,28 @@ test('deadline includes initial navigation and records a timed failure', async (
     limits: { ...limits, timeout_ms: 1 }, policy: {}, trace });
   assert.equal(result.success, false); assert.equal(result.termination, 'timeout');
   assert.ok(result.elapsed_ms > 0); assert.equal(result.counts.qwen_http_attempts, 0);
+});
+
+test('session cancellation stops an active model request and keeps the attempt', async () => {
+  const trace = new Trace(), task = upstream.journeys[0], controller = new AbortController();
+  const policy = { decide: async (...args) => {
+    controller.abort(new Error('Test session timeout'));
+    args[4].throwIfAborted();
+  } };
+  const result = await runAttempt({ upstream, browser, task, url: task.url(local.port), arm: 'A', repetition: 0,
+    limits, policy, trace, signal: controller.signal });
+  assert.equal(result.success, false); assert.equal(result.termination, 'session_timeout');
+});
+
+test('an HTTP error at a matching terminal URL cannot pass', async () => {
+  const trace = new Trace(), task = { name: 'test-http-error', goal: 'test', check: () => true };
+  const badUpstream = { ...upstream, run: async context => {
+    await context.pages()[0].goto(`http://localhost:${local.port}/missing-terminal`);
+    return { status: 'done', reason: 'test', decisions: [], history: [], usage: {} };
+  } };
+  const result = await runAttempt({ upstream: badUpstream, browser, task,
+    url: upstream.journeys[0].url(local.port), arm: 'A', repetition: 0, limits, policy: {}, trace });
+  assert.equal(result.acceptance.upstream_pass, true);
+  assert.equal(result.acceptance.document_http_status, 404);
+  assert.equal(result.success, false);
 });

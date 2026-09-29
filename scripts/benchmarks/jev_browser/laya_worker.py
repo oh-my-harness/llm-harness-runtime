@@ -7,11 +7,15 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def create_model(config, on_forward):
+    from audit_inputs import load_tokenizer_only
     from pilot_models import Laya
+    _, provenance = load_tokenizer_only()
     model = Laya(config)
+    model.setup["provenance"] = provenance
     model.agent.model.register_forward_pre_hook(lambda *_: on_forward())
     return model
 
@@ -44,6 +48,13 @@ def serve(reader, writer, factory=create_model):
                 body = request["body"]
                 if set(body) != {"model", "state", "questions"}:
                     raise ValueError("Unexpected decision payload")
+                if config.get("state_encoding") == "lossless_compact_json_string":
+                    from audit_inputs import compact_state_request, digest
+                    original = body
+                    body = compact_state_request(original)
+                    event.update(state_encoding=config["state_encoding"],
+                                 original_request_sha256=digest(original),
+                                 encoded_request_sha256=digest(body))
                 with contextlib.redirect_stdout(sys.stderr):
                     answers = model.predict(body["state"], body["questions"], event)
                 emit({"id": request_id, "ok": True, "answers": answers, "metrics": event})

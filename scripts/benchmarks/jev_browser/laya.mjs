@@ -37,7 +37,11 @@ export class LayaWorker {
       await trace.measure('model_setup', 'laya_load_and_warmup', async event => {
         const message = await this.request('init', { config: this.config, allow_model_load: true },
           signal, this.config.load_timeout_ms);
-        if (!message.ok) throw new Error('Laya initialization failed');
+        if (!message.ok) {
+          const error = new Error('Laya initialization failed');
+          error.name = /^[A-Za-z0-9_]+$/.test(message.error_type) ? message.error_type : 'WorkerError';
+          throw error;
+        }
         event.setup = message.setup;
       });
       this.ready = true;

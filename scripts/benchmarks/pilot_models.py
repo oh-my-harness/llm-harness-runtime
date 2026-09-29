@@ -97,6 +97,11 @@ class Laya:
         if self.agent.revision != config["revision"] or self.agent.device.type != "cuda":
             raise ValueError("Laya weight revision or device mismatch")
         self.forwards = []
+        if config.get("automatic_fallback") is False:
+            def cuda_only(model, _args):
+                if next(model.parameters()).device.type != "cuda":
+                    raise RuntimeError("Unapproved execution device; inference refused")
+            self.agent.model.register_forward_pre_hook(cuda_only)
         self.hook = self.agent.model.register_forward_pre_hook(
             lambda model, args: self.forwards.append(str(next(model.parameters()).device))
         )
@@ -108,6 +113,7 @@ class Laya:
             "cuda": torch.version.cuda, "autocast_dtype": str(self.agent.dtype),
             "warmup": [],
         }
+        self.setup["gpu_memory_total_bytes"] = torch.cuda.get_device_properties(0).total_memory
         for _ in range(config["warmup_calls"]):
             event = {}
             start = time.perf_counter_ns()
@@ -130,6 +136,7 @@ class Laya:
             raise InputBudgetError("Pinned Laya budgets lose state, instructions, or candidate content")
         before = len(self.forwards)
         self.torch.cuda.synchronize()
+        self.torch.cuda.reset_peak_memory_stats()
         event["actual_calls"] = 1
         try:
             response = self.agent.predict(
@@ -146,5 +153,7 @@ class Laya:
             event["forward_devices"] = self.forwards[before:]
             event["forward_attempts"] = len(self.forwards) - before
             event["cpu_fallback_count"] = self.agent.cpu_fallback_count
+            event["gpu_peak_allocated_bytes"] = self.torch.cuda.max_memory_allocated()
+            event["gpu_peak_reserved_bytes"] = self.torch.cuda.max_memory_reserved()
             if self.agent.cpu_fallback_count or any(not d.startswith("cuda") for d in self.forwards[before:]):
                 raise RuntimeError("Laya silently changed execution device")
