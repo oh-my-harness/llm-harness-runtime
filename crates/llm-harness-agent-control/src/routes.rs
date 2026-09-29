@@ -1,4 +1,5 @@
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response, Sse};
@@ -22,11 +23,16 @@ pub fn build_router(state: SharedAgentControlManager) -> Router {
         .route("/v1/agent-sessions/{id}/prompt", post(prompt_session))
         .route("/v1/agent-sessions/{id}/steer", post(steer_session))
         .route("/v1/agent-sessions/{id}/abort", post(abort_session))
+        .route(
+            "/v1/agent-sessions/{id}/files/upload",
+            post(upload_session_files),
+        )
         .route("/v1/agent-sessions/{id}/events", get(session_events))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,
         ))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state.clone());
 
     let health_routes = Router::new()
@@ -116,6 +122,18 @@ async fn abort_session(
     }
 }
 
+async fn upload_session_files(
+    State(state): State<SharedAgentControlManager>,
+    principal: axum::Extension<AuthenticatedPrincipal>,
+    Path(session_id): Path<String>,
+    axum::Json(request): axum::Json<llm_harness_sandbox_remote::protocol::UploadFilesRequest>,
+) -> Response {
+    match state.upload_files(&principal.0, &session_id, request).await {
+        Ok(response) => (StatusCode::OK, axum::Json(response)).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
 async fn delete_session(
     State(state): State<SharedAgentControlManager>,
     principal: axum::Extension<AuthenticatedPrincipal>,
@@ -157,6 +175,8 @@ async fn session_events(
 async fn health() -> &'static str {
     "ok"
 }
+
+const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
 fn error_response(error: ControlServiceError) -> Response {
     (
