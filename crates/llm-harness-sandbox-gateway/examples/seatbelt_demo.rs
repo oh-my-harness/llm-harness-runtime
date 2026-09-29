@@ -5,14 +5,15 @@
 //! cargo run -p llm-harness-sandbox-gateway --example seatbelt_demo
 //! ```
 
-#![cfg(target_os = "macos")]
-
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
 use llm_harness_sandbox_gateway::{
     GatewayBackend, GatewayConfig, GatewayPrincipalConfig, SandboxGateway,
 };
 
+#[cfg(target_os = "macos")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let token = std::env::var("GATEWAY_TOKEN")
@@ -74,3 +75,6 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
     Ok(())
 }
+
+#[cfg(not(target_os = "macos"))]
+fn main() {}
