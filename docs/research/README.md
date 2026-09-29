@@ -1,5 +1,5 @@
 # 研究文档索引
 
-- [大模型生成与 Laya 决策分工实验方案](../experiment-fast-model-agent-loop.md)：lqj 已确认使用 Laya，不再使用原版 Jev；具体 checkpoint 与实施条件待确认，尚无符合该目标的实验结果。
+- [大模型生成与 Laya 决策分工实验方案](../experiment-fast-model-agent-loop.md)：已确认沿用 Qwen2.5-72B，完成 Qwen 请求和 Laya GPU 接入检查，保留错误选择；完整 Agent 速度与通过率对照尚未执行，不能宣称提速或质量相近。
 
 2026-09-29 更正：撤下偏离目标的大小生成模型替换实验及规则模拟实验的脚本、数据和报告。旧结果不得作为本方案的证据；历史提交不重写。

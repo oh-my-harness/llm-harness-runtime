@@ -1,0 +1,8 @@
+# Deployment smoke only. These are direct pins, not a full transitive lockfile.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0+cu128
+laya @ git+https://github.com/NandhaKishorM/laya.git@9d955671415fc19f069b9cc998928075c1f255ec
+transformers==5.17.0
+huggingface-hub==1.33.0
+safetensors==0.8.0
+numpy==2.5.3
