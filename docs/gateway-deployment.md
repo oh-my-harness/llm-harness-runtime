@@ -11,6 +11,8 @@ cargo build --release -p llm-harness-sandbox-gateway --bin sandbox-gateway
 ./target/release/sandbox-gateway gateway.json
 ```
 
+可复制的生产模板和 systemd 单元见 [`deploy/README.md`](../deploy/README.md)。
+
 gateway 默认绑定 `127.0.0.1:7080`。生产部署应继续绑定内网地址，由 Caddy、Nginx、Cloudflare Tunnel 或 Tailscale Funnel 终止 TLS。
 
 ## 配置

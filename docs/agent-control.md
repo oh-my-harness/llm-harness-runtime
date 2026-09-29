@@ -50,6 +50,8 @@ export ANTHROPIC_API_KEY="<LLM API key>"
 cargo run -p llm-harness-agent-control --bin agent-control -- agent-control.json
 ```
 
+Linux 服务器生产部署可使用 [`deploy/README.md`](../deploy/README.md) 中的 systemd 模板。
+
 `base_url` 是 gateway 地址。`allow_insecure_http` 只适合 loopback 或受信任的内网实验环境；对非 loopback 的普通 HTTP，remote sandbox client 仍会拒绝。生产环境应通过反向代理或 tunnel 终止 TLS，并把 control service 的公网入口也配置为 HTTPS。
 
 ## 接口
