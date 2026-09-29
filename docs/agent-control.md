@@ -144,4 +144,4 @@ cargo run -p llm-harness-agent-control --bin agent-control -- agent-control.json
 cargo test -p llm-harness-agent-control
 ```
 
-测试覆盖 manager 层的创建、查询、prompt 事件流、session 数量限制和删除；也覆盖路由的 health 探活和未鉴权拒绝。另有 idle/active steer、SSE 关联字段、持久化和真实 gateway（Linux + Bwrap）E2E 测试。
+测试覆盖 manager 层的创建、查询、prompt 事件流、session 数量限制和删除；也覆盖路由的 health 探活和未鉴权拒绝。另有 idle/active steer、SSE 关联字段、持久化，以及真实 gateway（Linux + Bwrap）完整流程 E2E 测试。

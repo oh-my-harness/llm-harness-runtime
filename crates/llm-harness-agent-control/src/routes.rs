@@ -8,8 +8,8 @@ use tokio_stream::wrappers::BroadcastStream;
 
 use crate::auth::{AuthenticatedPrincipal, bearer_token};
 use crate::service::{
-    ControlEvent, ControlServiceError, CreateAgentSessionRequest, PromptRequest,
-    SessionEvent, SharedAgentControlManager, SteerRequest,
+    ControlEvent, ControlServiceError, CreateAgentSessionRequest, PromptRequest, SessionEvent,
+    SharedAgentControlManager, SteerRequest,
 };
 
 pub fn build_router(state: SharedAgentControlManager) -> Router {
