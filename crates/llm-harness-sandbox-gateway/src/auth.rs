@@ -22,6 +22,8 @@ pub struct GatewayPrincipalConfig {
     /// Highest profile this principal may request. Requests above the cap
     /// are rejected. Default `restricted`.
     pub max_trust_profile: llm_harness_platform::trust::TrustProfile,
+    /// Optional fixed-window request limit. `None` disables rate limiting.
+    pub requests_per_minute: Option<usize>,
 }
 
 /// Firecracker VM artifacts and VM defaults used by the gateway backend.
@@ -67,6 +69,7 @@ struct PrincipalSecret {
     fs_allowlist: Vec<PathBuf>,
     host_project_dirs: Vec<PathBuf>,
     max_trust_profile: llm_harness_platform::trust::TrustProfile,
+    requests_per_minute: Option<usize>,
 }
 
 /// An authenticated principal attached to a request by the auth middleware.
@@ -77,6 +80,7 @@ pub(crate) struct AuthenticatedPrincipal {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) host_project_dirs: Arc<[PathBuf]>,
     pub(crate) max_trust_profile: llm_harness_platform::trust::TrustProfile,
+    pub(crate) requests_per_minute: Option<usize>,
 }
 
 impl GatewayConfig {
@@ -123,12 +127,19 @@ impl GatewayConfig {
                 }
                 project_dirs.push(dir.clone());
             }
+            if principal.requests_per_minute == Some(0) {
+                anyhow::bail!(
+                    "gateway principal requests_per_minute for {:?} must be positive",
+                    principal.principal
+                );
+            }
             secrets.push(PrincipalSecret {
                 id: principal.principal,
                 token_hash: Sha256::digest(principal.bearer_token.as_bytes()).into(),
                 fs_allowlist: allowlist,
                 host_project_dirs: project_dirs,
                 max_trust_profile: principal.max_trust_profile,
+                requests_per_minute: principal.requests_per_minute,
             });
         }
 
@@ -260,6 +271,7 @@ impl GatewayConfig {
                 fs_allowlist: Arc::from(principal.fs_allowlist.as_slice()),
                 host_project_dirs: Arc::from(principal.host_project_dirs.as_slice()),
                 max_trust_profile: principal.max_trust_profile,
+                requests_per_minute: principal.requests_per_minute,
             })
     }
 
@@ -272,6 +284,7 @@ impl GatewayConfig {
                 fs_allowlist: Arc::from(principal.fs_allowlist.as_slice()),
                 host_project_dirs: Arc::from(principal.host_project_dirs.as_slice()),
                 max_trust_profile: principal.max_trust_profile,
+                requests_per_minute: principal.requests_per_minute,
             })
     }
 

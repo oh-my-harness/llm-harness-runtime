@@ -102,6 +102,10 @@ sudo systemctl start llm-harness-gateway.service
 
 只在 gateway 停止后备份 work root，避免 registry 和 sandbox 文件系统出现不一致快照。
 
+## 3.1 文件批量上传
+
+`POST /v1/sandboxes/{id}/fs/upload` 复用 guest path、allowlist/denylist、Base64 和 `max_request_bytes` 限制。单次请求最多 32 个路径唯一的文件；gateway 先解码并校验全部条目，再按顺序写入，已写入文件不会自动回滚。生产部署应继续把 `max_request_bytes` 设置为实际需要的最小值，并确认反向代理放行同样大小。
+
 ## 4. 最小权限部署
 
 推荐使用 [`deploy/README.md`](../deploy/README.md) 中的 systemd 模板。关键项如下：
@@ -154,6 +158,8 @@ gateway 不记录 bearer token、API key 或原始 prompt。结构化请求日�
 - `x-request-id`
 - method
 - path
+- principal
+- normalized route
 - status
 - duration
 
@@ -164,6 +170,21 @@ journalctl -u llm-harness-gateway.service -f
 journalctl -u llm-harness-gateway.service --since "1 hour ago"
 journalctl -u llm-harness-gateway.service -p warning
 ```
+
+### 指标
+
+```bash
+curl -fsS -H "Authorization: Bearer $SANDBOX_GATEWAY_TOKEN" \
+  http://127.0.0.1:7080/metrics
+```
+
+`/metrics` 使用 Prometheus 文本格式，输出：
+
+- `sandbox_gateway_requests_total`：按 method、normalized route、principal 和 status 分组；
+- `sandbox_gateway_request_duration_seconds_sum` / `_count`：同维度的累计耗时；
+- `sandbox_gateway_active_sandboxes`：当前 registry 中的 sandbox 数。
+
+这个端点是内部监控面，需要 bearer token；不要把它直接暴露到公网。当前指标足以判断请求量、错误率、延迟总量和活跃 sandbox 数，但不是完整的 Prometheus histogram，也不包含宿主机资源指标。
 
 ### 告警
 
@@ -248,6 +269,7 @@ gateway 启动时会 fail-closed 地 reconcile registry 和 work root，删除�
 - [ ] 每个 principal 有独立 token 和最小 `fs_allowlist`；
 - [ ] `host_project_dirs` 为空，除非明确理解 bind 风险；
 - [ ] `max_trust_profile` 不高于业务需要；
+- [ ] 公网或移动端入口配置了 `requests_per_minute`；
 - [ ] `max_sandboxes`、执行超时、输出大小和请求大小都已设置；
 - [ ] sandbox 对外网络默认拒绝；
 - [ ] 服务用户没有 shell；
@@ -263,7 +285,6 @@ gateway 启动时会 fail-closed 地 reconcile registry 和 work root，删除�
 
 - token 轮换/撤销需要重启；
 - 没有 runtime token revocation API；
-- 没有内置 Prometheus metrics；
 - 没有不可变审计后端；
 - 磁盘 quota 未实现；
 - 网络 allowlist 未实现；

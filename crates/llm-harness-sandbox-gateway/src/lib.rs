@@ -5,6 +5,7 @@
 
 mod auth;
 mod config;
+mod observability;
 mod routes;
 mod state;
 

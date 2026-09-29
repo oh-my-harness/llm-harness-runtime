@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE, header::RETRY_AFTER};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -15,7 +15,7 @@ use llm_harness_sandbox_remote::protocol::{
     CreateTempDirResponse, FileContent, FileInfoRequest, FileInfoResponse, FileInfoResponseValue,
     GatewayErrorResponse, ListDirRequest, ListDirResponse, ReadFileRequest, ReadFileResponse,
     RemoteExecEvent, RemoteSandboxState, RemoteSandboxStatus, RemoveRequest, ShellExecRequest,
-    ShellExecResponse, WriteFileRequest,
+    ShellExecResponse, UploadFilesRequest, UploadFilesResponse, UploadedFile, WriteFileRequest,
 };
 use llm_harness_types::{EnvError, FileInfo, ShellOptions};
 use tokio_stream::wrappers::ReceiverStream;
@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::auth::{AuthenticatedPrincipal, bearer_token, unauthorized};
+use crate::observability::PrincipalId;
 use crate::state::{GUEST_WORK_DIR, GatewayStateError, SharedState};
 
 pub async fn serve(
@@ -49,6 +50,7 @@ pub(crate) fn build_router(state: SharedState) -> Router {
         )
         .route("/v1/sandboxes/{id}/fs/read", post(read_file))
         .route("/v1/sandboxes/{id}/fs/write", post(write_file))
+        .route("/v1/sandboxes/{id}/fs/upload", post(upload_files))
         .route("/v1/sandboxes/{id}/fs/info", post(file_info))
         .route("/v1/sandboxes/{id}/fs/list", post(list_dir))
         .route("/v1/sandboxes/{id}/fs/exists", post(exists))
@@ -58,11 +60,15 @@ pub(crate) fn build_router(state: SharedState) -> Router {
             "/v1/sandboxes/{id}/fs/create-temp-dir",
             post(create_temp_dir),
         )
+        .route("/metrics", get(metrics))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,
         ))
-        .layer(axum::middleware::from_fn(log_request))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            log_request,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(
             state.config().max_request_bytes,
         ))
@@ -85,8 +91,22 @@ async fn authenticate(
     let Some(principal) = principal else {
         return unauthorized();
     };
+    if let Some(retry_after) = state.check_rate_limit(&principal.id, principal.requests_per_minute)
+    {
+        return rate_limited(principal.id.to_string(), retry_after);
+    }
+    let principal_id = PrincipalId(principal.id.clone());
     request.extensions_mut().insert(principal);
-    next.run(request).await
+    let mut response = next.run(request).await;
+    response.extensions_mut().insert(principal_id);
+    response
+}
+
+async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        state.render_metrics(),
+    )
 }
 
 #[derive(serde::Serialize)]
@@ -107,6 +127,7 @@ async fn readiness(State(state): State<SharedState>) -> Json<HealthResponse> {
 }
 
 async fn log_request(
+    State(state): State<SharedState>,
     request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
@@ -122,10 +143,23 @@ async fn log_request(
     let mut request = request;
     request.extensions_mut().insert(request_id.to_string());
     let response = next.run(request).await;
+    let principal = response
+        .extensions()
+        .get::<PrincipalId>()
+        .map(|principal| principal.0.to_string());
+    state.record_request(
+        method.as_str(),
+        &path,
+        principal.as_deref(),
+        response.status().as_u16(),
+        started.elapsed(),
+    );
     tracing::info!(
         request_id = %request_id,
         method = %method,
         path = %path,
+        principal = principal.as_deref().unwrap_or("anonymous"),
+        route = %crate::observability::metric_route(&path),
         status = response.status().as_u16(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "sandbox gateway request"
@@ -375,6 +409,77 @@ async fn write_file(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => fs_error(error, &request.path),
     }
+}
+
+async fn upload_files(
+    State(state): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<UploadFilesRequest>,
+) -> Response {
+    let Some(sandbox) = state.get_sandbox(&principal, &id) else {
+        return not_found(&id);
+    };
+    if request.files.len() > MAX_UPLOAD_FILES {
+        return gateway_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_many_files",
+            format!("batch upload accepts at most {MAX_UPLOAD_FILES} files"),
+            None,
+        );
+    }
+
+    let mut seen_paths = std::collections::HashSet::with_capacity(request.files.len());
+    let mut uploads = Vec::with_capacity(request.files.len());
+    for file in &request.files {
+        if !seen_paths.insert(file.path.as_str()) {
+            return gateway_error(
+                StatusCode::BAD_REQUEST,
+                "duplicate_path",
+                "batch upload paths must be unique".to_owned(),
+                Some(file.path.clone()),
+            );
+        }
+        let bytes = match decode_content(&file.content) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return gateway_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_base64",
+                    error,
+                    Some(file.path.clone()),
+                );
+            }
+        };
+        let path = match validate_guest_fs_path(&sandbox.config, &file.path) {
+            Ok(path) => path,
+            Err(response) => return *response,
+        };
+        uploads.push((file.path.clone(), path, bytes));
+    }
+
+    let mut uploaded = Vec::with_capacity(uploads.len());
+    for (requested_path, path, bytes) in uploads {
+        let byte_count = bytes.len() as u64;
+        match sandbox
+            .env
+            .write_file(&path, &bytes, CancellationToken::new())
+            .await
+        {
+            Ok(()) => {
+                uploaded.push(UploadedFile {
+                    path: requested_path,
+                    bytes: byte_count,
+                });
+            }
+            Err(error) => return fs_error(error, &requested_path),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(UploadFilesResponse { files: uploaded }),
+    )
+        .into_response()
 }
 
 async fn file_info(
@@ -777,6 +882,8 @@ fn validate_shell_request(state: &SharedState, request: &ShellExecRequest) -> Op
     None
 }
 
+const MAX_UPLOAD_FILES: usize = 32;
+
 fn validate_guest_fs_path(
     config: &llm_harness_sandbox_remote::RemoteSandboxConfig,
     value: &str,
@@ -878,6 +985,25 @@ fn gateway_error(
         }),
     )
         .into_response()
+}
+
+fn rate_limited(principal: String, retry_after: std::time::Duration) -> Response {
+    let mut response = gateway_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limit_exceeded",
+        format!("principal {principal} request rate limit exceeded"),
+        None,
+    );
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        retry_after
+            .as_secs()
+            .max(1)
+            .to_string()
+            .parse()
+            .expect("retry-after header"),
+    );
+    response
 }
 
 fn state_error(error: GatewayStateError) -> Response {

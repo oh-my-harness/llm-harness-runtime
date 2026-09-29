@@ -18,6 +18,6 @@ pub use error::RemoteSandboxError;
 pub use protocol::{
     CreateSandboxRequest, CreateSandboxResponse, FileContent, FileInfoResponse, ReadFileRequest,
     ReadFileResponse, RemoteExecEvent, RemoteSandboxStatus, ShellExecRequest, ShellExecResponse,
-    WriteFileRequest,
+    UploadFile, UploadFilesRequest, UploadFilesResponse, UploadedFile, WriteFileRequest,
 };
 pub use sandbox::{RemoteEnv, RemoteSandbox};

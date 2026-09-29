@@ -17,6 +17,7 @@ async fn health_endpoints_are_public_and_protected_routes_require_auth() {
         fs_allowlist: vec![PathBuf::from("/workspace")],
         host_project_dirs: Vec::new(),
         max_trust_profile: TrustProfile::Restricted,
+        requests_per_minute: None,
     }])
     .expect("valid config")
     .with_work_root(work_root.path().to_path_buf());

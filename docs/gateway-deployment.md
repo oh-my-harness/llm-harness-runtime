@@ -30,7 +30,8 @@ gateway 默认绑定 `127.0.0.1:7080`。生产部署应继续绑定内网地址�
       "principal": "control-service",
       "token_env": "SANDBOX_GATEWAY_TOKEN",
       "fs_allowlist": ["/workspace"],
-      "max_trust_profile": "restricted"
+      "max_trust_profile": "restricted",
+      "requests_per_minute": 120
     }
   ],
   "max_sandboxes": 128,
@@ -43,6 +44,10 @@ gateway 默认绑定 `127.0.0.1:7080`。生产部署应继续绑定内网地址�
 
 `token_env` 是环境变量名，不是 bearer token 本身。gateway 启动时读取并校验这个环境变量。不要把 token 写入配置文件或命令行。
 
+`requests_per_minute` 是可选的每 principal 固定窗口限流。省略表示不限制；设置为 `0` 会被拒绝。公网或移动端入口建议显式设置。
+
+`fs/upload` 允许移动端或控制服务一次预置最多 32 个文件，二进制仍使用 Base64；请求 body 也受 `max_request_bytes` 限制。失败时不回滚已写入文件，客户端可依赖错误响应中的 guest path 定位失败项。
+
 `work_root` 必须是绝对路径，并且权限必须是 `0700`：
 
 ```bash
@@ -54,6 +59,8 @@ sudo chmod 700 /var/lib/llm-harness-sandbox-gateway
 ## 探活和日志
 
 `/healthz` 和 `/readyz` 是公开端点，返回 backend 和状态，可用于 reverse proxy 或容器编排器探活。业务路由仍要求 bearer token。
+
+`/metrics` 返回 Prometheus 文本格式，包含按 method/route/principal/status 统计的请求总量和耗时、活跃 sandbox 数。它需要 bearer token，不要暴露到公网；建议只让内网监控进程或本地 exporter 拉取。
 
 ## 反向代理和 TLS
 
