@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
+import { createHash } from 'node:crypto';
 import { ROOT } from './source.mjs';
 
 export class LayaWorker {
@@ -17,6 +18,7 @@ export class LayaWorker {
     if (this.child) await this.close();
     const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/(API_KEY|TOKEN|SECRET)$/i.test(name)));
     Object.assign(env, { HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1', PYTHONUNBUFFERED: '1',
+      PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8:strict',
       HF_HOME: resolve(ROOT, '../benchmark/models/huggingface') });
     this.child = this.spawn(this.python, [this.script], { env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     this.child.stderr.resume();
@@ -79,7 +81,10 @@ export class LayaWorker {
     if (!this.ready) throw new Error('Laya must be initialized before task timing starts');
     return trace.measure('laya', 'decision', async event => {
       event.request = body;
-      const message = await this.request('predict', { body }, signal, this.config.request_timeout_ms, () => {
+      const bodyJson = JSON.stringify(body);
+      const message = await this.request('predict', { body_json: bodyJson,
+        body_sha256: createHash('sha256').update(bodyJson, 'utf8').digest('hex') },
+      signal, this.config.request_timeout_ms, () => {
         event.forward_starts++;
         trace.emit({ phase: 'forward_start', id: event.id, index: event.forward_starts });
       });

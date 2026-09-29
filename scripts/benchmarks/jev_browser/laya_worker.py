@@ -1,6 +1,7 @@
 """Pinned Laya JSON-lines worker. Never accepts API keys or executes model-selected tools."""
 
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -45,9 +46,19 @@ def serve(reader, writer, factory=create_model):
             elif request["method"] == "predict":
                 if model is None:
                     raise ValueError("Worker is not initialized")
-                body = request["body"]
+                event.update(actual_calls=0, forward_attempts=0, decision_questions=0)
+                if "body_json" in request:
+                    wire_hash = hashlib.sha256(request["body_json"].encode("utf-8")).hexdigest()
+                    if wire_hash != request.get("body_sha256"):
+                        raise ValueError("Input transport checksum mismatch")
+                    body = json.loads(request["body_json"])
+                    event.update(input_transport_verified=True, wire_sha256=wire_hash)
+                else:
+                    body = request["body"]
+                    event["input_transport_verified"] = False
                 if set(body) != {"model", "state", "questions"}:
                     raise ValueError("Unexpected decision payload")
+                event["decision_questions"] = len(body["questions"])
                 if config.get("state_encoding") == "lossless_compact_json_string":
                     from audit_inputs import compact_state_request, digest
                     original = body
@@ -65,6 +76,9 @@ def serve(reader, writer, factory=create_model):
 
 
 if __name__ == "__main__":
+    sys.stdin.reconfigure(encoding="utf-8", errors="strict")
+    sys.stdout.reconfigure(encoding="utf-8", errors="strict")
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
     serve(sys.stdin, sys.stdout)

@@ -3,7 +3,9 @@ import { createInterface } from 'node:readline';
 const lines = createInterface({ input: process.stdin });
 const emit = value => process.stdout.write(JSON.stringify(value) + '\n');
 for await (const line of lines) {
-  const { id, method, body } = JSON.parse(line);
+  const request = JSON.parse(line);
+  const { id, method } = request;
+  const body = request.body_json ? JSON.parse(request.body_json) : request.body;
   if (method === 'init') {
     emit({ id, ok: true, setup: { test_double: true, secret_present: Boolean(process.env.JEV_TEST_API_KEY) } });
     continue;

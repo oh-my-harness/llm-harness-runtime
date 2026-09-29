@@ -1,6 +1,7 @@
 """Offline protocol tests; the factory never imports torch or loads weights."""
 
 import importlib.util
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -45,6 +46,15 @@ def predict(state="page"):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_wire_checksum_rejects_changed_input_before_inference(self):
+        body = json.dumps(predict()["body"])
+        request = {"id": 2, "method": "predict", "body_json": body,
+                   "body_sha256": hashlib.sha256((body + " ").encode()).hexdigest()}
+        result = invoke([init(), request])[-1]
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["metrics"]["actual_calls"], 0)
+        self.assertEqual(result["metrics"]["forward_attempts"], 0)
+
     def test_live_encoding_preserves_structured_state_and_all_candidates(self):
         state = {"goal": "保留完整内容", "page": {"text": " a  b \n c "}}
         request = init()
