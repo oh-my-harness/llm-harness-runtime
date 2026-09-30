@@ -94,20 +94,33 @@ class KevServiceTests(unittest.TestCase):
                     for arm in ("A", "B")]
             rows[1]["counts"].update(kev_rpc=1, kev_predict=1, kev_forward=1)
             events = [{"task": "sample", "arm": "B", "repeat": 1, "service_seq": i,
-                       "component": component, "device": "cuda:0"}
-                      for i, component in enumerate(("kev_rpc_start", "kev_predict_start", "kev_forward"), 1)]
+                       "component": component, "device": "cuda:0", "request_sha256": kev.preflight.digest({}),
+                       "forward_count": 1 if component == "kev_predict" else 0}
+                      for i, component in enumerate(("kev_rpc_start", "kev_predict_start", "kev_forward", "kev_predict", "kev_rpc"), 1)]
+            client_event = {"task": "sample", "arm": "B", "repeat": 1, "component": "decision_http", "request_body": {},
+                            "http_status": 200, "model": kev.MODEL}
             manifest = {"decision_backend": "kev", "kev": {"model": kev.MODEL}, "tasks": ["sample"],
                         "order": [{k: r[k] for k in ("task", "arm", "repeat")} for r in rows]}
             report = {"rows": rows, "completed": 2, "unstarted": 0, "counts_including_warmup": rows[1]["counts"],
                       "comparison": author_control.compare(rows)}
             for name, value in (("manifest", manifest), ("report", report)):
                 (directory / (name + ".json")).write_text(json.dumps(value), encoding="utf-8")
-            for name, value in (("attempts", rows), ("events", events), ("kev-events", events)):
+            for name, value in (("attempts", rows), ("events", events + [client_event]), ("kev-events", events)):
                 (directory / (name + ".jsonl")).write_text("".join(json.dumps(v) + "\n" for v in value), encoding="utf-8")
             self.assertTrue(audit_author_run.audit(directory)["counters_and_comparison_verified"])
             (directory / "kev-events.jsonl").write_text("", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "service ledger"):
                 audit_author_run.audit(directory)
+
+    def test_timings_do_not_double_count_nested_inference(self):
+        events = [{"component": c, "elapsed_ms": ms} for c, ms in
+                  (("qwen_http", 200), ("decision_http", 300), ("kev_rpc", 290),
+                   ("kev_predict", 280), ("tool", 100), ("provider_backoff", 1000))]
+        result = audit_author_run.timing_summary(events)
+        self.assertEqual(result["model_call_seconds"], .5)
+        self.assertEqual(result["tool_seconds"], .1)
+        self.assertEqual(result["backoff_seconds"], 1)
+        self.assertEqual(result["http_transport_error"], 1)
 
 
 if __name__ == "__main__":
