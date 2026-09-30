@@ -24,6 +24,8 @@ pub struct GatewayPrincipalConfig {
     pub max_trust_profile: llm_harness_platform::trust::TrustProfile,
     /// Optional fixed-window request limit. `None` disables rate limiting.
     pub requests_per_minute: Option<usize>,
+    /// Optional maximum of concurrently tracked sandboxes for this principal.
+    pub max_active_sandboxes: Option<usize>,
 }
 
 /// Firecracker VM artifacts and VM defaults used by the gateway backend.
@@ -81,6 +83,7 @@ struct PrincipalSecret {
     host_project_dirs: Vec<PathBuf>,
     max_trust_profile: llm_harness_platform::trust::TrustProfile,
     requests_per_minute: Option<usize>,
+    max_active_sandboxes: Option<usize>,
 }
 
 /// An authenticated principal attached to a request by the auth middleware.
@@ -92,6 +95,7 @@ pub(crate) struct AuthenticatedPrincipal {
     pub(crate) host_project_dirs: Arc<[PathBuf]>,
     pub(crate) max_trust_profile: llm_harness_platform::trust::TrustProfile,
     pub(crate) requests_per_minute: Option<usize>,
+    pub(crate) max_active_sandboxes: Option<usize>,
 }
 
 impl GatewayConfig {
@@ -146,6 +150,12 @@ impl GatewayConfig {
                     principal.principal
                 );
             }
+            if principal.max_active_sandboxes == Some(0) {
+                anyhow::bail!(
+                    "gateway principal max_active_sandboxes for {:?} must be positive",
+                    principal.principal
+                );
+            }
             let token_hash = Sha256::digest(principal.bearer_token.as_bytes()).into();
             if !principal_ids.insert(principal.principal.clone()) {
                 anyhow::bail!(
@@ -163,6 +173,7 @@ impl GatewayConfig {
                 host_project_dirs: project_dirs,
                 max_trust_profile: principal.max_trust_profile,
                 requests_per_minute: principal.requests_per_minute,
+                max_active_sandboxes: principal.max_active_sandboxes,
             });
         }
 
@@ -327,6 +338,7 @@ impl GatewayConfig {
                 host_project_dirs: Arc::from(principal.host_project_dirs.as_slice()),
                 max_trust_profile: principal.max_trust_profile,
                 requests_per_minute: principal.requests_per_minute,
+                max_active_sandboxes: principal.max_active_sandboxes,
             })
     }
 

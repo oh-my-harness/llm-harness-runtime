@@ -10,7 +10,9 @@
       "principal": "control-service",
       "token_env": "LLM_HARNESS_GATEWAY_TOKEN",
       "fs_allowlist": ["/workspace"],
-      "max_trust_profile": "restricted"
+      "max_trust_profile": "restricted",
+      "requests_per_minute": 120,
+      "max_active_sandboxes": 8
     }
   ],
   "max_sandboxes": 32,

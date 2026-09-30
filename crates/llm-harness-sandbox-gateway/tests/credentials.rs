@@ -30,6 +30,7 @@ fn principal(id: &str, bearer_token: &str) -> GatewayPrincipalConfig {
         host_project_dirs: vec![],
         max_trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
         requests_per_minute: None,
+        max_active_sandboxes: None,
     }
 }
 

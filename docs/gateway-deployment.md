@@ -31,7 +31,8 @@ gateway 默认绑定 `127.0.0.1:7080`。生产部署应继续绑定内网地址�
       "token_env": "SANDBOX_GATEWAY_TOKEN",
       "fs_allowlist": ["/workspace"],
       "max_trust_profile": "restricted",
-      "requests_per_minute": 120
+      "requests_per_minute": 120,
+      "max_active_sandboxes": 8
     }
   ],
   "max_sandboxes": 128,
@@ -49,6 +50,8 @@ gateway 默认绑定 `127.0.0.1:7080`。生产部署应继续绑定内网地址�
 `token_env` 是环境变量名，不是 bearer token 本身。gateway 启动时读取并校验这个环境变量。不要把 token 写入配置文件或命令行。
 
 `requests_per_minute` 是可选的每 principal 固定窗口限流。省略表示不限制；设置为 `0` 会被拒绝。公网或移动端入口建议显式设置。
+
+`max_active_sandboxes` 是可选的每 principal 并发 sandbox 上限。省略表示不限制；设置为 `0` 会被拒绝。计数包括所有已注册且未删除的 sandbox；删除、清理或重启后恢复为不可用状态的记录仍会占用计数，直到被清理。
 
 Firecracker 后端可增加 `max_disk_mib`：
 

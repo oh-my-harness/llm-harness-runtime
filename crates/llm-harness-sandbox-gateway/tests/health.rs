@@ -18,6 +18,7 @@ async fn health_endpoints_are_public_and_protected_routes_require_auth() {
         host_project_dirs: Vec::new(),
         max_trust_profile: TrustProfile::Restricted,
         requests_per_minute: None,
+        max_active_sandboxes: None,
     }])
     .expect("valid config")
     .with_work_root(work_root.path().to_path_buf());
