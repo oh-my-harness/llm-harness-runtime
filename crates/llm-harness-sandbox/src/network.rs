@@ -239,6 +239,47 @@ impl NetworkSetup {
             ],
         ]
     }
+
+    pub fn nftables_script(&self, policy: &NetworkPolicy) -> String {
+        let table = self.nft_table();
+        let mut script = format!("table inet {table} {{\n");
+
+        script.push_str("  chain output {\n");
+        script.push_str("    type filter hook output priority 0; policy drop;\n");
+        script.push_str("    oifname \"lo\" accept\n");
+        for address in policy.dns_servers() {
+            let family = address_family_selector(address);
+            script.push_str(&format!(
+                "    {family} daddr {address} udp dport 53 accept\n"
+            ));
+            script.push_str(&format!(
+                "    {family} daddr {address} tcp dport 53 accept\n"
+            ));
+        }
+        for rule in policy.rules() {
+            let family = address_family_selector(&rule.target());
+            let destination = format_destination(rule);
+            let ports = format_ports(rule.ports());
+            for protocol in ["tcp", "udp"] {
+                script.push_str(&format!(
+                    "    {family} daddr {destination} {protocol} dport {ports} accept\n"
+                ));
+            }
+        }
+        script.push_str("  }\n");
+
+        script.push_str("  chain input {\n");
+        script.push_str("    type filter hook input priority 0; policy drop;\n");
+        script.push_str("    iifname \"lo\" accept\n");
+        script.push_str("    ct state established,related accept\n");
+        script.push_str("  }\n");
+        script.push_str("}\n");
+        script
+    }
+
+    fn nft_table(&self) -> String {
+        self.namespace.replace('-', "_")
+    }
 }
 
 fn validate_resource_id(resource_id: &str) -> anyhow::Result<()> {
@@ -271,7 +312,10 @@ fn parse_ip_or_cidr(host: &str) -> anyhow::Result<(IpAddr, Option<u8>)> {
         let prefix = prefix
             .parse::<u8>()
             .map_err(|error| anyhow!("invalid network CIDR prefix {host:?}: {error}"))?;
-        anyhow::ensure!(prefix <= maximum, "invalid network CIDR prefix {host:?}");
+        anyhow::ensure!(
+            prefix > 0 && prefix <= maximum,
+            "invalid network CIDR prefix {host:?}"
+        );
         Ok((address, Some(prefix)))
     } else {
         let address = host
@@ -321,6 +365,25 @@ fn is_unicast_link_local(address: &Ipv6Addr) -> bool {
     address.segments()[0] & 0xffc0 == 0xfe80
 }
 
+fn address_family_selector(address: &IpAddr) -> &'static str {
+    if address.is_ipv4() { "ip" } else { "ip6" }
+}
+
+fn format_destination(rule: &NetworkRule) -> String {
+    match rule.prefix() {
+        Some(prefix) => format!("{}/{}", rule.target(), prefix),
+        None => rule.target().to_string(),
+    }
+}
+
+fn format_ports((start, end): (u16, u16)) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}-{end}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +417,9 @@ mod tests {
         for rule in [
             rule("api.example.com", None),
             rule("192.168.1.10", None),
+            rule("203.0.113.0/0", None),
+            rule("0.0.0.0/0", None),
+            rule("203.0.113.10/32", None),
             rule("127.0.0.1", None),
             rule("203.0.113.10", Some((0, 443))),
             rule("203.0.113.10", Some((443, 80))),
@@ -420,5 +486,38 @@ mod tests {
             "via".to_string(),
             setup.host_ip().to_string(),
         ]));
+    }
+
+    #[test]
+    fn policy_builds_nftables_default_deny_rules() {
+        let policy = NetworkPolicy::new(
+            &[rule("203.0.113.10", Some((443, 443)))],
+            &["8.8.8.8".parse().unwrap()],
+        )
+        .unwrap();
+        let setup = NetworkSetup::new("sandbox-1").unwrap();
+        let script = setup.nftables_script(&policy);
+
+        assert!(script.contains("table inet llmh_sandbox_1 {"));
+        assert!(script.contains("type filter hook output priority 0; policy drop;"));
+        assert!(script.contains("type filter hook input priority 0; policy drop;"));
+        assert!(script.contains("oifname \"lo\" accept"));
+        assert!(script.contains("iifname \"lo\" accept"));
+        assert!(script.contains("ct state established,related accept"));
+        assert!(script.contains("ip daddr 8.8.8.8 udp dport 53 accept"));
+        assert!(script.contains("ip daddr 8.8.8.8 tcp dport 53 accept"));
+        assert!(script.contains("ip daddr 203.0.113.10 tcp dport 443 accept"));
+        assert!(script.contains("ip daddr 203.0.113.10 udp dport 443 accept"));
+        assert!(!script.contains("flush ruleset"));
+    }
+
+    #[test]
+    fn policy_handles_ipv6_cidrs() {
+        let policy = NetworkPolicy::new(&[rule("2001:db8:10::/48", None)], &[]).unwrap();
+        let setup = NetworkSetup::new("sandbox-1").unwrap();
+        let script = setup.nftables_script(&policy);
+
+        assert!(script.contains("ip6 daddr 2001:db8:10::/48 tcp dport 1-65535 accept"));
+        assert!(script.contains("ip6 daddr 2001:db8:10::/48 udp dport 1-65535 accept"));
     }
 }
