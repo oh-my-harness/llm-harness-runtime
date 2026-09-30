@@ -158,6 +158,7 @@ impl MobileSession {
                 .to_owned(),
         );
 
+        crate::probe(&format!("assemble: enter (id={session_id:?})"));
         let harness = Arc::new(match session_id.as_deref() {
             Some(id) => {
                 let storage = crate::manager::open_storage(id).await?;
@@ -170,6 +171,7 @@ impl MobileSession {
             }
             None => AgentHarness::new_in_memory(llm_client, env, opts).await,
         });
+        crate::probe("assemble: harness built");
 
         let session = Arc::new(Self {
             harness,
@@ -212,6 +214,13 @@ impl MobileSession {
     }
 
     fn push(&self, event: MobileEvent) {
+        if matches!(event, MobileEvent::Failed { .. }) {
+            let msg = match &event {
+                MobileEvent::Failed { message } => message.clone(),
+                _ => String::new(),
+            };
+            crate::probe(&format!("event pump: Failed: {msg}"));
+        }
         if let Ok(mut queue) = self.queue.lock() {
             // Bound the buffer: drop oldest text deltas under backpressure.
             if queue.len() > 4096 {
@@ -531,6 +540,33 @@ where
         // fn, so detach a task instead — Send bound applies to spawn only.
         Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
         Err(_) => runtime.block_on(future),
+    }
+}
+
+/// Debug probe: append a timestamped line to the session probe log.
+pub(crate) fn probe(msg: &str) {
+    use std::io::Write;
+    let root = if let Some(dir) = std::env::var_os("OHM_MOBILE_DATA_DIR") {
+        std::path::PathBuf::from(dir)
+    } else if let Some(dir) = crate::manager::session_root() {
+        dir
+    } else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("probe.log"))
+    {
+        let _ = writeln!(
+            f,
+            "{} {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+            msg
+        );
     }
 }
 

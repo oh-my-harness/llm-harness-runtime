@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::{MobileConfig, MobileError, MobileSession, run_on_runtime};
+use crate::{MobileConfig, MobileError, MobileSession, probe, run_on_runtime};
 use llm_harness_agent::session::SessionRepo;
 use llm_harness_sandbox_remote::RemoteSandbox;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -193,6 +193,10 @@ fn session_repo() -> anyhow::Result<Arc<llm_harness_agent::session::JsonlSession
     Ok(REPO.get_or_init(|| repo).clone())
 }
 
+pub(crate) fn session_root() -> Option<PathBuf> {
+    SESSION_ROOT.get().cloned()
+}
+
 fn dirs_data_root() -> anyhow::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("OHM_MOBILE_DATA_DIR") {
         let path = PathBuf::from(dir);
@@ -262,7 +266,9 @@ impl MobileSessionManager {
         config: MobileConfig,
         name: String,
     ) -> anyhow::Result<Arc<MobileSession>> {
+        crate::probe("create_session: start");
         let repo = session_repo()?;
+        crate::probe("create_session: repo ok");
         let storage = repo
             .create(llm_harness_agent::session::types::CreateSessionOptions {
                 name: if name.trim().is_empty() {
@@ -275,7 +281,9 @@ impl MobileSessionManager {
             })
             .await?;
         let session_id = storage.metadata().await?.id;
+        crate::probe(&format!("create_session: id={session_id}"));
         let sandbox = crate::connect_sandbox(&config).await?;
+        crate::probe(&format!("create_session: sandbox {}", sandbox.sandbox_id()));
         self.persist_state(&session_id, &sandbox, &config)?;
         MobileSession::assemble(config, sandbox, Some(session_id), false).await
     }
@@ -306,10 +314,18 @@ impl MobileSessionManager {
         config: MobileConfig,
         session_id: String,
     ) -> anyhow::Result<Arc<MobileSession>> {
+        crate::probe(&format!("open_session: start {session_id}"));
         // Validate the session exists before spending a sandbox.
         open_storage(&session_id).await?;
+        crate::probe("open_session: storage loaded");
+        crate::probe("open_session: connecting sandbox");
         let sandbox = crate::connect_sandbox(&config).await?;
+        crate::probe(&format!(
+            "open_session: sandbox {} connected",
+            sandbox.sandbox_id()
+        ));
         self.persist_state(&session_id, &sandbox, &config)?;
+        crate::probe("open_session: state persisted");
         MobileSession::assemble(config, sandbox, Some(session_id), true).await
     }
 

@@ -907,8 +907,8 @@ fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_list_sessions(
 ): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_open_session(`ptr`: Pointer,`config`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
-fun uniffi_llm_harness_mobile_core_fn_func_connect(`config`: RustBuffer.ByValue,
-): Long
+fun uniffi_llm_harness_mobile_core_fn_func_connect(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Pointer
 fun ffi_llm_harness_mobile_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun ffi_llm_harness_mobile_core_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -1035,7 +1035,7 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 }
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_llm_harness_mobile_core_checksum_func_connect() != 34237.toShort()) {
+    if (lib.uniffi_llm_harness_mobile_core_checksum_func_connect() != 62154.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_abort() != 1536.toShort()) {
@@ -2880,19 +2880,14 @@ public object FfiConverterSequenceTypeSessionSummary: FfiConverterRustBuffer<Lis
 
 
 
-    @Throws(MobileException::class)
-    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
-     suspend fun `connect`(`config`: MobileConfig) : MobileSession {
-        return uniffiRustCallAsync(
-        UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_func_connect(FfiConverterTypeMobileConfig.lower(`config`),),
-        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_poll_pointer(future, callback, continuation) },
-        { future, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_complete_pointer(future, continuation) },
-        { future -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_free_pointer(future) },
-        // lift function
-        { FfiConverterTypeMobileSession.lift(it) },
-        // Error FFI converter
-        MobileException.ErrorHandler,
+    @Throws(MobileException::class) fun `connect`(`config`: MobileConfig): MobileSession {
+            return FfiConverterTypeMobileSession.lift(
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_func_connect(
+        FfiConverterTypeMobileConfig.lower(`config`),_status)
+}
     )
     }
+    
 
 

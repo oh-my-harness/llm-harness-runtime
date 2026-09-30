@@ -108,6 +108,9 @@ class AppViewModel(
                 startPump(id, session)
                 refreshSessions()
                 setActive(id)
+                _uiState.value = _uiState.value.copy(
+                    connection = ConnectionState.Connected(currentConfig().trustProfile),
+                )
             } catch (e: Exception) {
                 _uiState.update {
                     it.copy(connection = ConnectionState.Failed(e.message ?: "create failed"))
@@ -127,6 +130,9 @@ class AppViewModel(
                     replayHistory(sessionId, session)
                 }
                 setActive(sessionId)
+                _uiState.value = _uiState.value.copy(
+                    connection = ConnectionState.Connected(currentConfig().trustProfile),
+                )
             } catch (e: Exception) {
                 _uiState.update {
                     it.copy(connection = ConnectionState.Failed(e.message ?: "resume failed"))
