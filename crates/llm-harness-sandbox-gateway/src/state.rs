@@ -30,6 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audit::{AuditEvent, GatewayAudit};
 use crate::auth::AuthenticatedPrincipal;
+use crate::credentials::CredentialStore;
 use crate::observability::{RateLimiter, RequestMetrics};
 
 pub(crate) const GUEST_WORK_DIR: &str = "/workspace";
@@ -49,6 +50,7 @@ pub(crate) struct GatewayState {
     metrics: RequestMetrics,
     rate_limiter: RateLimiter,
     audit_failure_mode: crate::auth::AuditFailureMode,
+    credentials: CredentialStore,
 }
 
 #[derive(Debug)]
@@ -576,6 +578,10 @@ impl GatewayState {
         create_private_directory(&sandbox_root)?;
         let work_root_lock = lock_work_root(&work_root)?;
         let registry = std::sync::Mutex::new(open_registry(&work_root.join("registry.sqlite"))?);
+        let credentials = CredentialStore::new(
+            &work_root.join("credentials.sqlite"),
+            &config.credential_seeds(),
+        )?;
         let audit_path = config
             .audit_path()
             .map(Path::to_path_buf)
@@ -617,7 +623,29 @@ impl GatewayState {
             metrics: RequestMetrics::default(),
             rate_limiter: RateLimiter::default(),
             audit_failure_mode,
+            credentials,
         })
+    }
+
+    pub(crate) fn authenticate(&self, bearer_token: &str) -> Option<AuthenticatedPrincipal> {
+        let principal_id = self.credentials.authenticate(bearer_token)?;
+        self.config.principal(&principal_id)
+    }
+
+    pub(crate) fn rotate_credential(
+        &self,
+        principal_id: &str,
+        bearer_token: &str,
+    ) -> Result<(), GatewayStateError> {
+        self.credentials
+            .rotate(principal_id, bearer_token)
+            .map_err(GatewayStateError::Storage)
+    }
+
+    pub(crate) fn revoke_credential(&self, principal_id: &str) -> Result<(), GatewayStateError> {
+        self.credentials
+            .revoke(principal_id)
+            .map_err(GatewayStateError::Storage)
     }
 
     #[allow(clippy::too_many_arguments)]

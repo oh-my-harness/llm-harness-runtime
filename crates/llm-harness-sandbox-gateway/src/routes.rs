@@ -62,6 +62,8 @@ pub(crate) fn build_router(state: SharedState) -> Router {
             post(create_temp_dir),
         )
         .route("/metrics", get(metrics))
+        .route("/v1/credentials/rotate", post(rotate_credential))
+        .route("/v1/credentials/revoke", post(revoke_credential))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,
@@ -88,7 +90,7 @@ async fn authenticate(
     mut request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
-    let principal = bearer_token(&request).and_then(|token| state.config().authenticate(token));
+    let principal = bearer_token(&request).and_then(|token| state.authenticate(token));
     let Some(principal) = principal else {
         let response = unauthorized();
         state
@@ -161,6 +163,58 @@ async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
 
 async fn readiness(State(state): State<SharedState>) -> Json<HealthResponse> {
     health(State(state)).await
+}
+
+#[derive(serde::Deserialize)]
+struct RotateCredentialRequest {
+    new_token: String,
+}
+
+async fn rotate_credential(
+    State(state): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(request): Json<RotateCredentialRequest>,
+) -> Response {
+    if let Err(error) = state.rotate_credential(&principal.id, &request.new_token) {
+        return state_error(error);
+    }
+    if let Err(error) = state.audit_request(
+        AuditEvent::CredentialRotated,
+        &Uuid::new_v4().to_string(),
+        Some(&principal.id),
+        "POST",
+        "/v1/credentials/rotate",
+        Some(StatusCode::NO_CONTENT.as_u16()),
+        None,
+        None,
+        serde_json::json!({ "principal": principal.id.as_ref() }),
+    ) {
+        return state_error(error);
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn revoke_credential(
+    State(state): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> Response {
+    if let Err(error) = state.revoke_credential(&principal.id) {
+        return state_error(error);
+    }
+    if let Err(error) = state.audit_request(
+        AuditEvent::CredentialRevoked,
+        &Uuid::new_v4().to_string(),
+        Some(&principal.id),
+        "POST",
+        "/v1/credentials/revoke",
+        Some(StatusCode::NO_CONTENT.as_u16()),
+        None,
+        None,
+        serde_json::json!({ "principal": principal.id.as_ref() }),
+    ) {
+        return state_error(error);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn log_request(

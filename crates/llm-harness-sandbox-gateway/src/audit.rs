@@ -31,6 +31,8 @@ pub(crate) enum AuditEvent {
     FileUploaded,
     FileRemoved,
     DirectoryCreated,
+    CredentialRotated,
+    CredentialRevoked,
     AuditFailure,
 }
 
