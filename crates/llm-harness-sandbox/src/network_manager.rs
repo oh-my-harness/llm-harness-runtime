@@ -14,12 +14,17 @@ pub enum NetworkResourceState {
 /// One immutable network identity and its current lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkResource {
+    resource_id: String,
     setup: NetworkSetup,
     policy: NetworkPolicy,
     state: NetworkResourceState,
 }
 
 impl NetworkResource {
+    pub fn resource_id(&self) -> &str {
+        &self.resource_id
+    }
+
     pub fn setup(&self) -> &NetworkSetup {
         &self.setup
     }
@@ -67,6 +72,7 @@ impl NetworkManager {
         self.resources.insert(
             resource_id.to_owned(),
             NetworkResource {
+                resource_id: resource_id.to_owned(),
                 setup,
                 policy,
                 state: NetworkResourceState::Active,
@@ -122,6 +128,7 @@ mod tests {
         manager.create("sandbox-1", policy("1.1.1.1")).unwrap();
 
         let resource = manager.get("sandbox-1").unwrap();
+        assert_eq!(resource.resource_id(), "sandbox-1");
         assert_eq!(resource.state(), NetworkResourceState::Active);
         assert_eq!(resource.policy(), &policy("1.1.1.1"));
         assert_eq!(resource.setup().namespace(), "llmh-sandbox-1");
