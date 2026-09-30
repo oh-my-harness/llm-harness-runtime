@@ -8,7 +8,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::{MobileConfig, MobileError, MobileSession, ensure_runtime};
+use crate::{MobileConfig, MobileError, MobileSession, run_on_runtime};
 use llm_harness_agent::session::SessionRepo;
 use llm_harness_sandbox_remote::RemoteSandbox;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -176,12 +176,21 @@ fn validate_session_id(session_id: &str) -> anyhow::Result<()> {
 static SESSION_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 fn session_repo() -> anyhow::Result<Arc<llm_harness_agent::session::JsonlSessionRepo>> {
+    static REPO: std::sync::OnceLock<Arc<llm_harness_agent::session::JsonlSessionRepo>> =
+        std::sync::OnceLock::new();
+    if let Some(repo) = REPO.get() {
+        return Ok(repo.clone());
+    }
     let root = dirs_data_root()?;
     let sessions_dir = root.join("sessions");
     std::fs::create_dir_all(&sessions_dir)?;
-    Ok(Arc::new(llm_harness_agent::session::JsonlSessionRepo::new(
+    let repo = Arc::new(llm_harness_agent::session::JsonlSessionRepo::new(
         sessions_dir,
-    )))
+    ));
+    // A single repo instance shares the open-storage cache: create→send→open
+    // must observe the same in-memory storage or the send never lands in the
+    // entries.jsonl the resume path reads.
+    Ok(REPO.get_or_init(|| repo).clone())
 }
 
 fn dirs_data_root() -> anyhow::Result<PathBuf> {
@@ -227,17 +236,11 @@ impl MobileSessionManager {
         config: MobileConfig,
         name: String,
     ) -> Result<Arc<MobileSession>, MobileError> {
-        let runtime = ensure_runtime();
-        runtime
-            .block_on(self.create_session_inner(config, name))
-            .map_err(MobileError::from)
+        run_on_runtime(self.create_session_inner(config, name)).map_err(MobileError::from)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>, MobileError> {
-        let runtime = ensure_runtime();
-        runtime
-            .block_on(self.list_sessions_inner())
-            .map_err(MobileError::from)
+        run_on_runtime(self.list_sessions_inner()).map_err(MobileError::from)
     }
 
     pub fn open_session(
@@ -245,17 +248,11 @@ impl MobileSessionManager {
         config: MobileConfig,
         session_id: String,
     ) -> Result<Arc<MobileSession>, MobileError> {
-        let runtime = ensure_runtime();
-        runtime
-            .block_on(self.open_session_inner(config, session_id))
-            .map_err(MobileError::from)
+        run_on_runtime(self.open_session_inner(config, session_id)).map_err(MobileError::from)
     }
 
     pub fn delete_session(&self, session_id: String) -> Result<(), MobileError> {
-        let runtime = ensure_runtime();
-        runtime
-            .block_on(self.delete_session_inner(session_id))
-            .map_err(MobileError::from)
+        run_on_runtime(self.delete_session_inner(session_id)).map_err(MobileError::from)
     }
 }
 

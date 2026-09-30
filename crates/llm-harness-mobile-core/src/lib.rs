@@ -248,17 +248,13 @@ impl MobileSession {
         let Some(id) = self.session_id.as_deref() else {
             return Ok(Vec::new());
         };
-        let runtime = ensure_runtime();
-        let storage = runtime
-            .block_on(crate::manager::open_storage(id))
-            .map_err(MobileError::from)?;
+        let storage =
+            run_on_runtime(crate::manager::open_storage(id)).map_err(MobileError::from)?;
         let session = llm_harness_agent::session::Session::new(storage);
         let context =
-            runtime
-                .block_on(session.build_context())
-                .map_err(|e| MobileError::Internal {
-                    detail: format!("read session history: {e}"),
-                })?;
+            run_on_runtime(session.build_context()).map_err(|e| MobileError::Internal {
+                detail: format!("read session history: {e}"),
+            })?;
         Ok(crate::manager::history_to_mobile(&context.messages))
     }
 }
@@ -313,15 +309,14 @@ impl MobileSession {
         let size = u64::try_from(content.len()).map_err(|_| MobileError::Internal {
             detail: "uploaded file is too large".to_owned(),
         })?;
-        ensure_runtime()
-            .block_on(
-                self.sandbox
-                    .env()
-                    .write_file(&path, &content, CancellationToken::new()),
-            )
-            .map_err(|error| MobileError::Internal {
-                detail: format!("upload file {path:?}: {error:#}"),
-            })?;
+        run_on_runtime(
+            self.sandbox
+                .env()
+                .write_file(&path, &content, CancellationToken::new()),
+        )
+        .map_err(|error| MobileError::Internal {
+            detail: format!("upload file {path:?}: {error:#}"),
+        })?;
         Ok(size)
     }
 
@@ -333,24 +328,23 @@ impl MobileSession {
         binary: bool,
     ) -> Result<Vec<u8>, MobileError> {
         let path = resolve_sandbox_path(&self.sandbox.env(), &guest_path)?;
-        let bytes = ensure_runtime()
-            .block_on(async {
-                if binary {
-                    self.sandbox
-                        .env()
-                        .read_binary_file(&path, CancellationToken::new())
-                        .await
-                } else {
-                    self.sandbox
-                        .env()
-                        .read_text_file(&path, CancellationToken::new())
-                        .await
-                        .map(String::into_bytes)
-                }
-            })
-            .map_err(|error| MobileError::Internal {
-                detail: format!("read file {path:?}: {error:#}"),
-            })?;
+        let bytes = run_on_runtime(async {
+            if binary {
+                self.sandbox
+                    .env()
+                    .read_binary_file(&path, CancellationToken::new())
+                    .await
+            } else {
+                self.sandbox
+                    .env()
+                    .read_text_file(&path, CancellationToken::new())
+                    .await
+                    .map(String::into_bytes)
+            }
+        })
+        .map_err(|error| MobileError::Internal {
+            detail: format!("read file {path:?}: {error:#}"),
+        })?;
         Ok(bytes)
     }
 
@@ -358,15 +352,14 @@ impl MobileSession {
     #[uniffi::method(name = "fileInfo")]
     pub fn file_info(self: Arc<Self>, guest_path: String) -> Result<MobileFileInfo, MobileError> {
         let path = resolve_sandbox_path(&self.sandbox.env(), &guest_path)?;
-        let info = ensure_runtime()
-            .block_on(
-                self.sandbox
-                    .env()
-                    .file_info(&path, CancellationToken::new()),
-            )
-            .map_err(|error| MobileError::Internal {
-                detail: format!("file info {path:?}: {error:#}"),
-            })?;
+        let info = run_on_runtime(
+            self.sandbox
+                .env()
+                .file_info(&path, CancellationToken::new()),
+        )
+        .map_err(|error| MobileError::Internal {
+            detail: format!("file info {path:?}: {error:#}"),
+        })?;
         Ok(mobile_file_info(info))
     }
 
@@ -377,8 +370,7 @@ impl MobileSession {
         guest_path: String,
     ) -> Result<Vec<MobileFileInfo>, MobileError> {
         let path = resolve_sandbox_directory(&self.sandbox.env(), &guest_path)?;
-        let entries = ensure_runtime()
-            .block_on(self.sandbox.env().list_dir(&path, CancellationToken::new()))
+        let entries = run_on_runtime(self.sandbox.env().list_dir(&path, CancellationToken::new()))
             .map_err(|error| MobileError::Internal {
                 detail: format!("list directory {path:?}: {error:#}"),
             })?;
@@ -509,8 +501,8 @@ impl From<anyhow::Error> for MobileError {
     }
 }
 #[uniffi::export]
-pub async fn connect(config: MobileConfig) -> Result<Arc<MobileSession>, MobileError> {
-    let session = ensure_runtime().block_on(MobileSession::new(config))?;
+pub fn connect(config: MobileConfig) -> Result<Arc<MobileSession>, MobileError> {
+    let session = run_on_runtime(MobileSession::new(config))?;
     Ok(session)
 }
 
@@ -521,6 +513,27 @@ pub async fn connect(config: MobileConfig) -> Result<Arc<MobileSession>, MobileE
 /// `tokio::fs`/`tokio::spawn`/reqwest their reactor. Do NOT `enter()` here:
 /// foreign threads call these repeatedly and nested EnterGuards must be
 /// dropped in reverse order (tokio panics otherwise).
+/// Run `future` to completion on the process-wide runtime.
+///
+/// This is the ONLY place allowed to call `block_on`. Calls that originate
+/// from inside a runtime-driven task (event pump, spawned prompt) must not
+/// nest `block_on` — tokio panics on that. Foreign FFI threads have no
+/// ambient context and get `block_on`; runtime threads get the future
+/// spawned onto the runtime instead.
+pub(crate) fn run_on_runtime<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let runtime = ensure_runtime();
+    match tokio::runtime::Handle::try_current() {
+        // Already on a runtime thread: cannot block that thread (it may be
+        // driving other tasks). LocalSet-style await is unavailable in a sync
+        // fn, so detach a task instead — Send bound applies to spawn only.
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => runtime.block_on(future),
+    }
+}
+
 fn ensure_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     RUNTIME.get_or_init(|| {

@@ -149,7 +149,7 @@ mod history_mapping {
 ///   OHM_MOBILE_DATA_DIR=<tmp writable dir>
 ///   MOBILE_E2E_GATEWAY_URL / MOBILE_E2E_GATEWAY_TOKEN / MOBILE_E2E_API_KEY
 /// Run: cargo test -p llm-harness-mobile-core --test manager -- --ignored
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires live gateway and LLM credentials"]
 async fn manager_create_and_resume_roundtrip() {
     let gateway_url = std::env::var("MOBILE_E2E_GATEWAY_URL").expect("gateway url");
@@ -162,7 +162,7 @@ async fn manager_create_and_resume_roundtrip() {
         gateway_token,
         api_key,
         model: "zai-org/GLM-5.2".to_owned(),
-        llm_base_url: "https://api.siliconflow.cn/v1".to_owned(),
+        llm_base_url: "https://api.siliconflow.cn".to_owned(),
         provider: "openai".to_owned(),
         allow_insecure_http: true,
         trust_profile: "restricted".to_owned(),
@@ -183,7 +183,7 @@ async fn manager_create_and_resume_roundtrip() {
     loop {
         match session.clone().poll_event() {
             Some(llm_harness_mobile_core::MobileEvent::RunFinished) => break,
-            Some(_) => {}
+            Some(event) => eprintln!("[probe] {event:?}"),
             None => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
         }
         assert!(std::time::Instant::now() < deadline, "timed out waiting");
