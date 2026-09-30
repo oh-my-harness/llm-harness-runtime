@@ -239,6 +239,25 @@ impl NetworkSetup {
             ],
         ]
     }
+
+    pub fn teardown_commands(&self) -> Vec<Vec<String>> {
+        vec![
+            vec![
+                "ip".into(),
+                "netns".into(),
+                "delete".into(),
+                self.namespace.clone(),
+            ],
+            vec![
+                "ip".into(),
+                "link".into(),
+                "delete".into(),
+                self.veth.clone(),
+                "type".into(),
+                "veth".into(),
+            ],
+        ]
+    }
 }
 
 fn validate_resource_id(resource_id: &str) -> anyhow::Result<()> {

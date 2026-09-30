@@ -29,6 +29,14 @@ impl NetworkResource {
         &self.setup
     }
 
+    pub fn setup_commands(&self) -> Vec<Vec<String>> {
+        self.setup.setup_commands()
+    }
+
+    pub fn teardown_commands(&self) -> Vec<Vec<String>> {
+        self.setup.teardown_commands()
+    }
+
     pub fn policy(&self) -> &NetworkPolicy {
         &self.policy
     }
@@ -159,5 +167,24 @@ mod tests {
         assert!(manager.delete("sandbox-1"));
         assert!(!manager.delete("sandbox-1"));
         assert!(manager.get("sandbox-1").is_none());
+    }
+
+    #[test]
+    fn resource_exposes_setup_and_teardown_commands() {
+        let mut manager = NetworkManager::default();
+        manager.create("sandbox-1", policy("1.1.1.1")).unwrap();
+        let resource = manager.get("sandbox-1").unwrap();
+
+        assert_eq!(resource.setup_commands(), resource.setup().setup_commands());
+        assert_eq!(
+            resource.teardown_commands(),
+            resource.setup().teardown_commands()
+        );
+        assert!(resource.teardown_commands().contains(&vec![
+            "ip".to_owned(),
+            "netns".to_owned(),
+            "delete".to_owned(),
+            "llmh-sandbox-1".to_owned(),
+        ]));
     }
 }
