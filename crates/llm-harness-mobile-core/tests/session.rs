@@ -51,7 +51,7 @@ fn maps_error_to_failed() {
 #[test]
 fn drops_non_displayable_events() {
     // PhaseChange and other harness-only events carry nothing for the UI.
-    let phase = AgentHarnessEvent::PhaseChange {
+    let _phase = AgentHarnessEvent::PhaseChange {
         from: HarnessPhase::Idle,
         to: HarnessPhase::Turning,
     };

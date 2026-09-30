@@ -155,7 +155,7 @@ async fn manager_create_and_resume_roundtrip() {
     let gateway_url = std::env::var("MOBILE_E2E_GATEWAY_URL").expect("gateway url");
     let gateway_token = std::env::var("MOBILE_E2E_GATEWAY_TOKEN").expect("gateway token");
     let api_key = std::env::var("MOBILE_E2E_API_KEY").expect("llm api key");
-    let data_dir = std::env::var("OHM_MOBILE_DATA_DIR").expect("data dir");
+    let _data_dir = std::env::var("OHM_MOBILE_DATA_DIR").expect("data dir");
 
     let config = llm_harness_mobile_core::MobileConfig {
         gateway_url,
