@@ -56,6 +56,19 @@ pub(crate) async fn connect_sandbox(config: &MobileConfig) -> anyhow::Result<Arc
 
 uniffi::setup_scaffolding!();
 
+/// File metadata exposed to the mobile UI.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MobileFileInfo {
+    /// Absolute guest-side path.
+    pub path: String,
+    /// True when the entry is a directory.
+    pub is_dir: bool,
+    /// File size in bytes; directories report zero.
+    pub size: u64,
+    /// Last modification time in Unix milliseconds.
+    pub modified_at_ms: u64,
+}
+
 /// Connection configuration for a mobile session.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct MobileConfig {
@@ -341,6 +354,37 @@ impl MobileSession {
         Ok(bytes)
     }
 
+    /// Return metadata for one file or directory.
+    #[uniffi::method(name = "fileInfo")]
+    pub fn file_info(self: Arc<Self>, guest_path: String) -> Result<MobileFileInfo, MobileError> {
+        let path = resolve_sandbox_path(&self.sandbox.env(), &guest_path)?;
+        let info = ensure_runtime()
+            .block_on(
+                self.sandbox
+                    .env()
+                    .file_info(&path, CancellationToken::new()),
+            )
+            .map_err(|error| MobileError::Internal {
+                detail: format!("file info {path:?}: {error:#}"),
+            })?;
+        Ok(mobile_file_info(info))
+    }
+
+    /// List files in a sandbox directory. An empty path lists the workspace.
+    #[uniffi::method(name = "listFiles")]
+    pub fn list_files(
+        self: Arc<Self>,
+        guest_path: String,
+    ) -> Result<Vec<MobileFileInfo>, MobileError> {
+        let path = resolve_sandbox_directory(&self.sandbox.env(), &guest_path)?;
+        let entries = ensure_runtime()
+            .block_on(self.sandbox.env().list_dir(&path, CancellationToken::new()))
+            .map_err(|error| MobileError::Internal {
+                detail: format!("list directory {path:?}: {error:#}"),
+            })?;
+        Ok(entries.into_iter().map(mobile_file_info).collect())
+    }
+
     pub async fn shutdown(&self) -> Result<(), MobileError> {
         let sandbox = <RemoteSandbox as Clone>::clone(&self.sandbox);
         Ok(ensure_runtime()
@@ -402,6 +446,25 @@ fn resolve_sandbox_path(
         return Ok(path.to_path_buf());
     }
     Ok(env.working_dir().join(path))
+}
+
+fn resolve_sandbox_directory(
+    env: &Arc<dyn llm_harness_types::ExecutionEnv>,
+    guest_path: &str,
+) -> Result<PathBuf, MobileError> {
+    if guest_path.trim().is_empty() {
+        return Ok(env.working_dir().to_path_buf());
+    }
+    resolve_sandbox_path(env, guest_path)
+}
+
+fn mobile_file_info(info: llm_harness_types::FileInfo) -> MobileFileInfo {
+    MobileFileInfo {
+        path: info.path.to_string_lossy().into_owned(),
+        is_dir: info.is_dir,
+        size: info.size,
+        modified_at_ms: u64::try_from(info.modified.timestamp_millis()).unwrap_or(0),
+    }
 }
 
 /// Parse the FFI trust-profile string into the wire enum.
@@ -499,5 +562,31 @@ mod tests {
         let env: Arc<dyn llm_harness_types::ExecutionEnv> =
             Arc::new(UnsupportedEnv::with_working_dir("/workspace"));
         assert!(resolve_sandbox_path(&env, "   ").is_err());
+    }
+
+    #[test]
+    fn resolves_empty_directory_to_working_dir() {
+        let env: Arc<dyn llm_harness_types::ExecutionEnv> =
+            Arc::new(UnsupportedEnv::with_working_dir("/workspace"));
+        assert_eq!(
+            resolve_sandbox_directory(&env, "  ").unwrap(),
+            PathBuf::from("/workspace")
+        );
+    }
+
+    #[test]
+    fn converts_file_info_for_ffi() {
+        let info = llm_harness_types::FileInfo {
+            path: PathBuf::from("/workspace/result.txt"),
+            is_dir: false,
+            size: 12,
+            modified: chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+                .expect("valid timestamp"),
+        };
+        let mobile = mobile_file_info(info);
+        assert_eq!(mobile.path, "/workspace/result.txt");
+        assert!(!mobile.is_dir);
+        assert_eq!(mobile.size, 12);
+        assert_eq!(mobile.modified_at_ms, 1_700_000_000_000);
     }
 }

@@ -757,6 +757,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -776,7 +780,11 @@ internal interface IntegrityCheckingUniffiLib : Library {
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_abort(
 ): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_fileinfo(
+): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_history(
+): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_listfiles(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_pollevent(
 ): Short
@@ -861,7 +869,11 @@ fun uniffi_llm_harness_mobile_core_fn_free_mobilesession(`ptr`: Pointer,uniffi_o
 ): Unit
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_abort(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_fileinfo(`ptr`: Pointer,`guestPath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_history(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_listfiles(`ptr`: Pointer,`guestPath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_pollevent(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1029,7 +1041,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_abort() != 1536.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_fileinfo() != 58696.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_history() != 4701.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_listfiles() != 3946.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_pollevent() != 5697.toShort()) {
@@ -1493,11 +1511,21 @@ public interface MobileSessionInterface {
     fun `abort`()
     
     /**
+     * Return metadata for one file or directory.
+     */
+    fun `fileInfo`(`guestPath`: kotlin.String): MobileFileInfo
+    
+    /**
      * Replay persisted history (read-only bubbles; new events continue from
      * here). Empty for ad-hoc sessions. Sync on purpose — see the manager
      * methods: foreign-driven futures needing the reactor deadlock.
      */
     fun `history`(): List<MobileHistoryMessage>
+    
+    /**
+     * List files in a sandbox directory. An empty path lists the workspace.
+     */
+    fun `listFiles`(`guestPath`: kotlin.String): List<MobileFileInfo>
     
     /**
      * Poll one buffered UI event, oldest first. `None` when idle.
@@ -1651,6 +1679,22 @@ open class MobileSession: Disposable, AutoCloseable, MobileSessionInterface
 
     
     /**
+     * Return metadata for one file or directory.
+     */
+    @Throws(MobileException::class)override fun `fileInfo`(`guestPath`: kotlin.String): MobileFileInfo {
+            return FfiConverterTypeMobileFileInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_fileinfo(
+        it, FfiConverterString.lower(`guestPath`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
      * Replay persisted history (read-only bubbles; new events continue from
      * here). Empty for ad-hoc sessions. Sync on purpose — see the manager
      * methods: foreign-driven futures needing the reactor deadlock.
@@ -1661,6 +1705,22 @@ open class MobileSession: Disposable, AutoCloseable, MobileSessionInterface
     uniffiRustCallWithError(MobileException) { _status ->
     UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_history(
         it, _status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * List files in a sandbox directory. An empty path lists the workspace.
+     */
+    @Throws(MobileException::class)override fun `listFiles`(`guestPath`: kotlin.String): List<MobileFileInfo> {
+            return FfiConverterSequenceTypeMobileFileInfo.lift(
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_listfiles(
+        it, FfiConverterString.lower(`guestPath`),_status)
 }
     }
     )
@@ -2249,6 +2309,61 @@ public object FfiConverterTypeMobileConfig: FfiConverterRustBuffer<MobileConfig>
 
 
 /**
+ * File metadata exposed to the mobile UI.
+ */
+data class MobileFileInfo (
+    /**
+     * Absolute guest-side path.
+     */
+    var `path`: kotlin.String, 
+    /**
+     * True when the entry is a directory.
+     */
+    var `isDir`: kotlin.Boolean, 
+    /**
+     * File size in bytes; directories report zero.
+     */
+    var `size`: kotlin.ULong, 
+    /**
+     * Last modification time in Unix milliseconds.
+     */
+    var `modifiedAtMs`: kotlin.ULong
+) {
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileFileInfo: FfiConverterRustBuffer<MobileFileInfo> {
+    override fun read(buf: ByteBuffer): MobileFileInfo {
+        return MobileFileInfo(
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterULong.read(buf),
+            FfiConverterULong.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileFileInfo) = (
+            FfiConverterString.allocationSize(value.`path`) +
+            FfiConverterBoolean.allocationSize(value.`isDir`) +
+            FfiConverterULong.allocationSize(value.`size`) +
+            FfiConverterULong.allocationSize(value.`modifiedAtMs`)
+    )
+
+    override fun write(value: MobileFileInfo, buf: ByteBuffer) {
+            FfiConverterString.write(value.`path`, buf)
+            FfiConverterBoolean.write(value.`isDir`, buf)
+            FfiConverterULong.write(value.`size`, buf)
+            FfiConverterULong.write(value.`modifiedAtMs`, buf)
+    }
+}
+
+
+
+/**
  * One replayed history message for the resume screen.
  */
 data class MobileHistoryMessage (
@@ -2670,6 +2785,34 @@ public object FfiConverterOptionalTypeMobileEvent: FfiConverterRustBuffer<Mobile
         } else {
             buf.put(1)
             FfiConverterTypeMobileEvent.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeMobileFileInfo: FfiConverterRustBuffer<List<MobileFileInfo>> {
+    override fun read(buf: ByteBuffer): List<MobileFileInfo> {
+        val len = buf.getInt()
+        return List<MobileFileInfo>(len) {
+            FfiConverterTypeMobileFileInfo.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<MobileFileInfo>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeMobileFileInfo.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<MobileFileInfo>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeMobileFileInfo.write(it, buf)
         }
     }
 }
