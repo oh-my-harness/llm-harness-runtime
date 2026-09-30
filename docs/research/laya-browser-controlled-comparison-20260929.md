@@ -40,7 +40,7 @@
 | --- | --- |
 | 任务来源 | 浏览器权重作者发布的 Suite A 16 题，同任务、同引擎；纯 Qwen 组是我们补充的本地对照，不是作者已发布的配对成绩 |
 | 大模型 | 两组均为 SiliconFlow `Qwen/Qwen2.5-72B-Instruct`，不是作者本地 Qwen3-8B |
-| 决策模型 | `cklxx/laya-browser` v19s，固定快照 `645cf366a2ae35f1086e8c20eff48f909bb49206` |
+| 决策模型 | `cklxx/laya-browser` v19s，mmBERT-base，**约 0.322B（322M，3.22 亿参数）**，规模依据[作者固定版本模型卡](https://huggingface.co/cklxx/laya-browser/blob/645cf366a2ae35f1086e8c20eff48f909bb49206/README.md)；固定快照 `645cf366a2ae35f1086e8c20eff48f909bb49206` |
 | 本地环境 | Windows、RTX 5070 Ti 16 GiB、BF16、`fast=False`；Python 3.13.9、torch 2.11.0+cu128、Laya 0.3.21、transformers 5.17.0、browser-harness 0.1.13 |
 | 公共生成参数 | `temperature=0`、`top_p=1`、`max_tokens=1024`、JSON 输出；A 合并决策与必要文本，B 按作者 helper 调用 |
 | 网络与运行顺序 | 浏览器和 Qwen 均显式使用同一本地代理，Laya/CDP 直连；按题与轮次交替 A/B 先后，每次独立浏览器上下文，工程测试不与计时并行 |
