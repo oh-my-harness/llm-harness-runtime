@@ -595,6 +595,26 @@ impl GatewayState {
                 config.max_sandboxes
             );
         }
+        let mut persisted_by_principal: HashMap<&str, usize> = HashMap::new();
+        for record in &persisted {
+            let count = persisted_by_principal
+                .entry(record.owner.as_str())
+                .or_default();
+            *count += 1;
+            let max_active_sandboxes = config
+                .principal(&record.owner)
+                .and_then(|principal| principal.max_active_sandboxes);
+            if let Some(max_active_sandboxes) = max_active_sandboxes
+                && *count > max_active_sandboxes
+            {
+                anyhow::bail!(
+                    "persisted sandbox count {} for principal {:?} exceeds configured maximum {}",
+                    *count,
+                    record.owner,
+                    max_active_sandboxes
+                );
+            }
+        }
         let mut sandboxes = HashMap::with_capacity(persisted.len());
         for record in persisted {
             let sandbox_id = record.sandbox_id.clone();
@@ -729,6 +749,26 @@ impl GatewayState {
         self.rate_limiter.check(principal, requests_per_minute)
     }
 
+    fn check_sandbox_capacity(
+        &self,
+        sandboxes: &HashMap<String, SandboxRecord>,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<(), GatewayStateError> {
+        if sandboxes.len() >= self.config.max_sandboxes {
+            return Err(GatewayStateError::Capacity);
+        }
+        if let Some(max_active_sandboxes) = principal.max_active_sandboxes {
+            let active_count = sandboxes
+                .values()
+                .filter(|record| record.owner == principal.id)
+                .count();
+            if active_count >= max_active_sandboxes {
+                return Err(GatewayStateError::Capacity);
+            }
+        }
+        Ok(())
+    }
+
     fn active_sandbox_count(&self) -> usize {
         self.sandboxes
             .lock()
@@ -799,9 +839,7 @@ impl GatewayState {
         request: RemoteSandboxConfig,
     ) -> Result<String, GatewayStateError> {
         let mut sandboxes = self.lock_sandboxes();
-        if sandboxes.len() >= self.config.max_sandboxes {
-            return Err(GatewayStateError::Capacity);
-        }
+        self.check_sandbox_capacity(&sandboxes, principal)?;
         let request = normalize_request_config(principal, request)
             .map_err(GatewayStateError::InvalidConfig)?;
         let sandbox_config =
@@ -871,9 +909,7 @@ impl GatewayState {
         request: RemoteSandboxConfig,
     ) -> Result<String, GatewayStateError> {
         let mut sandboxes = self.lock_sandboxes();
-        if sandboxes.len() >= self.config.max_sandboxes {
-            return Err(GatewayStateError::Capacity);
-        }
+        self.check_sandbox_capacity(&sandboxes, principal)?;
         let request = normalize_request_config(principal, request)
             .map_err(GatewayStateError::InvalidConfig)?;
         let sandbox_config =
@@ -965,9 +1001,7 @@ impl GatewayState {
         backend: &crate::auth::FirecrackerBackendConfig,
     ) -> Result<String, GatewayStateError> {
         let mut sandboxes = self.lock_sandboxes();
-        if sandboxes.len() >= self.config.max_sandboxes {
-            return Err(GatewayStateError::Capacity);
-        }
+        self.check_sandbox_capacity(&sandboxes, principal)?;
         let request = normalize_request_config(principal, request)
             .map_err(GatewayStateError::InvalidConfig)?;
         validate_firecracker_policies(&request, backend)

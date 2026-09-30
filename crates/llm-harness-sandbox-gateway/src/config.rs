@@ -61,6 +61,8 @@ pub struct PrincipalConfig {
     pub max_trust_profile: llm_harness_platform::trust::TrustProfile,
     #[serde(default)]
     pub requests_per_minute: Option<usize>,
+    #[serde(default)]
+    pub max_active_sandboxes: Option<usize>,
 }
 
 impl GatewayServiceConfig {
@@ -86,6 +88,7 @@ impl GatewayServiceConfig {
                     host_project_dirs: principal.host_project_dirs,
                     max_trust_profile: principal.max_trust_profile,
                     requests_per_minute: principal.requests_per_minute,
+                    max_active_sandboxes: principal.max_active_sandboxes,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;

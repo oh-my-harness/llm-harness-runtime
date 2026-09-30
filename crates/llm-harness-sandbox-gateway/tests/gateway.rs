@@ -98,6 +98,7 @@ fn principal(id: &str, token: &str) -> GatewayPrincipalConfig {
         host_project_dirs: Vec::new(),
         max_trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
         requests_per_minute: None,
+        max_active_sandboxes: None,
     }
 }
 
@@ -117,6 +118,47 @@ fn private_tempdir() -> tempfile::TempDir {
 fn gateway_defaults_to_the_bwrap_backend() {
     let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)]).expect("gateway config");
     assert!(matches!(config.backend(), GatewayBackend::Bwrap));
+}
+
+#[tokio::test]
+async fn gateway_enforces_per_principal_active_sandbox_quota() {
+    let mut capped = principal("tenant-a", TOKEN_A);
+    capped.max_active_sandboxes = Some(1);
+    let first = start_gateway_with_config(
+        GatewayConfig::new(vec![capped, principal("tenant-b", TOKEN_B)])
+            .expect("gateway config")
+            .with_max_sandboxes(2),
+    )
+    .await;
+    let client_a = remote_client(&first.base_url, TOKEN_A);
+    let client_b = remote_client(&first.base_url, TOKEN_B);
+
+    let first_sandbox = client_a
+        .create_sandbox(sandbox_config())
+        .await
+        .expect("create first sandbox for capped principal");
+    let quota_error = client_a
+        .create_sandbox(sandbox_config())
+        .await
+        .expect_err("per-principal quota must reject the second sandbox");
+    assert!(quota_error.to_string().contains("sandbox limit reached"));
+
+    client_b
+        .create_sandbox(sandbox_config())
+        .await
+        .expect("another principal is independent of the capped principal");
+
+    client_a
+        .delete_sandbox(&first_sandbox.sandbox_id)
+        .await
+        .expect("delete sandbox");
+    client_a
+        .create_sandbox(sandbox_config())
+        .await
+        .expect("deleted sandbox releases principal capacity");
+
+    let work_root = first.stop().await;
+    std::fs::remove_dir_all(work_root).expect("remove work root");
 }
 
 #[cfg(target_os = "macos")]

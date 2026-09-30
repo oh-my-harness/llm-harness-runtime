@@ -30,6 +30,7 @@ fn gateway_config(work_root: PathBuf) -> GatewayConfig {
         host_project_dirs: vec![],
         max_trust_profile: llm_harness_platform::trust::TrustProfile::TrustedLan,
         requests_per_minute: None,
+        max_active_sandboxes: None,
     }])
     .unwrap()
     .with_work_root(work_root)

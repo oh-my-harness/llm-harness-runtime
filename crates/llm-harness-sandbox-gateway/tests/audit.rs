@@ -24,6 +24,7 @@ fn config(audit_path: &Path, failure_mode: AuditFailureMode) -> GatewayConfig {
         host_project_dirs: vec![],
         max_trust_profile: TrustProfile::Restricted,
         requests_per_minute: None,
+        max_active_sandboxes: None,
     }])
     .expect("gateway config")
     .with_audit_failure_mode(failure_mode)

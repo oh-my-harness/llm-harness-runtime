@@ -18,6 +18,7 @@ async fn metrics_are_protected_and_rate_limited_per_principal() {
         host_project_dirs: Vec::new(),
         max_trust_profile: TrustProfile::Restricted,
         requests_per_minute: Some(1),
+        max_active_sandboxes: None,
     }])
     .expect("valid config")
     .with_work_root(work_root.path().to_path_buf());

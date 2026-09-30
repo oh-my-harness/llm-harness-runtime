@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
             host_project_dirs: Vec::new(),
             max_trust_profile: llm_harness_platform::trust::TrustProfile::TrustedFull,
             requests_per_minute: None,
+            max_active_sandboxes: None,
         },
         GatewayPrincipalConfig {
             principal: "kiosk".to_owned(),
@@ -52,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
             host_project_dirs: Vec::new(),
             max_trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
             requests_per_minute: None,
+            max_active_sandboxes: None,
         },
     ])?
     .with_work_root(work_root)

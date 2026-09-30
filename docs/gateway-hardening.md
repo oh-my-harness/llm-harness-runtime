@@ -271,6 +271,7 @@ gateway 启动时会 fail-closed 地 reconcile registry 和 work root，删除�
 - [ ] `max_trust_profile` 不高于业务需要；
 - [ ] 公网或移动端入口配置了 `requests_per_minute`；
 - [ ] `max_sandboxes`、执行超时、输出大小和请求大小都已设置；
+- [ ] 多租户部署为每个 principal 设置 `max_active_sandboxes`；
 - [ ] sandbox 对外网络默认拒绝；
 - [ ] 服务用户没有 shell；
 - [ ] systemd 启用 `NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome=true`；
