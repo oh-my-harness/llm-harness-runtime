@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use llm_harness_platform::sandbox::{NetRule, ResourceLimits, Sandbox, SandboxConfig};
+use llm_harness_platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_sandbox_gateway::{
     FirecrackerBackendConfig, GatewayBackend, GatewayConfig, GatewayPrincipalConfig, SandboxGateway,
 };
@@ -525,6 +525,7 @@ fn firecracker_backend(root: &Path, vsock_guest_cid_base: u32) -> GatewayBackend
     })
 }
 
+#[cfg(target_os = "linux")]
 fn firecracker_artifact_root() -> tempfile::TempDir {
     let root = private_tempdir();
     for name in ["firecracker", "vmlinux", "rootfs-base.ext4"] {
@@ -539,6 +540,7 @@ fn firecracker_artifact_root() -> tempfile::TempDir {
     root
 }
 
+#[cfg(target_os = "linux")]
 fn write_fake_firecracker(path: &Path, guest_port: u32) {
     let script = r#"#!/usr/bin/env python3
 import base64, json, os, select, socket, sys

@@ -313,6 +313,7 @@ pub struct SeatbeltEnv {
 }
 
 impl SeatbeltEnv {
+    #[cfg(test)]
     pub(crate) fn new(
         work_dir: PathBuf,
         work_dir_canon: PathBuf,
