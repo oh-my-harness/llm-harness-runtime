@@ -22,6 +22,7 @@ default = ["os", "bwrap", "seatbelt"]
 os = []
 bwrap = ["os", "dep:cap-std"]
 seatbelt = ["os"]
+linux-network = ["os"]
 # API boundary compile-probe tests are off by default — they spawn ~20
 # `cargo check` subprocesses and add ~17s to the test suite.  Enable with
 # `cargo test -p llm-harness-sandbox --features api-boundary-tests`.
