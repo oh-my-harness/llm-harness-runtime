@@ -1,5 +1,19 @@
 # jev-browser 研究入口
 
+## Decider-2B 三组对照
+
+2026-09-30 经 lqj 确认，`--with-decider` 在原受控 Flash 场次加入 C 组；A/B 原决策及 helper 路径不改。C 以 `Mapika/decider-2b@533964dae8be954c5b5e19fa4948e48408094c1e` v11 代替本地决策打分器，B/C 共用原作者页面/候选压缩和分块。模型原生分词和编码不同，不是参数量的因果消融。
+
+先用 `decider_adapter.py --output logs/benchmarks/NEW_DECIDER_PREFLIGHT` 检验 CUDA、作者原生多候选数值一致性及真实单候选前向。固定权重 SHA-256 为 `acaef2228b134dcdc20cad4ee79219482c927ec819aa3687b9b8a575c338817f`，源码随 Hub 固定快照读取；运行中不联网更新模型。采用 BF16/CUDA eager，无编译/图捕获/schema 缓存；Windows 当前缺少 causal-conv1d 与 flash-linear-attention 的加速实现，参考 PyTorch 路径的速度限制须披露。
+
+```powershell
+$env:PYTHONUTF8='1'
+python scripts/benchmarks/jev_browser/author_suite.py --paired --controlled --with-decider --text-backend deepseek-flash --repeats 2 --qwen-http-limit 237 --proxy http://127.0.0.1:7890 --output logs/benchmarks/NEW_DECIDER_RUN --chromium $env:CHROMIUM_EXECUTABLE
+python scripts/benchmarks/jev_browser/audit_decider_run.py logs/benchmarks/NEW_DECIDER_RUN
+```
+
+共 16 题 × 3 组 × 2 轮，A/B 相对顺序不改，C 按题及轮次在首/中/末轮换。Laya 与 Decider 的 RPC、predict、真实前向分别计数；模型调用总用时仅相加 Flash HTTP 和本地 decision HTTP，不累加嵌套阶段。仍从 `DEEPSEEK_API_KEY` 环境变量读取凭据；不得出现在参数、日志或提交中。旧运行保持不变，三组审计使用 `audit_decider_run.py`，不能用旧双组审计漏掉 C。
+
 当前按 lqj 要求以浏览器权重作者公布的方案为基准。来源、任务和边界见[中文计划](../../../docs/experiment-fast-model-agent-loop.md)。唯一目标仍是比较速度与完整任务通过率；旧 7 任务入口只作历史保留，不是当前默认运行路线。
 
 ## 当前：作者 Suite A

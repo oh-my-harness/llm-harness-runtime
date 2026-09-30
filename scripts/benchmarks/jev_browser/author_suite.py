@@ -120,8 +120,12 @@ def validate_run_options(paired, repeats, controlled, proxy):
 
 
 def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=None, qwen_http_limit=None,
-        text_backend="qwen"):
+        text_backend="qwen", with_decider=False):
     validate_run_options(paired, repeats, controlled, proxy)
+    if with_decider and (not paired or not controlled or text_backend != "deepseek-flash"):
+        raise ValueError("Decider comparison requires paired, controlled DeepSeek Flash mode")
+    if with_decider:
+        import decider_adapter
     if text_backend not in TEXT_BACKENDS or (text_backend != "qwen" and not controlled):
         raise ValueError("Use a supported text backend; alternative models require controlled mode")
     backend = TEXT_BACKENDS[text_backend]
@@ -187,6 +191,8 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
             "tokens": {"qwen_input_tokens": 0, "qwen_output_tokens": 0}}
     counts = {"qwen_http": 0, "laya_rpc": 0, "laya_predict": 0, "laya_forward": 0,
               "tools": 0, "qwen_input_tokens": 0, "qwen_output_tokens": 0}
+    if with_decider:
+        counts.update(decider_rpc=0, decider_predict=0, decider_forward=0)
 
     def emit(component, **data):
         with lock:
@@ -212,7 +218,7 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
     browser = None
     started = time.perf_counter()
     rows = []
-    planned = len(suite.TASKS) * (2 if paired else 1) * repeats
+    planned = len(suite.TASKS) * (3 if with_decider else 2 if paired else 1) * repeats
     try:
         with measured("model_load"):
             lb = LayaBrowser.from_pretrained(str(SNAPSHOT), device="cuda", fast=False)
@@ -233,11 +239,36 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                 record["usage"] = result.get("usage")
                 return result
         lb.agent.predict = observed_predict
+        decider = decider_browser = None
+        if with_decider:
+            import decider_adapter
+            (output / "decider-source.py").write_bytes(Path(decider_adapter.__file__).read_bytes())
+            def decider_forward():
+                device = str(next(decider.native.m.parameters()).device)
+                if not device.startswith("cuda"):
+                    raise RuntimeError("Unexpected Decider CPU inference")
+                counts["decider_forward"] += 1
+                emit("decider_forward", device=device)
+            with measured("decider_model_load"):
+                decider = decider_adapter.DeciderPredictAdapter(emit, decider_forward)
+            decider_predict = decider.predict
+            def observed_decider_predict(state, questions):
+                counts["decider_predict"] += 1
+                with measured("decider_predict", questions=len(questions)) as record:
+                    result = decider_predict(state, questions)
+                    record["usage"] = result["usage"]
+                    return result
+            decider.predict = observed_decider_predict
+            decider_browser = LayaBrowser(decider)
         systemone = lb.systemone
         def observed_systemone(body):
-            counts["laya_rpc"] += 1
-            with measured("laya_rpc") as record:
-                result = systemone(body)
+            is_decider = with_decider and task["arm"] == "C"
+            component = "decider_rpc" if is_decider else "laya_rpc"
+            counts[component] += 1
+            with measured(component) as record:
+                result = decider_browser.systemone(body) if is_decider else systemone(body)
+                if is_decider:
+                    result["model"] = decider.native.name
                 record["answers"] = result["answers"]
                 return result
         lb.systemone = observed_systemone
@@ -247,6 +278,11 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
         sample = json.loads((SNAPSHOT / "code/sample_request.json").read_text(encoding="utf-8"))
         for _ in range(3):
             lb.systemone(sample)
+        if with_decider:
+            task["arm"] = "C"
+            for _ in range(3):
+                lb.systemone(sample)
+            task["arm"] = None
         executable = str(chromium) if chromium else subprocess.check_output(["node", "-e",
             "console.log(require('../benchmark/sources/jev-browser/node_modules/playwright').chromium.executablePath())"],
             cwd=ROOT, text=True).strip()
@@ -273,6 +309,8 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                 if remote:
                     record["request_body"] = json.loads(request.content)
                     record["network_route"] = proxy or "inherited"
+                elif with_decider:
+                    record["request_body"] = json.loads(request.content)
                 try:
                     response = send(request, *args, **kwargs)
                 except Exception:
@@ -281,6 +319,8 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                         add_usage(task["tokens"], None)
                     raise
                 record["http_status"] = response.status_code
+                if not remote and with_decider and response.is_success:
+                    record["model"] = response.json().get("model")
                 if remote:
                     record["response_headers"] = {k: v for k, v in response.headers.items()
                                                   if k.lower() in ("retry-after", "x-siliconcloud-trace-id")
@@ -342,7 +382,8 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                 return raw_cdp(method, **params)
             browser_module.cdp = isolated_cdp
         schedule = [(t, arm, rep) for rep in range(1, repeats + 1)
-                    for t, arm in (author_control.schedule(suite.TASKS, rep - 1) if paired else [(t, "B") for t in suite.TASKS])]
+                    for t, arm in (decider_adapter.schedule(suite.TASKS, rep - 1) if with_decider else
+                                   author_control.schedule(suite.TASKS, rep - 1) if paired else [(t, "B") for t in suite.TASKS])]
         manifest = {"source": REVISION, "engine": expected, "suite": "A", "repeats": repeats,
                     "paired": paired, "order": [{"task": t[0], "arm": arm, "repeat": rep} for t, arm, rep in schedule],
                     "controlled": controlled,
@@ -364,6 +405,9 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                     "enabled": {"undo_guard": True, "select_llm": True, "safe": False,
                                 "planner": False, "escalate": False, "verify_done": False, "macros": False},
                     "warmup_counts": dict(counts)}
+        if with_decider:
+            manifest.update(arms={"A": "pure Flash", "B": "Laya + Flash", "C": "Decider-2B + Flash"},
+                            decider=decider.metadata, decider_adapter_sha256=sha(Path(decider_adapter.__file__)))
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         for original_task, arm, repeat in schedule:
             task.update(name=original_task[0], arm=arm, repeat=repeat, initial=None,
@@ -425,7 +469,7 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                   "passed": sum(row["pass"] for row in rows), "counts_including_warmup": counts,
                   "session_wall_seconds": time.perf_counter() - started, "rows": rows}
         if paired:
-            report["comparison"] = author_control.compare(rows)
+            report["comparison"] = decider_adapter.compare(rows) if with_decider else author_control.compare(rows)
         (output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         events.close()
 
@@ -440,6 +484,7 @@ if __name__ == "__main__":
     parser.add_argument("--proxy", help="Explicit local HTTP proxy for the browser and text model; local services bypass it")
     parser.add_argument("--qwen-http-limit", type=int, help="Session HTTP cap, at most 360, including retries")
     parser.add_argument("--text-backend", choices=tuple(TEXT_BACKENDS), default="qwen")
+    parser.add_argument("--with-decider", action="store_true", help="Add the pinned Decider-2B C arm; keep original A/B paths")
     args = parser.parse_args()
     run(args.output.resolve(), args.chromium, args.paired, args.repeats, args.controlled, args.proxy,
-        args.qwen_http_limit, args.text_backend)
+        args.qwen_http_limit, args.text_backend, args.with_decider)
