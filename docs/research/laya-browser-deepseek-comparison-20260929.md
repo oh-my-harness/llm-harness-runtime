@@ -33,7 +33,7 @@ B 保留作者的输入压缩、截断、候选分块和已启用的执行保护
 | --- | --- |
 | 替换范围 | 原 SiliconFlow Qwen2.5-72B 改为 DeepSeek 官方 `deepseek-flash`，接口 `https://api.deepseek.com`；两组明确 `thinking.type=disabled`，沿用已验证的非思考模式 |
 | 任务和顺序 | 与原报告前两轮的 16 题、目标和 A/B 交替顺序完全一致；每次独立浏览器上下文 |
-| Laya | `cklxx/laya-browser` v19s，快照 `645cf366a2ae35f1086e8c20eff48f909bb49206`，BF16，`fast=False`，作者 1024/768 输入预算 |
+| Laya | `cklxx/laya-browser` v19s，mmBERT-base，**约 0.322B（322M，3.22 亿参数）**，规模依据[作者固定版本模型卡](https://huggingface.co/cklxx/laya-browser/blob/645cf366a2ae35f1086e8c20eff48f909bb49206/README.md)；快照 `645cf366a2ae35f1086e8c20eff48f909bb49206`，BF16，`fast=False`，作者 1024/768 输入预算 |
 | 引擎 | `browser-use/jev-ultrafast@1231850a0bf1a0c0341fe408ef1668dbbfdfac46`，同一作者补丁和两组共有空值修复；纯 LLM 组是我们补充的对照 |
 | 环境 | Windows、RTX 5070 Ti 16 GiB；Python 3.13.9、torch 2.11.0+cu128、Laya 0.3.21、transformers 5.17.0、browser-harness 0.1.13；相同 headless Chromium、1120×780 |
 | 公共生成参数 | temperature=0、top_p=1、max_tokens=1024、JSON 输出；Flash 请求和响应中的模型名均已核对 |
