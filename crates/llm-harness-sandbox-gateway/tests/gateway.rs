@@ -120,6 +120,19 @@ fn gateway_defaults_to_the_bwrap_backend() {
     assert!(matches!(config.backend(), GatewayBackend::Bwrap));
 }
 
+#[test]
+fn gateway_rejects_zero_principal_sandbox_quota() {
+    let mut principal = principal("tenant-a", TOKEN_A);
+    principal.max_active_sandboxes = Some(0);
+
+    let error = GatewayConfig::new(vec![principal]).expect_err("zero quota must be invalid");
+    assert!(
+        error
+            .to_string()
+            .contains("max_active_sandboxes for \"tenant-a\" must be positive"),
+    );
+}
+
 #[tokio::test]
 async fn gateway_enforces_per_principal_active_sandbox_quota() {
     let mut capped = principal("tenant-a", TOKEN_A);
