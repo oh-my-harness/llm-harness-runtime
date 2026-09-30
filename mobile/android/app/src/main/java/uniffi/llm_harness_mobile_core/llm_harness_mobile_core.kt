@@ -753,6 +753,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -776,6 +780,8 @@ fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_history(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_pollevent(
 ): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_readfile(
+): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sandboxid(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sandboxrecreated(
@@ -787,6 +793,8 @@ fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sessionid(
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_shutdown(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_steer(
+): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_uploadfile(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_create_session(
 ): Short
@@ -857,6 +865,8 @@ fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_history(`ptr`: Pointe
 ): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_pollevent(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_readfile(`ptr`: Pointer,`guestPath`: RustBuffer.ByValue,`binary`: Byte,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_sandboxid(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_sandboxrecreated(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -869,6 +879,8 @@ fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_shutdown(`ptr`: Point
 ): Long
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_steer(`ptr`: Pointer,`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_uploadfile(`ptr`: Pointer,`guestPath`: RustBuffer.ByValue,`content`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Long
 fun uniffi_llm_harness_mobile_core_fn_clone_mobilesessionmanager(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
 fun uniffi_llm_harness_mobile_core_fn_free_mobilesessionmanager(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -1023,6 +1035,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_pollevent() != 5697.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_readfile() != 27136.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sandboxid() != 55365.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1039,6 +1054,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_steer() != 13051.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_uploadfile() != 33464.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_create_session() != 56194.toShort()) {
@@ -1342,6 +1360,25 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
     }
 }
 
+/**
+ * @suppress
+ */
+public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
+    override fun read(buf: ByteBuffer): ByteArray {
+        val len = buf.getInt()
+        val byteArr = ByteArray(len)
+        buf.get(byteArr)
+        return byteArr
+    }
+    override fun allocationSize(value: ByteArray): ULong {
+        return 4UL + value.size.toULong()
+    }
+    override fun write(value: ByteArray, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        buf.put(value)
+    }
+}
+
 
 // This template implements a class for working with a Rust struct via a Pointer/Arc<T>
 // to the live Rust struct on the other side of the FFI.
@@ -1467,6 +1504,11 @@ public interface MobileSessionInterface {
      */
     fun `pollEvent`(): MobileEvent?
     
+    /**
+     * Read bytes from the sandbox. Text requests reject invalid UTF-8.
+     */
+    fun `readFile`(`guestPath`: kotlin.String, `binary`: kotlin.Boolean): kotlin.ByteArray
+    
     fun `sandboxId`(): kotlin.String
     
     /**
@@ -1492,6 +1534,14 @@ public interface MobileSessionInterface {
      * Send guidance to the running agent without starting a new turn.
      */
     fun `steer`(`text`: kotlin.String)
+    
+    /**
+     * Upload bytes into the sandbox, replacing the destination file.
+     *
+     * `guest_path` may be absolute or relative to the sandbox working
+     * directory. The gateway still enforces the sandbox path boundary.
+     */
+    fun `uploadFile`(`guestPath`: kotlin.String, `content`: kotlin.ByteArray): kotlin.ULong
     
     companion object
 }
@@ -1632,6 +1682,22 @@ open class MobileSession: Disposable, AutoCloseable, MobileSessionInterface
     }
     
 
+    
+    /**
+     * Read bytes from the sandbox. Text requests reject invalid UTF-8.
+     */
+    @Throws(MobileException::class)override fun `readFile`(`guestPath`: kotlin.String, `binary`: kotlin.Boolean): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_readfile(
+        it, FfiConverterString.lower(`guestPath`),FfiConverterBoolean.lower(`binary`),_status)
+}
+    }
+    )
+    }
+    
+
     override fun `sandboxId`(): kotlin.String {
             return FfiConverterString.lift(
     callWithPointer {
@@ -1725,6 +1791,25 @@ open class MobileSession: Disposable, AutoCloseable, MobileSessionInterface
 }
     }
     
+    
+
+    
+    /**
+     * Upload bytes into the sandbox, replacing the destination file.
+     *
+     * `guest_path` may be absolute or relative to the sandbox working
+     * directory. The gateway still enforces the sandbox path boundary.
+     */
+    @Throws(MobileException::class)override fun `uploadFile`(`guestPath`: kotlin.String, `content`: kotlin.ByteArray): kotlin.ULong {
+            return FfiConverterULong.lift(
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_uploadfile(
+        it, FfiConverterString.lower(`guestPath`),FfiConverterByteArray.lower(`content`),_status)
+}
+    }
+    )
+    }
     
 
     

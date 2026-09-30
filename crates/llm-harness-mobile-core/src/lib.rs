@@ -4,12 +4,17 @@
 //! The core owns no retry/persistence policy of its own — errors propagate to
 //! the caller (the UI) verbatim, per the MVP design spec.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Context as _;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use llm_harness_agent::harness::{AgentHarness, AgentHarnessOptions};
+use llm_harness_platform::sandbox::Sandbox;
 use llm_harness_sandbox_remote::{RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig};
 use llm_harness_tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 use llm_harness_types::{AgentMessage, ContentBlock, UserMessage};
@@ -142,7 +147,7 @@ impl MobileSession {
 
         let harness = Arc::new(match session_id.as_deref() {
             Some(id) => {
-                let storage = crate::manager::open_storage(&id).await?;
+                let storage = crate::manager::open_storage(id).await?;
                 AgentHarness::with_session(
                     llm_client,
                     env,
@@ -281,6 +286,61 @@ impl MobileSession {
         self.harness.abort();
     }
 
+    /// Upload bytes into the sandbox, replacing the destination file.
+    ///
+    /// `guest_path` may be absolute or relative to the sandbox working
+    /// directory. The gateway still enforces the sandbox path boundary.
+    #[uniffi::method(name = "uploadFile")]
+    pub fn upload_file(
+        self: Arc<Self>,
+        guest_path: String,
+        content: Vec<u8>,
+    ) -> Result<u64, MobileError> {
+        let path = resolve_sandbox_path(&self.sandbox.env(), &guest_path)?;
+        let size = u64::try_from(content.len()).map_err(|_| MobileError::Internal {
+            detail: "uploaded file is too large".to_owned(),
+        })?;
+        ensure_runtime()
+            .block_on(
+                self.sandbox
+                    .env()
+                    .write_file(&path, &content, CancellationToken::new()),
+            )
+            .map_err(|error| MobileError::Internal {
+                detail: format!("upload file {path:?}: {error:#}"),
+            })?;
+        Ok(size)
+    }
+
+    /// Read bytes from the sandbox. Text requests reject invalid UTF-8.
+    #[uniffi::method(name = "readFile")]
+    pub fn read_file(
+        self: Arc<Self>,
+        guest_path: String,
+        binary: bool,
+    ) -> Result<Vec<u8>, MobileError> {
+        let path = resolve_sandbox_path(&self.sandbox.env(), &guest_path)?;
+        let bytes = ensure_runtime()
+            .block_on(async {
+                if binary {
+                    self.sandbox
+                        .env()
+                        .read_binary_file(&path, CancellationToken::new())
+                        .await
+                } else {
+                    self.sandbox
+                        .env()
+                        .read_text_file(&path, CancellationToken::new())
+                        .await
+                        .map(String::into_bytes)
+                }
+            })
+            .map_err(|error| MobileError::Internal {
+                detail: format!("read file {path:?}: {error:#}"),
+            })?;
+        Ok(bytes)
+    }
+
     pub async fn shutdown(&self) -> Result<(), MobileError> {
         let sandbox = <RemoteSandbox as Clone>::clone(&self.sandbox);
         Ok(ensure_runtime()
@@ -325,6 +385,23 @@ fn sandbox_config(
         trust_profile,
         host_binds: Vec::new(),
     }
+}
+
+fn resolve_sandbox_path(
+    env: &Arc<dyn llm_harness_types::ExecutionEnv>,
+    guest_path: &str,
+) -> Result<PathBuf, MobileError> {
+    let value = guest_path.trim();
+    if value.is_empty() {
+        return Err(MobileError::Internal {
+            detail: "file path is empty".to_owned(),
+        });
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(env.working_dir().join(path))
 }
 
 /// Parse the FFI trust-profile string into the wire enum.
@@ -389,4 +466,38 @@ fn ensure_runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("build tokio runtime")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llm_harness_types::UnsupportedEnv;
+    use std::sync::Arc;
+
+    #[test]
+    fn resolves_relative_paths_against_sandbox_working_dir() {
+        let env: Arc<dyn llm_harness_types::ExecutionEnv> =
+            Arc::new(UnsupportedEnv::with_working_dir("/workspace"));
+        assert_eq!(
+            resolve_sandbox_path(&env, "result.txt").unwrap(),
+            PathBuf::from("/workspace/result.txt")
+        );
+    }
+
+    #[test]
+    fn keeps_absolute_guest_paths_unchanged() {
+        let env: Arc<dyn llm_harness_types::ExecutionEnv> =
+            Arc::new(UnsupportedEnv::with_working_dir("/workspace"));
+        assert_eq!(
+            resolve_sandbox_path(&env, "/workspace/result.txt").unwrap(),
+            PathBuf::from("/workspace/result.txt")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_file_paths() {
+        let env: Arc<dyn llm_harness_types::ExecutionEnv> =
+            Arc::new(UnsupportedEnv::with_working_dir("/workspace"));
+        assert!(resolve_sandbox_path(&env, "   ").is_err());
+    }
 }
