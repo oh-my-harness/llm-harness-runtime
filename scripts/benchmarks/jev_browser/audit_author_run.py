@@ -61,6 +61,27 @@ def audit(directory):
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     events = [json.loads(line) for line in (directory / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     rows = report["rows"]
+    kev = manifest.get("decision_backend") == "kev"
+    components = {**COMPONENTS, **({"kev_rpc": "kev_rpc_start", "kev_predict": "kev_predict_start",
+                                  "kev_forward": "kev_forward"} if kev else {})}
+    if kev:
+        from kev_service import MODEL
+        ledger = [json.loads(line) for line in (directory / "kev-events.jsonl").read_text(encoding="utf-8").splitlines()]
+        imported = [{k: v for k, v in e.items()} for e in events if "service_seq" in e]
+        if imported != ledger or [r["service_seq"] for r in ledger] != list(range(1, len(ledger) + 1)):
+            raise ValueError("Kev service ledger mismatch")
+        if any(r["counts"]["laya_rpc"] or (r["arm"] != "B" and r["counts"]["kev_rpc"]) for r in rows):
+            raise ValueError("Unexpected decision model arm")
+        for event in events:
+            if event["component"] == "kev_forward" and event.get("device") != "cuda:0":
+                raise ValueError("Kev CPU fallback")
+            if event["component"] == "decision_http" and event.get("http_status") == 200 and event.get("model") != MODEL:
+                raise ValueError("Kev model identity drift")
+        if manifest["kev"]["model"] != MODEL:
+            raise ValueError("Kev manifest model drift")
+    attempts = [json.loads(line) for line in (directory / "attempts.jsonl").read_text(encoding="utf-8").splitlines()]
+    if attempts != rows:
+        raise ValueError("Attempt ledger mismatch")
     if len(rows) != report["completed"] or report["completed"] + report["unstarted"] != len(manifest["order"]):
         raise ValueError("Attempt count mismatch")
     keys = ("task", "arm", "repeat") if "repeat" in manifest["order"][0] else ("task", "arm")
@@ -71,12 +92,12 @@ def audit(directory):
     for row in rows:
         attempt = [e for e in events if e["task"] == row["task"] and e.get("arm") == row["arm"]
                    and e.get("repeat", 1) == row.get("repeat", 1)]
-        for key, component in COMPONENTS.items():
+        for key, component in components.items():
             if row["counts"][key] != sum(e["component"] == component for e in attempt):
                 raise ValueError(f"Counter mismatch: {row['task']} {row['arm']} {key}")
         if row["arm"] == "A" and row["counts"]["laya_forward"]:
             raise ValueError("Pure text-model arm used Laya")
-    for key, component in COMPONENTS.items():
+    for key, component in components.items():
         if report["counts_including_warmup"][key] != sum(e["component"] == component for e in events):
             raise ValueError(f"Session counter mismatch: {key}")
     for arm in ("A", "B"):

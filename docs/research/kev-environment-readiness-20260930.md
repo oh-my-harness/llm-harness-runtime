@@ -1,6 +1,6 @@
 # Kev 环境准备与验收
 
-更新：2026-09-30 15:34 Asia/Shanghai。负责人：lqj。状态：本地模型环境与跨系统接口预检通过；正式 A/B 尚未启动，整场预算与计量接入仍待完成。
+更新：2026-09-30 18:50 Asia/Shanghai。负责人：lqj。状态：本地模型环境、跨系统接口及正式服务生命周期预检通过；预算和计量已接入，正式 A/B 准备启动。以下保留 15:34 的模型预检结果，文末补充正式接口验收，不把预检当成任务成绩。
 
 ## 范围
 
@@ -84,6 +84,8 @@ python -X utf8 scripts/benchmarks/jev_browser/kev_preflight.py probe --output lo
 - 当前证据足以说明该固定模型在本机可运行、能承接原客户端请求、可记录真实前向。下一步仅完成既有 A/B runner 的 Kev 组接入和计量验收，再冻结场次；正式实验仍比较纯 Flash 与 Kev+Flash，保留原任务、原 helper 和独立验收。
 
 ## 事实依据
+
+补充（2026-09-30 18:50）：正式 runner 已增加 `--decision-backend kev`，B 使用上述固定模型，A 保持原 Flash。服务预检 `logs/benchmarks/kev-service-smoke-20260930-02/smoke.json` 通过，4 次有效推理、1 次预期 HTTP 500，缓存清理后选择一致且进程正常关闭；均无 Flash 请求和网站任务。新增独立服务账本、开始/结束计数、实际前向、模型身份审计及失联中止逻辑。每题前清空前缀缓存，清理在任务计时外；任务内使用作者默认缓存。服务与客户端耗时是嵌套关系，不能相加两遍。正式条件见[计划](../experiment-fast-model-agent-loop.md)的 Kev 正式接入与对照节。
 
 - [Kev 仓库](https://github.com/jaredpalmer/kev)，本次下载源码 `0fe8fc97c2bcc247fa3efb6e5c32af4e99770e91`。
 - [Qwen3 旧版模型卡](https://github.com/jaredpalmer/kev/blob/0fe8fc97c2bcc247fa3efb6e5c32af4e99770e91/docs/model-cards/kev-4b-qwen3.md)。不是官方 Jev 权重，分类结果不能代替浏览器实验。

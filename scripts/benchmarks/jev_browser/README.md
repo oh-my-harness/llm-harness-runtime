@@ -71,6 +71,8 @@ python scripts/benchmarks/jev_browser/author_suite.py --paired --controlled --re
 
 ### DeepSeek Flash 同条件替换
 
+Kev 对照可在该命令增加 `--decision-backend kev`，替换 B 的 Laya，不增加 C 组。须先按 [Kev 环境记录](../../../docs/research/kev-environment-readiness-20260930.md)完成固定 WSL 环境，将 `KEV_WSL_PYTHON` 与 `KEV_HF_HOME` 设为 WSL 中已验收的绝对路径；`KEV_WSL_DISTRO` 默认为 Ubuntu-24.04。运行前可用 `python -X utf8 scripts/benchmarks/jev_browser/kev_service.py --smoke --output logs/benchmarks/NEW_KEV_SMOKE --port 18792` 检查原 Windows 客户端、错误计量和进程关闭，不调用 Flash。正式入口自动启动/关闭本地服务并保存 `kev-events.jsonl`；`audit_author_run.py` 对账独立服务日志和任务计数。失联停止场次，失败与未执行项不删除。`qwen_*` 仍是 Flash 的历史计数字段；Kev 单独使用 `kev_rpc/predict/forward`，不会计成 Laya。
+
 按 lqj 授权，以 `--text-backend deepseek-flash` 只替换两组的远端文本模型，保持上述作者模型、任务、提示、执行器和验收不变。密钥从 `DEEPSEEK_API_KEY` 读取；仅使用官方 `https://api.deepseek.com`，两组均显式 `thinking.type=disabled`，其余受控请求参数、代理和重试不变。原 Qwen 模式仍是默认值。
 
 ```powershell

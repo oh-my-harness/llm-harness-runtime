@@ -120,8 +120,17 @@ def validate_run_options(paired, repeats, controlled, proxy):
 
 
 def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=None, qwen_http_limit=None,
-        text_backend="qwen", with_decider=False):
+        text_backend="qwen", with_decider=False, decision_backend="laya"):
     validate_run_options(paired, repeats, controlled, proxy)
+    if decision_backend not in ("laya", "kev"):
+        raise ValueError("Unknown decision backend")
+    use_kev = decision_backend == "kev"
+    if use_kev and (with_decider or not paired or not controlled or text_backend != "deepseek-flash"):
+        raise ValueError("Kev replaces B in a controlled, paired Flash run; no third arm")
+    abort_types = (BudgetExhausted,)
+    if use_kev:
+        import kev_service
+        abort_types += (kev_service.KevUnavailable,)
     if with_decider and (not paired or not controlled or text_backend != "deepseek-flash"):
         raise ValueError("Decider comparison requires paired, controlled DeepSeek Flash mode")
     if with_decider:
@@ -193,6 +202,8 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
               "tools": 0, "qwen_input_tokens": 0, "qwen_output_tokens": 0}
     if with_decider:
         counts.update(decider_rpc=0, decider_predict=0, decider_forward=0)
+    if use_kev:
+        counts.update(dict.fromkeys(kev_service.COUNTERS, 0))
 
     def emit(component, **data):
         with lock:
@@ -216,29 +227,36 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
             emit(component, elapsed_ms=(time.perf_counter() - start) * 1000, **data)
 
     browser = None
+    kev = None
     started = time.perf_counter()
     rows = []
     planned = len(suite.TASKS) * (3 if with_decider else 2 if paired else 1) * repeats
     try:
-        with measured("model_load"):
-            lb = LayaBrowser.from_pretrained(str(SNAPSHOT), device="cuda", fast=False)
-        if lb.agent.cfg["max_len"] != 1024 or lb.agent.cfg["head_max_len"] != 768:
-            raise ValueError("Author defaults changed")
-        def forward_hook(module, args):
-            counts["laya_forward"] += 1
-            device = str(next(module.parameters()).device)
-            emit("laya_forward", device=device)
-            if not device.startswith("cuda"):
-                raise RuntimeError("Unexpected CPU inference")
-        lb.agent.model.register_forward_pre_hook(forward_hook)
-        predict = lb.agent.predict
-        def observed_predict(state, questions, *args, **kwargs):
-            counts["laya_predict"] += 1
-            with measured("laya_predict", questions=len(questions)) as record:
-                result = predict(state, questions, *args, **kwargs)
-                record["usage"] = result.get("usage")
-                return result
-        lb.agent.predict = observed_predict
+        if use_kev:
+            kev = kev_service.KevProcess(output, model_port, emit, counts)
+            kev_metadata = kev.start()
+            for module in (kev_service, kev_service.preflight):
+                (output / Path(module.__file__).name).write_bytes(Path(module.__file__).read_bytes())
+        else:
+            with measured("model_load"):
+                lb = LayaBrowser.from_pretrained(str(SNAPSHOT), device="cuda", fast=False)
+            if lb.agent.cfg["max_len"] != 1024 or lb.agent.cfg["head_max_len"] != 768:
+                raise ValueError("Author defaults changed")
+            def forward_hook(module, args):
+                counts["laya_forward"] += 1
+                device = str(next(module.parameters()).device)
+                emit("laya_forward", device=device)
+                if not device.startswith("cuda"):
+                    raise RuntimeError("Unexpected CPU inference")
+            lb.agent.model.register_forward_pre_hook(forward_hook)
+            predict = lb.agent.predict
+            def observed_predict(state, questions, *args, **kwargs):
+                counts["laya_predict"] += 1
+                with measured("laya_predict", questions=len(questions)) as record:
+                    result = predict(state, questions, *args, **kwargs)
+                    record["usage"] = result.get("usage")
+                    return result
+            lb.agent.predict = observed_predict
         decider = decider_browser = None
         if with_decider:
             import decider_adapter
@@ -260,24 +278,33 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                     return result
             decider.predict = observed_decider_predict
             decider_browser = LayaBrowser(decider)
-        systemone = lb.systemone
-        def observed_systemone(body):
-            is_decider = with_decider and task["arm"] == "C"
-            component = "decider_rpc" if is_decider else "laya_rpc"
-            counts[component] += 1
-            with measured(component) as record:
-                result = decider_browser.systemone(body) if is_decider else systemone(body)
-                if is_decider:
-                    result["model"] = decider.native.name
-                record["answers"] = result["answers"]
-                return result
-        lb.systemone = observed_systemone
-        threading.Thread(target=lb.serve, kwargs={"port": model_port}, daemon=True).start()
-        wait_http(model_url)
+        if not use_kev:
+            systemone = lb.systemone
+            def observed_systemone(body):
+                is_decider = with_decider and task["arm"] == "C"
+                component = "decider_rpc" if is_decider else "laya_rpc"
+                counts[component] += 1
+                with measured(component) as record:
+                    result = decider_browser.systemone(body) if is_decider else systemone(body)
+                    if is_decider:
+                        result["model"] = decider.native.name
+                    record["answers"] = result["answers"]
+                    return result
+            lb.systemone = observed_systemone
+            threading.Thread(target=lb.serve, kwargs={"port": model_port}, daemon=True).start()
+            wait_http(model_url)
         # Warm up with the same recorded request and repeat count as the author's verify.py.
         sample = json.loads((SNAPSHOT / "code/sample_request.json").read_text(encoding="utf-8"))
         for _ in range(3):
-            lb.systemone(sample)
+            if use_kev:
+                request = model_module.CLIENT.build_request("POST", model_url + "/v1/systemone", json=sample)
+                kev.decorate(request, task)
+                response = model_module.CLIENT.send(request)
+                response.raise_for_status()
+                kev_service.preflight.validate(sample["questions"], response.json())
+                kev.collect()
+            else:
+                lb.systemone(sample)
         if with_decider:
             task["arm"] = "C"
             for _ in range(3):
@@ -301,6 +328,10 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
             if destination not in (model_url + "/v1/systemone", text_base + "/chat/completions"):
                 raise RuntimeError("Unexpected model destination")
             remote = destination == text_base + "/chat/completions"
+            if not remote and use_kev:
+                if task["arm"] != "B":
+                    raise kev_service.KevUnavailable("Kev called outside B")
+                kev.decorate(request, task)
             if remote:
                 if counts["qwen_http"] >= qwen_limit:
                     raise BudgetExhausted("Text-model HTTP budget exhausted")
@@ -309,7 +340,7 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                 if remote:
                     record["request_body"] = json.loads(request.content)
                     record["network_route"] = proxy or "inherited"
-                elif with_decider:
+                elif with_decider or use_kev:
                     record["request_body"] = json.loads(request.content)
                 try:
                     response = send(request, *args, **kwargs)
@@ -317,10 +348,17 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                     if remote:
                         add_usage(counts, None)
                         add_usage(task["tokens"], None)
+                    elif use_kev:
+                        raise kev_service.KevUnavailable("Local inference connection failed") from None
                     raise
+                finally:
+                    if not remote and use_kev:
+                        kev.collect()
                 record["http_status"] = response.status_code
-                if not remote and with_decider and response.is_success:
+                if not remote and (with_decider or use_kev) and response.is_success:
                     record["model"] = response.json().get("model")
+                    if use_kev and record["model"] != kev_service.MODEL:
+                        raise kev_service.KevUnavailable("Kev model identity changed")
                 if remote:
                     record["response_headers"] = {k: v for k, v in response.headers.items()
                                                   if k.lower() in ("retry-after", "x-siliconcloud-trace-id")
@@ -396,7 +434,8 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                     "shared_null_guard_fix": paired, "isolated_browser_contexts": paired,
                     "cooperative_attempt_seconds": 180 if paired else None,
                     "tasks": [row[0] for row in suite.TASKS], "qwen": text_model, "qwen_http_limit": qwen_limit,
-                    "max_len": 1024, "head_max_len": 768, "fast": False, "device": str(lb.agent.device),
+                    "max_len": None if use_kev else 1024, "head_max_len": None if use_kev else 768,
+                    "fast": None if use_kev else False, "device": "cuda:0" if use_kev else str(lb.agent.device),
                     "python": sys.version, "torch": torch.__version__,
                     "packages": {n: importlib.metadata.version(n) for n in ("laya", "transformers", "browser-harness")},
                     "author_files_sha256": {p: sha(SNAPSHOT / p) for p in SOURCE_HASHES},
@@ -405,6 +444,9 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                     "enabled": {"undo_guard": True, "select_llm": True, "safe": False,
                                 "planner": False, "escalate": False, "verify_done": False, "macros": False},
                     "warmup_counts": dict(counts)}
+        if use_kev:
+            manifest.update(decision_backend="kev", arms={"A": "pure Flash", "B": "Kev-4B + Flash"},
+                            kev=kev_metadata, decision_budget=120, tool_step_budget=20)
         if with_decider:
             manifest.update(arms={"A": "pure Flash", "B": "Laya + Flash", "C": "Decider-2B + Flash"},
                             decider=decider.metadata, decider_adapter_sha256=sha(Path(decider_adapter.__file__)))
@@ -418,13 +460,18 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
                 with measured("context_setup"):
                     context["id"] = raw_cdp("Target.createBrowserContext", disposeOnDetach=True)["browserContextId"]
             before = dict(counts)
+            if use_kev:
+                with measured("kev_cache_reset"):
+                    kev.reset()
             attempt_started = time.perf_counter()
             task["deadline"] = attempt_started + 180 if paired else float("inf")
             exhausted = False
             try:
                 ok, steps, status, wall, final = suite.run(*original_task)
-            except BudgetExhausted:
-                ok, steps, status = False, None, "error:BudgetExhausted"
+            except abort_types as error:
+                if use_kev:
+                    kev.close()
+                ok, steps, status = False, None, "error:" + type(error).__name__
                 wall, final = time.perf_counter() - attempt_started, last_page.get("url", "")
                 exhausted = True
             passed = author_control.accepted(ok, status, task["name"], last_page) if paired else ok
@@ -450,6 +497,8 @@ def run(output, chromium=None, paired=False, repeats=1, controlled=False, proxy=
     finally:
         task["name"] = "cleanup"
         os.environ.pop("TEXT_MODEL_API_KEY", None)
+        if kev is not None:
+            kev.close()
         if browser is not None:
             try:
                 from browser_harness.helpers import cdp
@@ -485,6 +534,7 @@ if __name__ == "__main__":
     parser.add_argument("--qwen-http-limit", type=int, help="Session HTTP cap, at most 360, including retries")
     parser.add_argument("--text-backend", choices=tuple(TEXT_BACKENDS), default="qwen")
     parser.add_argument("--with-decider", action="store_true", help="Add the pinned Decider-2B C arm; keep original A/B paths")
+    parser.add_argument("--decision-backend", choices=("laya", "kev"), default="laya", help="Replace B's decision model")
     args = parser.parse_args()
     run(args.output.resolve(), args.chromium, args.paired, args.repeats, args.controlled, args.proxy,
-        args.qwen_http_limit, args.text_backend, args.with_decider)
+        args.qwen_http_limit, args.text_backend, args.with_decider, args.decision_backend)
