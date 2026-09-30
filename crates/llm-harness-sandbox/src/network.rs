@@ -148,6 +148,97 @@ impl NetworkSetup {
     pub fn guest_ip(&self) -> Ipv4Addr {
         self.guest_ip
     }
+
+    pub fn setup_commands(&self) -> Vec<Vec<String>> {
+        vec![
+            vec![
+                "ip".into(),
+                "netns".into(),
+                "add".into(),
+                self.namespace.clone(),
+            ],
+            vec![
+                "ip".into(),
+                "link".into(),
+                "add".into(),
+                self.veth.clone(),
+                "type".into(),
+                "veth".into(),
+                "peer".into(),
+                "name".into(),
+                "eth0".into(),
+            ],
+            vec![
+                "ip".into(),
+                "link".into(),
+                "set".into(),
+                "eth0".into(),
+                "netns".into(),
+                self.namespace.clone(),
+            ],
+            vec![
+                "ip".into(),
+                "address".into(),
+                "add".into(),
+                format!("{}/30", self.host_ip),
+                "dev".into(),
+                self.veth.clone(),
+            ],
+            vec![
+                "ip".into(),
+                "link".into(),
+                "set".into(),
+                self.veth.clone(),
+                "up".into(),
+            ],
+            vec![
+                "ip".into(),
+                "netns".into(),
+                "exec".into(),
+                self.namespace.clone(),
+                "ip".into(),
+                "link".into(),
+                "set".into(),
+                "lo".into(),
+                "up".into(),
+            ],
+            vec![
+                "ip".into(),
+                "netns".into(),
+                "exec".into(),
+                self.namespace.clone(),
+                "ip".into(),
+                "address".into(),
+                "add".into(),
+                format!("{}/30", self.guest_ip),
+                "dev".into(),
+                "eth0".into(),
+            ],
+            vec![
+                "ip".into(),
+                "netns".into(),
+                "exec".into(),
+                self.namespace.clone(),
+                "ip".into(),
+                "link".into(),
+                "set".into(),
+                "eth0".into(),
+                "up".into(),
+            ],
+            vec![
+                "ip".into(),
+                "netns".into(),
+                "exec".into(),
+                self.namespace.clone(),
+                "ip".into(),
+                "route".into(),
+                "replace".into(),
+                "default".into(),
+                "via".into(),
+                self.host_ip.to_string(),
+            ],
+        ]
+    }
 }
 
 fn validate_resource_id(resource_id: &str) -> anyhow::Result<()> {
@@ -305,5 +396,29 @@ mod tests {
         assert!(NetworkSetup::new("../escape").is_err());
         assert!(NetworkSetup::new("").is_err());
         assert!(NetworkSetup::new(&"a".repeat(49)).is_err());
+    }
+
+    #[test]
+    fn setup_builds_deterministic_network_commands() {
+        let setup = NetworkSetup::new("sandbox-1").unwrap();
+        let commands = setup.setup_commands();
+        assert!(commands.contains(&vec![
+            "ip".to_string(),
+            "netns".to_string(),
+            "add".to_string(),
+            setup.namespace().to_string(),
+        ]));
+        assert!(commands.contains(&vec![
+            "ip".to_string(),
+            "netns".to_string(),
+            "exec".to_string(),
+            setup.namespace().to_string(),
+            "ip".to_string(),
+            "route".to_string(),
+            "replace".to_string(),
+            "default".to_string(),
+            "via".to_string(),
+            setup.host_ip().to_string(),
+        ]));
     }
 }
