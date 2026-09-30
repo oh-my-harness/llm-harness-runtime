@@ -52,6 +52,11 @@ fun AppNavHost(viewModel: AppViewModel, startOnSetup: Boolean, modifier: Modifie
                     viewModel.send(text)
                     input = ""
                 },
+                onStop = viewModel::stop,
+                onSteer = { text ->
+                    viewModel.steer(text)
+                    input = ""
+                },
                 onRetry = viewModel::retry,
                 onSessions = { navController.navigate(Routes.SESSIONS) },
                 onSettings = { navController.navigate(Routes.SETTINGS) },

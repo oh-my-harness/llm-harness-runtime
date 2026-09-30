@@ -61,6 +61,12 @@ fn drops_non_displayable_events() {
 }
 
 #[test]
+fn maps_harness_abort_to_run_aborted() {
+    let mobile = map_event(&Arc::new(AgentHarnessEvent::Aborted)).expect("abort must map");
+    assert!(matches!(mobile, MobileEvent::RunAborted));
+}
+
+#[test]
 fn tool_finished_summary_is_first_line_truncated() {
     let result = ToolResult::full(
         vec![DataBlock::Text {

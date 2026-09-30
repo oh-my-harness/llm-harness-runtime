@@ -749,6 +749,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -766,6 +770,8 @@ internal interface IntegrityCheckingUniffiLib : Library {
     // Integrity check functions only
     fun uniffi_llm_harness_mobile_core_checksum_func_connect(
 ): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_abort(
+): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_history(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_pollevent(
@@ -779,6 +785,8 @@ fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_send(
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sessionid(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_shutdown(
+): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_steer(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_create_session(
 ): Short
@@ -843,6 +851,8 @@ internal interface UniffiLib : Library {
 ): Pointer
 fun uniffi_llm_harness_mobile_core_fn_free_mobilesession(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_abort(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_history(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_pollevent(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -857,6 +867,8 @@ fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_sessionid(`ptr`: Poin
 ): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_shutdown(`ptr`: Pointer,
 ): Long
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_steer(`ptr`: Pointer,`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_llm_harness_mobile_core_fn_clone_mobilesessionmanager(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
 fun uniffi_llm_harness_mobile_core_fn_free_mobilesessionmanager(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -1002,6 +1014,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_llm_harness_mobile_core_checksum_func_connect() != 34237.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_abort() != 1536.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_history() != 4701.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1021,6 +1036,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_shutdown() != 37921.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_steer() != 13051.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_create_session() != 56194.toShort()) {
@@ -1433,6 +1451,11 @@ public object FfiConverterString: FfiConverter<String, RustBuffer.ByValue> {
 public interface MobileSessionInterface {
     
     /**
+     * Cancel the current run. Completion is observed through `RunAborted`.
+     */
+    fun `abort`()
+    
+    /**
      * Replay persisted history (read-only bubbles; new events continue from
      * here). Empty for ad-hoc sessions. Sync on purpose — see the manager
      * methods: foreign-driven futures needing the reactor deadlock.
@@ -1464,6 +1487,11 @@ public interface MobileSessionInterface {
     fun `sessionId`(): kotlin.String?
     
     suspend fun `shutdown`()
+    
+    /**
+     * Send guidance to the running agent without starting a new turn.
+     */
+    fun `steer`(`text`: kotlin.String)
     
     companion object
 }
@@ -1556,6 +1584,20 @@ open class MobileSession: Disposable, AutoCloseable, MobileSessionInterface
             UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_clone_mobilesession(pointer!!, status)
         }
     }
+
+    
+    /**
+     * Cancel the current run. Completion is observed through `RunAborted`.
+     */override fun `abort`()
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_abort(
+        it, _status)
+}
+    }
+    
+    
 
     
     /**
@@ -1669,6 +1711,21 @@ open class MobileSession: Disposable, AutoCloseable, MobileSessionInterface
         MobileException.ErrorHandler,
     )
     }
+
+    
+    /**
+     * Send guidance to the running agent without starting a new turn.
+     */
+    @Throws(MobileException::class)override fun `steer`(`text`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_steer(
+        it, FfiConverterString.lower(`text`),_status)
+}
+    }
+    
+    
 
     
 
@@ -2341,6 +2398,12 @@ sealed class MobileEvent {
     
     
     /**
+     * The run was cancelled by the user.
+     */
+    object RunAborted : MobileEvent()
+    
+    
+    /**
      * The run failed; message is display-ready.
      */
     data class Failed(
@@ -2371,7 +2434,8 @@ public object FfiConverterTypeMobileEvent : FfiConverterRustBuffer<MobileEvent>{
                 FfiConverterString.read(buf),
                 )
             4 -> MobileEvent.RunFinished
-            5 -> MobileEvent.Failed(
+            5 -> MobileEvent.RunAborted
+            6 -> MobileEvent.Failed(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -2403,6 +2467,12 @@ public object FfiConverterTypeMobileEvent : FfiConverterRustBuffer<MobileEvent>{
             )
         }
         is MobileEvent.RunFinished -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+            )
+        }
+        is MobileEvent.RunAborted -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
                 4UL
@@ -2440,8 +2510,12 @@ public object FfiConverterTypeMobileEvent : FfiConverterRustBuffer<MobileEvent>{
                 buf.putInt(4)
                 Unit
             }
-            is MobileEvent.Failed -> {
+            is MobileEvent.RunAborted -> {
                 buf.putInt(5)
+                Unit
+            }
+            is MobileEvent.Failed -> {
+                buf.putInt(6)
                 FfiConverterString.write(value.`message`, buf)
                 Unit
             }

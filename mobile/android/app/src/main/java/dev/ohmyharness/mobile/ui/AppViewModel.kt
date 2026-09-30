@@ -83,6 +83,21 @@ class AppViewModel(
         session.send(text)
     }
 
+    fun steer(text: String) {
+        val session = activeSession() ?: return
+        val id = _uiState.value.activeSessionId ?: return
+        appendSystem(id, "steer: $text")
+        try {
+            session.steer(text)
+        } catch (e: Exception) {
+            appendSystem(id, "steer failed: ${e.message}")
+        }
+    }
+
+    fun stop() {
+        activeSession()?.abort()
+    }
+
     fun newSession(name: String) {
         viewModelScope.launch {
             try {
@@ -205,6 +220,10 @@ class AppViewModel(
             }
             is MobileEvent.Failed -> appendSystem(sessionId, event.message)
             is MobileEvent.RunFinished -> finishStreaming(sessionId)
+            is MobileEvent.RunAborted -> {
+                appendSystem(sessionId, "run aborted")
+                finishStreaming(sessionId)
+            }
         }
     }
 

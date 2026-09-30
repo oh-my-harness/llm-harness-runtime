@@ -12,6 +12,7 @@ use tokio::sync::broadcast;
 use llm_harness_agent::harness::{AgentHarness, AgentHarnessOptions};
 use llm_harness_sandbox_remote::{RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig};
 use llm_harness_tools::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
+use llm_harness_types::{AgentMessage, ContentBlock, UserMessage};
 
 mod events;
 pub mod manager;
@@ -259,6 +260,25 @@ impl MobileSession {
                 });
             }
         });
+    }
+
+    /// Send guidance to the running agent without starting a new turn.
+    #[uniffi::method(name = "steer")]
+    pub fn steer(self: Arc<Self>, text: String) -> Result<(), MobileError> {
+        self.harness
+            .steer_message(AgentMessage::User(UserMessage {
+                content: vec![ContentBlock::Text { text }],
+                timestamp: chrono::Utc::now(),
+            }))
+            .map_err(|error| MobileError::Internal {
+                detail: error.to_string(),
+            })
+    }
+
+    /// Cancel the current run. Completion is observed through `RunAborted`.
+    #[uniffi::method(name = "abort")]
+    pub fn abort(self: Arc<Self>) {
+        self.harness.abort();
     }
 
     pub async fn shutdown(&self) -> Result<(), MobileError> {

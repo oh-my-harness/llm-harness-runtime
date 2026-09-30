@@ -33,6 +33,8 @@ fun ChatScreen(
     inputText: String,
     onInput: (String) -> Unit,
     onSend: (String) -> Unit,
+    onStop: () -> Unit,
+    onSteer: (String) -> Unit,
     onRetry: () -> Unit,
     onSessions: () -> Unit,
     onSettings: () -> Unit,
@@ -64,6 +66,8 @@ fun ChatScreen(
             value = inputText,
             onValueChange = onInput,
             onSend = onSend,
+            onStop = onStop,
+            onSteer = onSteer,
             streaming = messages.lastOrNull() is ChatMessage.Assistant &&
                 (messages.lastOrNull() as ChatMessage.Assistant).isStreaming,
         )

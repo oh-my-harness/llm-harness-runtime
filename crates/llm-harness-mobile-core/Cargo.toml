@@ -14,6 +14,7 @@ llm-harness-types.workspace = true
 llm-harness-platform.workspace = true
 llm_adapter.workspace = true
 llm-harness-tools.workspace = true
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

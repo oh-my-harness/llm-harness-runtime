@@ -2510,13 +2510,16 @@ name = "llm-harness-mobile-core"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "llm-harness-agent",
  "llm-harness-platform",
  "llm-harness-sandbox-remote",
  "llm-harness-tools",
  "llm-harness-types",
  "llm_adapter",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",

@@ -11,6 +11,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -27,6 +28,7 @@ fun InputBar(
     onValueChange: (String) -> Unit,
     onSend: (String) -> Unit,
     onStop: () -> Unit = {},
+    onSteer: (String) -> Unit = {},
     streaming: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
@@ -46,6 +48,10 @@ fun InputBar(
             Icon(Icons.Filled.Add, contentDescription = "voice (coming soon)")
         }
         if (streaming) {
+            TextButton(
+                onClick = { if (value.isNotBlank()) onSteer(value.trim()) },
+                enabled = enabled && value.isNotBlank(),
+            ) { Text("Steer") }
             IconButton(onClick = onStop, enabled = enabled) {
                 Icon(Icons.Filled.Close, contentDescription = "stop")
             }

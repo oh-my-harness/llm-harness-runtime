@@ -25,6 +25,8 @@ pub enum MobileEvent {
         full_output: String,
     },
     RunFinished,
+    /// The run was cancelled by the user.
+    RunAborted,
     /// The run failed; message is display-ready.
     Failed {
         message: String,
@@ -33,10 +35,11 @@ pub enum MobileEvent {
 
 /// Map one harness event to zero or one mobile event.
 pub fn map_event(event: &Arc<AgentHarnessEvent>) -> Option<MobileEvent> {
-    let AgentHarnessEvent::Agent(agent_event) = event.as_ref() else {
-        return None;
-    };
-    map_agent_event(agent_event)
+    match event.as_ref() {
+        AgentHarnessEvent::Agent(agent_event) => map_agent_event(agent_event),
+        AgentHarnessEvent::Aborted => Some(MobileEvent::RunAborted),
+        _ => None,
+    }
 }
 
 /// Map a raw loop event; also used directly by unit tests.
