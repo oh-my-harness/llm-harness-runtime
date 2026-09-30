@@ -50,9 +50,24 @@ impl FirecrackerImageAllocator {
         &self,
         destination_path: impl AsRef<Path>,
     ) -> Result<FirecrackerImage, FirecrackerImageError> {
+        self.allocate_with_capacity(destination_path, None)
+    }
+
+    pub fn allocate_with_capacity(
+        &self,
+        destination_path: impl AsRef<Path>,
+        max_bytes: Option<u64>,
+    ) -> Result<FirecrackerImage, FirecrackerImageError> {
         let destination_path = destination_path.as_ref();
         validate_absolute_path("base image", &self.base_image_path)?;
         validate_absolute_path("destination image", destination_path)?;
+        if let Some(max_bytes) = max_bytes
+            && max_bytes == 0
+        {
+            return Err(FirecrackerImageError::new(
+                "image capacity must be positive",
+            ));
+        }
 
         let parent_path = destination_path.parent().ok_or_else(|| {
             FirecrackerImageError::new("destination image path must have a parent directory")
@@ -63,10 +78,30 @@ impl FirecrackerImageAllocator {
         if source_metadata.len() == 0 {
             return Err(FirecrackerImageError::new("base image must not be empty"));
         }
+        if let Some(max_bytes) = max_bytes
+            && source_metadata.len() > max_bytes
+        {
+            return Err(FirecrackerImageError::new(format!(
+                "base image size {} exceeds requested image capacity {max_bytes}",
+                source_metadata.len()
+            )));
+        }
 
         let (mut destination, file_name) = create_destination_file(&parent, destination_path)?;
         let allocation_result = copy_and_sync(&mut source, &mut destination, &parent);
         if let Err(error) = allocation_result {
+            let _ = unlink_file(&parent, &file_name);
+            let _ = parent.sync_all();
+            return Err(error);
+        }
+        let resize_result = match max_bytes {
+            Some(max_bytes) if max_bytes > source_metadata.len() => {
+                resize_image(&mut destination, max_bytes)
+                    .and_then(|()| destination.sync_all().map_err(FirecrackerImageError::from))
+            }
+            _ => Ok(()),
+        };
+        if let Err(error) = resize_result {
             let _ = unlink_file(&parent, &file_name);
             let _ = parent.sync_all();
             return Err(error);
@@ -79,6 +114,45 @@ impl FirecrackerImageAllocator {
             removed: false,
         })
     }
+}
+
+fn resize_image(image: &mut File, max_bytes: u64) -> Result<(), FirecrackerImageError> {
+    let image_path = read_proc_fd_path(image)?;
+    image
+        .set_len(max_bytes)
+        .map_err(FirecrackerImageError::from)?;
+    let output = std::process::Command::new("resize2fs")
+        .arg("-f")
+        .arg(&image_path)
+        .arg(format!("{}M", max_bytes / (1024 * 1024)))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| {
+            FirecrackerImageError::new(format!(
+                "failed to run resize2fs to set image capacity: {error}"
+            ))
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(FirecrackerImageError::new(format!(
+            "resize2fs failed with status {:?}: {}{}",
+            output.status.code(),
+            stdout.trim_end(),
+            stderr.trim_end()
+        )));
+    }
+    Ok(())
+}
+
+fn read_proc_fd_path(image: &File) -> Result<PathBuf, FirecrackerImageError> {
+    let raw_fd = image.as_raw_fd();
+    let link = format!("/proc/self/fd/{raw_fd}");
+    std::fs::read_link(link).map_err(|error| {
+        FirecrackerImageError::new(format!(
+            "failed to resolve image path for resize2fs: {error}"
+        ))
+    })
 }
 
 #[derive(Debug)]
@@ -290,6 +364,24 @@ mod tests {
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         image.remove().expect("remove image");
         assert!(!destination_path.exists());
+    }
+
+    #[test]
+    fn allocate_rejects_base_image_larger_than_capacity() {
+        let root = tempfile::tempdir().expect("temp directory");
+        let base_image = write_base_image(root.path());
+        let destination = root.path().join("rootfs.ext4");
+
+        let error = FirecrackerImageAllocator::new(&base_image)
+            .allocate_with_capacity(&destination, Some(8))
+            .expect_err("base image larger than capacity");
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds requested image capacity")
+        );
+        assert!(!destination.exists());
     }
 
     #[test]

@@ -46,6 +46,17 @@ gateway 默认绑定 `127.0.0.1:7080`。生产部署应继续绑定内网地址�
 
 `requests_per_minute` 是可选的每 principal 固定窗口限流。省略表示不限制；设置为 `0` 会被拒绝。公网或移动端入口建议显式设置。
 
+Firecracker 后端可增加 `max_disk_mib`：
+
+```json
+"backend": {
+  "type": "firecracker",
+  "max_disk_mib": 2048
+}
+```
+
+省略该字段时，客户端请求 `max_disk_mb` 会被拒绝；配置后，请求中的 `max_disk_mb` 不能超过这个硬上限。分配的 Firecracker rootfs 是按沙箱复制的 ext4 镜像，`max_disk_mb` 表示 rootfs 文件系统容量（MiB），必须不小于基础镜像实际大小。扩容需要宿主机安装并允许执行 `resize2fs`。
+
 `fs/upload` 允许移动端或控制服务一次预置最多 32 个文件，二进制仍使用 Base64；请求 body 也受 `max_request_bytes` 限制。失败时不回滚已写入文件，客户端可依赖错误响应中的 guest path 定位失败项。
 
 `work_root` 必须是绝对路径，并且权限必须是 `0700`：

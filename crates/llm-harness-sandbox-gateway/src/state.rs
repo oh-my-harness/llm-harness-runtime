@@ -499,6 +499,12 @@ impl FirecrackerSandbox {
             *vsock_guest_cid,
         )
         .with_guest_agent_port(backend.guest_agent_port)
+        .with_image_capacity(
+            limits
+                .max_disk_mb
+                .and_then(|value| u64::try_from(value).ok())
+                .map(|value| value.saturating_mul(1024 * 1024)),
+        )
         .with_readiness_timeout(backend.readiness_timeout))
     }
 
@@ -1259,8 +1265,20 @@ fn validate_firecracker_policies(
     if limits.max_processes.is_some() {
         anyhow::bail!("Firecracker backend does not support max_processes");
     }
-    if limits.max_disk_mb.is_some() {
-        anyhow::bail!("Firecracker backend does not support max_disk_mb");
+    if limits.max_disk_mb.is_some() && backend.max_disk_mib.is_none() {
+        anyhow::bail!(
+            "Firecracker backend does not configure max_disk_mib, so max_disk_mb is unsupported"
+        );
+    }
+    if let Some(max_disk_mb) = limits.max_disk_mb
+        && let Some(max_disk_mib) = backend.max_disk_mib
+        && u64::try_from(max_disk_mb).unwrap_or(u64::MAX) > u64::from(max_disk_mib)
+    {
+        anyhow::bail!(
+            "Firecracker max_disk_mb {} exceeds backend maximum {}",
+            max_disk_mb,
+            max_disk_mib
+        );
     }
     if let Some(max_cpus) = limits.max_cpus {
         let max_cpus = u32::try_from(max_cpus)
