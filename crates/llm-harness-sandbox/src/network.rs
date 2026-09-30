@@ -53,22 +53,12 @@ impl NetworkPolicy {
             let host = rule.host.trim();
             anyhow::ensure!(!host.is_empty(), "network allowlist host cannot be empty");
             let (target, prefix) = parse_ip_or_cidr(host)?;
-            validate_global_ip(&target)?;
+            validate_global_ip(&target, prefix.is_some())?;
             if let Some(prefix) = prefix {
                 let maximum = if target.is_ipv4() { 32 } else { 128 };
                 anyhow::ensure!(
                     prefix < maximum,
                     "single-address CIDR {host:?} must use an IP literal"
-                );
-            } else {
-                anyhow::ensure!(
-                    !matches!(target, IpAddr::V4(Ipv4Addr::LOCALHOST))
-                        && !matches!(target, IpAddr::V6(address) if address.is_loopback()),
-                    "loopback network allowlists are not supported"
-                );
-                anyhow::ensure!(
-                    !is_private_ip(&target),
-                    "private network allowlists are not supported from sandboxes"
                 );
             }
 
@@ -88,7 +78,7 @@ impl NetworkPolicy {
 
         let mut validated_dns = Vec::with_capacity(dns_servers.len());
         for address in dns_servers {
-            validate_global_ip(address)?;
+            validate_global_ip(address, false)?;
             if !validated_dns.contains(address) {
                 validated_dns.push(*address);
             }
@@ -325,7 +315,7 @@ fn parse_ip_or_cidr(host: &str) -> anyhow::Result<(IpAddr, Option<u8>)> {
     }
 }
 
-fn validate_global_ip(address: &IpAddr) -> anyhow::Result<()> {
+fn validate_global_ip(address: &IpAddr, is_cidr: bool) -> anyhow::Result<()> {
     let valid = match address {
         IpAddr::V4(address) => {
             !(address.is_private()
@@ -333,32 +323,38 @@ fn validate_global_ip(address: &IpAddr) -> anyhow::Result<()> {
                 || address.is_link_local()
                 || address.is_multicast()
                 || address.is_unspecified()
-                || address.is_broadcast())
+                || address.is_broadcast()
+                || address.is_documentation())
         }
         IpAddr::V6(address) => {
             !(address.is_loopback()
                 || address.is_multicast()
                 || address.is_unspecified()
+                || is_documentation(address)
                 || is_unicast_link_local(address)
                 || is_unique_local(address))
         }
     };
     anyhow::ensure!(
         valid,
-        "network allowlist target {address} must be globally routable"
+        if is_cidr {
+            "network allowlist CIDR {address:?} must cover globally routable addresses"
+        } else {
+            "network allowlist target {address} must be globally routable"
+        }
     );
     Ok(())
 }
 
-fn is_private_ip(address: &IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => address.is_private() || address.is_loopback(),
-        IpAddr::V6(address) => address.is_loopback() || is_unique_local(address),
-    }
-}
-
 fn is_unique_local(address: &Ipv6Addr) -> bool {
     address.segments()[0] & 0xfe00 == 0xfc00
+}
+
+fn is_documentation(address: &Ipv6Addr) -> bool {
+    address.octets()[0] == 0x20
+        && address.octets()[1] == 0x01
+        && address.octets()[2] == 0x0d
+        && address.octets()[3] == 0xb8
 }
 
 fn is_unicast_link_local(address: &Ipv6Addr) -> bool {
@@ -399,17 +395,17 @@ mod tests {
     fn accepts_global_ips_and_cidrs() {
         let policy = NetworkPolicy::new(
             &[
-                rule("203.0.113.10", Some((443, 443))),
-                rule("2001:db8:10::/48", None),
+                rule("8.8.4.4", Some((443, 443))),
+                rule("2606:4700:4700::/64", None),
             ],
             &[],
         )
         .unwrap();
 
         assert_eq!(policy.rules().len(), 2);
-        assert_eq!(policy.rules()[0].target().to_string(), "203.0.113.10");
+        assert_eq!(policy.rules()[0].target().to_string(), "8.8.4.4");
         assert_eq!(policy.rules()[0].ports(), (443, 443));
-        assert_eq!(policy.rules()[1].prefix(), Some(48));
+        assert_eq!(policy.rules()[1].prefix(), Some(64));
     }
 
     #[test]
@@ -417,12 +413,15 @@ mod tests {
         for rule in [
             rule("api.example.com", None),
             rule("192.168.1.10", None),
+            rule("192.168.0.0/24", None),
+            rule("127.0.0.0/8", None),
             rule("203.0.113.0/0", None),
             rule("0.0.0.0/0", None),
+            rule("2001:db8::/32", None),
             rule("203.0.113.10/32", None),
             rule("127.0.0.1", None),
-            rule("203.0.113.10", Some((0, 443))),
-            rule("203.0.113.10", Some((443, 80))),
+            rule("8.8.4.4", Some((0, 443))),
+            rule("8.8.4.4", Some((443, 80))),
         ] {
             assert!(
                 NetworkPolicy::new(&[rule], &[]).is_err(),
@@ -435,11 +434,8 @@ mod tests {
     fn rejects_empty_allowlist_and_private_dns() {
         assert!(NetworkPolicy::new(&[], &[]).is_err());
         assert!(
-            NetworkPolicy::new(
-                &[rule("203.0.113.10", None)],
-                &["192.168.0.53".parse().unwrap()]
-            )
-            .is_err()
+            NetworkPolicy::new(&[rule("8.8.4.4", None)], &["192.168.0.53".parse().unwrap()])
+                .is_err()
         );
     }
 
@@ -491,7 +487,7 @@ mod tests {
     #[test]
     fn policy_builds_nftables_default_deny_rules() {
         let policy = NetworkPolicy::new(
-            &[rule("203.0.113.10", Some((443, 443)))],
+            &[rule("1.1.1.1", Some((443, 443)))],
             &["8.8.8.8".parse().unwrap()],
         )
         .unwrap();
@@ -506,18 +502,18 @@ mod tests {
         assert!(script.contains("ct state established,related accept"));
         assert!(script.contains("ip daddr 8.8.8.8 udp dport 53 accept"));
         assert!(script.contains("ip daddr 8.8.8.8 tcp dport 53 accept"));
-        assert!(script.contains("ip daddr 203.0.113.10 tcp dport 443 accept"));
-        assert!(script.contains("ip daddr 203.0.113.10 udp dport 443 accept"));
+        assert!(script.contains("ip daddr 1.1.1.1 tcp dport 443 accept"));
+        assert!(script.contains("ip daddr 1.1.1.1 udp dport 443 accept"));
         assert!(!script.contains("flush ruleset"));
     }
 
     #[test]
     fn policy_handles_ipv6_cidrs() {
-        let policy = NetworkPolicy::new(&[rule("2001:db8:10::/48", None)], &[]).unwrap();
+        let policy = NetworkPolicy::new(&[rule("2606:4700:4700::/64", None)], &[]).unwrap();
         let setup = NetworkSetup::new("sandbox-1").unwrap();
         let script = setup.nftables_script(&policy);
 
-        assert!(script.contains("ip6 daddr 2001:db8:10::/48 tcp dport 1-65535 accept"));
-        assert!(script.contains("ip6 daddr 2001:db8:10::/48 udp dport 1-65535 accept"));
+        assert!(script.contains("ip6 daddr 2606:4700:4700::/64 tcp dport 1-65535 accept"));
+        assert!(script.contains("ip6 daddr 2606:4700:4700::/64 udp dport 1-65535 accept"));
     }
 }
