@@ -64,7 +64,7 @@
 
 ## llm-harness-sandbox-gateway
 
-Linux 远程沙箱网关。默认复用 `BwrapSandbox` 的 namespace/capability 隔离，也可选择内置的 Linux Firecracker 后端。gateway 提供 Bearer 认证、principal 到 sandbox 的租户绑定、执行超时与输出上限、reset/delete/start 生命周期，以及持久化 registry 和重启恢复；Firecracker 的网络策略和真实部署验证仍未完成。该实现仍需部署级 TLS 终止、cgroup v2 环境验证和运维审计闭环。
+Linux 远程沙箱网关。默认复用 `BwrapSandbox` 的 namespace/capability 隔离，也可选择内置的 Linux Firecracker 后端。gateway 提供 Bearer 认证、principal 到 sandbox 的租户绑定、执行超时与输出上限、reset/delete/start 生命周期、持久化 registry 和重启恢复，以及 JSONL hash-chain 请求审计；Firecracker 的网络策略和真实部署验证仍未完成。该实现仍需部署级 TLS 终止和 cgroup v2 环境验证。
 
 远程沙箱协议客户端，实现 `Sandbox` / `ExecutionEnv` 到远程 gateway 的适配。它负责 HTTPS/Bearer 认证、guest path 校验、JSON 控制面、文件操作、SSE 流式 shell、abort/timeout 上限和错误映射。
 
@@ -76,6 +76,8 @@ Linux 远程沙箱网关。默认复用 `BwrapSandbox` 的 namespace/capability 
 | `RemoteSandboxClient` | HTTP/SSE 协议客户端 |
 | `RemoteSandbox` | `Sandbox` 实现，持有 gateway 返回的 sandbox 生命周期 |
 | `RemoteEnv` | `ExecutionEnv` 实现，暴露远程文件和 shell 操作 |
+
+gateway 的审计配置、失败语义、权限、rotation 限制和 `sandbox-gateway validate-audit` 用法见 [gateway-deployment.md](gateway-deployment.md)。
 
 协议、生产 gateway 要求和当前边界见 [remote-sandbox-backend.md](design/2026-09-15-remote-sandbox-backend.md)。
 

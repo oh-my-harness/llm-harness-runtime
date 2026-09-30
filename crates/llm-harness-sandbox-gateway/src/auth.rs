@@ -60,7 +60,17 @@ pub struct GatewayConfig {
     pub max_output_bytes: usize,
     pub max_request_bytes: usize,
     work_root: Option<PathBuf>,
+    audit_path: Option<PathBuf>,
+    audit_failure_mode: AuditFailureMode,
     backend: GatewayBackend,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditFailureMode {
+    #[default]
+    FailClosed,
+    FailOpen,
 }
 
 #[derive(Clone)]
@@ -152,6 +162,8 @@ impl GatewayConfig {
             max_output_bytes: 1024 * 1024,
             max_request_bytes: 64 * 1024 * 1024,
             work_root: None,
+            audit_path: None,
+            audit_failure_mode: AuditFailureMode::FailClosed,
             backend: GatewayBackend::Bwrap,
         };
         config.validate()?;
@@ -186,6 +198,18 @@ impl GatewayConfig {
     /// Set the gateway-owned root used for sandbox work directories.
     pub fn with_work_root(mut self, root: PathBuf) -> Self {
         self.work_root = Some(root);
+        self
+    }
+
+    /// Set an explicit gateway audit log path.
+    pub fn with_audit_path(mut self, path: PathBuf) -> Self {
+        self.audit_path = Some(path);
+        self
+    }
+
+    /// Set whether failed audit writes reject requests or continue with a warning.
+    pub fn with_audit_failure_mode(mut self, mode: AuditFailureMode) -> Self {
+        self.audit_failure_mode = mode;
         self
     }
 
@@ -247,6 +271,18 @@ impl GatewayConfig {
         if self.max_output_bytes == 0 {
             anyhow::bail!("max_output_bytes must be positive");
         }
+        if let Some(audit_path) = &self.audit_path {
+            if !audit_path.is_absolute() {
+                anyhow::bail!("audit_path must be absolute");
+            }
+            let parent = audit_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("audit_path must have a parent directory"))?;
+            anyhow::ensure!(
+                parent.is_dir(),
+                "audit_path parent directory {parent:?} must exist"
+            );
+        }
         match &self.backend {
             GatewayBackend::Bwrap => {}
             #[cfg(target_os = "macos")]
@@ -294,6 +330,14 @@ impl GatewayConfig {
         self.work_root
             .as_deref()
             .expect("gateway work root is prepared")
+    }
+
+    pub(crate) fn audit_path(&self) -> Option<&std::path::Path> {
+        self.audit_path.as_deref()
+    }
+
+    pub(crate) fn audit_failure_mode(&self) -> AuditFailureMode {
+        self.audit_failure_mode
     }
 }
 

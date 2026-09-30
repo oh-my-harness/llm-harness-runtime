@@ -28,6 +28,7 @@ use llm_harness_vm_firecracker::{FirecrackerLifecycle, FirecrackerLifecycleConfi
 use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 
+use crate::audit::{AuditEvent, GatewayAudit};
 use crate::auth::AuthenticatedPrincipal;
 use crate::observability::{RateLimiter, RequestMetrics};
 
@@ -40,18 +41,21 @@ pub(crate) struct GatewayState {
     config: crate::auth::GatewayConfig,
     work_root: PathBuf,
     _work_root_lock: File,
+    audit: Option<GatewayAudit>,
     registry: std::sync::Mutex<Connection>,
     sandboxes: std::sync::Mutex<HashMap<String, SandboxRecord>>,
     executions: std::sync::Mutex<HashMap<String, ExecutionRecord>>,
     lifecycle_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     metrics: RequestMetrics,
     rate_limiter: RateLimiter,
+    audit_failure_mode: crate::auth::AuditFailureMode,
 }
 
 #[derive(Debug)]
 pub(crate) enum GatewayStateError {
     InvalidConfig(anyhow::Error),
     Storage(anyhow::Error),
+    Audit(anyhow::Error),
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Capacity,
     Busy,
@@ -63,6 +67,7 @@ impl GatewayStateError {
         match self {
             Self::InvalidConfig(error) => error.to_string(),
             Self::Storage(_) => "sandbox registry operation failed".to_owned(),
+            Self::Audit(_) => "gateway audit sink is unavailable".to_owned(),
             Self::Capacity => "gateway sandbox limit reached".to_owned(),
             Self::Busy => "sandbox is busy; retry after active requests complete".to_owned(),
             Self::NotFound => "sandbox not found".to_owned(),
@@ -72,6 +77,7 @@ impl GatewayStateError {
     pub(crate) fn detail(&self) -> String {
         match self {
             Self::Storage(error) => error.to_string(),
+            Self::Audit(error) => error.to_string(),
             other => other.message(),
         }
     }
@@ -564,11 +570,17 @@ struct PersistedSandbox {
 impl GatewayState {
     pub(crate) fn new(mut config: crate::auth::GatewayConfig) -> anyhow::Result<Self> {
         config.validate()?;
+        let audit_failure_mode = config.audit_failure_mode();
         let work_root = config.prepare_work_root()?;
         let sandbox_root = work_root.join("sandboxes");
         create_private_directory(&sandbox_root)?;
         let work_root_lock = lock_work_root(&work_root)?;
         let registry = std::sync::Mutex::new(open_registry(&work_root.join("registry.sqlite"))?);
+        let audit_path = config
+            .audit_path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| work_root.join("audit.jsonl"));
+        let audit = GatewayAudit::new(audit_path)?;
         let persisted = reconcile_registry(&registry, &sandbox_root, &config)?;
         if persisted.len() > config.max_sandboxes {
             anyhow::bail!(
@@ -597,13 +609,58 @@ impl GatewayState {
             config,
             work_root,
             _work_root_lock: work_root_lock,
+            audit: Some(audit),
             registry,
             sandboxes: std::sync::Mutex::new(sandboxes),
             executions: std::sync::Mutex::new(HashMap::new()),
             lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
             metrics: RequestMetrics::default(),
             rate_limiter: RateLimiter::default(),
+            audit_failure_mode,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn audit_request(
+        &self,
+        event: AuditEvent,
+        request_id: &str,
+        principal: Option<&str>,
+        method: &str,
+        path: &str,
+        status: Option<u16>,
+        sandbox_id: Option<&str>,
+        duration_ms: Option<u64>,
+        detail: serde_json::Value,
+    ) -> Result<(), GatewayStateError> {
+        let Some(audit) = self.audit.as_ref() else {
+            return Ok(());
+        };
+        if let Err(error) = audit.record(
+            event,
+            request_id,
+            principal.unwrap_or("anonymous"),
+            method,
+            crate::observability::metric_route(path),
+            path,
+            status,
+            sandbox_id,
+            duration_ms,
+            detail,
+        ) {
+            return match self.audit_failure_mode {
+                crate::auth::AuditFailureMode::FailOpen => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        error = %error,
+                        "failed to write gateway audit record"
+                    );
+                    Ok(())
+                }
+                crate::auth::AuditFailureMode::FailClosed => Err(GatewayStateError::Audit(error)),
+            };
+        }
+        Ok(())
     }
 
     pub(crate) fn config(&self) -> &crate::auth::GatewayConfig {

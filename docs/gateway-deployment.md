@@ -38,7 +38,11 @@ gateway 默认绑定 `127.0.0.1:7080`。生产部署应继续绑定内网地址�
   "default_exec_timeout_ms": 60000,
   "max_exec_timeout_ms": 3600000,
   "max_output_bytes": 1048576,
-  "max_request_bytes": 67108864
+  "max_request_bytes": 67108864,
+  "audit": {
+    "path": "/var/lib/llm-harness-sandbox-gateway/audit.jsonl",
+    "failure_mode": "fail_closed"
+  }
 }
 ```
 
@@ -66,6 +70,41 @@ sudo mkdir -p /var/lib/llm-harness-sandbox-gateway
 sudo chown gateway:gateway /var/lib/llm-harness-sandbox-gateway
 sudo chmod 700 /var/lib/llm-harness-sandbox-gateway
 ```
+
+## 审计日志
+
+gateway 会在启动时初始化 JSONL hash-chain 审计日志。默认路径是 `work_root/audit.jsonl`，head 摘要文件是 `work_root/audit.jsonl.head`。可以用 `audit.path` 指定独立磁盘；该路径必须是绝对路径，父目录必须已存在。两类文件创建为 `0600`，重启时会拒绝权限不是 `0600` 的已有文件。
+
+审计文件不是普通 tracing 日志。每条记录包含时间、事件、`request_id`、principal、method、route、原始 path、HTTP status、sandbox、耗时和 detail。请求前先写 `request_started`，完成后写一个语义事件，例如 `sandbox_created`、`sandbox_started`、`sandbox_deleted`、`execution_started`、`file_read` 或 `file_written`。认证失败、限流和策略拒绝也会留下状态和原因。客户端传入的 UUID 格式 `x-request-id` 会保留；缺失时自动生成。
+
+`failure_mode` 定义审计写入失败后的行为：
+
+- `fail_closed`（默认）：请求被拒绝为 `503 audit_unavailable`；审计不可用时继续处理会留下不可审计的安全动作。
+- `fail_open`：请求继续执行，gateway 记录 warning。这个模式适合可用性优先、由外层监控补偿告警的环境。
+
+第一次审计写入失败后，当前 gateway 进程的审计 sink 会进入 degraded 状态；`fail_open` 只保证后续请求不被这次故障阻塞，不会隐式丢弃已有日志。重启 gateway 前先排查磁盘、权限和文件系统错误。
+
+不要依赖 gateway 自身来提供绝对不可篡改存储。hash chain 可以检测单条记录修改和 head 与链尾不一致；但运行 gateway 的服务账号必须有追加权限，root 仍可能改文件。更强的部署应把 `audit.jsonl` 和 `.head` 定期复制到外部 append-only 存储，或使用 WORM/快照备份，并监控备份失败。
+
+启动时 gateway 会验证已有链和 head。停止 gateway 后执行：
+
+```bash
+./target/release/sandbox-gateway validate-audit /var/lib/llm-harness-sandbox-gateway/audit.jsonl
+```
+
+运行时 gateway 会持续追加并更新 head，所以不要一边运行一边用该命令判断生产文件；先拷贝两个文件再验证副本，或先停止 gateway。
+
+gateway 没有内置自动 rotation。旋转要在 gateway 停止后成对移动主文件和 head 文件，例如：
+
+```bash
+systemctl stop llm-harness-sandbox-gateway
+suffix="$(date -u +%Y%m%dT%H%M%SZ)"
+mv /var/lib/llm-harness-sandbox-gateway/audit.jsonl "/var/archive/audit-${suffix}.jsonl"
+mv /var/lib/llm-harness-sandbox-gateway/audit.jsonl.head "/var/archive/audit-${suffix}.jsonl.head"
+systemctl start llm-harness-sandbox-gateway
+```
+
+不要设置自动删除。保留期限由组织合规要求决定；备份和归档必须先确认可读、可验证且至少有一个异地或不可变副本。
 
 ## 探活和日志
 

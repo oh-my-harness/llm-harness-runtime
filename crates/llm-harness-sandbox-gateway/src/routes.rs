@@ -22,6 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::audit::AuditEvent;
 use crate::auth::{AuthenticatedPrincipal, bearer_token, unauthorized};
 use crate::observability::PrincipalId;
 use crate::state::{GUEST_WORK_DIR, GatewayStateError, SharedState};
@@ -89,11 +90,47 @@ async fn authenticate(
 ) -> Response {
     let principal = bearer_token(&request).and_then(|token| state.config().authenticate(token));
     let Some(principal) = principal else {
-        return unauthorized();
+        let response = unauthorized();
+        state
+            .audit_request(
+                AuditEvent::AuthenticationDenied,
+                request
+                    .extensions()
+                    .get::<String>()
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                None,
+                request.method().as_str(),
+                request.uri().path(),
+                Some(response.status().as_u16()),
+                None,
+                None,
+                serde_json::json!({ "reason": "invalid_or_missing_token" }),
+            )
+            .ok();
+        return response;
     };
     if let Some(retry_after) = state.check_rate_limit(&principal.id, principal.requests_per_minute)
     {
-        return rate_limited(principal.id.to_string(), retry_after);
+        let response = rate_limited(principal.id.to_string(), retry_after);
+        state
+            .audit_request(
+                AuditEvent::RateLimited,
+                request
+                    .extensions()
+                    .get::<String>()
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                Some(principal.id.as_ref()),
+                request.method().as_str(),
+                request.uri().path(),
+                Some(response.status().as_u16()),
+                None,
+                None,
+                serde_json::json!({ "retry_after_ms": retry_after.as_millis() }),
+            )
+            .ok();
+        return response;
     }
     let principal_id = PrincipalId(principal.id.clone());
     request.extensions_mut().insert(principal);
@@ -142,11 +179,44 @@ async fn log_request(
         .unwrap_or_else(Uuid::new_v4);
     let mut request = request;
     request.extensions_mut().insert(request_id.to_string());
+    if let Err(error) = state.audit_request(
+        AuditEvent::RequestStarted,
+        &request_id.to_string(),
+        None,
+        method.as_str(),
+        &path,
+        None,
+        None,
+        None,
+        serde_json::Value::Null,
+    ) {
+        return state_error(error);
+    }
     let response = next.run(request).await;
     let principal = response
         .extensions()
         .get::<PrincipalId>()
         .map(|principal| principal.0.to_string());
+    let sandbox_id = sandbox_id_from_path(&path);
+    let duration_ms = started.elapsed().as_millis().try_into().ok();
+    let completed_event = completed_audit_event(method.as_str(), &path);
+    if let Err(error) = state.audit_request(
+        completed_event,
+        &request_id.to_string(),
+        principal.as_deref(),
+        method.as_str(),
+        &path,
+        Some(response.status().as_u16()),
+        sandbox_id.as_deref(),
+        duration_ms,
+        serde_json::Value::Null,
+    ) {
+        tracing::error!(
+            request_id = %request_id,
+            error = error.detail(),
+            "failed to write completed gateway request audit record"
+        );
+    }
     state.record_request(
         method.as_str(),
         &path,
@@ -165,6 +235,30 @@ async fn log_request(
         "sandbox gateway request"
     );
     response
+}
+
+fn completed_audit_event(method: &str, path: &str) -> AuditEvent {
+    match (method, path) {
+        ("POST", "/v1/sandboxes") => AuditEvent::SandboxCreated,
+        ("POST", path) if path.ends_with("/start") => AuditEvent::SandboxStarted,
+        ("POST", path) if path.ends_with("/reset") => AuditEvent::SandboxReset,
+        ("POST", path) if path.ends_with("/cleanup") => AuditEvent::SandboxCleaned,
+        ("DELETE", path) if path.matches('/').count() == 3 => AuditEvent::SandboxDeleted,
+        ("POST", path) if path.ends_with("/exec") => AuditEvent::ExecutionStarted,
+        ("POST", path) if path.ends_with("/kill") => AuditEvent::ExecutionKilled,
+        ("POST", path) if path.ends_with("/fs/read") => AuditEvent::FileRead,
+        ("POST", path) if path.ends_with("/fs/write") => AuditEvent::FileWritten,
+        ("POST", path) if path.ends_with("/fs/upload") => AuditEvent::FileUploaded,
+        ("POST", path) if path.ends_with("/fs/remove") => AuditEvent::FileRemoved,
+        ("POST", path) if path.ends_with("/fs/create-dir") => AuditEvent::DirectoryCreated,
+        _ => AuditEvent::RequestCompleted,
+    }
+}
+
+fn sandbox_id_from_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/v1/sandboxes/")?;
+    let sandbox_id = rest.split('/').next()?;
+    (!sandbox_id.is_empty()).then(|| sandbox_id.to_owned())
 }
 
 async fn create_sandbox(
@@ -1012,6 +1106,7 @@ fn state_error(error: GatewayStateError) -> Response {
         GatewayStateError::Storage(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "sandbox_registry_error")
         }
+        GatewayStateError::Audit(_) => (StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable"),
         GatewayStateError::Capacity => (StatusCode::SERVICE_UNAVAILABLE, "sandbox_limit_reached"),
         GatewayStateError::Busy => (StatusCode::CONFLICT, "sandbox_busy"),
         GatewayStateError::NotFound => (StatusCode::NOT_FOUND, "sandbox_not_found"),
