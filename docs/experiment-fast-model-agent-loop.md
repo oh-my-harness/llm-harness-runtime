@@ -1,8 +1,20 @@
 # jev-browser 复现计划
 
-更新：2026-09-30 12:14 Asia/Shanghai。负责人：lqj。状态：三组正式场次 96/96 次完成，只读审计通过，[中文报告](research/decider-browser-flash-comparison-20260930.md)及 lqj 成果入口已交付，待非作者复核。纯 Flash / Laya+Flash / Decider-2B+Flash 分别通过 27/32、24/32、13/32；当前 2B 替换没有收益，不再自动补跑。此前 [Flash 报告](research/laya-browser-deepseek-comparison-20260929.md)和 [Qwen 报告](research/laya-browser-controlled-comparison-20260929.md)及其原始数据均保持不变。
+更新：2026-09-30 15:34 Asia/Shanghai。负责人：lqj。状态：按用户要求转向 Kev，先准备环境。固定旧版 Kev-4B@qwen3 的本地模型和跨系统接口预检通过；正式 A/B 尚未启动，下一步补齐 runner 计量与预算接入。原任务、Flash、工具、验收及历史原始数据保持不变。此前 Decider 三组结果仅是未充分优化部署下的观察，不作为作者完整加速方案的速度结论。
 
 ## 0. 当前执行基准（覆盖旧条件）
+
+### Kev 环境准备（2026-09-30，先验收，不运行正式对照）
+
+更新：2026-09-30 15:34 Asia/Shanghai。用户确认先试 Kev，强调环境准备好。暂停 Decider 部署整改，保留其代码、旧结果和未完成事项；不继续原来未确认的 HTTP 入口切换。
+
+- [x] 核查作者依赖和模型卡；本次准备前文建议的 `jaredpalmer/kev-4b@qwen3`，明确是旧版 Qwen3-4B，不是当前 Qwen3.5 主版本，也不是 2B。
+- [x] 独立 WSL2 环境安装作者依赖，固定源码、adapter 与底座修订；验证 GPU、依赖和内存，不修改原 Laya/Decider 环境。
+- [x] 18 条历史输入、72 次回放、96 次前向通过；保留原作者预处理，Kev 无新增截断；冷热选择一致，实际 CUDA 内核和计时已记录。
+- [x] 原 Windows 浏览器客户端到 WSL 回环服务连接通过；中文验收记录完成。预检不代表正式实验就绪。
+- [ ] 补齐原 runner 的 Kev 组服务生命周期、预算中断、独立计数和失败路径审计，再冻结正式 A/B 场次。
+
+研究目标、Flash、16 个任务、工具和独立验收不变。本轮不访问实验网站，不调用付费生成模型、不训练或改权重、不添加日期规则、不裁剪候选。预检不是任务质量测试，也不把作者分类准确率写成浏览器通过率。详见 [Kev 环境准备记录](research/kev-environment-readiness-20260930.md)。
 
 ### Decider-2B 三组对照（2026-09-30，运行前固定）
 
