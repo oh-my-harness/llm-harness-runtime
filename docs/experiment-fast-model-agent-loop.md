@@ -1,6 +1,6 @@
 # jev-browser 复现计划
 
-更新：2026-09-30 12:10 Asia/Shanghai。负责人：lqj。状态：三组正式场次 96/96 次完成，只读审计通过，正在发布[中文报告](research/decider-browser-flash-comparison-20260930.md)。纯 Flash / Laya+Flash / Decider-2B+Flash 分别通过 27/32、24/32、13/32；当前 2B 替换没有收益，不再自动补跑。此前 [Flash 报告](research/laya-browser-deepseek-comparison-20260929.md)和 [Qwen 报告](research/laya-browser-controlled-comparison-20260929.md)及其原始数据均保持不变。
+更新：2026-09-30 12:14 Asia/Shanghai。负责人：lqj。状态：三组正式场次 96/96 次完成，只读审计通过，[中文报告](research/decider-browser-flash-comparison-20260930.md)及 lqj 成果入口已交付，待非作者复核。纯 Flash / Laya+Flash / Decider-2B+Flash 分别通过 27/32、24/32、13/32；当前 2B 替换没有收益，不再自动补跑。此前 [Flash 报告](research/laya-browser-deepseek-comparison-20260929.md)和 [Qwen 报告](research/laya-browser-controlled-comparison-20260929.md)及其原始数据均保持不变。
 
 ## 0. 当前执行基准（覆盖旧条件）
 
@@ -16,7 +16,8 @@
 - [x] 核查固定代码、协议、单候选与 CUDA 运行兼容性。
 - [x] 完成最小接入、离线回归及计量审计后冻结代码。
 - [x] 运行同场三组两轮；失败不覆盖，原始文件仅写入新目录。
-- [~] 只读复算并发布中文报告，更新 lqj 成果入口。
+- [x] 只读复算并发布中文报告，更新 lqj 成果入口。
+- [ ] 非作者复核三组报告及典型重复操作轨迹；不自动追加实验。
 
 进展：2026-09-30 11:42，已取得固定配置、作者推理源码及训练/限制说明，正在下载权重；发现并登记单候选接口差异，尚无新模型成绩。
 
@@ -25,6 +26,8 @@
 进展：2026-09-30 11:49，最终 Python 101/101 通过，代码已提交推送。官方只读模型列表检查确认 Flash 可用，没有额外生成请求；启动 `logs/benchmarks/decider-browser-flash-20260930-01/`，凭据仅经隐藏输入传入进程环境，不落盘。正式 Flash 请求上限 237，计时阶段仅观察日志。
 
 进展：2026-09-30 12:10，12:06 正常结束，两轮完整、未执行 0；214 次 Flash HTTP 全部 200，未触发退避。A/B/C 累计用时 287.723/217.522/583.634 秒，工具 105/110/430 次；C 有 15/32 次到达步数上限，三组各有 1 次终止性浏览器超时。96 条记录、请求参数/路由、CUDA 前向及配对统计复核通过；报告明确完整负结果、输入/训练差异和 C 未启用优化内核的部署限制，不把结果归结为参数量因果关系。
+
+进展：2026-09-30 12:14，完整报告已推送，运行后 Python 101/101 再次通过，源码副本与实际冻结散列一致；原始账本不修改。成果发布于 [runtime PR #270](https://github.com/oh-my-harness/llm-harness-runtime/pull/270)，[知识库 PR #9](https://github.com/oh-my-harness/HarnessGroupKB/pull/9)已合入，主入口为 lqj 个人页，项目页/roadmap 同步且保持待评审。Rust 本地全仓检查仍受既有 Windows 编译错误阻断；远端 Actions 因账号支付/额度条件未启动，不能冒称 CI 通过。
 
 ### DeepSeek Flash 替换对照（运行前固定，已完成）
 
