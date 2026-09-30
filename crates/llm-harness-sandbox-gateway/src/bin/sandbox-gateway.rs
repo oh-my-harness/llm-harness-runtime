@@ -1,10 +1,21 @@
-use llm_harness_sandbox_gateway::{GatewayServiceConfig, SandboxGateway};
+use llm_harness_sandbox_gateway::{GatewayServiceConfig, SandboxGateway, validate_audit};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "validate-audit" {
+        let validation = validate_audit(&args[2])?;
+        println!(
+            "audit log valid: entries={} last_hash={}",
+            validation.entries,
+            validation.last_hash.as_deref().unwrap_or("none")
+        );
+        return Ok(());
+    }
     if args.len() != 2 {
-        anyhow::bail!("usage: sandbox-gateway <config.json>");
+        anyhow::bail!(
+            "usage: sandbox-gateway <config.json> | sandbox-gateway validate-audit <audit.jsonl>"
+        );
     }
 
     tracing_subscriber::fmt()

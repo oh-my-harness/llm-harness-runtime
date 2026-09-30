@@ -16,6 +16,15 @@ pub struct GatewayServiceConfig {
     pub max_exec_timeout_ms: Option<u64>,
     pub max_output_bytes: Option<usize>,
     pub max_request_bytes: Option<usize>,
+    pub audit: Option<AuditConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditConfig {
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub failure_mode: Option<crate::auth::AuditFailureMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +106,14 @@ impl GatewayServiceConfig {
         if let Some(value) = self.max_request_bytes {
             config = config.with_max_request_bytes(value);
         }
+        if let Some(audit) = self.audit {
+            if let Some(path) = audit.path {
+                config = config.with_audit_path(path);
+            }
+            if let Some(failure_mode) = audit.failure_mode {
+                config = config.with_audit_failure_mode(failure_mode);
+            }
+        }
         config = config.with_backend(self.backend.into_gateway_backend()?);
         Ok(config)
     }
@@ -160,5 +177,41 @@ mod tests {
         assert_eq!(config.port(), 7080);
         assert_eq!(config.principals.len(), 1);
         assert_eq!(config.principals[0].token_env, "PHONE_TOKEN");
+    }
+
+    #[test]
+    fn parses_audit_service_config() {
+        let config = GatewayServiceConfig::from_slice(
+            br#"{
+                "work_root": "/tmp/llm-harness-sandbox-gateway",
+                "backend": {"type": "bwrap"},
+                "principals": [
+                    {
+                        "principal": "phone",
+                        "token_env": "PHONE_TOKEN"
+                    }
+                ],
+                "audit": {
+                    "path": "/var/log/llm-harness-sandbox-gateway/audit.jsonl",
+                    "failure_mode": "fail_open"
+                }
+            }"#,
+        )
+        .expect("valid config");
+
+        assert_eq!(
+            config
+                .audit
+                .as_ref()
+                .and_then(|audit| audit.path.as_deref()),
+            Some(PathBuf::from(
+                "/var/log/llm-harness-sandbox-gateway/audit.jsonl"
+            ))
+            .as_deref()
+        );
+        assert_eq!(
+            config.audit.and_then(|audit| audit.failure_mode),
+            Some(crate::AuditFailureMode::FailOpen)
+        );
     }
 }
