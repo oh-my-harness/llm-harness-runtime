@@ -310,7 +310,7 @@ impl GatewayConfig {
             GatewayBackend::Bwrap => {}
             #[cfg(target_os = "macos")]
             GatewayBackend::Seatbelt => {
-                if !self.work_root.is_some() {
+                if self.work_root.is_none() {
                     anyhow::bail!("seatbelt backend requires an explicit work root");
                 }
             }
