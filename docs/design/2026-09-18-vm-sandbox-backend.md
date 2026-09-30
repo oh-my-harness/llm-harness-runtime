@@ -138,8 +138,9 @@ the gateway.
 - `max_cpus` maps to Firecracker vCPU count.
 - `max_memory_mb` maps to Firecracker guest memory.
 - `max_processes` is enforced by the guest agent and treated as defense in depth.
-- `max_disk_mb` maps to the workspace block device size; the host refuses to grow
-  it beyond the configured cap.
+- `max_disk_mb` maps to the per-sandbox Firecracker rootfs ext4 capacity. It is
+  accepted only when the gateway configures `max_disk_mib` and the requested
+  capacity fits that cap; growing an image requires `resize2fs`.
 - Configurations that cannot be enforced fail closed at sandbox creation.
 
 ### Network
@@ -203,7 +204,8 @@ does not succeed.
 `FirecrackerImageAllocator` copies a non-empty regular base image to a new
 private destination, rejects symlinks at every path component, creates the
 destination exclusively with mode `0600`, syncs the file and parent directory,
-and removes the image through its opened parent descriptor on cleanup.
+optionally resizes the copied ext4 image to a configured byte capacity, and
+removes the image through its opened parent descriptor on cleanup.
 `FirecrackerLifecycleConfig` derives the rootfs, API socket, config file, and
 vsock socket from a symlink-free run directory, validates host files and
 resource limits, and preflights that no lifecycle artifact already exists.
@@ -257,12 +259,12 @@ command-configuration primitive, initial jailed lifecycle staging, and the
 Firecracker host-side vsock UDS transport are implemented. They are not yet
 assembled into a complete production VM backend, network policy, guest shutdown
 acknowledgement, or deployment validation. The gateway does now expose the
-Firecracker backend, maps guest CPU/memory limits, persists sandbox records,
+Firecracker backend, maps guest CPU/memory/disk limits, persists sandbox records,
 restores restart-interrupted records into `Creating`, and completes those
 records through `POST /v1/sandboxes/{id}/start`; startup recovery also cleans a
 verified stale Firecracker PID and artifacts. It remains a gateway-integrated
 Firecracker backend, not a production-ready VM sandbox. In particular, network
-allowlists and process/disk limits fail closed, real bare-metal/KVM/Firecracker
+allowlists and process limits fail closed, real bare-metal/KVM/Firecracker
 deployment validation is still outstanding, and immutable production auditing
 and TLS deployment remain gateway-level work. Issue #193 is closed; the VM
 backend and deployment work continues under #207 and its related production

@@ -34,6 +34,7 @@ pub struct FirecrackerBackendConfig {
     pub base_image_path: PathBuf,
     pub max_vcpu_count: u32,
     pub max_memory_mib: u32,
+    pub max_disk_mib: Option<u32>,
     pub vsock_guest_cid_base: u32,
     pub guest_agent_port: u32,
     pub readiness_timeout: Duration,
@@ -354,6 +355,20 @@ fn validate_firecracker_backend(
     }
     if config.max_memory_mib == 0 {
         anyhow::bail!("firecracker max_memory_mib must be positive");
+    }
+    if let Some(max_disk_mib) = config.max_disk_mib {
+        if max_disk_mib == 0 {
+            anyhow::bail!("firecracker max_disk_mib must be positive");
+        }
+        let max_disk_bytes = u64::from(max_disk_mib) * 1024 * 1024;
+        let base_image_size = std::fs::metadata(&config.base_image_path)
+            .map_err(|error| anyhow::anyhow!("invalid firecracker base image path: {error}"))?
+            .len();
+        if base_image_size > max_disk_bytes {
+            anyhow::bail!(
+                "firecracker base image size {base_image_size} exceeds max_disk_mib {max_disk_mib}"
+            );
+        }
     }
     if config.vsock_guest_cid_base < 3 {
         anyhow::bail!("firecracker vsock_guest_cid_base must be at least 3");

@@ -34,6 +34,7 @@ pub struct FirecrackerConfig {
     pub base_image_path: PathBuf,
     pub max_vcpu_count: u32,
     pub max_memory_mib: u32,
+    pub max_disk_mib: Option<u32>,
     pub vsock_guest_cid_base: u32,
     pub guest_agent_port: u32,
     pub readiness_timeout_ms: u64,
@@ -122,6 +123,7 @@ impl BackendConfig {
                     base_image_path: config.base_image_path,
                     max_vcpu_count: config.max_vcpu_count,
                     max_memory_mib: config.max_memory_mib,
+                    max_disk_mib: config.max_disk_mib,
                     vsock_guest_cid_base: config.vsock_guest_cid_base,
                     guest_agent_port: config.guest_agent_port,
                     readiness_timeout: std::time::Duration::from_millis(

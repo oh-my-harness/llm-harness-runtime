@@ -285,6 +285,7 @@ fn gateway_rejects_a_relative_firecracker_path() {
         base_image_path: PathBuf::from("/rootfs.ext4"),
         max_vcpu_count: 1,
         max_memory_mib: 128,
+        max_disk_mib: None,
         vsock_guest_cid_base: 3,
         guest_agent_port: 6000,
         readiness_timeout: Duration::from_secs(1),
@@ -330,6 +331,87 @@ fn gateway_rejects_vsock_cid_capacity_overflow() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("vsock CID capacity"));
+}
+
+#[test]
+fn gateway_rejects_zero_firecracker_disk_capacity() {
+    let root = private_tempdir();
+    for name in ["firecracker", "vmlinux", "rootfs-base.ext4"] {
+        std::fs::write(root.path().join(name), b"artifact").expect("write Firecracker artifact");
+    }
+    let mut permissions = std::fs::metadata(root.path().join("firecracker"))
+        .expect("binary metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(root.path().join("firecracker"), permissions)
+        .expect("make Firecracker binary executable");
+
+    let backend = GatewayBackend::Firecracker(FirecrackerBackendConfig {
+        binary_path: root.path().join("firecracker"),
+        kernel_image_path: root.path().join("vmlinux"),
+        base_image_path: root.path().join("rootfs-base.ext4"),
+        max_vcpu_count: 1,
+        max_memory_mib: 128,
+        max_disk_mib: Some(0),
+        vsock_guest_cid_base: 3,
+        guest_agent_port: 6000,
+        readiness_timeout: Duration::from_secs(1),
+    });
+
+    let work_root = private_tempdir();
+    let error = match SandboxGateway::new(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_work_root(work_root.path().to_path_buf())
+            .with_backend(backend),
+    ) {
+        Ok(_) => panic!("zero Firecracker disk capacity accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("max_disk_mib must be positive"));
+}
+
+#[test]
+fn gateway_rejects_firecracker_base_image_larger_than_disk_capacity() {
+    let root = private_tempdir();
+    std::fs::write(root.path().join("firecracker"), b"artifact")
+        .expect("write Firecracker artifact");
+    std::fs::write(root.path().join("vmlinux"), b"artifact").expect("write kernel artifact");
+    std::fs::write(
+        root.path().join("rootfs-base.ext4"),
+        vec![0u8; 1024 * 1024 + 1],
+    )
+    .expect("write oversized Firecracker base image");
+    let mut permissions = std::fs::metadata(root.path().join("firecracker"))
+        .expect("binary metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(root.path().join("firecracker"), permissions)
+        .expect("make Firecracker binary executable");
+
+    let backend = GatewayBackend::Firecracker(FirecrackerBackendConfig {
+        binary_path: root.path().join("firecracker"),
+        kernel_image_path: root.path().join("vmlinux"),
+        base_image_path: root.path().join("rootfs-base.ext4"),
+        max_vcpu_count: 1,
+        max_memory_mib: 128,
+        max_disk_mib: Some(1),
+        vsock_guest_cid_base: 3,
+        guest_agent_port: 6000,
+        readiness_timeout: Duration::from_secs(1),
+    });
+
+    let work_root = private_tempdir();
+    let error = match SandboxGateway::new(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_work_root(work_root.path().to_path_buf())
+            .with_backend(backend),
+    ) {
+        Ok(_) => panic!("Firecracker base image larger than disk capacity accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("exceeds max_disk_mib"));
 }
 
 #[cfg(target_os = "linux")]
@@ -381,6 +463,7 @@ fn firecracker_backend(root: &Path, vsock_guest_cid_base: u32) -> GatewayBackend
         base_image_path: root.join("rootfs-base.ext4"),
         max_vcpu_count: 2,
         max_memory_mib: 256,
+        max_disk_mib: Some(64),
         vsock_guest_cid_base,
         guest_agent_port: 6000,
         readiness_timeout: Duration::from_secs(2),
