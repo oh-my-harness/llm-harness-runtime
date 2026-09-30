@@ -275,7 +275,7 @@ impl MobileSessionManager {
             })
             .await?;
         let session_id = storage.metadata().await?.id;
-        let sandbox = crate::connect_sandbox(&config).await?;
+        let sandbox = crate::session::connect_sandbox(&config).await?;
         self.persist_state(&session_id, &sandbox, &config)?;
         MobileSession::assemble(config, sandbox, Some(session_id), false).await
     }
@@ -308,7 +308,7 @@ impl MobileSessionManager {
     ) -> anyhow::Result<Arc<MobileSession>> {
         // Validate the session exists before spending a sandbox.
         open_storage(&session_id).await?;
-        let sandbox = crate::connect_sandbox(&config).await?;
+        let sandbox = crate::session::connect_sandbox(&config).await?;
         self.persist_state(&session_id, &sandbox, &config)?;
         MobileSession::assemble(config, sandbox, Some(session_id), true).await
     }
