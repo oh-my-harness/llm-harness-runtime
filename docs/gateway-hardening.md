@@ -288,7 +288,7 @@ gateway 启动时会 fail-closed 地 reconcile registry 和 work root，删除�
 - 没有 runtime token revocation API；
 - 没有不可变审计后端；
 - 磁盘 quota 未实现；
-- 网络 allowlist 未实现；
+- 网络 allowlist 未实现；当前实现仍默认拒绝非空规则，设计草案见 [沙箱网络 allowlist 设计](design/network-allowlist.md)；
 - cgroup v2 资源限额仍需要真实部署验证；
 - Firecracker backend 仍未完成生产部署验证。
 
