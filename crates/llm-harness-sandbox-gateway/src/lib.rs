@@ -6,6 +6,7 @@
 pub mod audit;
 mod auth;
 mod config;
+mod credentials;
 mod observability;
 mod routes;
 mod state;

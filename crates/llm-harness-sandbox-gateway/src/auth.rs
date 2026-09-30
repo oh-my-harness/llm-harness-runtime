@@ -100,6 +100,8 @@ impl GatewayConfig {
         if principals.is_empty() {
             anyhow::bail!("at least one gateway principal is required");
         }
+        let mut principal_ids = std::collections::HashSet::new();
+        let mut token_hashes = std::collections::HashSet::new();
 
         let mut secrets = Vec::with_capacity(principals.len());
         for principal in principals {
@@ -144,9 +146,19 @@ impl GatewayConfig {
                     principal.principal
                 );
             }
+            let token_hash = Sha256::digest(principal.bearer_token.as_bytes()).into();
+            if !principal_ids.insert(principal.principal.clone()) {
+                anyhow::bail!(
+                    "gateway principal {:?} is defined more than once",
+                    principal.principal
+                );
+            }
+            if !token_hashes.insert(token_hash) {
+                anyhow::bail!("gateway bearer token hashes must be unique");
+            }
             secrets.push(PrincipalSecret {
                 id: principal.principal,
-                token_hash: Sha256::digest(principal.bearer_token.as_bytes()).into(),
+                token_hash,
                 fs_allowlist: allowlist,
                 host_project_dirs: project_dirs,
                 max_trust_profile: principal.max_trust_profile,
@@ -298,18 +310,11 @@ impl GatewayConfig {
         Ok(())
     }
 
-    pub(crate) fn authenticate(&self, bearer_token: &str) -> Option<AuthenticatedPrincipal> {
-        let token_hash: [u8; 32] = Sha256::digest(bearer_token.as_bytes()).into();
+    pub(crate) fn credential_seeds(&self) -> Vec<(String, [u8; 32])> {
         self.principals
             .iter()
-            .find(|principal| constant_time_eq(&principal.token_hash, &token_hash))
-            .map(|principal| AuthenticatedPrincipal {
-                id: Arc::from(principal.id.as_str()),
-                fs_allowlist: Arc::from(principal.fs_allowlist.as_slice()),
-                host_project_dirs: Arc::from(principal.host_project_dirs.as_slice()),
-                max_trust_profile: principal.max_trust_profile,
-                requests_per_minute: principal.requests_per_minute,
-            })
+            .map(|principal| (principal.id.clone(), principal.token_hash))
+            .collect()
     }
 
     pub(crate) fn principal(&self, principal_id: &str) -> Option<AuthenticatedPrincipal> {

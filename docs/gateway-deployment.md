@@ -106,6 +106,26 @@ systemctl start llm-harness-sandbox-gateway
 
 不要设置自动删除。保留期限由组织合规要求决定；备份和归档必须先确认可读、可验证且至少有一个异地或不可变副本。
 
+## Token rotation 和 revocation
+
+gateway 将每个 principal 的当前 token 哈希保存在 `work_root/credentials.sqlite`，文件权限为 `0600`，使用 WAL 和 `synchronous=FULL`。启动时从这个存储加载哈希；如果文件损坏、schema 不支持或存储不可用，gateway 启动失败，不会退回明文或绕过验证。配置文件仍通过 `token_env` 提供 bootstrap token；SQLite 已有该 principal 的记录时，配置 token 不会覆盖已轮换状态。
+
+认证成功后可以自服务轮换或撤销自己的 token：
+
+```bash
+curl -X POST https://gateway.example.com/v1/credentials/rotate \
+  -H "Authorization: Bearer $SANDBOX_GATEWAY_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"new_token":"<at-least-32-byte-new-token>"}'
+
+curl -X POST https://gateway.example.com/v1/credentials/revoke \
+  -H "Authorization: Bearer $SANDBOX_GATEWAY_TOKEN"
+```
+
+成功时两个端点返回 `204`；gateway 不在响应、日志或审计中记录 token 明文。rotate 会立即使当前 token 失效，并激活新 token；其他 principal 的有效 token 不受影响。revoke 会立即使当前 principal 的当前 token 失效，适合收到“撤销使用中凭证”的指令时调用。已经发出的 HTTP handler 不重新认证；下一次请求按更新后的内存凭证判断。
+
+credential store 写入失败时，gateway 保持内存凭证不变，并返回 `500`。启动时打开或校验 credential store 失败也会让 gateway 启动失败。撤销后的 principal 不能再自行认证。若要恢复到配置文件中的 bootstrap token，必须先停止 gateway，删除或重建 `credentials.sqlite`，确认外部备份仍可读后再启动；不要在 gateway 运行时删除数据库。
+
 ## 探活和日志
 
 `/healthz` 和 `/readyz` 是公开端点，返回 backend 和状态，可用于 reverse proxy 或容器编排器探活。业务路由仍要求 bearer token。
