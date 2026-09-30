@@ -93,6 +93,10 @@ impl NetworkManager {
         self.resources.get(resource_id)
     }
 
+    pub fn list(&self) -> Vec<&NetworkResource> {
+        self.resources.values().collect()
+    }
+
     /// Record the result of an external host-resource probe.
     pub fn reconcile(&mut self, resource_id: &str, exists: bool) -> anyhow::Result<()> {
         let resource = self
@@ -186,5 +190,21 @@ mod tests {
             "delete".to_owned(),
             "llmh-sandbox-1".to_owned(),
         ]));
+    }
+
+    #[test]
+    fn list_returns_all_resources() {
+        let mut manager = NetworkManager::default();
+        manager.create("sandbox-1", policy("1.1.1.1")).unwrap();
+        manager.create("sandbox-2", policy("8.8.4.4")).unwrap();
+
+        let resources = manager.list();
+        let mut resource_ids = resources
+            .iter()
+            .map(|resource| resource.resource_id())
+            .collect::<Vec<_>>();
+        resource_ids.sort();
+
+        assert_eq!(resource_ids, vec!["sandbox-1", "sandbox-2"]);
     }
 }
