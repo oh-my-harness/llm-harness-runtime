@@ -217,37 +217,44 @@ impl MobileSessionManager {
         Arc::new(Self { data_dir: path })
     }
 
-    pub async fn create_session(
+    ///
+    /// Deliberately NOT uniffi-async: foreign-side polling of a Rust future
+    /// that needs the tokio reactor (network I/O) deadlocks — nothing drives
+    /// the reactor. We block the calling (Kotlin dispatch) thread instead,
+    /// exactly like the top-level `connect`.
+    pub fn create_session(
         &self,
         config: MobileConfig,
         name: String,
     ) -> Result<Arc<MobileSession>, MobileError> {
-        ensure_runtime();
-        self.create_session_inner(config, name)
-            .await
+        let runtime = ensure_runtime();
+        runtime
+            .block_on(self.create_session_inner(config, name))
             .map_err(MobileError::from)
     }
 
-    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, MobileError> {
-        ensure_runtime();
-        self.list_sessions_inner().await.map_err(MobileError::from)
+    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>, MobileError> {
+        let runtime = ensure_runtime();
+        runtime
+            .block_on(self.list_sessions_inner())
+            .map_err(MobileError::from)
     }
 
-    pub async fn open_session(
+    pub fn open_session(
         &self,
         config: MobileConfig,
         session_id: String,
     ) -> Result<Arc<MobileSession>, MobileError> {
-        ensure_runtime();
-        self.open_session_inner(config, session_id)
-            .await
+        let runtime = ensure_runtime();
+        runtime
+            .block_on(self.open_session_inner(config, session_id))
             .map_err(MobileError::from)
     }
 
-    pub async fn delete_session(&self, session_id: String) -> Result<(), MobileError> {
-        ensure_runtime();
-        self.delete_session_inner(session_id)
-            .await
+    pub fn delete_session(&self, session_id: String) -> Result<(), MobileError> {
+        let runtime = ensure_runtime();
+        runtime
+            .block_on(self.delete_session_inner(session_id))
             .map_err(MobileError::from)
     }
 }

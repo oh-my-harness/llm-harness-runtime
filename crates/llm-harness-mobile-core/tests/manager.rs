@@ -173,7 +173,6 @@ async fn manager_create_and_resume_roundtrip() {
 
     let session = manager
         .create_session(config.clone(), "e2e-smoke".to_owned())
-        .await
         .expect("create session");
     let session_id = session
         .session_id()
@@ -193,13 +192,12 @@ async fn manager_create_and_resume_roundtrip() {
 
     let resumed = manager
         .open_session(config, session_id.clone())
-        .await
         .expect("resume session");
     assert!(
         resumed.sandbox_recreated(),
         "conservative resume always recreates"
     );
-    let history = resumed.history().await.expect("history");
+    let history = resumed.history().expect("history");
     assert!(
         history.iter().any(|m| m.role == "user"),
         "history should contain the user turn"

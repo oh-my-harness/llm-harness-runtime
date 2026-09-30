@@ -45,8 +45,15 @@ class AppViewModel(
             configCache = cfg
             _uiState.value = _uiState.value.copy(configComplete = cfg.isComplete(), config = cfg)
             if (cfg.isComplete()) {
-                refreshSessions()
-                connectWith(cfg)
+                // Resume the most recent session when one exists; create only
+                // on a fresh install. Creating per launch spawns a sandbox
+                // on every cold start.
+                val sessions = runCatching { manager.listSessions() }.getOrDefault(emptyList())
+                if (sessions.isNotEmpty()) {
+                    switchSession(sessions.first().id)
+                } else {
+                    connectWith(cfg)
+                }
             }
         }
     }

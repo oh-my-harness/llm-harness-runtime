@@ -843,8 +843,8 @@ internal interface UniffiLib : Library {
 ): Pointer
 fun uniffi_llm_harness_mobile_core_fn_free_mobilesession(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): Unit
-fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_history(`ptr`: Pointer,
-): Long
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_history(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_pollevent(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_sandboxid(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -863,14 +863,14 @@ fun uniffi_llm_harness_mobile_core_fn_free_mobilesessionmanager(`ptr`: Pointer,u
 ): Unit
 fun uniffi_llm_harness_mobile_core_fn_constructor_mobilesessionmanager_new(`dataDir`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
-fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_create_session(`ptr`: Pointer,`config`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,
-): Long
-fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_delete_session(`ptr`: Pointer,`sessionId`: RustBuffer.ByValue,
-): Long
-fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_list_sessions(`ptr`: Pointer,
-): Long
-fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_open_session(`ptr`: Pointer,`config`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,
-): Long
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_create_session(`ptr`: Pointer,`config`: RustBuffer.ByValue,`name`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Pointer
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_delete_session(`ptr`: Pointer,`sessionId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_list_sessions(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_open_session(`ptr`: Pointer,`config`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Pointer
 fun uniffi_llm_harness_mobile_core_fn_func_connect(`config`: RustBuffer.ByValue,
 ): Long
 fun ffi_llm_harness_mobile_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1002,7 +1002,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_llm_harness_mobile_core_checksum_func_connect() != 34237.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_history() != 47669.toShort()) {
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_history() != 4701.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_pollevent() != 5697.toShort()) {
@@ -1023,16 +1023,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_shutdown() != 37921.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_create_session() != 3326.toShort()) {
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_create_session() != 56194.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_delete_session() != 18108.toShort()) {
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_delete_session() != 31918.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_list_sessions() != 40462.toShort()) {
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_list_sessions() != 62738.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_open_session() != 4661.toShort()) {
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_open_session() != 55099.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_llm_harness_mobile_core_checksum_constructor_mobilesessionmanager_new() != 24743.toShort()) {
@@ -1434,9 +1434,10 @@ public interface MobileSessionInterface {
     
     /**
      * Replay persisted history (read-only bubbles; new events continue from
-     * here). Empty for ad-hoc sessions.
+     * here). Empty for ad-hoc sessions. Sync on purpose — see the manager
+     * methods: foreign-driven futures needing the reactor deadlock.
      */
-    suspend fun `history`(): List<MobileHistoryMessage>
+    fun `history`(): List<MobileHistoryMessage>
     
     /**
      * Poll one buffered UI event, oldest first. `None` when idle.
@@ -1559,27 +1560,20 @@ open class MobileSession: Disposable, AutoCloseable, MobileSessionInterface
     
     /**
      * Replay persisted history (read-only bubbles; new events continue from
-     * here). Empty for ad-hoc sessions.
+     * here). Empty for ad-hoc sessions. Sync on purpose — see the manager
+     * methods: foreign-driven futures needing the reactor deadlock.
      */
-    @Throws(MobileException::class)
-    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
-    override suspend fun `history`() : List<MobileHistoryMessage> {
-        return uniffiRustCallAsync(
-        callWithPointer { thisPtr ->
-            UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_history(
-                thisPtr,
-                
-            )
-        },
-        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_poll_rust_buffer(future, callback, continuation) },
-        { future, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_complete_rust_buffer(future, continuation) },
-        { future -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_free_rust_buffer(future) },
-        // lift function
-        { FfiConverterSequenceTypeMobileHistoryMessage.lift(it) },
-        // Error FFI converter
-        MobileException.ErrorHandler,
+    @Throws(MobileException::class)override fun `history`(): List<MobileHistoryMessage> {
+            return FfiConverterSequenceTypeMobileHistoryMessage.lift(
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_history(
+        it, _status)
+}
+    }
     )
     }
+    
 
     
     /**
@@ -1819,13 +1813,20 @@ public object FfiConverterTypeMobileSession: FfiConverter<MobileSession, Pointer
  */
 public interface MobileSessionManagerInterface {
     
-    suspend fun `createSession`(`config`: MobileConfig, `name`: kotlin.String): MobileSession
+    /**
+     *
+     * Deliberately NOT uniffi-async: foreign-side polling of a Rust future
+     * that needs the tokio reactor (network I/O) deadlocks — nothing drives
+     * the reactor. We block the calling (Kotlin dispatch) thread instead,
+     * exactly like the top-level `connect`.
+     */
+    fun `createSession`(`config`: MobileConfig, `name`: kotlin.String): MobileSession
     
-    suspend fun `deleteSession`(`sessionId`: kotlin.String)
+    fun `deleteSession`(`sessionId`: kotlin.String)
     
-    suspend fun `listSessions`(): List<SessionSummary>
+    fun `listSessions`(): List<SessionSummary>
     
-    suspend fun `openSession`(`config`: MobileConfig, `sessionId`: kotlin.String): MobileSession
+    fun `openSession`(`config`: MobileConfig, `sessionId`: kotlin.String): MobileSession
     
     companion object
 }
@@ -1926,89 +1927,62 @@ open class MobileSessionManager: Disposable, AutoCloseable, MobileSessionManager
     }
 
     
-    @Throws(MobileException::class)
-    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
-    override suspend fun `createSession`(`config`: MobileConfig, `name`: kotlin.String) : MobileSession {
-        return uniffiRustCallAsync(
-        callWithPointer { thisPtr ->
-            UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_create_session(
-                thisPtr,
-                FfiConverterTypeMobileConfig.lower(`config`),FfiConverterString.lower(`name`),
-            )
-        },
-        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_poll_pointer(future, callback, continuation) },
-        { future, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_complete_pointer(future, continuation) },
-        { future -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_free_pointer(future) },
-        // lift function
-        { FfiConverterTypeMobileSession.lift(it) },
-        // Error FFI converter
-        MobileException.ErrorHandler,
+    /**
+     *
+     * Deliberately NOT uniffi-async: foreign-side polling of a Rust future
+     * that needs the tokio reactor (network I/O) deadlocks — nothing drives
+     * the reactor. We block the calling (Kotlin dispatch) thread instead,
+     * exactly like the top-level `connect`.
+     */
+    @Throws(MobileException::class)override fun `createSession`(`config`: MobileConfig, `name`: kotlin.String): MobileSession {
+            return FfiConverterTypeMobileSession.lift(
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_create_session(
+        it, FfiConverterTypeMobileConfig.lower(`config`),FfiConverterString.lower(`name`),_status)
+}
+    }
     )
     }
+    
 
     
-    @Throws(MobileException::class)
-    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
-    override suspend fun `deleteSession`(`sessionId`: kotlin.String) {
-        return uniffiRustCallAsync(
-        callWithPointer { thisPtr ->
-            UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_delete_session(
-                thisPtr,
-                FfiConverterString.lower(`sessionId`),
-            )
-        },
-        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_poll_void(future, callback, continuation) },
-        { future, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_complete_void(future, continuation) },
-        { future -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_free_void(future) },
-        // lift function
-        { Unit },
-        
-        // Error FFI converter
-        MobileException.ErrorHandler,
-    )
+    @Throws(MobileException::class)override fun `deleteSession`(`sessionId`: kotlin.String)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_delete_session(
+        it, FfiConverterString.lower(`sessionId`),_status)
+}
     }
+    
+    
 
     
-    @Throws(MobileException::class)
-    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
-    override suspend fun `listSessions`() : List<SessionSummary> {
-        return uniffiRustCallAsync(
-        callWithPointer { thisPtr ->
-            UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_list_sessions(
-                thisPtr,
-                
-            )
-        },
-        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_poll_rust_buffer(future, callback, continuation) },
-        { future, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_complete_rust_buffer(future, continuation) },
-        { future -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_free_rust_buffer(future) },
-        // lift function
-        { FfiConverterSequenceTypeSessionSummary.lift(it) },
-        // Error FFI converter
-        MobileException.ErrorHandler,
+    @Throws(MobileException::class)override fun `listSessions`(): List<SessionSummary> {
+            return FfiConverterSequenceTypeSessionSummary.lift(
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_list_sessions(
+        it, _status)
+}
+    }
     )
     }
+    
 
     
-    @Throws(MobileException::class)
-    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
-    override suspend fun `openSession`(`config`: MobileConfig, `sessionId`: kotlin.String) : MobileSession {
-        return uniffiRustCallAsync(
-        callWithPointer { thisPtr ->
-            UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_open_session(
-                thisPtr,
-                FfiConverterTypeMobileConfig.lower(`config`),FfiConverterString.lower(`sessionId`),
-            )
-        },
-        { future, callback, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_poll_pointer(future, callback, continuation) },
-        { future, continuation -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_complete_pointer(future, continuation) },
-        { future -> UniffiLib.INSTANCE.ffi_llm_harness_mobile_core_rust_future_free_pointer(future) },
-        // lift function
-        { FfiConverterTypeMobileSession.lift(it) },
-        // Error FFI converter
-        MobileException.ErrorHandler,
+    @Throws(MobileException::class)override fun `openSession`(`config`: MobileConfig, `sessionId`: kotlin.String): MobileSession {
+            return FfiConverterTypeMobileSession.lift(
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_open_session(
+        it, FfiConverterTypeMobileConfig.lower(`config`),FfiConverterString.lower(`sessionId`),_status)
+}
+    }
     )
     }
+    
 
     
 

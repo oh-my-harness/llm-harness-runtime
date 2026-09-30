@@ -101,7 +101,7 @@ impl MobileSession {
         session_id: Option<String>,
         sandbox_recreated: bool,
     ) -> anyhow::Result<Arc<Self>> {
-        ensure_runtime();
+        // Runtime context comes from the caller's block_on; no bare enter.
         let llm_client: Arc<dyn llm_adapter::Provider> = match config.provider.as_str() {
             "openai" => {
                 let mut builder = llm_adapter::openai::OpenAIProvider::builder(config.api_key);
@@ -223,21 +223,23 @@ impl MobileSession {
     }
 
     /// Replay persisted history (read-only bubbles; new events continue from
-    /// here). Empty for ad-hoc sessions.
-    pub async fn history(&self) -> Result<Vec<crate::manager::MobileHistoryMessage>, MobileError> {
+    /// here). Empty for ad-hoc sessions. Sync on purpose — see the manager
+    /// methods: foreign-driven futures needing the reactor deadlock.
+    pub fn history(&self) -> Result<Vec<crate::manager::MobileHistoryMessage>, MobileError> {
         let Some(id) = self.session_id.as_deref() else {
             return Ok(Vec::new());
         };
-        let storage = crate::manager::open_storage(id)
-            .await
+        let runtime = ensure_runtime();
+        let storage = runtime
+            .block_on(crate::manager::open_storage(id))
             .map_err(MobileError::from)?;
         let session = llm_harness_agent::session::Session::new(storage);
-        let context = session
-            .build_context()
-            .await
-            .map_err(|e| MobileError::Internal {
-                detail: format!("read session history: {e}"),
-            })?;
+        let context =
+            runtime
+                .block_on(session.build_context())
+                .map_err(|e| MobileError::Internal {
+                    detail: format!("read session history: {e}"),
+                })?;
         Ok(crate::manager::history_to_mobile(&context.messages))
     }
 }
@@ -352,24 +354,19 @@ pub async fn connect(config: MobileConfig) -> Result<Arc<MobileSession>, MobileE
     Ok(session)
 }
 
-/// Install a global multi-thread tokio runtime exactly once and enter it.
+/// Install a global multi-thread tokio runtime exactly once.
 ///
-/// uniffi drives its async entry points on the foreign side, so the Rust
-/// futures need a live runtime *context* (reactor + spawn handle) for
-/// `tokio::fs`/`tokio::spawn` even though polling happens on a foreign
-/// thread. The runtime leaks deliberately: it must live for the process.
+/// FFI entry points that need async work call `runtime.block_on(...)`, which
+/// enters the runtime context for the duration — that is what gives
+/// `tokio::fs`/`tokio::spawn`/reqwest their reactor. Do NOT `enter()` here:
+/// foreign threads call these repeatedly and nested EnterGuards must be
+/// dropped in reverse order (tokio panics otherwise).
 fn ensure_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    let runtime = RUNTIME.get_or_init(|| {
+    RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("build tokio runtime")
-    });
-    // Enter without a stored guard: the thread-local context is retained by
-    // leaking the guard once per thread. Entering is idempotent for our
-    // multi-thread runtime and uniffi entry points are the only callers.
-    let guard = runtime.enter();
-    std::mem::forget(guard);
-    runtime
+    })
 }
