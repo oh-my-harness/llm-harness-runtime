@@ -1,9 +1,9 @@
 {
   "gatewayUrl": "http://10.0.13.115:7080",
   "gatewayToken": "mvp-smoke-token-0123456789abcdef",
-  "apiKey": "sk-owhsbodinupygpqweapwaixkcohzwbtzdhsqceietbxtsqdl",
-  "model": "zai-org/GLM-5.2",
-  "llmBaseUrl": "https://api.siliconflow.cn",
+  "apiKey": "sk-2d75ab69db8b40a2a365341347802964",
+  "model": "deepseek-v4-flash",
+  "llmBaseUrl": "https://api.deepseek.com",
   "provider": "openai",
   "allowInsecureHttp": true,
   "trustProfile": "trusted-lan"
