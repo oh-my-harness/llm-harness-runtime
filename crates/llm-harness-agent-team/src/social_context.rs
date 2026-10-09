@@ -808,7 +808,7 @@ impl SocialContext {
             .filter(|message| match message.message_type {
                 MessageType::Broadcast => true,
                 MessageType::Direct => {
-                    message.broadcast_id.is_some() && message.to.as_str() == reserved::OPERATOR
+                    message.to.as_str() == reserved::OPERATOR
                 }
                 _ => false,
             })
@@ -872,7 +872,7 @@ impl SocialContext {
             .filter(|message| match message.message_type {
                 MessageType::Broadcast => true,
                 MessageType::Direct => {
-                    message.broadcast_id.is_some() && message.to.as_str() == reserved::OPERATOR
+                    message.to.as_str() == reserved::OPERATOR
                 }
                 _ => false,
             })
