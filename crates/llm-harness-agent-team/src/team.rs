@@ -602,7 +602,18 @@ impl AgentTeam {
             return Err(TeamError::NotBuilt);
         }
         let ctx = self.ctx.as_ref().ok_or(TeamError::NotBuilt)?;
-        ctx.broadcast_with_message_id(&self.operator_id, task, message_id)
+        let mention_target = task
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix('@').filter(|id| !id.is_empty()))
+            .filter(|id| *id != "team")
+            .map(AgentId::new)
+            .filter(|agent_id| ctx.get_agent_info(agent_id).is_some());
+        match mention_target {
+            Some(target) => {
+                ctx.send_broadcast_to_with_message_id(&self.operator_id, &target, task, message_id)
+            }
+            None => ctx.broadcast_with_message_id(&self.operator_id, task, message_id),
+        }
     }
 
     /// Receive messages that agents sent to the operator.

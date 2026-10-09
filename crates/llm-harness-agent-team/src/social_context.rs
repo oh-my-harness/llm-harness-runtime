@@ -709,6 +709,43 @@ impl SocialContext {
             broadcast_id,
         })
     }
+
+    /// Send a public-reply broadcast to exactly one member.
+    ///
+    /// Operator messages that explicitly mention one member use this targeted
+    /// delivery. Keeping `MessageType::Broadcast` preserves the public-reply
+    /// protocol and group-history semantics while preventing unmentioned
+    /// members from waking up and spending provider tokens.
+    pub fn send_broadcast_to_with_message_id(
+        &self,
+        from: &AgentId,
+        to: &AgentId,
+        body: impl Into<String>,
+        message_id: Option<String>,
+    ) -> crate::Result<BroadcastMessageIds> {
+        if self.get_agent_info(to).is_none() {
+            return Err(crate::TeamError::AgentNotFound(to.as_str().to_string()));
+        }
+        let message_id = message_id.unwrap_or_else(generate_message_id);
+        let broadcast_id = uuid::Uuid::now_v7().to_string();
+        let message = InboxMessage {
+            journal_id: None,
+            from: from.clone(),
+            to: to.clone(),
+            body: body.into(),
+            message_type: MessageType::Broadcast,
+            priority: crate::inbox::priority::NORMAL,
+            task_id: None,
+            broadcast_id: Some(broadcast_id.clone()),
+            message_id: Some(message_id.clone()),
+        };
+        self.push_message(message)?;
+        Ok(BroadcastMessageIds {
+            message_id,
+            broadcast_id,
+        })
+    }
+
     /// Push a pre-constructed message into the recipient's inbox.
     ///
     /// Ensures the recipient has the sender in their contact list (inbound
@@ -1553,6 +1590,27 @@ mod tests {
         let alice_message = ctx.private_history(&operator, &alice, 1).remove(0);
         let bob_message = ctx.private_history(&operator, &bob, 1).remove(0);
         assert_ne!(alice_message.message_id, bob_message.message_id);
+    }
+
+    #[test]
+    fn targeted_broadcast_reaches_only_mentioned_member() {
+        let ctx = SocialContext::new(10);
+        let operator = AgentId::new(reserved::OPERATOR);
+        let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
+        ctx.register_agent(operator.clone(), reserved::OPERATOR);
+        ctx.register_agent(alice.clone(), "analysis");
+        ctx.register_agent(bob.clone(), "review");
+
+        let sent = ctx
+            .send_broadcast_to_with_message_id(&operator, &alice, "@alice only", None)
+            .unwrap();
+        assert!(ctx.drain_inbox(&bob).is_empty());
+        let delivered = ctx.drain_inbox(&alice);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].message_type, MessageType::Broadcast);
+        assert_eq!(delivered[0].message_id, Some(sent.message_id));
+        assert_eq!(ctx.group_history(10).len(), 1);
     }
 
     #[test]
