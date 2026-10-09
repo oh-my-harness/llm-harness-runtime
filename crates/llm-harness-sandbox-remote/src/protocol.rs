@@ -33,6 +33,20 @@ pub struct CreateSandboxResponse {
     /// Trust level actually granted (echoed for audit; UIs should display it).
     #[serde(default)]
     pub trust_profile: llm_harness_platform::trust::TrustProfile,
+    /// Host directories the gateway bound into this sandbox read-write
+    /// (trusted profiles only). Empty for restricted profiles and older
+    /// gateways.
+    #[serde(default)]
+    pub host_binds: Vec<HostBindWire>,
+}
+
+/// Wire form of a host-directory bind.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HostBindWire {
+    /// Absolute host-side directory.
+    pub host: String,
+    /// Guest-side path it appears at (e.g. `/workspace/myproj`).
+    pub guest: String,
 }
 
 /// Detailed sandbox status.

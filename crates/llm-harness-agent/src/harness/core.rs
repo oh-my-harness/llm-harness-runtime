@@ -36,7 +36,10 @@ const BROADCAST_CAPACITY: usize = 256;
 /// Unlike [`crate::Agent`], `AgentHarness` does not wrap `Agent` — it drives
 /// `agent_loop` directly and manages session writes via `pending_session_writes`.
 pub struct AgentHarness {
-    pub(super) client: Arc<dyn LlmClient>,
+    /// LLM client currently driving turns. Swappable at runtime via
+    /// [`AgentHarness::set_client`] / [`AgentHarness::switch_llm`]; an
+    /// in-flight turn keeps the client it started with.
+    pub(super) client: RwLock<Arc<dyn LlmClient>>,
     pub(super) session: Session,
     pub(super) env: Arc<dyn ExecutionEnv>,
     pub(super) inner: Arc<Mutex<HarnessInner>>,
@@ -166,7 +169,7 @@ impl AgentHarness {
             .unwrap_or_else(|| Arc::new(DefaultConvertToLlm::new()));
 
         Self {
-            client,
+            client: RwLock::new(client),
             session,
             env,
             inner: Arc::new(Mutex::new(inner)),
@@ -366,6 +369,73 @@ impl AgentHarness {
     }
 
     // ── Runtime configuration (any phase) ─────────────────────────────────
+
+    /// Clone the LLM client currently driving this harness.
+    ///
+    /// Read once per turn (and per summary/compaction call), so a client swap
+    /// takes effect at the start of the next turn — an in-flight stream keeps
+    /// the client it started with.
+    pub(super) fn client(&self) -> Arc<dyn LlmClient> {
+        self.client.read().unwrap().clone()
+    }
+
+    /// Replace the LLM client (provider / base URL / API key).
+    ///
+    /// Purely structural: the model id, token limits and the persisted session
+    /// entry are untouched. Use [`AgentHarness::switch_llm`] to swap the client
+    /// and record the change (with its provider) in one step.
+    pub fn set_client(&self, client: Arc<dyn LlmClient>) {
+        *self.client.write().unwrap() = client;
+    }
+
+    /// Swap the LLM client and the model together, recording a `ModelChange`
+    /// entry that names the new provider.
+    ///
+    /// This is the "switch to another configured LLM" path: provider, base URL
+    /// and API key live inside `client`, while `model` is what requests carry.
+    /// Takes effect at the start of the next turn (a running turn keeps its
+    /// client); the `ModelChange` entry is queued like every other runtime
+    /// change when the harness is busy.
+    ///
+    /// A `ModelChange` entry is appended even when the model id is unchanged —
+    /// the provider may still have changed, and the session log is the audit
+    /// trail of which provider served which turn.
+    pub async fn switch_llm(
+        &self,
+        client: Arc<dyn LlmClient>,
+        model: String,
+        info: Option<ModelInfo>,
+        provider: Option<String>,
+    ) -> Result<(), HarnessError> {
+        self.set_client(client);
+        let (old, pending) = {
+            let mut inner = self.inner.lock().unwrap();
+            let old = inner.state.model.clone();
+            let payload = SessionEntryPayload::ModelChange {
+                to: model.clone(),
+                provider,
+                model_id: None,
+            };
+            inner.state.model = model.clone();
+            inner.state.model_info = info;
+            if inner.state.phase == HarnessPhase::Idle {
+                (old, Some(payload))
+            } else {
+                inner.state.pending_session_writes.push_back(payload);
+                (old, None)
+            }
+        };
+        if let Some(payload) = pending {
+            self.session.append(payload).await?;
+        }
+        if old != model {
+            self.emit(AgentHarnessEvent::ModelUpdate {
+                from: old,
+                to: model,
+            });
+        }
+        Ok(())
+    }
 
     /// Update the model (appends a `ModelChange` entry if Idle).
     pub async fn set_model(
@@ -670,7 +740,7 @@ impl AgentHarness {
             .build();
 
         let response = self
-            .client
+            .client()
             .chat(&req)
             .await
             .map_err(|e| CompactionError::SummaryFailed(e.to_string()))?;

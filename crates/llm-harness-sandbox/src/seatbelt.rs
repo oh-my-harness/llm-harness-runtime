@@ -77,18 +77,51 @@ pub(crate) fn generate_policy(
     let work_dir_str = work_dir_canon.to_string_lossy();
     let mut s = String::with_capacity(1024);
 
-    s.push_str("(version 1)\n");
-    s.push_str(";; Allow default, then deny sensitive host paths\n");
-    s.push_str("(allow default)\n");
-    s.push('\n');
+    // ── trusted-full: user-equivalent, by construction ──────────────────
+    //
+    // The denylist shape below exists to sandbox less-trusted profiles.
+    // Applying it to trusted-full and then punching holes for every
+    // toolchain (cargo/libcurl reads /private/etc/ssl, clang writes
+    // /var/folders temp files, homebrew needs /opt, ...) is whack-a-mole.
+    // trusted-full's contract is "like the user sitting at the machine",
+    // so it gets a minimal policy instead: allow everything, keep only the
+    // credential/privacy floors. No path/env special-cases are needed
+    // downstream because nothing a normal user session can do is denied.
+    if config.trust_profile == TrustProfile::TrustedFull {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut tf = String::with_capacity(512);
+        tf.push_str("(version 1)\n");
+        tf.push_str(";; trusted-full: user-equivalent. Everything allowed except\n");
+        tf.push_str(";; the credential/privacy floors (last-match-wins).\n");
+        tf.push_str("(allow default)\n");
+        if !home.is_empty() {
+            for deny in credential_read_deny_paths(&home, work_dir_canon) {
+                tf.push_str(&format!(
+                    r#"(deny file-read* (subpath "{}"))"#,
+                    deny.to_string_lossy()
+                ));
+                tf.push('\n');
+            }
+            tf.push_str(&format!(
+                r#"(deny file-read* (literal "{work_dir_str}/.env"))"#
+            ));
+            tf.push('\n');
+        }
+        return tf;
+    }
 
     let trusted = matches!(
         config.trust_profile,
         TrustProfile::TrustedLan | TrustProfile::TrustedFull
     );
 
-    // restricted: deny network entirely. trusted: allow (incl. DNS).
-    s.push_str(";; Network\n");
+    // ── restricted / trusted-lan: denylist sandbox ──────────────────────
+    s.push_str("(version 1)\n");
+    s.push_str(";; Allow default, then deny sensitive host paths\n");
+    s.push_str("(allow default)\n");
+    s.push('\n');
+
+    // restricted: deny network entirely. trusted-lan: allow (incl. DNS).
     if trusted {
         s.push_str("(allow network*)\n");
     } else {
@@ -96,11 +129,12 @@ pub(crate) fn generate_policy(
     }
     s.push('\n');
 
-    // Deny reads to sensitive host paths. IMPORTANT: /Library must NOT be
-    // blanket-denied — toolchain binaries (CLT python3/swift shims) resolve
-    // through it and seatbelt's deny beats subtree allows during exec-path
-    // resolution. Deny sensitive SUBDIRECTORIES instead. /etc and /var are
-    // denied via their real (/private/...) and symlink paths.
+    // Deny reads to sensitive host paths (fine-grained). IMPORTANT:
+    // /Library must NOT be blanket-denied — toolchain binaries (CLT
+    // python3/swift shims) resolve through it and seatbelt's deny beats
+    // subtree allows during exec-path resolution. Deny sensitive
+    // SUBDIRECTORIES instead. /etc and /var are denied via their real
+    // (/private/...) and symlink paths.
     s.push_str(";; Deny reads to sensitive host paths (fine-grained)\n");
     for path in [
         "/etc",
@@ -126,11 +160,9 @@ pub(crate) fn generate_policy(
         s.push('\n');
     }
     s.push('\n');
-
-    // Deny writes to /private/tmp (seatbelt last-match-wins: the work_dir
-    // allow below overrides this for work_dir paths).
-    // Also deny writes to all of / to prevent writing anywhere except
-    // explicitly allowed paths.
+    // Deny writes to /private/tmp (the work_dir allow below overrides this
+    // via last-match-wins) and to all of / (nothing writable except
+    // explicitly allowed paths).
     s.push_str(";; Deny writes to /private/tmp, allow work_dir (last-match-wins)\n");
     s.push_str(r#"(deny file-write* (subpath "/private/tmp"))"#);
     s.push('\n');
@@ -172,7 +204,8 @@ pub(crate) fn generate_policy(
         }
     }
 
-    // Trusted-profile host project binds: read-write at the real host path.
+    // Trusted-lan host project binds: read-write at the real host path, with
+    // the credential floors applied last (last-match-wins).
     if trusted {
         for bind in &config.host_binds {
             let host = bind.host.to_string_lossy();
@@ -181,19 +214,10 @@ pub(crate) fn generate_policy(
             s.push_str(&format!(r#"(allow file-write* (subpath "{host}"))"#));
             s.push('\n');
         }
-    }
-    // Trusted profiles grant broad host read/write; the credential and
-    // system floors come LAST so last-match-wins keeps them denied no
-    // matter what was allowed above.
-    if trusted {
         let home = std::env::var("HOME").unwrap_or_default();
         if !home.is_empty() {
             s.push_str(&format!(r#"(allow file-read* (subpath "{home}"))"#));
             s.push('\n');
-            if config.trust_profile == TrustProfile::TrustedFull {
-                s.push_str(&format!(r#"(allow file-write* (subpath "{home}"))"#));
-                s.push('\n');
-            }
             for deny in credential_read_deny_paths(&home, work_dir_canon) {
                 s.push_str(&format!(
                     r#"(deny file-read* (subpath "{}"))"#,
@@ -439,6 +463,39 @@ impl SeatbeltEnv {
         self.owned
     }
 
+    /// Translate an absolute guest-coordinate path to its host path via the
+    /// longest-prefix guest mapping. Returns `None` when the path is outside
+    /// every mapped guest root.
+    fn map_guest_to_host(&self, path: &Path) -> Option<PathBuf> {
+        let normalized_guest = lexical_normalize(path);
+        let mut best: Option<(PathBuf, PathBuf)> = None;
+        for (guest_root, host_root) in &self.guest_mappings {
+            let guest_root_norm = lexical_normalize(guest_root);
+            if normalized_guest == guest_root_norm || normalized_guest.starts_with(&guest_root_norm)
+            {
+                let better = best
+                    .as_ref()
+                    .map(|(prev, _)| {
+                        guest_root_norm.components().count() > prev.components().count()
+                    })
+                    .unwrap_or(true);
+                if better {
+                    best = Some((guest_root_norm, host_root.clone()));
+                }
+            }
+        }
+        best.map(|(guest_root_norm, host_root)| {
+            if normalized_guest == guest_root_norm {
+                host_root.clone()
+            } else {
+                let relative = normalized_guest
+                    .strip_prefix(&guest_root_norm)
+                    .expect("guest prefix checked");
+                host_root.join(relative)
+            }
+        })
+    }
+
     /// Resolve `path` to a canonical path within an allowed root.
     ///
     /// 1. Make the path absolute (join with work_dir if relative).
@@ -457,36 +514,11 @@ impl SeatbeltEnv {
             // longest-prefix mapping; relative paths are already
             // work-dir-relative.
             if path.is_absolute() {
-                let normalized_guest = lexical_normalize(path);
-                let mut best: Option<(PathBuf, PathBuf)> = None;
-                for (guest_root, host_root) in &self.guest_mappings {
-                    let guest_root_norm = lexical_normalize(guest_root);
-                    if normalized_guest == guest_root_norm
-                        || normalized_guest.starts_with(&guest_root_norm)
-                    {
-                        let better = best
-                            .as_ref()
-                            .map(|(prev, _)| {
-                                guest_root_norm.components().count() > prev.components().count()
-                            })
-                            .unwrap_or(true);
-                        if better {
-                            best = Some((guest_root_norm, host_root.clone()));
-                        }
+                match self.map_guest_to_host(path) {
+                    Some(host) => host,
+                    None => {
+                        return Err(EnvError::PermissionDenied(lexical_normalize(path)));
                     }
-                }
-                match best {
-                    Some((guest_root_norm, host_root)) => {
-                        if normalized_guest == guest_root_norm {
-                            host_root.clone()
-                        } else {
-                            let relative = normalized_guest
-                                .strip_prefix(&guest_root_norm)
-                                .expect("guest prefix checked");
-                            host_root.join(relative)
-                        }
-                    }
-                    None => return Err(EnvError::PermissionDenied(normalized_guest)),
                 }
             } else {
                 self.work_dir_canon.join(path)
@@ -894,18 +926,67 @@ impl ExecutionEnv for SeatbeltEnv {
                 });
             }
 
+            // macOS seatbelt does not mount anything: the shell resolves
+            // paths against the real filesystem, so a guest-coordinate cwd
+            // (/workspace/...) would not exist. Translate it to the real
+            // host path via the guest mapping before spawning.
             let cwd = opts
                 .cwd
-                .map(|c| c.to_path_buf())
+                .map(|c| {
+                    if c.is_absolute() && !self.guest_mappings.is_empty() {
+                        self.map_guest_to_host(c).unwrap_or_else(|| c.to_path_buf())
+                    } else {
+                        c.to_path_buf()
+                    }
+                })
+                // When the caller gives no cwd, prefer the first host bind
+                // (the user's real workspace) over the empty transient work
+                // dir: agents invoke bash without a cwd and expect to land
+                // in the repo.
+                .or_else(|| self.config.host_binds.first().map(|bind| bind.host.clone()))
                 .unwrap_or_else(|| self.work_dir_canon.clone());
 
             let mut shell_cmd = tokio::process::Command::new("sandbox-exec");
             shell_cmd.arg("-f").arg(&self.policy_path);
             shell_cmd.arg("--");
+            let mut shell_cmd = tokio::process::Command::new("sandbox-exec");
+            shell_cmd.arg("-f").arg(&self.policy_path);
+            shell_cmd.arg("--");
             shell_cmd.arg("/usr/bin/env");
             shell_cmd.arg("-i");
-            shell_cmd.arg("PATH=/usr/bin:/bin");
-            shell_cmd.arg(format!("HOME={}", cwd.to_string_lossy()));
+            // trusted-full aims for user-equivalent shells: include the
+            // common toolchain roots the user's own PATH has. Restricted
+            // keeps the minimal system PATH.
+            let home_env = std::env::var("HOME").unwrap_or_default();
+            let path_baseline = if self.config.trust_profile == llm_harness_platform::trust::TrustProfile::TrustedFull {
+                format!("{home_env}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+            } else {
+                "/usr/bin:/bin".to_owned()
+            };
+            shell_cmd.arg(format!("PATH={path_baseline}"));
+            // trusted-full: real HOME so user-level toolchains (~/.cargo)
+            // resolve. Otherwise HOME is the sandbox work dir (isolation).
+            if self.config.trust_profile == llm_harness_platform::trust::TrustProfile::TrustedFull
+            {
+                shell_cmd.arg(format!("HOME={home_env}"));
+            } else {
+                shell_cmd.arg(format!("HOME={}", cwd.to_string_lossy()));
+            }
+            // /etc is blanket-denied on restricted/trusted-lan, so git's
+            // system-config probe gets EPERM instead of ENOENT and every
+            // git command — even --version — exits 128. Harmless when /etc
+            // is readable (trusted-full). Callers can override via opts.env.
+            shell_cmd.arg("GIT_CONFIG_NOSYSTEM=1");
+            // If a default SDK symlink exists, pin SDKROOT to it: xcrun
+            // picks the highest-versioned SDK which may ship .tbd files the
+            // installed ld cannot parse (tapi: malformed file). The symlink
+            // always points at the SDK the CLT itself ships.
+            if self.config.trust_profile == llm_harness_platform::trust::TrustProfile::TrustedFull {
+                let default_sdk = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk";
+                if std::path::Path::new(default_sdk).exists() {
+                    shell_cmd.arg(format!("SDKROOT={default_sdk}"));
+                }
+            }
             for (key, val) in &opts.env {
                 shell_cmd.arg(format!("{key}={val}"));
             }

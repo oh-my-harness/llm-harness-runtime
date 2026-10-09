@@ -1,12 +1,13 @@
 //! The `bash` tool: execute a shell command via [`ExecutionEnv::execute_shell`]
 //! and surface the merged stdout/stderr plus exit code back to the LLM.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
 use llm_harness_types::{
     DataBlock, EnvError, ShellOptions, ShellOutput, Tool, ToolContext, ToolError, ToolFailure,
-    ToolResult,
+    ToolProgress, ToolResult,
 };
 
 use crate::resolve_path;
@@ -28,6 +29,13 @@ const MAX_TIMEOUT_SECS: u64 = 3600;
 /// normal result; a non-zero exit code is conveyed via a trailing
 /// `Command exited with code <n>` line and a `details.exit_code` field rather
 /// than as a `ToolFailure` (the command *ran*, it just failed).
+type ShellCallback = Option<Box<dyn FnMut(&str) + Send>>;
+
+struct StreamState {
+    accumulated: String,
+    last_flush: Option<std::time::Instant>,
+}
+
 pub struct BashTool;
 
 impl BashTool {
@@ -141,12 +149,44 @@ impl Tool for BashTool {
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
 
+            // Stream stdout into the tool-progress channel, throttled to a
+            // frame every ~250ms so UI consumers get a live tail without a
+            // callback per output chunk. The callback only sees the tail; the
+            // final ToolFinished still carries the full output.
+            let update_tx = ctx.update_tx.clone();
+            let stream_state: Arc<Mutex<StreamState>> = Arc::new(Mutex::new(StreamState {
+                accumulated: String::new(),
+                last_flush: None,
+            }));
+            let on_stdout: ShellCallback = Some(Box::new(move |chunk: &str| {
+                let mut state = stream_state.lock().unwrap();
+                state.accumulated.push_str(chunk);
+                let now = std::time::Instant::now();
+                if state.last_flush.is_some_and(|last| {
+                    now.duration_since(last) < std::time::Duration::from_millis(250)
+                }) {
+                    return;
+                }
+                state.last_flush = Some(now);
+                let tail: String = {
+                    let lines: Vec<&str> = state.accumulated.lines().rev().take(8).collect();
+                    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+                };
+                let _ = update_tx.try_send(ToolProgress {
+                    content: vec![llm_harness_types::DataBlock::Text {
+                        text: tail,
+                        mime_type: None,
+                    }],
+                    details: serde_json::Value::Null,
+                });
+            }));
+
             let opts = ShellOptions {
                 cwd,
                 env: env_vec,
                 timeout: Some(Duration::from_secs(timeout)),
                 abort: ctx.abort.clone(),
-                on_stdout: None,
+                on_stdout,
                 on_stderr: None,
                 max_output_bytes: None,
             };
@@ -246,6 +286,28 @@ impl Tool for BashTool {
 
 #[cfg(test)]
 mod tests {
+    /// bash streams stdout chunks through ctx.update_tx while running.
+    #[tokio::test]
+    async fn streams_output_progress() {
+        let env = Arc::new(MockExecutionEnv::new());
+        let (tx, mut rx) = mpsc::channel(64);
+        let ctx = make_ctx_inner(env, tx);
+        let tool = BashTool::new();
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "echo line1; sleep 0.4; echo line2"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(text_of(&result).contains("line2"));
+        let mut updates = 0;
+        while rx.try_recv().is_ok() {
+            updates += 1;
+        }
+        assert!(updates >= 1, "expected at least one ToolProgress update");
+    }
+
     use super::*;
     use crate::test_env::MockExecutionEnv;
     use chrono::Utc;
@@ -258,6 +320,10 @@ mod tests {
     /// Build a `ToolContext` backed by `env` with a no-op update channel.
     fn make_ctx(env: Arc<MockExecutionEnv>) -> ToolContext {
         let (tx, _rx) = mpsc::channel(1);
+        make_ctx_inner(env, tx)
+    }
+
+    fn make_ctx_inner(env: Arc<MockExecutionEnv>, tx: mpsc::Sender<ToolProgress>) -> ToolContext {
         ToolContext {
             run: Arc::new(llm_harness_types::RunContext::new(
                 llm_harness_types::RunRequest::default(),

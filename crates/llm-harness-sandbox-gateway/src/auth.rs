@@ -49,6 +49,9 @@ pub enum GatewayBackend {
     /// macOS `sandbox-exec` backend (Seatbelt). Only available on macOS.
     #[cfg(target_os = "macos")]
     Seatbelt,
+    /// No-isolation backend: tools run directly on the host. Single-user,
+    /// fully-trusted setups only.
+    Os,
     Firecracker(FirecrackerBackendConfig),
 }
 
@@ -314,6 +317,11 @@ impl GatewayConfig {
                     anyhow::bail!("seatbelt backend requires an explicit work root");
                 }
             }
+            GatewayBackend::Os => {
+                if self.work_root.is_none() {
+                    anyhow::bail!("os backend requires an explicit work root");
+                }
+            }
             GatewayBackend::Firecracker(config) => {
                 validate_firecracker_backend(config, self.max_sandboxes)?
             }
@@ -472,6 +480,7 @@ impl std::fmt::Debug for GatewayConfig {
                     GatewayBackend::Bwrap => "bwrap",
                     #[cfg(target_os = "macos")]
                     GatewayBackend::Seatbelt => "macos-seatbelt",
+                    GatewayBackend::Os => "os",
                     GatewayBackend::Firecracker(_) => "firecracker",
                 },
             )

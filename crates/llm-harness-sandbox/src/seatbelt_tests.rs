@@ -178,16 +178,22 @@ fn trusted_full_policy_near_host_with_floors() {
     };
     let policy = generate_policy(&config, &PathBuf::from("/private/tmp/seatbelt-abc"), &[]);
     assert!(!policy.contains("(deny network*)"));
+    // User-equivalent: no blanket path denies at all — (allow default)
+    // covers everything, so /etc, /opt, /System etc. all pass.
+    assert!(!policy.contains(r#"(deny file-read* (subpath "/etc"))"#));
+    assert!(!policy.contains(r#"(deny file-read* (subpath "/opt"))"#));
     let home = std::env::var("HOME").unwrap();
-    assert!(policy.contains(&format!(r#"(allow file-read* (subpath "{home}"))"#)));
-    assert!(policy.contains(&format!(r#"(allow file-write* (subpath "{home}"))"#)));
-    // Floors hold: .ssh / Keychains denied after the home allow.
+    // Credential floors: denied after the blanket allow.
     assert!(policy.contains(&format!(r#"(deny file-read* (subpath "{home}/.ssh"))"#)));
     assert!(policy.contains(&format!(
         r#"(deny file-read* (subpath "{home}/Library/Keychains"))"#
     )));
-    // /etc write floor still present.
-    assert!(policy.contains(r#"(deny file-write* (subpath "/"))"#));
+    // trusted-full is user-equivalent: no blanket "/" write deny; /tmp is
+    // writable so toolchain temp files work.
+    assert!(!policy.contains(r#"(deny file-write* (subpath "/"))"#));
+    assert!(!policy.contains(r#"(deny file-write* (subpath "/private/tmp"))"#));
+    // Credential floors still hold.
+    assert!(policy.contains(&format!(r#"(deny file-read* (subpath "{home}/.ssh"))"#)));
 }
 
 // ── File API tests ─────────────────────────────────────────────────────────

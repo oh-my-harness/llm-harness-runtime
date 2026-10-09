@@ -13,9 +13,10 @@ use llm_harness_platform::sandbox::Sandbox;
 use llm_harness_sandbox_remote::protocol::{
     CreateDirRequest, CreateSandboxRequest, CreateSandboxResponse, CreateTempDirRequest,
     CreateTempDirResponse, FileContent, FileInfoRequest, FileInfoResponse, FileInfoResponseValue,
-    GatewayErrorResponse, ListDirRequest, ListDirResponse, ReadFileRequest, ReadFileResponse,
-    RemoteExecEvent, RemoteSandboxState, RemoteSandboxStatus, RemoveRequest, ShellExecRequest,
-    ShellExecResponse, UploadFilesRequest, UploadFilesResponse, UploadedFile, WriteFileRequest,
+    GatewayErrorResponse, HostBindWire, ListDirRequest, ListDirResponse, ReadFileRequest,
+    ReadFileResponse, RemoteExecEvent, RemoteSandboxState, RemoteSandboxStatus, RemoveRequest,
+    ShellExecRequest, ShellExecResponse, UploadFilesRequest, UploadFilesResponse, UploadedFile,
+    WriteFileRequest,
 };
 use llm_harness_types::{EnvError, FileInfo, ShellOptions};
 use tokio_stream::wrappers::ReceiverStream;
@@ -338,9 +339,21 @@ async fn create_sandbox(
         cleanup_failed_sandbox(&state, &sandbox_id, "sandbox state persistence failure").await;
         return state_error(error);
     }
-    let work_dir = state
+    let (work_dir, host_binds) = state
         .get_sandbox(&principal, &sandbox_id)
-        .map(|sandbox| sandbox.work_dir.to_string_lossy().into_owned())
+        .map(|sandbox| {
+            (
+                sandbox.work_dir.to_string_lossy().into_owned(),
+                sandbox
+                    .host_binds
+                    .iter()
+                    .map(|(host, guest)| HostBindWire {
+                        host: host.to_string_lossy().into_owned(),
+                        guest: guest.to_string_lossy().into_owned(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
         .unwrap_or_default();
     tracing::info!(sandbox_id = %sandbox_id, principal = %principal.id, "sandbox created");
     let trust_profile = state.requested_profile(&sandbox_id);
@@ -352,6 +365,7 @@ async fn create_sandbox(
             backend: state.backend_label().to_owned(),
             state: RemoteSandboxState::Running,
             trust_profile,
+            host_binds,
         }),
     )
         .into_response()

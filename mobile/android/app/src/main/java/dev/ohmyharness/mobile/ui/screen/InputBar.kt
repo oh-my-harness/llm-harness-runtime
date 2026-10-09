@@ -1,25 +1,32 @@
 package dev.ohmyharness.mobile.ui.screen
 
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import dev.ohmyharness.mobile.ui.theme.OhmRadius
+import dev.ohmyharness.mobile.ui.theme.OhmSpacing
 
 /**
- * Bottom input bar: message field + voice placeholder (disabled Add icon) +
- * send/stop. Stop appears while the assistant is streaming.
+ * Floating rounded input bar. The action button is send; while streaming it
+ * becomes stop, and a small steer affordance sits above the bar.
  */
 @Composable
 fun InputBar(
@@ -32,35 +39,79 @@ fun InputBar(
     streaming: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
-    Row(
-        modifier = modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
+    val canAct = enabled && value.isNotBlank()
+    androidx.compose.foundation.layout.Column(
+        modifier = modifier.fillMaxWidth().padding(horizontal = OhmSpacing.sm),
     ) {
-        OutlinedTextField(
-            value = value,
-            onValueChange = onValueChange,
-            modifier = Modifier.weight(1f),
-            enabled = enabled,
-            placeholder = { Text("message") },
-            maxLines = 4,
-        )
-        IconButton(onClick = {}, enabled = false) {
-            Icon(Icons.Filled.Add, contentDescription = "voice (coming soon)")
-        }
-        if (streaming) {
+        if (streaming && value.isNotBlank()) {
             TextButton(
-                onClick = { if (value.isNotBlank()) onSteer(value.trim()) },
-                enabled = enabled && value.isNotBlank(),
-            ) { Text("Steer") }
-            IconButton(onClick = onStop, enabled = enabled) {
-                Icon(Icons.Filled.Close, contentDescription = "stop")
-            }
-        } else {
-            IconButton(
-                onClick = { if (value.isNotBlank()) onSend(value.trim()) },
-                enabled = enabled && value.isNotBlank(),
+                onClick = { onSteer(value.trim()) },
+                enabled = enabled,
+                modifier = Modifier.align(Alignment.End).padding(bottom = OhmSpacing.xs),
+            ) { Text("Steer", style = MaterialTheme.typography.labelSmall) }
+        }
+        Surface(
+            shape = RoundedCornerShape(OhmRadius.input),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            border = BorderStroke(
+                1.dp,
+                MaterialTheme.colorScheme.outline.copy(alpha = 0.4f),
+            ),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Row(
+                modifier = Modifier.padding(start = OhmSpacing.md, top = OhmSpacing.xs, bottom = OhmSpacing.xs, end = OhmSpacing.xs),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send")
+                androidx.compose.foundation.text.BasicTextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    enabled = enabled,
+                    modifier = Modifier.weight(1f).padding(vertical = OhmSpacing.sm),
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(
+                        color = MaterialTheme.colorScheme.onBackground,
+                    ),
+                    maxLines = 5,
+                    decorationBox = { inner ->
+                        if (value.isEmpty()) {
+                            Text(
+                                "message",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                        inner()
+                    },
+                )
+                Surface(
+                    shape = CircleShape,
+                    color = if (canAct || streaming) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.surface
+                    },
+                    modifier = Modifier.padding(OhmSpacing.xs),
+                ) {
+                    IconButton(
+                        onClick = {
+                            when {
+                                streaming -> onStop()
+                                value.isNotBlank() -> onSend(value.trim())
+                            }
+                        },
+                        enabled = enabled && (streaming || value.isNotBlank()),
+                    ) {
+                        Icon(
+                            if (streaming) Icons.Filled.Stop else Icons.AutoMirrored.Filled.Send,
+                            contentDescription = if (streaming) "stop" else "Send",
+                            tint = if (canAct || streaming) {
+                                MaterialTheme.colorScheme.onPrimary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    }
+                }
             }
         }
     }

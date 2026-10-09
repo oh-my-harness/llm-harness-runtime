@@ -206,6 +206,7 @@ async fn create_sandbox(
         backend: "test-local-process".to_owned(),
         state: RemoteSandboxState::Running,
         trust_profile: request.config.trust_profile,
+        host_binds: Vec::new(),
     };
     state.0.sandboxes.lock().unwrap().insert(
         sandbox_id,

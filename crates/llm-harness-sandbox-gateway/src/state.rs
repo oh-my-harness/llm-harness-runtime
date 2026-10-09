@@ -14,7 +14,7 @@ use futures::future::BoxFuture;
 use llm_harness_platform::sandbox::{NetRule, ResourceLimits, Sandbox, SandboxConfig};
 #[cfg(target_os = "linux")]
 use llm_harness_sandbox::BwrapSandbox;
-#[cfg(target_os = "macos")]
+use llm_harness_sandbox::OsEnvSandbox;
 use llm_harness_sandbox::SeatbeltSandbox;
 use llm_harness_sandbox_remote::RemoteSandboxConfig;
 use llm_harness_sandbox_remote::protocol::RemoteSandboxState;
@@ -91,6 +91,9 @@ pub(crate) struct SandboxRecord {
     pub(crate) env: Arc<dyn ExecutionEnv>,
     pub(crate) work_dir: PathBuf,
     pub(crate) config: RemoteSandboxConfig,
+    /// Host directories bound read-write into this sandbox (trusted
+    /// profiles); echoed in the create response.
+    pub(crate) host_binds: Vec<(PathBuf, PathBuf)>,
     pub(crate) state: RemoteSandboxState,
 }
 
@@ -104,6 +107,9 @@ pub(crate) enum GatewaySandbox {
 #[cfg(target_os = "macos")]
 pub(crate) enum GatewaySandbox {
     Seatbelt(SeatbeltSandbox),
+    /// No-isolation backend: tools run directly on the host with a
+    /// per-sandbox work dir. For fully-trusted single-user setups.
+    Os(OsEnvSandbox),
 }
 
 #[cfg(target_os = "macos")]
@@ -111,36 +117,42 @@ impl Sandbox for GatewaySandbox {
     fn start(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         match self {
             GatewaySandbox::Seatbelt(sandbox) => sandbox.start(),
+            GatewaySandbox::Os(sandbox) => Sandbox::start(sandbox),
         }
     }
 
     fn env(&self) -> Arc<dyn ExecutionEnv> {
         match self {
             GatewaySandbox::Seatbelt(sandbox) => sandbox.env(),
+            GatewaySandbox::Os(sandbox) => sandbox.env(),
         }
     }
 
     fn reset(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         match self {
             GatewaySandbox::Seatbelt(sandbox) => sandbox.reset(),
+            GatewaySandbox::Os(sandbox) => sandbox.reset(),
         }
     }
 
     fn shutdown(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         match *self {
             GatewaySandbox::Seatbelt(sandbox) => Sandbox::shutdown(Box::new(sandbox)),
+            GatewaySandbox::Os(sandbox) => Sandbox::shutdown(Box::new(sandbox)),
         }
     }
 
     fn config(&self) -> &SandboxConfig {
         match self {
             GatewaySandbox::Seatbelt(sandbox) => sandbox.config(),
+            GatewaySandbox::Os(sandbox) => sandbox.config(),
         }
     }
 
     fn is_running(&self) -> bool {
         match self {
             GatewaySandbox::Seatbelt(sandbox) => sandbox.is_running(),
+            GatewaySandbox::Os(sandbox) => sandbox.is_running(),
         }
     }
 }
@@ -720,6 +732,7 @@ impl GatewayState {
             crate::auth::GatewayBackend::Bwrap => "linux-bwrap",
             #[cfg(target_os = "macos")]
             crate::auth::GatewayBackend::Seatbelt => "macos-seatbelt",
+            crate::auth::GatewayBackend::Os => "os",
             crate::auth::GatewayBackend::Firecracker(_) => "linux-firecracker",
         }
     }
@@ -816,6 +829,9 @@ impl GatewayState {
         if let crate::auth::GatewayBackend::Seatbelt = self.config.backend() {
             return self.create_seatbelt_sandbox(principal, request);
         }
+        if let crate::auth::GatewayBackend::Os = self.config.backend() {
+            return self.create_os_sandbox(principal, request);
+        }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let _ = (principal, request);
@@ -895,6 +911,7 @@ impl GatewayState {
             env,
             work_dir: PathBuf::from(GUEST_WORK_DIR),
             config: request,
+            host_binds,
             state: RemoteSandboxState::Creating,
         };
 
@@ -927,6 +944,7 @@ impl GatewayState {
         sandbox_config.work_dir = Some(work_dir.clone());
         // Trusted profiles bind the principal's host project directories at
         // guest /workspace/<basename>. Ignored by restricted (floors hold).
+        let mut host_binds: Vec<(PathBuf, PathBuf)> = Vec::new();
         for dir in principal.host_project_dirs.iter() {
             let base = dir
                 .file_name()
@@ -936,12 +954,14 @@ impl GatewayState {
                         "host project dir {dir:?} has no file name"
                     ))
                 })?;
+            let guest = std::path::PathBuf::from(GUEST_WORK_DIR).join(base);
             sandbox_config
                 .host_binds
                 .push(llm_harness_platform::sandbox::HostBind {
                     host: dir.clone(),
-                    guest: std::path::PathBuf::from(GUEST_WORK_DIR).join(base),
+                    guest: guest.clone(),
                 });
+            host_binds.push((dir.clone(), guest));
         }
         let sandbox = match llm_harness_sandbox::SeatbeltSandbox::new(sandbox_config) {
             Ok(sandbox) => GatewaySandbox::Seatbelt(sandbox),
@@ -986,6 +1006,7 @@ impl GatewayState {
             env,
             work_dir: PathBuf::from(GUEST_WORK_DIR),
             config: request,
+            host_binds,
             state: RemoteSandboxState::Creating,
         };
 
@@ -993,6 +1014,83 @@ impl GatewayState {
         Ok(sandbox_id)
     }
 
+    /// No-isolation backend: per-sandbox work dir on the host, no isolation
+    /// policy. Tools run with the gateway process's full host access — only
+    /// appropriate for fully-trusted single-user setups.
+    fn create_os_sandbox(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: RemoteSandboxConfig,
+    ) -> Result<String, GatewayStateError> {
+        let mut sandboxes = self.lock_sandboxes();
+        self.check_sandbox_capacity(&sandboxes, principal)?;
+        let request = normalize_request_config(principal, request)
+            .map_err(GatewayStateError::InvalidConfig)?;
+        let sandbox_config =
+            build_sandbox_config(&request).map_err(GatewayStateError::InvalidConfig)?;
+        let sandbox_id = uuid::Uuid::new_v4().to_string();
+        let work_dir = self.work_root.join("sandboxes").join(&sandbox_id);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&work_dir)
+            .map_err(|error| GatewayStateError::InvalidConfig(error.into()))?;
+        // Pin the sandbox to the gateway-created work dir so the shell cwd
+        // resolves to a per-sandbox directory.
+        let mut sandbox_config = sandbox_config;
+        sandbox_config.work_dir = Some(work_dir.clone());
+        // Host binds still apply: on the os backend the "guest" coordinate is
+        // the host path itself, but keep the /workspace/<basename> alias so
+        // session prompt logic stays backend-agnostic.
+        let mut host_binds: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for dir in principal.host_project_dirs.iter() {
+            let base = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    GatewayStateError::InvalidConfig(anyhow::anyhow!(
+                        "host project dir {dir:?} has no file name"
+                    ))
+                })?;
+            let guest = std::path::PathBuf::from(GUEST_WORK_DIR).join(base);
+            host_binds.push((dir.clone(), guest));
+        }
+        let sandbox = GatewaySandbox::Os(OsEnvSandbox::new(sandbox_config));
+        let config_json = serde_json::to_string(&request)
+            .map_err(|error| GatewayStateError::Storage(error.into()))?;
+        let now_ms = unix_now_ms().map_err(GatewayStateError::Storage)?;
+        insert_registry_record(
+            &self.registry,
+            &sandbox_id,
+            &principal.id,
+            &config_json,
+            None,
+            now_ms,
+        )
+        .map_err(|error| {
+            let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
+            if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %cleanup_error,
+                    "failed to remove work root after registry failure"
+                );
+            }
+            GatewayStateError::Storage(error)
+        })?;
+        let env = sandbox.env();
+        let record = SandboxRecord {
+            owner: Arc::clone(&principal.id),
+            sandbox: Arc::new(sandbox),
+            env,
+            work_dir: PathBuf::from(GUEST_WORK_DIR),
+            config: request,
+            host_binds,
+            state: RemoteSandboxState::Creating,
+        };
+
+        sandboxes.insert(sandbox_id.clone(), record);
+        Ok(sandbox_id)
+    }
     #[cfg(target_os = "linux")]
     async fn create_firecracker_sandbox(
         &self,
@@ -1064,6 +1162,7 @@ impl GatewayState {
             env,
             work_dir: PathBuf::from(GUEST_WORK_DIR),
             config: request,
+            host_binds: Vec::new(),
             state: RemoteSandboxState::Creating,
         };
         sandboxes.insert(sandbox_id.clone(), record);
@@ -1108,6 +1207,7 @@ impl GatewayState {
             env: Arc::clone(&record.env),
             work_dir: record.work_dir.clone(),
             config: record.config.clone(),
+            host_binds: record.host_binds.clone(),
             state: record.state,
         })
     }
@@ -1275,6 +1375,7 @@ impl GatewayState {
             env: Arc::clone(&record.env),
             work_dir: record.work_dir.clone(),
             config: record.config.clone(),
+            host_binds: record.host_binds.clone(),
             state: record.state,
         })
     }
@@ -1466,6 +1567,7 @@ fn restore_sandbox(
                 env,
                 work_dir: PathBuf::from(GUEST_WORK_DIR),
                 config: persisted_config,
+                host_binds: Vec::new(),
                 state: RemoteSandboxState::Creating,
             });
         }
@@ -1497,6 +1599,7 @@ fn restore_sandbox(
             env: Arc::clone(&env),
             work_dir: PathBuf::from(GUEST_WORK_DIR),
             config: persisted_config,
+            host_binds: Vec::new(),
             state: RemoteSandboxState::Running,
         })
     }
@@ -1515,8 +1618,29 @@ fn restore_sandbox(
             .join(&persisted.sandbox_id);
         let mut sandbox_config = sandbox_config;
         sandbox_config.work_dir = Some(work_dir);
-        let sandbox =
-            GatewaySandbox::Seatbelt(llm_harness_sandbox::SeatbeltSandbox::new(sandbox_config)?);
+        let host_binds: Vec<(PathBuf, PathBuf)> = principal
+            .host_project_dirs
+            .iter()
+            .filter_map(|dir| {
+                dir.file_name()
+                    .map(|base| (dir.clone(), PathBuf::from(GUEST_WORK_DIR).join(base)))
+            })
+            .collect();
+        sandbox_config.host_binds = host_binds
+            .iter()
+            .map(|(host, guest)| llm_harness_platform::sandbox::HostBind {
+                host: host.clone(),
+                guest: guest.clone(),
+            })
+            .collect();
+        let sandbox = match config.backend() {
+            crate::auth::GatewayBackend::Os => {
+                GatewaySandbox::Os(llm_harness_sandbox::OsEnvSandbox::new(sandbox_config))
+            }
+            _ => {
+                GatewaySandbox::Seatbelt(llm_harness_sandbox::SeatbeltSandbox::new(sandbox_config)?)
+            }
+        };
         let env = sandbox.env();
         Ok(SandboxRecord {
             owner: Arc::clone(&principal.id),
@@ -1524,6 +1648,7 @@ fn restore_sandbox(
             env,
             work_dir: PathBuf::from(GUEST_WORK_DIR),
             config: persisted_config,
+            host_binds,
             state: RemoteSandboxState::Running,
         })
     }
@@ -1914,5 +2039,6 @@ pub(crate) struct SandboxLease {
     pub(crate) env: Arc<dyn ExecutionEnv>,
     pub(crate) work_dir: PathBuf,
     pub(crate) config: RemoteSandboxConfig,
+    pub(crate) host_binds: Vec<(PathBuf, PathBuf)>,
     pub(crate) state: RemoteSandboxState,
 }

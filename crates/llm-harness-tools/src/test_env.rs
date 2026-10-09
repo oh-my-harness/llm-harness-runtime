@@ -405,7 +405,12 @@ impl ExecutionEnv for MockExecutionEnv {
             // Fake shell: `echo <text>` echoes, `false` fails, `__seq:N`
             // generates N numbered lines (exit 0), `__seq_fail:N` generates
             // N numbered lines with exit_code=1, else succeeds.
+            // Simulate real streaming: invoke on_stdout in chunks so tools
+            // wired to the progress channel can be tested end-to-end.
             let trimmed = cmd.trim();
+            if let Some(mut callback) = opts.on_stdout {
+                callback(&format!("stream:{trimmed}\n"));
+            }
             if let Some(rest) = trimmed.strip_prefix("__seq_fail:") {
                 let n: usize = rest.parse().unwrap_or(0);
                 let stdout = (1..=n)

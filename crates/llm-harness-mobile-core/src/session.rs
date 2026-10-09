@@ -3,7 +3,10 @@
 //! Events are drained via `poll_event` (an FFI-side queue the UI polls);
 //! this sidesteps cross-FFI callbacks.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::Context as _;
 use tokio::sync::broadcast;
@@ -36,6 +39,37 @@ pub(crate) fn parse_trust_profile(
     }
 }
 
+/// Build an LLM provider from a (provider, api key, base URL) triple.
+///
+/// `provider` selects the wire protocol; anything other than `"openai"` falls
+/// back to the Anthropic protocol, matching [`MobileConfig::provider`]'s
+/// documented default. An empty `base_url` keeps the provider's own default
+/// endpoint. Construction performs no I/O, so a bad URL/key only surfaces when
+/// a turn is actually sent.
+pub(crate) fn build_provider(
+    provider: &str,
+    api_key: &str,
+    base_url: &str,
+) -> Arc<dyn llm_adapter::Provider> {
+    match provider {
+        "openai" => {
+            let mut builder = llm_adapter::openai::OpenAIProvider::builder(api_key.to_owned());
+            if !base_url.is_empty() {
+                builder = builder.base_url(base_url.to_owned());
+            }
+            Arc::new(builder.build())
+        }
+        _ => {
+            let mut builder =
+                llm_adapter::anthropic::AnthropicProvider::builder(api_key.to_owned());
+            if !base_url.is_empty() {
+                builder = builder.base_url(base_url.to_owned());
+            }
+            Arc::new(builder.build())
+        }
+    }
+}
+
 /// Connect a fresh remote sandbox for `config` (shared by connect + resume).
 pub(crate) async fn connect_sandbox(config: &MobileConfig) -> anyhow::Result<Arc<RemoteSandbox>> {
     let client_config = if config.allow_insecure_http {
@@ -63,10 +97,44 @@ pub(crate) async fn connect_sandbox(config: &MobileConfig) -> anyhow::Result<Arc
 ///
 /// Events are drained via `poll_event`: an internal FFI-side queue buffers
 /// every mapped event; the UI polls (e.g. on a 100ms timer) and renders.
+/// Execution backend for a session: a remote gateway sandbox or the phone
+/// itself (no tools, pure chat).
+#[derive(Clone)]
+pub(crate) enum SandboxHandle {
+    Remote(Arc<RemoteSandbox>),
+    /// Sandbox-free session: no tools, no gateway. LLM access only.
+    Local,
+}
+
+impl SandboxHandle {
+    fn env(&self) -> Arc<dyn llm_harness_types::ExecutionEnv> {
+        match self {
+            SandboxHandle::Remote(sandbox) => Sandbox::env(&**sandbox),
+            SandboxHandle::Local => Arc::new(llm_harness_sandbox::OsEnv::new(std::env::temp_dir())),
+        }
+    }
+
+    /// Host project binds (remote only; local sessions have none).
+    fn host_binds(&self) -> Vec<(PathBuf, PathBuf)> {
+        match self {
+            SandboxHandle::Remote(sandbox) => sandbox.host_binds().to_vec(),
+            SandboxHandle::Local => Vec::new(),
+        }
+    }
+
+    /// Gateway sandbox id (remote only; local sessions report empty).
+    fn sandbox_id(&self) -> &str {
+        match self {
+            SandboxHandle::Remote(sandbox) => sandbox.sandbox_id(),
+            SandboxHandle::Local => "",
+        }
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct MobileSession {
     harness: Arc<AgentHarness>,
-    sandbox: Arc<RemoteSandbox>,
+    sandbox: SandboxHandle,
     session_id: Option<String>,
     sandbox_recreated: bool,
     queue: Mutex<Vec<MobileEvent>>,
@@ -74,57 +142,123 @@ pub struct MobileSession {
 
 impl MobileSession {
     pub(crate) async fn new(config: MobileConfig) -> anyhow::Result<Arc<Self>> {
+        if config.gateway_url.is_empty() {
+            return Self::assemble(config, SandboxHandle::Local, None, false).await;
+        }
         let sandbox = connect_sandbox(&config).await?;
-        Self::assemble(config, sandbox, None, false).await
+        Self::assemble(config, SandboxHandle::Remote(sandbox), None, false).await
     }
 
-    /// Assemble a session around an already-connected sandbox. `session_id`
+    /// Assemble a session around an existing backend. `session_id`
     /// attaches the session to a persisted `Session` (resume); `None` creates
     /// an in-memory session (MVP path).
     pub(crate) async fn assemble(
         config: MobileConfig,
-        sandbox: Arc<RemoteSandbox>,
+        sandbox: SandboxHandle,
         session_id: Option<String>,
         sandbox_recreated: bool,
     ) -> anyhow::Result<Arc<Self>> {
         // Runtime context comes from the caller's block_on; no bare enter.
-        let llm_client: Arc<dyn llm_adapter::Provider> = match config.provider.as_str() {
-            "openai" => {
-                let mut builder = llm_adapter::openai::OpenAIProvider::builder(config.api_key);
-                if !config.llm_base_url.is_empty() {
-                    builder = builder.base_url(config.llm_base_url.clone());
-                }
-                Arc::new(builder.build())
-            }
-            _ => {
-                let mut builder =
-                    llm_adapter::anthropic::AnthropicProvider::builder(config.api_key);
-                if !config.llm_base_url.is_empty() {
-                    builder = builder.base_url(config.llm_base_url.clone());
-                }
-                Arc::new(builder.build())
-            }
-        };
+        let llm_client = build_provider(&config.provider, &config.api_key, &config.llm_base_url);
 
-        let env = llm_harness_platform::sandbox::Sandbox::env(&*sandbox);
+        let env = sandbox.env();
 
         let mut opts = AgentHarnessOptions::new(config.model.clone());
-        opts.tools = vec![
-            Arc::new(BashTool::new()) as Arc<dyn llm_harness_types::Tool>,
-            Arc::new(ReadTool::new(None)),
-            Arc::new(WriteTool::new(None)),
-            Arc::new(EditTool::new(None)),
-            Arc::new(GlobTool::new()),
-            Arc::new(GrepTool::new()),
-        ];
-        opts.system_prompt = Some(
-            "You are a helpful agent working in the user's remote sandbox \
-             (an isolated workspace). Use the provided tools to inspect files \
-             and run commands; paths are relative to the sandbox work \
-             directory. Be concise."
-                .to_owned(),
-        );
+        match &sandbox {
+            SandboxHandle::Remote(_) => {
+                opts.tools = vec![
+                    Arc::new(BashTool::new()) as Arc<dyn llm_harness_types::Tool>,
+                    Arc::new(ReadTool::new(None)),
+                    Arc::new(WriteTool::new(None)),
+                    Arc::new(EditTool::new(None)),
+                    Arc::new(GlobTool::new()),
+                    Arc::new(GrepTool::new()),
+                ];
+            }
+            // Sandbox-free sessions get no tools: pure LLM conversation.
+            SandboxHandle::Local => {}
+        }
+        // Trusted profiles bind host project directories read-write at their
+        // real host paths. Tell the agent where they are so it works in the
+        // real repo instead of concluding the sandbox is empty (its cwd is a
+        // fresh work dir). `git` cannot read /etc/gitconfig under the
+        // seatbelt policy; GIT_CONFIG_NOSYSTEM=1 avoids the fatal error.
+        let host_binds: Vec<PathBuf> = sandbox
+            .host_binds()
+            .iter()
+            .map(|(host, _guest)| host.clone())
+            .collect();
 
+        // ── System prompt: baseline only; project knowledge comes from the
+        // repo's AGENTS.md and the skills system, not from hardcoded prompt
+        // text (omp model: context files + skills metadata + skill:// reads).
+        let conclusion_first = "When running tests or builds, state the \
+            conclusion first (e.g. \"12 passed, 3 failed\") before any details \
+            or logs.";
+        let mut prompt = if sandbox.host_binds().is_empty() {
+            "You are a helpful assistant. Be concise.".to_owned()
+        } else {
+            "You are a helpful agent working on the user's machine with \
+             direct shell access. Be concise."
+                .to_owned()
+        };
+        prompt.push_str(conclusion_first);
+
+        if !host_binds.is_empty() {
+            // Machine facts the agent cannot discover: bind locations and
+            // the seatbelt gitconfig quirk. Kept minimal; project knowledge
+            // belongs in the repo's AGENTS.md, loaded below.
+            let mut extra = String::from(
+                "\n\n## Environment\n- Host directories bound read-write to \
+                 this session; always use these absolute paths for cd/ls/git \
+                 (there is no /home, and /workspace/<name> does not exist in \
+                 shells):\n",
+            );
+            for host in &host_binds {
+                extra.push_str(&format!("  - {}\n", host.display()));
+            }
+            extra.push_str(
+                "- Your shell starts directly inside the first directory \
+                 above; relative paths work from there.\n",
+            );
+            prompt.push_str(&extra);
+            // Project context: the repo's own AGENTS.md (project knowledge
+            // belongs to the repo, not to hardcoded prompt text). Truncate
+            // very long files — context files are advisory.
+            let agents_root = host_binds.first().unwrap();
+            let agents_md = agents_root.join("AGENTS.md");
+            if let Ok(content) = tokio::fs::read_to_string(&agents_md).await {
+                // Truncate very long files: context files are advisory.
+                let content = if content.chars().count() > 12_000 {
+                    let head: String = content.chars().take(12_000).collect();
+                    format!("{head}\n…(truncated)")
+                } else {
+                    content
+                };
+                prompt.push_str("\n\n## Project instructions (AGENTS.md)\n\n");
+                prompt.push_str(&content);
+            }
+        }
+        opts.system_prompt = Some(prompt);
+
+        // ── Skills: load from the machine's skills root and expose the
+        // skill_read tool (omp-style: prompt carries name+description only;
+        // the model reads skill://<name> on demand).
+        if !host_binds.is_empty() {
+            let skills_root = host_binds[0].join(".harness").join("skills");
+            let (skills, _diags) =
+                llm_harness_agent::load_skills(env.as_ref(), &[skills_root]).await;
+            if !skills.is_empty() {
+                let readable = Arc::new(std::sync::RwLock::new(skills.clone()));
+                opts.skills = skills;
+                opts.readable_skills = Some(readable);
+                opts.tools
+                    .push(Arc::new(llm_harness_agent::SkillReadTool::new(
+                        opts.readable_skills.clone().unwrap(),
+                        env.clone(),
+                    )));
+            }
+        }
         let harness = Arc::new(match session_id.as_deref() {
             Some(id) => {
                 let storage = crate::manager::open_storage(id).await?;
@@ -223,6 +357,47 @@ impl MobileSession {
                 detail: format!("read session history: {e}"),
             })?;
         Ok(crate::manager::history_to_mobile(&context.messages))
+    }
+
+    /// Switch the LLM behind this session: model id plus the provider
+    /// configuration (provider protocol, base URL, API key) it runs on.
+    ///
+    /// This is what the "switch LLM profile" UI calls: the app never has to
+    /// re-enter a key to change models. A new provider client is built and
+    /// installed, so cross-provider switches work mid-conversation instead of
+    /// requiring a new session.
+    ///
+    /// Takes effect at the start of the next turn: Idle applies immediately, a
+    /// running turn keeps the client it started with and the change is queued
+    /// (the harness records a `ModelChange` entry naming the new provider).
+    /// `contextWindow` / `maxTokens` are optional compaction-estimation hints.
+    #[uniffi::method(name = "setLlm")]
+    pub fn set_llm(
+        &self,
+        model: String,
+        provider: String,
+        base_url: String,
+        api_key: String,
+        context_window: Option<u32>,
+        max_tokens: Option<u32>,
+    ) -> Result<(), MobileError> {
+        let info = match (context_window, max_tokens) {
+            (Some(window), Some(tokens)) => Some(llm_harness_agent::agent::ModelInfo {
+                context_window: window,
+                max_tokens: tokens,
+            }),
+            _ => None,
+        };
+        let client = build_provider(&provider, &api_key, &base_url);
+        let harness = Arc::clone(&self.harness);
+        run_on_runtime(async move {
+            harness
+                .switch_llm(client, model, info, Some(provider))
+                .await
+                .map_err(|e| MobileError::Internal {
+                    detail: format!("switch llm: {e}"),
+                })
+        })
     }
 }
 
@@ -343,12 +518,20 @@ impl MobileSession {
             })?;
         Ok(entries.into_iter().map(mobile_file_info).collect())
     }
-
     pub async fn shutdown(&self) -> Result<(), MobileError> {
-        let sandbox = <RemoteSandbox as Clone>::clone(&self.sandbox);
+        let sandbox = self.sandbox.clone();
         Ok(ensure_runtime()
             .spawn(async move {
-                llm_harness_platform::sandbox::Sandbox::shutdown(Box::new(sandbox)).await
+                match sandbox {
+                    SandboxHandle::Remote(sandbox) => {
+                        llm_harness_platform::sandbox::Sandbox::shutdown(Box::new(
+                            <RemoteSandbox as Clone>::clone(&sandbox),
+                        ))
+                        .await
+                    }
+                    // Local sessions hold no host resources to release.
+                    SandboxHandle::Local => Ok(()),
+                }
             })
             .await
             .map_err(|e| MobileError::Internal {
@@ -387,5 +570,77 @@ fn sandbox_config(
         work_dir: None,
         trust_profile,
         host_binds: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chat_only_config(provider: &str, model: &str, base_url: &str) -> MobileConfig {
+        MobileConfig {
+            gateway_url: String::new(),
+            gateway_token: String::new(),
+            api_key: "test-key".into(),
+            model: model.into(),
+            llm_base_url: base_url.into(),
+            provider: provider.into(),
+            allow_insecure_http: false,
+            trust_profile: "restricted".into(),
+        }
+    }
+
+    /// Wire-protocol selection: `openai` builds the OpenAI-compatible provider,
+    /// every other name falls back to the Anthropic protocol. The two protocols
+    /// advertise distinct capabilities, so this is observable without I/O.
+    #[test]
+    fn build_provider_selects_protocol_and_defaults_to_anthropic() {
+        let openai = build_provider("openai", "k", "http://127.0.0.1:9/v1");
+        assert!(
+            openai.capabilities().supports_json_schema(),
+            "openai protocol expected for provider=\"openai\""
+        );
+
+        let anthropic = build_provider("anthropic", "k", "");
+        assert!(
+            !anthropic.capabilities().supports_json_schema(),
+            "anthropic protocol expected for provider=\"anthropic\""
+        );
+
+        let fallback = build_provider("some-unknown-gateway", "k", "");
+        assert_eq!(
+            fallback.capabilities(),
+            anthropic.capabilities(),
+            "unknown provider names must fall back to the anthropic protocol"
+        );
+    }
+
+    /// Switching LLM configuration must not need a gateway, a network round
+    /// trip, or a new session: the client is rebuilt from the profile and the
+    /// harness picks it up for the next turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_llm_switches_provider_mid_session() {
+        let session = MobileSession::new(chat_only_config(
+            "openai",
+            "deepseek-v4-flash",
+            "https://api.deepseek.com",
+        ))
+        .await
+        .expect("chat-only session assembly must not touch the network");
+        assert_eq!(session.harness.state().model, "deepseek-v4-flash");
+
+        // Cross-provider switch: openai/deepseek -> anthropic/claude.
+        session
+            .set_llm(
+                "claude-sonnet-4-6".into(),
+                "anthropic".into(),
+                "https://api.anthropic.com".into(),
+                "other-key".into(),
+                None,
+                None,
+            )
+            .expect("switch must succeed while idle");
+
+        assert_eq!(session.harness.state().model, "claude-sonnet-4-6");
     }
 }

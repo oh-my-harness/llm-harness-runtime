@@ -2067,3 +2067,22 @@ async fn gateway_rejects_cross_tenant_sandbox_access() {
         .await
         .expect("delete sandbox");
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn create_response_echoes_host_binds() {
+    let project = private_tempdir();
+    let mut trusted = principal("tenant-a", TOKEN_A);
+    trusted.host_project_dirs = vec![project.path().to_path_buf()];
+    trusted.max_trust_profile = llm_harness_platform::trust::TrustProfile::TrustedFull;
+    let gateway = start_gateway(vec![trusted]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+    let mut request = sandbox_config();
+    request.trust_profile = llm_harness_platform::trust::TrustProfile::TrustedFull;
+    let response = client.create_sandbox(request).await.expect("create");
+    assert_eq!(response.host_binds.len(), 1, "response must echo binds");
+    assert_eq!(
+        std::path::Path::new(&response.host_binds[0].host),
+        project.path()
+    );
+}

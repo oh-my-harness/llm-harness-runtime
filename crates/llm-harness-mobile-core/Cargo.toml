@@ -10,6 +10,7 @@ crate-type = ["lib", "cdylib"]
 [dependencies]
 llm-harness-agent.workspace = true
 llm-harness-sandbox-remote.workspace = true
+llm-harness-sandbox.workspace = true
 llm-harness-types.workspace = true
 llm-harness-platform.workspace = true
 llm_adapter.workspace = true

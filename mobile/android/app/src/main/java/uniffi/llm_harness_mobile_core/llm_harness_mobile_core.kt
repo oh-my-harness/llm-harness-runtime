@@ -761,6 +761,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -798,6 +802,8 @@ fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_send(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sessionid(
 ): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_setllm(
+): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_shutdown(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesession_steer(
@@ -811,6 +817,8 @@ fun uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_delete_s
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_list_sessions(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_open_session(
+): Short
+fun uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_read_history(
 ): Short
 fun uniffi_llm_harness_mobile_core_checksum_constructor_mobilesessionmanager_new(
 ): Short
@@ -887,6 +895,8 @@ fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_send(`ptr`: Pointer,`
 ): Unit
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_sessionid(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_setllm(`ptr`: Pointer,`model`: RustBuffer.ByValue,`provider`: RustBuffer.ByValue,`baseUrl`: RustBuffer.ByValue,`apiKey`: RustBuffer.ByValue,`contextWindow`: RustBuffer.ByValue,`maxTokens`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_shutdown(`ptr`: Pointer,
 ): Long
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesession_steer(`ptr`: Pointer,`text`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -907,6 +917,8 @@ fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_list_sessions(
 ): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_open_session(`ptr`: Pointer,`config`: RustBuffer.ByValue,`sessionId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
+fun uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_read_history(`ptr`: Pointer,`sessionId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
 fun uniffi_llm_harness_mobile_core_fn_func_connect(`config`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): Pointer
 fun ffi_llm_harness_mobile_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1068,6 +1080,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_sessionid() != 7065.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_setllm() != 12058.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesession_shutdown() != 37921.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1087,6 +1102,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_open_session() != 55099.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_llm_harness_mobile_core_checksum_method_mobilesessionmanager_read_history() != 20734.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_llm_harness_mobile_core_checksum_constructor_mobilesessionmanager_new() != 24743.toShort()) {
@@ -1273,6 +1291,29 @@ private class JavaLangRefCleanable(
     val cleanable: java.lang.ref.Cleaner.Cleanable
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterUInt: FfiConverter<UInt, Int> {
+    override fun lift(value: Int): UInt {
+        return value.toUInt()
+    }
+
+    override fun read(buf: ByteBuffer): UInt {
+        return lift(buf.getInt())
+    }
+
+    override fun lower(value: UInt): Int {
+        return value.toInt()
+    }
+
+    override fun allocationSize(value: UInt) = 4UL
+
+    override fun write(value: UInt, buf: ByteBuffer) {
+        buf.putInt(value.toInt())
+    }
 }
 
 /**
@@ -1496,13 +1537,6 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
 //
 
 
-/**
- * One mobile session: a remote sandbox plus an agent loop driving it.
- *
- * Events are drained via [`MobileSession::poll_event`]: an internal FFI-side
- * queue buffers every mapped event; the UI polls (e.g. on a 100ms timer) and
- * renders. This sidesteps cross-FFI callbacks for the MVP.
- */
 public interface MobileSessionInterface {
     
     /**
@@ -1556,6 +1590,22 @@ public interface MobileSessionInterface {
      */
     fun `sessionId`(): kotlin.String?
     
+    /**
+     * Switch the LLM behind this session: model id plus the provider
+     * configuration (provider protocol, base URL, API key) it runs on.
+     *
+     * This is what the "switch LLM profile" UI calls: the app never has to
+     * re-enter a key to change models. A new provider client is built and
+     * installed, so cross-provider switches work mid-conversation instead of
+     * requiring a new session.
+     *
+     * Takes effect at the start of the next turn: Idle applies immediately, a
+     * running turn keeps the client it started with and the change is queued
+     * (the harness records a `ModelChange` entry naming the new provider).
+     * `contextWindow` / `maxTokens` are optional compaction-estimation hints.
+     */
+    fun `setLlm`(`model`: kotlin.String, `provider`: kotlin.String, `baseUrl`: kotlin.String, `apiKey`: kotlin.String, `contextWindow`: kotlin.UInt?, `maxTokens`: kotlin.UInt?)
+    
     suspend fun `shutdown`()
     
     /**
@@ -1574,13 +1624,6 @@ public interface MobileSessionInterface {
     companion object
 }
 
-/**
- * One mobile session: a remote sandbox plus an agent loop driving it.
- *
- * Events are drained via [`MobileSession::poll_event`]: an internal FFI-side
- * queue buffers every mapped event; the UI polls (e.g. on a 100ms timer) and
- * renders. This sidesteps cross-FFI callbacks for the MVP.
- */
 open class MobileSession: Disposable, AutoCloseable, MobileSessionInterface
 {
 
@@ -1817,6 +1860,32 @@ open class MobileSession: Disposable, AutoCloseable, MobileSessionInterface
     
 
     
+    /**
+     * Switch the LLM behind this session: model id plus the provider
+     * configuration (provider protocol, base URL, API key) it runs on.
+     *
+     * This is what the "switch LLM profile" UI calls: the app never has to
+     * re-enter a key to change models. A new provider client is built and
+     * installed, so cross-provider switches work mid-conversation instead of
+     * requiring a new session.
+     *
+     * Takes effect at the start of the next turn: Idle applies immediately, a
+     * running turn keeps the client it started with and the change is queued
+     * (the harness records a `ModelChange` entry naming the new provider).
+     * `contextWindow` / `maxTokens` are optional compaction-estimation hints.
+     */
+    @Throws(MobileException::class)override fun `setLlm`(`model`: kotlin.String, `provider`: kotlin.String, `baseUrl`: kotlin.String, `apiKey`: kotlin.String, `contextWindow`: kotlin.UInt?, `maxTokens`: kotlin.UInt?)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesession_setllm(
+        it, FfiConverterString.lower(`model`),FfiConverterString.lower(`provider`),FfiConverterString.lower(`baseUrl`),FfiConverterString.lower(`apiKey`),FfiConverterOptionalUInt.lower(`contextWindow`),FfiConverterOptionalUInt.lower(`maxTokens`),_status)
+}
+    }
+    
+    
+
+    
     @Throws(MobileException::class)
     @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
     override suspend fun `shutdown`() {
@@ -2030,6 +2099,12 @@ public interface MobileSessionManagerInterface {
     
     fun `openSession`(`config`: MobileConfig, `sessionId`: kotlin.String): MobileSession
     
+    /**
+     * Read a session's persisted history WITHOUT connecting to a gateway
+     * or building a harness. Powers the lazy-connect chat screen.
+     */
+    fun `readHistory`(`sessionId`: kotlin.String): List<MobileHistoryMessage>
+    
     companion object
 }
 
@@ -2180,6 +2255,23 @@ open class MobileSessionManager: Disposable, AutoCloseable, MobileSessionManager
     uniffiRustCallWithError(MobileException) { _status ->
     UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_open_session(
         it, FfiConverterTypeMobileConfig.lower(`config`),FfiConverterString.lower(`sessionId`),_status)
+}
+    }
+    )
+    }
+    
+
+    
+    /**
+     * Read a session's persisted history WITHOUT connecting to a gateway
+     * or building a harness. Powers the lazy-connect chat screen.
+     */
+    @Throws(MobileException::class)override fun `readHistory`(`sessionId`: kotlin.String): List<MobileHistoryMessage> {
+            return FfiConverterSequenceTypeMobileHistoryMessage.lift(
+    callWithPointer {
+    uniffiRustCallWithError(MobileException) { _status ->
+    UniffiLib.INSTANCE.uniffi_llm_harness_mobile_core_fn_method_mobilesessionmanager_read_history(
+        it, FfiConverterString.lower(`sessionId`),_status)
 }
     }
     )
@@ -2579,7 +2671,18 @@ sealed class MobileEvent {
      * A tool started executing in the sandbox.
      */
     data class ToolStarted(
+        val `toolUseId`: kotlin.String, 
         val `name`: kotlin.String) : MobileEvent() {
+        companion object
+    }
+    
+    /**
+     * Streaming tool output chunk (throttled by the harness caller);
+     * `text` carries the accumulated tail for the live preview.
+     */
+    data class ToolUpdate(
+        val `toolUseId`: kotlin.String, 
+        val `text`: kotlin.String) : MobileEvent() {
         companion object
     }
     
@@ -2588,6 +2691,7 @@ sealed class MobileEvent {
      * carries the complete (untruncated) tool result for expandable cards.
      */
     data class ToolFinished(
+        val `toolUseId`: kotlin.String, 
         val `name`: kotlin.String, 
         val `summary`: kotlin.String, 
         val `fullOutput`: kotlin.String) : MobileEvent() {
@@ -2627,15 +2731,21 @@ public object FfiConverterTypeMobileEvent : FfiConverterRustBuffer<MobileEvent>{
                 )
             2 -> MobileEvent.ToolStarted(
                 FfiConverterString.read(buf),
-                )
-            3 -> MobileEvent.ToolFinished(
-                FfiConverterString.read(buf),
-                FfiConverterString.read(buf),
                 FfiConverterString.read(buf),
                 )
-            4 -> MobileEvent.RunFinished
-            5 -> MobileEvent.RunAborted
-            6 -> MobileEvent.Failed(
+            3 -> MobileEvent.ToolUpdate(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                )
+            4 -> MobileEvent.ToolFinished(
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                FfiConverterString.read(buf),
+                )
+            5 -> MobileEvent.RunFinished
+            6 -> MobileEvent.RunAborted
+            7 -> MobileEvent.Failed(
                 FfiConverterString.read(buf),
                 )
             else -> throw RuntimeException("invalid enum value, something is very wrong!!")
@@ -2654,13 +2764,23 @@ public object FfiConverterTypeMobileEvent : FfiConverterRustBuffer<MobileEvent>{
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
                 4UL
+                + FfiConverterString.allocationSize(value.`toolUseId`)
                 + FfiConverterString.allocationSize(value.`name`)
+            )
+        }
+        is MobileEvent.ToolUpdate -> {
+            // Add the size for the Int that specifies the variant plus the size needed for all fields
+            (
+                4UL
+                + FfiConverterString.allocationSize(value.`toolUseId`)
+                + FfiConverterString.allocationSize(value.`text`)
             )
         }
         is MobileEvent.ToolFinished -> {
             // Add the size for the Int that specifies the variant plus the size needed for all fields
             (
                 4UL
+                + FfiConverterString.allocationSize(value.`toolUseId`)
                 + FfiConverterString.allocationSize(value.`name`)
                 + FfiConverterString.allocationSize(value.`summary`)
                 + FfiConverterString.allocationSize(value.`fullOutput`)
@@ -2696,26 +2816,34 @@ public object FfiConverterTypeMobileEvent : FfiConverterRustBuffer<MobileEvent>{
             }
             is MobileEvent.ToolStarted -> {
                 buf.putInt(2)
+                FfiConverterString.write(value.`toolUseId`, buf)
                 FfiConverterString.write(value.`name`, buf)
                 Unit
             }
-            is MobileEvent.ToolFinished -> {
+            is MobileEvent.ToolUpdate -> {
                 buf.putInt(3)
+                FfiConverterString.write(value.`toolUseId`, buf)
+                FfiConverterString.write(value.`text`, buf)
+                Unit
+            }
+            is MobileEvent.ToolFinished -> {
+                buf.putInt(4)
+                FfiConverterString.write(value.`toolUseId`, buf)
                 FfiConverterString.write(value.`name`, buf)
                 FfiConverterString.write(value.`summary`, buf)
                 FfiConverterString.write(value.`fullOutput`, buf)
                 Unit
             }
             is MobileEvent.RunFinished -> {
-                buf.putInt(4)
-                Unit
-            }
-            is MobileEvent.RunAborted -> {
                 buf.putInt(5)
                 Unit
             }
-            is MobileEvent.Failed -> {
+            is MobileEvent.RunAborted -> {
                 buf.putInt(6)
+                Unit
+            }
+            is MobileEvent.Failed -> {
+                buf.putInt(7)
                 FfiConverterString.write(value.`message`, buf)
                 Unit
             }
@@ -2724,6 +2852,38 @@ public object FfiConverterTypeMobileEvent : FfiConverterRustBuffer<MobileEvent>{
 }
 
 
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalUInt: FfiConverterRustBuffer<kotlin.UInt?> {
+    override fun read(buf: ByteBuffer): kotlin.UInt? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUInt.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UInt?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUInt.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UInt?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUInt.write(value, buf)
+        }
+    }
+}
 
 
 

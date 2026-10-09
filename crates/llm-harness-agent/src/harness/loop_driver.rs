@@ -387,7 +387,7 @@ impl AgentHarness {
             self.push_pending_write(SessionEntryPayload::Message(msg.clone()));
         }
 
-        let mut stream = Box::pin(agent_loop(self.client.clone(), ctx, config));
+        let mut stream = Box::pin(agent_loop(self.client(), ctx, config));
         let mut turn_messages: Vec<AgentMessage> = vec![];
 
         while let Some(event) = stream.next().await {

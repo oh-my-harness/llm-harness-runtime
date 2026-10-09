@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use llm_harness_agent::harness::AgentHarnessEvent;
-use llm_harness_types::{AgentError, AgentEvent, DataBlock, HarnessPhase, ToolResult};
+use llm_harness_types::{
+    AgentError, AgentEvent, DataBlock, HarnessPhase, ToolProgress, ToolResult,
+};
 
 use llm_harness_mobile_core::{MobileEvent, map_agent_event, map_event};
 
@@ -46,6 +48,22 @@ fn maps_error_to_failed() {
     let mobile =
         map_event(&harness_event(AgentEvent::Error(AgentError::Aborted))).expect("error must map");
     assert!(matches!(mobile, MobileEvent::Failed { .. }));
+}
+
+#[test]
+fn maps_tool_execution_update_to_tool_update() {
+    let mobile = map_agent_event(&AgentEvent::ToolExecutionUpdate {
+        tool_use_id: "tu_1".into(),
+        partial: ToolProgress {
+            content: vec![DataBlock::Text {
+                text: "l1\nl2\nl3".into(),
+                mime_type: None,
+            }],
+            details: serde_json::Value::Null,
+        },
+    })
+    .expect("update must map");
+    assert!(matches!(mobile, MobileEvent::ToolUpdate { .. }));
 }
 
 #[test]

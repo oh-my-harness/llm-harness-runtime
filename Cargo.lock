@@ -2513,6 +2513,7 @@ dependencies = [
  "chrono",
  "llm-harness-agent",
  "llm-harness-platform",
+ "llm-harness-sandbox",
  "llm-harness-sandbox-remote",
  "llm-harness-tools",
  "llm-harness-types",

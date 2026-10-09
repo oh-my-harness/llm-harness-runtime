@@ -10,7 +10,6 @@ use serde::Serialize;
 
 use crate::{MobileConfig, MobileError, MobileSession, run_on_runtime};
 use llm_harness_agent::session::SessionRepo;
-use llm_harness_sandbox_remote::RemoteSandbox;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SessionState {
     pub sandbox_id: String,
@@ -243,6 +242,26 @@ impl MobileSessionManager {
         run_on_runtime(self.list_sessions_inner()).map_err(MobileError::from)
     }
 
+    /// Read a session's persisted history WITHOUT connecting to a gateway
+    /// or building a harness. Powers the lazy-connect chat screen.
+    pub fn read_history(
+        &self,
+        session_id: String,
+    ) -> Result<Vec<MobileHistoryMessage>, MobileError> {
+        run_on_runtime(async move {
+            validate_session_id(&session_id)?;
+            let storage = open_storage(&session_id).await?;
+            let session = llm_harness_agent::session::Session::new(storage);
+            let context = session
+                .build_context()
+                .await
+                .map_err(|e| MobileError::Internal {
+                    detail: format!("read session history: {e}"),
+                })?;
+            Ok::<Vec<MobileHistoryMessage>, MobileError>(history_to_mobile(&context.messages))
+        })
+    }
+
     pub fn open_session(
         &self,
         config: MobileConfig,
@@ -275,9 +294,27 @@ impl MobileSessionManager {
             })
             .await?;
         let session_id = storage.metadata().await?.id;
-        let sandbox = crate::session::connect_sandbox(&config).await?;
-        self.persist_state(&session_id, &sandbox, &config)?;
-        MobileSession::assemble(config, sandbox, Some(session_id), false).await
+        if config.gateway_url.is_empty() {
+            // Sandbox-free session: no gateway, no tools. LLM access only.
+            self.persist_state(&session_id, "", &config)?;
+            MobileSession::assemble(
+                config,
+                crate::session::SandboxHandle::Local,
+                Some(session_id),
+                false,
+            )
+            .await
+        } else {
+            let sandbox = crate::session::connect_sandbox(&config).await?;
+            self.persist_state(&session_id, sandbox.sandbox_id(), &config)?;
+            MobileSession::assemble(
+                config,
+                crate::session::SandboxHandle::Remote(sandbox),
+                Some(session_id),
+                false,
+            )
+            .await
+        }
     }
 
     async fn list_sessions_inner(&self) -> anyhow::Result<Vec<SessionSummary>> {
@@ -308,9 +345,26 @@ impl MobileSessionManager {
     ) -> anyhow::Result<Arc<MobileSession>> {
         // Validate the session exists before spending a sandbox.
         open_storage(&session_id).await?;
-        let sandbox = crate::session::connect_sandbox(&config).await?;
-        self.persist_state(&session_id, &sandbox, &config)?;
-        MobileSession::assemble(config, sandbox, Some(session_id), true).await
+        if config.gateway_url.is_empty() {
+            self.persist_state(&session_id, "", &config)?;
+            MobileSession::assemble(
+                config,
+                crate::session::SandboxHandle::Local,
+                Some(session_id),
+                false,
+            )
+            .await
+        } else {
+            let sandbox = crate::session::connect_sandbox(&config).await?;
+            self.persist_state(&session_id, sandbox.sandbox_id(), &config)?;
+            MobileSession::assemble(
+                config,
+                crate::session::SandboxHandle::Remote(sandbox),
+                Some(session_id),
+                true,
+            )
+            .await
+        }
     }
 
     async fn delete_session_inner(&self, session_id: String) -> anyhow::Result<()> {
@@ -333,7 +387,7 @@ impl MobileSessionManager {
     fn persist_state(
         &self,
         session_id: &str,
-        sandbox: &RemoteSandbox,
+        sandbox_id: &str,
         config: &MobileConfig,
     ) -> anyhow::Result<()> {
         validate_session_id(session_id)?;
@@ -344,7 +398,7 @@ impl MobileSessionManager {
         state::write_state(
             &dir,
             &SessionState {
-                sandbox_id: sandbox.sandbox_id().to_owned(),
+                sandbox_id: sandbox_id.to_owned(),
                 trust_profile: config.trust_profile.clone(),
                 last_active_at_ms: previous.last_active_at_ms,
             },

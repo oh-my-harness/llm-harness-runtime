@@ -15,11 +15,19 @@ pub enum MobileEvent {
     },
     /// A tool started executing in the sandbox.
     ToolStarted {
+        tool_use_id: String,
         name: String,
+    },
+    /// Streaming tool output chunk (throttled by the harness caller);
+    /// `text` carries the accumulated tail for the live preview.
+    ToolUpdate {
+        tool_use_id: String,
+        text: String,
     },
     /// A tool finished; `summary` is a one-line UI hint and `full_output`
     /// carries the complete (untruncated) tool result for expandable cards.
     ToolFinished {
+        tool_use_id: String,
         name: String,
         summary: String,
         full_output: String,
@@ -46,17 +54,26 @@ pub fn map_event(event: &Arc<AgentHarnessEvent>) -> Option<MobileEvent> {
 pub fn map_agent_event(event: &AgentEvent) -> Option<MobileEvent> {
     match event {
         AgentEvent::TextDelta { text, .. } => Some(MobileEvent::TextDelta { text: text.clone() }),
-        AgentEvent::ToolExecutionStart { tool_name, .. } => Some(MobileEvent::ToolStarted {
+        AgentEvent::ToolExecutionStart {
+            tool_use_id,
+            tool_name,
+            ..
+        } => Some(MobileEvent::ToolStarted {
+            tool_use_id: tool_use_id.clone(),
             name: tool_name.clone(),
         }),
-        AgentEvent::ToolExecutionEnd { result, .. } => {
+        AgentEvent::ToolExecutionEnd {
+            tool_use_id,
+            result,
+            ..
+        } => {
             let (name, summary, full_output) = match result {
                 Ok(tool_result) => {
                     let text = tool_result
                         .model_content
                         .iter()
                         .find_map(|block| match block {
-                            llm_harness_types::DataBlock::Text { text, .. } => Some(text.as_str()),
+                            llm_harness_types::DataBlock::Text { text, .. } => Some(text.clone()),
                             _ => None,
                         })
                         .unwrap_or_default();
@@ -76,9 +93,31 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<MobileEvent> {
                 ),
             };
             Some(MobileEvent::ToolFinished {
+                tool_use_id: tool_use_id.clone(),
                 name,
                 summary,
                 full_output,
+            })
+        }
+        AgentEvent::ToolExecutionUpdate {
+            tool_use_id,
+            partial,
+            ..
+        } => {
+            // Tail preview: last 8 lines of the accumulated tool output.
+            let text: String = partial
+                .content
+                .iter()
+                .find_map(|block| match block {
+                    llm_harness_types::DataBlock::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let tail: Vec<&str> = text.lines().rev().take(8).collect::<Vec<_>>();
+            let tail: String = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+            Some(MobileEvent::ToolUpdate {
+                tool_use_id: tool_use_id.clone(),
+                text: tail,
             })
         }
         AgentEvent::AgentEnd { .. } => Some(MobileEvent::RunFinished),

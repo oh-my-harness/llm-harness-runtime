@@ -33,6 +33,9 @@ pub enum BackendConfig {
     Bwrap,
     #[cfg(target_os = "macos")]
     Seatbelt,
+    /// No-isolation backend (tools run directly on the host). Single-user,
+    /// fully-trusted setups only.
+    Os,
     Firecracker(FirecrackerConfig),
 }
 
@@ -136,6 +139,7 @@ impl BackendConfig {
             Self::Bwrap => Ok(GatewayBackend::Bwrap),
             #[cfg(target_os = "macos")]
             Self::Seatbelt => Ok(GatewayBackend::Seatbelt),
+            Self::Os => Ok(GatewayBackend::Os),
             Self::Firecracker(config) => {
                 Ok(GatewayBackend::Firecracker(FirecrackerBackendConfig {
                     binary_path: config.binary_path,
