@@ -89,7 +89,7 @@ impl SendMessageTool {
                     "This public reply is reserved for '{responder}'. Use send_message to ask a peer directly instead."
                 )));
             }
-            return self.public_reply(body);
+            return self.public_reply(body, broadcast_id);
         }
         self.ctx
             .send_direct_with_task(&self.agent_id, &target_id, body, 0, task_id, broadcast_id)
@@ -103,11 +103,27 @@ impl SendMessageTool {
     }
 
     #[allow(clippy::result_large_err)]
-    fn public_reply(&self, body: &str) -> Result<String, ToolFailure> {
-        match self.ctx.broadcast(&self.agent_id, body) {
-            Ok(_) => Ok("sent".to_string()),
-            Err(_) => Err(ToolFailure::new("code", "failed".to_string())),
-        }
+    fn public_reply(
+        &self,
+        body: &str,
+        broadcast_id: Option<String>,
+    ) -> Result<String, ToolFailure> {
+        self.ctx
+            .send_direct_with_task(
+                &self.agent_id,
+                &AgentId::new(crate::timeout_manager::reserved::OPERATOR),
+                body,
+                0,
+                None,
+                broadcast_id,
+            )
+            .map(|_| "sent".to_string())
+            .map_err(|error| {
+                ToolFailure::new(
+                    "inbox_journal_persistence_failed",
+                    format!("failed to persist public reply: {error}"),
+                )
+            })
     }
 }
 
@@ -218,9 +234,11 @@ mod tests {
         let operator = AgentId::new(crate::timeout_manager::reserved::OPERATOR);
         let alice = AgentId::new("alice");
         let bob = AgentId::new("bob");
+        let carol = AgentId::new("carol");
         ctx.register_agent(operator.clone(), "operator");
         ctx.register_agent(alice.clone(), "research");
         ctx.register_agent(bob.clone(), "coder");
+        ctx.register_agent(carol.clone(), "reviewer");
         ctx.ensure_contact(&alice, &operator);
         ctx.ensure_contact(&bob, &operator);
 
@@ -245,5 +263,9 @@ mod tests {
             )
             .unwrap();
         assert!(ctx.has_messages(&operator));
+        assert!(
+            !ctx.has_messages(&carol),
+            "a targeted public reply must not wake unrelated members"
+        );
     }
 }
