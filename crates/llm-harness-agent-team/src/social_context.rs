@@ -14,6 +14,15 @@ use crate::inbox::{InboxMessage, InboxStore, MessageType};
 use crate::relation::RelationEngine;
 use crate::timeout_manager::reserved;
 
+/// Callback invoked after a direct or broadcast message is queued.
+///
+/// Observers run synchronously on the caller's task and may send follow-up
+/// messages. A routing configuration that forms a cycle can therefore loop;
+/// observers are meant to encode finite, declarative hand-offs.
+pub trait MessageObserver: Send + Sync {
+    fn on_message(&self, message: &InboxMessage);
+}
+
 /// Outcome of cancelling a pending timeout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimeoutCancel {
@@ -442,6 +451,7 @@ pub struct SocialContext {
     /// [`crate::agent_runner::spawn_monitor_task`] so shutdown can abort
     /// monitors whose runner died without running its own cleanup.
     monitor_registry: Arc<Mutex<HashMap<AgentId, AbortHandle>>>,
+    message_observers: Arc<Mutex<Vec<Arc<dyn MessageObserver>>>>,
     max_contacts: usize,
 }
 
@@ -457,6 +467,7 @@ impl SocialContext {
             timer_journal: None,
             chat_history_journal: None,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
+            message_observers: Arc::new(Mutex::new(Vec::new())),
             chat_history: Arc::new(Mutex::new(VecDeque::new())),
             max_contacts,
         }
@@ -499,6 +510,7 @@ impl SocialContext {
             timer_journal,
             chat_history_journal,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
+            message_observers: Arc::new(Mutex::new(Vec::new())),
             chat_history: Arc::new(Mutex::new(VecDeque::new())),
             max_contacts,
         };
@@ -581,6 +593,11 @@ impl SocialContext {
     /// Number of currently tracked monitor tasks (test observability).
     pub fn monitor_count(&self) -> usize {
         self.monitor_registry.lock().len()
+    }
+
+    /// Register a callback for newly queued direct and broadcast messages.
+    pub fn add_message_observer(&self, observer: Arc<dyn MessageObserver>) {
+        self.message_observers.lock().push(observer);
     }
 
     /// Update an agent's lifecycle status. Returns `false` if not found.
@@ -778,7 +795,11 @@ impl SocialContext {
                 history.pop_front();
             }
         }
-        self.inboxes.push(message)?;
+        self.inboxes.push(message.clone())?;
+        let observers = self.message_observers.lock().clone();
+        for observer in observers {
+            observer.on_message(&message);
+        }
         Ok(())
     }
 
@@ -807,9 +828,7 @@ impl SocialContext {
             .rev()
             .filter(|message| match message.message_type {
                 MessageType::Broadcast => true,
-                MessageType::Direct => {
-                    message.to.as_str() == reserved::OPERATOR
-                }
+                MessageType::Direct => message.to.as_str() == reserved::OPERATOR,
                 _ => false,
             })
             .cloned()
@@ -871,9 +890,7 @@ impl SocialContext {
             .rev()
             .filter(|message| match message.message_type {
                 MessageType::Broadcast => true,
-                MessageType::Direct => {
-                    message.to.as_str() == reserved::OPERATOR
-                }
+                MessageType::Direct => message.to.as_str() == reserved::OPERATOR,
                 _ => false,
             })
             .cloned()
@@ -1381,6 +1398,7 @@ mod tests {
             timeouts: Arc::new(TimeoutRegistry::default()),
             timer_journal: None,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
+            message_observers: Arc::new(Mutex::new(Vec::new())),
             chat_history_journal: None,
             max_contacts: 10,
         };
