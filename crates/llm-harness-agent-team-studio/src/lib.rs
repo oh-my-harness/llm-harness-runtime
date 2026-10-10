@@ -13,6 +13,7 @@ pub mod events;
 #[cfg(unix)]
 pub mod host;
 pub mod issue;
+pub mod message_router;
 pub mod pulse;
 pub mod roles;
 pub mod routes;

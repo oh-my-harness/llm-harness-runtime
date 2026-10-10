@@ -131,7 +131,18 @@ pub enum Behavior {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Trigger {
-    ResourceConfirmed { resource: String },
+    ResourceConfirmed {
+        resource: String,
+    },
+    /// Match a delivered direct or broadcast message by its logical
+    /// sender/recipient and a literal substring in its body.
+    Message {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
+        body_contains: String,
+    },
 }
 
 /// 成员级 provider 覆写；None 字段继承全局。
@@ -212,6 +223,19 @@ mod tests {
         }]);
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<TeamSpec>(&json).unwrap(), s);
+    }
+
+    #[test]
+    fn message_trigger_json_roundtrip() {
+        let trigger = Trigger::Message {
+            from: Some("worker".into()),
+            to: None,
+            body_contains: "DONE".into(),
+        };
+        let json = serde_json::to_string(&trigger).unwrap();
+        assert!(json.contains(r#""kind":"message""#));
+        assert!(json.contains(r#""body_contains":"DONE""#));
+        assert_eq!(serde_json::from_str::<Trigger>(&json).unwrap(), trigger);
     }
 
     #[test]
