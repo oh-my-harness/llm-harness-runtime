@@ -828,7 +828,9 @@ impl SocialContext {
             .rev()
             .filter(|message| match message.message_type {
                 MessageType::Broadcast => true,
-                MessageType::Direct => message.to.as_str() == reserved::OPERATOR,
+                MessageType::Direct => {
+                    message.to.as_str() == reserved::OPERATOR && message.broadcast_id.is_some()
+                }
                 _ => false,
             })
             .cloned()
@@ -890,7 +892,9 @@ impl SocialContext {
             .rev()
             .filter(|message| match message.message_type {
                 MessageType::Broadcast => true,
-                MessageType::Direct => message.to.as_str() == reserved::OPERATOR,
+                MessageType::Direct => {
+                    message.to.as_str() == reserved::OPERATOR && message.broadcast_id.is_some()
+                }
                 _ => false,
             })
             .cloned()
@@ -1604,6 +1608,7 @@ mod tests {
             .unwrap();
         ctx.send_direct_with_message_id(&bob, &operator, "done", 0, None, None, None)
             .unwrap();
+        assert!(ctx.group_history(10).is_empty());
 
         let alice_message = ctx.private_history(&operator, &alice, 1).remove(0);
         let bob_message = ctx.private_history(&operator, &bob, 1).remove(0);

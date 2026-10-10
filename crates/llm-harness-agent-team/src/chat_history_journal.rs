@@ -136,6 +136,7 @@ impl ChatHistoryJournal {
                     OR (
                         message_type = 'direct'
                         AND to_id = ?3
+                        AND broadcast_id IS NOT NULL
                     )
                 )
              ORDER BY id DESC LIMIT ?2";
@@ -310,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn member_reports_to_operator_are_group_visible_without_broadcast_id() {
+    fn member_reports_to_operator_are_private_without_broadcast_id() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("chat.sqlite3");
         let journal = ChatHistoryJournal::open(&path).unwrap();
@@ -321,8 +322,7 @@ mod tests {
         journal.append(&verifier_report).unwrap();
 
         let group = journal.group_history(10, None).unwrap();
-        assert_eq!(group.len(), 1);
-        assert_eq!(group[0].message.body, "FAIL");
+        assert!(group.is_empty());
 
         let private_entries = journal
             .private_history(
