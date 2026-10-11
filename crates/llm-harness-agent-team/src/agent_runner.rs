@@ -187,8 +187,13 @@ fn final_plain_text(entries: &[SessionEntry]) -> Option<String> {
     })
 }
 
-/// Whether the run already delivered a public reply through a social tool.
-fn public_reply_was_sent(entries: &[SessionEntry]) -> bool {
+/// Whether the run already delivered an operator-directed reply through a
+/// social tool.
+///
+/// The final-text fallback is for models that finished with plain prose.
+/// If the model used `send_message`, it made an explicit channel choice;
+/// the runtime must not promote that private delivery to a public reply.
+fn operator_reply_was_sent(entries: &[SessionEntry]) -> bool {
     entries.iter().any(|entry| {
         let SessionEntryPayload::Message(AgentMessage::Assistant(message)) = &entry.payload else {
             return false;
@@ -200,11 +205,7 @@ fn public_reply_was_sent(entries: &[SessionEntry]) -> bool {
                     if name == "broadcast"
                         || (name == "send_message"
                             && input.get("to").and_then(serde_json::Value::as_str)
-                                == Some(crate::timeout_manager::reserved::OPERATOR)
-                            && input
-                                .get("broadcast_id")
-                                .and_then(serde_json::Value::as_str)
-                                .is_some_and(|broadcast_id| !broadcast_id.is_empty()))
+                                == Some(crate::timeout_manager::reserved::OPERATOR))
             )
         })
     })
@@ -717,7 +718,7 @@ impl AgentRunner {
                                     .filter(|entry| !prior_entries.contains(&entry.id))
                                     .collect::<Vec<_>>();
                                 if may_reply_publicly
-                                    && !public_reply_was_sent(&new_entries)
+                                    && !operator_reply_was_sent(&new_entries)
                                     && let Some(body) = final_plain_text(&new_entries)
                                     && let Some(group) = group_context.as_ref()
                                 {
@@ -926,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn public_reply_detection_requires_public_channel() {
+    fn operator_reply_detection_prevents_channel_override() {
         let private = assistant_entry(
             "",
             Some(ContentBlock::ToolUse {
@@ -935,7 +936,7 @@ mod tests {
                 input: serde_json::json!({"to": "operator", "body": "private"}),
             }),
         );
-        assert!(!public_reply_was_sent(std::slice::from_ref(&private)));
+        assert!(operator_reply_was_sent(std::slice::from_ref(&private)));
 
         let public = assistant_entry(
             "",
@@ -949,7 +950,7 @@ mod tests {
                 }),
             }),
         );
-        assert!(public_reply_was_sent(std::slice::from_ref(&public)));
+        assert!(operator_reply_was_sent(std::slice::from_ref(&public)));
 
         let broadcast = assistant_entry(
             "",
@@ -959,7 +960,7 @@ mod tests {
                 input: serde_json::json!({"message": "team update"}),
             }),
         );
-        assert!(public_reply_was_sent(std::slice::from_ref(&broadcast)));
+        assert!(operator_reply_was_sent(std::slice::from_ref(&broadcast)));
     }
 
     #[test]
