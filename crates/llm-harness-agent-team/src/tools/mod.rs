@@ -195,7 +195,7 @@ mod tests {
         let tool = SendMessageTool::new(alice.clone(), Arc::new(ctx.clone()));
         let input = json!({"to": "bob", "body": "hello from alice"});
         let result = tool.call_inner(&input).unwrap();
-        assert!(result.contains("Message sent to bob"));
+        assert!(result.contains("Private message sent to bob"));
     }
 
     #[test]

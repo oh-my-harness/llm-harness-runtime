@@ -25,7 +25,7 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
             },
             "broadcast_id": {
                 "type": "string",
-                "description": "Optional. When responding to a broadcast, echo the broadcast_id shown in the broadcast message so the sender can correlate your reply with the original broadcast."
+                "description": "Optional. Include only to make an operator-directed reply visible in the shared group chat; use the broadcast_id from the message being answered. Omit it for a private message, even when that message triggered the current turn."
             }
         },
         "required": ["to", "body"],
@@ -62,8 +62,12 @@ impl SendMessageTool {
         let to_str = field_str(input, "to")?;
         let body = field_str(input, "body")?;
         let task_id = optional_str(input, "task_id");
-        let broadcast_id = optional_str(input, "broadcast_id")
-            .or_else(|| group.map(|group| group.broadcast_id.clone()));
+        let explicit_broadcast_id = optional_str(input, "broadcast_id");
+        let broadcast_id = if to_str == crate::timeout_manager::reserved::OPERATOR {
+            explicit_broadcast_id
+        } else {
+            explicit_broadcast_id.or_else(|| group.map(|group| group.broadcast_id.clone()))
+        };
 
         let target_id = AgentId::new(to_str);
 
@@ -99,7 +103,7 @@ impl SendMessageTool {
                     format!("failed to persist message: {error}"),
                 )
             })?;
-        Ok(format!("Message sent to {to_str}."))
+        Ok(format!("Private message sent to {to_str}."))
     }
 
     #[allow(clippy::result_large_err)]
@@ -117,7 +121,7 @@ impl SendMessageTool {
                 None,
                 broadcast_id,
             )
-            .map(|_| "sent".to_string())
+            .map(|_| "Public reply sent to operator.".to_string())
             .map_err(|error| {
                 ToolFailure::new(
                     "inbox_journal_persistence_failed",
@@ -155,15 +159,17 @@ impl Tool for SendMessageTool {
         "Send a direct message to another agent in your contact list. \
          The recipient will find it in their inbox.\n\n\
          Use when: asking a specific peer a question; sharing information with \
-         one agent; responding to a delegation; volunteering to help with a \
-         broadcast.\n\
+         one agent; responding to a delegation; sending a private response to an \
+         operator.\n\
          Don't use for: sending to multiple agents (use broadcast); delegating \
          a task with tracking (use delegate_task); reaching agents not in your \
          contact list (use search_contacts first).\n\n\
-         If you are answering a public group message, use broadcast instead of \
-         send_message so every member can see your reply.\n\n\
-         When responding to a broadcast, include the broadcast_id from the \
-         broadcast message so the sender can correlate your reply. Keep your \
+         If an operator-directed reply must be visible in the shared group chat, \
+         include the broadcast_id from the public message. Omit broadcast_id for \
+         a private reply, even if the current turn was triggered by a broadcast.\
+         When sending a public reply, use the broadcast_id from the \
+         broadcast message so the sender can correlate it with the original \
+         broadcast. Keep your \
          reply short (e.g. \"I can help, I have experience with X\") — do not \
          start working until formally delegated via delegate_task.\n\
          When responding to a delegation, include the task_id from the \
@@ -249,7 +255,7 @@ mod tests {
         let forbidden = SendMessageTool::new(alice.clone(), Arc::new(ctx.clone()));
         let error = forbidden
             .call_inner_with_group(
-                &serde_json::json!({"to": "operator", "body": "I'll take this"}),
+                &serde_json::json!({"to": "operator", "body": "I'll take this", "broadcast_id": "broadcast-1"}),
                 Some(&group),
             )
             .unwrap_err();
@@ -258,7 +264,7 @@ mod tests {
         let allowed = SendMessageTool::new(bob.clone(), Arc::new(ctx.clone()));
         allowed
             .call_inner_with_group(
-                &serde_json::json!({"to": "operator", "body": "on it"}),
+                &serde_json::json!({"to": "operator", "body": "on it", "broadcast_id": "broadcast-1"}),
                 Some(&group),
             )
             .unwrap();
@@ -267,5 +273,58 @@ mod tests {
             !ctx.has_messages(&carol),
             "a targeted public reply must not wake unrelated members"
         );
+    }
+
+    #[test]
+    fn send_message_without_broadcast_id_is_private_even_in_group_turn() {
+        let ctx = SocialContext::new(10);
+        let operator = AgentId::new(crate::timeout_manager::reserved::OPERATOR);
+        let bob = AgentId::new("bob");
+        ctx.register_agent(operator.clone(), "operator");
+        ctx.register_agent(bob.clone(), "coder");
+        ctx.ensure_contact(&bob, &operator);
+
+        let group = GroupReplyContext {
+            broadcast_id: "broadcast-1".to_string(),
+            responder: Some("bob".to_string()),
+        };
+        SendMessageTool::new(bob.clone(), Arc::new(ctx.clone()))
+            .call_inner_with_group(
+                &serde_json::json!({"to": "operator", "body": "private hello"}),
+                Some(&group),
+            )
+            .unwrap();
+
+        let messages = ctx.drain_inbox(&operator);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_type, crate::MessageType::Direct);
+        assert_eq!(messages[0].broadcast_id, None);
+        assert_eq!(ctx.private_history(&operator, &bob, 10).len(), 1);
+        assert!(ctx.group_history(10).is_empty());
+    }
+
+    #[test]
+    fn peer_broadcast_replies_inherit_broadcast_context() {
+        let ctx = SocialContext::new(10);
+        let a1 = AgentId::new("a1");
+        let a2 = AgentId::new("a2");
+        ctx.register_agent(a1.clone(), "analysis");
+        ctx.register_agent(a2.clone(), "research");
+        ctx.ensure_contact(&a2, &a1);
+
+        let group = GroupReplyContext {
+            broadcast_id: "broadcast-1".to_string(),
+            responder: None,
+        };
+        SendMessageTool::new(a2.clone(), Arc::new(ctx.clone()))
+            .call_inner_with_group(
+                &serde_json::json!({"to": "a1", "body": "I can help"}),
+                Some(&group),
+            )
+            .unwrap();
+
+        let messages = ctx.drain_inbox(&a1);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].broadcast_id.as_deref(), Some("broadcast-1"));
     }
 }

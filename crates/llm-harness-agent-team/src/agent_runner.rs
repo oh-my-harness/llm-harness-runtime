@@ -196,8 +196,15 @@ fn public_reply_was_sent(entries: &[SessionEntry]) -> bool {
         message.content.iter().any(|block| {
             matches!(
                 block,
-                ContentBlock::ToolUse { name, .. }
-                    if name == "broadcast" || name == "send_message"
+                ContentBlock::ToolUse { name, input, .. }
+                    if name == "broadcast"
+                        || (name == "send_message"
+                            && input.get("to").and_then(serde_json::Value::as_str)
+                                == Some(crate::timeout_manager::reserved::OPERATOR)
+                            && input
+                                .get("broadcast_id")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|broadcast_id| !broadcast_id.is_empty()))
             )
         })
     })
@@ -916,6 +923,43 @@ mod tests {
             final_no_response_entry(std::slice::from_ref(&real_reply)),
             None
         );
+    }
+
+    #[test]
+    fn public_reply_detection_requires_public_channel() {
+        let private = assistant_entry(
+            "",
+            Some(ContentBlock::ToolUse {
+                id: "tool-1".into(),
+                name: "send_message".into(),
+                input: serde_json::json!({"to": "operator", "body": "private"}),
+            }),
+        );
+        assert!(!public_reply_was_sent(std::slice::from_ref(&private)));
+
+        let public = assistant_entry(
+            "",
+            Some(ContentBlock::ToolUse {
+                id: "tool-2".into(),
+                name: "send_message".into(),
+                input: serde_json::json!({
+                    "to": "operator",
+                    "body": "public",
+                    "broadcast_id": "broadcast-1"
+                }),
+            }),
+        );
+        assert!(public_reply_was_sent(std::slice::from_ref(&public)));
+
+        let broadcast = assistant_entry(
+            "",
+            Some(ContentBlock::ToolUse {
+                id: "tool-3".into(),
+                name: "broadcast".into(),
+                input: serde_json::json!({"message": "team update"}),
+            }),
+        );
+        assert!(public_reply_was_sent(std::slice::from_ref(&broadcast)));
     }
 
     #[test]
