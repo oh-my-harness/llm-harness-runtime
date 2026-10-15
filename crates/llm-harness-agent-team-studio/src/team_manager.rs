@@ -399,6 +399,8 @@ impl TeamManager {
                     timeout: None,
                 },
                 work_dir: Some(working_dir.clone()),
+                trust_profile: Default::default(),
+                host_binds: Vec::new(),
             }).map_err(|e| std::io::Error::other(format!("sandbox required: {e}")))?;
             sandbox.start().await
                 .map_err(|e| std::io::Error::other(format!("sandbox required: {e}")))?;

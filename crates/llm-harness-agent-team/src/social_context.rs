@@ -840,6 +840,7 @@ impl SocialContext {
             message_type: MessageType::Broadcast,
             priority: crate::inbox::priority::NORMAL,
             task_id: None,
+            task_kind: None,
             broadcast_id: Some(broadcast_id.clone()),
             message_id: Some(message_id.clone()),
         };
@@ -1143,6 +1144,8 @@ impl SocialContext {
     /// without replacing (and thereby cancelling) an already-live token.
     pub fn ensure_controlled_task(&self, task_id: &str) {
         self.controlled_tasks.ensure(task_id);
+    }
+
     /// Copy pending messages for read-only observers without consuming them.
     ///
     /// This applies the same late-reply filtering as `drain_inbox`, but does

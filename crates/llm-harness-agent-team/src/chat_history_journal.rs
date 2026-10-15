@@ -335,6 +335,9 @@ mod tests {
             assert_eq!(entries[1].message.from.as_str(), "planner");
             assert_eq!(entries[1].message.body, "reply");
         }
+    }
+
+    #[test]
     fn member_reports_to_operator_are_private_without_broadcast_id() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("chat.sqlite3");
