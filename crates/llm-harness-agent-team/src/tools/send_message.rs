@@ -5,7 +5,8 @@ use std::sync::{Arc, LazyLock};
 use futures::future::BoxFuture;
 use llm_harness_types::{DataBlock, Tool, ToolContext, ToolFailure, ToolResult};
 
-use crate::{AgentId, GroupReplyContext, SocialContext};
+use crate::controlled::{ControlledWorkerRun, DecisionWorkerRun, terminal_task_report};
+use crate::{AgentId, GroupReplyContext, SocialContext, TaskMessageKind};
 
 static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
     serde_json::json!({
@@ -22,6 +23,11 @@ static SCHEMA: LazyLock<serde_json::Value> = LazyLock::new(|| {
             "task_id": {
                 "type": "string",
                 "description": "Optional. When replying to a delegated task, echo the task_id from the delegation request so the sender can correlate and cancel any pending follow-up timer."
+            },
+            "task_kind": {
+                "type": "string",
+                "enum": ["ack", "progress", "result", "blocked", "error"],
+                "description": "Optional lifecycle meaning for a task-correlated message. ACK and PROGRESS are non-terminal; RESULT, BLOCKED, and ERROR are terminal and require a non-empty body."
             },
             "broadcast_id": {
                 "type": "string",
@@ -62,6 +68,18 @@ impl SendMessageTool {
         let to_str = field_str(input, "to")?;
         let body = field_str(input, "body")?;
         let task_id = optional_str(input, "task_id");
+        let task_kind = optional_task_kind(input)?;
+        if task_kind.is_some_and(|kind| {
+            matches!(
+                kind,
+                TaskMessageKind::Result | TaskMessageKind::Blocked | TaskMessageKind::Error
+            )
+        }) && terminal_task_report(task_kind, body).is_none()
+        {
+            return Err(ToolFailure::invalid_arguments(
+                "terminal task messages require a non-empty body",
+            ));
+        }
         let broadcast_id = optional_str(input, "broadcast_id")
             .or_else(|| group.map(|group| group.broadcast_id.clone()));
 
@@ -92,7 +110,15 @@ impl SendMessageTool {
             return self.public_reply(body);
         }
         self.ctx
-            .send_direct_with_task(&self.agent_id, &target_id, body, 0, task_id, broadcast_id)
+            .send_direct_with_task_kind(
+                &self.agent_id,
+                &target_id,
+                body,
+                0,
+                task_id,
+                broadcast_id,
+                task_kind,
+            )
             .map_err(|error| {
                 ToolFailure::new(
                     "inbox_journal_persistence_failed",
@@ -126,6 +152,19 @@ fn optional_str(v: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[allow(clippy::result_large_err)]
+fn optional_task_kind(v: &serde_json::Value) -> Result<Option<TaskMessageKind>, ToolFailure> {
+    let Some(value) = v.get("task_kind") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|_| ToolFailure::invalid_arguments("invalid task_kind"))
+}
+
 impl Tool for SendMessageTool {
     fn name(&self) -> &str {
         "send_message"
@@ -151,11 +190,14 @@ impl Tool for SendMessageTool {
          reply short (e.g. \"I can help, I have experience with X\") — do not \
          start working until formally delegated via delegate_task.\n\
          When responding to a delegation, include the task_id from the \
-         delegation request so the sender can cancel any follow-up timer.\n\n\
+         delegation request so the sender can cancel any follow-up timer. For \
+         controlled tasks, use task_kind=ack or progress for non-terminal \
+         updates, and task_kind=result, blocked, or error for the one terminal \
+         report. Terminal reports require a non-empty body.\n\n\
          Examples:\n\
          {\"to\": \"researcher-1\", \"body\": \"What's the status of the analysis?\"}\n\
          {\"to\": \"architect\", \"body\": \"I can help with this\", \"broadcast_id\": \"abc123\"}\n\
-         {\"to\": \"coder-alpha\", \"body\": \"Done, here are the results\", \"task_id\": \"task-0\"}"
+         {\"to\": \"coder-alpha\", \"body\": \"Tests passed\", \"task_id\": \"task-0\", \"task_kind\": \"result\"}"
     }
 
     fn parameters_schema(&self) -> &serde_json::Value {
@@ -170,10 +212,34 @@ impl Tool for SendMessageTool {
         Box::pin(async move {
             let text =
                 self.call_inner_with_group(&args, ctx.run.extension::<GroupReplyContext>())?;
+            let terminal_delivered =
+                if let Some(controlled) = ctx.run.extension::<ControlledWorkerRun>() {
+                    controlled.record_delivery(
+                        field_str(&args, "to")?,
+                        optional_str(&args, "task_id").as_deref(),
+                        optional_task_kind(&args)?,
+                        field_str(&args, "body")?,
+                    )
+                } else if let Some(decision) = ctx.run.extension::<DecisionWorkerRun>() {
+                    // A valid correlated ACTION is the Orchestrator's decision
+                    // terminal: seal the run so no further provider turn or
+                    // tool call (a second ACTION) can execute for this task.
+                    decision.record_delivery(
+                        field_str(&args, "to")?,
+                        optional_str(&args, "task_id").as_deref(),
+                        field_str(&args, "body")?,
+                    )
+                } else {
+                    false
+                };
             Ok(ToolResult::full(
                 vec![DataBlock::text(text)],
                 serde_json::Value::Null,
-                false,
+                // A durably delivered controlled terminal is the final tool
+                // action for this run. This avoids another model turn while
+                // the runner's terminal-seal path provides a hard fallback for
+                // any harness work still unwinding after delivery.
+                terminal_delivered,
             ))
         })
     }
@@ -245,5 +311,69 @@ mod tests {
             )
             .unwrap();
         assert!(ctx.has_messages(&operator));
+    }
+
+    #[test]
+    fn task_kind_is_validated_and_transported() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal =
+            Arc::new(crate::InboxJournal::open(temp.path().join("typed-message.sqlite3")).unwrap());
+        let ctx = SocialContext::with_journal(10, Some(journal.clone()), None).unwrap();
+        let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
+        ctx.register_agent(alice.clone(), "implementation");
+        ctx.register_agent(bob.clone(), "controller");
+        ctx.ensure_contact(&alice, &bob);
+        let tool = SendMessageTool::new(alice, Arc::new(ctx.clone()));
+
+        tool.call_inner(&serde_json::json!({
+            "to": "bob",
+            "task_id": "task-1",
+            "task_kind": "result",
+            "body": "tests passed"
+        }))
+        .unwrap();
+
+        let delivered = ctx.drain_inbox(&bob).remove(0);
+        assert_eq!(delivered.message_type, crate::MessageType::Direct);
+        assert_eq!(delivered.task_kind, Some(TaskMessageKind::Result));
+        assert_eq!(delivered.body, "tests passed");
+
+        let recovered = SocialContext::with_journal(10, Some(journal), None).unwrap();
+        let persisted = recovered.drain_inbox(&bob).remove(0);
+        assert_eq!(persisted.task_kind, Some(TaskMessageKind::Result));
+        assert_eq!(persisted.task_id.as_deref(), Some("task-1"));
+
+        let error = tool
+            .call_inner(&serde_json::json!({
+                "to": "bob",
+                "task_id": "task-1",
+                "task_kind": "complete",
+                "body": "tests passed"
+            }))
+            .unwrap_err();
+        assert!(error.model_message.contains("invalid task_kind"));
+    }
+
+    #[test]
+    fn terminal_task_kind_requires_nonempty_body() {
+        let ctx = SocialContext::new(10);
+        let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
+        ctx.register_agent(alice.clone(), "implementation");
+        ctx.register_agent(bob.clone(), "controller");
+        ctx.ensure_contact(&alice, &bob);
+        let tool = SendMessageTool::new(alice, Arc::new(ctx));
+
+        let error = tool
+            .call_inner(&serde_json::json!({
+                "to": "bob",
+                "task_id": "task-1",
+                "task_kind": "blocked",
+                "body": "  "
+            }))
+            .unwrap_err();
+
+        assert!(error.model_message.contains("non-empty body"));
     }
 }

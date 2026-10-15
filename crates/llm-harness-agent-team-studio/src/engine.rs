@@ -84,6 +84,7 @@ pub struct AssembleInputs {
 pub struct Assembled {
     pub team: AgentTeam,
     pub handoffs: Vec<HandoffRoute>,
+    pub workflow_gate: Option<Arc<crate::pipeline::WorkflowGate>>,
     /// Cancels MCP background tasks on drop; `None` when the team has no MCP toolkits.
     pub mcp_lifecycle: Option<McpManagerLifecycle>,
 }
@@ -379,7 +380,11 @@ pub fn build_member_providers(
             continue;
         }
         let client: Arc<dyn LlmClient> = if base_url.is_empty() {
-            Arc::new(llm_harness_loop::OpenAIProvider::builder(&key).build())
+            Arc::new(
+                llm_harness_loop::OpenAIProvider::builder(&key)
+                    .max_tokens_scheme(llm_harness_loop::MaxTokensScheme::MaxCompletionTokens)
+                    .build(),
+            )
         } else {
             Arc::new(llm_harness_loop::openai_compatible(&key, &base_url))
         };
@@ -398,7 +403,9 @@ pub fn validate_spec(spec: &TeamSpec) -> Result<(), AssembleError> {
 
     let mut seen = std::collections::HashSet::new();
     for m in &spec.members {
-        if m.id.is_empty()
+        if (crate::pipeline::is_controlled(spec)
+            && matches!(m.id.as_str(), crate::pipeline::CONTROLLER | "planner"))
+            || m.id.is_empty()
             || matches!(m.id.as_str(), "." | ".." | "operator" | "self" | "timer")
             || m.id.contains(['/', '\\', '\0'])
             || m.id.starts_with("reminder:")
@@ -460,6 +467,7 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
         validate_toolkits(m)?;
     }
 
+    crate::novel_v1::validate_binding(&inputs.spec)?;
     let (mcp_tools, mcp_lifecycle) = prepare_mcp_tools(&inputs.spec, &inputs.data_dir).await?;
     let mcp_by_server: std::collections::HashMap<&str, &[Arc<dyn Tool>]> = mcp_tools
         .iter()
@@ -484,6 +492,8 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
     };
     std::fs::create_dir_all(project_dir.join("memory"))?;
 
+    let workflow_gate = crate::pipeline::is_controlled(&inputs.spec)
+        .then(|| Arc::new(crate::pipeline::WorkflowGate::default()));
     let mut team = AgentTeam::with_config(config);
     let mut handoffs = Vec::new();
     for m in &inputs.spec.members {
@@ -496,7 +506,13 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
         let spec = IndividualSpec::new(&m.id, &m.role_label, model)
             .with_prompt(m.persona.clone())
             .configure(|b| {
-                let b = b.max_tokens(16384);
+                let mut b = b.max_tokens(16384);
+                if let Some(gate) = &workflow_gate {
+                    b = b.before_tool_call_hook(Arc::new(crate::pipeline::WorkflowToolGuard::new(
+                        &m.id,
+                        gate.clone(),
+                    )));
+                }
                 // 成员级 toolkit：社交/memory/knowledge 由 team.build 统一装；
                 // fs/web 是显式 opt-in 的成员级插件。
                 let mut b = b;
@@ -559,8 +575,8 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
 
     // AgentTeam intentionally seeds only operator contacts. Studio specs are
     // declarative team topologies, so make every declared peer addressable
-    // before runners start; templates can then rely on reviewer→judge and
-    // judge→planner without first delegating through an intermediary.
+    // before runners start; templates can then rely on peer messaging
+    // without first delegating through an intermediary.
     let social_context = team.social_context().ok_or(TeamError::NotBuilt)?.clone();
     for sender in &inputs.spec.members {
         for receiver in &inputs.spec.members {
@@ -573,8 +589,14 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
         }
     }
 
+    // Controlled teams are activated only by their workflow owner.
     // Patrol arming：task 为空 → 引擎生成默认文本（issues_dir 有值则拼入）。
-    for m in &inputs.spec.members {
+    for m in inputs
+        .spec
+        .members
+        .iter()
+        .filter(|_| workflow_gate.is_none())
+    {
         for bh in &m.behaviors {
             if let Behavior::Patrol {
                 interval_secs,
@@ -601,6 +623,7 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
         team,
         handoffs,
         mcp_lifecycle: Some(mcp_lifecycle),
+        workflow_gate,
     })
 }
 
@@ -642,6 +665,7 @@ mod tests {
             template_baseline: None,
             name: "T".into(),
             repo_path: None,
+            sandbox_mode: None,
             members,
         }
     }

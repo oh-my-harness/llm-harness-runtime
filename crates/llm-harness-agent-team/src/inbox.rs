@@ -27,6 +27,33 @@ pub enum MessageType {
     ReflectionTrigger,
 }
 
+/// Lifecycle meaning of a message correlated to a task.
+///
+/// This is independent of [`MessageType`]: task updates are still transported
+/// as direct messages, while this field describes what the update means to the
+/// task owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskMessageKind {
+    Ack,
+    Progress,
+    Result,
+    Blocked,
+    Error,
+}
+
+impl TaskMessageKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ack => "ack",
+            Self::Progress => "progress",
+            Self::Result => "result",
+            Self::Blocked => "blocked",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// Server-defined conversation view for a chat message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatView {
@@ -84,6 +111,10 @@ pub struct InboxMessage {
     pub message_id: Option<String>,
     /// Correlation id for delegation/broadcast timeouts, when applicable.
     pub task_id: Option<String>,
+    /// Lifecycle meaning for a correlated task message. Absent on ordinary
+    /// social traffic and on messages persisted before this field existed.
+    #[serde(default)]
+    pub task_kind: Option<TaskMessageKind>,
     /// Correlation id shared by all messages of one broadcast, when applicable.
     pub broadcast_id: Option<String>,
     /// Durable journal row id; `None` for tests, legacy snapshots, and teams
@@ -369,9 +400,20 @@ mod tests {
             message_type: MessageType::Direct,
             priority,
             task_id: None,
+            task_kind: None,
             broadcast_id: None,
             message_id: None,
         }
+    }
+
+    #[test]
+    fn legacy_message_without_task_kind_deserializes() {
+        let mut value = serde_json::to_value(msg("a", "b", "legacy", 0)).unwrap();
+        value.as_object_mut().unwrap().remove("task_kind");
+
+        let recovered: InboxMessage = serde_json::from_value(value).unwrap();
+
+        assert_eq!(recovered.task_kind, None);
     }
 
     /// Push a message into the queue WITHOUT firing the Notify wakeup —

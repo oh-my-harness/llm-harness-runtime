@@ -531,3 +531,144 @@ async fn panic_mid_run_does_not_double_wrap_tools() {
         "expected exactly one duration annotation, got {annotations}: {ctx:?}"
     );
 }
+
+// ── Steer / teardown boundary (lost-steer race regression) ────────────────────
+
+/// Gate mounted as the run's `ShouldStopHook`: the loop parks inside the hook
+/// at its FINAL stop decision — after `agent_loop` has already drained the
+/// steer channel one last time at that boundary — until the test releases it.
+///
+/// The gate's `steer_tx` handle is the harness sender captured from the
+/// BeforeRunCtx's resources; we instead grab the live sender by calling
+/// `steer_message` on the harness (which forwards to the run's live channel).
+struct TeardownGate {
+    /// Set once the loop is parked at the final stop decision.
+    parked: Arc<std::sync::atomic::AtomicBool>,
+    /// Test releases the gate to let the run finish.
+    release: Arc<tokio::sync::Notify>,
+    /// Gate parks only the FIRST stop decision; later runs stop freely.
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl llm_harness_types::ShouldStopHook for TeardownGate {
+    fn should_stop<'a>(
+        &'a self,
+        _ctx: llm_harness_types::ShouldStopCtx<'a>,
+    ) -> BoxFuture<'a, bool> {
+        let parked = Arc::clone(&self.parked);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            // Park only the first stop decision (the instrumented run);
+            // later runs (consuming the salvage) must proceed normally.
+            if self
+                .armed
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                parked.store(true, std::sync::atomic::Ordering::SeqCst);
+                release.notified().await;
+            }
+            true
+        })
+    }
+}
+
+fn gate_user_text(text: &str) -> AgentMessage {
+    AgentMessage::User(UserMessage {
+        content: vec![ContentBlock::Text {
+            text: text.to_owned(),
+        }],
+        timestamp: chrono::Utc::now(),
+    })
+}
+
+/// Race reproduction without wall-clock sleeps driving the ordering:
+///
+/// 1. run's single turn completes; `agent_loop` yields TurnEnd.
+/// 2. should_stop hook parks the loop AFTER the loop's final steer drain.
+/// 3. test sends a steer via `steer_message` (returns Ok — sender alive).
+/// 4. test releases the gate; the run exits; the receiver is dropped.
+///
+/// Before the fix the steer vanished. Now run_loop must salvage it into
+/// queued_next_turn, and the next prompt must consume it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_after_final_drain_is_salvaged_into_next_run() {
+    let client = Arc::new(MockLlmClient::new(vec![MockResponse::text("first done")]));
+    let mut opts = AgentHarnessOptions::new("test-model");
+    let parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    opts.hooks.should_stop.push(Arc::new(TeardownGate {
+        parked: Arc::clone(&parked),
+        release: Arc::clone(&release),
+        armed: std::sync::atomic::AtomicBool::new(true),
+    }));
+    let h = Arc::new(
+        AgentHarness::new_in_memory(
+            Arc::clone(&client) as Arc<dyn LlmClient>,
+            Arc::new(NoOpEnv),
+            opts,
+        )
+        .await,
+    );
+
+    let run1 = {
+        let h = Arc::clone(&h);
+        tokio::spawn(async move { h.prompt("run one").await })
+    };
+
+    // Deterministic parking point: the mock has been called once AND the
+    // hook reports it is inside the final stop decision.
+    for _ in 0..1000 {
+        if parked.load(std::sync::atomic::Ordering::SeqCst)
+            && client.call_count.load(std::sync::atomic::Ordering::SeqCst) == 1
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    assert!(
+        parked.load(std::sync::atomic::Ordering::SeqCst),
+        "loop never reached its final stop decision"
+    );
+
+    // The loop is parked at the final stop decision — past the turn-boundary
+    // drain, before the final drain. A steer now gets Ok from try_send —
+    // exactly the racing monitor send.
+    h.steer_message(gate_user_text("late steer at teardown boundary"))
+        .expect("live run must accept the steer");
+
+    // Exit the run WITHOUT letting the loop's final drain consume the steer
+    // as a follow-up turn: abort the harness, then release the gate. The
+    // generator's post-run salvage must recover the steer instead of
+    // dropping it. (Release after abort: the cancelled token is what forces
+    // the salvage path instead of a live follow-up turn.)
+    h.abort();
+    release.notify_one();
+    run1.await.unwrap().expect("aborted run must return Ok");
+
+    // Invariant A-or-B: the steer was consumed by the run OR is recoverable.
+    // The abort path guarantees the salvage branch; assert it explicitly.
+    assert!(
+        h.has_queued_messages(),
+        "steer sent before the receiver dropped must be salvaged, not lost"
+    );
+
+    // Next run consumes the salvaged message first. The harness's mock
+    // client falls back to a plain text response once presets are exhausted.
+    h.prompt("run two").await.expect("run two must succeed");
+
+    let ctx = h.build_context().await.unwrap();
+    let steered = ctx.messages.iter().any(|m| {
+        matches!(m, AgentMessage::User(u) if u.content.iter().any(
+            |c| matches!(c, ContentBlock::Text { text } if text.contains("late steer"))
+        ))
+    });
+    assert!(
+        steered,
+        "salvaged steer must appear in the next run's context: {:?}",
+        ctx.messages
+    );
+    assert!(
+        !h.has_queued_messages(),
+        "salvaged steer must be consumed exactly once by the next run"
+    );
+}

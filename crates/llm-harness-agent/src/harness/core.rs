@@ -117,6 +117,7 @@ impl AgentHarness {
             pending_tool_calls: HashSet::new(),
             pending_session_writes: VecDeque::new(),
             queued_next_turn: vec![],
+            salvaged_steers: false,
             error_message: None,
         };
 
@@ -824,6 +825,17 @@ impl AgentHarness {
         inner.follow_up_tx = follow_up_tx;
         inner.state.queued_next_turn.clear();
         Ok(())
+    }
+
+    /// Whether the last run salvaged steers the loop never consumed.
+    ///
+    /// Set by the run teardown paths when a steer that the loop never read
+    /// was buffered for recovery. The scheduling layer (agent-team's runner)
+    /// consumes this after a run to requeue the original inbox messages,
+    /// because its wakeup loop only observes the social inbox.
+    pub fn take_salvaged_steers(&self) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        std::mem::replace(&mut inner.state.salvaged_steers, false)
     }
 
     /// Returns `true` if any queue is non-empty.

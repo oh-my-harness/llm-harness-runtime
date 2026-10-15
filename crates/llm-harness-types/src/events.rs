@@ -15,6 +15,12 @@ pub enum AgentEvent {
     AgentStart,
     /// Agent 完成本次运行；携带本次新增的全部消息（Harness 的关键接口契约）。
     AgentEnd { new_messages: Vec<AgentMessage> },
+    /// Steer 消息在 loop 退出后仍未被消费；由 loop 在最后排空 steer 通道时
+    /// 收集并交给宿主层（harness）以便后续 run 继续处理，防止消息静默丢失。
+    SteerOrphaned { messages: Vec<AgentMessage> },
+    /// loop 在 turn 边界注入的 steer 消息：宿主必须把它们写入会话，否则
+    /// 注入内容只存在于本次运行的内存上下文中，会话历史会静默缺页。
+    SteerConsumed { messages: Vec<AgentMessage> },
 
     // === Turn 生命周期 ===
     /// 一次 turn 开始；`index` 从 0 开始递增。

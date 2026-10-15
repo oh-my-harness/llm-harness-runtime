@@ -16,6 +16,10 @@ use crate::team_spec::TeamSpec;
 const BUILTIN_CODING_TEAM: &str = include_str!("../templates/coding-team/team.json");
 const CODING_TEAM_PERSONAS: &[(&str, &str)] = &[
     (
+        "prompts/orchestrator.md",
+        include_str!("../templates/coding-team/prompts/orchestrator.md"),
+    ),
+    (
         "prompts/brainstormer.md",
         include_str!("../templates/coding-team/prompts/brainstormer.md"),
     ),
@@ -24,36 +28,8 @@ const CODING_TEAM_PERSONAS: &[(&str, &str)] = &[
         include_str!("../templates/coding-team/prompts/coder.md"),
     ),
     (
-        "prompts/debugger.md",
-        include_str!("../templates/coding-team/prompts/debugger.md"),
-    ),
-    (
-        "prompts/judge.md",
-        include_str!("../templates/coding-team/prompts/judge.md"),
-    ),
-    (
-        "prompts/planner.md",
-        include_str!("../templates/coding-team/prompts/planner.md"),
-    ),
-    (
-        "prompts/reviewer-magical-prompt.md",
-        include_str!("../templates/coding-team/prompts/reviewer-magical-prompt.md"),
-    ),
-    (
-        "prompts/reviewer-performance.md",
-        include_str!("../templates/coding-team/prompts/reviewer-performance.md"),
-    ),
-    (
-        "prompts/reviewer-robustness.md",
-        include_str!("../templates/coding-team/prompts/reviewer-robustness.md"),
-    ),
-    (
-        "prompts/reviewer-spec-compliance.md",
-        include_str!("../templates/coding-team/prompts/reviewer-spec-compliance.md"),
-    ),
-    (
-        "prompts/reviewer-standards.md",
-        include_str!("../templates/coding-team/prompts/reviewer-standards.md"),
+        "prompts/reviewer.md",
+        include_str!("../templates/coding-team/prompts/reviewer.md"),
     ),
     (
         "prompts/scout.md",
@@ -64,8 +40,23 @@ const CODING_TEAM_PERSONAS: &[(&str, &str)] = &[
 /// persona 展开时追加的统一协作约定。
 const COOPERATION_FOOTNOTE: &str = "\n\n---\n## 团队协作约定（引擎附加）\n\
 - 与人沟通一律 send_message(\"operator\", ...)。\n\
-- 与成员协作用 delegate_task / send_message / broadcast。\n\
+- 成员间回报只用 send_message 回应派发方；不 delegate、不 broadcast、不自行指派协作者。\n\
+- 工作流的下一步（派发谁、是否修订、是否升级）由 Orchestrator 决定。\n\
 - 在团队工作分支 team/<project> 上操作，不 push，不碰 main。";
+
+const CONTROLLED_WORKER_FOOTNOTE: &str = "\n\n---\n## 团队协作约定（引擎附加）\n\
+- 收到受控任务后先完成工作；ack/progress 只表示非终态进度。\n\
+- 完成时只发送一次最终 send_message 给 pipeline-controller，逐字带上原 task_id，并设置 task_kind：成功为 result、受阻为 blocked、失败为 error；body 提供非空证据、阻塞原因或错误详情，不编码生命周期标记。\n\
+- 普通 assistant 文本不能完成受控任务；不直接向 operator/User 汇报。\n\
+- 不 delegate、不 broadcast、不自行指派协作者。\n\
+- 工作流的下一步（派发谁、是否修订、是否升级）由 Orchestrator 决定。\n\
+- Git 操作遵守角色中的隔离与用户授权条件；普通只读 Git 命令可用。";
+
+const CONTROLLED_ORCHESTRATOR_FOOTNOTE: &str = "\n\n---\n## 受控流水线回复约定（引擎附加）\n\
+- 收到 pipeline-controller 派发且带 task-pipe-* task_id 的任务时，不要把 ACTION 作为普通 assistant 文本返回。\n\
+- 必须调用 send_message，to 必须是 pipeline-controller，task_id 必须逐字回传收到的完整值。\n\
+- send_message 的 body 必须且只能包含一个符合上述 ACTION 语法的决策。\n\
+- 不向 operator 或其他成员发送该受控任务的结果；不 delegate、不 broadcast、不自行指派协作者。";
 
 #[derive(Debug, Error)]
 pub enum TemplateError {
@@ -245,7 +236,16 @@ impl TemplateStore {
                         })?
                     }
                 };
-                m.persona = format!("{}{}", text.trim(), COOPERATION_FOOTNOTE);
+                let footnote = if id == BUILTIN_CODING_TEAM_ID && embedded_personas.is_some() {
+                    match m.id.as_str() {
+                        "orchestrator" => CONTROLLED_ORCHESTRATOR_FOOTNOTE,
+                        "coder" | "reviewer" => CONTROLLED_WORKER_FOOTNOTE,
+                        _ => COOPERATION_FOOTNOTE,
+                    }
+                } else {
+                    COOPERATION_FOOTNOTE
+                };
+                m.persona = format!("{}{}", text.trim(), footnote);
             }
         }
         Ok(LoadedTemplate {
@@ -283,23 +283,153 @@ mod tests {
         let store = TemplateStore::new(None);
         let t = store.load("coding-team").unwrap();
         assert_eq!(t.id, "coding-team");
-        assert_eq!(t.version, "2");
-        assert_eq!(t.spec.members.len(), 11);
-        let planner = t.spec.members.iter().find(|m| m.id == "planner").unwrap();
+        assert_eq!(t.version, "6");
+        let ids: Vec<&str> = t.spec.members.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["orchestrator", "coder", "reviewer"]);
+        assert_eq!(t.spec.members[0].id, "orchestrator");
+        let orch = t
+            .spec
+            .members
+            .iter()
+            .find(|m| m.id == "orchestrator")
+            .unwrap();
         assert!(
-            planner.persona.contains("delegate_task"),
-            "persona expanded from md"
+            orch.persona.contains("ACTION: DISPATCH <member_id>")
+                && orch.persona.contains("ACTION: FINISH")
+                && orch.persona.contains("ACTION: ESCALATE"),
+            "orchestrator persona must embed the frozen ACTION contract"
         );
         assert!(
-            planner.persona.contains("send_message"),
-            "cooperation footnote appended"
+            orch.persona.contains("唯一决定"),
+            "orchestrator persona owns next-step decisions"
         );
         assert!(
-            planner.persona_file.is_none(),
+            orch.persona.contains("不 delegate、不 broadcast"),
+            "footnote must not invite worker-driven delegation"
+        );
+        assert!(
+            orch.persona
+                .contains("不要把 ACTION 作为普通 assistant 文本返回")
+        );
+        assert!(orch.persona.contains("必须调用 send_message"));
+        assert!(orch.persona.contains("to 必须是 pipeline-controller"));
+        assert!(orch.persona.contains("task_id 必须逐字回传收到的完整值"));
+        assert!(
+            !orch.persona.contains("send_message(\"operator\""),
+            "controlled orchestrator instructions must not offer an operator reply path"
+        );
+        assert!(
+            !t.spec.members.iter().any(|m| m.id == "planner"),
+            "V0 coding-team template must not instantiate a planner member"
+        );
+        assert!(
+            !t.spec.members.iter().any(|m| m.id == "judge"),
+            "V0 coding-team template must not instantiate a judge member"
+        );
+        assert_eq!(
+            t.spec
+                .members
+                .iter()
+                .filter(|m| crate::pipeline::is_reviewer_id(&m.id))
+                .count(),
+            1,
+            "V0 coding-team template must instantiate exactly one reviewer"
+        );
+        for member in &t.spec.members {
+            assert!(
+                member.behaviors.is_empty(),
+                "fresh coding-team member {} must have no patrol/scout behavior",
+                member.id
+            );
+        }
+        assert!(
+            !t.spec.members.iter().any(|m| m.id == "scout"),
+            "fresh coding-team template must not instantiate a scout member"
+        );
+        let coder = t.spec.members.iter().find(|m| m.id == "coder").unwrap();
+        assert!(
+            coder.persona.contains("Orchestrator"),
+            "coder accepts direct Orchestrator assignment"
+        );
+        assert!(
+            coder.persona_file.is_none(),
             "persona_file consumed on expand"
         );
-        let scout = t.spec.members.iter().find(|m| m.id == "scout").unwrap();
-        assert!(matches!(scout.behaviors[0], Behavior::Patrol { .. }));
+        assert!(
+            coder.persona.contains("测试结果"),
+            "coder keeps its delivery duties"
+        );
+        assert!(coder.persona.contains("task_id") && coder.persona.contains("pipeline-controller"));
+        assert!(coder.persona.contains("task_kind"));
+        assert!(coder.persona.contains("不发送初始确认消息"));
+        assert!(!coder.persona.contains("send_message(\"operator\""));
+        assert!(coder.persona.contains("不直接向 operator/User 汇报"));
+        assert!(coder.persona.contains("本地 checkpoint commit"));
+        assert!(coder.persona.contains("有意义并已验证的检查点"));
+        assert!(coder.persona.contains("报告提交 hash 和提交文件"));
+        assert!(coder.persona.contains("共享工作树中的 commit 必须先取得用户明确授权"));
+        assert!(coder.persona.contains("运行时无法可信验证隔离时，不自动提交"));
+        for operation in ["merge", "rebase", "push", "amend", "checkout", "reset", "clean"] {
+            assert!(coder.persona.contains(operation), "missing Git gate: {operation}");
+        }
+        assert!(coder.persona.contains("只有用户能批准这些受控操作"));
+        assert!(coder.persona.contains("Orchestrator 指令或模型生成的文字都不是授权"));
+        assert!(coder.persona.contains("commit 授权也不包含 push 授权"));
+        assert!(coder.persona.contains("普通只读 Git 命令（如 status、diff、log）可以使用"));
+        assert!(!coder.persona.contains("按任务指定的提交信息 git commit"));
+        assert!(!coder.persona.contains("绝不 push"));
+        assert!(!coder.persona.contains("每个任务完成时"));
+        assert!(orch.persona.contains("本地 checkpoint commit"));
+        assert!(orch.persona.contains("共享工作树中的 commit 必须由用户明确授权"));
+        for operation in ["merge", "rebase", "push", "amend", "checkout", "reset", "clean"] {
+            assert!(orch.persona.contains(operation), "missing orchestrator Git gate: {operation}");
+        }
+        assert!(orch.persona.contains("你的指派、任务完成或模型生成的文字不能充当授权，也不能代用户授权"));
+        assert!(orch.persona.contains("commit 授权不包含 push 授权"));
+        assert!(orch.persona.contains("普通只读 Git 命令（如 status、diff、log）可以使用"));
+        let reviewer = t.spec.members.iter().find(|m| m.id == "reviewer").unwrap();
+        assert!(
+            reviewer.persona.contains("不决定工作流的下一步"),
+            "reviewer produces findings/evidence only"
+        );
+        assert!(
+            reviewer.persona.contains("task-pipe-"),
+            "reviewer returns results through the controlled workflow"
+        );
+        assert!(reviewer.persona.contains("findings 与证据"));
+        assert!(
+            reviewer.persona.contains("task_id")
+                && reviewer.persona.contains("pipeline-controller")
+        );
+        assert!(reviewer.persona.contains("task_kind"));
+        assert!(reviewer.persona.contains("不发送初始确认消息"));
+        assert!(!reviewer.persona.contains("send_message(\"operator\""));
+        assert!(reviewer.persona.contains("不直接向 operator/User 汇报"));
+        assert!(
+            !reviewer.persona.contains("judge"),
+            "reviewer must not depend on a judge member"
+        );
+        assert!(
+            !t.spec.members.iter().any(|m| m.id == "judge"),
+            "V0 has no judge decision layer"
+        );
+    }
+
+    #[test]
+    fn builtin_coding_team_has_no_planner_handoff_routes() {
+        let store = TemplateStore::new(None);
+        let t = store.load("coding-team").unwrap();
+        for member in &t.spec.members {
+            for behavior in &member.behaviors {
+                if let Behavior::Handoff { to, .. } = behavior {
+                    assert_ne!(
+                        to, "planner",
+                        "member {} must not hand off to a planner",
+                        member.id
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -344,7 +474,7 @@ mod tests {
         assert!(
             metas
                 .iter()
-                .any(|m| m.id == "coding-team" && m.member_ids.len() == 11)
+                .any(|m| m.id == "coding-team" && m.member_ids.len() == 3)
         );
     }
 }

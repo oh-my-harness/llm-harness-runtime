@@ -10,7 +10,7 @@ use tokio::task::AbortHandle;
 use crate::agent_id::AgentId;
 use crate::chat_history_journal::ChatHistoryEntry;
 use crate::contact::{ContactRecord, ContactStore};
-use crate::inbox::{InboxMessage, InboxStore, MessageType};
+use crate::inbox::{InboxMessage, InboxStore, MessageType, TaskMessageKind};
 use crate::relation::RelationEngine;
 use crate::timeout_manager::reserved;
 
@@ -442,6 +442,7 @@ pub struct SocialContext {
     /// [`crate::agent_runner::spawn_monitor_task`] so shutdown can abort
     /// monitors whose runner died without running its own cleanup.
     monitor_registry: Arc<Mutex<HashMap<AgentId, AbortHandle>>>,
+    controlled_tasks: Arc<crate::controlled::ControlledTaskRegistry>,
     max_contacts: usize,
 }
 
@@ -457,6 +458,7 @@ impl SocialContext {
             timer_journal: None,
             chat_history_journal: None,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
+            controlled_tasks: Arc::new(crate::controlled::ControlledTaskRegistry::default()),
             chat_history: Arc::new(Mutex::new(VecDeque::new())),
             max_contacts,
         }
@@ -499,6 +501,7 @@ impl SocialContext {
             timer_journal,
             chat_history_journal,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
+            controlled_tasks: Arc::new(crate::controlled::ControlledTaskRegistry::default()),
             chat_history: Arc::new(Mutex::new(VecDeque::new())),
             max_contacts,
         };
@@ -529,6 +532,35 @@ impl SocialContext {
             }
         }
         Ok(context)
+    }
+
+    /// Establish a fresh cancellation lifetime for one controlled assignment.
+    pub fn begin_controlled_task(&self, task_id: &str) -> tokio_util::sync::CancellationToken {
+        self.controlled_tasks.begin(task_id)
+    }
+
+    /// Observe the controller-owned lifetime of a controlled assignment.
+    pub fn controlled_task_token(
+        &self,
+        task_id: &str,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        self.controlled_tasks.token(task_id)
+    }
+
+    /// Invalidate an outstanding controlled assignment and wake its runner.
+    pub fn cancel_controlled_task(&self, task_id: &str) -> bool {
+        self.controlled_tasks.cancel(task_id)
+    }
+
+    /// Mark a task as terminal for controller ingress while retaining its
+    /// cancellation token until the runner observes cancellation and exits.
+    pub fn retire_controlled_task(&self, task_id: &str) {
+        self.controlled_tasks.retire(task_id);
+    }
+
+    /// Forget a successfully quiesced controlled assignment.
+    pub fn complete_controlled_task(&self, task_id: &str) {
+        self.controlled_tasks.complete(task_id);
     }
     /// Register an agent in the registry.
     pub fn register_agent(&self, id: AgentId, expertise: impl Into<String>) {
@@ -624,7 +656,34 @@ impl SocialContext {
         task_id: Option<String>,
         broadcast_id: Option<String>,
     ) -> crate::Result<()> {
-        self.send_direct_with_message_id(from, to, body, priority, task_id, broadcast_id, None)?;
+        self.send_direct_with_task_kind(from, to, body, priority, task_id, broadcast_id, None)?;
+        Ok(())
+    }
+
+    /// Send a direct message with correlation and optional task lifecycle
+    /// metadata. The social transport preserves the kind without interpreting
+    /// workflow meaning.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_direct_with_task_kind(
+        &self,
+        from: &AgentId,
+        to: &AgentId,
+        body: impl Into<String>,
+        priority: u32,
+        task_id: Option<String>,
+        broadcast_id: Option<String>,
+        task_kind: Option<TaskMessageKind>,
+    ) -> crate::Result<()> {
+        self.send_direct_with_message_id_and_task_kind(
+            from,
+            to,
+            body,
+            priority,
+            task_id,
+            broadcast_id,
+            None,
+            task_kind,
+        )?;
         Ok(())
     }
 
@@ -644,6 +703,32 @@ impl SocialContext {
         broadcast_id: Option<String>,
         message_id: Option<String>,
     ) -> crate::Result<String> {
+        self.send_direct_with_message_id_and_task_kind(
+            from,
+            to,
+            body,
+            priority,
+            task_id,
+            broadcast_id,
+            message_id,
+            None,
+        )
+    }
+
+    /// Full direct-message constructor, including optional task lifecycle
+    /// metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_direct_with_message_id_and_task_kind(
+        &self,
+        from: &AgentId,
+        to: &AgentId,
+        body: impl Into<String>,
+        priority: u32,
+        task_id: Option<String>,
+        broadcast_id: Option<String>,
+        message_id: Option<String>,
+        task_kind: Option<TaskMessageKind>,
+    ) -> crate::Result<String> {
         self.apply_relation_event(from, to, crate::relation::RelationEvent::Communication);
         let message_id = message_id.unwrap_or_else(generate_message_id);
         let message = InboxMessage {
@@ -654,6 +739,7 @@ impl SocialContext {
             message_type: MessageType::Direct,
             priority,
             task_id,
+            task_kind,
             broadcast_id,
             message_id: Some(message_id.clone()),
         };
@@ -699,6 +785,7 @@ impl SocialContext {
                 message_type: MessageType::Broadcast,
                 priority: crate::inbox::priority::NORMAL,
                 task_id: None,
+                task_kind: None,
                 broadcast_id: Some(broadcast_id.clone()),
                 message_id: Some(message_id.clone()),
             };
@@ -721,6 +808,23 @@ impl SocialContext {
         let mut message = message;
         if message.message_id.is_none() {
             message.message_id = Some(generate_message_id());
+        }
+        // A completed pipeline task can never belong to a future waiter.
+        // Consume its duplicate/late deliveries at the controller boundary
+        // instead of durably enqueueing a row that every later wait would
+        // requeue. This is intentionally limited to the private namespace;
+        // unknown task IDs are left for the controller to classify.
+        if message.to.as_str() == "pipeline-controller"
+            && message
+                .task_id
+                .as_deref()
+                .is_some_and(|task_id| task_id.starts_with("task-pipe-"))
+            && message
+                .task_id
+                .as_deref()
+                .is_some_and(|task_id| self.controlled_tasks.is_completed(task_id))
+        {
+            return Ok(());
         }
         if message.from.as_str() != reserved::TIMER
             && message.from.as_str() != reserved::SELF
@@ -975,6 +1079,12 @@ impl SocialContext {
             .collect();
         self.inboxes.ack(&dropped);
         messages
+    }
+
+    /// Ensure a controller-owned pipeline task has a cancellation lifetime
+    /// without replacing (and thereby cancelling) an already-live token.
+    pub fn ensure_controlled_task(&self, task_id: &str) {
+        self.controlled_tasks.ensure(task_id);
     }
 
     /// Whether an agent has any pending messages.
@@ -1322,6 +1432,7 @@ mod tests {
             timeouts: Arc::new(TimeoutRegistry::default()),
             timer_journal: None,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
+            controlled_tasks: Arc::new(crate::controlled::ControlledTaskRegistry::default()),
             chat_history_journal: None,
             max_contacts: 10,
         };
@@ -1851,6 +1962,7 @@ mod tests {
                     message_type: MessageType::Timeout,
                     priority: crate::inbox::priority::TIMEOUT,
                     task_id: Some("task-0".to_string()),
+                    task_kind: None,
                     broadcast_id: None,
                     message_id: None,
                 });
@@ -1929,6 +2041,7 @@ mod tests {
                     message_type: MessageType::Timeout,
                     priority: crate::inbox::priority::TIMEOUT,
                     task_id: Some("task-0".to_string()),
+                    task_kind: None,
                     broadcast_id: None,
                     message_id: None,
                 });
@@ -2219,6 +2332,7 @@ mod tests {
             message_type: MessageType::Timeout,
             priority: crate::inbox::priority::TIMEOUT,
             task_id: Some("task-0".to_string()),
+            task_kind: None,
             broadcast_id: None,
             message_id: None,
         });
@@ -2255,6 +2369,7 @@ mod tests {
             message_type: MessageType::SelfReminder,
             priority: crate::inbox::priority::SELF_REMINDER,
             task_id: Some("task-0".to_string()),
+            task_kind: None,
             broadcast_id: None,
             message_id: None,
         });
@@ -2336,6 +2451,7 @@ mod tests {
             message_type: MessageType::DelegationRequest,
             priority: crate::inbox::priority::DELEGATION,
             task_id: Some("task-alice-0".into()),
+            task_kind: None,
             broadcast_id: None,
             message_id: None,
         };
@@ -2353,6 +2469,7 @@ mod tests {
             message_type: MessageType::Timeout,
             priority: crate::inbox::priority::TIMEOUT,
             task_id: Some("task-alice-0".into()),
+            task_kind: None,
             broadcast_id: None,
             message_id: None,
         };
@@ -2519,6 +2636,7 @@ mod tests {
             message_type: MessageType::Direct,
             priority: crate::inbox::priority::NORMAL,
             task_id: None,
+            task_kind: None,
             broadcast_id: None,
             message_id: None,
         });
