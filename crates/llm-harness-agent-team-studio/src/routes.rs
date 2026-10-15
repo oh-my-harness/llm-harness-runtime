@@ -1759,7 +1759,7 @@ async fn add_member(State(state): State<AppState>, Json(body): Json<AddMemberBod
     match pm.restart(&body.project, &settings, &api_key).await {
         Ok(()) => {
             register_team_side_effects(&state, &pm, &body.project);
-            Json(serde_json::json!({ "ok": true })).into_response()
+            (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
         }
         Err(e) => err_resp(e.to_string(), StatusCode::CONFLICT),
     }
