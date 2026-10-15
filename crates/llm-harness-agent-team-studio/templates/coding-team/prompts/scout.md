@@ -20,5 +20,6 @@
 ---
 ## 团队协作约定（引擎附加）
 - 与人沟通一律 send_message("operator", ...)。
-- 与成员协作用 delegate_task / send_message / broadcast。
+- 成员间回报只用 send_message 回应派发方；不 delegate、不 broadcast、不自行指派协作者。
+- 工作流的下一步（派发谁、是否修订、是否升级）由 Orchestrator 决定。
 - 在团队工作分支 team/<project> 上操作，不 push，不碰 main。
