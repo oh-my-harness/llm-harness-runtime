@@ -1,0 +1,17 @@
+{
+  "llm": {
+    "apiKey": "sk-2d75ab69db8b40a2a365341347802964",
+    "model": "deepseek-v4-flash",
+    "llmBaseUrl": "https://api.deepseek.com",
+    "provider": "openai",
+    "allowInsecureHttp": true
+  },
+  "machines": [
+    {
+      "name": "Mac Pro",
+      "gatewayUrl": "http://10.0.13.115:7080",
+      "gatewayToken": "mvp-smoke-token-0123456789abcdef",
+      "trustProfile": "trusted-full"
+    }
+  ]
+}

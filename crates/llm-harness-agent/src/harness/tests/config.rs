@@ -298,3 +298,130 @@ async fn set_tools_rejects_user_tool_using_reserved_name_alone() {
         .unwrap_err();
     assert!(err.to_string().contains("reserved by the framework"));
 }
+
+// ── LLM switching (provider / base URL / API key) ────────────────────────────
+
+/// Two mock clients let us prove which client served a turn: each records its
+/// own call count, and each has exactly one preset response (so a second call
+/// against the same client would return the "(no more mock responses)" text).
+fn make_switch_clients() -> (Arc<MockLlmClient>, Arc<MockLlmClient>) {
+    (
+        Arc::new(MockLlmClient::new(vec![MockResponse::text("from-a")])),
+        Arc::new(MockLlmClient::new(vec![MockResponse::text("from-b")])),
+    )
+}
+
+#[tokio::test]
+async fn set_client_swaps_the_client_for_the_next_turn() {
+    let (a, b) = make_switch_clients();
+    let h = make_harness(vec![]);
+    h.set_client(a.clone() as Arc<dyn LlmClient>);
+
+    h.prompt("first").await.unwrap();
+    h.wait_for_idle().await;
+    assert_eq!(a.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(b.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    h.set_client(b.clone() as Arc<dyn LlmClient>);
+    h.prompt("second").await.unwrap();
+    h.wait_for_idle().await;
+
+    assert_eq!(
+        a.call_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "old client must not be reused"
+    );
+    assert_eq!(
+        b.call_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "new client must serve the next turn"
+    );
+    // The model carried by the request is unchanged: set_client is structural.
+    assert_eq!(b.captured_requests.lock()[0].model(), "test-model");
+}
+
+#[tokio::test]
+async fn switch_llm_swaps_client_and_model_together() {
+    let (a, b) = make_switch_clients();
+    let h = make_harness(vec![]);
+    h.set_client(a.clone() as Arc<dyn LlmClient>);
+    h.set_model("model-a".into(), None).await.unwrap();
+
+    h.prompt("first").await.unwrap();
+    h.wait_for_idle().await;
+    assert_eq!(a.captured_requests.lock()[0].model(), "model-a");
+
+    h.switch_llm(
+        b.clone() as Arc<dyn LlmClient>,
+        "model-b".into(),
+        None,
+        Some("anthropic".into()),
+    )
+    .await
+    .unwrap();
+
+    h.prompt("second").await.unwrap();
+    h.wait_for_idle().await;
+
+    assert_eq!(a.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(b.call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(b.captured_requests.lock()[0].model(), "model-b");
+    assert_eq!(h.state().model, "model-b");
+}
+
+#[tokio::test]
+async fn switch_llm_records_model_change_with_provider() {
+    let (_, b) = make_switch_clients();
+    let h = make_harness(vec![]);
+
+    h.switch_llm(
+        b.clone() as Arc<dyn LlmClient>,
+        "model-b".into(),
+        None,
+        Some("openai".into()),
+    )
+    .await
+    .unwrap();
+
+    let entries = h.session.read_active_path().await.unwrap();
+    let changes: Vec<_> = entries
+        .iter()
+        .filter_map(|e| match &e.payload {
+            SessionEntryPayload::ModelChange {
+                to,
+                provider,
+                model_id,
+            } => Some((to.clone(), provider.clone(), model_id.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(changes.len(), 1, "expected exactly one ModelChange entry");
+    assert_eq!(changes[0].0, "model-b");
+    assert_eq!(changes[0].1.as_deref(), Some("openai"));
+    assert_eq!(changes[0].2, None);
+}
+
+/// A provider swap with an unchanged model id still has to be recorded: the
+/// session log is the audit trail of which provider served which turn.
+#[tokio::test]
+async fn switch_llm_same_model_still_records_provider_change() {
+    let (_, b) = make_switch_clients();
+    let h = make_harness(vec![]);
+
+    h.switch_llm(
+        b.clone() as Arc<dyn LlmClient>,
+        "test-model".into(),
+        None,
+        Some("anthropic".into()),
+    )
+    .await
+    .unwrap();
+
+    let entries = h.session.read_active_path().await.unwrap();
+    let changes = entries
+        .iter()
+        .filter(|e| matches!(e.payload, SessionEntryPayload::ModelChange { .. }))
+        .count();
+    assert_eq!(changes, 1);
+    assert_eq!(h.state().model, "test-model");
+}

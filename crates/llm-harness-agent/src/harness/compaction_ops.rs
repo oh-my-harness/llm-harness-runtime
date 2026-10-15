@@ -466,7 +466,7 @@ impl AgentHarness {
                         summary_model_info: m_info,
                         prompt: inner.compaction_prompt.clone(),
                     };
-                    (tc, self.client.clone(), sc)
+                    (tc, self.client(), sc)
                 }
             }
         };

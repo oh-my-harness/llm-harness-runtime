@@ -1,0 +1,5 @@
+.gradle/
+build/
+local.properties
+# debug .so exceeds GitHub 100MB limit — build it with scripts/build-android.sh
+app/src/main/jniLibs/

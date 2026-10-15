@@ -224,6 +224,16 @@ impl InboxQueue {
         }
         out
     }
+
+    /// Copy all messages without consuming them, in priority order.
+    pub fn peek_sorted(&self) -> Vec<InboxMessage> {
+        let mut entries = self.heap.iter().collect::<Vec<_>>();
+        entries.sort();
+        entries
+            .into_iter()
+            .map(|entry| entry.message.clone())
+            .collect()
+    }
 }
 
 /// Per-agent inbox store, safe for concurrent access.
@@ -315,6 +325,15 @@ impl InboxStore {
         let mut queues = self.queues.lock();
         match queues.get_mut(agent_id) {
             Some(q) => q.drain_sorted(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Copy pending messages for `agent_id` without changing their state.
+    pub fn peek_all(&self, agent_id: &AgentId) -> Vec<InboxMessage> {
+        let queues = self.queues.lock();
+        match queues.get(agent_id) {
+            Some(q) => q.peek_sorted(),
             None => Vec::new(),
         }
     }

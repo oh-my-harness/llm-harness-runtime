@@ -30,6 +30,9 @@ mod cgroup;
 #[cfg(all(feature = "bwrap", target_os = "linux"))]
 pub mod bwrap;
 
+#[cfg(all(feature = "linux-network", target_os = "linux"))]
+pub mod network;
+
 #[cfg(all(feature = "seatbelt", target_os = "macos"))]
 pub mod seatbelt;
 
@@ -44,6 +47,9 @@ pub use os::{OsEnv, OsEnvFactory, OsEnvSandbox};
 
 #[cfg(all(feature = "bwrap", target_os = "linux"))]
 pub use bwrap::{BwrapEnv, BwrapSandbox};
+
+#[cfg(all(feature = "linux-network", target_os = "linux"))]
+pub use network::{NetworkPolicy, NetworkSetup};
 
 /// Stub — `BwrapSandbox` is only available on Linux.
 #[cfg(all(feature = "bwrap", not(target_os = "linux")))]

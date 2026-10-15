@@ -34,6 +34,7 @@ fn default_config(work_dir: PathBuf) -> SandboxConfig {
             timeout: None,
         },
         work_dir: Some(work_dir),
+        trust_profile: Default::default(),
     }
 }
 
@@ -51,6 +52,7 @@ fn owned_config() -> SandboxConfig {
             timeout: None,
         },
         work_dir: None,
+        trust_profile: Default::default(),
     }
 }
 

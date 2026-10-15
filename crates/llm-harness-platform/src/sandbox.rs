@@ -17,7 +17,7 @@ pub struct NetRule {
 }
 
 /// Resource limits for sandbox execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ResourceLimits {
     /// Maximum CPU count. `None` means no limit.
     pub max_cpus: Option<usize>,
@@ -32,8 +32,17 @@ pub struct ResourceLimits {
     pub timeout: Option<Duration>,
 }
 
+/// A host directory bound into the sandbox at a guest path.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostBind {
+    /// Absolute host-side directory.
+    pub host: PathBuf,
+    /// Absolute guest-side path it appears at (e.g. `/workspace/myproj`).
+    pub guest: PathBuf,
+}
+
 /// Sandbox permission boundary declaration (v0.2 minimal set).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SandboxConfig {
     /// File system path allowlist (read/write).
     pub fs_allowlist: Vec<PathBuf>,
@@ -48,6 +57,12 @@ pub struct SandboxConfig {
     /// After `start()` succeeds, `env().working_dir()` MUST return this path
     /// (if set), otherwise the sandbox backend's default working directory.
     pub work_dir: Option<PathBuf>,
+    /// Trust level granted to this sandbox. Backends parameterize their
+    /// isolation policy by it; `restricted` is the conservative default.
+    pub trust_profile: crate::trust::TrustProfile,
+    /// Host directories bound into the sandbox (trusted profiles only;
+    /// ignored on `restricted`).
+    pub host_binds: Vec<HostBind>,
 }
 
 /// Sandbox abstraction — wraps `ExecutionEnv`, adding lifecycle management.

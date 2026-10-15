@@ -14,6 +14,15 @@ use crate::inbox::{InboxMessage, InboxStore, MessageType, TaskMessageKind};
 use crate::relation::RelationEngine;
 use crate::timeout_manager::reserved;
 
+/// Callback invoked after a direct or broadcast message is queued.
+///
+/// Observers run synchronously on the caller's task and may send follow-up
+/// messages. A routing configuration that forms a cycle can therefore loop;
+/// observers are meant to encode finite, declarative hand-offs.
+pub trait MessageObserver: Send + Sync {
+    fn on_message(&self, message: &InboxMessage);
+}
+
 /// Outcome of cancelling a pending timeout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimeoutCancel {
@@ -443,6 +452,7 @@ pub struct SocialContext {
     /// monitors whose runner died without running its own cleanup.
     monitor_registry: Arc<Mutex<HashMap<AgentId, AbortHandle>>>,
     controlled_tasks: Arc<crate::controlled::ControlledTaskRegistry>,
+    message_observers: Arc<Mutex<Vec<Arc<dyn MessageObserver>>>>,
     max_contacts: usize,
 }
 
@@ -459,6 +469,7 @@ impl SocialContext {
             chat_history_journal: None,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
             controlled_tasks: Arc::new(crate::controlled::ControlledTaskRegistry::default()),
+            message_observers: Arc::new(Mutex::new(Vec::new())),
             chat_history: Arc::new(Mutex::new(VecDeque::new())),
             max_contacts,
         }
@@ -502,6 +513,7 @@ impl SocialContext {
             chat_history_journal,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
             controlled_tasks: Arc::new(crate::controlled::ControlledTaskRegistry::default()),
+            message_observers: Arc::new(Mutex::new(Vec::new())),
             chat_history: Arc::new(Mutex::new(VecDeque::new())),
             max_contacts,
         };
@@ -613,6 +625,11 @@ impl SocialContext {
     /// Number of currently tracked monitor tasks (test observability).
     pub fn monitor_count(&self) -> usize {
         self.monitor_registry.lock().len()
+    }
+
+    /// Register a callback for newly queued direct and broadcast messages.
+    pub fn add_message_observer(&self, observer: Arc<dyn MessageObserver>) {
+        self.message_observers.lock().push(observer);
     }
 
     /// Update an agent's lifecycle status. Returns `false` if not found.
@@ -796,6 +813,43 @@ impl SocialContext {
             broadcast_id,
         })
     }
+
+    /// Send a public-reply broadcast to exactly one member.
+    ///
+    /// Operator messages that explicitly mention one member use this targeted
+    /// delivery. Keeping `MessageType::Broadcast` preserves the public-reply
+    /// protocol and group-history semantics while preventing unmentioned
+    /// members from waking up and spending provider tokens.
+    pub fn send_broadcast_to_with_message_id(
+        &self,
+        from: &AgentId,
+        to: &AgentId,
+        body: impl Into<String>,
+        message_id: Option<String>,
+    ) -> crate::Result<BroadcastMessageIds> {
+        if self.get_agent_info(to).is_none() {
+            return Err(crate::TeamError::AgentNotFound(to.as_str().to_string()));
+        }
+        let message_id = message_id.unwrap_or_else(generate_message_id);
+        let broadcast_id = uuid::Uuid::now_v7().to_string();
+        let message = InboxMessage {
+            journal_id: None,
+            from: from.clone(),
+            to: to.clone(),
+            body: body.into(),
+            message_type: MessageType::Broadcast,
+            priority: crate::inbox::priority::NORMAL,
+            task_id: None,
+            broadcast_id: Some(broadcast_id.clone()),
+            message_id: Some(message_id.clone()),
+        };
+        self.push_message(message)?;
+        Ok(BroadcastMessageIds {
+            message_id,
+            broadcast_id,
+        })
+    }
+
     /// Push a pre-constructed message into the recipient's inbox.
     ///
     /// Ensures the recipient has the sender in their contact list (inbound
@@ -845,7 +899,11 @@ impl SocialContext {
                 history.pop_front();
             }
         }
-        self.inboxes.push(message)?;
+        self.inboxes.push(message.clone())?;
+        let observers = self.message_observers.lock().clone();
+        for observer in observers {
+            observer.on_message(&message);
+        }
         Ok(())
     }
 
@@ -875,7 +933,7 @@ impl SocialContext {
             .filter(|message| match message.message_type {
                 MessageType::Broadcast => true,
                 MessageType::Direct => {
-                    message.broadcast_id.is_some() && message.to.as_str() == reserved::OPERATOR
+                    message.to.as_str() == reserved::OPERATOR && message.broadcast_id.is_some()
                 }
                 _ => false,
             })
@@ -939,7 +997,7 @@ impl SocialContext {
             .filter(|message| match message.message_type {
                 MessageType::Broadcast => true,
                 MessageType::Direct => {
-                    message.broadcast_id.is_some() && message.to.as_str() == reserved::OPERATOR
+                    message.to.as_str() == reserved::OPERATOR && message.broadcast_id.is_some()
                 }
                 _ => false,
             })
@@ -1085,6 +1143,26 @@ impl SocialContext {
     /// without replacing (and thereby cancelling) an already-live token.
     pub fn ensure_controlled_task(&self, task_id: &str) {
         self.controlled_tasks.ensure(task_id);
+    /// Copy pending messages for read-only observers without consuming them.
+    ///
+    /// This applies the same late-reply filtering as `drain_inbox`, but does
+    /// not consume timeout notifications or clear their fired marks: a
+    /// projection must not change delivery state as a side effect.
+    pub fn peek_inbox(&self, agent_id: &AgentId) -> Vec<InboxMessage> {
+        self.inboxes
+            .peek_all(agent_id)
+            .into_iter()
+            .filter(|msg| {
+                if matches!(
+                    msg.message_type,
+                    MessageType::Timeout | MessageType::SelfReminder
+                ) {
+                    return true;
+                }
+                let key = msg.task_id.as_ref().or(msg.broadcast_id.as_ref());
+                key.is_none_or(|key| !self.is_key_fired(agent_id, key))
+            })
+            .collect()
     }
 
     /// Whether an agent has any pending messages.
@@ -1433,6 +1511,7 @@ mod tests {
             timer_journal: None,
             monitor_registry: Arc::new(Mutex::new(HashMap::new())),
             controlled_tasks: Arc::new(crate::controlled::ControlledTaskRegistry::default()),
+            message_observers: Arc::new(Mutex::new(Vec::new())),
             chat_history_journal: None,
             max_contacts: 10,
         };
@@ -1506,6 +1585,44 @@ mod tests {
 
         // Inbox is drained.
         assert!(!ctx.has_messages(&bob));
+    }
+
+    #[test]
+    fn peek_inbox_is_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let chat_journal = Arc::new(
+            crate::chat_history_journal::ChatHistoryJournal::open(temp.path().join("chat.sqlite3"))
+                .unwrap(),
+        );
+        let ctx = SocialContext::with_journals(10, None, None, Some(chat_journal)).unwrap();
+        let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
+        ctx.register_agent(alice.clone(), "rust");
+        ctx.register_agent(bob.clone(), "python");
+
+        ctx.send_direct(&alice, &bob, "hello", 0);
+        let first = ctx.peek_inbox(&bob);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].body, "hello");
+        assert!(ctx.has_messages(&bob));
+
+        let second = ctx.peek_inbox(&bob);
+        assert_eq!(second.len(), first.len());
+        assert_eq!(
+            second
+                .iter()
+                .map(|msg| msg.body.as_str())
+                .collect::<Vec<_>>(),
+            first
+                .iter()
+                .map(|msg| msg.body.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ctx.chat_history(&bob, 10).len(),
+            1,
+            "projection must not duplicate transcript history"
+        );
     }
 
     #[test]
@@ -1600,10 +1717,32 @@ mod tests {
             .unwrap();
         ctx.send_direct_with_message_id(&bob, &operator, "done", 0, None, None, None)
             .unwrap();
+        assert!(ctx.group_history(10).is_empty());
 
         let alice_message = ctx.private_history(&operator, &alice, 1).remove(0);
         let bob_message = ctx.private_history(&operator, &bob, 1).remove(0);
         assert_ne!(alice_message.message_id, bob_message.message_id);
+    }
+
+    #[test]
+    fn targeted_broadcast_reaches_only_mentioned_member() {
+        let ctx = SocialContext::new(10);
+        let operator = AgentId::new(reserved::OPERATOR);
+        let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
+        ctx.register_agent(operator.clone(), reserved::OPERATOR);
+        ctx.register_agent(alice.clone(), "analysis");
+        ctx.register_agent(bob.clone(), "review");
+
+        let sent = ctx
+            .send_broadcast_to_with_message_id(&operator, &alice, "@alice only", None)
+            .unwrap();
+        assert!(ctx.drain_inbox(&bob).is_empty());
+        let delivered = ctx.drain_inbox(&alice);
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].message_type, MessageType::Broadcast);
+        assert_eq!(delivered[0].message_id, Some(sent.message_id));
+        assert_eq!(ctx.group_history(10).len(), 1);
     }
 
     #[test]

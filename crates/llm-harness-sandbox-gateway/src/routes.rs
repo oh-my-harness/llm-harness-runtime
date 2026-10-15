@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE, header::RETRY_AFTER};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -13,16 +13,19 @@ use llm_harness_platform::sandbox::Sandbox;
 use llm_harness_sandbox_remote::protocol::{
     CreateDirRequest, CreateSandboxRequest, CreateSandboxResponse, CreateTempDirRequest,
     CreateTempDirResponse, FileContent, FileInfoRequest, FileInfoResponse, FileInfoResponseValue,
-    GatewayErrorResponse, ListDirRequest, ListDirResponse, ReadFileRequest, ReadFileResponse,
-    RemoteExecEvent, RemoteSandboxState, RemoteSandboxStatus, RemoveRequest, ShellExecRequest,
-    ShellExecResponse, WriteFileRequest,
+    GatewayErrorResponse, HostBindWire, ListDirRequest, ListDirResponse, ReadFileRequest,
+    ReadFileResponse, RemoteExecEvent, RemoteSandboxState, RemoteSandboxStatus, RemoveRequest,
+    ShellExecRequest, ShellExecResponse, UploadFilesRequest, UploadFilesResponse, UploadedFile,
+    WriteFileRequest,
 };
 use llm_harness_types::{EnvError, FileInfo, ShellOptions};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::audit::AuditEvent;
 use crate::auth::{AuthenticatedPrincipal, bearer_token, unauthorized};
+use crate::observability::PrincipalId;
 use crate::state::{GUEST_WORK_DIR, GatewayStateError, SharedState};
 
 pub async fn serve(
@@ -33,7 +36,7 @@ pub async fn serve(
 }
 
 pub(crate) fn build_router(state: SharedState) -> Router {
-    Router::new()
+    let protected_routes = Router::new()
         .route("/v1/sandboxes", post(create_sandbox))
         .route(
             "/v1/sandboxes/{id}",
@@ -49,6 +52,7 @@ pub(crate) fn build_router(state: SharedState) -> Router {
         )
         .route("/v1/sandboxes/{id}/fs/read", post(read_file))
         .route("/v1/sandboxes/{id}/fs/write", post(write_file))
+        .route("/v1/sandboxes/{id}/fs/upload", post(upload_files))
         .route("/v1/sandboxes/{id}/fs/info", post(file_info))
         .route("/v1/sandboxes/{id}/fs/list", post(list_dir))
         .route("/v1/sandboxes/{id}/fs/exists", post(exists))
@@ -58,15 +62,28 @@ pub(crate) fn build_router(state: SharedState) -> Router {
             "/v1/sandboxes/{id}/fs/create-temp-dir",
             post(create_temp_dir),
         )
+        .route("/metrics", get(metrics))
+        .route("/v1/credentials/rotate", post(rotate_credential))
+        .route("/v1/credentials/revoke", post(revoke_credential))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authenticate,
         ))
-        .layer(axum::middleware::from_fn(log_request))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            log_request,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(
             state.config().max_request_bytes,
         ))
-        .with_state(state)
+        .with_state(state.clone());
+
+    let health_routes = Router::new()
+        .route("/healthz", get(health))
+        .route("/readyz", get(readiness))
+        .with_state(state);
+
+    protected_routes.merge(health_routes)
 }
 
 async fn authenticate(
@@ -74,15 +91,135 @@ async fn authenticate(
     mut request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
-    let principal = bearer_token(&request).and_then(|token| state.config().authenticate(token));
+    let principal = bearer_token(&request).and_then(|token| state.authenticate(token));
     let Some(principal) = principal else {
-        return unauthorized();
+        let response = unauthorized();
+        state
+            .audit_request(
+                AuditEvent::AuthenticationDenied,
+                request
+                    .extensions()
+                    .get::<String>()
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                None,
+                request.method().as_str(),
+                request.uri().path(),
+                Some(response.status().as_u16()),
+                None,
+                None,
+                serde_json::json!({ "reason": "invalid_or_missing_token" }),
+            )
+            .ok();
+        return response;
     };
+    if let Some(retry_after) = state.check_rate_limit(&principal.id, principal.requests_per_minute)
+    {
+        let response = rate_limited(principal.id.to_string(), retry_after);
+        state
+            .audit_request(
+                AuditEvent::RateLimited,
+                request
+                    .extensions()
+                    .get::<String>()
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                Some(principal.id.as_ref()),
+                request.method().as_str(),
+                request.uri().path(),
+                Some(response.status().as_u16()),
+                None,
+                None,
+                serde_json::json!({ "retry_after_ms": retry_after.as_millis() }),
+            )
+            .ok();
+        return response;
+    }
+    let principal_id = PrincipalId(principal.id.clone());
     request.extensions_mut().insert(principal);
-    next.run(request).await
+    let mut response = next.run(request).await;
+    response.extensions_mut().insert(principal_id);
+    response
+}
+
+async fn metrics(State(state): State<SharedState>) -> impl IntoResponse {
+    (
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        state.render_metrics(),
+    )
+}
+
+#[derive(serde::Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    backend: &'static str,
+}
+
+async fn health(State(state): State<SharedState>) -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        backend: state.backend_label(),
+    })
+}
+
+async fn readiness(State(state): State<SharedState>) -> Json<HealthResponse> {
+    health(State(state)).await
+}
+
+#[derive(serde::Deserialize)]
+struct RotateCredentialRequest {
+    new_token: String,
+}
+
+async fn rotate_credential(
+    State(state): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(request): Json<RotateCredentialRequest>,
+) -> Response {
+    if let Err(error) = state.rotate_credential(&principal.id, &request.new_token) {
+        return state_error(error);
+    }
+    if let Err(error) = state.audit_request(
+        AuditEvent::CredentialRotated,
+        &Uuid::new_v4().to_string(),
+        Some(&principal.id),
+        "POST",
+        "/v1/credentials/rotate",
+        Some(StatusCode::NO_CONTENT.as_u16()),
+        None,
+        None,
+        serde_json::json!({ "principal": principal.id.as_ref() }),
+    ) {
+        return state_error(error);
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn revoke_credential(
+    State(state): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> Response {
+    if let Err(error) = state.revoke_credential(&principal.id) {
+        return state_error(error);
+    }
+    if let Err(error) = state.audit_request(
+        AuditEvent::CredentialRevoked,
+        &Uuid::new_v4().to_string(),
+        Some(&principal.id),
+        "POST",
+        "/v1/credentials/revoke",
+        Some(StatusCode::NO_CONTENT.as_u16()),
+        None,
+        None,
+        serde_json::json!({ "principal": principal.id.as_ref() }),
+    ) {
+        return state_error(error);
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn log_request(
+    State(state): State<SharedState>,
     request: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> Response {
@@ -97,16 +234,86 @@ async fn log_request(
         .unwrap_or_else(Uuid::new_v4);
     let mut request = request;
     request.extensions_mut().insert(request_id.to_string());
+    if let Err(error) = state.audit_request(
+        AuditEvent::RequestStarted,
+        &request_id.to_string(),
+        None,
+        method.as_str(),
+        &path,
+        None,
+        None,
+        None,
+        serde_json::Value::Null,
+    ) {
+        return state_error(error);
+    }
     let response = next.run(request).await;
+    let principal = response
+        .extensions()
+        .get::<PrincipalId>()
+        .map(|principal| principal.0.to_string());
+    let sandbox_id = sandbox_id_from_path(&path);
+    let duration_ms = started.elapsed().as_millis().try_into().ok();
+    let completed_event = completed_audit_event(method.as_str(), &path);
+    if let Err(error) = state.audit_request(
+        completed_event,
+        &request_id.to_string(),
+        principal.as_deref(),
+        method.as_str(),
+        &path,
+        Some(response.status().as_u16()),
+        sandbox_id.as_deref(),
+        duration_ms,
+        serde_json::Value::Null,
+    ) {
+        tracing::error!(
+            request_id = %request_id,
+            error = error.detail(),
+            "failed to write completed gateway request audit record"
+        );
+    }
+    state.record_request(
+        method.as_str(),
+        &path,
+        principal.as_deref(),
+        response.status().as_u16(),
+        started.elapsed(),
+    );
     tracing::info!(
         request_id = %request_id,
         method = %method,
         path = %path,
+        principal = principal.as_deref().unwrap_or("anonymous"),
+        route = %crate::observability::metric_route(&path),
         status = response.status().as_u16(),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "sandbox gateway request"
     );
     response
+}
+
+fn completed_audit_event(method: &str, path: &str) -> AuditEvent {
+    match (method, path) {
+        ("POST", "/v1/sandboxes") => AuditEvent::SandboxCreated,
+        ("POST", path) if path.ends_with("/start") => AuditEvent::SandboxStarted,
+        ("POST", path) if path.ends_with("/reset") => AuditEvent::SandboxReset,
+        ("POST", path) if path.ends_with("/cleanup") => AuditEvent::SandboxCleaned,
+        ("DELETE", path) if path.matches('/').count() == 3 => AuditEvent::SandboxDeleted,
+        ("POST", path) if path.ends_with("/exec") => AuditEvent::ExecutionStarted,
+        ("POST", path) if path.ends_with("/kill") => AuditEvent::ExecutionKilled,
+        ("POST", path) if path.ends_with("/fs/read") => AuditEvent::FileRead,
+        ("POST", path) if path.ends_with("/fs/write") => AuditEvent::FileWritten,
+        ("POST", path) if path.ends_with("/fs/upload") => AuditEvent::FileUploaded,
+        ("POST", path) if path.ends_with("/fs/remove") => AuditEvent::FileRemoved,
+        ("POST", path) if path.ends_with("/fs/create-dir") => AuditEvent::DirectoryCreated,
+        _ => AuditEvent::RequestCompleted,
+    }
+}
+
+fn sandbox_id_from_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/v1/sandboxes/")?;
+    let sandbox_id = rest.split('/').next()?;
+    (!sandbox_id.is_empty()).then(|| sandbox_id.to_owned())
 }
 
 async fn create_sandbox(
@@ -132,11 +339,24 @@ async fn create_sandbox(
         cleanup_failed_sandbox(&state, &sandbox_id, "sandbox state persistence failure").await;
         return state_error(error);
     }
-    let work_dir = state
+    let (work_dir, host_binds) = state
         .get_sandbox(&principal, &sandbox_id)
-        .map(|sandbox| sandbox.work_dir.to_string_lossy().into_owned())
+        .map(|sandbox| {
+            (
+                sandbox.work_dir.to_string_lossy().into_owned(),
+                sandbox
+                    .host_binds
+                    .iter()
+                    .map(|(host, guest)| HostBindWire {
+                        host: host.to_string_lossy().into_owned(),
+                        guest: guest.to_string_lossy().into_owned(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
         .unwrap_or_default();
     tracing::info!(sandbox_id = %sandbox_id, principal = %principal.id, "sandbox created");
+    let trust_profile = state.requested_profile(&sandbox_id);
     (
         StatusCode::CREATED,
         Json(CreateSandboxResponse {
@@ -144,6 +364,8 @@ async fn create_sandbox(
             work_dir,
             backend: state.backend_label().to_owned(),
             state: RemoteSandboxState::Running,
+            trust_profile,
+            host_binds,
         }),
     )
         .into_response()
@@ -349,6 +571,77 @@ async fn write_file(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => fs_error(error, &request.path),
     }
+}
+
+async fn upload_files(
+    State(state): State<SharedState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<UploadFilesRequest>,
+) -> Response {
+    let Some(sandbox) = state.get_sandbox(&principal, &id) else {
+        return not_found(&id);
+    };
+    if request.files.len() > MAX_UPLOAD_FILES {
+        return gateway_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_many_files",
+            format!("batch upload accepts at most {MAX_UPLOAD_FILES} files"),
+            None,
+        );
+    }
+
+    let mut seen_paths = std::collections::HashSet::with_capacity(request.files.len());
+    let mut uploads = Vec::with_capacity(request.files.len());
+    for file in &request.files {
+        if !seen_paths.insert(file.path.as_str()) {
+            return gateway_error(
+                StatusCode::BAD_REQUEST,
+                "duplicate_path",
+                "batch upload paths must be unique".to_owned(),
+                Some(file.path.clone()),
+            );
+        }
+        let bytes = match decode_content(&file.content) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return gateway_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_base64",
+                    error,
+                    Some(file.path.clone()),
+                );
+            }
+        };
+        let path = match validate_guest_fs_path(&sandbox.config, &file.path) {
+            Ok(path) => path,
+            Err(response) => return *response,
+        };
+        uploads.push((file.path.clone(), path, bytes));
+    }
+
+    let mut uploaded = Vec::with_capacity(uploads.len());
+    for (requested_path, path, bytes) in uploads {
+        let byte_count = bytes.len() as u64;
+        match sandbox
+            .env
+            .write_file(&path, &bytes, CancellationToken::new())
+            .await
+        {
+            Ok(()) => {
+                uploaded.push(UploadedFile {
+                    path: requested_path,
+                    bytes: byte_count,
+                });
+            }
+            Err(error) => return fs_error(error, &requested_path),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(UploadFilesResponse { files: uploaded }),
+    )
+        .into_response()
 }
 
 async fn file_info(
@@ -751,6 +1044,8 @@ fn validate_shell_request(state: &SharedState, request: &ShellExecRequest) -> Op
     None
 }
 
+const MAX_UPLOAD_FILES: usize = 32;
+
 fn validate_guest_fs_path(
     config: &llm_harness_sandbox_remote::RemoteSandboxConfig,
     value: &str,
@@ -854,12 +1149,32 @@ fn gateway_error(
         .into_response()
 }
 
+fn rate_limited(principal: String, retry_after: std::time::Duration) -> Response {
+    let mut response = gateway_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "rate_limit_exceeded",
+        format!("principal {principal} request rate limit exceeded"),
+        None,
+    );
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        retry_after
+            .as_secs()
+            .max(1)
+            .to_string()
+            .parse()
+            .expect("retry-after header"),
+    );
+    response
+}
+
 fn state_error(error: GatewayStateError) -> Response {
     let (status, code) = match error {
         GatewayStateError::InvalidConfig(_) => (StatusCode::BAD_REQUEST, "invalid_config"),
         GatewayStateError::Storage(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "sandbox_registry_error")
         }
+        GatewayStateError::Audit(_) => (StatusCode::SERVICE_UNAVAILABLE, "audit_unavailable"),
         GatewayStateError::Capacity => (StatusCode::SERVICE_UNAVAILABLE, "sandbox_limit_reached"),
         GatewayStateError::Busy => (StatusCode::CONFLICT, "sandbox_busy"),
         GatewayStateError::NotFound => (StatusCode::NOT_FOUND, "sandbox_not_found"),

@@ -1,15 +1,22 @@
-#![cfg(target_os = "linux")]
-
 //! Authenticated Linux gateway for the remote sandbox protocol.
 //!
 //! The gateway uses [`BwrapSandbox`] as its execution backend. It rejects
 //! policies that bubblewrap cannot enforce instead of downgrading them.
 
+pub mod audit;
 mod auth;
+mod config;
+mod credentials;
+mod observability;
 mod routes;
 mod state;
 
-pub use auth::{FirecrackerBackendConfig, GatewayBackend, GatewayConfig, GatewayPrincipalConfig};
+pub use audit::{AuditValidation, validate_audit};
+pub use auth::{
+    AuditFailureMode, FirecrackerBackendConfig, GatewayBackend, GatewayConfig,
+    GatewayPrincipalConfig,
+};
+pub use config::GatewayServiceConfig;
 pub use routes::serve;
 
 use std::sync::Arc;

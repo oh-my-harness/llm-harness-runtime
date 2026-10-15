@@ -1,4 +1,6 @@
 /target/
+/node_modules/
+/logs/benchmarks/
 **/*.rs.bk
 Cargo.lock
 .cargo/config.toml
@@ -20,3 +22,6 @@ tests/wasm-smoke/target/
 /pr211.zip
 .tmp-*
 tests/wasm-smoke/bindgen/
+mobile/android/.kotlin/
+Library/
+/.rustup/

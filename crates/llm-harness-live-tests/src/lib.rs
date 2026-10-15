@@ -191,6 +191,8 @@ mod inner {
                 timeout: None,
             },
             work_dir: Some(tmp.path().to_path_buf()),
+            trust_profile: Default::default(),
+            host_binds: Vec::new(),
         };
         let sandbox = OsEnvSandbox::new(config);
         (tmp, sandbox)

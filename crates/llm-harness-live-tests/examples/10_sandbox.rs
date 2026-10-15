@@ -44,6 +44,8 @@ fn make_sandbox(tmp: &tempfile::TempDir, limits: ResourceLimits) -> OsEnvSandbox
         net_allowlist: vec![],
         resource_limits: limits,
         work_dir: Some(tmp.path().to_path_buf()),
+        host_binds: vec![],
+        trust_profile: Default::default(),
     };
     OsEnvSandbox::new(config)
 }

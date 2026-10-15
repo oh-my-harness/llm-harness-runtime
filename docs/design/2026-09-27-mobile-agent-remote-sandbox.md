@@ -106,7 +106,7 @@ HAR-001 应该增加一个可运行的 gateway binary，并提供显式配置项
 - 执行和请求限制；
 - logging level。
 
-使用简单的 TOML 或环境变量配置即可。具体格式应优先保证可复现性，并避免把 secret 泄漏到进程参数或日志中。
+第一版 gateway 配置使用 JSON，方便运维复制和校验。bearer token 只保存引用名，实际值从环境变量读取。这样既保持配置文件可审查，也避免把 secret 写进磁盘上的明文配置或进程参数。后续如需要，可在不改变安全边界的前提下增加环境变量覆盖或 TOML 展开层。
 
 ### 运行行为
 
@@ -118,6 +118,8 @@ gateway 进程应该：
 - 在 SIGTERM/Ctrl-C 时优雅关闭；
 - 根据现有 gateway recovery 语义停止或恢复沙箱；
 - 输出结构化 lifecycle 事件。
+
+`/healthz` 和 `/readyz` 保持无鉴权，方便反向代理和编排器探测。这两个端点只返回 backend 和状态，不暴露 principal、文件路径或内部配置。业务路由继续走原有 bearer-token 鉴权。
 
 ### TLS
 
@@ -354,17 +356,17 @@ HAR-001 完成的条件是：
 - [ ] sandbox gateway 可以通过显式配置启动；
 - [ ] 已实现 health/readiness 和优雅关闭；
 - [ ] Bwrap 是默认且经过测试的后端；
-- [ ] 部署文档展示 reverse-proxy 或 tunnel 配置；
+- [x] 部署文档展示 reverse-proxy 或 tunnel 配置；
 - [ ] 正常关闭后没有泄漏沙箱资源。
 
 HAR-002 完成的条件是：
 
-- [ ] control service 可以创建由 `RemoteSandbox` 支撑的 Agent session；
-- [ ] prompt、event streaming、steer 和 abort 可以端到端工作；
-- [ ] session 按已认证 principal 隔离；
-- [ ] session 删除会停止 Agent 并删除沙箱；
-- [ ] 重启 reconciliation 不会留下不可达但仍在运行的沙箱；
-- [ ] 集成测试覆盖移动端控制契约。
+- [x] control service 可以创建由 `RemoteSandbox` 支撑的 Agent session；
+- [x] prompt、event streaming、steer 和 abort 的控制契约有集成测试；真实 gateway E2E 已覆盖完整流程；
+- [x] session 按已认证 principal 隔离；
+- [x] session 删除会停止 Agent 并删除沙箱；
+- [x] 重启 reconciliation 不会留下不可达但仍在运行的沙箱；
+- [x] 集成测试覆盖移动端控制契约。
 
 当脚本化客户端能完成完整流程时，组合 MVP 才算可用：
 

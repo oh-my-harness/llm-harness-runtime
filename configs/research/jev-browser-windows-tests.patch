@@ -1,0 +1,22 @@
+diff --git a/tests/browser.test.ts b/tests/browser.test.ts
+index 276658a..0b48793 100644
+--- a/tests/browser.test.ts
++++ b/tests/browser.test.ts
+@@ -51,4 +51,17 @@ async function freePort(): Promise<number> {
+ /** Counts processes whose command line carries this run's debugging-port flag. */
+ async function chromiumProcessCount(cdpPort: number): Promise<number> {
++  if (process.platform === "win32") {
++    const script =
++      `$flag = '--remote-debugging-port=' + ${cdpPort}; ` +
++      "@(Get-CimInstance Win32_Process | Where-Object { " +
++      "$_.Name -eq 'chrome.exe' -and $_.CommandLine -and " +
++      "$_.CommandLine.Contains($flag) }).Count";
++    const { stdout } = await execFileAsync(
++      "powershell.exe",
++      ["-NoProfile", "-NonInteractive", "-Command", script],
++      { windowsHide: true },
++    );
++    return Number(stdout.trim());
++  }
+   const { stdout } = await execFileAsync("ps", ["-axo", "command"]);
+   return stdout

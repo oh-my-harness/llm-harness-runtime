@@ -17,6 +17,7 @@ use llm_harness_mcp::manager::McpManager;
 use llm_harness_types::ExecutionEnv;
 use llm_harness_types::{DataBlock, Tool, ToolContext, ToolFailure, ToolResult};
 
+use crate::message_router::MessageRoute;
 use crate::scout;
 use crate::team_spec::{Behavior, MemberSpec, TeamSpec};
 
@@ -40,6 +41,10 @@ pub enum AssembleError {
     },
     #[error("handoff on member {member} targets unknown member: {to}")]
     UnknownHandoffTarget { member: String, to: String },
+    #[error("member {member}: message handoff body_contains cannot be empty")]
+    EmptyMessageHandoffTrigger { member: String },
+    #[error("member {member}: message handoff trigger references unknown member: {to}")]
+    UnknownMessageHandoffTriggerMember { member: String, to: String },
     #[error("member {member}: MCP server '{server}' is not configured in {config_file}")]
     McpServerNotConfigured {
         member: String,
@@ -85,6 +90,7 @@ pub struct Assembled {
     pub team: AgentTeam,
     pub handoffs: Vec<HandoffRoute>,
     pub workflow_gate: Option<Arc<crate::pipeline::WorkflowGate>>,
+    pub message_routes: Vec<MessageRoute>,
     /// Cancels MCP background tasks on drop; `None` when the team has no MCP toolkits.
     pub mcp_lifecycle: Option<McpManagerLifecycle>,
 }
@@ -418,13 +424,36 @@ pub fn validate_spec(spec: &TeamSpec) -> Result<(), AssembleError> {
     }
     for m in &spec.members {
         for behavior in &m.behaviors {
-            if let Behavior::Handoff { to, .. } = behavior
-                && !seen.contains(to.as_str())
-            {
-                return Err(AssembleError::UnknownHandoffTarget {
-                    member: m.id.clone(),
-                    to: to.clone(),
-                });
+            if let Behavior::Handoff { on, to, .. } = behavior {
+                if !seen.contains(to.as_str()) {
+                    return Err(AssembleError::UnknownHandoffTarget {
+                        member: m.id.clone(),
+                        to: to.clone(),
+                    });
+                }
+                if let crate::team_spec::Trigger::Message {
+                    from,
+                    to: trigger_to,
+                    body_contains,
+                } = on
+                {
+                    if body_contains.is_empty() {
+                        return Err(AssembleError::EmptyMessageHandoffTrigger {
+                            member: m.id.clone(),
+                        });
+                    }
+                    for referenced in [from, trigger_to] {
+                        if let Some(id) = referenced
+                            && id != llm_harness_agent_team::reserved::OPERATOR
+                            && !seen.contains(id.as_str())
+                        {
+                            return Err(AssembleError::UnknownMessageHandoffTriggerMember {
+                                member: m.id.clone(),
+                                to: id.clone(),
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -436,21 +465,25 @@ pub fn handoff_routes(spec: &TeamSpec) -> Vec<HandoffRoute> {
     spec.members
         .iter()
         .flat_map(|m| {
-            m.behaviors.iter().filter_map(|behavior| match behavior {
-                Behavior::Handoff {
+            m.behaviors.iter().filter_map(|behavior| {
+                let Behavior::Handoff {
                     on,
                     to,
                     message_template,
-                } => Some(HandoffRoute {
+                } = behavior
+                else {
+                    return None;
+                };
+                Some(HandoffRoute {
                     resource: match on {
                         crate::team_spec::Trigger::ResourceConfirmed { resource } => {
                             resource.clone()
                         }
+                        crate::team_spec::Trigger::Message { .. } => return None,
                     },
                     to: to.clone(),
                     message_template: message_template.clone(),
-                }),
-                _ => None,
+                })
             })
         })
         .collect()
@@ -548,10 +581,12 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
                         crate::team_spec::Trigger::ResourceConfirmed { resource } => {
                             resource.clone()
                         }
+                        crate::team_spec::Trigger::Message { .. } => continue,
                     },
                     to: to.clone(),
                     message_template: message_template.clone(),
                 });
+                continue;
             }
         }
     }
@@ -572,6 +607,7 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
     }
 
     team.build(inputs.env.clone(), providers).await?;
+    crate::message_router::install(&inputs.spec, &team);
 
     // AgentTeam intentionally seeds only operator contacts. Studio specs are
     // declarative team topologies, so make every declared peer addressable
@@ -622,6 +658,7 @@ pub async fn assemble(inputs: AssembleInputs) -> Result<Assembled, AssembleError
     Ok(Assembled {
         team,
         handoffs,
+        message_routes: crate::message_router::message_routes(&inputs.spec),
         mcp_lifecycle: Some(mcp_lifecycle),
         workflow_gate,
     })
@@ -823,6 +860,45 @@ mod tests {
         assert_eq!(out.handoffs[0].resource, "issues");
         assert_eq!(out.handoffs[0].to, "planner");
         assert_eq!(out.handoffs[0].message_template, "issue: {body}");
+    }
+
+    #[test]
+    fn empty_message_handoff_trigger_fails_fast() {
+        let mut m = member("worker", &[], ModelRef::Explicit("m".into()));
+        m.behaviors = vec![Behavior::Handoff {
+            on: Trigger::Message {
+                from: None,
+                to: None,
+                body_contains: String::new(),
+            },
+            to: "worker".into(),
+            message_template: "route: {body}".into(),
+        }];
+        let s = spec(vec![m]);
+        assert!(matches!(
+            validate_spec(&s),
+            Err(AssembleError::EmptyMessageHandoffTrigger { member }) if member == "worker"
+        ));
+    }
+
+    #[test]
+    fn unknown_message_handoff_trigger_member_fails_fast() {
+        let mut m = member("worker", &[], ModelRef::Explicit("m".into()));
+        m.behaviors = vec![Behavior::Handoff {
+            on: Trigger::Message {
+                from: Some("missing".into()),
+                to: None,
+                body_contains: "DONE".into(),
+            },
+            to: "worker".into(),
+            message_template: "route: {body}".into(),
+        }];
+        let s = spec(vec![m]);
+        assert!(matches!(
+            validate_spec(&s),
+            Err(AssembleError::UnknownMessageHandoffTriggerMember { member, to })
+                if member == "worker" && to == "missing"
+        ));
     }
 
     #[test]

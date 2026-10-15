@@ -27,6 +27,8 @@ fn default_config(work_dir: PathBuf) -> SandboxConfig {
             timeout: None,
         },
         work_dir: Some(work_dir),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     }
 }
 
@@ -43,6 +45,8 @@ fn owned_config() -> SandboxConfig {
             timeout: None,
         },
         work_dir: None,
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     }
 }
 
@@ -71,16 +75,21 @@ fn policy_denies_network() {
 fn policy_denies_sensitive_reads() {
     let config = default_config(PathBuf::from("/tmp/test"));
     let policy = generate_policy(&config, &PathBuf::from("/tmp/test"), &[]);
-    // Comprehensive denylist: /etc, /var, /root, /Users, /Library, /System,
-    // /private/etc, /private/var, /private/root, /opt, /srv, /home.
+    // Fine-grained denylist: /Library is intentionally NOT blanket-denied
+    // (toolchain shims resolve through it — see generate_policy comment).
+    // Credential-bearing subtrees are denied instead.
     assert!(policy.contains(r#"(deny file-read* (subpath "/etc"))"#));
-    assert!(policy.contains(r#"(deny file-read* (subpath "/var"))"#));
+    assert!(policy.contains(r#"(deny file-read* (subpath "/private/etc"))"#));
+    assert!(policy.contains(r#"(deny file-read* (subpath "/private/var/db"))"#));
     assert!(policy.contains(r#"(deny file-read* (subpath "/root"))"#));
     assert!(policy.contains(r#"(deny file-read* (subpath "/Users"))"#));
-    assert!(policy.contains(r#"(deny file-read* (subpath "/Library"))"#));
+    assert!(policy.contains(r#"(deny file-read* (subpath "/Library/Keychains"))"#));
+    assert!(policy.contains(r#"(deny file-read* (subpath "/Library/Preferences"))"#));
     assert!(policy.contains(r#"(deny file-read* (subpath "/System"))"#));
-    assert!(policy.contains(r#"(deny file-read* (subpath "/private/etc"))"#));
-    assert!(policy.contains(r#"(deny file-read* (subpath "/private/var"))"#));
+    assert!(!policy.contains(r#"(deny file-read* (subpath "/Library"))"#));
+    assert!(
+        policy.contains(r#"(allow file-read* (subpath "/Library/Developer/CommandLineTools"))"#)
+    );
 }
 
 #[test]
@@ -116,6 +125,77 @@ fn policy_denies_writes_to_private_tmp() {
     assert!(policy.contains("(allow file-write* (subpath \"/private/tmp/seatbelt-abc\"))"));
 }
 
+#[test]
+fn restricted_policy_is_unchanged() {
+    let config = default_config(PathBuf::from("/tmp/test"));
+    let policy = generate_policy(&config, &PathBuf::from("/tmp/test"), &[]);
+    assert!(policy.contains("(deny network*)"));
+    assert!(!policy.contains("(allow network*)"));
+    // No credential floors emitted for restricted (host paths unreachable
+    // via the blanket /Users deny already).
+    assert!(!policy.contains("/.ssh"));
+}
+
+#[test]
+fn trusted_lan_policy_allows_network_and_enforces_credential_floors() {
+    let config = SandboxConfig {
+        trust_profile: llm_harness_platform::trust::TrustProfile::TrustedLan,
+        ..default_config(PathBuf::from("/private/tmp/seatbelt-abc"))
+    };
+    let policy = generate_policy(&config, &PathBuf::from("/private/tmp/seatbelt-abc"), &[]);
+    // Network opened.
+    assert!(!policy.contains("(deny network*)"));
+    assert!(policy.contains("(allow network*)"));
+    // Credential floors: home allow first, then .ssh/Keychains deny after.
+    let home = std::env::var("HOME").unwrap();
+    let home_allow = policy
+        .find(&format!(r#"(allow file-read* (subpath "{home}"))"#))
+        .expect("trusted-lan must allow home read");
+    let ssh_deny = policy
+        .find(&format!(r#"(deny file-read* (subpath "{home}/.ssh"))"#))
+        .expect(".ssh deny floor missing");
+    assert!(
+        ssh_deny > home_allow,
+        "credential deny must follow home allow"
+    );
+    // .env floor after work_dir allow.
+    let wd_allow = policy
+        .find(r#"(allow file-read* (subpath "/private/tmp/seatbelt-abc"))"#)
+        .unwrap();
+    let env_deny = policy
+        .find(r#"(deny file-read* (literal "/private/tmp/seatbelt-abc/.env"))"#)
+        .expect(".env deny floor missing");
+    assert!(env_deny > wd_allow);
+    // System write floors still present.
+    assert!(policy.contains(r#"(deny file-write* (subpath "/"))"#));
+}
+
+#[test]
+fn trusted_full_policy_near_host_with_floors() {
+    let config = SandboxConfig {
+        trust_profile: llm_harness_platform::trust::TrustProfile::TrustedFull,
+        ..default_config(PathBuf::from("/private/tmp/seatbelt-abc"))
+    };
+    let policy = generate_policy(&config, &PathBuf::from("/private/tmp/seatbelt-abc"), &[]);
+    assert!(!policy.contains("(deny network*)"));
+    // User-equivalent: no blanket path denies at all — (allow default)
+    // covers everything, so /etc, /opt, /System etc. all pass.
+    assert!(!policy.contains(r#"(deny file-read* (subpath "/etc"))"#));
+    assert!(!policy.contains(r#"(deny file-read* (subpath "/opt"))"#));
+    let home = std::env::var("HOME").unwrap();
+    // Credential floors: denied after the blanket allow.
+    assert!(policy.contains(&format!(r#"(deny file-read* (subpath "{home}/.ssh"))"#)));
+    assert!(policy.contains(&format!(
+        r#"(deny file-read* (subpath "{home}/Library/Keychains"))"#
+    )));
+    // trusted-full is user-equivalent: no blanket "/" write deny; /tmp is
+    // writable so toolchain temp files work.
+    assert!(!policy.contains(r#"(deny file-write* (subpath "/"))"#));
+    assert!(!policy.contains(r#"(deny file-write* (subpath "/private/tmp"))"#));
+    // Credential floors still hold.
+    assert!(policy.contains(&format!(r#"(deny file-read* (subpath "{home}/.ssh"))"#)));
+}
+
 // ── File API tests ─────────────────────────────────────────────────────────
 
 fn make_env(tmp: &tempfile::TempDir) -> SeatbeltEnv {
@@ -124,6 +204,7 @@ fn make_env(tmp: &tempfile::TempDir) -> SeatbeltEnv {
     SeatbeltEnv::new(
         work_dir_canon.clone(),
         work_dir_canon,
+        None,
         vec![],
         config,
         false,
@@ -141,6 +222,7 @@ fn make_env_with_policy(tmp: &tempfile::TempDir) -> SeatbeltEnv {
     SeatbeltEnv::new(
         work_dir_canon.clone(),
         work_dir_canon,
+        None,
         vec![],
         config,
         false,

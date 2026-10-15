@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Browser protocol contract fixture</title>
+<body>
+<form onsubmit="event.preventDefault(); window.submissions++; document.querySelector('#result').textContent = 'Saved ' + this.name.value + ' / ' + this.tier.selectedOptions[0].textContent;">
+  <label>Name <input id="name" name="name"></label>
+  <label>Tier <select id="tier" name="tier"><option value="silver">Silver</option><option value="gold">Gold</option></select></label>
+  <button id="save" type="submit">Save</button>
+</form>
+<p id="result" role="status">Not saved</p>
+<input aria-label="Password" type="password" value="fixture-only">
+<input aria-label="Upload" type="file">
+<input aria-label="Disabled" disabled>
+<input aria-label="Read only" readonly value="fixed">
+<button hidden>Hidden button</button>
+<script>window.submissions = 0;</script>
+</body>
+</html>

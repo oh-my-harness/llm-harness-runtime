@@ -23,11 +23,18 @@ struct RemoteSandboxInner {
     work_dir: PathBuf,
     backend: String,
     config: SandboxConfig,
+    /// Host directories the gateway bound into this sandbox (from the
+    /// create response; empty for older gateways).
+    host_binds: Vec<(PathBuf, PathBuf)>,
     running: AtomicBool,
     remote_active: AtomicBool,
 }
 
 /// Runtime-side handle to a sandbox managed by a remote gateway.
+///
+/// Cloning shares the same underlying sandbox; remote resources are cleaned
+/// up when the last handle drops (or `shutdown` is called once).
+#[derive(Clone)]
 pub struct RemoteSandbox {
     inner: Arc<RemoteSandboxInner>,
 }
@@ -63,16 +70,29 @@ impl RemoteSandbox {
             }
         };
         let running = response.state == RemoteSandboxState::Running;
+        let host_binds = response
+            .host_binds
+            .iter()
+            .map(|bind| (PathBuf::from(&bind.host), PathBuf::from(&bind.guest)))
+            .collect();
         let inner = Arc::new(RemoteSandboxInner {
             client,
             sandbox_id: response.sandbox_id,
             work_dir,
             backend: response.backend,
             config,
+            host_binds,
             running: AtomicBool::new(running),
             remote_active: AtomicBool::new(true),
         });
         Ok(Self { inner })
+    }
+
+    /// Host directories the gateway bound into this sandbox read-write
+    /// (host path, guest path). Empty for restricted profiles and older
+    /// gateways.
+    pub fn host_binds(&self) -> &[(PathBuf, PathBuf)] {
+        &self.inner.host_binds
     }
 
     /// Return the gateway-reported backend identifier.
@@ -638,6 +658,8 @@ mod tests {
                 timeout: None,
             },
             work_dir: Some(PathBuf::from("/workspace")),
+            trust_profile: Default::default(),
+            host_binds: Vec::new(),
         }
     }
 
@@ -647,6 +669,8 @@ mod tests {
             work_dir: work_dir.to_owned(),
             backend: "test".to_owned(),
             state: crate::protocol::RemoteSandboxState::Running,
+            trust_profile: Default::default(),
+            host_binds: Vec::new(),
         }
     }
 

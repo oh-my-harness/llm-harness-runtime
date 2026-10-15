@@ -23,13 +23,30 @@ pub struct CreateSandboxRequest {
     pub config: RemoteSandboxConfig,
 }
 
-/// Response body for sandbox creation and status.
+/// Response body for sandbox creation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSandboxResponse {
     pub sandbox_id: String,
     pub work_dir: String,
     pub backend: String,
     pub state: RemoteSandboxState,
+    /// Trust level actually granted (echoed for audit; UIs should display it).
+    #[serde(default)]
+    pub trust_profile: llm_harness_platform::trust::TrustProfile,
+    /// Host directories the gateway bound into this sandbox read-write
+    /// (trusted profiles only). Empty for restricted profiles and older
+    /// gateways.
+    #[serde(default)]
+    pub host_binds: Vec<HostBindWire>,
+}
+
+/// Wire form of a host-directory bind.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HostBindWire {
+    /// Absolute host-side directory.
+    pub host: String,
+    /// Guest-side path it appears at (e.g. `/workspace/myproj`).
+    pub guest: String,
 }
 
 /// Detailed sandbox status.
@@ -69,6 +86,32 @@ pub struct WriteFileRequest {
     pub path: String,
     pub content: FileContent,
     pub append: bool,
+}
+
+/// A single file in a batch upload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadFile {
+    pub path: String,
+    pub content: FileContent,
+}
+
+/// Request body for uploading multiple files at once.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadFilesRequest {
+    pub files: Vec<UploadFile>,
+}
+
+/// A file successfully written by a batch upload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadedFile {
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// Response body for a batch upload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadFilesResponse {
+    pub files: Vec<UploadedFile>,
 }
 
 /// File or directory metadata.

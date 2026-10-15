@@ -1,0 +1,162 @@
+diff --git a/src/decide.ts b/src/decide.ts
+index 0306e0a..628035d 100644
+--- a/src/decide.ts
++++ b/src/decide.ts
+@@ -281,23 +281,10 @@ export async function decide(
+ class InvalidAnswer extends Error {}
+ 
+-async function decideOnce(
++export function buildDecisionRequest(
+   observation: PageObservation,
+   goal: string,
+   history: HistoryEntry[],
+-  /**
+-   * Answers already given in this run, keyed by the exact request.
+-   *
+-   * The classifier is a function of its request: asked the same thing six
+-   * times it returned the same operation and target every time, varying
+-   * only confidence, 0.960 to 0.980. An identical request therefore costs
+-   * about 200 ms and tells us nothing new. A run repeats one about three
+-   * times, when a decision is discarded and the page settles back.
+-   */
+-  cache?: Map<string, Decision>,
+-  /** Cancels the request when the caller no longer needs the answer. */
+-  signal?: AbortSignal,
+-  /** Operations not to offer this time, such as DONE right after a refused claim. */
+   withheld: Operation[] = []
+-): Promise<Decision> {
++) {
+   const space = actionSpace(observation.actions);
+   const available = operationsFromSpace(space).filter(
+@@ -369,4 +356,18 @@ async function decideOnce(
+   };
+ 
++  return { body, space, operationCriteria, perOpCriteria, targetHeadOps };
++}
++
++async function decideOnce(
++  observation: PageObservation,
++  goal: string,
++  history: HistoryEntry[],
++  cache?: Map<string, Decision>,
++  signal?: AbortSignal,
++  withheld: Operation[] = [],
++  transport: typeof postTypeSafe = postTypeSafe,
++): Promise<Decision> {
++  const { body, space, operationCriteria, perOpCriteria, targetHeadOps } =
++    buildDecisionRequest(observation, goal, history, withheld);
+   const cacheKey = cache ? JSON.stringify(body) : "";
+   const remembered = cache?.get(cacheKey);
+@@ -380,5 +381,5 @@ async function decideOnce(
+ 
+   const start = performance.now();
+-  const json = await postTypeSafe(body, signal);
++  const json = await transport(body, signal);
+   const latencyMs = Math.round(performance.now() - start);
+   const usage = {
+diff --git a/src/run.ts b/src/run.ts
+index d86bea9..fd88adf 100644
+--- a/src/run.ts
++++ b/src/run.ts
+@@ -68,4 +68,9 @@ export type RunResult = {
+ export type RunOptions = {
+   goal: string;
++  /** Research adapters replace models, never the observation/execution loop. */
++  policy?: { decide: typeof decide; fieldText: typeof fieldText };
++  measure?: <T>(phase: string, work: () => Promise<T>) => Promise<T>;
++  maxActions?: number;
++  maxDecisions?: number;
+   uploadDir?: string;
+   /** Screenshots stay off in the default path; that is half the speed win. */
+@@ -188,11 +193,17 @@ export async function run(
+   const decisions: (Decision & { elapsedMs: number })[] = [];
+   const limit = options.browserTimeoutMs ?? BROWSER_TIMEOUT_MS;
++  const maxActions = options.maxActions ?? MAX_ACTIONS;
++  const maxDecisions = options.maxDecisions ?? MAX_DECISIONS;
++  if (![maxActions, maxDecisions].every((n) => Number.isInteger(n) && n > 0))
++    throw new Error("Action and decision limits must be positive integers");
++  const measure: NonNullable<RunOptions["measure"]> =
++    options.measure ?? ((_phase, work) => work());
+   const look = () =>
+-    bounded(
++    measure("observe", () => bounded(
+       observe(context, { screenshot: options.screenshots, diagnostics: false }),
+       limit,
+-    );
++    ));
+   const stillFresh = (seen: PageObservation, action?: ObservedAction) =>
+-    bounded(fresh(context, seen, action), limit);
++    measure("freshness", () => bounded(fresh(context, seen, action), limit));
+   // A met condition counts only if the page it was checked on is still the
+   // page: the check is a model call, and the page can move while it runs.
+@@ -265,7 +276,7 @@ export async function run(
+         break;
+       }
+-      if (decisions.length >= MAX_DECISIONS) {
++      if (decisions.length >= maxDecisions) {
+         status = "blocked";
+-        reason = `reached the limit of ${MAX_DECISIONS} decisions`;
++        reason = `reached the limit of ${maxDecisions} decisions`;
+         break;
+       }
+@@ -308,5 +319,5 @@ export async function run(
+       // claim again: on Peek it claimed done twice at once while the date
+       // picker, which ignores its first click, stayed shut.
+-      const decision = await decide(
++      const decision = await (options.policy?.decide ?? decide)(
+         observation,
+         goal,
+@@ -383,7 +394,7 @@ export async function run(
+           `Decision named an action this observation does not contain: ${decision.choice}`,
+         );
+-      if (history.length >= MAX_ACTIONS) {
++      if (history.length >= maxActions) {
+         status = "blocked";
+-        reason = `reached the limit of ${MAX_ACTIONS} actions`;
++        reason = `reached the limit of ${maxActions} actions`;
+         break;
+       }
+@@ -402,5 +413,5 @@ export async function run(
+             textLatencyMs = cached.latencyMs;
+           } else {
+-            const generated = await fieldText(
++            const generated = await (options.policy?.fieldText ?? fieldText)(
+               {
+                 goal,
+@@ -469,11 +480,12 @@ export async function run(
+           }
+         }
+-        await bounded(
+-          execute(context, observation, action, {
++        const actionObservation = observation;
++        await measure("execute", () => bounded(
++          execute(context, actionObservation, action, {
+             text: text ?? undefined,
+             uploadDir,
+           }),
+           limit,
+-        );
++        ));
+         pendingText.clear();
+       } catch (error) {
+@@ -537,5 +549,5 @@ export async function run(
+       history.push(entry);
+ 
+-      await bounded(
++      await measure("settle", () => bounded(
+         settle(
+           activePage(context),
+@@ -544,5 +556,5 @@ export async function run(
+         ),
+         limit,
+-      );
++      ));
+       observation = await look();
+       entry.pageChanged = observation.fingerprint !== before.fingerprint;
+@@ -645,5 +657,5 @@ export async function run(
+     closedShadowHosts: hung
+       ? 0
+-      : await bounded(closedShadowHosts(context), limit).catch(() => 0),
++      : await measure("diagnostics", () => bounded(closedShadowHosts(context), limit)).catch(() => 0),
+     frames: observation?.frames ?? [],
+     tabs: observation?.tabs ?? [],

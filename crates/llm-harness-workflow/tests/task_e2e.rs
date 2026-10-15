@@ -50,6 +50,8 @@ fn make_sandbox() -> Arc<OsEnvSandbox> {
             timeout: None,
         },
         work_dir: Some(dir.path().to_path_buf()),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     std::mem::forget(dir);
     Arc::new(OsEnvSandbox::new(config))

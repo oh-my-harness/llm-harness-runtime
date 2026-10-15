@@ -105,6 +105,7 @@ pub struct FirecrackerLifecycleConfig {
     cgroup_mounts_path: PathBuf,
     vcpu_count: u32,
     mem_size_mib: u32,
+    image_capacity_bytes: Option<u64>,
     vsock_guest_cid: u32,
     guest_agent_port: u32,
     boot_args: String,
@@ -141,6 +142,7 @@ impl FirecrackerLifecycleConfig {
             cgroup_mounts_path: PathBuf::from("/proc/mounts"),
             vcpu_count,
             mem_size_mib,
+            image_capacity_bytes: None,
             vsock_guest_cid,
             guest_agent_port: DEFAULT_GUEST_AGENT_PORT,
             boot_args: String::new(),
@@ -157,6 +159,11 @@ impl FirecrackerLifecycleConfig {
 
     pub fn with_rootfs_read_only(mut self, read_only: bool) -> Self {
         self.rootfs_read_only = read_only;
+        self
+    }
+
+    pub fn with_image_capacity(mut self, capacity_bytes: Option<u64>) -> Self {
+        self.image_capacity_bytes = capacity_bytes;
         self
     }
 
@@ -482,7 +489,7 @@ impl FirecrackerLifecycle {
         }
 
         let mut image = match FirecrackerImageAllocator::new(&config.base_image_path)
-            .allocate(paths.rootfs_path.clone())
+            .allocate_with_capacity(paths.rootfs_path.clone(), config.image_capacity_bytes)
         {
             Ok(image) => image,
             Err(error) => {

@@ -51,6 +51,7 @@ JSON 响应必须是 `application/json`（忽略参数并按大小写不敏感�
 | `POST /v1/sandboxes/{id}/cleanup` | `204` | 清理临时资源 |
 | `POST /v1/sandboxes/{id}/fs/read` | `200` + `ReadFileResponse` | 读文本或二进制文件 |
 | `POST /v1/sandboxes/{id}/fs/write` | `204` | 写入或追加文件 |
+| `POST /v1/sandboxes/{id}/fs/upload` | `200` + `UploadFilesResponse` | 批量写入预置文件 |
 | `POST /v1/sandboxes/{id}/fs/info` | `200` + file info | 查询元数据 |
 | `POST /v1/sandboxes/{id}/fs/list` | `200` + entries | 列目录 |
 | `POST /v1/sandboxes/{id}/fs/exists` | `200` + boolean | 判断路径存在 |
@@ -80,6 +81,8 @@ JSON 响应必须是 `application/json`（忽略参数并按大小写不敏感�
 
 客户端会验证 read 返回的内容类型与请求的 `binary` 匹配，并拒绝非法 Base64。
 文件元数据和目录列表中的 guest path 必须通过同一规则校验；`file_info` 返回的路径必须与请求一致，目录列表条目必须是请求目录的直接子路径，`create_temp_dir` 返回的路径必须位于 sandbox `work_dir` 下。
+
+`fs/upload` 复用 `fs/write` 的路径、allowlist/denylist 和 Base64 语义。一次请求最多包含 32 个路径唯一的文件，gateway 会先解码并校验全部条目，再按请求顺序写入；文件会被覆盖。批量上传不是事务：某个文件写入失败时，已写入的文件不会回滚，响应中的错误会标识失败的 guest path。
 
 执行请求中的 `cwd` 使用同一 guest path 规则；环境变量 key 必须非空且不包含 `=` 或 NUL，环境变量值不允许包含 NUL。`create_temp_dir` 的 prefix 必须是单个路径组件，不能包含 `/`、`\`、NUL、`.` 或 `..`。
 
@@ -165,6 +168,8 @@ VM-level backend selection and threat model are defined separately in
 该 gateway 的 `serve` 只提供 HTTP listener；生产部署必须由 sidecar、ingress 或服务网格终止 TLS，并以最小权限 OS 用户运行。
 
 Linux systemd 部署模板见 [`deploy/README.md`](../../../deploy/README.md)。
+
+Linux 生产加固 Runbook 见 [`gateway-hardening.md`](../gateway-hardening.md)。
 
 ### 仍不满足的完整生产要求
 

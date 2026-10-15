@@ -45,8 +45,8 @@ pub use memory_store::{
 };
 pub use relation::{RelationConfig, RelationEngine, RelationEvent};
 pub use social_context::{
-    AgentInfo, AgentRegistry, AgentStatus, BroadcastMessageIds, CancelledTimeout, SocialContext,
-    TimeoutCancel,
+    AgentInfo, AgentRegistry, AgentStatus, BroadcastMessageIds, CancelledTimeout, MessageObserver,
+    SocialContext, TimeoutCancel,
 };
 pub use team::{AgentTeam, OperatorMessage, TeamConfig};
 pub use timeout_manager::TimeoutManager;

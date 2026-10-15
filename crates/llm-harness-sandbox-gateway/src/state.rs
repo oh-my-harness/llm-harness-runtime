@@ -6,40 +6,59 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::future::BoxFuture;
 use llm_harness_platform::sandbox::{NetRule, ResourceLimits, Sandbox, SandboxConfig};
+#[cfg(target_os = "linux")]
 use llm_harness_sandbox::BwrapSandbox;
+use llm_harness_sandbox::OsEnvSandbox;
+use llm_harness_sandbox::SeatbeltSandbox;
 use llm_harness_sandbox_remote::RemoteSandboxConfig;
 use llm_harness_sandbox_remote::protocol::RemoteSandboxState;
-use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
+use llm_harness_types::ExecutionEnv;
+#[cfg(target_os = "linux")]
+use llm_harness_types::{EnvError, FileInfo, ShellOptions, ShellOutput};
+#[cfg(target_os = "linux")]
 use llm_harness_vm_agent_env::GuestAgentEnv;
+#[cfg(target_os = "linux")]
 use llm_harness_vm_firecracker::{FirecrackerLifecycle, FirecrackerLifecycleConfig};
 use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 
+use crate::audit::{AuditEvent, GatewayAudit};
 use crate::auth::AuthenticatedPrincipal;
+use crate::credentials::CredentialStore;
+use crate::observability::{RateLimiter, RequestMetrics};
 
 pub(crate) const GUEST_WORK_DIR: &str = "/workspace";
 
 pub(crate) type SharedState = Arc<GatewayState>;
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct GatewayState {
     config: crate::auth::GatewayConfig,
     work_root: PathBuf,
     _work_root_lock: File,
+    audit: Option<GatewayAudit>,
     registry: std::sync::Mutex<Connection>,
     sandboxes: std::sync::Mutex<HashMap<String, SandboxRecord>>,
     executions: std::sync::Mutex<HashMap<String, ExecutionRecord>>,
     lifecycle_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    metrics: RequestMetrics,
+    rate_limiter: RateLimiter,
+    audit_failure_mode: crate::auth::AuditFailureMode,
+    credentials: CredentialStore,
 }
 
 #[derive(Debug)]
 pub(crate) enum GatewayStateError {
     InvalidConfig(anyhow::Error),
     Storage(anyhow::Error),
+    Audit(anyhow::Error),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Capacity,
     Busy,
     NotFound,
@@ -50,6 +69,7 @@ impl GatewayStateError {
         match self {
             Self::InvalidConfig(error) => error.to_string(),
             Self::Storage(_) => "sandbox registry operation failed".to_owned(),
+            Self::Audit(_) => "gateway audit sink is unavailable".to_owned(),
             Self::Capacity => "gateway sandbox limit reached".to_owned(),
             Self::Busy => "sandbox is busy; retry after active requests complete".to_owned(),
             Self::NotFound => "sandbox not found".to_owned(),
@@ -59,6 +79,7 @@ impl GatewayStateError {
     pub(crate) fn detail(&self) -> String {
         match self {
             Self::Storage(error) => error.to_string(),
+            Self::Audit(error) => error.to_string(),
             other => other.message(),
         }
     }
@@ -70,75 +91,169 @@ pub(crate) struct SandboxRecord {
     pub(crate) env: Arc<dyn ExecutionEnv>,
     pub(crate) work_dir: PathBuf,
     pub(crate) config: RemoteSandboxConfig,
+    /// Host directories bound read-write into this sandbox (trusted
+    /// profiles); echoed in the create response.
+    pub(crate) host_binds: Vec<(PathBuf, PathBuf)>,
     pub(crate) state: RemoteSandboxState,
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) enum GatewaySandbox {
-    Bwrap(BwrapSandbox),
+    Bwrap(Box<BwrapSandbox>),
     Firecracker(Box<FirecrackerSandbox>),
 }
 
+/// macOS backend: macOS `sandbox-exec` isolation via `SeatbeltSandbox`.
+#[cfg(target_os = "macos")]
+pub(crate) enum GatewaySandbox {
+    Seatbelt(SeatbeltSandbox),
+    /// No-isolation backend: tools run directly on the host with a
+    /// per-sandbox work dir. For fully-trusted single-user setups.
+    Os(OsEnvSandbox),
+}
+
+#[cfg(target_os = "macos")]
 impl Sandbox for GatewaySandbox {
     fn start(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         match self {
-            Self::Bwrap(sandbox) => sandbox.start(),
-            Self::Firecracker(sandbox) => Box::pin(sandbox.start()),
+            GatewaySandbox::Seatbelt(sandbox) => sandbox.start(),
+            GatewaySandbox::Os(sandbox) => Sandbox::start(sandbox),
         }
     }
 
     fn env(&self) -> Arc<dyn ExecutionEnv> {
         match self {
-            Self::Bwrap(sandbox) => sandbox.env(),
-            Self::Firecracker(sandbox) => sandbox.env(),
+            GatewaySandbox::Seatbelt(sandbox) => sandbox.env(),
+            GatewaySandbox::Os(sandbox) => sandbox.env(),
         }
     }
 
     fn reset(&self) -> BoxFuture<'_, anyhow::Result<()>> {
         match self {
-            Self::Bwrap(sandbox) => sandbox.reset(),
-            Self::Firecracker(sandbox) => Box::pin(sandbox.reset()),
+            GatewaySandbox::Seatbelt(sandbox) => sandbox.reset(),
+            GatewaySandbox::Os(sandbox) => sandbox.reset(),
         }
     }
 
     fn shutdown(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
         match *self {
-            Self::Bwrap(sandbox) => Box::new(sandbox).shutdown(),
-            Self::Firecracker(sandbox) => Box::pin(sandbox.shutdown_owned()),
+            GatewaySandbox::Seatbelt(sandbox) => Sandbox::shutdown(Box::new(sandbox)),
+            GatewaySandbox::Os(sandbox) => Sandbox::shutdown(Box::new(sandbox)),
         }
     }
 
     fn config(&self) -> &SandboxConfig {
         match self {
-            Self::Bwrap(sandbox) => sandbox.config(),
-            Self::Firecracker(sandbox) => sandbox.config(),
+            GatewaySandbox::Seatbelt(sandbox) => sandbox.config(),
+            GatewaySandbox::Os(sandbox) => sandbox.config(),
         }
     }
 
     fn is_running(&self) -> bool {
         match self {
-            Self::Bwrap(sandbox) => sandbox.is_running(),
-            Self::Firecracker(sandbox) => sandbox.is_running(),
+            GatewaySandbox::Seatbelt(sandbox) => sandbox.is_running(),
+            GatewaySandbox::Os(sandbox) => sandbox.is_running(),
         }
     }
 }
 
+#[cfg(target_os = "linux")]
+impl Sandbox for GatewaySandbox {
+    fn start(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        match self {
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::start(&**sandbox),
+            GatewaySandbox::Firecracker(sandbox) => Box::pin(sandbox.start()),
+        }
+    }
+
+    fn env(&self) -> Arc<dyn ExecutionEnv> {
+        match self {
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::env(&**sandbox),
+            GatewaySandbox::Firecracker(sandbox) => FirecrackerSandbox::env(sandbox),
+        }
+    }
+
+    fn reset(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        match self {
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::reset(&**sandbox),
+            GatewaySandbox::Firecracker(sandbox) => Box::pin(sandbox.reset()),
+        }
+    }
+
+    fn shutdown(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
+        match *self {
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::shutdown(sandbox),
+            GatewaySandbox::Firecracker(sandbox) => Box::pin(sandbox.shutdown_owned()),
+        }
+    }
+
+    fn config(&self) -> &SandboxConfig {
+        match self {
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::config(&**sandbox),
+            GatewaySandbox::Firecracker(sandbox) => FirecrackerSandbox::config(sandbox),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        match self {
+            GatewaySandbox::Bwrap(sandbox) => Sandbox::is_running(&**sandbox),
+            GatewaySandbox::Firecracker(sandbox) => FirecrackerSandbox::is_running(sandbox),
+        }
+    }
+}
+
+/// Other non-Linux platforms: no sandbox backend is wired; construction
+/// paths fail closed before reaching this type.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[derive(Debug)]
+pub(crate) enum GatewaySandbox {}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+impl Sandbox for GatewaySandbox {
+    fn start(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        unreachable!("no sandbox backend is available on this platform")
+    }
+
+    fn env(&self) -> Arc<dyn ExecutionEnv> {
+        unreachable!("no sandbox backend is available on this platform")
+    }
+
+    fn reset(&self) -> BoxFuture<'_, anyhow::Result<()>> {
+        unreachable!("no sandbox backend is available on this platform")
+    }
+
+    fn shutdown(self: Box<Self>) -> BoxFuture<'static, anyhow::Result<()>> {
+        unreachable!("no sandbox backend is available on this platform")
+    }
+
+    fn config(&self) -> &SandboxConfig {
+        unreachable!("no sandbox backend is available on this platform")
+    }
+
+    fn is_running(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) struct FirecrackerSandboxConfig {
     backend: crate::auth::FirecrackerBackendConfig,
     run_directory: PathBuf,
     vsock_guest_cid: u32,
 }
 
+#[cfg(target_os = "linux")]
 struct PendingGuestAgentEnv {
     env: Arc<std::sync::RwLock<Option<Arc<dyn ExecutionEnv>>>>,
 }
 
+#[cfg(target_os = "linux")]
 impl PendingGuestAgentEnv {
     fn new() -> Self {
         Self {
             env: Arc::new(std::sync::RwLock::new(None)),
         }
     }
-
     fn set(&self, env: Arc<dyn ExecutionEnv>) {
         *self
             .env
@@ -162,6 +277,7 @@ impl PendingGuestAgentEnv {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl ExecutionEnv for PendingGuestAgentEnv {
     fn working_dir(&self) -> &Path {
         Path::new(GUEST_WORK_DIR)
@@ -270,6 +386,7 @@ impl ExecutionEnv for PendingGuestAgentEnv {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) struct FirecrackerSandbox {
     config: SandboxConfig,
     firecracker_config: Option<FirecrackerSandboxConfig>,
@@ -278,6 +395,7 @@ pub(crate) struct FirecrackerSandbox {
     running: AtomicBool,
 }
 
+#[cfg(target_os = "linux")]
 impl FirecrackerSandbox {
     fn new(config: SandboxConfig, firecracker_config: FirecrackerSandboxConfig) -> Self {
         Self {
@@ -401,6 +519,12 @@ impl FirecrackerSandbox {
             *vsock_guest_cid,
         )
         .with_guest_agent_port(backend.guest_agent_port)
+        .with_image_capacity(
+            limits
+                .max_disk_mb
+                .and_then(|value| u64::try_from(value).ok())
+                .map(|value| value.saturating_mul(1024 * 1024)),
+        )
         .with_readiness_timeout(backend.readiness_timeout))
     }
 
@@ -460,11 +584,21 @@ struct PersistedSandbox {
 impl GatewayState {
     pub(crate) fn new(mut config: crate::auth::GatewayConfig) -> anyhow::Result<Self> {
         config.validate()?;
+        let audit_failure_mode = config.audit_failure_mode();
         let work_root = config.prepare_work_root()?;
         let sandbox_root = work_root.join("sandboxes");
         create_private_directory(&sandbox_root)?;
         let work_root_lock = lock_work_root(&work_root)?;
         let registry = std::sync::Mutex::new(open_registry(&work_root.join("registry.sqlite"))?);
+        let credentials = CredentialStore::new(
+            &work_root.join("credentials.sqlite"),
+            &config.credential_seeds(),
+        )?;
+        let audit_path = config
+            .audit_path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| work_root.join("audit.jsonl"));
+        let audit = GatewayAudit::new(audit_path)?;
         let persisted = reconcile_registry(&registry, &sandbox_root, &config)?;
         if persisted.len() > config.max_sandboxes {
             anyhow::bail!(
@@ -473,16 +607,39 @@ impl GatewayState {
                 config.max_sandboxes
             );
         }
+        let mut persisted_by_principal: HashMap<&str, usize> = HashMap::new();
+        for record in &persisted {
+            let count = persisted_by_principal
+                .entry(record.owner.as_str())
+                .or_default();
+            *count += 1;
+            let max_active_sandboxes = config
+                .principal(&record.owner)
+                .and_then(|principal| principal.max_active_sandboxes);
+            if let Some(max_active_sandboxes) = max_active_sandboxes
+                && *count > max_active_sandboxes
+            {
+                anyhow::bail!(
+                    "persisted sandbox count {} for principal {:?} exceeds configured maximum {}",
+                    *count,
+                    record.owner,
+                    max_active_sandboxes
+                );
+            }
+        }
         let mut sandboxes = HashMap::with_capacity(persisted.len());
         for record in persisted {
             let sandbox_id = record.sandbox_id.clone();
             let record = restore_sandbox(&config, record)?;
+            #[cfg(target_os = "linux")]
             let registry_state =
                 if matches!(record.sandbox.as_ref(), GatewaySandbox::Firecracker(_)) {
                     RegistryState::Creating
                 } else {
                     RegistryState::Running
                 };
+            #[cfg(not(target_os = "linux"))]
+            let registry_state = RegistryState::Running;
             set_registry_state(&registry, &sandbox_id, registry_state)?;
             sandboxes.insert(sandbox_id, record);
         }
@@ -490,11 +647,80 @@ impl GatewayState {
             config,
             work_root,
             _work_root_lock: work_root_lock,
+            audit: Some(audit),
             registry,
             sandboxes: std::sync::Mutex::new(sandboxes),
             executions: std::sync::Mutex::new(HashMap::new()),
             lifecycle_locks: std::sync::Mutex::new(HashMap::new()),
+            metrics: RequestMetrics::default(),
+            rate_limiter: RateLimiter::default(),
+            audit_failure_mode,
+            credentials,
         })
+    }
+
+    pub(crate) fn authenticate(&self, bearer_token: &str) -> Option<AuthenticatedPrincipal> {
+        let principal_id = self.credentials.authenticate(bearer_token)?;
+        self.config.principal(&principal_id)
+    }
+
+    pub(crate) fn rotate_credential(
+        &self,
+        principal_id: &str,
+        bearer_token: &str,
+    ) -> Result<(), GatewayStateError> {
+        self.credentials
+            .rotate(principal_id, bearer_token)
+            .map_err(GatewayStateError::Storage)
+    }
+
+    pub(crate) fn revoke_credential(&self, principal_id: &str) -> Result<(), GatewayStateError> {
+        self.credentials
+            .revoke(principal_id)
+            .map_err(GatewayStateError::Storage)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn audit_request(
+        &self,
+        event: AuditEvent,
+        request_id: &str,
+        principal: Option<&str>,
+        method: &str,
+        path: &str,
+        status: Option<u16>,
+        sandbox_id: Option<&str>,
+        duration_ms: Option<u64>,
+        detail: serde_json::Value,
+    ) -> Result<(), GatewayStateError> {
+        let Some(audit) = self.audit.as_ref() else {
+            return Ok(());
+        };
+        if let Err(error) = audit.record(
+            event,
+            request_id,
+            principal.unwrap_or("anonymous"),
+            method,
+            crate::observability::metric_route(path),
+            path,
+            status,
+            sandbox_id,
+            duration_ms,
+            detail,
+        ) {
+            return match self.audit_failure_mode {
+                crate::auth::AuditFailureMode::FailOpen => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        error = %error,
+                        "failed to write gateway audit record"
+                    );
+                    Ok(())
+                }
+                crate::auth::AuditFailureMode::FailClosed => Err(GatewayStateError::Audit(error)),
+            };
+        }
+        Ok(())
     }
 
     pub(crate) fn config(&self) -> &crate::auth::GatewayConfig {
@@ -504,7 +730,76 @@ impl GatewayState {
     pub(crate) fn backend_label(&self) -> &'static str {
         match self.config.backend() {
             crate::auth::GatewayBackend::Bwrap => "linux-bwrap",
+            #[cfg(target_os = "macos")]
+            crate::auth::GatewayBackend::Seatbelt => "macos-seatbelt",
+            crate::auth::GatewayBackend::Os => "os",
             crate::auth::GatewayBackend::Firecracker(_) => "linux-firecracker",
+        }
+    }
+
+    pub(crate) fn record_request(
+        &self,
+        method: &str,
+        route: &str,
+        principal: Option<&str>,
+        status: u16,
+        duration: std::time::Duration,
+    ) {
+        self.metrics
+            .record(method, route, principal, status, duration);
+    }
+
+    pub(crate) fn render_metrics(&self) -> String {
+        self.metrics
+            .render(self.backend_label(), self.active_sandbox_count())
+    }
+
+    pub(crate) fn check_rate_limit(
+        &self,
+        principal: &str,
+        requests_per_minute: Option<usize>,
+    ) -> Option<std::time::Duration> {
+        self.rate_limiter.check(principal, requests_per_minute)
+    }
+
+    fn check_sandbox_capacity(
+        &self,
+        sandboxes: &HashMap<String, SandboxRecord>,
+        principal: &AuthenticatedPrincipal,
+    ) -> Result<(), GatewayStateError> {
+        if sandboxes.len() >= self.config.max_sandboxes {
+            return Err(GatewayStateError::Capacity);
+        }
+        if let Some(max_active_sandboxes) = principal.max_active_sandboxes {
+            let active_count = sandboxes
+                .values()
+                .filter(|record| record.owner == principal.id)
+                .count();
+            if active_count >= max_active_sandboxes {
+                return Err(GatewayStateError::Capacity);
+            }
+        }
+        Ok(())
+    }
+
+    fn active_sandbox_count(&self) -> usize {
+        self.sandboxes
+            .lock()
+            .map(|sandboxes| sandboxes.len())
+            .unwrap_or(0)
+    }
+
+    /// Trust profile actually granted to a sandbox (from its stored config).
+    pub(crate) fn requested_profile(
+        &self,
+        sandbox_id: &str,
+    ) -> llm_harness_platform::trust::TrustProfile {
+        match self.sandboxes.lock() {
+            Ok(sandboxes) => sandboxes
+                .get(sandbox_id)
+                .map(|record| record.config.trust_profile)
+                .unwrap_or_default(),
+            Err(_) => Default::default(),
         }
     }
 
@@ -513,23 +808,54 @@ impl GatewayState {
         principal: &AuthenticatedPrincipal,
         request: RemoteSandboxConfig,
     ) -> Result<String, GatewayStateError> {
+        if request.trust_profile > principal.max_trust_profile {
+            return Err(GatewayStateError::InvalidConfig(anyhow::anyhow!(
+                "trust profile {:?} exceeds principal cap {:?}",
+                request.trust_profile,
+                principal.max_trust_profile
+            )));
+        }
+        #[cfg(target_os = "linux")]
         if let crate::auth::GatewayBackend::Firecracker(backend) = self.config.backend() {
             return self
                 .create_firecracker_sandbox(principal, request, backend)
                 .await;
         }
-        self.create_bwrap_sandbox(principal, request)
+        #[cfg(target_os = "linux")]
+        if let crate::auth::GatewayBackend::Bwrap = self.config.backend() {
+            return self.create_bwrap_sandbox(principal, request);
+        }
+        #[cfg(target_os = "macos")]
+        if let crate::auth::GatewayBackend::Seatbelt = self.config.backend() {
+            return self.create_seatbelt_sandbox(principal, request);
+        }
+        if let crate::auth::GatewayBackend::Os = self.config.backend() {
+            return self.create_os_sandbox(principal, request);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let _ = (principal, request);
+            Err(GatewayStateError::InvalidConfig(anyhow::anyhow!(
+                "no sandbox backend is available on this platform"
+            )))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (principal, request);
+            Err(GatewayStateError::InvalidConfig(anyhow::anyhow!(
+                "no sandbox backend is available on this platform"
+            )))
+        }
     }
 
+    #[cfg(target_os = "linux")]
     fn create_bwrap_sandbox(
         &self,
         principal: &AuthenticatedPrincipal,
         request: RemoteSandboxConfig,
     ) -> Result<String, GatewayStateError> {
         let mut sandboxes = self.lock_sandboxes();
-        if sandboxes.len() >= self.config.max_sandboxes {
-            return Err(GatewayStateError::Capacity);
-        }
+        self.check_sandbox_capacity(&sandboxes, principal)?;
         let request = normalize_request_config(principal, request)
             .map_err(GatewayStateError::InvalidConfig)?;
         let sandbox_config =
@@ -543,7 +869,7 @@ impl GatewayState {
         let sandbox =
             match BwrapSandbox::new_mapped(sandbox_config, work_dir, PathBuf::from(GUEST_WORK_DIR))
             {
-                Ok(sandbox) => GatewaySandbox::Bwrap(sandbox),
+                Ok(sandbox) => GatewaySandbox::Bwrap(Box::new(sandbox)),
                 Err(error) => {
                     let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
                     if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
@@ -585,6 +911,7 @@ impl GatewayState {
             env,
             work_dir: PathBuf::from(GUEST_WORK_DIR),
             config: request,
+            host_binds,
             state: RemoteSandboxState::Creating,
         };
 
@@ -592,6 +919,179 @@ impl GatewayState {
         Ok(sandbox_id)
     }
 
+    #[cfg(target_os = "macos")]
+    fn create_seatbelt_sandbox(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: RemoteSandboxConfig,
+    ) -> Result<String, GatewayStateError> {
+        let mut sandboxes = self.lock_sandboxes();
+        self.check_sandbox_capacity(&sandboxes, principal)?;
+        let request = normalize_request_config(principal, request)
+            .map_err(GatewayStateError::InvalidConfig)?;
+        let sandbox_config =
+            build_sandbox_config(&request).map_err(GatewayStateError::InvalidConfig)?;
+        let sandbox_id = uuid::Uuid::new_v4().to_string();
+        let work_dir = self.work_root.join("sandboxes").join(&sandbox_id);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&work_dir)
+            .map_err(|error| GatewayStateError::InvalidConfig(error.into()))?;
+        // Pin the sandbox to the gateway-created work dir so the shell cwd
+        // and the guest-coordinate fs mapping (/workspace) resolve to the
+        // same host directory.
+        let mut sandbox_config = sandbox_config;
+        sandbox_config.work_dir = Some(work_dir.clone());
+        // Trusted profiles bind the principal's host project directories at
+        // guest /workspace/<basename>. Ignored by restricted (floors hold).
+        let mut host_binds: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for dir in principal.host_project_dirs.iter() {
+            let base = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    GatewayStateError::InvalidConfig(anyhow::anyhow!(
+                        "host project dir {dir:?} has no file name"
+                    ))
+                })?;
+            let guest = std::path::PathBuf::from(GUEST_WORK_DIR).join(base);
+            sandbox_config
+                .host_binds
+                .push(llm_harness_platform::sandbox::HostBind {
+                    host: dir.clone(),
+                    guest: guest.clone(),
+                });
+            host_binds.push((dir.clone(), guest));
+        }
+        let sandbox = match llm_harness_sandbox::SeatbeltSandbox::new(sandbox_config) {
+            Ok(sandbox) => GatewaySandbox::Seatbelt(sandbox),
+            Err(error) => {
+                let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
+                if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %cleanup_error,
+                        "failed to remove work root after sandbox construction failure"
+                    );
+                }
+                return Err(GatewayStateError::InvalidConfig(error));
+            }
+        };
+        let config_json = serde_json::to_string(&request)
+            .map_err(|error| GatewayStateError::Storage(error.into()))?;
+        let now_ms = unix_now_ms().map_err(GatewayStateError::Storage)?;
+        insert_registry_record(
+            &self.registry,
+            &sandbox_id,
+            &principal.id,
+            &config_json,
+            None,
+            now_ms,
+        )
+        .map_err(|error| {
+            let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
+            if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %cleanup_error,
+                    "failed to remove work root after registry failure"
+                );
+            }
+            GatewayStateError::Storage(error)
+        })?;
+        let env = sandbox.env();
+        let record = SandboxRecord {
+            owner: Arc::clone(&principal.id),
+            sandbox: Arc::new(sandbox),
+            env,
+            work_dir: PathBuf::from(GUEST_WORK_DIR),
+            config: request,
+            host_binds,
+            state: RemoteSandboxState::Creating,
+        };
+
+        sandboxes.insert(sandbox_id.clone(), record);
+        Ok(sandbox_id)
+    }
+
+    /// No-isolation backend: per-sandbox work dir on the host, no isolation
+    /// policy. Tools run with the gateway process's full host access — only
+    /// appropriate for fully-trusted single-user setups.
+    fn create_os_sandbox(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: RemoteSandboxConfig,
+    ) -> Result<String, GatewayStateError> {
+        let mut sandboxes = self.lock_sandboxes();
+        self.check_sandbox_capacity(&sandboxes, principal)?;
+        let request = normalize_request_config(principal, request)
+            .map_err(GatewayStateError::InvalidConfig)?;
+        let sandbox_config =
+            build_sandbox_config(&request).map_err(GatewayStateError::InvalidConfig)?;
+        let sandbox_id = uuid::Uuid::new_v4().to_string();
+        let work_dir = self.work_root.join("sandboxes").join(&sandbox_id);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&work_dir)
+            .map_err(|error| GatewayStateError::InvalidConfig(error.into()))?;
+        // Pin the sandbox to the gateway-created work dir so the shell cwd
+        // resolves to a per-sandbox directory.
+        let mut sandbox_config = sandbox_config;
+        sandbox_config.work_dir = Some(work_dir.clone());
+        // Host binds still apply: on the os backend the "guest" coordinate is
+        // the host path itself, but keep the /workspace/<basename> alias so
+        // session prompt logic stays backend-agnostic.
+        let mut host_binds: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for dir in principal.host_project_dirs.iter() {
+            let base = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    GatewayStateError::InvalidConfig(anyhow::anyhow!(
+                        "host project dir {dir:?} has no file name"
+                    ))
+                })?;
+            let guest = std::path::PathBuf::from(GUEST_WORK_DIR).join(base);
+            host_binds.push((dir.clone(), guest));
+        }
+        let sandbox = GatewaySandbox::Os(OsEnvSandbox::new(sandbox_config));
+        let config_json = serde_json::to_string(&request)
+            .map_err(|error| GatewayStateError::Storage(error.into()))?;
+        let now_ms = unix_now_ms().map_err(GatewayStateError::Storage)?;
+        insert_registry_record(
+            &self.registry,
+            &sandbox_id,
+            &principal.id,
+            &config_json,
+            None,
+            now_ms,
+        )
+        .map_err(|error| {
+            let orphan_path = self.work_root.join("sandboxes").join(&sandbox_id);
+            if let Err(cleanup_error) = std::fs::remove_dir_all(&orphan_path) {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %cleanup_error,
+                    "failed to remove work root after registry failure"
+                );
+            }
+            GatewayStateError::Storage(error)
+        })?;
+        let env = sandbox.env();
+        let record = SandboxRecord {
+            owner: Arc::clone(&principal.id),
+            sandbox: Arc::new(sandbox),
+            env,
+            work_dir: PathBuf::from(GUEST_WORK_DIR),
+            config: request,
+            host_binds,
+            state: RemoteSandboxState::Creating,
+        };
+
+        sandboxes.insert(sandbox_id.clone(), record);
+        Ok(sandbox_id)
+    }
+    #[cfg(target_os = "linux")]
     async fn create_firecracker_sandbox(
         &self,
         principal: &AuthenticatedPrincipal,
@@ -599,9 +1099,7 @@ impl GatewayState {
         backend: &crate::auth::FirecrackerBackendConfig,
     ) -> Result<String, GatewayStateError> {
         let mut sandboxes = self.lock_sandboxes();
-        if sandboxes.len() >= self.config.max_sandboxes {
-            return Err(GatewayStateError::Capacity);
-        }
+        self.check_sandbox_capacity(&sandboxes, principal)?;
         let request = normalize_request_config(principal, request)
             .map_err(GatewayStateError::InvalidConfig)?;
         validate_firecracker_policies(&request, backend)
@@ -664,6 +1162,7 @@ impl GatewayState {
             env,
             work_dir: PathBuf::from(GUEST_WORK_DIR),
             config: request,
+            host_binds: Vec::new(),
             state: RemoteSandboxState::Creating,
         };
         sandboxes.insert(sandbox_id.clone(), record);
@@ -708,6 +1207,7 @@ impl GatewayState {
             env: Arc::clone(&record.env),
             work_dir: record.work_dir.clone(),
             config: record.config.clone(),
+            host_binds: record.host_binds.clone(),
             state: record.state,
         })
     }
@@ -875,6 +1375,7 @@ impl GatewayState {
             env: Arc::clone(&record.env),
             work_dir: record.work_dir.clone(),
             config: record.config.clone(),
+            host_binds: record.host_binds.clone(),
             state: record.state,
         })
     }
@@ -884,6 +1385,7 @@ impl GatewayState {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn normalize_request_config(
     principal: &AuthenticatedPrincipal,
     mut request: RemoteSandboxConfig,
@@ -918,6 +1420,7 @@ fn normalize_request_config(
     Ok(request)
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn build_sandbox_config(request: &RemoteSandboxConfig) -> anyhow::Result<SandboxConfig> {
     let resource_limits = ResourceLimits {
         max_cpus: request.resource_limits.max_cpus,
@@ -942,9 +1445,12 @@ fn build_sandbox_config(request: &RemoteSandboxConfig) -> anyhow::Result<Sandbox
             .collect(),
         resource_limits,
         work_dir: None,
+        trust_profile: request.trust_profile,
+        host_binds: Vec::new(),
     })
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn validate_fs_paths(paths: &[String], field: &str) -> anyhow::Result<()> {
     for path in paths {
         if path != GUEST_WORK_DIR
@@ -961,6 +1467,7 @@ fn validate_fs_paths(paths: &[String], field: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn validate_firecracker_policies(
     request: &RemoteSandboxConfig,
     backend: &crate::auth::FirecrackerBackendConfig,
@@ -978,8 +1485,20 @@ fn validate_firecracker_policies(
     if limits.max_processes.is_some() {
         anyhow::bail!("Firecracker backend does not support max_processes");
     }
-    if limits.max_disk_mb.is_some() {
-        anyhow::bail!("Firecracker backend does not support max_disk_mb");
+    if limits.max_disk_mb.is_some() && backend.max_disk_mib.is_none() {
+        anyhow::bail!(
+            "Firecracker backend does not configure max_disk_mib, so max_disk_mb is unsupported"
+        );
+    }
+    if let Some(max_disk_mb) = limits.max_disk_mb
+        && let Some(max_disk_mib) = backend.max_disk_mib
+        && u64::try_from(max_disk_mb).unwrap_or(u64::MAX) > u64::from(max_disk_mib)
+    {
+        anyhow::bail!(
+            "Firecracker max_disk_mb {} exceeds backend maximum {}",
+            max_disk_mb,
+            max_disk_mib
+        );
     }
     if let Some(max_cpus) = limits.max_cpus {
         let max_cpus = u32::try_from(max_cpus)
@@ -1006,6 +1525,7 @@ fn validate_firecracker_policies(
     Ok(())
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables, unused_mut))]
 fn restore_sandbox(
     config: &crate::auth::GatewayConfig,
     persisted: PersistedSandbox,
@@ -1020,10 +1540,8 @@ fn restore_sandbox(
         vsock_guest_cid,
         state: _,
     } = persisted;
+    #[cfg(target_os = "linux")]
     match (&config.backend(), vsock_guest_cid) {
-        (crate::auth::GatewayBackend::Bwrap, Some(_)) => {
-            anyhow::bail!("persisted sandbox {sandbox_id:?} has a vsock CID on the Bwrap backend")
-        }
         (crate::auth::GatewayBackend::Firecracker(backend), Some(cid)) => {
             if cid < backend.vsock_guest_cid_base {
                 anyhow::bail!(
@@ -1049,34 +1567,96 @@ fn restore_sandbox(
                 env,
                 work_dir: PathBuf::from(GUEST_WORK_DIR),
                 config: persisted_config,
+                host_binds: Vec::new(),
                 state: RemoteSandboxState::Creating,
             });
         }
         (crate::auth::GatewayBackend::Firecracker(_), None) => {
             anyhow::bail!("persisted sandbox {sandbox_id:?} is missing a vsock CID");
         }
+        (crate::auth::GatewayBackend::Bwrap, Some(_)) => {
+            anyhow::bail!("persisted sandbox {sandbox_id:?} has a vsock CID on the Bwrap backend");
+        }
         _ => {}
     }
-    let persisted_config = normalize_request_config(&principal, request)?;
-    let sandbox_config = build_sandbox_config(&persisted_config)?;
-    let work_dir = config
-        .work_root()
-        .join("sandboxes")
-        .join(&persisted.sandbox_id);
-    let sandbox = GatewaySandbox::Bwrap(BwrapSandbox::new_mapped(
-        sandbox_config,
-        work_dir,
-        PathBuf::from(GUEST_WORK_DIR),
-    )?);
-    let env = sandbox.env();
-    Ok(SandboxRecord {
-        owner: Arc::clone(&principal.id),
-        sandbox: Arc::new(sandbox),
-        env: Arc::clone(&env),
-        work_dir: PathBuf::from(GUEST_WORK_DIR),
-        config: persisted_config,
-        state: RemoteSandboxState::Running,
-    })
+    #[cfg(target_os = "linux")]
+    {
+        let persisted_config = normalize_request_config(&principal, request)?;
+        let sandbox_config = build_sandbox_config(&persisted_config)?;
+        let work_dir = config
+            .work_root()
+            .join("sandboxes")
+            .join(&persisted.sandbox_id);
+        let sandbox = GatewaySandbox::Bwrap(Box::new(BwrapSandbox::new_mapped(
+            sandbox_config,
+            work_dir,
+            PathBuf::from(GUEST_WORK_DIR),
+        )?));
+        let env = sandbox.env();
+        Ok(SandboxRecord {
+            owner: Arc::clone(&principal.id),
+            sandbox: Arc::new(sandbox),
+            env: Arc::clone(&env),
+            work_dir: PathBuf::from(GUEST_WORK_DIR),
+            config: persisted_config,
+            host_binds: Vec::new(),
+            state: RemoteSandboxState::Running,
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if vsock_guest_cid.is_some() {
+            anyhow::bail!(
+                "persisted sandbox {sandbox_id:?} has a vsock CID on the Seatbelt backend"
+            );
+        }
+        let persisted_config = normalize_request_config(&principal, request)?;
+        let sandbox_config = build_sandbox_config(&persisted_config)?;
+        let work_dir = config
+            .work_root()
+            .join("sandboxes")
+            .join(&persisted.sandbox_id);
+        let mut sandbox_config = sandbox_config;
+        sandbox_config.work_dir = Some(work_dir);
+        let host_binds: Vec<(PathBuf, PathBuf)> = principal
+            .host_project_dirs
+            .iter()
+            .filter_map(|dir| {
+                dir.file_name()
+                    .map(|base| (dir.clone(), PathBuf::from(GUEST_WORK_DIR).join(base)))
+            })
+            .collect();
+        sandbox_config.host_binds = host_binds
+            .iter()
+            .map(|(host, guest)| llm_harness_platform::sandbox::HostBind {
+                host: host.clone(),
+                guest: guest.clone(),
+            })
+            .collect();
+        let sandbox = match config.backend() {
+            crate::auth::GatewayBackend::Os => {
+                GatewaySandbox::Os(llm_harness_sandbox::OsEnvSandbox::new(sandbox_config))
+            }
+            _ => {
+                GatewaySandbox::Seatbelt(llm_harness_sandbox::SeatbeltSandbox::new(sandbox_config)?)
+            }
+        };
+        let env = sandbox.env();
+        Ok(SandboxRecord {
+            owner: Arc::clone(&principal.id),
+            sandbox: Arc::new(sandbox),
+            env,
+            work_dir: PathBuf::from(GUEST_WORK_DIR),
+            config: persisted_config,
+            host_binds,
+            state: RemoteSandboxState::Running,
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (config, vsock_guest_cid);
+        anyhow::bail!("no sandbox backend is available on this platform")
+    }
 }
 
 fn create_private_directory(path: &std::path::Path) -> anyhow::Result<()> {
@@ -1251,6 +1831,7 @@ fn unix_now_ms() -> anyhow::Result<i64> {
     i64::try_from(millis).map_err(|_| anyhow::anyhow!("system time is too large"))
 }
 
+#[cfg(target_os = "linux")]
 fn allocate_vsock_guest_cid(
     registry: &std::sync::Mutex<Connection>,
     cid_base: u32,
@@ -1276,6 +1857,7 @@ fn allocate_vsock_guest_cid(
     anyhow::bail!("no vsock CID is available")
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn insert_registry_record(
     registry: &std::sync::Mutex<Connection>,
     sandbox_id: &str,
@@ -1457,5 +2039,6 @@ pub(crate) struct SandboxLease {
     pub(crate) env: Arc<dyn ExecutionEnv>,
     pub(crate) work_dir: PathBuf,
     pub(crate) config: RemoteSandboxConfig,
+    pub(crate) host_binds: Vec<(PathBuf, PathBuf)>,
     pub(crate) state: RemoteSandboxState,
 }

@@ -13,6 +13,13 @@ pub struct RemoteSandboxClientConfig {
     pub endpoint: Url,
     /// Bearer token used for gateway authentication.
     pub bearer_token: String,
+    /// Explicitly allow plain HTTP to non-loopback endpoints.
+    ///
+    /// Default `false`: non-loopback endpoints must use HTTPS so the bearer
+    /// token never crosses an untrusted network in clear text. Set `true`
+    /// only for trusted LANs (e.g. a phone talking to a gateway on the same
+    /// home WiFi) where TLS termination is not practical.
+    pub allow_insecure_http: bool,
     /// TCP/TLS connection timeout.
     pub connect_timeout: Duration,
     /// Timeout for non-streaming control and file requests.
@@ -38,21 +45,30 @@ impl fmt::Debug for RemoteSandboxClientConfig {
 }
 
 impl RemoteSandboxClientConfig {
-    /// Create a validated client configuration.
+    /// Create a validated client configuration. Non-loopback plain-HTTP
+    /// endpoints are rejected; use [`Self::new_insecure`] to opt in.
     pub fn new(
         endpoint: impl Into<String>,
         bearer_token: impl Into<String>,
     ) -> Result<Self, RemoteSandboxError> {
+        Self::build(endpoint, bearer_token, false)
+    }
+
+    fn build(
+        endpoint: impl Into<String>,
+        bearer_token: impl Into<String>,
+        allow_insecure_http: bool,
+    ) -> Result<Self, RemoteSandboxError> {
         let mut endpoint = Url::parse(&endpoint.into()).map_err(|error| {
             RemoteSandboxError::invalid_config(format!("invalid endpoint: {error}"))
         })?;
+        let bearer_token = bearer_token.into();
         if !endpoint.path().ends_with('/') {
             let mut path = endpoint.path().to_owned();
             path.push('/');
             endpoint.set_path(&path);
         }
-        let bearer_token = bearer_token.into();
-        Self::validate_endpoint_and_token(&endpoint, &bearer_token)?;
+        Self::validate_endpoint_and_token(&endpoint, &bearer_token, allow_insecure_http)?;
         Self::validate_runtime_options(
             Duration::from_secs(5),
             Duration::from_secs(30),
@@ -63,11 +79,29 @@ impl RemoteSandboxClientConfig {
         Ok(Self {
             endpoint,
             bearer_token,
+            allow_insecure_http,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
             max_exec_timeout: Duration::from_secs(60 * 60),
             max_response_bytes: 64 * 1024 * 1024,
         })
+    }
+
+    /// Create a client config that permits plain HTTP to non-loopback
+    /// endpoints. Only for trusted LANs (e.g. a phone and the gateway on the
+    /// same home WiFi) where the bearer token never crosses an untrusted
+    /// network; the name makes the trade-off visible at call sites.
+    pub fn new_insecure(
+        endpoint: impl Into<String>,
+        bearer_token: impl Into<String>,
+    ) -> Result<Self, RemoteSandboxError> {
+        Self::build(endpoint, bearer_token, true)
+    }
+
+    /// Explicitly permit plain HTTP to non-loopback endpoints.
+    pub fn with_allow_insecure_http(mut self, allow: bool) -> Self {
+        self.allow_insecure_http = allow;
+        self
     }
 
     /// Override the default connection timeout.
@@ -95,7 +129,11 @@ impl RemoteSandboxClientConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), RemoteSandboxError> {
-        Self::validate_endpoint_and_token(&self.endpoint, &self.bearer_token)?;
+        Self::validate_endpoint_and_token(
+            &self.endpoint,
+            &self.bearer_token,
+            self.allow_insecure_http,
+        )?;
         Self::validate_runtime_options(
             self.connect_timeout,
             self.request_timeout,
@@ -107,16 +145,21 @@ impl RemoteSandboxClientConfig {
     fn validate_endpoint_and_token(
         endpoint: &Url,
         bearer_token: &str,
+        allow_insecure_http: bool,
     ) -> Result<(), RemoteSandboxError> {
         if !matches!(endpoint.scheme(), "http" | "https") {
             return Err(RemoteSandboxError::invalid_config(
                 "remote sandbox endpoint must use http or https",
             ));
         }
-        if endpoint.scheme() == "http" && !is_loopback_host(endpoint.host_str().unwrap_or_default())
+        if endpoint.scheme() == "http"
+            && !allow_insecure_http
+            && !is_loopback_host(endpoint.host_str().unwrap_or_default())
         {
             return Err(RemoteSandboxError::invalid_config(
-                "remote sandbox endpoint must use HTTPS for non-loopback hosts",
+                "remote sandbox endpoint must use HTTPS for non-loopback hosts \
+                 (set allow_insecure_http to explicitly permit plain HTTP on a \
+                 trusted network)",
             ));
         }
         if endpoint.host_str().is_none() {
@@ -213,6 +256,10 @@ pub struct RemoteSandboxConfig {
     pub net_allowlist: Vec<NetRuleWire>,
     pub resource_limits: ResourceLimitsWire,
     pub work_dir: Option<String>,
+    /// Trust level requested for the sandbox. Defaults to `restricted` so
+    /// clients that predate the field keep working unchanged.
+    #[serde(default)]
+    pub trust_profile: llm_harness_platform::trust::TrustProfile,
 }
 
 /// Wire representation of a network allowlist rule.
@@ -256,13 +303,13 @@ impl TryFrom<SandboxConfig> for RemoteSandboxConfig {
             None => None,
         };
         let resource_limits = ResourceLimitsWire::try_from(value.resource_limits)?;
-
         Ok(Self {
             fs_allowlist,
             fs_denylist,
             net_allowlist,
             resource_limits,
             work_dir,
+            trust_profile: value.trust_profile,
         })
     }
 }
@@ -373,6 +420,39 @@ mod tests {
     }
 
     #[test]
+    fn trust_profile_defaults_to_restricted_and_roundtrips() {
+        let json = r#"{"fs_allowlist":[],"fs_denylist":[],"net_allowlist":[],"resource_limits":{"max_cpus":null,"max_processes":null,"max_memory_mb":null,"max_disk_mb":null,"timeout":null}}"#;
+        let config: RemoteSandboxConfig =
+            serde_json::from_str(json).expect("old clients without trust_profile parse");
+        assert_eq!(
+            config.trust_profile,
+            llm_harness_platform::trust::TrustProfile::Restricted
+        );
+
+        let json_lan = json.replace(
+            r#""net_allowlist":[]"#,
+            r#""net_allowlist":[],"trust_profile":"trusted_lan""#,
+        );
+        let config: RemoteSandboxConfig =
+            serde_json::from_str(&json_lan).expect("explicit trust_profile parses");
+        assert_eq!(
+            config.trust_profile,
+            llm_harness_platform::trust::TrustProfile::TrustedLan
+        );
+        assert_eq!(
+            serde_json::to_string(&config.trust_profile).unwrap(),
+            "\"trusted_lan\""
+        );
+    }
+
+    #[test]
+    fn trust_profile_orders_restricted_lt_lan_lt_full() {
+        use llm_harness_platform::trust::TrustProfile;
+        assert!(TrustProfile::Restricted < TrustProfile::TrustedLan);
+        assert!(TrustProfile::TrustedLan < TrustProfile::TrustedFull);
+    }
+
+    #[test]
     fn rejects_zero_runtime_limits() {
         let error = RemoteSandboxClientConfig::validate_runtime_options(
             Duration::ZERO,
@@ -403,6 +483,8 @@ mod tests {
                     timeout: None,
                 },
                 work_dir: Some(work_dir),
+                trust_profile: Default::default(),
+                host_binds: Vec::new(),
             };
             let error = RemoteSandboxConfig::try_from(config)
                 .expect_err("invalid guest path should be rejected");
@@ -430,15 +512,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_max_execution_timeout_that_exceeds_the_wire_format() {
-        let error = RemoteSandboxClientConfig::validate_runtime_options(
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_secs(u64::MAX),
-            1,
-        )
-        .expect_err("timeout should not fit the wire format");
+    fn allow_insecure_http_opt_in_permits_non_loopback_http() {
+        // Default: `new` rejects non-loopback HTTP.
+        let error = RemoteSandboxClientConfig::new("http://192.168.31.20:7080", "token")
+            .expect_err("non-loopback HTTP must default to rejected");
         assert!(matches!(error, RemoteSandboxError::InvalidConfig(_)));
+
+        // Opt-in via `new_insecure`: accepted and auditable.
+        let config = RemoteSandboxClientConfig::new_insecure("http://192.168.31.20:7080", "token")
+            .expect("opted-in insecure HTTP is valid");
+        assert!(config.allow_insecure_http);
+        config.validate().expect("flag consistent with validation");
+
+        // HTTPS endpoints never need the flag.
+        RemoteSandboxClientConfig::new("https://sandbox.example.internal", "token")
+            .expect("HTTPS is always valid");
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod execution_policy;
 pub mod host;
 pub mod issue;
 pub mod pipeline;
+pub mod message_router;
 pub mod pulse;
 pub mod roles;
 pub mod routes;

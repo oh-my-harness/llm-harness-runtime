@@ -293,6 +293,20 @@ fn group_reply_context(messages: &[InboxMessage]) -> Option<GroupReplyContext> {
     })
 }
 
+/// Whether a plain-text fallback may become a public broadcast reply.
+///
+/// Explicit @mentions reserve the group turn. Other members may still see the
+/// reply, but they must not accidentally turn their acknowledgement into a
+/// second public answer.
+fn may_broadcast_final_plain_text(
+    group_context: Option<&GroupReplyContext>,
+    agent_id: &AgentId,
+) -> bool {
+    group_context
+        .and_then(|context| context.responder.as_deref())
+        .is_none_or(|responder| responder == agent_id.as_str())
+}
+
 /// A sentinel-only final answer is an explicit runtime decline.
 fn is_no_response_message(message: &AgentMessage) -> bool {
     let AgentMessage::Assistant(message) = message else {
@@ -914,12 +928,14 @@ impl AgentRunner {
                 }
                 let group_context = group_reply_context(&messages);
                 let is_group_reply = group_context.is_some();
+                let may_reply_publicly =
+                    may_broadcast_final_plain_text(group_context.as_ref(), &agent_id);
                 let prior_entries = if group_context.is_some() {
                     prior_entry_ids(&harness).await
                 } else {
                     HashSet::new()
                 };
-                if let Some(group) = group_context {
+                if let Some(group) = group_context.clone() {
                     request = request.with_extension(group);
                 }
                 if let Some(access) = &knowledge_access {
@@ -1336,8 +1352,10 @@ impl AgentRunner {
                                         .into_iter()
                                         .filter(|entry| !prior_entries.contains(&entry.id))
                                         .collect::<Vec<_>>();
-                                    if !public_reply_was_sent(&new_entries)
+                                    if may_reply_publicly
+                                        && !public_reply_was_sent(&new_entries)
                                         && let Some(body) = final_plain_text(&new_entries)
+                                        && let Some(group) = group_context.as_ref()
                                     {
                                         // Deliver as a direct reply to the operator
                                         // carrying the ORIGINATING broadcast_id
@@ -1350,17 +1368,11 @@ impl AgentRunner {
                                         // the runaway loop this regression closes.
                                         let _ = ctx.send_direct_with_task(
                                             &agent_id,
-                                            &AgentId::new(crate::reserved::OPERATOR),
-                                            body,
+                                            &AgentId::new(crate::timeout_manager::reserved::OPERATOR),
+                                            &body,
                                             0,
                                             None,
-                                            Some(
-                                                group_reply_context(&messages)
-                                                    .expect(
-                                                        "is_group_reply implies a broadcast context",
-                                                    )
-                                                    .broadcast_id,
-                                            ),
+                                            Some(group.broadcast_id.clone()),
                                         );
                                     }
                                 }
@@ -2516,7 +2528,9 @@ mod tests {
         );
         let ctx = SocialContext::new(10);
         let alice = AgentId::new("alice");
+        let bob = AgentId::new("bob");
         ctx.register_agent(alice.clone(), "rust");
+        ctx.register_agent(bob.clone(), "reviewer");
         ctx.register_agent(AgentId::new("operator"), "operator");
         ctx.push_message(broadcast_message("please answer"));
 
@@ -2535,6 +2549,10 @@ mod tests {
             ctx.group_history(10)
                 .iter()
                 .any(|message| message.from == alice && message.body == "plain final answer")
+        );
+        assert!(
+            !ctx.has_messages(&bob),
+            "a plain final public reply must not wake unrelated members"
         );
         task.abort();
     }

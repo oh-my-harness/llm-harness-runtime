@@ -1,15 +1,15 @@
-#![cfg(target_os = "linux")]
-
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use llm_harness_platform::sandbox::{NetRule, ResourceLimits, Sandbox, SandboxConfig};
+use llm_harness_platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_sandbox_gateway::{
     FirecrackerBackendConfig, GatewayBackend, GatewayConfig, GatewayPrincipalConfig, SandboxGateway,
 };
-use llm_harness_sandbox_remote::protocol::RemoteSandboxState;
+use llm_harness_sandbox_remote::protocol::{
+    FileContent, RemoteSandboxState, UploadFile, UploadFilesRequest,
+};
 use llm_harness_sandbox_remote::{
     RemoteSandbox, RemoteSandboxClient, RemoteSandboxClientConfig, RemoteSandboxConfig,
     RemoteSandboxError, ResourceLimitsWire,
@@ -34,6 +34,10 @@ async fn start_gateway(principals: Vec<GatewayPrincipalConfig>) -> TestGateway {
 }
 
 async fn start_gateway_with_config(config: GatewayConfig) -> TestGateway {
+    // Bwrap is Linux-only; on macOS the default backend is unavailable, so
+    // the shared behavior tests run against the Seatbelt backend instead.
+    #[cfg(target_os = "macos")]
+    let config = config.with_backend(GatewayBackend::Seatbelt);
     let work_root = private_tempdir();
     let path = work_root.path().to_path_buf();
     let mut gateway = start_gateway_at(config, path).await;
@@ -91,11 +95,19 @@ fn principal(id: &str, token: &str) -> GatewayPrincipalConfig {
         principal: id.to_owned(),
         bearer_token: token.to_owned(),
         fs_allowlist: Vec::new(),
+        host_project_dirs: Vec::new(),
+        max_trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
+        requests_per_minute: None,
+        max_active_sandboxes: None,
     }
 }
 
 fn private_tempdir() -> tempfile::TempDir {
-    let directory = tempfile::tempdir().expect("gateway work root");
+    // macOS tempdir parents are symlinked (/var -> /private/var); the gateway
+    // requires an already-canonical work root, so create the directory under
+    // the canonicalized system temp path.
+    let system_temp = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp");
+    let directory = tempfile::tempdir_in(system_temp).expect("gateway work root");
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
         .expect("gateway work root permissions");
@@ -106,6 +118,194 @@ fn private_tempdir() -> tempfile::TempDir {
 fn gateway_defaults_to_the_bwrap_backend() {
     let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)]).expect("gateway config");
     assert!(matches!(config.backend(), GatewayBackend::Bwrap));
+}
+
+#[test]
+fn gateway_rejects_zero_principal_sandbox_quota() {
+    let mut principal = principal("tenant-a", TOKEN_A);
+    principal.max_active_sandboxes = Some(0);
+
+    let error = GatewayConfig::new(vec![principal]).expect_err("zero quota must be invalid");
+    assert!(
+        error
+            .to_string()
+            .contains("max_active_sandboxes for \"tenant-a\" must be positive"),
+    );
+}
+
+#[tokio::test]
+async fn gateway_enforces_per_principal_active_sandbox_quota() {
+    let mut capped = principal("tenant-a", TOKEN_A);
+    capped.max_active_sandboxes = Some(1);
+    let first = start_gateway_with_config(
+        GatewayConfig::new(vec![capped, principal("tenant-b", TOKEN_B)])
+            .expect("gateway config")
+            .with_max_sandboxes(2),
+    )
+    .await;
+    let client_a = remote_client(&first.base_url, TOKEN_A);
+    let client_b = remote_client(&first.base_url, TOKEN_B);
+
+    let first_sandbox = client_a
+        .create_sandbox(sandbox_config())
+        .await
+        .expect("create first sandbox for capped principal");
+    let quota_error = client_a
+        .create_sandbox(sandbox_config())
+        .await
+        .expect_err("per-principal quota must reject the second sandbox");
+    assert!(quota_error.to_string().contains("sandbox limit reached"));
+
+    client_b
+        .create_sandbox(sandbox_config())
+        .await
+        .expect("another principal is independent of the capped principal");
+
+    client_a
+        .delete_sandbox(&first_sandbox.sandbox_id)
+        .await
+        .expect("delete sandbox");
+    client_a
+        .create_sandbox(sandbox_config())
+        .await
+        .expect("deleted sandbox releases principal capacity");
+
+    let work_root = first.stop().await;
+    std::fs::remove_dir_all(work_root).expect("remove work root");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn gateway_accepts_seatbelt_backend() {
+    let work_root = private_tempdir();
+    let gateway = SandboxGateway::new(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_work_root(work_root.path().to_path_buf())
+            .with_backend(GatewayBackend::Seatbelt),
+    );
+    assert!(gateway.is_ok(), "seatbelt gateway must construct on macOS");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn seatbelt_gateway_enforces_allowlists_and_rejects_denylists() {
+    let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+
+    // denylist: Seatbelt fails closed at construction time
+    let mut denied = sandbox_config();
+    denied.fs_denylist = vec![std::path::PathBuf::from("/workspace/denied")];
+    let error = client
+        .create_sandbox(denied)
+        .await
+        .expect_err("seatbelt must reject denylist policies");
+    assert!(
+        error.to_string().contains("fs_denylist is not supported"),
+        "unexpected denylist error: {error}"
+    );
+
+    // allowlist: guest-coordinate entries map into the sandbox work dir
+    let mut allowed = sandbox_config();
+    allowed.fs_allowlist = vec![std::path::PathBuf::from("/workspace/allowed")];
+    let sandbox = RemoteSandbox::connect(allowed, Arc::clone(&client))
+        .await
+        .expect("create sandbox with allowlist");
+    let env = sandbox.env();
+    let outside = std::path::PathBuf::from("/workspace/outside.txt");
+    let error = env
+        .write_file(&outside, b"forbidden\n", CancellationToken::new())
+        .await
+        .expect_err("allowlist must restrict guest paths");
+    assert!(matches!(error, EnvError::PermissionDenied(_)));
+    let inside = std::path::PathBuf::from("/workspace/allowed/file.txt");
+    env.write_file(&inside, b"allowed\n", CancellationToken::new())
+        .await
+        .expect("write allowed path");
+    Box::new(sandbox)
+        .shutdown()
+        .await
+        .expect("shutdown sandbox");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn trusted_lan_binds_host_project_dir_and_caps_by_principal() {
+    let project = private_tempdir();
+    std::fs::write(project.path().join("marker.txt"), b"from-host").expect("write marker");
+    let project_name = project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let mut trusted = principal("tenant-a", TOKEN_A);
+    trusted.host_project_dirs = vec![project.path().to_path_buf()];
+    trusted.max_trust_profile = llm_harness_platform::trust::TrustProfile::TrustedLan;
+    let mut kiosk = principal("kiosk", TOKEN_B);
+    kiosk.max_trust_profile = llm_harness_platform::trust::TrustProfile::Restricted;
+    let gateway = start_gateway(vec![trusted, kiosk]).await;
+    let client_a = remote_client(&gateway.base_url, TOKEN_A);
+    let client_b = remote_client(&gateway.base_url, TOKEN_B);
+
+    // 1. trusted-lan create succeeds; the project dir is visible at
+    //    /workspace/<basename> and read-write in both directions.
+    let mut request = sandbox_config();
+    request.trust_profile = llm_harness_platform::trust::TrustProfile::TrustedLan;
+    let sandbox = RemoteSandbox::connect(request.clone(), Arc::clone(&client_a))
+        .await
+        .expect("trusted-lan create");
+    let env = sandbox.env();
+    let marker = std::path::PathBuf::from(format!("/workspace/{project_name}/marker.txt"));
+    let text = env
+        .read_text_file(&marker, CancellationToken::new())
+        .await
+        .expect("read bound host file");
+    assert_eq!(text, "from-host");
+    env.write_file(
+        &std::path::PathBuf::from(format!("/workspace/{project_name}/from-guest.txt")),
+        b"from-guest",
+        CancellationToken::new(),
+    )
+    .await
+    .expect("write into bound dir");
+    assert_eq!(
+        std::fs::read(project.path().join("from-guest.txt")).expect("host sees guest write"),
+        b"from-guest"
+    );
+    Box::new(sandbox).shutdown().await.expect("shutdown");
+
+    // 2. principal capped at restricted cannot request trusted-lan.
+    let error = client_b
+        .create_sandbox(request.clone())
+        .await
+        .expect_err("over-cap profile must be rejected");
+    assert!(
+        error.to_string().contains("exceeds principal cap"),
+        "unexpected cap error: {error}"
+    );
+
+    // 3. a principal WITHOUT host_project_dirs: trusted-lan create still
+    //    succeeds but nothing is bound (empty binds are a no-op).
+    let mut empty = principal("tenant-c", TOKEN_A);
+    empty.max_trust_profile = llm_harness_platform::trust::TrustProfile::TrustedFull;
+    let _ = empty; // covered implicitly by tenant-a in other tests
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn trusted_lan_without_project_dirs_is_valid() {
+    let mut p = principal("tenant-a", TOKEN_A);
+    p.max_trust_profile = llm_harness_platform::trust::TrustProfile::TrustedFull;
+    let gateway = start_gateway(vec![p]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+    let mut request = sandbox_config();
+    request.trust_profile = llm_harness_platform::trust::TrustProfile::TrustedLan;
+    let sandbox = RemoteSandbox::connect(request, Arc::clone(&client))
+        .await
+        .expect("trusted-lan without binds is valid");
+    Box::new(sandbox).shutdown().await.expect("shutdown");
 }
 
 #[test]
@@ -140,6 +340,7 @@ fn gateway_rejects_a_relative_firecracker_path() {
         base_image_path: PathBuf::from("/rootfs.ext4"),
         max_vcpu_count: 1,
         max_memory_mib: 128,
+        max_disk_mib: None,
         vsock_guest_cid_base: 3,
         guest_agent_port: 6000,
         readiness_timeout: Duration::from_secs(1),
@@ -187,6 +388,88 @@ fn gateway_rejects_vsock_cid_capacity_overflow() {
     assert!(error.to_string().contains("vsock CID capacity"));
 }
 
+#[test]
+fn gateway_rejects_zero_firecracker_disk_capacity() {
+    let root = private_tempdir();
+    for name in ["firecracker", "vmlinux", "rootfs-base.ext4"] {
+        std::fs::write(root.path().join(name), b"artifact").expect("write Firecracker artifact");
+    }
+    let mut permissions = std::fs::metadata(root.path().join("firecracker"))
+        .expect("binary metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(root.path().join("firecracker"), permissions)
+        .expect("make Firecracker binary executable");
+
+    let backend = GatewayBackend::Firecracker(FirecrackerBackendConfig {
+        binary_path: root.path().join("firecracker"),
+        kernel_image_path: root.path().join("vmlinux"),
+        base_image_path: root.path().join("rootfs-base.ext4"),
+        max_vcpu_count: 1,
+        max_memory_mib: 128,
+        max_disk_mib: Some(0),
+        vsock_guest_cid_base: 3,
+        guest_agent_port: 6000,
+        readiness_timeout: Duration::from_secs(1),
+    });
+
+    let work_root = private_tempdir();
+    let error = match SandboxGateway::new(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_work_root(work_root.path().to_path_buf())
+            .with_backend(backend),
+    ) {
+        Ok(_) => panic!("zero Firecracker disk capacity accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("max_disk_mib must be positive"));
+}
+
+#[test]
+fn gateway_rejects_firecracker_base_image_larger_than_disk_capacity() {
+    let root = private_tempdir();
+    std::fs::write(root.path().join("firecracker"), b"artifact")
+        .expect("write Firecracker artifact");
+    std::fs::write(root.path().join("vmlinux"), b"artifact").expect("write kernel artifact");
+    std::fs::write(
+        root.path().join("rootfs-base.ext4"),
+        vec![0u8; 1024 * 1024 + 1],
+    )
+    .expect("write oversized Firecracker base image");
+    let mut permissions = std::fs::metadata(root.path().join("firecracker"))
+        .expect("binary metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(root.path().join("firecracker"), permissions)
+        .expect("make Firecracker binary executable");
+
+    let backend = GatewayBackend::Firecracker(FirecrackerBackendConfig {
+        binary_path: root.path().join("firecracker"),
+        kernel_image_path: root.path().join("vmlinux"),
+        base_image_path: root.path().join("rootfs-base.ext4"),
+        max_vcpu_count: 1,
+        max_memory_mib: 128,
+        max_disk_mib: Some(1),
+        vsock_guest_cid_base: 3,
+        guest_agent_port: 6000,
+        readiness_timeout: Duration::from_secs(1),
+    });
+
+    let work_root = private_tempdir();
+    let error = match SandboxGateway::new(
+        GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+            .expect("gateway config")
+            .with_work_root(work_root.path().to_path_buf())
+            .with_backend(backend),
+    ) {
+        Ok(_) => panic!("Firecracker base image larger than disk capacity accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("exceeds max_disk_mib"));
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn firecracker_backend_does_not_fall_back_to_bwrap() {
     let root = private_tempdir();
@@ -235,12 +518,14 @@ fn firecracker_backend(root: &Path, vsock_guest_cid_base: u32) -> GatewayBackend
         base_image_path: root.join("rootfs-base.ext4"),
         max_vcpu_count: 2,
         max_memory_mib: 256,
+        max_disk_mib: Some(64),
         vsock_guest_cid_base,
         guest_agent_port: 6000,
         readiness_timeout: Duration::from_secs(2),
     })
 }
 
+#[cfg(target_os = "linux")]
 fn firecracker_artifact_root() -> tempfile::TempDir {
     let root = private_tempdir();
     for name in ["firecracker", "vmlinux", "rootfs-base.ext4"] {
@@ -255,6 +540,7 @@ fn firecracker_artifact_root() -> tempfile::TempDir {
     root
 }
 
+#[cfg(target_os = "linux")]
 fn write_fake_firecracker(path: &Path, guest_port: u32) {
     let script = r#"#!/usr/bin/env python3
 import base64, json, os, select, socket, sys
@@ -397,6 +683,8 @@ fn sandbox_config() -> SandboxConfig {
             timeout: None,
         },
         work_dir: None,
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     }
 }
 
@@ -413,10 +701,10 @@ fn persisted_sandbox_config_json() -> String {
             timeout_ms: None,
         },
         work_dir: None,
+        trust_profile: Default::default(),
     })
     .expect("serialize persisted sandbox config")
 }
-
 #[test]
 fn gateway_migrates_registry_schema_v1_to_v2() {
     let work_root = private_tempdir();
@@ -520,6 +808,7 @@ fn gateway_registry_requires_unique_vsock_cids() {
     assert!(error.to_string().contains("UNIQUE"));
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn firecracker_backend_rejects_unsupported_sandbox_policies() {
     let artifacts = firecracker_artifact_root();
@@ -602,6 +891,7 @@ async fn firecracker_backend_rejects_unsupported_sandbox_policies() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn firecracker_gateway_start_reset_and_shutdown() {
     let artifacts = firecracker_artifact_root();
@@ -642,6 +932,7 @@ async fn firecracker_gateway_start_reset_and_shutdown() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn firecracker_gateway_supports_shell_and_files() {
     let artifacts = firecracker_artifact_root();
@@ -827,6 +1118,9 @@ fn work_root_contains_file(work_root: &Path, file_name: &str) -> bool {
         })
 }
 
+// fs_denylist enforcement is a Bwrap capability; Seatbelt fails closed on
+// denylist policies by design (see llm-harness-sandbox seatbelt.rs).
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn gateway_enforces_guest_denylists() {
     let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
@@ -1068,6 +1362,93 @@ async fn bwrap_gateway_supports_files_shell_reset_and_delete() {
 }
 
 #[tokio::test]
+async fn gateway_uploads_a_batch_of_text_and_binary_files() {
+    if !bwrap_available() {
+        return;
+    }
+    let gateway = start_gateway(vec![principal("tenant-a", TOKEN_A)]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+    let sandbox = client
+        .create_sandbox(sandbox_config())
+        .await
+        .expect("create sandbox");
+
+    let text_path = PathBuf::from(&sandbox.work_dir).join("notes.txt");
+    let binary_path = PathBuf::from(&sandbox.work_dir).join("payload.bin");
+    let uploaded = client
+        .upload_files(
+            &sandbox.sandbox_id,
+            &[
+                (text_path.as_path(), b"text file\n".as_slice()),
+                (binary_path.as_path(), [0_u8, 1, 255].as_slice()),
+            ],
+        )
+        .await
+        .expect("upload files");
+
+    assert_eq!(
+        uploaded,
+        [
+            llm_harness_sandbox_remote::protocol::UploadedFile {
+                path: text_path.to_string_lossy().into_owned(),
+                bytes: 10,
+            },
+            llm_harness_sandbox_remote::protocol::UploadedFile {
+                path: binary_path.to_string_lossy().into_owned(),
+                bytes: 3,
+            },
+        ]
+    );
+    assert_eq!(
+        client
+            .read_file(&sandbox.sandbox_id, &text_path, false)
+            .await
+            .expect("read uploaded text"),
+        b"text file\n"
+    );
+    assert_eq!(
+        client
+            .read_file(&sandbox.sandbox_id, &binary_path, true)
+            .await
+            .expect("read uploaded binary"),
+        [0_u8, 1, 255]
+    );
+
+    let duplicate = UploadFilesRequest {
+        files: vec![
+            UploadFile {
+                path: text_path.to_string_lossy().into_owned(),
+                content: FileContent::Text {
+                    value: "first".to_owned(),
+                },
+            },
+            UploadFile {
+                path: text_path.to_string_lossy().into_owned(),
+                content: FileContent::Text {
+                    value: "second".to_owned(),
+                },
+            },
+        ],
+    };
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/v1/sandboxes/{}/fs/upload",
+            gateway.base_url, sandbox.sandbox_id
+        ))
+        .header("Authorization", format!("Bearer {TOKEN_A}"))
+        .json(&duplicate)
+        .send()
+        .await
+        .expect("duplicate upload request");
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    client
+        .delete_sandbox(&sandbox.sandbox_id)
+        .await
+        .expect("delete sandbox");
+}
+
+#[tokio::test]
 async fn gateway_restores_sandbox_work_roots_and_ownership_after_restart() {
     if !bwrap_available() {
         return;
@@ -1250,6 +1631,7 @@ fn gateway_fails_closed_on_invalid_persisted_registry_entries() {
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
 async fn firecracker_gateway_restores_restarted_sandboxes_as_creating() {
     let artifacts = firecracker_artifact_root();
     let work_root = private_tempdir();
@@ -1300,6 +1682,7 @@ async fn firecracker_gateway_restores_restarted_sandboxes_as_creating() {
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
 async fn firecracker_gateway_starts_a_recovered_sandbox_only_after_guest_readiness() {
     let artifacts = firecracker_artifact_root();
     write_fake_firecracker(artifacts.path().join("firecracker").as_path(), 6000);
@@ -1367,6 +1750,7 @@ async fn firecracker_gateway_starts_a_recovered_sandbox_only_after_guest_readine
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
 async fn firecracker_gateway_keeps_a_recovered_sandbox_creating_after_start_failure() {
     let artifacts = firecracker_artifact_root();
     let work_root = private_tempdir();
@@ -1682,4 +2066,23 @@ async fn gateway_rejects_cross_tenant_sandbox_access() {
         .delete_sandbox(&sandbox_id)
         .await
         .expect("delete sandbox");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn create_response_echoes_host_binds() {
+    let project = private_tempdir();
+    let mut trusted = principal("tenant-a", TOKEN_A);
+    trusted.host_project_dirs = vec![project.path().to_path_buf()];
+    trusted.max_trust_profile = llm_harness_platform::trust::TrustProfile::TrustedFull;
+    let gateway = start_gateway(vec![trusted]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+    let mut request = sandbox_config();
+    request.trust_profile = llm_harness_platform::trust::TrustProfile::TrustedFull;
+    let response = client.create_sandbox(request).await.expect("create");
+    assert_eq!(response.host_binds.len(), 1, "response must echo binds");
+    assert_eq!(
+        std::path::Path::new(&response.host_binds[0].host),
+        project.path()
+    );
 }

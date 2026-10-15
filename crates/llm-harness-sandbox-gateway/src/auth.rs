@@ -13,7 +13,19 @@ use sha2::{Digest, Sha256};
 pub struct GatewayPrincipalConfig {
     pub principal: String,
     pub bearer_token: String,
+    /// Guest-coordinate allowlist (restricted profile). Must be `/workspace`
+    /// or a subpath.
     pub fs_allowlist: Vec<PathBuf>,
+    /// Host directories bound read-write into trusted-profile sandboxes,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub host_project_dirs: Vec<PathBuf>,
+    /// Highest profile this principal may request. Requests above the cap
+    /// are rejected. Default `restricted`.
+    pub max_trust_profile: llm_harness_platform::trust::TrustProfile,
+    /// Optional fixed-window request limit. `None` disables rate limiting.
+    pub requests_per_minute: Option<usize>,
+    /// Optional maximum of concurrently tracked sandboxes for this principal.
+    pub max_active_sandboxes: Option<usize>,
 }
 
 /// Firecracker VM artifacts and VM defaults used by the gateway backend.
@@ -24,6 +36,7 @@ pub struct FirecrackerBackendConfig {
     pub base_image_path: PathBuf,
     pub max_vcpu_count: u32,
     pub max_memory_mib: u32,
+    pub max_disk_mib: Option<u32>,
     pub vsock_guest_cid_base: u32,
     pub guest_agent_port: u32,
     pub readiness_timeout: Duration,
@@ -33,6 +46,12 @@ pub struct FirecrackerBackendConfig {
 #[derive(Clone)]
 pub enum GatewayBackend {
     Bwrap,
+    /// macOS `sandbox-exec` backend (Seatbelt). Only available on macOS.
+    #[cfg(target_os = "macos")]
+    Seatbelt,
+    /// No-isolation backend: tools run directly on the host. Single-user,
+    /// fully-trusted setups only.
+    Os,
     Firecracker(FirecrackerBackendConfig),
 }
 
@@ -46,7 +65,17 @@ pub struct GatewayConfig {
     pub max_output_bytes: usize,
     pub max_request_bytes: usize,
     work_root: Option<PathBuf>,
+    audit_path: Option<PathBuf>,
+    audit_failure_mode: AuditFailureMode,
     backend: GatewayBackend,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditFailureMode {
+    #[default]
+    FailClosed,
+    FailOpen,
 }
 
 #[derive(Clone)]
@@ -54,6 +83,10 @@ struct PrincipalSecret {
     id: String,
     token_hash: [u8; 32],
     fs_allowlist: Vec<PathBuf>,
+    host_project_dirs: Vec<PathBuf>,
+    max_trust_profile: llm_harness_platform::trust::TrustProfile,
+    requests_per_minute: Option<usize>,
+    max_active_sandboxes: Option<usize>,
 }
 
 /// An authenticated principal attached to a request by the auth middleware.
@@ -61,6 +94,11 @@ struct PrincipalSecret {
 pub(crate) struct AuthenticatedPrincipal {
     pub(crate) id: Arc<str>,
     pub(crate) fs_allowlist: Arc<[PathBuf]>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) host_project_dirs: Arc<[PathBuf]>,
+    pub(crate) max_trust_profile: llm_harness_platform::trust::TrustProfile,
+    pub(crate) requests_per_minute: Option<usize>,
+    pub(crate) max_active_sandboxes: Option<usize>,
 }
 
 impl GatewayConfig {
@@ -69,6 +107,8 @@ impl GatewayConfig {
         if principals.is_empty() {
             anyhow::bail!("at least one gateway principal is required");
         }
+        let mut principal_ids = std::collections::HashSet::new();
+        let mut token_hashes = std::collections::HashSet::new();
 
         let mut secrets = Vec::with_capacity(principals.len());
         for principal in principals {
@@ -93,10 +133,50 @@ impl GatewayConfig {
                 }
                 allowlist.push(std::path::PathBuf::from(root));
             }
+            let mut project_dirs = Vec::with_capacity(principal.host_project_dirs.len());
+            for dir in &principal.host_project_dirs {
+                if !dir.is_absolute() {
+                    anyhow::bail!(
+                        "gateway principal host_project_dirs entry {dir:?} must be absolute"
+                    );
+                }
+                if !dir.is_dir() {
+                    anyhow::bail!(
+                        "gateway principal host_project_dirs entry {dir:?} must exist and be a directory"
+                    );
+                }
+                project_dirs.push(dir.clone());
+            }
+            if principal.requests_per_minute == Some(0) {
+                anyhow::bail!(
+                    "gateway principal requests_per_minute for {:?} must be positive",
+                    principal.principal
+                );
+            }
+            if principal.max_active_sandboxes == Some(0) {
+                anyhow::bail!(
+                    "gateway principal max_active_sandboxes for {:?} must be positive",
+                    principal.principal
+                );
+            }
+            let token_hash = Sha256::digest(principal.bearer_token.as_bytes()).into();
+            if !principal_ids.insert(principal.principal.clone()) {
+                anyhow::bail!(
+                    "gateway principal {:?} is defined more than once",
+                    principal.principal
+                );
+            }
+            if !token_hashes.insert(token_hash) {
+                anyhow::bail!("gateway bearer token hashes must be unique");
+            }
             secrets.push(PrincipalSecret {
                 id: principal.principal,
-                token_hash: Sha256::digest(principal.bearer_token.as_bytes()).into(),
+                token_hash,
                 fs_allowlist: allowlist,
+                host_project_dirs: project_dirs,
+                max_trust_profile: principal.max_trust_profile,
+                requests_per_minute: principal.requests_per_minute,
+                max_active_sandboxes: principal.max_active_sandboxes,
             });
         }
 
@@ -108,6 +188,8 @@ impl GatewayConfig {
             max_output_bytes: 1024 * 1024,
             max_request_bytes: 64 * 1024 * 1024,
             work_root: None,
+            audit_path: None,
+            audit_failure_mode: AuditFailureMode::FailClosed,
             backend: GatewayBackend::Bwrap,
         };
         config.validate()?;
@@ -142,6 +224,18 @@ impl GatewayConfig {
     /// Set the gateway-owned root used for sandbox work directories.
     pub fn with_work_root(mut self, root: PathBuf) -> Self {
         self.work_root = Some(root);
+        self
+    }
+
+    /// Set an explicit gateway audit log path.
+    pub fn with_audit_path(mut self, path: PathBuf) -> Self {
+        self.audit_path = Some(path);
+        self
+    }
+
+    /// Set whether failed audit writes reject requests or continue with a warning.
+    pub fn with_audit_failure_mode(mut self, mode: AuditFailureMode) -> Self {
+        self.audit_failure_mode = mode;
         self
     }
 
@@ -203,11 +297,31 @@ impl GatewayConfig {
         if self.max_output_bytes == 0 {
             anyhow::bail!("max_output_bytes must be positive");
         }
-        if self.max_request_bytes == 0 {
-            anyhow::bail!("max_request_bytes must be positive");
+        if let Some(audit_path) = &self.audit_path {
+            if !audit_path.is_absolute() {
+                anyhow::bail!("audit_path must be absolute");
+            }
+            let parent = audit_path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("audit_path must have a parent directory"))?;
+            anyhow::ensure!(
+                parent.is_dir(),
+                "audit_path parent directory {parent:?} must exist"
+            );
         }
         match &self.backend {
             GatewayBackend::Bwrap => {}
+            #[cfg(target_os = "macos")]
+            GatewayBackend::Seatbelt => {
+                if self.work_root.is_none() {
+                    anyhow::bail!("seatbelt backend requires an explicit work root");
+                }
+            }
+            GatewayBackend::Os => {
+                if self.work_root.is_none() {
+                    anyhow::bail!("os backend requires an explicit work root");
+                }
+            }
             GatewayBackend::Firecracker(config) => {
                 validate_firecracker_backend(config, self.max_sandboxes)?
             }
@@ -215,15 +329,11 @@ impl GatewayConfig {
         Ok(())
     }
 
-    pub(crate) fn authenticate(&self, bearer_token: &str) -> Option<AuthenticatedPrincipal> {
-        let token_hash: [u8; 32] = Sha256::digest(bearer_token.as_bytes()).into();
+    pub(crate) fn credential_seeds(&self) -> Vec<(String, [u8; 32])> {
         self.principals
             .iter()
-            .find(|principal| constant_time_eq(&principal.token_hash, &token_hash))
-            .map(|principal| AuthenticatedPrincipal {
-                id: Arc::from(principal.id.as_str()),
-                fs_allowlist: Arc::from(principal.fs_allowlist.as_slice()),
-            })
+            .map(|principal| (principal.id.clone(), principal.token_hash))
+            .collect()
     }
 
     pub(crate) fn principal(&self, principal_id: &str) -> Option<AuthenticatedPrincipal> {
@@ -233,13 +343,26 @@ impl GatewayConfig {
             .map(|principal| AuthenticatedPrincipal {
                 id: Arc::from(principal.id.as_str()),
                 fs_allowlist: Arc::from(principal.fs_allowlist.as_slice()),
+                host_project_dirs: Arc::from(principal.host_project_dirs.as_slice()),
+                max_trust_profile: principal.max_trust_profile,
+                requests_per_minute: principal.requests_per_minute,
+                max_active_sandboxes: principal.max_active_sandboxes,
             })
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn work_root(&self) -> &std::path::Path {
         self.work_root
             .as_deref()
             .expect("gateway work root is prepared")
+    }
+
+    pub(crate) fn audit_path(&self) -> Option<&std::path::Path> {
+        self.audit_path.as_deref()
+    }
+
+    pub(crate) fn audit_failure_mode(&self) -> AuditFailureMode {
+        self.audit_failure_mode
     }
 }
 
@@ -302,6 +425,20 @@ fn validate_firecracker_backend(
     if config.max_memory_mib == 0 {
         anyhow::bail!("firecracker max_memory_mib must be positive");
     }
+    if let Some(max_disk_mib) = config.max_disk_mib {
+        if max_disk_mib == 0 {
+            anyhow::bail!("firecracker max_disk_mib must be positive");
+        }
+        let max_disk_bytes = u64::from(max_disk_mib) * 1024 * 1024;
+        let base_image_size = std::fs::metadata(&config.base_image_path)
+            .map_err(|error| anyhow::anyhow!("invalid firecracker base image path: {error}"))?
+            .len();
+        if base_image_size > max_disk_bytes {
+            anyhow::bail!(
+                "firecracker base image size {base_image_size} exceeds max_disk_mib {max_disk_mib}"
+            );
+        }
+    }
     if config.vsock_guest_cid_base < 3 {
         anyhow::bail!("firecracker vsock_guest_cid_base must be at least 3");
     }
@@ -341,6 +478,9 @@ impl std::fmt::Debug for GatewayConfig {
                 "backend",
                 &match self.backend {
                     GatewayBackend::Bwrap => "bwrap",
+                    #[cfg(target_os = "macos")]
+                    GatewayBackend::Seatbelt => "macos-seatbelt",
+                    GatewayBackend::Os => "os",
                     GatewayBackend::Firecracker(_) => "firecracker",
                 },
             )

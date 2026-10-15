@@ -135,8 +135,8 @@ impl ChatHistoryJournal {
                     message_type = 'broadcast'
                     OR (
                         message_type = 'direct'
-                        AND broadcast_id IS NOT NULL
                         AND to_id = ?3
+                        AND broadcast_id IS NOT NULL
                     )
                 )
              ORDER BY id DESC LIMIT ?2";
@@ -335,6 +335,28 @@ mod tests {
             assert_eq!(entries[1].message.from.as_str(), "planner");
             assert_eq!(entries[1].message.body, "reply");
         }
+    fn member_reports_to_operator_are_private_without_broadcast_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("chat.sqlite3");
+        let journal = ChatHistoryJournal::open(&path).unwrap();
+
+        let operator_task = direct("operator", "verifier", "private task", "message-1", None);
+        let verifier_report = direct("verifier", "operator", "FAIL", "message-2", None);
+        journal.append(&operator_task).unwrap();
+        journal.append(&verifier_report).unwrap();
+
+        let group = journal.group_history(10, None).unwrap();
+        assert!(group.is_empty());
+
+        let private_entries = journal
+            .private_history(
+                &crate::AgentId::new("operator"),
+                &crate::AgentId::new("verifier"),
+                10,
+                None,
+            )
+            .unwrap();
+        assert_eq!(private_entries.len(), 2);
     }
 
     #[test]

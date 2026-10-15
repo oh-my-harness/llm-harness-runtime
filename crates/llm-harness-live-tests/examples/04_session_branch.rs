@@ -196,6 +196,8 @@ async fn main() {
                 timeout: None,
             },
             work_dir: Some(tmp2.path().to_path_buf()),
+            host_binds: vec![],
+            trust_profile: Default::default(),
         };
         let sandbox = OsEnvSandbox::new(config);
         sandbox.start().await.unwrap();
