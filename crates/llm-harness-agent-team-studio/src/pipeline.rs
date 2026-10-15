@@ -1980,6 +1980,117 @@ impl PipelineController {
         );
     }
 
+    /// Operator-initiated cancellation of a running controlled workflow.
+    ///
+    /// The `terminal_user_outcome` guard makes this idempotent and
+    /// race-free against `run()`'s own terminal paths: whichever side sees a
+    /// non-terminal state first claims the single escalation (`finish`'s
+    /// `newly_terminal` check is the second line of defense), and a
+    /// published `terminal_user_outcome` short-circuits to idempotent 200.
+    pub fn stop(&self, issue_id: &str, reason: String) -> Option<PipelineState> {
+        let existing = self.state(issue_id);
+        if existing
+            .as_ref()
+            .and_then(|state| state.terminal_user_outcome.as_ref())
+            .is_some()
+        {
+            return existing;
+        }
+        if existing.is_none() {
+            // Workflow never got past lease acquisition (`run` not entered):
+            // insert the state so the escalation has a tracked pipeline.
+            self.states.lock().insert(
+                issue_id.to_string(),
+                PipelineState {
+                    issue_id: issue_id.to_string(),
+                    phase: "deciding".into(),
+                    review_round: 0,
+                    max_rounds: self.max_rounds,
+                    snapshot_id: None,
+                    latest_verdict: None,
+                    reviewers_dispatched: vec![],
+                    reviewer_findings: vec![],
+                    last_judge_report: None,
+                    terminal_reason: None,
+                    terminal_user_outcome: None,
+                },
+            );
+        }
+        self.finish(
+            issue_id,
+            PipelinePhase::Escalated,
+            reason.clone(),
+            TerminalUserOutcome {
+                attribution: TerminalAttribution::WorkflowStatus,
+                body: format!(
+                    "Workflow stopped by the operator: {reason}. Partial progress stays in the issue and snapshot history; start a new workflow on this team to continue."
+                ),
+            },
+            &crate::issue::Issue {
+                id: issue_id.to_string(),
+                status: crate::issue::IssueStatus::Confirmed,
+                source: "operator".into(),
+                created: chrono::Utc::now().to_rfc3339(),
+                title: issue_id.to_string(),
+                body: String::new(),
+            },
+            &[],
+            self.snapshot_runs.lock().get(issue_id).copied(),
+        );
+        self.state(issue_id)
+    }
+
+    /// Terminalize a workflow that failed before `run()` inserted any state
+    /// (A2-3: snapshot lease acquisition failure). Same
+    /// `terminal_user_outcome` single-outcome guarantee as `finish`.
+    pub fn mark_escalated_without_run(&self, issue_id: &str, reason: String) {
+        let existing = self.state(issue_id);
+        if existing
+            .as_ref()
+            .and_then(|state| state.terminal_user_outcome.as_ref())
+            .is_some()
+        {
+            return;
+        }
+        if existing.is_none() {
+            self.states.lock().insert(
+                issue_id.to_string(),
+                PipelineState {
+                    issue_id: issue_id.to_string(),
+                    phase: PipelinePhase::Escalated.as_str().to_string(),
+                    review_round: 0,
+                    max_rounds: self.max_rounds,
+                    snapshot_id: None,
+                    latest_verdict: None,
+                    reviewers_dispatched: vec![],
+                    reviewer_findings: vec![],
+                    last_judge_report: None,
+                    terminal_reason: Some(reason.clone()),
+                    terminal_user_outcome: Some(TerminalUserOutcome {
+                        attribution: TerminalAttribution::WorkflowStatus,
+                        body: format!("Workflow stopped: {reason}."),
+                    }),
+                },
+            );
+        } else {
+            self.update_state_fn(issue_id, |s| {
+                if s.terminal_user_outcome.is_some() {
+                    return;
+                }
+                s.phase = PipelinePhase::Escalated.as_str().to_string();
+                s.terminal_reason = Some(reason.clone());
+                s.terminal_user_outcome = Some(TerminalUserOutcome {
+                    attribution: TerminalAttribution::WorkflowStatus,
+                    body: format!("Workflow stopped: {reason}."),
+                });
+            });
+        }
+        self.emit(
+            "pipeline_escalated",
+            serde_json::json!({ "issue_id": issue_id, "reason": reason }),
+        );
+    }
+
     fn update_state_fn(&self, issue_id: &str, f: impl FnOnce(&mut PipelineState)) {
         let mut states = self.states.lock();
         if let Some(state) = states.get_mut(issue_id) {

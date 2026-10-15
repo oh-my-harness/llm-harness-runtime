@@ -212,7 +212,31 @@ impl TeamEntry {
             let lease = match controller.snapshot_workflow_lease().await {
                 Ok(lease) => lease,
                 Err(error) => {
+                    // Real storage failure (permissions, `.pipeline` swapped
+                    // for a symlink, ...). The chat request already returned
+                    // 202, so the workflow MUST publish a terminal outcome
+                    // instead of silently vanishing. Transient contention is
+                    // WouldBlock and retried inside `snapshot_workflow_lease`.
                     tracing::warn!(%error, "cannot acquire workflow snapshot lease");
+                    let terminal = crate::pipeline::TerminalUserOutcome {
+                        attribution: crate::pipeline::TerminalAttribution::WorkflowStatus,
+                        body: format!(
+                            "Workflow stopped: snapshot storage unavailable: {error}. The objective was accepted but no work could start; fix the storage problem and resend."
+                        ),
+                    };
+                    if let Err(publish_error) = publish_workflow_terminal(
+                        &chat_history_path,
+                        &project_id,
+                        &issue.id,
+                        &terminal,
+                        events.as_deref(),
+                    ) {
+                        tracing::error!(workflow_id = %issue.id, "failed to persist workflow terminal outcome: {publish_error}");
+                    }
+                    controller.mark_escalated_without_run(
+                        &issue.id,
+                        format!("snapshot storage unavailable: {error}"),
+                    );
                     return;
                 }
             };
@@ -473,6 +497,68 @@ impl TeamManager {
         let mut ids: Vec<String> = self.teams.keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    /// Cancel one team's running controlled workflow task without shutting
+    /// the team down. Publishes the operator terminal outcome to the chat
+    /// journal + live bus (the aborted task can no longer do it), then aborts
+    /// the spawned task and the member harnesses. The team itself stays alive
+    /// so the operator can start the next workflow on the same instance.
+    pub fn stop_workflow(
+        &mut self,
+        id: &str,
+        events: Option<Arc<crate::events::EventBus>>,
+    ) -> Result<(), TeamManagerError> {
+        let (issue_id, chat_history_path, project_id, terminal) = {
+            let entry = self
+                .teams
+                .get(id)
+                .ok_or_else(|| TeamManagerError::UnknownTeam(id.to_string()))?;
+            let controller = entry
+                .workflow
+                .as_ref()
+                .ok_or_else(|| TeamManagerError::Workflow("team is not controlled".into()))?;
+            let issue_id = controller
+                .all_states()
+                .into_iter()
+                .find(|state| state.terminal_user_outcome.is_some())
+                .map(|state| state.issue_id)
+                .ok_or_else(|| TeamManagerError::Workflow("no terminal workflow state".into()))?;
+            (
+                issue_id.clone(),
+                entry.data_dir().join("chat.sqlite3"),
+                entry.id.clone(),
+                controller
+                    .state(&issue_id)
+                    .and_then(|state| state.terminal_user_outcome),
+            )
+        };
+        // The chat journal's `message_id` dedup keeps this a no-op when the
+        // aborted task still managed to publish on its own.
+        if let Some(terminal) = terminal.as_ref() {
+            if let Err(error) = publish_workflow_terminal(
+                &chat_history_path,
+                &project_id,
+                &issue_id,
+                terminal,
+                events.as_deref(),
+            ) {
+                tracing::error!(workflow_id = %issue_id, "failed to persist workflow terminal outcome: {error}");
+            }
+        }
+        let entry = self
+            .teams
+            .get_mut(id)
+            .ok_or_else(|| TeamManagerError::UnknownTeam(id.to_string()))?;
+        entry.stop_workflow();
+        // Abort in-flight member turns; the team itself stays alive so the
+        // operator can start the next workflow on the same instance.
+        for member in &entry.spec.members {
+            if let Some(harness) = entry.team.harness(&llm_harness_agent_team::AgentId::new(&member.id)) {
+                harness.abort();
+            }
+        }
+        Ok(())
     }
 
     /// Shut down one team and drop it (issues/memory persist).
@@ -1108,6 +1194,114 @@ mod tests {
         let issue_id = outcome.expect("first workflow must start on a fresh team");
         assert_eq!(issue_id, issue.id);
         assert!(pm_shared_reads_ok(&tm_shared).await);
+    }
+
+    /// A2-3 regression: a workflow that cannot acquire its snapshot lease
+    /// (real IO error, not WouldBlock) must terminalize — the chat journal
+    /// gets exactly one Escalated terminal message and the controller state
+    /// is Escalated with a terminal outcome — instead of silently vanishing
+    /// after the 202 was already returned. WouldBlock contention keeps its
+    /// internal 50 ms retry and is unaffected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_lease_failure_publishes_terminal_outcome() {
+        let _factory = install_mock_factory();
+        let root = unique_dir("ct-tm-lease");
+        let repo = make_repo();
+        let mut spec = blank_spec();
+        spec.id = "coding-team".into(); // is_controlled → workflow controller attached
+        spec.template = Some(crate::team_spec::TemplateRef {
+            template_id: "coding-team".into(),
+            version: "test".into(),
+        });
+        let mut tm = TeamManager::new(&root);
+        tm.create(spec, Some(repo.clone()), &settings(), "")
+            .await
+            .unwrap();
+        let events = std::sync::Arc::new(crate::events::EventBus::new());
+        let issue = crate::issue::Issue {
+            id: "wf-lease-1".into(),
+            status: crate::issue::IssueStatus::Confirmed,
+            source: "test".into(),
+            created: chrono::Utc::now().to_rfc3339(),
+            title: "lease failure regression".into(),
+            body: "noop".into(),
+        };
+
+        // Sabotage lease acquisition with a permanent (non-WouldBlock) error:
+        // replace the repo's .pipeline directory with a symlink, which
+        // safe_dir rejects.
+        let pipeline = repo.join(".pipeline");
+        std::fs::create_dir_all(&pipeline).unwrap();
+        std::fs::remove_dir_all(&pipeline).unwrap();
+        let elsewhere = repo.join(".pipeline-real-elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &pipeline).unwrap();
+
+        let tm_shared = std::sync::Arc::new(tokio::sync::RwLock::new(tm));
+        let started = {
+            let tm_shared = tm_shared.clone();
+            let issue = issue.clone();
+            let events = events.clone();
+            tokio::spawn(async move {
+                let pm = tm_shared.read().await;
+                let entry = pm.get("coding-team").unwrap();
+                entry.start_workflow(issue, Some(events))
+            })
+            .await
+            .unwrap()
+            .expect("workflow accepted");
+        };
+
+        // The spawned workflow task must publish the terminal outcome even
+        // though the lease failed: chat journal has exactly one terminal
+        // message, and the controller state is Escalated with an outcome.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let done = tm_shared
+                    .read()
+                    .await
+                    .get("coding-team")
+                    .unwrap()
+                    .workflow
+                    .as_ref()
+                    .unwrap()
+                    .state(&issue.id)
+                    .is_some_and(|state| state.terminal_user_outcome.is_some());
+                if done {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("lease failure must terminalize the workflow");
+
+        let journal = llm_harness_agent_team::ChatHistoryJournal::open(
+            root.join("teams").join("coding-team").join("chat.sqlite3"),
+        )
+        .unwrap();
+        let history = journal.group_history(10, None).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].message.from.as_str(),
+            crate::pipeline::WORKFLOW_STATUS_ID
+        );
+        assert!(history[0].message.body.contains("snapshot storage unavailable"));
+        let state = tm_shared
+            .read()
+            .await
+            .get("coding-team")
+            .unwrap()
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state(&issue.id)
+            .unwrap();
+        assert_eq!(state.phase, "escalated");
+        assert_eq!(
+            state.terminal_user_outcome.unwrap().attribution,
+            crate::pipeline::TerminalAttribution::WorkflowStatus
+        );
     }
 
     /// The workflow task keeps running against the mock client; give it a

@@ -103,6 +103,7 @@ fn team_routes(prefix: &'static str, state: AppState) -> Router {
         .route(&format!("{prefix}/pulse"), get(pulse))
         .route(&format!("{prefix}/agent/inject"), post(agent_inject))
         .route(&format!("{prefix}/agent/abort"), post(agent_abort))
+        .route(&format!("{prefix}/workflow/stop"), post(workflow_stop))
         .route(&format!("{prefix}/agent/session"), get(agent_session))
         .route(
             &format!("{prefix}/agent/config"),
@@ -770,6 +771,80 @@ async fn agent_abort(State(state): State<AppState>, Query(q): Query<AgentCtlQuer
         }
         None => err_resp(format!("unknown agent: {}", q.agent), StatusCode::NOT_FOUND),
     }
+}
+
+/// POST /api/team/workflow/stop?project= — cancel a running controlled
+/// workflow. The controller terminalizes the current issue (Escalated) and
+/// publishes the terminal outcome; the workflow task itself is aborted by
+/// `TeamManager::stop_workflow` on the manager side. Idempotent: stopping an
+/// already-terminal or not-running workflow returns the current state.
+#[derive(Deserialize)]
+struct WorkflowStopQuery {
+    project: String,
+}
+
+async fn workflow_stop(
+    State(state): State<AppState>,
+    Query(q): Query<WorkflowStopQuery>,
+) -> Response {
+    let pm = state.pm.read().await;
+    let Some(project) = pm.get(&q.project) else {
+        return err_resp(
+            format!("unknown project: {}", q.project),
+            StatusCode::NOT_FOUND,
+        );
+    };
+    let Some(controller) = project.workflow.as_ref() else {
+        return conflict("team is not a controlled workflow team".into());
+    };
+    if !project.workflow_running() {
+        return err_resp(
+            "no running controlled workflow to stop".into(),
+            StatusCode::CONFLICT,
+        );
+    }
+    let Some(issue_id) = latest_running_id(controller) else {
+        return err_resp(
+            "no running controlled workflow to stop".into(),
+            StatusCode::CONFLICT,
+        );
+    };
+    let terminal = controller.stop(&issue_id, "operator requested workflow stop".into());
+    // Terminate the spawned workflow task only after the terminal state is
+    // recorded: aborting earlier could race the journal write in
+    // `start_workflow`'s task with the operator terminal published here.
+    // `stop_workflow` also republishes the terminal outcome to the chat
+    // journal + live bus, since the aborted task can no longer do it.
+    drop(pm);
+    state
+        .pm
+        .write()
+        .await
+        .stop_workflow(&q.project, Some(state.events.clone()));
+    match terminal {
+        Some(outcome) => {
+            Json(serde_json::json!({
+                "ok": true,
+                "workflow_id": issue_id,
+                "phase": outcome.phase,
+                "terminal_reason": outcome.terminal_reason,
+            }))
+            .into_response()
+        }
+        None => err_resp(
+            format!("unknown workflow: {issue_id}"),
+            StatusCode::NOT_FOUND,
+        ),
+    }
+}
+
+/// Latest tracked pipeline state for a controlled team (the running issue).
+fn latest_running_id(controller: &crate::pipeline::PipelineController) -> Option<String> {
+    controller
+        .all_states()
+        .into_iter()
+        .max_by_key(|state| state.issue_id.clone())
+        .map(|state| state.issue_id)
 }
 
 /// GET /api/team/agent/session?project=&agent= — the agent's run history
@@ -3064,6 +3139,172 @@ mod tests {
         assert_eq!(orchestrator.tasks.lock().len(), 1);
         assert!(coder.tasks.lock().is_empty());
         assert_eq!(idle.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A2-2 regression: POST /api/team/workflow/stop cancels a running
+    /// controlled workflow — the issue lands in a terminal escalated state,
+    /// the workflow task stops, and the operator sees exactly one terminal
+    /// chat message.
+    #[tokio::test]
+    async fn controlled_workflow_stop_terminalizes_and_publishes_once() {
+        // The orchestrator never answers the first decision, so the workflow
+        // stays running until we stop it.
+        let (router, pm, _orchestrator, _coder, _idle, _factory) =
+            controlled_fixture(&[], false).await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().unwrap().to_string();
+        // Wait until the controller has tracked state for this issue.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if pm
+                    .read()
+                    .await
+                    .get("controlled")
+                    .unwrap()
+                    .workflow
+                    .as_ref()
+                    .unwrap()
+                    .state(&workflow_id)
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("workflow state never appeared");
+
+        let (status, body) = json_post(
+            &router,
+            "/api/team/workflow/stop?project=controlled",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["workflow_id"], workflow_id.as_str());
+        assert_eq!(body["phase"], "escalated");
+
+        wait_workflow_phase(&pm, &workflow_id, "escalated").await;
+        let guard = pm.read().await;
+        let project = guard.get("controlled").unwrap();
+        let state = project
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state(&workflow_id)
+            .unwrap();
+        assert_eq!(state.phase, "escalated");
+        let terminal = state.terminal_user_outcome.expect("terminal outcome set");
+        assert_eq!(
+            terminal.attribution,
+            crate::pipeline::TerminalAttribution::WorkflowStatus
+        );
+        assert!(terminal.body.contains("stopped by the operator"));
+        assert!(!project.workflow_running());
+        drop(guard);
+
+        // Exactly one journaled terminal message for this issue.
+        let (status, history) =
+            get_json(&router, "/api/team/chat?project=controlled&agent=team").await;
+        assert_eq!(status, 200);
+        let terminal_messages: Vec<_> = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["broadcast_id"] == workflow_id.as_str()
+                    && message["from"] == crate::pipeline::WORKFLOW_STATUS_ID
+            })
+            .collect();
+        assert_eq!(terminal_messages.len(), 1, "{history}");
+    }
+
+    /// A2-2 idempotence + race guard: a stop issued after the workflow has
+    /// already reached its own terminal state (here: FINISH racing the stop)
+    /// must not publish a second terminal outcome — the journaled terminal
+    /// message for the issue stays exactly one.
+    #[tokio::test]
+    async fn controlled_workflow_stop_racing_natural_finish_publishes_once() {
+        let (router, pm, _orchestrator, _coder, _idle, _factory) =
+            controlled_fixture(&["ACTION: FINISH\nFinal response."], false).await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().unwrap().to_string();
+        wait_workflow_phase(&pm, &workflow_id, "done").await;
+
+        // Stop arrives after natural completion: idempotent terminal, 200.
+        let (status, body) = json_post(
+            &router,
+            "/api/team/workflow/stop?project=controlled",
+            serde_json::json!({}),
+        ).await;
+        assert_eq!(status, 409, "{body}");
+
+        let guard = pm.read().await;
+        let project = guard.get("controlled").unwrap();
+        let state = project
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state(&workflow_id)
+            .unwrap();
+        // The natural FINISH owns the terminal outcome, not the operator stop.
+        assert!(state.terminal_user_outcome.is_some());
+        assert_ne!(state.phase, "escalated");
+        drop(guard);
+        let (status, history) =
+            get_json(&router, "/api/team/chat?project=controlled&agent=team").await;
+        assert_eq!(status, 200);
+        let terminal_messages: Vec<_> = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["broadcast_id"] == workflow_id.as_str())
+            .filter(|message| message["text"].as_str().is_some_and(|text| text.contains("## Human review package")))
+            .collect();
+        assert_eq!(terminal_messages.len(), 1, "{history}");
+    }
+
+    /// Stopping a team that is not a controlled workflow team is a conflict.
+    #[tokio::test]
+    async fn workflow_stop_rejects_uncontrolled_team() {
+        // setup() pre-grants its repo, so registering an uncontrolled team
+        // succeeds without touching workspace grants.
+        let (router, _pm, repo, _factory) = setup().await;
+        let (status, json) = json_post(
+            &router,
+            "/api/team/projects",
+            serde_json::json!({
+                "id": "plain",
+                "repo_path": repo.to_string_lossy(),
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{json}");
+        let (status, json) = json_post(
+            &router,
+            "/api/team/workflow/stop?project=plain",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 409, "{json}");
     }
 
     fn tier() -> ModelTier {
