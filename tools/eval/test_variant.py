@@ -84,10 +84,30 @@ class VariantTests(unittest.TestCase):
         self.assertNotEqual(base["variant_digest"], renamed["variant_digest"])
 
     def test_dirty_source_state_is_recorded_and_binary_marked_unproven(self):
-        manifest = self.manifest()
+        # Do not assume the production repo tree is dirty (a completed
+        # release commit makes it clean); exercise the dirty path on a
+        # synthetic repo with committed, modified and untracked files.
+        repo = self.root / "dirty-repo"
+        repo.mkdir()
+        (repo / "main.rs").write_text("fn main() {}\n")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-qm", "c"], cwd=repo, check=True)
+        (repo / "main.rs").write_text("fn main() { println!(\"dirty\"); }\n")
+        (repo / "scratch.txt").write_text("untracked\n")
+
+        binary = self.root / "dirty-variant-studio"
+        binary.write_bytes(b"\x7fELF-fake-dirty-variant-binary")
+        manifest = self.manifest(binary=binary, source_cwd=repo)
         self.assertTrue(manifest["source"]["dirty"])
         self.assertIn("unproven", manifest["runtime_binary"]["source_provenance"])
         self.assertTrue(manifest["source"]["untracked_files"])
+
+        dirty_state = variant.capture_source_state(cwd=repo)
+        self.assertTrue(dirty_state["dirty"])
+        self.assertTrue(dirty_state["untracked_files"])
+        self.assertIn("unproven", variant.binary_provenance(binary))
 
     def test_clean_synthetic_source_marks_provenance_clean(self):
         # A throwaway git repo with a clean tree proves nothing about the
