@@ -41,6 +41,8 @@ fn config_for(work_dir: std::path::PathBuf) -> SandboxConfig {
             timeout: None,
         },
         work_dir: Some(work_dir),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     }
 }
 
