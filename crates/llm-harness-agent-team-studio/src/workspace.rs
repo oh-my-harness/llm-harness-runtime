@@ -290,7 +290,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let unc_host = r"\\wsl.localhost\TestDistro";
-        let unc_dollars = format!(r"\\WSL$\Other-Distro");
+        let unc_dollars = r"\\WSL$\Other-Distro".to_string();
         let unc = format!("{unc_host}\\{}", tail.replace('/', "\\"));
         let unc_slashes = format!("{unc_dollars}/{}", tail);
 

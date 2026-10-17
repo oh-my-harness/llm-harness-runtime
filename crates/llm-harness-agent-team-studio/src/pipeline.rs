@@ -16,6 +16,14 @@ use serde::Serialize;
 use crate::issue::Issue;
 use crate::snapshot_storage::{CaptureLimits, SnapshotPolicy, StorageLease};
 
+type EventSink = Arc<dyn Fn(&str, &serde_json::Value) + Send + Sync>;
+
+struct ReviewPosition {
+    run_id: uuid::Uuid,
+    decision_step: u32,
+    review_round: u32,
+}
+
 /// Controller-side correlation prefix so agent replies can be matched to
 /// pipeline round without an intermediary agent.
 const TASK_PREFIX: &str = "task-pipe-";
@@ -833,7 +841,9 @@ fn create_safe_dir(root: &Path, relative: &Path) -> std::io::Result<()> {
             }
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let mut builder = std::fs::DirBuilder::new();
+                let builder = std::fs::DirBuilder::new();
+                #[cfg(unix)]
+                let mut builder = builder;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::DirBuilderExt;
@@ -1124,7 +1134,9 @@ struct PatchGitRepo {
 impl PatchGitRepo {
     fn new() -> std::io::Result<Self> {
         let root = std::env::temp_dir().join(format!("pipeline-patch-{}", uuid::Uuid::new_v4()));
-        let mut builder = std::fs::DirBuilder::new();
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -1314,7 +1326,7 @@ pub struct PipelineController {
     /// `(event_name, payload)` in addition to the event bus fan-out.
     /// `RwLock` because the workflow owner attaches the bus-backed sink after
     /// the shared `Arc<PipelineController>` exists (`set_sink`).
-    sink: parking_lot::RwLock<Option<Arc<dyn Fn(&str, &serde_json::Value) + Send + Sync>>>,
+    sink: parking_lot::RwLock<Option<EventSink>>,
 }
 
 impl PipelineController {
@@ -1404,7 +1416,7 @@ impl PipelineController {
 
     /// Attach the thin observability sink (see [`PipelineEvent`]). No storage
     /// here — a concrete caller decides what to do with the payloads.
-    pub fn with_sink(self, sink: Arc<dyn Fn(&str, &serde_json::Value) + Send + Sync>) -> Self {
+    pub fn with_sink(self, sink: EventSink) -> Self {
         *self.sink.write() = Some(sink);
         self
     }
@@ -1412,7 +1424,7 @@ impl PipelineController {
     /// Attach a sink after construction. `TeamManager` builds one shared
     /// controller per team before the project's `EventBus` exists; the
     /// workflow owner attaches the bus-backed sink at `start_workflow` time.
-    pub fn set_sink(&self, sink: Arc<dyn Fn(&str, &serde_json::Value) + Send + Sync>) {
+    pub fn set_sink(&self, sink: EventSink) {
         *self.sink.write() = Some(sink);
     }
 
@@ -1735,8 +1747,7 @@ impl PipelineController {
         if let Err(reason) = &result {
             self.finish(
                 &issue.id,
-                PipelinePhase::Escalated,
-                reason.clone(),
+                (PipelinePhase::Escalated, reason.clone()),
                 TerminalUserOutcome {
                     attribution: TerminalAttribution::WorkflowStatus,
                     body: controller_failure_message(reason),
@@ -1811,8 +1822,7 @@ impl PipelineController {
                 Action::Finish(final_response) => {
                     self.finish(
                         &issue.id,
-                        PipelinePhase::Done,
-                        "orchestrator finished".into(),
+                        (PipelinePhase::Done, "orchestrator finished".into()),
                         TerminalUserOutcome {
                             attribution: TerminalAttribution::Orchestrator,
                             body: final_response.clone(),
@@ -1837,8 +1847,7 @@ impl PipelineController {
                     };
                     self.finish(
                         &issue.id,
-                        PipelinePhase::Escalated,
-                        "orchestrator escalated".into(),
+                        (PipelinePhase::Escalated, "orchestrator escalated".into()),
                         terminal_user_outcome,
                         issue,
                         records,
@@ -1903,9 +1912,11 @@ impl PipelineController {
                         evidence = self
                             .review_implementation(
                                 issue,
-                                run_id,
-                                step,
-                                review_round,
+                                ReviewPosition {
+                                    run_id,
+                                    decision_step: step,
+                                    review_round,
+                                },
                                 &task_id,
                                 &reply.body,
                                 records,
@@ -1927,14 +1938,17 @@ impl PipelineController {
     async fn review_implementation(
         &self,
         issue: &Issue,
-        run_id: uuid::Uuid,
-        decision_step: u32,
-        review_round: u32,
+        position: ReviewPosition,
         coder_task_id: &str,
         coder_evidence: &str,
         records: &mut Vec<ReviewRecord>,
         baseline: Option<&ArtifactSnapshot>,
     ) -> Result<String, String> {
+        let ReviewPosition {
+            run_id,
+            decision_step,
+            review_round,
+        } = position;
         let mut reviewers: Vec<_> = self
             .members
             .iter()
@@ -2086,8 +2100,7 @@ impl PipelineController {
     fn finish(
         &self,
         issue_id: &str,
-        phase: PipelinePhase,
-        reason: String,
+        (phase, reason): (PipelinePhase, String),
         mut terminal_user_outcome: TerminalUserOutcome,
         issue: &Issue,
         records: &[ReviewRecord],
@@ -2162,8 +2175,7 @@ impl PipelineController {
         }
         self.finish(
             issue_id,
-            PipelinePhase::Escalated,
-            reason.clone(),
+            (PipelinePhase::Escalated, reason.clone()),
             TerminalUserOutcome {
                 attribution: TerminalAttribution::WorkflowStatus,
                 body: format!(
@@ -2497,8 +2509,7 @@ mod tests {
         );
         controller.finish(
             "issue",
-            PipelinePhase::Done,
-            "orchestrator finished".into(),
+            (PipelinePhase::Done, "orchestrator finished".into()),
             TerminalUserOutcome {
                 attribution: TerminalAttribution::Orchestrator,
                 body: "Finished once.".into(),
@@ -2509,8 +2520,7 @@ mod tests {
         );
         controller.finish(
             "issue",
-            PipelinePhase::Escalated,
-            "late failure".into(),
+            (PipelinePhase::Escalated, "late failure".into()),
             TerminalUserOutcome {
                 attribution: TerminalAttribution::WorkflowStatus,
                 body: "Workflow stopped late.".into(),
@@ -3425,9 +3435,11 @@ mod tests {
         let err = controller
             .review_implementation(
                 &issue,
-                run_id,
-                1,
-                1,
+                ReviewPosition {
+                    run_id,
+                    decision_step: 1,
+                    review_round: 1,
+                },
                 "coder-task",
                 "coder evidence",
                 &mut Vec::new(),
@@ -3481,9 +3493,11 @@ mod tests {
         let err = controller
             .review_implementation(
                 &issue,
-                run_id,
-                1,
-                1,
+                ReviewPosition {
+                    run_id,
+                    decision_step: 1,
+                    review_round: 1,
+                },
                 "coder-task",
                 "coder evidence",
                 &mut Vec::new(),
@@ -3532,9 +3546,11 @@ mod tests {
         let err = controller
             .review_implementation(
                 &issue,
-                run_id,
-                1,
-                1,
+                ReviewPosition {
+                    run_id,
+                    decision_step: 1,
+                    review_round: 1,
+                },
                 "coder-task",
                 "coder evidence",
                 &mut Vec::new(),
@@ -3641,7 +3657,7 @@ mod tests {
         let task = "task-pipe-I-001-decision-1";
         let waiter = {
             let controller = controller.clone();
-            let member = member.clone();
+            let _member = member.clone();
             tokio::spawn(async move { controller.wait_for_task(ORCHESTRATOR_ID, task).await })
         };
 
@@ -3676,7 +3692,7 @@ mod tests {
         let task = "task-pipe-I-001-decision-2";
         let waiter = {
             let controller = controller.clone();
-            let member = member.clone();
+            let _member = member.clone();
             tokio::spawn(async move { controller.wait_for_task(ORCHESTRATOR_ID, task).await })
         };
 
@@ -3719,7 +3735,7 @@ mod tests {
         let task = "task-pipe-I-001-decision-3";
         let waiter = {
             let controller = controller.clone();
-            let member = member.clone();
+            let _member = member.clone();
             tokio::spawn(async move { controller.wait_for_task(ORCHESTRATOR_ID, task).await })
         };
 
@@ -3769,7 +3785,7 @@ mod tests {
         let task = "task-pipe-I-001-decision-4";
         let waiter = {
             let controller = controller.clone();
-            let member = member.clone();
+            let _member = member.clone();
             tokio::spawn(async move { controller.wait_for_task(ORCHESTRATOR_ID, task).await })
         };
 
@@ -3814,7 +3830,7 @@ mod tests {
         let task = "task-pipe-I-001-decision-5";
         let waiter = {
             let controller = controller.clone();
-            let member = member.clone();
+            let _member = member.clone();
             tokio::spawn(async move { controller.wait_for_task(ORCHESTRATOR_ID, task).await })
         };
 
@@ -3875,7 +3891,7 @@ mod tests {
         let task = "task-pipe-I-001-decision-6";
         let waiter = {
             let controller = controller.clone();
-            let member = member.clone();
+            let _member = member.clone();
             tokio::spawn(async move { controller.wait_for_task(ORCHESTRATOR_ID, task).await })
         };
 

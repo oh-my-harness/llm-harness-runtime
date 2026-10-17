@@ -11,8 +11,11 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use llm_harness_platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
-use llm_harness_sandbox::{BwrapSandbox, OsEnv};
+#[cfg(target_os = "linux")]
+use llm_harness_sandbox::BwrapSandbox;
+use llm_harness_sandbox::OsEnv;
 use llm_harness_types::ShellOptions;
 use tokio_util::sync::CancellationToken;
 
@@ -28,6 +31,7 @@ fn shell_opts() -> ShellOptions<'static> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn config_for(work_dir: std::path::PathBuf) -> SandboxConfig {
     SandboxConfig {
         fs_allowlist: vec![],
@@ -50,6 +54,7 @@ fn config_for(work_dir: std::path::PathBuf) -> SandboxConfig {
 /// can run bwrap, unconfined `OsEnv` otherwise. Tests that assert
 /// confinement must skip when the fallback applies. Async because
 /// `Sandbox::start` spawns tokio processes; never call from a sync context.
+#[cfg(target_os = "linux")]
 async fn confined_env_or_none(
     work_dir: std::path::PathBuf,
 ) -> Option<std::sync::Arc<dyn llm_harness_types::ExecutionEnv>> {
@@ -63,8 +68,11 @@ async fn confined_env_or_none(
     }
 }
 
-async fn bwrap_works() -> bool {
-    confined_env_or_none(std::env::temp_dir()).await.is_some()
+#[cfg(not(target_os = "linux"))]
+async fn confined_env_or_none(
+    _work_dir: std::path::PathBuf,
+) -> Option<std::sync::Arc<dyn llm_harness_types::ExecutionEnv>> {
+    None
 }
 
 #[tokio::test]
@@ -211,10 +219,13 @@ async fn sandbox_construction_follows_host_capability() {
     let confined = confined_env_or_none(workspace.path().to_path_buf())
         .await
         .is_some();
+    #[cfg(target_os = "linux")]
     let direct = match BwrapSandbox::new(config_for(workspace.path().to_path_buf())) {
         Ok(sandbox) => sandbox.start().await.is_ok(),
         Err(_) => false,
     };
+    #[cfg(not(target_os = "linux"))]
+    let direct = false;
     assert_eq!(
         confined, direct,
         "env selection must track bwrap availability exactly"
@@ -250,7 +261,7 @@ async fn unconfined_osenv_documented_as_insecure_for_evaluations() {
 
 // ── B2 Task A: production-path regression ──────────────────────────────────
 use llm_harness_agent_team_studio::team_manager::TeamManager;
-use llm_harness_agent_team_studio::team_spec::{MemberSpec, ModelRef, TeamSpec};
+use llm_harness_agent_team_studio::team_spec::{MemberSpec, TeamSpec};
 
 fn solo_spec(id: &str, repo: &std::path::Path) -> TeamSpec {
     TeamSpec {

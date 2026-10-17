@@ -1829,7 +1829,7 @@ async fn v0_coder_result_requires_review_before_next_decision() {
         let reqs = orchestrator_client.captured_requests.lock();
         let all = reqs
             .iter()
-            .map(|r| flatten_request(r))
+            .map(flatten_request)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -1850,7 +1850,7 @@ async fn v0_coder_result_requires_review_before_next_decision() {
         let reqs = coder_client.captured_requests.lock();
         let all = reqs
             .iter()
-            .map(|r| flatten_request(r))
+            .map(flatten_request)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(

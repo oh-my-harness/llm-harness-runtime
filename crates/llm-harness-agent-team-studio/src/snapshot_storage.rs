@@ -223,7 +223,9 @@ fn safe_dir(root: &Path, rel: &Path) -> Result<()> {
         match fs::symlink_metadata(&path) {
             Ok(_) => real_dir(&path)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let mut builder = fs::DirBuilder::new();
+                let builder = fs::DirBuilder::new();
+                #[cfg(unix)]
+                let mut builder = builder;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::DirBuilderExt;
@@ -1406,7 +1408,7 @@ mod tests {
             for i in 0..65u64 {
                 let mut state = seed.wrapping_add(i * 19 + 1);
                 let mut bytes = vec![0u8; 2 << 20];
-                for chunk in bytes.chunks_exact_mut(8) {
+                for chunk in bytes.as_chunks_mut::<8>().0 {
                     state ^= state << 13;
                     state ^= state >> 7;
                     state ^= state << 17;

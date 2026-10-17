@@ -13,7 +13,9 @@ use std::sync::Arc;
 use llm_harness_agent_team::{
     AgentTeam, IndividualSpec, TeamError, TimeoutJournal, TimerJournalError,
 };
-use llm_harness_platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
+#[cfg(target_os = "linux")]
+use llm_harness_platform::sandbox::Sandbox;
+use llm_harness_platform::sandbox::{ResourceLimits, SandboxConfig};
 use llm_harness_sandbox::{BwrapSandbox, OsEnv};
 use llm_harness_types::ExecutionEnv;
 
@@ -131,21 +133,35 @@ fn publish_workflow_terminal(
             return Err(error);
         }
     };
-    if inserted {
-        if let Some(events) = events {
-            events.publish(crate::events::team_message_event(
-                project_id,
-                from,
-                "operator",
-                &terminal.body,
-                "direct",
-                Some(message_id),
-                Some(issue_id.to_string()),
-                llm_harness_agent_team::ChatView::GroupReply.as_str(),
-            ));
-        }
+    if inserted && let Some(events) = events {
+        events.publish(crate::events::team_message_event(
+            project_id,
+            from,
+            "operator",
+            &terminal.body,
+            "direct",
+            Some(message_id),
+            Some(issue_id.to_string()),
+            llm_harness_agent_team::ChatView::GroupReply.as_str(),
+        ));
     }
     Ok(inserted)
+}
+
+#[cfg(target_os = "linux")]
+async fn start_confined_sandbox(sandbox: BwrapSandbox) -> std::io::Result<Arc<dyn ExecutionEnv>> {
+    sandbox
+        .start()
+        .await
+        .map_err(|error| std::io::Error::other(format!("sandbox required: {error}")))?;
+    Ok(sandbox.env())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn start_confined_sandbox(_sandbox: BwrapSandbox) -> std::io::Result<Arc<dyn ExecutionEnv>> {
+    Err(std::io::Error::other(
+        "sandbox required: BwrapSandbox is only available on Linux",
+    ))
 }
 
 impl TeamEntry {
@@ -273,10 +289,11 @@ impl TeamEntry {
             })
             .await
             .is_ok();
-            if outcome.is_ok() && idle {
-                if let Err(error) = controller.complete_snapshot_history(&issue.id) {
-                    tracing::warn!(%error, "snapshot history remains protected: completion metadata unavailable");
-                }
+            if outcome.is_ok()
+                && idle
+                && let Err(error) = controller.complete_snapshot_history(&issue.id)
+            {
+                tracing::warn!(%error, "snapshot history remains protected: completion metadata unavailable");
             }
             drop(lease);
             controller.retain_snapshot_history(&issue.id);
@@ -436,11 +453,7 @@ impl TeamManager {
                 host_binds: Vec::new(),
             })
             .map_err(|e| std::io::Error::other(format!("sandbox required: {e}")))?;
-            sandbox
-                .start()
-                .await
-                .map_err(|e| std::io::Error::other(format!("sandbox required: {e}")))?;
-            (sandbox.env(), "bwrap")
+            (start_confined_sandbox(sandbox).await?, "bwrap")
         };
         let mut spec = spec;
         spec.sandbox_mode = Some(sandbox_mode.to_string());
@@ -551,16 +564,16 @@ impl TeamManager {
         };
         // The chat journal's `message_id` dedup keeps this a no-op when the
         // aborted task still managed to publish on its own.
-        if let Some(terminal) = terminal.as_ref() {
-            if let Err(error) = publish_workflow_terminal(
+        if let Some(terminal) = terminal.as_ref()
+            && let Err(error) = publish_workflow_terminal(
                 &chat_history_path,
                 &project_id,
                 &issue_id,
                 terminal,
                 events.as_deref(),
-            ) {
-                tracing::error!(workflow_id = %issue_id, "failed to persist workflow terminal outcome: {error}");
-            }
+            )
+        {
+            tracing::error!(workflow_id = %issue_id, "failed to persist workflow terminal outcome: {error}");
         }
         let entry = self
             .teams
@@ -1044,6 +1057,32 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn unsupported_sandbox_remains_fail_closed() {
+        let error = start_confined_sandbox(BwrapSandbox)
+            .await
+            .err()
+            .expect("unsupported sandbox must reject execution");
+        assert_eq!(
+            error.to_string(),
+            "sandbox required: BwrapSandbox is only available on Linux"
+        );
+        let data = tempfile::tempdir().unwrap();
+        let mut manager = TeamManager::new(data.path().to_path_buf());
+        let error = manager
+            .create(blank_spec(), None, &settings(), "mock")
+            .await
+            .err()
+            .expect("an ungranted team must not receive a host environment");
+        assert!(
+            error
+                .to_string()
+                .contains("BwrapSandbox is only available on Linux")
+        );
+        assert!(manager.get("t").is_none());
+    }
+
     #[must_use]
     fn install_mock_factory() -> env_cfg::TestProviderFactoryGuard {
         env_cfg::install_test_provider_factory(std::sync::Arc::new(|| {
@@ -1257,7 +1296,7 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, &pipeline).unwrap();
 
         let tm_shared = std::sync::Arc::new(tokio::sync::RwLock::new(tm));
-        let started = {
+        {
             let tm_shared = tm_shared.clone();
             let issue = issue.clone();
             let events = events.clone();

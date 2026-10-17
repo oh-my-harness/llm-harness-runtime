@@ -106,12 +106,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         uuid::Uuid::new_v4()
     ));
     std::fs::create_dir_all(&data)?;
-    let mut settings = llm_harness_agent_team_studio::settings::Settings::default();
-    settings.base_url = "http://127.0.0.1:1/v1".into();
-    settings.models = llm_harness_agent_team_studio::roles::ModelTier {
-        strong: "dry-run-unused".into(),
-        main: "dry-run-unused".into(),
-        cheap: "dry-run-unused".into(),
+    let settings = llm_harness_agent_team_studio::settings::Settings {
+        base_url: "http://127.0.0.1:1/v1".into(),
+        models: llm_harness_agent_team_studio::roles::ModelTier {
+            strong: "dry-run-unused".into(),
+            main: "dry-run-unused".into(),
+            cheap: "dry-run-unused".into(),
+        },
+        ..Default::default()
     };
     let mut assembled = engine::assemble(engine::AssembleInputs {
         spec: spec.clone(),

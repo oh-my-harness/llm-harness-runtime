@@ -817,7 +817,7 @@ async fn workflow_stop(
     // `stop_workflow` also republishes the terminal outcome to the chat
     // journal + live bus, since the aborted task can no longer do it.
     drop(pm);
-    state
+    let _ = state
         .pm
         .write()
         .await
@@ -2304,10 +2304,10 @@ mod tests {
                 let attack = self.attacks.lock().pop_front();
                 let response = if let Some((tool, args)) = attack {
                     MockResponse::tool_use("bypass", &tool, &args.to_string())
-                } else if let Some(body) = ({
+                } else if let Some(body) = {
                     let mut replies = self.replies.lock();
                     replies.pop_front()
-                }) {
+                } {
                     if self.tasks.lock().len() == 2
                         && self.hold_second.load(std::sync::atomic::Ordering::SeqCst)
                     {
@@ -2696,7 +2696,7 @@ mod tests {
     /// the subsequent valid ACTION advances the workflow.
     #[tokio::test]
     async fn controlled_ack_then_action_dispatches_coder_once() {
-        let (router, pm, orchestrator, coder, _idle, _factory) = controlled_fixture(
+        let (router, pm, _orchestrator, coder, _idle, _factory) = controlled_fixture(
             &[
                 "ACK — decision in progress: closing the verification gap.",
                 "ACTION: DISPATCH coder\nimplement the feature now.",
@@ -4882,7 +4882,7 @@ mod tests {
         assert_eq!(status, 202, "{body}");
         let workflow_id = body["workflow_id"].as_str().unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
-            while coder.tasks.lock().len() < 1 {
+            while coder.tasks.lock().is_empty() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })

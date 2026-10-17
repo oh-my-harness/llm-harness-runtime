@@ -447,10 +447,10 @@ async fn evaluation_daemon_restoration_overrides_an_operator_host_grant() {
             child.0.try_wait().unwrap().is_none(),
             "evaluation daemon exited"
         );
-        if let Ok(bytes) = std::fs::read(data.path().join("panel.json")) {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                break value;
-            }
+        if let Ok(bytes) = std::fs::read(data.path().join("panel.json"))
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        {
+            break value;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     };
