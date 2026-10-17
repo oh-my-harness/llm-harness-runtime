@@ -24,6 +24,12 @@ pub struct TeamSpec {
     /// 工作仓库；None = 数据目录兜底（非 coding 类团队）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_path: Option<String>,
+    /// Execution-env confinement actually applied at team creation:
+    /// `bwrap` (workspace-scoped sandbox) or `trusted-host` (explicit operator
+    /// grant). This field is output, not policy input. Recorded for evaluation comparability;
+    /// `None` = created by an older build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<String>,
     pub members: Vec<MemberSpec>,
 }
 
@@ -182,6 +188,7 @@ mod tests {
             template_baseline: None,
             name: "T".into(),
             repo_path: None,
+            sandbox_mode: None,
             members,
         }
     }

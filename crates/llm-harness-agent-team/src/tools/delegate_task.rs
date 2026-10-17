@@ -128,6 +128,7 @@ impl DelegateTaskTool {
             message_type: MessageType::DelegationRequest,
             priority: crate::inbox::priority::DELEGATION,
             task_id: Some(task_id_str.clone()),
+            task_kind: None,
             broadcast_id: None,
             message_id: None,
         };

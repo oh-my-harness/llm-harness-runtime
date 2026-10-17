@@ -10,9 +10,11 @@ pub mod diagnostics;
 pub mod engine;
 pub mod env_cfg;
 pub mod events;
+pub mod execution_policy;
 #[cfg(unix)]
 pub mod host;
 pub mod issue;
+pub mod pipeline;
 pub mod message_router;
 pub mod pulse;
 pub mod roles;
@@ -20,7 +22,10 @@ pub mod routes;
 pub mod runtime;
 pub mod scout;
 pub mod settings;
+pub mod snapshot_storage;
 pub mod team_manager;
 pub mod team_spec;
 pub mod template_store;
 pub mod workspace;
+
+pub mod novel_v1;

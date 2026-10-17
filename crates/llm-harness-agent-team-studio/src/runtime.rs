@@ -287,6 +287,7 @@ impl StudioRuntime {
             serde_json::json!({
                 "event": "startup",
                 "recovery": recovery,
+                "execution_mode": runtime.pm.read().await.execution_mode(),
                 "bound_address": runtime.bound_addr().map(|addr| addr.to_string()),
             }),
         ) {
@@ -684,6 +685,7 @@ mod tests {
             id: "startup-grants".into(),
             name: "Startup Grants".into(),
             repo_path: Some(repo.to_string_lossy().into_owned()),
+            sandbox_mode: None,
             members: vec![crate::team_spec::MemberSpec {
                 id: "planner".into(),
                 persona: "test".into(),
@@ -739,6 +741,7 @@ mod tests {
             id: id.into(),
             name: "Startup Recovery".into(),
             repo_path: repo_path.map(|path| path.to_string_lossy().into_owned()),
+            sandbox_mode: None,
             members: vec![crate::team_spec::MemberSpec {
                 id: "planner".into(),
                 persona: "test".into(),
