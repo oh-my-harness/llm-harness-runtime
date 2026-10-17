@@ -1073,12 +1073,11 @@ mod tests {
         let error = manager
             .create(blank_spec(), None, &settings(), "mock")
             .await
-            .err()
-            .expect("an ungranted team must not receive a host environment");
-        assert!(
-            error
-                .to_string()
-                .contains("BwrapSandbox is only available on Linux")
+            .expect_err("an ungranted team must not receive a host environment");
+        assert!(matches!(&error, TeamManagerError::Io(_)));
+        assert_eq!(
+            error.to_string(),
+            "sandbox required: BwrapSandbox is only available on Linux"
         );
         assert!(manager.get("t").is_none());
     }
@@ -1260,6 +1259,7 @@ mod tests {
     /// is Escalated with a terminal outcome — instead of silently vanishing
     /// after the 202 was already returned. WouldBlock contention keeps its
     /// internal 50 ms retry and is unaffected.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_lease_failure_publishes_terminal_outcome() {
         let _factory = install_mock_factory();

@@ -288,6 +288,7 @@ fn studio_settings() -> llm_harness_agent_team_studio::settings::Settings {
     llm_harness_agent_team_studio::settings::Settings::default()
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn fresh_team_registration_selects_bwrap() {
     let client: Arc<dyn llm_harness_loop::LlmClient> =
@@ -316,6 +317,34 @@ async fn fresh_team_registration_selects_bwrap() {
     );
 }
 
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn fresh_team_registration_rejects_unsupported_sandbox() {
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut pm = TeamManager::new(data.path());
+    let error = pm
+        .create(
+            solo_spec("fresh-bwrap", repo.path()),
+            Some(repo.path().to_path_buf()),
+            &studio_settings(),
+            "",
+        )
+        .await
+        .expect_err("an unsupported sandbox must not fall back to host execution");
+    assert!(matches!(
+        &error,
+        llm_harness_agent_team_studio::team_manager::TeamManagerError::Io(_)
+    ));
+    assert_eq!(
+        error.to_string(),
+        "sandbox required: BwrapSandbox is only available on Linux"
+    );
+    assert!(pm.get("fresh-bwrap").is_none());
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn symlinked_issues_directory_is_rejected() {
     let repo = tempfile::tempdir().unwrap();
