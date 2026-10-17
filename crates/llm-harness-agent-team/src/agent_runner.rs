@@ -268,10 +268,7 @@ fn controlled_worker_run(
 /// report. A decision-local receipt lets the runner seal execution once a
 /// valid correlated ACTION is durably delivered, instead of waiting for the
 /// harness to exit naturally (which may linger or emit a second ACTION).
-fn decision_worker_run(
-    agent_id: &AgentId,
-    messages: &[InboxMessage],
-) -> Option<DecisionWorkerRun> {
+fn decision_worker_run(agent_id: &AgentId, messages: &[InboxMessage]) -> Option<DecisionWorkerRun> {
     (agent_id.as_str() == ORCHESTRATOR)
         .then(|| controlled_pipeline_task(messages))
         .flatten()
@@ -1289,8 +1286,7 @@ impl AgentRunner {
                                 // is a no-op that preserves the old behavior
                                 // of acking a finished batch in place.
                                 if unconsumed_steers_salvaged {
-                                    let continuation =
-                                        RunRequest::from_text(String::new());
+                                    let continuation = RunRequest::from_text(String::new());
                                     #[cfg(test)]
                                     if let Some(probe) = &continuation_probe {
                                         probe.entered();
@@ -1368,7 +1364,9 @@ impl AgentRunner {
                                         // the runaway loop this regression closes.
                                         let _ = ctx.send_direct_with_task(
                                             &agent_id,
-                                            &AgentId::new(crate::timeout_manager::reserved::OPERATOR),
+                                            &AgentId::new(
+                                                crate::timeout_manager::reserved::OPERATOR,
+                                            ),
                                             &body,
                                             0,
                                             None,
@@ -3739,7 +3737,10 @@ mod tests {
         })
         .await
         .expect("first decision must reach the controller");
-        assert_eq!(reply.body, "ACTION: DISPATCH coder\nimplement the assignment");
+        assert_eq!(
+            reply.body,
+            "ACTION: DISPATCH coder\nimplement the assignment"
+        );
 
         // Wait for quiescence through the real runner loop, then prove the
         // sealed run never produced the second ACTION.
@@ -3836,10 +3837,7 @@ mod tests {
         let reply = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let messages = ctx.drain_inbox(&controller);
-                if let Some(reply) = messages
-                    .into_iter()
-                    .find(|m| m.body.starts_with("ACTION:"))
-                {
+                if let Some(reply) = messages.into_iter().find(|m| m.body.starts_with("ACTION:")) {
                     break reply;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -3847,7 +3845,10 @@ mod tests {
         })
         .await
         .expect("valid ACTION retry must reach the controller");
-        assert_eq!(reply.body, "ACTION: FINISH\nvalid retry after malformed prose");
+        assert_eq!(
+            reply.body,
+            "ACTION: FINISH\nvalid retry after malformed prose"
+        );
         assert_eq!(
             client.call_count.load(std::sync::atomic::Ordering::SeqCst),
             2,
@@ -4519,8 +4520,7 @@ mod tests {
         // One-shot: only the FIRST run's final stop decision steers. A steer
         // on the continuation run would re-salvage and never quiesce — an
         // artifact of the test, not the production race.
-        static STEERED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
+        static STEERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
         let client = Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![
             llm_harness_loop::test_utils::MockResponse::text("first run done"),
@@ -4536,16 +4536,14 @@ mod tests {
                     if !STEERED.swap(true, std::sync::atomic::Ordering::SeqCst)
                         && let Some(harness) = HARNESS.get()
                     {
-                        let _ = harness.steer_message(
-                            llm_harness_types::AgentMessage::User(
-                                llm_harness_types::UserMessage {
-                                    content: vec![llm_harness_types::ContentBlock::Text {
-                                        text: self.0.to_owned(),
-                                    }],
-                                    timestamp: chrono::Utc::now(),
-                                },
-                            ),
-                        );
+                        let _ = harness.steer_message(llm_harness_types::AgentMessage::User(
+                            llm_harness_types::UserMessage {
+                                content: vec![llm_harness_types::ContentBlock::Text {
+                                    text: self.0.to_owned(),
+                                }],
+                                timestamp: chrono::Utc::now(),
+                            },
+                        ));
                     }
                     true
                 })

@@ -293,7 +293,10 @@ mod tests {
 
     #[test]
     fn decision_grammar_mirrors_the_controller_action_parser() {
-        assert_eq!(parse_action("ACTION: FINISH\nall done"), Some("ACTION: FINISH"));
+        assert_eq!(
+            parse_action("ACTION: FINISH\nall done"),
+            Some("ACTION: FINISH")
+        );
         assert_eq!(parse_action("ACTION: ESCALATE"), Some("ACTION: ESCALATE"));
         assert_eq!(
             parse_action("ACTION: DISPATCH coder\nplease implement"),
@@ -322,7 +325,11 @@ mod tests {
         assert!(!receipt.decision_delivered().is_cancelled());
         // Wrong recipient or wrong task id must not seal either.
         assert!(!receipt.record_delivery("operator", Some("task-pipe-d1"), "ACTION: FINISH\nx"));
-        assert!(!receipt.record_delivery("pipeline-controller", Some("other"), "ACTION: FINISH\nx"));
+        assert!(!receipt.record_delivery(
+            "pipeline-controller",
+            Some("other"),
+            "ACTION: FINISH\nx"
+        ));
         // First valid correlated ACTION seals.
         assert!(receipt.record_delivery(
             "pipeline-controller",

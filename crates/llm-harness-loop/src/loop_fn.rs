@@ -2152,9 +2152,11 @@ mod tests {
             })
             .expect("late steer must be surfaced as SteerOrphaned");
         assert_eq!(orphaned.len(), 1);
-        assert!(matches!(&orphaned[0], AgentMessage::User(u) if u.content.iter().any(
-            |c| matches!(c, ContentBlock::Text { text } if text == "late steer")
-        )));
+        assert!(
+            matches!(&orphaned[0], AgentMessage::User(u) if u.content.iter().any(
+                |c| matches!(c, ContentBlock::Text { text } if text == "late steer")
+            ))
+        );
         // Exactly one provider call: the run stopped instead of extending.
         assert_eq!(
             client.call_count.load(std::sync::atomic::Ordering::SeqCst),

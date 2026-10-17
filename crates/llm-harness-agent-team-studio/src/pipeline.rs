@@ -341,10 +341,26 @@ fn review_package(
             "- Captured revision: {} (round {}).",
             latest.snapshot.snapshot_id, latest.snapshot.round
         );
-        let _ = writeln!(out, "- All captured files: {} (complete list in Snapshot manifest).", latest.snapshot.changed_files.len());
+        let _ = writeln!(
+            out,
+            "- All captured files: {} (complete list in Snapshot manifest).",
+            latest.snapshot.changed_files.len()
+        );
         match &latest.snapshot.task_relative_changed_paths {
-            Some(paths) => { let _ = writeln!(out, "- Files changed relative to task start: {}.", if paths.is_empty() { "none".into() } else { paths.join(", ") }); }
-            None => out.push_str("- Files changed relative to task start: unavailable (no baseline evidence).\n"),
+            Some(paths) => {
+                let _ = writeln!(
+                    out,
+                    "- Files changed relative to task start: {}.",
+                    if paths.is_empty() {
+                        "none".into()
+                    } else {
+                        paths.join(", ")
+                    }
+                );
+            }
+            None => out.push_str(
+                "- Files changed relative to task start: unavailable (no baseline evidence).\n",
+            ),
         }
         let _ = writeln!(
             out,
@@ -450,12 +466,22 @@ fn review_package(
         if let Some(baseline) = &record.snapshot.task_start_baseline {
             let _ = writeln!(out, "  - Task-start baseline: {}.", baseline.display());
             if record.snapshot.task_relative_diff.is_some() {
-                let _ = writeln!(out, "  - Task-relative change evidence: {}.", record.snapshot.evidence_dir.join("task-relative.patch").display());
+                let _ = writeln!(
+                    out,
+                    "  - Task-relative change evidence: {}.",
+                    record
+                        .snapshot
+                        .evidence_dir
+                        .join("task-relative.patch")
+                        .display()
+                );
             } else {
                 out.push_str("  - Task-relative change evidence: no changed captured bytes.\n");
             }
         } else {
-            out.push_str("  - Task-relative change evidence: unavailable (no baseline evidence).\n");
+            out.push_str(
+                "  - Task-relative change evidence: unavailable (no baseline evidence).\n",
+            );
         }
     }
     out.push_str("\n### Human attention\n");
@@ -549,12 +575,23 @@ impl ArtifactSnapshot {
         round: u32,
         baseline: Option<&Self>,
     ) -> std::io::Result<Self> {
-        Self::collect_configured(repo_root, issue_id, run_id, round, baseline, &CaptureLimits::default())
+        Self::collect_configured(
+            repo_root,
+            issue_id,
+            run_id,
+            round,
+            baseline,
+            &CaptureLimits::default(),
+        )
     }
 
     pub fn collect_configured(
-        repo_root: &Path, issue_id: &str, run_id: uuid::Uuid, round: u32,
-        baseline: Option<&Self>, limits: &CaptureLimits,
+        repo_root: &Path,
+        issue_id: &str,
+        run_id: uuid::Uuid,
+        round: u32,
+        baseline: Option<&Self>,
+        limits: &CaptureLimits,
     ) -> std::io::Result<Self> {
         limits.validate()?;
         let existing_lease = StorageLease::inspection_if_existing(repo_root)?;
@@ -584,7 +621,13 @@ impl ArtifactSnapshot {
                         )));
                     }
                     Err(err) => return Err(err),
-                    Ok(_) => capture_file_limited(repo_root, &path, &mut files, &mut total_bytes, limits)?,
+                    Ok(_) => capture_file_limited(
+                        repo_root,
+                        &path,
+                        &mut files,
+                        &mut total_bytes,
+                        limits,
+                    )?,
                 }
             }
             ("git_ignore_aware".to_string(), excluded)
@@ -595,7 +638,10 @@ impl ArtifactSnapshot {
         files.sort_by(|a, b| a.0.cmp(&b.0));
         files.dedup_by(|a, b| a.0 == b.0);
 
-        let _lease = match existing_lease { Some(lease) => lease, None => StorageLease::inspection(repo_root)? };
+        let _lease = match existing_lease {
+            Some(lease) => lease,
+            None => StorageLease::inspection(repo_root)?,
+        };
         let content_hash = collect_hash(&files);
         let file_hashes: std::collections::BTreeMap<String, String> = files
             .iter()
@@ -642,10 +688,15 @@ impl ArtifactSnapshot {
         let (diff, dirty) = git_state(repo_root, capture_policy == "git_ignore_aware")?;
         let git_head = git_head(repo_root, capture_policy == "git_ignore_aware")?;
         let task_relative_changed_paths = baseline.map(|start| {
-            start.file_hashes.keys().chain(file_hashes.keys())
+            start
+                .file_hashes
+                .keys()
+                .chain(file_hashes.keys())
                 .filter(|path| start.file_hashes.get(*path) != file_hashes.get(*path))
-                .cloned().collect::<std::collections::BTreeSet<_>>()
-                .into_iter().collect::<Vec<_>>()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
         });
         let snapshot = ArtifactSnapshot {
             issue_id: issue_id.to_string(),
@@ -681,14 +732,21 @@ impl ArtifactSnapshot {
         }
         let mut snapshot = snapshot;
         if let Some(start) = baseline {
-            if start.run_id != snapshot.run_id || start.round != 0 || start.repo_root != snapshot.repo_root {
-                return Err(std::io::Error::other("task-start baseline does not match workflow"));
+            if start.run_id != snapshot.run_id
+                || start.round != 0
+                || start.repo_root != snapshot.repo_root
+            {
+                return Err(std::io::Error::other(
+                    "task-start baseline does not match workflow",
+                ));
             }
             for (rel, expected_hash) in &start.file_hashes {
                 validate_relative_path(Path::new(rel))?;
                 let bytes = std::fs::read(start.evidence_dir.join("files").join(rel))?;
                 if sha256_hex(&bytes) != *expected_hash {
-                    return Err(std::io::Error::other(format!("task-start baseline file changed: {rel}")));
+                    return Err(std::io::Error::other(format!(
+                        "task-start baseline file changed: {rel}"
+                    )));
                 }
             }
             let patch_path = snapshot.evidence_dir.join("task-relative.patch");
@@ -704,8 +762,15 @@ impl ArtifactSnapshot {
                 &files_dir,
                 &snapshot.file_hashes,
             )?;
-            if patch.is_empty() != snapshot.task_relative_changed_paths.as_ref().is_some_and(Vec::is_empty) {
-                return Err(std::io::Error::other("task-relative patch disagrees with captured file hashes"));
+            if patch.is_empty()
+                != snapshot
+                    .task_relative_changed_paths
+                    .as_ref()
+                    .is_some_and(Vec::is_empty)
+            {
+                return Err(std::io::Error::other(
+                    "task-relative patch disagrees with captured file hashes",
+                ));
             }
             if !patch.is_empty() {
                 write_private_file(&patch_path, &patch)?;
@@ -813,7 +878,11 @@ fn git_worktree(root: &Path) -> bool {
         })
 }
 
-fn git_file_paths(root: &Path, ignored: bool, limits: &CaptureLimits) -> std::io::Result<Vec<String>> {
+fn git_file_paths(
+    root: &Path,
+    ignored: bool,
+    limits: &CaptureLimits,
+) -> std::io::Result<Vec<String>> {
     let mut command = std::process::Command::new("git");
     command.args(["ls-files", "-z"]);
     if ignored {
@@ -848,7 +917,8 @@ fn git_file_paths(root: &Path, ignored: bool, limits: &CaptureLimits) -> std::io
     paths.dedup();
     if paths.len() > limits.max_files {
         return Err(std::io::Error::other(format!(
-            "snapshot file listing exceeds {} paths", limits.max_files
+            "snapshot file listing exceeds {} paths",
+            limits.max_files
         )));
     }
     Ok(paths)
@@ -864,7 +934,12 @@ fn git_tracks_path(root: &Path, relative: &str) -> std::io::Result<bool> {
 }
 
 #[cfg(test)]
-fn capture_file(root: &Path, path: &Path, out: &mut Vec<(String, Vec<u8>)>, total_bytes: &mut u64) -> std::io::Result<()> {
+fn capture_file(
+    root: &Path,
+    path: &Path,
+    out: &mut Vec<(String, Vec<u8>)>,
+    total_bytes: &mut u64,
+) -> std::io::Result<()> {
     capture_file_limited(root, path, out, total_bytes, &CaptureLimits::default())
 }
 
@@ -905,7 +980,10 @@ fn capture_file_limited(
     {
         return Err(std::io::Error::other(format!(
             "snapshot capture limit exceeded at {} (max {} files, {} bytes/file, {} bytes total)",
-            path.display(), limits.max_files, limits.max_file_bytes, limits.max_total_bytes
+            path.display(),
+            limits.max_files,
+            limits.max_file_bytes,
+            limits.max_total_bytes
         )));
     }
     let mut bytes = Vec::new();
@@ -1020,8 +1098,12 @@ fn git_head(repo_root: &Path, is_git_worktree: bool) -> std::io::Result<Option<S
         .current_dir(repo_root)
         .output()?;
     if output.status.success() {
-        Ok(Some(String::from_utf8(output.stdout)
-            .map_err(std::io::Error::other)?.trim().to_string()))
+        Ok(Some(
+            String::from_utf8(output.stdout)
+                .map_err(std::io::Error::other)?
+                .trim()
+                .to_string(),
+        ))
     } else if output.status.code() == Some(128) {
         // A newly initialized repository has no commit yet.
         Ok(None)
@@ -1119,7 +1201,9 @@ impl PatchGitRepo {
                     !matches!(hash.len(), 40 | 64) || !hash.iter().all(u8::is_ascii_hexdigit)
                 })
             {
-                return Err(std::io::Error::other("malformed task-relative Git object hashes"));
+                return Err(std::io::Error::other(
+                    "malformed task-relative Git object hashes",
+                ));
             }
             for (rel, hash) in batch.iter().zip(hashes) {
                 index_info.extend_from_slice(b"100644 ");
@@ -1130,13 +1214,18 @@ impl PatchGitRepo {
             }
         }
 
-        let mut child = self.command()
+        let mut child = self
+            .command()
             .args(["update-index", "-z", "--index-info"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()?;
-        child.stdin.take().expect("piped Git stdin").write_all(&index_info)?;
+        child
+            .stdin
+            .take()
+            .expect("piped Git stdin")
+            .write_all(&index_info)?;
         let updated = child.wait_with_output()?;
         if !updated.status.success() {
             return Err(patch_git_error("build captured tree", &updated));
@@ -1148,7 +1237,9 @@ impl PatchGitRepo {
         let oid = String::from_utf8(tree.stdout).map_err(std::io::Error::other)?;
         let oid = oid.trim();
         if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(std::io::Error::other("malformed task-relative Git tree hash"));
+            return Err(std::io::Error::other(
+                "malformed task-relative Git tree hash",
+            ));
         }
         Ok(oid.to_string())
     }
@@ -1288,8 +1379,15 @@ impl PipelineController {
 
     pub fn retain_snapshot_history(&self, issue_id: &str) {
         if self.snapshot_policy.retention.enabled {
-            match crate::snapshot_storage::retain(&self.repo_root, &self.snapshot_policy.retention, false) {
-                Ok(report) => self.emit("snapshot_retention", serde_json::json!({"issue_id": issue_id, "report": report})),
+            match crate::snapshot_storage::retain(
+                &self.repo_root,
+                &self.snapshot_policy.retention,
+                false,
+            ) {
+                Ok(report) => self.emit(
+                    "snapshot_retention",
+                    serde_json::json!({"issue_id": issue_id, "report": report}),
+                ),
                 Err(error) => tracing::warn!(%error, "snapshot retention deferred or failed"),
             }
         }
@@ -1603,7 +1701,10 @@ impl PipelineController {
             .running
             .try_lock()
             .map_err(|_| "workflow already running")?;
-        let _snapshot_lease = self.snapshot_workflow_lease().await.map_err(|e| format!("snapshot storage unavailable: {e}"))?;
+        let _snapshot_lease = self
+            .snapshot_workflow_lease()
+            .await
+            .map_err(|e| format!("snapshot storage unavailable: {e}"))?;
         let _clear = ClearGate {
             gate: self.gate.clone(),
             ctx: self.ctx.clone(),
@@ -1659,12 +1760,24 @@ impl PipelineController {
         }
         let run_id = uuid::Uuid::new_v4();
         *run_id_out = Some(run_id);
-        crate::snapshot_storage::begin_run_protected(&self.repo_root, run_id, &self.snapshot_policy.protect_new_runs).map_err(|e| format!("snapshot lifecycle metadata failed: {e}"))?;
+        crate::snapshot_storage::begin_run_protected(
+            &self.repo_root,
+            run_id,
+            &self.snapshot_policy.protect_new_runs,
+        )
+        .map_err(|e| format!("snapshot lifecycle metadata failed: {e}"))?;
         self.snapshot_runs.lock().insert(issue.id.clone(), run_id);
         // Capture before the first worker dispatch. r0 is never refreshed for
         // later review rounds, including rounds after a coder commit.
-        let baseline = ArtifactSnapshot::collect_configured(&self.repo_root, &issue.id, run_id, 0, None, &self.snapshot_policy.capture)
-            .map_err(|err| format!("task-start baseline capture failed: {err}"))?;
+        let baseline = ArtifactSnapshot::collect_configured(
+            &self.repo_root,
+            &issue.id,
+            run_id,
+            0,
+            None,
+            &self.snapshot_policy.capture,
+        )
+        .map_err(|err| format!("task-start baseline capture failed: {err}"))?;
         let mut evidence = String::from("No worker has run yet.");
         let mut review_round = 0;
         for step in 1..=self.max_rounds {
@@ -1745,9 +1858,13 @@ impl PipelineController {
                     }
                     if self.members.contains("writer") {
                         if is_reviewer_id(&member_id) {
-                            return Err("Novel reviewer dispatch requires controller delivery gate".into());
+                            return Err(
+                                "Novel reviewer dispatch requires controller delivery gate".into(),
+                            );
                         }
-                        if member_id == "writer" { crate::novel_v1::expected_paths(&issue.body)?; }
+                        if member_id == "writer" {
+                            crate::novel_v1::expected_paths(&issue.body)?;
+                        }
                     }
                     if !self.is_worker(&member_id) {
                         return Err(format!("invalid worker target: {member_id}"));
@@ -1771,9 +1888,16 @@ impl PipelineController {
                     );
                     let event = worker_terminal_event(outcome);
                     self.emit(event, serde_json::json!({"issue_id": issue.id, "worker": member_id, "task_id": task_id, "task_kind": task_outcome_name(outcome), "result": reply.body}));
-                    if matches!(member_id.as_str(), IMPLEMENTER_ID | "writer") && outcome == TaskMessageKind::Result {
+                    if matches!(member_id.as_str(), IMPLEMENTER_ID | "writer")
+                        && outcome == TaskMessageKind::Result
+                    {
                         if member_id == "writer" {
-                            crate::novel_v1::verify_delivery(&self.repo_root, &issue.body, &reply.body, None)?;
+                            crate::novel_v1::verify_delivery(
+                                &self.repo_root,
+                                &issue.body,
+                                &reply.body,
+                                None,
+                            )?;
                         }
                         review_round += 1;
                         evidence = self
@@ -1825,10 +1949,22 @@ impl PipelineController {
         }
         let reviewer = reviewers.remove(0);
 
-        let snapshot = ArtifactSnapshot::collect_configured(&self.repo_root, &issue.id, run_id, review_round, baseline, &self.snapshot_policy.capture)
-            .map_err(|err| format!("artifact snapshot failed before review: {err}"))?;
+        let snapshot = ArtifactSnapshot::collect_configured(
+            &self.repo_root,
+            &issue.id,
+            run_id,
+            review_round,
+            baseline,
+            &self.snapshot_policy.capture,
+        )
+        .map_err(|err| format!("artifact snapshot failed before review: {err}"))?;
         if self.members.contains("writer") {
-            crate::novel_v1::verify_delivery(&self.repo_root, &issue.body, coder_evidence, Some(&snapshot))?;
+            crate::novel_v1::verify_delivery(
+                &self.repo_root,
+                &issue.body,
+                coder_evidence,
+                Some(&snapshot),
+            )?;
         }
         self.update_state(&issue.id, |state| {
             state.phase = PipelinePhase::Reviewing.as_str().into();
@@ -1847,7 +1983,11 @@ impl PipelineController {
             }),
         );
 
-        let worker_id = if self.members.contains("writer") { "writer" } else { IMPLEMENTER_ID };
+        let worker_id = if self.members.contains("writer") {
+            "writer"
+        } else {
+            IMPLEMENTER_ID
+        };
         let review_task_id = format!("{TASK_PREFIX}{run_id}-review-{decision_step}-{review_round}");
         records.push(ReviewRecord {
             snapshot: snapshot.clone(),
@@ -1877,7 +2017,11 @@ impl PipelineController {
             coder_evidence,
         );
         if worker_id == "writer" {
-            assignment = assignment.replace("successful implementation", "delivered draft").replace("source and tests", "draft and authorized baseline").replace("Coder task:", "Writer task:").replace("Coder-supplied evidence:", "Writer-supplied evidence:");
+            assignment = assignment
+                .replace("successful implementation", "delivered draft")
+                .replace("source and tests", "draft and authorized baseline")
+                .replace("Coder task:", "Writer task:")
+                .replace("Coder-supplied evidence:", "Writer-supplied evidence:");
         }
         self.emit(
             "task_delegated",
@@ -3033,9 +3177,17 @@ mod tests {
         let start = ArtifactSnapshot::collect(&repo.root, "I-001", run, 0).unwrap();
         let start_head = start.git_head.clone();
         std::fs::write(repo.root.join("tracked.txt"), "round one\n").unwrap();
-        let r1 = ArtifactSnapshot::collect_with_baseline(&repo.root, "I-001", run, 1, Some(&start)).unwrap();
-        assert_eq!(r1.task_relative_changed_paths.as_deref(), Some(["tracked.txt".to_string()].as_slice()));
-        assert!(std::fs::read_to_string(r1.evidence_dir.join("task-relative.patch")).unwrap().contains("+round one"));
+        let r1 = ArtifactSnapshot::collect_with_baseline(&repo.root, "I-001", run, 1, Some(&start))
+            .unwrap();
+        assert_eq!(
+            r1.task_relative_changed_paths.as_deref(),
+            Some(["tracked.txt".to_string()].as_slice())
+        );
+        assert!(
+            std::fs::read_to_string(r1.evidence_dir.join("task-relative.patch"))
+                .unwrap()
+                .contains("+round one")
+        );
         assert_task_relative_patch_applies(&start, &r1);
 
         std::fs::write(repo.root.join("tracked.txt"), "committed\n").unwrap();
@@ -3045,12 +3197,25 @@ mod tests {
         std::fs::remove_file(repo.root.join("deleted.txt")).unwrap();
         repo.git(&["add", "-A"]);
         repo.git(&["commit", "--quiet", "-m", "coder work"]);
-        let r2 = ArtifactSnapshot::collect_with_baseline(&repo.root, "I-001", run, 2, Some(&start)).unwrap();
+        let r2 = ArtifactSnapshot::collect_with_baseline(&repo.root, "I-001", run, 2, Some(&start))
+            .unwrap();
         assert!(r2.diff.is_none(), "git diff HEAD is empty after the commit");
         assert_ne!(r2.git_head, start_head);
         assert_eq!(r2.task_start_head, start_head);
-        assert_eq!(r2.task_start_baseline, Some(start.evidence_dir.join("snapshot.json")));
-        assert_eq!(r2.task_relative_changed_paths.as_ref().unwrap(), &["binary.bin", "deleted.txt", "existing.bin", "new.txt", "tracked.txt"]);
+        assert_eq!(
+            r2.task_start_baseline,
+            Some(start.evidence_dir.join("snapshot.json"))
+        );
+        assert_eq!(
+            r2.task_relative_changed_paths.as_ref().unwrap(),
+            &[
+                "binary.bin",
+                "deleted.txt",
+                "existing.bin",
+                "new.txt",
+                "tracked.txt"
+            ]
+        );
         let patch = std::fs::read(r2.evidence_dir.join("task-relative.patch")).unwrap();
         let patch = String::from_utf8_lossy(&patch);
         assert!(patch.contains("+committed") && patch.contains("new final content"));
@@ -3058,12 +3223,23 @@ mod tests {
         assert!(patch.contains("diff --git a/tracked.txt b/tracked.txt"));
         assert!(patch.contains("diff --git a/existing.bin b/existing.bin"));
         assert_task_relative_patch_applies(&start, &r2);
-        assert_eq!(std::fs::read(r1.evidence_dir.join("files/tracked.txt")).unwrap(), b"round one\n");
-        assert_eq!(std::fs::read(start.evidence_dir.join("files/tracked.txt")).unwrap(), b"original\n");
+        assert_eq!(
+            std::fs::read(r1.evidence_dir.join("files/tracked.txt")).unwrap(),
+            b"round one\n"
+        );
+        assert_eq!(
+            std::fs::read(start.evidence_dir.join("files/tracked.txt")).unwrap(),
+            b"original\n"
+        );
         std::fs::write(repo.root.join("tracked.txt"), "post commit edit\n").unwrap();
-        let r3 = ArtifactSnapshot::collect_with_baseline(&repo.root, "I-001", run, 3, Some(&start)).unwrap();
+        let r3 = ArtifactSnapshot::collect_with_baseline(&repo.root, "I-001", run, 3, Some(&start))
+            .unwrap();
         assert!(r3.diff.as_deref().unwrap().contains("+post commit edit"));
-        assert!(std::fs::read_to_string(r3.evidence_dir.join("task-relative.patch")).unwrap().contains("+post commit edit"));
+        assert!(
+            std::fs::read_to_string(r3.evidence_dir.join("task-relative.patch"))
+                .unwrap()
+                .contains("+post commit edit")
+        );
         assert_task_relative_patch_applies(&start, &r3);
     }
 
@@ -3074,17 +3250,31 @@ mod tests {
         std::fs::write(repo.root.join("scratch.txt"), "existing untracked\n").unwrap();
         let run = uuid::Uuid::new_v4();
         let start = ArtifactSnapshot::collect(&repo.root, "I-002", run, 0).unwrap();
-        let unchanged = ArtifactSnapshot::collect_with_baseline(&repo.root, "I-002", run, 1, Some(&start)).unwrap();
+        let unchanged =
+            ArtifactSnapshot::collect_with_baseline(&repo.root, "I-002", run, 1, Some(&start))
+                .unwrap();
         assert_eq!(unchanged.task_relative_changed_paths, Some(vec![]));
         assert!(unchanged.task_relative_diff.is_none());
         assert!(!unchanged.evidence_dir.join("task-relative.patch").exists());
-        assert!(unchanged.task_start_status.as_deref().unwrap().contains("scratch.txt"));
+        assert!(
+            unchanged
+                .task_start_status
+                .as_deref()
+                .unwrap()
+                .contains("scratch.txt")
+        );
         std::fs::write(repo.root.join("tracked.txt"), "task edit\n").unwrap();
         std::fs::write(repo.root.join("scratch.txt"), "task changed untracked\n").unwrap();
         std::fs::write(repo.root.join("fresh.txt"), "new untracked final\n").unwrap();
-        let changed = ArtifactSnapshot::collect_with_baseline(&repo.root, "I-002", run, 2, Some(&start)).unwrap();
-        assert_eq!(changed.task_relative_changed_paths.as_ref().unwrap(), &["fresh.txt", "scratch.txt", "tracked.txt"]);
-        let patch = std::fs::read_to_string(changed.evidence_dir.join("task-relative.patch")).unwrap();
+        let changed =
+            ArtifactSnapshot::collect_with_baseline(&repo.root, "I-002", run, 2, Some(&start))
+                .unwrap();
+        assert_eq!(
+            changed.task_relative_changed_paths.as_ref().unwrap(),
+            &["fresh.txt", "scratch.txt", "tracked.txt"]
+        );
+        let patch =
+            std::fs::read_to_string(changed.evidence_dir.join("task-relative.patch")).unwrap();
         assert!(patch.contains("-already dirty") && patch.contains("+task edit"));
         assert!(patch.contains("-existing untracked") && patch.contains("+task changed untracked"));
         assert!(patch.contains("+new untracked final"));
@@ -3101,8 +3291,13 @@ mod tests {
         let start = ArtifactSnapshot::collect(&repo.root, "I-quoted", run, 0).unwrap();
         std::fs::write(repo.root.join("line\nbreak.txt"), b"after\r\n").unwrap();
         std::fs::write(repo.root.join("space name.txt"), b"new\r\n").unwrap();
-        let target = ArtifactSnapshot::collect_with_baseline(&repo.root, "I-quoted", run, 1, Some(&start)).unwrap();
-        assert_eq!(target.task_relative_changed_paths.as_ref().unwrap(), &["line\nbreak.txt", "space name.txt"]);
+        let target =
+            ArtifactSnapshot::collect_with_baseline(&repo.root, "I-quoted", run, 1, Some(&start))
+                .unwrap();
+        assert_eq!(
+            target.task_relative_changed_paths.as_ref().unwrap(),
+            &["line\nbreak.txt", "space name.txt"]
+        );
         assert_task_relative_patch_applies(&start, &target);
     }
 
@@ -3113,11 +3308,23 @@ mod tests {
         let run = uuid::Uuid::new_v4();
         let start = ArtifactSnapshot::collect(&repo.root, "I-003", run, 0).unwrap();
         std::fs::write(repo.root.join("notes.txt"), "after\n").unwrap();
-        let current = ArtifactSnapshot::collect_with_baseline(&repo.root, "I-003", run, 1, Some(&start)).unwrap();
+        let current =
+            ArtifactSnapshot::collect_with_baseline(&repo.root, "I-003", run, 1, Some(&start))
+                .unwrap();
         assert!(current.git_head.is_none() && current.task_start_head.is_none());
-        assert_eq!(current.task_relative_changed_paths.as_ref().unwrap(), &["notes.txt"]);
+        assert_eq!(
+            current.task_relative_changed_paths.as_ref().unwrap(),
+            &["notes.txt"]
+        );
         let mut old = serde_json::to_value(&current).unwrap();
-        for field in ["git_head", "task_start_baseline", "task_start_head", "task_start_status", "task_relative_changed_paths", "task_relative_diff"] {
+        for field in [
+            "git_head",
+            "task_start_baseline",
+            "task_start_head",
+            "task_start_status",
+            "task_relative_changed_paths",
+            "task_relative_diff",
+        ] {
             old.as_object_mut().unwrap().remove(field);
         }
         let legacy: ArtifactSnapshot = serde_json::from_value(old).unwrap();
@@ -3131,9 +3338,16 @@ mod tests {
         let run = uuid::Uuid::new_v4();
         let start = ArtifactSnapshot::collect(&repo.root, "I-004", run, 0).unwrap();
         std::fs::write(repo.root.join("tracked.txt"), "changed\n").unwrap();
-        let patch_path = repo.root.join(".pipeline/snapshots").join(run.to_string()).join("r1/task-relative.patch");
+        let patch_path = repo
+            .root
+            .join(".pipeline/snapshots")
+            .join(run.to_string())
+            .join("r1/task-relative.patch");
         std::fs::create_dir_all(&patch_path).unwrap();
-        assert!(ArtifactSnapshot::collect_with_baseline(&repo.root, "I-004", run, 1, Some(&start)).is_err());
+        assert!(
+            ArtifactSnapshot::collect_with_baseline(&repo.root, "I-004", run, 1, Some(&start))
+                .is_err()
+        );
         assert!(!patch_path.parent().unwrap().join("snapshot.json").exists());
     }
 
@@ -3428,9 +3642,7 @@ mod tests {
         let waiter = {
             let controller = controller.clone();
             let member = member.clone();
-            tokio::spawn(async move {
-                controller.wait_for_task(ORCHESTRATOR_ID, task).await
-            })
+            tokio::spawn(async move { controller.wait_for_task(ORCHESTRATOR_ID, task).await })
         };
 
         ctx.send_direct_with_task(
@@ -3465,12 +3677,16 @@ mod tests {
         let waiter = {
             let controller = controller.clone();
             let member = member.clone();
-            tokio::spawn(async move {
-                controller.wait_for_task(ORCHESTRATOR_ID, task).await
-            })
+            tokio::spawn(async move { controller.wait_for_task(ORCHESTRATOR_ID, task).await })
         };
 
-        reply_cited_kind(&ctx, &member, task, TaskMessageKind::Ack, "decision in progress");
+        reply_cited_kind(
+            &ctx,
+            &member,
+            task,
+            TaskMessageKind::Ack,
+            "decision in progress",
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             !waiter.is_finished(),
@@ -3504,9 +3720,7 @@ mod tests {
         let waiter = {
             let controller = controller.clone();
             let member = member.clone();
-            tokio::spawn(async move {
-                controller.wait_for_task(ORCHESTRATOR_ID, task).await
-            })
+            tokio::spawn(async move { controller.wait_for_task(ORCHESTRATOR_ID, task).await })
         };
 
         reply_cited_kind(
@@ -3556,9 +3770,7 @@ mod tests {
         let waiter = {
             let controller = controller.clone();
             let member = member.clone();
-            tokio::spawn(async move {
-                controller.wait_for_task(ORCHESTRATOR_ID, task).await
-            })
+            tokio::spawn(async move { controller.wait_for_task(ORCHESTRATOR_ID, task).await })
         };
 
         for body in [
@@ -3603,9 +3815,7 @@ mod tests {
         let waiter = {
             let controller = controller.clone();
             let member = member.clone();
-            tokio::spawn(async move {
-                controller.wait_for_task(ORCHESTRATOR_ID, task).await
-            })
+            tokio::spawn(async move { controller.wait_for_task(ORCHESTRATOR_ID, task).await })
         };
 
         reply_cited_kind(
@@ -3649,7 +3859,10 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(decision.body, "ACTION: FINISH\nfinal after ack-shaped noise");
+        assert_eq!(
+            decision.body,
+            "ACTION: FINISH\nfinal after ack-shaped noise"
+        );
     }
 
     /// Two correlated ACTION messages from one decision task: the first valid
@@ -3663,9 +3876,7 @@ mod tests {
         let waiter = {
             let controller = controller.clone();
             let member = member.clone();
-            tokio::spawn(async move {
-                controller.wait_for_task(ORCHESTRATOR_ID, task).await
-            })
+            tokio::spawn(async move { controller.wait_for_task(ORCHESTRATOR_ID, task).await })
         };
 
         ctx.send_direct_with_task(

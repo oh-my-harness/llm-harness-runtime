@@ -14,8 +14,8 @@ pub mod execution_policy;
 #[cfg(unix)]
 pub mod host;
 pub mod issue;
-pub mod pipeline;
 pub mod message_router;
+pub mod pipeline;
 pub mod pulse;
 pub mod roles;
 pub mod routes;

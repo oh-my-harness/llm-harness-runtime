@@ -8,17 +8,14 @@ use std::sync::Arc as StdArc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use llm_harness_agent_team::{
-    AgentId, AgentRunner, AgentStatus, SocialContext, TaskMessageKind,
-};
+use llm_harness_agent_team::{AgentId, AgentRunner, AgentStatus, SocialContext, TaskMessageKind};
 use llm_harness_agent_team_studio::pipeline::{
-    parse_action, Action, PipelineController, ORCHESTRATOR_ID, ORCHESTRATOR_DECISION_TIMEOUT,
+    Action, ORCHESTRATOR_DECISION_TIMEOUT, ORCHESTRATOR_ID, PipelineController, parse_action,
 };
 
 const CONTROLLER_ID: &str = "pipeline-controller";
 const ORCH_ID: &str = "orchestrator";
 type StdLlm = Arc<dyn llm_harness_loop::LlmClient>;
-
 
 fn action_reply(body: &str, task_id: &str) -> llm_harness_loop::test_utils::MockResponse {
     action_reply_kind(None, body, task_id)
@@ -116,7 +113,9 @@ impl DecisionScene {
     /// returns Some for the Nth message.
     async fn wait_for(
         &self,
-        mut pick: impl FnMut(Vec<llm_harness_agent_team::InboxMessage>) -> Option<llm_harness_agent_team::InboxMessage>,
+        mut pick: impl FnMut(
+            Vec<llm_harness_agent_team::InboxMessage>,
+        ) -> Option<llm_harness_agent_team::InboxMessage>,
         what: &str,
     ) -> llm_harness_agent_team::InboxMessage {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -135,8 +134,7 @@ impl DecisionScene {
     /// Wait through the real runner loop until the orchestrator settles Idle.
     async fn settle_idle(&self) {
         tokio::time::timeout(Duration::from_secs(5), async {
-            while self.ctx.get_agent_info(&self.orchestrator).unwrap().status != AgentStatus::Idle
-            {
+            while self.ctx.get_agent_info(&self.orchestrator).unwrap().status != AgentStatus::Idle {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -374,8 +372,15 @@ async fn timeout_without_valid_action_terminalizes_visibly() {
     let state = controller.state(&issue.id).unwrap();
     assert_eq!(state.phase, "escalated");
     let terminal = state.terminal_user_outcome.unwrap();
-    assert_eq!(terminal.attribution, llm_harness_agent_team_studio::pipeline::TerminalAttribution::WorkflowStatus);
-    assert!(terminal.body.contains("Workflow stopped: Orchestrator decision timed out."));
+    assert_eq!(
+        terminal.attribution,
+        llm_harness_agent_team_studio::pipeline::TerminalAttribution::WorkflowStatus
+    );
+    assert!(
+        terminal
+            .body
+            .contains("Workflow stopped: Orchestrator decision timed out.")
+    );
 }
 
 /// An accepted decision must never leave the Runner Busy: after the FINISH
@@ -407,7 +412,11 @@ async fn accepted_decision_does_not_leave_the_runner_busy() {
         "accepted decision must seal the run: no continuation provider turn"
     );
     assert_eq!(
-        scene.ctx.get_agent_info(&scene.orchestrator).unwrap().status,
+        scene
+            .ctx
+            .get_agent_info(&scene.orchestrator)
+            .unwrap()
+            .status,
         AgentStatus::Idle,
         "an accepted decision must not leave the Runner indefinitely Busy"
     );

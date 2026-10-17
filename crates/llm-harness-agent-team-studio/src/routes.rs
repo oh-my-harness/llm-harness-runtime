@@ -118,7 +118,8 @@ fn team_routes(prefix: &'static str, state: AppState) -> Router {
 async fn startup_recovery(State(state): State<AppState>) -> Response {
     let recovery = state.startup_recovery.read().await.clone();
     let execution_mode = state.pm.read().await.execution_mode();
-    Json(serde_json::json!({ "recovery": recovery, "execution_mode": execution_mode })).into_response()
+    Json(serde_json::json!({ "recovery": recovery, "execution_mode": execution_mode }))
+        .into_response()
 }
 
 // ── GET /api/team/projects ───────────────────────────────────────────────────
@@ -822,15 +823,13 @@ async fn workflow_stop(
         .await
         .stop_workflow(&q.project, Some(state.events.clone()));
     match terminal {
-        Some(outcome) => {
-            Json(serde_json::json!({
-                "ok": true,
-                "workflow_id": issue_id,
-                "phase": outcome.phase,
-                "terminal_reason": outcome.terminal_reason,
-            }))
-            .into_response()
-        }
+        Some(outcome) => Json(serde_json::json!({
+            "ok": true,
+            "workflow_id": issue_id,
+            "phase": outcome.phase,
+            "terminal_reason": outcome.terminal_reason,
+        }))
+        .into_response(),
         None => err_resp(
             format!("unknown workflow: {issue_id}"),
             StatusCode::NOT_FOUND,
@@ -2683,7 +2682,10 @@ mod tests {
             .unwrap();
         assert_eq!(state.phase, "done");
         let terminal = state.terminal_user_outcome.expect("terminal package");
-        assert_eq!(terminal.attribution, crate::pipeline::TerminalAttribution::Orchestrator);
+        assert_eq!(
+            terminal.attribution,
+            crate::pipeline::TerminalAttribution::Orchestrator
+        );
         assert!(terminal.body.contains("**Outcome:** FINISH"));
         assert!(terminal.body.contains("Final response after the ACK."));
         assert_eq!(orchestrator.tasks.lock().len(), 1);
@@ -2766,9 +2768,16 @@ mod tests {
             .state(workflow_id)
             .unwrap();
         let terminal = state.terminal_user_outcome.expect("terminal package");
-        assert_eq!(terminal.attribution, crate::pipeline::TerminalAttribution::Orchestrator);
+        assert_eq!(
+            terminal.attribution,
+            crate::pipeline::TerminalAttribution::Orchestrator
+        );
         assert!(terminal.body.contains("**Outcome:** ESCALATE"));
-        assert!(terminal.body.contains("A human must approve the unavailable credential."));
+        assert!(
+            terminal
+                .body
+                .contains("A human must approve the unavailable credential.")
+        );
 
         let (status, history) =
             get_json(&router, "/api/team/chat?project=controlled&agent=team").await;
@@ -2809,7 +2818,12 @@ mod tests {
             .filter(|message| message["from"] == crate::pipeline::WORKFLOW_STATUS_ID)
             .collect();
         assert_eq!(terminals.len(), 1);
-        assert!(terminals[0]["text"].as_str().unwrap().contains("requires orchestrator"));
+        assert!(
+            terminals[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("requires orchestrator")
+        );
         assert!(orchestrator.tasks.lock().is_empty());
         assert!(coder.tasks.lock().is_empty());
         assert_eq!(idle.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -3099,10 +3113,7 @@ mod tests {
                     .unwrap()
                     .state(body["workflow_id"].as_str().unwrap());
                 if state.is_some_and(|state| {
-                    matches!(
-                        state.phase.as_str(),
-                        "done" | "failed" | "escalated"
-                    )
+                    matches!(state.phase.as_str(), "done" | "failed" | "escalated")
                 }) {
                     panic!("malformed next action must not terminalize the decision");
                 }
@@ -3254,7 +3265,8 @@ mod tests {
             &router,
             "/api/team/workflow/stop?project=controlled",
             serde_json::json!({}),
-        ).await;
+        )
+        .await;
         assert_eq!(status, 409, "{body}");
 
         let guard = pm.read().await;
@@ -3277,7 +3289,11 @@ mod tests {
             .unwrap()
             .iter()
             .filter(|message| message["broadcast_id"] == workflow_id.as_str())
-            .filter(|message| message["text"].as_str().is_some_and(|text| text.contains("## Human review package")))
+            .filter(|message| {
+                message["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("## Human review package"))
+            })
             .collect();
         assert_eq!(terminal_messages.len(), 1, "{history}");
     }
@@ -4788,7 +4804,10 @@ mod tests {
         // releases workflow ownership. Malformed replies are progress now and
         // can no longer drive this path.
         let (router, pm, _orchestrator, _coder, _idle, _factory) = controlled_fixture(
-            &["ACTION: DISPATCH ghost\nimplement", "ACTION: FINISH\nretry done."],
+            &[
+                "ACTION: DISPATCH ghost\nimplement",
+                "ACTION: FINISH\nretry done.",
+            ],
             false,
         )
         .await;

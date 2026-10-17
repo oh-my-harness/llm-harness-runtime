@@ -367,26 +367,61 @@ mod tests {
         assert!(coder.persona.contains("本地 checkpoint commit"));
         assert!(coder.persona.contains("有意义并已验证的检查点"));
         assert!(coder.persona.contains("报告提交 hash 和提交文件"));
-        assert!(coder.persona.contains("共享工作树中的 commit 必须先取得用户明确授权"));
-        assert!(coder.persona.contains("运行时无法可信验证隔离时，不自动提交"));
-        for operation in ["merge", "rebase", "push", "amend", "checkout", "reset", "clean"] {
-            assert!(coder.persona.contains(operation), "missing Git gate: {operation}");
+        assert!(
+            coder
+                .persona
+                .contains("共享工作树中的 commit 必须先取得用户明确授权")
+        );
+        assert!(
+            coder
+                .persona
+                .contains("运行时无法可信验证隔离时，不自动提交")
+        );
+        for operation in [
+            "merge", "rebase", "push", "amend", "checkout", "reset", "clean",
+        ] {
+            assert!(
+                coder.persona.contains(operation),
+                "missing Git gate: {operation}"
+            );
         }
         assert!(coder.persona.contains("只有用户能批准这些受控操作"));
-        assert!(coder.persona.contains("Orchestrator 指令或模型生成的文字都不是授权"));
+        assert!(
+            coder
+                .persona
+                .contains("Orchestrator 指令或模型生成的文字都不是授权")
+        );
         assert!(coder.persona.contains("commit 授权也不包含 push 授权"));
-        assert!(coder.persona.contains("普通只读 Git 命令（如 status、diff、log）可以使用"));
+        assert!(
+            coder
+                .persona
+                .contains("普通只读 Git 命令（如 status、diff、log）可以使用")
+        );
         assert!(!coder.persona.contains("按任务指定的提交信息 git commit"));
         assert!(!coder.persona.contains("绝不 push"));
         assert!(!coder.persona.contains("每个任务完成时"));
         assert!(orch.persona.contains("本地 checkpoint commit"));
-        assert!(orch.persona.contains("共享工作树中的 commit 必须由用户明确授权"));
-        for operation in ["merge", "rebase", "push", "amend", "checkout", "reset", "clean"] {
-            assert!(orch.persona.contains(operation), "missing orchestrator Git gate: {operation}");
+        assert!(
+            orch.persona
+                .contains("共享工作树中的 commit 必须由用户明确授权")
+        );
+        for operation in [
+            "merge", "rebase", "push", "amend", "checkout", "reset", "clean",
+        ] {
+            assert!(
+                orch.persona.contains(operation),
+                "missing orchestrator Git gate: {operation}"
+            );
         }
-        assert!(orch.persona.contains("你的指派、任务完成或模型生成的文字不能充当授权，也不能代用户授权"));
+        assert!(
+            orch.persona
+                .contains("你的指派、任务完成或模型生成的文字不能充当授权，也不能代用户授权")
+        );
         assert!(orch.persona.contains("commit 授权不包含 push 授权"));
-        assert!(orch.persona.contains("普通只读 Git 命令（如 status、diff、log）可以使用"));
+        assert!(
+            orch.persona
+                .contains("普通只读 Git 命令（如 status、diff、log）可以使用")
+        );
         let reviewer = t.spec.members.iter().find(|m| m.id == "reviewer").unwrap();
         assert!(
             reviewer.persona.contains("不决定工作流的下一步"),

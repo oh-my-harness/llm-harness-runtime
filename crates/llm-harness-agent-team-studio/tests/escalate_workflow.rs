@@ -6,8 +6,8 @@
 //! `PipelineController::run` / `wait_for_task` / decision handler reacts.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -209,11 +209,8 @@ impl LlmClient for EchoClient {
             if let Some(kind) = task_kind {
                 args["task_kind"] = serde_json::Value::String(kind.into());
             }
-            let response = MockResponse::tool_use_end_turn(
-                "reply",
-                "send_message",
-                &args.to_string(),
-            );
+            let response =
+                MockResponse::tool_use_end_turn("reply", "send_message", &args.to_string());
             MockLlmClient::with_single(response).chat_stream(req).await
         })
     }
@@ -260,64 +257,71 @@ async fn run_escalation_case(escalate_body: &str, expected: TerminalUserOutcome)
         PipelineController::new("escalate", ctx.clone(), repo.clone(), &members, 3).with_sink({
             let ledger = Arc::clone(&ledger);
             Arc::new(move |event: &str, payload: &serde_json::Value| {
-                ledger.events.lock().push((event.to_string(), payload.clone()));
+                ledger
+                    .events
+                    .lock()
+                    .push((event.to_string(), payload.clone()));
             })
         }),
     );
 
-        let store = llm_harness_agent_team_studio::issue::IssueStore::new(&issues_root);
-        let issue = store
-            .create("operator", "escalate me", "the orchestrator will refuse")
-            .unwrap();
-        store.set_status(&issue.id, IssueStatus::Confirmed).unwrap();
-        let confirmed = store.load(&issue.id).unwrap().0;
+    let store = llm_harness_agent_team_studio::issue::IssueStore::new(&issues_root);
+    let issue = store
+        .create("operator", "escalate me", "the orchestrator will refuse")
+        .unwrap();
+    store.set_status(&issue.id, IssueStatus::Confirmed).unwrap();
+    let confirmed = store.load(&issue.id).unwrap().0;
 
-        let run_handle = tokio::spawn({
-            let controller = Arc::clone(&controller);
-            let issue = confirmed.clone();
-            async move { (*controller).run(&issue).await }
-        });
-        let outcome = tokio::time::timeout(STAGE_BOUND, run_handle)
-            .await
-            .expect("workflow did not reach a terminal state in time")
-            .expect("workflow task panicked");
-        // Escalation is not an Err: the controller returns Ok(None).
-        assert_eq!(outcome, Ok(None), "escalation must return Ok(None)");
+    let run_handle = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let issue = confirmed.clone();
+        async move { (*controller).run(&issue).await }
+    });
+    let outcome = tokio::time::timeout(STAGE_BOUND, run_handle)
+        .await
+        .expect("workflow did not reach a terminal state in time")
+        .expect("workflow task panicked");
+    // Escalation is not an Err: the controller returns Ok(None).
+    assert_eq!(outcome, Ok(None), "escalation must return Ok(None)");
 
-        let state = controller.state(&confirmed.id).unwrap();
-        assert_eq!(state.phase, PipelinePhase::Escalated.as_str(), "{state:?}");
-        assert_eq!(
-            state.terminal_reason.as_deref(),
-            Some("orchestrator escalated"),
-            "terminal reason must record the escalation"
-        );
-        let terminal = state.terminal_user_outcome.expect("terminal package");
-        assert_eq!(terminal.attribution, expected.attribution);
-        assert!(terminal.body.contains("**Outcome:** ESCALATE"));
-        assert!(terminal.body.contains(&expected.body));
-        assert!(terminal.body.contains("Verification commands and results: unavailable"));
-        assert_eq!(
-            ledger.events.lock().last().map(|(e, _)| e.clone()),
-            Some("pipeline_escalated".to_string()),
-            "terminal escalation event must be emitted exactly at the end"
-        );
+    let state = controller.state(&confirmed.id).unwrap();
+    assert_eq!(state.phase, PipelinePhase::Escalated.as_str(), "{state:?}");
+    assert_eq!(
+        state.terminal_reason.as_deref(),
+        Some("orchestrator escalated"),
+        "terminal reason must record the escalation"
+    );
+    let terminal = state.terminal_user_outcome.expect("terminal package");
+    assert_eq!(terminal.attribution, expected.attribution);
+    assert!(terminal.body.contains("**Outcome:** ESCALATE"));
+    assert!(terminal.body.contains(&expected.body));
+    assert!(
+        terminal
+            .body
+            .contains("Verification commands and results: unavailable")
+    );
+    assert_eq!(
+        ledger.events.lock().last().map(|(e, _)| e.clone()),
+        Some("pipeline_escalated".to_string()),
+        "terminal escalation event must be emitted exactly at the end"
+    );
 
-        // No worker dispatch: coder, reviewer, and judge never ran.
-        assert_eq!(coder.call_count.load(Ordering::SeqCst), 0);
-        assert_eq!(reviewer.call_count.load(Ordering::SeqCst), 0);
-        assert_eq!(judge.call_count.load(Ordering::SeqCst), 0);
+    // No worker dispatch: coder, reviewer, and judge never ran.
+    assert_eq!(coder.call_count.load(Ordering::SeqCst), 0);
+    assert_eq!(reviewer.call_count.load(Ordering::SeqCst), 0);
+    assert_eq!(judge.call_count.load(Ordering::SeqCst), 0);
 
-        // ESCALATE is a distinct terminal event, never "pipeline_completed".
-        let names: Vec<String> = ledger
-            .events
-            .lock()
-            .iter()
-            .map(|(e, _)| e.clone())
-            .collect();
-        assert_eq!(names, vec!["pipeline_started", "pipeline_escalated"]);
-        assert!(!names.contains(&"pipeline_completed".to_string()));
+    // ESCALATE is a distinct terminal event, never "pipeline_completed".
+    let names: Vec<String> = ledger
+        .events
+        .lock()
+        .iter()
+        .map(|(e, _)| e.clone())
+        .collect();
+    assert_eq!(names, vec!["pipeline_started", "pipeline_escalated"]);
+    assert!(!names.contains(&"pipeline_completed".to_string()));
 
-        pm.shutdown("escalate").await.unwrap();
+    pm.shutdown("escalate").await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -338,9 +342,8 @@ async fn orchestrator_escalate_empty_body_falls_back_to_workflow_status() {
         "ACTION: ESCALATE",
         TerminalUserOutcome {
             attribution: TerminalAttribution::WorkflowStatus,
-            body:
-                "Workflow stopped: the Orchestrator escalated without a user-facing explanation."
-                    .into(),
+            body: "Workflow stopped: the Orchestrator escalated without a user-facing explanation."
+                .into(),
         },
     )
     .await;
@@ -427,9 +430,8 @@ async fn controlled_timeout_cancellation_path_stops_active_worker_and_blocks_lat
     let repo = make_repo();
     std::fs::write(repo.join("seed.txt"), "seed").unwrap();
 
-    let orchestrator = EchoClient::new(&[
-        "ACTION: DISPATCH coder\nImplement the change and report evidence.",
-    ]);
+    let orchestrator =
+        EchoClient::new(&["ACTION: DISPATCH coder\nImplement the change and report evidence."]);
     let coder = Arc::new(MutatingWorkerClient::default());
     let reviewer = EchoClient::new(&[]);
     let judge = EchoClient::new(&[]);
@@ -471,7 +473,11 @@ async fn controlled_timeout_cancellation_path_stops_active_worker_and_blocks_lat
         let entry = pm.get("timeout").unwrap();
         let issue = entry
             .issues
-            .create("operator", "work that will not finish", "coder never reports")
+            .create(
+                "operator",
+                "work that will not finish",
+                "coder never reports",
+            )
             .unwrap();
         entry
             .issues
@@ -484,7 +490,11 @@ async fn controlled_timeout_cancellation_path_stops_active_worker_and_blocks_lat
             .iter()
             .map(|m| m.id.clone())
             .collect::<Vec<_>>();
-        let workflow_gate = entry.workflow.as_ref().map(|w| w.gate()).expect("controlled");
+        let workflow_gate = entry
+            .workflow
+            .as_ref()
+            .map(|w| w.gate())
+            .expect("controlled");
         (
             entry.team.social_context().unwrap().clone(),
             members,
@@ -498,11 +508,14 @@ async fn controlled_timeout_cancellation_path_stops_active_worker_and_blocks_lat
         PipelineController::new("timeout", ctx.clone(), repo.clone(), &members, 2)
             .with_gate(workflow_gate)
             .with_sink({
-            let ledger = Arc::clone(&ledger);
-            Arc::new(move |event: &str, payload: &serde_json::Value| {
-                ledger.events.lock().push((event.to_string(), payload.clone()));
-            })
-        }),
+                let ledger = Arc::clone(&ledger);
+                Arc::new(move |event: &str, payload: &serde_json::Value| {
+                    ledger
+                        .events
+                        .lock()
+                        .push((event.to_string(), payload.clone()));
+                })
+            }),
     );
 
     let _run_handle = tokio::spawn({

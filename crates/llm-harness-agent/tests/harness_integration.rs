@@ -560,10 +560,7 @@ impl llm_harness_types::ShouldStopHook for TeardownGate {
         Box::pin(async move {
             // Park only the first stop decision (the instrumented run);
             // later runs (consuming the salvage) must proceed normally.
-            if self
-                .armed
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 parked.store(true, std::sync::atomic::Ordering::SeqCst);
                 release.notified().await;
             }

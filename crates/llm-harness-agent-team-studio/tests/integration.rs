@@ -1722,16 +1722,26 @@ async fn v0_coder_result_requires_review_before_next_decision() {
         .collect::<Vec<_>>();
     assert_eq!(snapshots.len(), 2);
     let run_root = repo.join(".pipeline/snapshots");
-    let run_dirs: Vec<_> = std::fs::read_dir(&run_root).unwrap().map(|entry| entry.unwrap().path()).collect();
+    let run_dirs: Vec<_> = std::fs::read_dir(&run_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
     assert_eq!(run_dirs.len(), 1, "one task-start baseline per workflow");
     let baseline_path = run_dirs[0].join("r0/snapshot.json");
     let baseline_before = std::fs::read(&baseline_path).unwrap();
     for round in [1, 2] {
         let manifest: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(run_dirs[0].join(format!("r{round}/snapshot.json"))).unwrap()
-        ).unwrap();
-        assert_eq!(manifest["task_start_baseline"], baseline_path.to_string_lossy().as_ref());
-        assert_eq!(manifest["task_relative_changed_paths"], serde_json::json!([]));
+            &std::fs::read(run_dirs[0].join(format!("r{round}/snapshot.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["task_start_baseline"],
+            baseline_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            manifest["task_relative_changed_paths"],
+            serde_json::json!([])
+        );
     }
     assert_eq!(std::fs::read(&baseline_path).unwrap(), baseline_before);
     assert!(package.contains(&format!("r1 / {} · coder report", snapshots[0])));
@@ -1972,22 +1982,23 @@ async fn start_workflow_publishes_lifecycle_events_to_project_event_bus() {
         .start_workflow(confirmed.clone(), Some(bus.clone()))
         .unwrap();
 
-    let events: Vec<serde_json::Value> = tokio::time::timeout(std::time::Duration::from_secs(8), async {
-        loop {
-            let parsed: Vec<serde_json::Value> = bus
-                .replay()
-                .iter()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .filter(|event: &serde_json::Value| event["type"] == "pipeline_escalated")
-                .collect();
-            if !parsed.is_empty() {
-                break parsed;
+    let events: Vec<serde_json::Value> =
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                let parsed: Vec<serde_json::Value> = bus
+                    .replay()
+                    .iter()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .filter(|event: &serde_json::Value| event["type"] == "pipeline_escalated")
+                    .collect();
+                if !parsed.is_empty() {
+                    break parsed;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("workflow did not reach the terminal event on the bus");
+        })
+        .await
+        .expect("workflow did not reach the terminal event on the bus");
 
     assert_eq!(events.len(), 1);
     let escalated = &events[0];
@@ -2060,7 +2071,9 @@ async fn live_event_bus_subscriber_receives_workflow_lifecycle_events() {
         let entry = pm.get("r2live").unwrap();
         let issues_root = entry.issues.root().to_path_buf();
         let store = llm_harness_agent_team_studio::issue::IssueStore::new(&issues_root);
-        let issue = store.create("operator", "revise twice", "two review rounds").unwrap();
+        let issue = store
+            .create("operator", "revise twice", "two review rounds")
+            .unwrap();
         store.set_status(&issue.id, IssueStatus::Confirmed).unwrap();
         let confirmed = store.load(&issue.id).unwrap().0;
         entry
@@ -2178,7 +2191,9 @@ async fn workflow_terminal_reaches_bus_once_and_cancel_creates_no_success() {
             let entry = pm.get(project_id).unwrap();
             let data_dir = entry.data_dir().to_path_buf();
             let store = llm_harness_agent_team_studio::issue::IssueStore::new(entry.issues.root());
-            let issue = store.create("operator", "finish fast", "one decision").unwrap();
+            let issue = store
+                .create("operator", "finish fast", "one decision")
+                .unwrap();
             store.set_status(&issue.id, IssueStatus::Confirmed).unwrap();
             let confirmed = store.load(&issue.id).unwrap().0;
             let bus = Arc::new(llm_harness_agent_team_studio::events::EventBus::new());
@@ -2202,8 +2217,7 @@ async fn workflow_terminal_reaches_bus_once_and_cancel_creates_no_success() {
                             .message_id
                             .as_deref()
                             .is_some_and(|m| m.ends_with(":terminal"))
-                    })
-                    {
+                    }) {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2256,7 +2270,10 @@ async fn workflow_terminal_reaches_bus_once_and_cancel_creates_no_success() {
         let orchestrator = Arc::new(MockLlmClient::new(vec![]));
         let coder = EchoClient::new(&[]);
         install_providers(vec![
-            ("orchestrator", orchestrator.clone() as Arc<dyn llm_harness_loop::LlmClient>),
+            (
+                "orchestrator",
+                orchestrator.clone() as Arc<dyn llm_harness_loop::LlmClient>,
+            ),
             ("coder", coder.clone()),
             ("reviewer-robustness", EchoClient::new(&[])),
             ("judge", EchoClient::new(&[])),
@@ -2281,7 +2298,9 @@ async fn workflow_terminal_reaches_bus_once_and_cancel_creates_no_success() {
         {
             let entry = pm.get(project_id).unwrap();
             let store = llm_harness_agent_team_studio::issue::IssueStore::new(entry.issues.root());
-            let issue = store.create("operator", "never finishes", "aborted").unwrap();
+            let issue = store
+                .create("operator", "never finishes", "aborted")
+                .unwrap();
             store.set_status(&issue.id, IssueStatus::Confirmed).unwrap();
             let confirmed = store.load(&issue.id).unwrap().0;
             entry
@@ -3038,11 +3057,7 @@ async fn live_barebones_v0_three_agent_acceptance() {
         entry
             .start_workflow(issue.clone(), Some(bus.clone()))
             .expect("production ingress starts the workflow");
-        (
-            controller,
-            issue.id.clone(),
-            entry.data_dir().to_path_buf(),
-        )
+        (controller, issue.id.clone(), entry.data_dir().to_path_buf())
     };
 
     // 4. Observe the workflow's ACTUAL terminal state (bounded by the
@@ -3073,8 +3088,8 @@ async fn live_barebones_v0_three_agent_acceptance() {
     };
     let finished = terminal_phase == PipelinePhase::Done.as_str();
 
-    let journal = llm_harness_agent_team::ChatHistoryJournal::open(data_dir.join("chat.sqlite3"))
-        .unwrap();
+    let journal =
+        llm_harness_agent_team::ChatHistoryJournal::open(data_dir.join("chat.sqlite3")).unwrap();
 
     // 5. Durable terminal package: published exactly once under the
     // workflow-wide identity, with an explicit FINISH or ESCALATE outcome.
@@ -3127,12 +3142,7 @@ async fn live_barebones_v0_three_agent_acceptance() {
     // the orchestrator or the workflow-status identity may address the user.
     for member in ["coder", "reviewer"] {
         let direct_to_operator = journal
-            .private_history(
-                &AgentId::new(member),
-                &AgentId::new("operator"),
-                50,
-                None,
-            )
+            .private_history(&AgentId::new(member), &AgentId::new("operator"), 50, None)
             .unwrap();
         assert!(
             direct_to_operator.is_empty(),
@@ -3213,16 +3223,16 @@ async fn live_barebones_v0_three_agent_acceptance() {
                     Some("task_delegated") => {
                         assert!(started, "task_delegated must follow pipeline_started");
                         assert!(
-                            event["task_id"].as_str().is_some_and(|t| t.starts_with("task-pipe-")),
+                            event["task_id"]
+                                .as_str()
+                                .is_some_and(|t| t.starts_with("task-pipe-")),
                             "dispatch must carry the controller task id: {line}"
                         );
                         assert_eq!(
                             event["issue_id"], issue_id,
                             "dispatch must reference the workflow issue: {line}"
                         );
-                        delegated.push(
-                            event["to"].as_str().unwrap_or("?").to_string(),
-                        );
+                        delegated.push(event["to"].as_str().unwrap_or("?").to_string());
                     }
                     Some("worker_started") => {
                         worker_started += 1;
@@ -3250,8 +3260,7 @@ async fn live_barebones_v0_three_agent_acceptance() {
                             "the workflow must terminate exactly once: {line}"
                         );
                         assert_eq!(event["issue_id"], issue_id);
-                        terminal_event =
-                            Some(event["type"].as_str().unwrap().to_string());
+                        terminal_event = Some(event["type"].as_str().unwrap().to_string());
                         break;
                     }
                     Some(other) => panic!("unexpected lifecycle event {other}: {line}"),

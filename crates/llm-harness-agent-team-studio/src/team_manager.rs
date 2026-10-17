@@ -264,10 +264,15 @@ impl TeamEntry {
                 harness.abort();
             }
             let idle = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while harnesses.iter().any(|h| h.state().phase != llm_harness_types::HarnessPhase::Idle) {
+                while harnesses
+                    .iter()
+                    .any(|h| h.state().phase != llm_harness_types::HarnessPhase::Idle)
+                {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
-            }).await.is_ok();
+            })
+            .await
+            .is_ok();
             if outcome.is_ok() && idle {
                 if let Err(error) = controller.complete_snapshot_history(&issue.id) {
                     tracing::warn!(%error, "snapshot history remains protected: completion metadata unavailable");
@@ -348,7 +353,11 @@ impl TeamManager {
     }
 
     pub fn execution_mode(&self) -> &'static str {
-        if self.evaluation_only { "evaluation" } else { "development" }
+        if self.evaluation_only {
+            "evaluation"
+        } else {
+            "development"
+        }
     }
 
     /// Root directory holding all per-team state (for config/display).
@@ -425,8 +434,11 @@ impl TeamManager {
                 work_dir: Some(working_dir.clone()),
                 trust_profile: Default::default(),
                 host_binds: Vec::new(),
-            }).map_err(|e| std::io::Error::other(format!("sandbox required: {e}")))?;
-            sandbox.start().await
+            })
+            .map_err(|e| std::io::Error::other(format!("sandbox required: {e}")))?;
+            sandbox
+                .start()
+                .await
                 .map_err(|e| std::io::Error::other(format!("sandbox required: {e}")))?;
             (sandbox.env(), "bwrap")
         };
@@ -445,27 +457,31 @@ impl TeamManager {
         std::fs::create_dir_all(team_dir.join("issues"))?;
         let issues = IssueStore::new(team_dir.join("issues"));
 
-        let workflow = assembled.workflow_gate.as_ref().map(|gate| -> std::io::Result<_> {
-            Ok(Arc::new(
-                crate::pipeline::PipelineController::new(
-                    &team_id,
-                    assembled
-                        .team
-                        .social_context()
-                        .expect("assembled team")
-                        .clone(),
-                    repo_path.clone().unwrap_or_else(|| team_dir.clone()),
-                    &spec
-                        .members
-                        .iter()
-                        .map(|m| m.id.clone())
-                        .collect::<Vec<_>>(),
-                    crate::pipeline::DEFAULT_MAX_STEPS,
-                )
-                .with_gate(gate.clone())
-                .with_snapshot_policy(snapshot_policy.clone())?,
-            ))
-        }).transpose()?;
+        let workflow = assembled
+            .workflow_gate
+            .as_ref()
+            .map(|gate| -> std::io::Result<_> {
+                Ok(Arc::new(
+                    crate::pipeline::PipelineController::new(
+                        &team_id,
+                        assembled
+                            .team
+                            .social_context()
+                            .expect("assembled team")
+                            .clone(),
+                        repo_path.clone().unwrap_or_else(|| team_dir.clone()),
+                        &spec
+                            .members
+                            .iter()
+                            .map(|m| m.id.clone())
+                            .collect::<Vec<_>>(),
+                        crate::pipeline::DEFAULT_MAX_STEPS,
+                    )
+                    .with_gate(gate.clone())
+                    .with_snapshot_policy(snapshot_policy.clone())?,
+                ))
+            })
+            .transpose()?;
         persist_spec(&self.data_root, &spec);
         self.teams.insert(
             team_id.clone(),
@@ -554,7 +570,10 @@ impl TeamManager {
         // Abort in-flight member turns; the team itself stays alive so the
         // operator can start the next workflow on the same instance.
         for member in &entry.spec.members {
-            if let Some(harness) = entry.team.harness(&llm_harness_agent_team::AgentId::new(&member.id)) {
+            if let Some(harness) = entry
+                .team
+                .harness(&llm_harness_agent_team::AgentId::new(&member.id))
+            {
                 harness.abort();
             }
         }
@@ -1286,7 +1305,12 @@ mod tests {
             history[0].message.from.as_str(),
             crate::pipeline::WORKFLOW_STATUS_ID
         );
-        assert!(history[0].message.body.contains("snapshot storage unavailable"));
+        assert!(
+            history[0]
+                .message
+                .body
+                .contains("snapshot storage unavailable")
+        );
         let state = tm_shared
             .read()
             .await

@@ -72,8 +72,11 @@ async fn agent_env_shell_cannot_read_paths_outside_workspace() {
     // Secret placed outside the workspace, simulating hidden benchmark
     // assets (acceptance suite / reference / another attempt's results).
     let outside = tempfile::tempdir().unwrap();
-    std::fs::write(outside.path().join("hidden-suite.py"), "HIDDEN-TEST-CONTENT")
-        .unwrap();
+    std::fs::write(
+        outside.path().join("hidden-suite.py"),
+        "HIDDEN-TEST-CONTENT",
+    )
+    .unwrap();
 
     let workspace = tempfile::tempdir().unwrap();
     let env = match confined_env_or_none(workspace.path().to_path_buf()).await {
@@ -95,7 +98,10 @@ async fn agent_env_shell_cannot_read_paths_outside_workspace() {
 
     let result = env
         .execute_shell(
-            &format!("cat {}/hidden-suite.py 2>/dev/null || echo BLOCKED", outside.path().display()),
+            &format!(
+                "cat {}/hidden-suite.py 2>/dev/null || echo BLOCKED",
+                outside.path().display()
+            ),
             shell_opts(),
         )
         .await
@@ -121,7 +127,10 @@ async fn agent_env_shell_cannot_write_outside_workspace() {
     let target = outside.path().join("tamper.txt");
     let result = env
         .execute_shell(
-            &format!("touch {} 2>/dev/null && echo WROTE || echo BLOCKED", target.display()),
+            &format!(
+                "touch {} 2>/dev/null && echo WROTE || echo BLOCKED",
+                target.display()
+            ),
             shell_opts(),
         )
         .await
@@ -136,8 +145,11 @@ async fn agent_env_shell_cannot_write_outside_workspace() {
 #[tokio::test]
 async fn agent_env_workspace_work_remains_functional() {
     let workspace = tempfile::tempdir().unwrap();
-    std::fs::write(workspace.path().join("calc.py"), b"def add(a, b):\n    return a + b\n")
-        .unwrap();
+    std::fs::write(
+        workspace.path().join("calc.py"),
+        b"def add(a, b):\n    return a + b\n",
+    )
+    .unwrap();
     let env = match confined_env_or_none(workspace.path().to_path_buf()).await {
         Some(env) => env,
         None => {
@@ -148,7 +160,10 @@ async fn agent_env_workspace_work_remains_functional() {
     // The documented TDD loop (write failing test, run, implement) needs
     // workspace reads/writes plus a working python inside the sandbox.
     let result = env
-        .execute_shell("python3 -m py_compile calc.py && echo COMPILED", shell_opts())
+        .execute_shell(
+            "python3 -m py_compile calc.py && echo COMPILED",
+            shell_opts(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -175,7 +190,8 @@ async fn agent_env_clears_host_environment_variables() {
             return;
         }
     };
-    let result = env.execute_shell("printenv P4C_SECRET || echo ABSENT", shell_opts())
+    let result = env
+        .execute_shell("printenv P4C_SECRET || echo ABSENT", shell_opts())
         .await
         .unwrap();
     assert!(
@@ -263,9 +279,8 @@ fn studio_settings() -> llm_harness_agent_team_studio::settings::Settings {
 
 #[tokio::test]
 async fn fresh_team_registration_selects_bwrap() {
-    let client: Arc<dyn llm_harness_loop::LlmClient> = Arc::new(
-        llm_harness_loop::test_utils::MockLlmClient::new(vec![]),
-    );
+    let client: Arc<dyn llm_harness_loop::LlmClient> =
+        Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![]));
     llm_harness_agent_team_studio::env_cfg::install_provider_factory(Arc::new(move || {
         vec![("m".into(), client.clone())]
     }));
@@ -275,7 +290,12 @@ async fn fresh_team_registration_selects_bwrap() {
     let mut pm = TeamManager::new(data.path());
     let team_spec = solo_spec("fresh-bwrap", repo.path());
     let entry = pm
-        .create(team_spec, Some(repo.path().to_path_buf()), &studio_settings(), "")
+        .create(
+            team_spec,
+            Some(repo.path().to_path_buf()),
+            &studio_settings(),
+            "",
+        )
         .await
         .expect("fresh registration must succeed");
     assert_eq!(
@@ -298,8 +318,12 @@ async fn symlinked_issues_directory_is_rejected() {
     std::os::unix::fs::symlink(outside.path(), team_dir.join("issues")).unwrap();
     let mut pm = TeamManager::new(data.path());
     let result = pm
-        .create(solo_spec("link-team", repo.path()), Some(repo.path().to_path_buf()),
-                &studio_settings(), "")
+        .create(
+            solo_spec("link-team", repo.path()),
+            Some(repo.path().to_path_buf()),
+            &studio_settings(),
+            "",
+        )
         .await;
     assert!(
         result.is_err(),
