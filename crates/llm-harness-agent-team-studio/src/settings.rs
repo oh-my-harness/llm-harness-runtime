@@ -56,6 +56,7 @@ impl Settings {
         let text = std::fs::read_to_string(&path)?;
         let v: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| SettingsError::Parse(e.to_string()))?;
+        crate::snapshot_storage::SnapshotPolicy::from_settings(&v)?;
         let models = v.get("models").cloned().unwrap_or(serde_json::json!({}));
         Ok(Some(Settings {
             models: ModelTier {
@@ -90,7 +91,7 @@ impl Settings {
     /// Atomic save (tmp + rename).
     pub fn save(&self, data_root: &Path) -> Result<(), SettingsError> {
         std::fs::create_dir_all(data_root)?;
-        let v = serde_json::json!({
+        let mut v = serde_json::json!({
             "models": {
                 "strong": self.models.strong,
                 "main": self.models.main,
@@ -100,6 +101,15 @@ impl Settings {
             "base_url": self.base_url,
         });
         let path = settings_path(data_root);
+        // Model/settings updates preserve the separately operated snapshot
+        // policy in this same existing configuration document.
+        if path.exists() {
+            let previous: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            crate::snapshot_storage::SnapshotPolicy::from_settings(&previous)?;
+            if let Some(policy) = previous.get("snapshots") {
+                v["snapshots"] = policy.clone();
+            }
+        }
         let tmp = data_root.join("settings.json.tmp");
         std::fs::write(&tmp, serde_json::to_string_pretty(&v)?)?;
         std::fs::rename(&tmp, &path)?;

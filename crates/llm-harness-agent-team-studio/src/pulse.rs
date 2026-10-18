@@ -186,7 +186,14 @@ mod tests {
         let agents = snap["agents"].as_array().unwrap();
         let ids: Vec<&str> = agents.iter().map(|a| a["id"].as_str().unwrap()).collect();
         assert_eq!(ids.len(), members.len()); // operator excluded
-        assert!(ids.contains(&"planner"));
+        assert!(
+            !ids.contains(&"planner"),
+            "V0 coding team must not contain a planner member"
+        );
+        assert!(
+            ids.contains(&"orchestrator"),
+            "the LLM orchestrator is a real team member"
+        );
         assert!(!ids.contains(&"operator"), "operator has no harness");
         for a in agents {
             assert!(a["activity"]["task"].is_null(), "fresh team: no activity");
@@ -198,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn pending_traffic_is_read_only() {
         let mut team = built_team().await;
-        team.submit("planner", "fix the bug").unwrap();
+        team.submit("coder", "fix the bug").unwrap();
         let members = built_members();
         let history_before = team
             .social_context()
@@ -207,7 +214,7 @@ mod tests {
         let v = pending_traffic(&team, &members);
         let pending = v["pending"].as_array().unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0]["to"], "planner");
+        assert_eq!(pending[0]["to"], "coder");
         assert!(pending[0]["body"].as_str().unwrap().contains("fix the bug"));
         let repeat = pending_traffic(&team, &members);
         assert_eq!(repeat, v, "pulse is a read-only projection");
@@ -239,7 +246,7 @@ mod tests {
         let timer = TimeoutManager::new(ctx.clone());
         timer
             .set_self_reminder_durably(
-                AgentId::new("planner"),
+                AgentId::new("coder"),
                 "check review results",
                 Duration::from_millis(10),
                 Some("review-check".into()),
@@ -249,7 +256,7 @@ mod tests {
         assert_eq!(pending_timers(&team), 1);
         timer
             .set_self_reminder_durably(
-                AgentId::new("planner"),
+                AgentId::new("coder"),
                 "check again",
                 Duration::from_millis(10),
                 Some("review-check".into()),

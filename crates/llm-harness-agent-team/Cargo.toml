@@ -33,3 +33,4 @@ llm-harness-loop = { workspace = true, features = ["test-utils"] }
 llm-harness-sandbox.workspace = true
 tempfile.workspace = true
 async-trait.workspace = true
+tracing-subscriber.workspace = true

@@ -103,6 +103,7 @@ fn team_routes(prefix: &'static str, state: AppState) -> Router {
         .route(&format!("{prefix}/pulse"), get(pulse))
         .route(&format!("{prefix}/agent/inject"), post(agent_inject))
         .route(&format!("{prefix}/agent/abort"), post(agent_abort))
+        .route(&format!("{prefix}/workflow/stop"), post(workflow_stop))
         .route(&format!("{prefix}/agent/session"), get(agent_session))
         .route(
             &format!("{prefix}/agent/config"),
@@ -116,7 +117,9 @@ fn team_routes(prefix: &'static str, state: AppState) -> Router {
 
 async fn startup_recovery(State(state): State<AppState>) -> Response {
     let recovery = state.startup_recovery.read().await.clone();
-    Json(serde_json::json!({ "recovery": recovery })).into_response()
+    let execution_mode = state.pm.read().await.execution_mode();
+    Json(serde_json::json!({ "recovery": recovery, "execution_mode": execution_mode }))
+        .into_response()
 }
 
 // ── GET /api/team/projects ───────────────────────────────────────────────────
@@ -221,6 +224,7 @@ async fn register_project(
             template_baseline: None,
             name: body.name.clone().unwrap_or_else(|| body.id.clone()),
             repo_path: body.repo_path.clone(),
+            sandbox_mode: None,
             members: vec![],
         },
     };
@@ -242,7 +246,7 @@ async fn register_project(
         .as_ref()
         .and_then(|p| (!p.is_empty()).then(|| std::path::PathBuf::from(p)));
     let repo = match repo {
-        Some(path) => match std::fs::canonicalize(&path) {
+        Some(path) => match crate::workspace::canonicalize_client_workspace_path(&path) {
             Ok(path) => Some(path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return err_resp(
@@ -708,6 +712,9 @@ async fn agent_inject(
             StatusCode::NOT_FOUND,
         );
     };
+    if project.workflow.is_some() {
+        return conflict("controlled teams accept work through /api/team/chat".into());
+    }
     match project
         .team
         .harness(&llm_harness_agent_team::AgentId::new(&q.agent))
@@ -730,6 +737,16 @@ async fn agent_abort(State(state): State<AppState>, Query(q): Query<AgentCtlQuer
             StatusCode::NOT_FOUND,
         );
     };
+    // Controlled teams own cancellation through the PipelineController:
+    // a member-level harness.abort() would kill the member's harness without
+    // cancelling the controller-owned task token, leaving the controller
+    // waiter blocked until its timeout. Rejection mirrors agent_inject.
+    // The bus-backed workflow sink is the authorized shutdown path instead.
+    if project.workflow.is_some() || crate::pipeline::is_controlled(&project.spec) {
+        return conflict(
+            "controlled teams cancel work through the workflow owner, not agent abort".into(),
+        );
+    }
     if q.agent == TEAM_TARGET {
         let interrupted: Vec<&str> = project
             .spec
@@ -755,6 +772,78 @@ async fn agent_abort(State(state): State<AppState>, Query(q): Query<AgentCtlQuer
         }
         None => err_resp(format!("unknown agent: {}", q.agent), StatusCode::NOT_FOUND),
     }
+}
+
+/// POST /api/team/workflow/stop?project= — cancel a running controlled
+/// workflow. The controller terminalizes the current issue (Escalated) and
+/// publishes the terminal outcome; the workflow task itself is aborted by
+/// `TeamManager::stop_workflow` on the manager side. Idempotent: stopping an
+/// already-terminal or not-running workflow returns the current state.
+#[derive(Deserialize)]
+struct WorkflowStopQuery {
+    project: String,
+}
+
+async fn workflow_stop(
+    State(state): State<AppState>,
+    Query(q): Query<WorkflowStopQuery>,
+) -> Response {
+    let pm = state.pm.read().await;
+    let Some(project) = pm.get(&q.project) else {
+        return err_resp(
+            format!("unknown project: {}", q.project),
+            StatusCode::NOT_FOUND,
+        );
+    };
+    let Some(controller) = project.workflow.as_ref() else {
+        return conflict("team is not a controlled workflow team".into());
+    };
+    if !project.workflow_running() {
+        return err_resp(
+            "no running controlled workflow to stop".into(),
+            StatusCode::CONFLICT,
+        );
+    }
+    let Some(issue_id) = latest_running_id(controller) else {
+        return err_resp(
+            "no running controlled workflow to stop".into(),
+            StatusCode::CONFLICT,
+        );
+    };
+    let terminal = controller.stop(&issue_id, "operator requested workflow stop".into());
+    // Terminate the spawned workflow task only after the terminal state is
+    // recorded: aborting earlier could race the journal write in
+    // `start_workflow`'s task with the operator terminal published here.
+    // `stop_workflow` also republishes the terminal outcome to the chat
+    // journal + live bus, since the aborted task can no longer do it.
+    drop(pm);
+    let _ = state
+        .pm
+        .write()
+        .await
+        .stop_workflow(&q.project, Some(state.events.clone()));
+    match terminal {
+        Some(outcome) => Json(serde_json::json!({
+            "ok": true,
+            "workflow_id": issue_id,
+            "phase": outcome.phase,
+            "terminal_reason": outcome.terminal_reason,
+        }))
+        .into_response(),
+        None => err_resp(
+            format!("unknown workflow: {issue_id}"),
+            StatusCode::NOT_FOUND,
+        ),
+    }
+}
+
+/// Latest tracked pipeline state for a controlled team (the running issue).
+fn latest_running_id(controller: &crate::pipeline::PipelineController) -> Option<String> {
+    controller
+        .all_states()
+        .into_iter()
+        .max_by_key(|state| state.issue_id.clone())
+        .map(|state| state.issue_id)
 }
 
 /// GET /api/team/agent/session?project=&agent= — the agent's run history
@@ -1402,6 +1491,80 @@ async fn chat(State(state): State<AppState>, Json(body): Json<ChatBody>) -> Resp
         )
             .into_response();
     };
+    // Controlled coding-team ingress: ordinary user chat — team broadcast or
+    // direct member target — must reach the orchestrator workflow only, never
+    // a worker inbox. Generic teams keep direct/broadcast chat below.
+    if project.workflow.is_some() || crate::pipeline::is_controlled(&project.spec) {
+        if body.target != TEAM_TARGET && !project.spec.members.iter().any(|m| m.id == body.target) {
+            return err_resp(
+                format!("unknown member: {}", body.target),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        if body.text.trim().is_empty() {
+            return err_resp(
+                "workflow objective must not be empty".into(),
+                StatusCode::BAD_REQUEST,
+            );
+        }
+        if project.team.social_context().is_none() {
+            return conflict("team is not built".into());
+        }
+        let journal = match llm_harness_agent_team::ChatHistoryJournal::open(
+            project.data_dir().join("chat.sqlite3"),
+        ) {
+            Ok(journal) => journal,
+            Err(error) => return conflict(error.to_string()),
+        };
+        let issue = crate::issue::Issue {
+            id: format!("chat-{}", uuid::Uuid::new_v4()),
+            status: IssueStatus::Confirmed,
+            source: "operator".into(),
+            created: chrono::Utc::now().to_rfc3339(),
+            title: "Operator request".into(),
+            body: body.text.clone(),
+        };
+        return match project.start_workflow(issue, Some(state.events.clone())) {
+            Ok(id) => {
+                // Admission precedes representation: a rejected workflow is not
+                // an accepted team message. The journal write never touches an
+                // AgentRunner inbox or wakes a worker.
+                let message_id = uuid::Uuid::now_v7().to_string();
+                let broadcast_id = id.clone();
+                let message = llm_harness_agent_team::InboxMessage {
+                    journal_id: None,
+                    from: llm_harness_agent_team::AgentId::new(reserved::OPERATOR),
+                    to: llm_harness_agent_team::AgentId::new(TEAM_TARGET),
+                    body: body.text.clone(),
+                    message_type: llm_harness_agent_team::MessageType::Broadcast,
+                    priority: llm_harness_agent_team::priority::OPERATOR,
+                    task_id: None,
+                    task_kind: None,
+                    broadcast_id: Some(broadcast_id.clone()),
+                    message_id: Some(message_id.clone()),
+                };
+                if let Err(error) = journal.append(&message) {
+                    return conflict(error.to_string());
+                }
+                state.events.publish(crate::events::team_message_event(
+                    &body.project,
+                    reserved::OPERATOR,
+                    TEAM_TARGET,
+                    &body.text,
+                    "broadcast",
+                    Some(message_id),
+                    Some(broadcast_id),
+                    ChatView::GroupMessage.as_str(),
+                ));
+                (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({"ok": true, "workflow_id": id})),
+                )
+                    .into_response()
+            }
+            Err(error) => conflict(error.to_string()),
+        };
+    }
     let effective_target = if body.target == TEAM_TARGET {
         let mention = body
             .text
@@ -1670,7 +1833,7 @@ async fn add_member(State(state): State<AppState>, Json(body): Json<AddMemberBod
     match pm.restart(&body.project, &settings, &api_key).await {
         Ok(()) => {
             register_team_side_effects(&state, &pm, &body.project);
-            Json(serde_json::json!({ "ok": true })).into_response()
+            (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
         }
         Err(e) => err_resp(e.to_string(), StatusCode::CONFLICT),
     }
@@ -1817,7 +1980,7 @@ async fn transition_issue(state: AppState, id: &str, to: IssueStatus) -> Respons
     // Confirmed issues: submit via the team's handoff routes (from spec
     // behaviors). No route → status change only.
     if to == IssueStatus::Confirmed
-        && let Err(e) = pm.apply_issue_handoff(&project_id, &issue)
+        && let Err(e) = pm.apply_issue_handoff(&project_id, &issue, Some(state.events.clone()))
     {
         tracing::error!("issue {id} confirmed but handoff failed: {e}");
         return conflict(format!("status changed but handoff failed: {e}"));
@@ -1840,11 +2003,18 @@ async fn events_ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
+    Query(query): Query<EventsWsQuery>,
 ) -> Response {
     if !is_localhost_origin(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    ws.on_upgrade(move |socket| events_ws_loop(socket, state))
+    ws.on_upgrade(move |socket| events_ws_loop(socket, state, query.live_only))
+}
+
+#[derive(Default, Deserialize)]
+struct EventsWsQuery {
+    #[serde(default)]
+    live_only: bool,
 }
 
 /// Localhost-browser-origin check shared with the inspector's event WS
@@ -1864,24 +2034,52 @@ fn is_localhost_origin(headers: &axum::http::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-async fn events_ws_loop(socket: axum::extract::ws::WebSocket, state: AppState) {
+async fn events_ws_loop(socket: axum::extract::ws::WebSocket, state: AppState, live_only: bool) {
     use axum::extract::ws::Message;
     use futures::{SinkExt, StreamExt};
     let (mut sender, mut receiver) = socket.split();
-    // Replay recent events first, then forward live ones.
-    for line in state.events.replay() {
-        if sender.send(Message::Text(line.into())).await.is_err() {
+    // Collector mode subscribes before acknowledging readiness, avoiding the
+    // replay-to-subscription gap. The ordinary panel path is unchanged.
+    let mut rx = if live_only {
+        Some(state.events.subscribe())
+    } else {
+        None
+    };
+    if live_only {
+        if sender
+            .send(Message::Text(r#"{"type":"event_stream_ready"}"#.into()))
+            .await
+            .is_err()
+        {
             return;
         }
+    } else {
+        for line in state.events.replay() {
+            if sender.send(Message::Text(line.into())).await.is_err() {
+                return;
+            }
+        }
     }
-    let mut rx = state.events.subscribe();
+    let mut rx = rx.take().unwrap_or_else(|| state.events.subscribe());
     loop {
         tokio::select! {
             // Client pings/pongs keep the connection healthy; ignore input.
             Some(Ok(_)) = receiver.next() => {}
-            Ok(line) = rx.recv() => {
-                if sender.send(Message::Text(line.into())).await.is_err() {
-                    break;
+            result = rx.recv() => {
+                match result {
+                    Ok(line) => {
+                        if sender.send(Message::Text(line.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) if live_only => {
+                        let marker = serde_json::json!({"type": "event_stream_gap", "dropped": count}).to_string();
+                        if sender.send(Message::Text(marker.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
             else => break,
@@ -2013,6 +2211,1117 @@ mod tests {
     use llm_harness_loop::test_utils::MockLlmClient;
     use std::time::Duration;
     use tower::ServiceExt;
+
+    /// Dynamic mock echoes the actual runtime-generated task id. Every reply
+    /// travels through the real model/tool/runner path, not direct inbox injection.
+    struct WorkflowClient {
+        replies: Mutex<std::collections::VecDeque<String>>,
+        tasks: Mutex<Vec<String>>,
+        attacks: Mutex<std::collections::VecDeque<(String, serde_json::Value)>>,
+        hold_second: std::sync::atomic::AtomicBool,
+        release: tokio::sync::Notify,
+    }
+
+    impl WorkflowClient {
+        fn new(replies: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                replies: Mutex::new(replies.iter().map(|s| s.to_string()).collect()),
+                tasks: Mutex::new(vec![]),
+                attacks: Mutex::new(std::collections::VecDeque::new()),
+                hold_second: std::sync::atomic::AtomicBool::new(false),
+                release: tokio::sync::Notify::new(),
+            })
+        }
+    }
+
+    impl llm_harness_loop::LlmClient for WorkflowClient {
+        fn capabilities(&self) -> llm_harness_loop::ProviderCapabilities {
+            llm_harness_loop::ProviderCapabilities::new(false, false, false)
+        }
+
+        fn chat<'a, 'b, 'f>(
+            &'a self,
+            req: &'b llm_harness_loop::ChatRequest,
+        ) -> futures::future::BoxFuture<
+            'f,
+            Result<llm_harness_loop::ChatResponse, llm_harness_loop::LlmError>,
+        >
+        where
+            'a: 'f,
+            'b: 'f,
+            Self: 'f,
+        {
+            Box::pin(async move { self.chat_stream(req).await?.collect().await })
+        }
+
+        fn chat_stream<'a, 'b, 'f>(
+            &'a self,
+            req: &'b llm_harness_loop::ChatRequest,
+        ) -> futures::future::BoxFuture<
+            'f,
+            Result<llm_harness_loop::StreamHandle, llm_harness_loop::LlmError>,
+        >
+        where
+            'a: 'f,
+            'b: 'f,
+            Self: 'f,
+        {
+            Box::pin(async move {
+                use llm_harness_loop::test_utils::MockResponse;
+                use llm_harness_loop::{LlmMessage, RequestContent};
+                let text = req
+                    .messages()
+                    .iter()
+                    .filter_map(|message| match message {
+                        LlmMessage::User(content) => Some(
+                            content
+                                .iter()
+                                .filter_map(|part| match part {
+                                    RequestContent::Text(text) => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let task = text
+                    .rsplit_once("task_id=\"")
+                    .expect("runtime reply contract")
+                    .1
+                    .split('"')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                {
+                    let mut tasks = self.tasks.lock();
+                    if !tasks.contains(&task) {
+                        tasks.push(task.clone());
+                    }
+                }
+                let attack = self.attacks.lock().pop_front();
+                let response = if let Some((tool, args)) = attack {
+                    MockResponse::tool_use("bypass", &tool, &args.to_string())
+                } else if let Some(body) = {
+                    let mut replies = self.replies.lock();
+                    replies.pop_front()
+                } {
+                    if self.tasks.lock().len() == 2
+                        && self.hold_second.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        self.release.notified().await;
+                    }
+                    MockResponse::tool_use(
+                        "reply",
+                        "send_message",
+                        &serde_json::json!({
+                            "to": crate::pipeline::CONTROLLER, "task_id": task,
+                            "task_kind": "result", "body": body,
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    MockResponse::text("reply delivered")
+                };
+                llm_harness_loop::test_utils::MockLlmClient::with_single(response)
+                    .chat_stream(req)
+                    .await
+            })
+        }
+    }
+
+    async fn controlled_fixture(
+        replies: &[&str],
+        missing: bool,
+    ) -> (
+        Router,
+        SharedPm,
+        Arc<WorkflowClient>,
+        Arc<WorkflowClient>,
+        Arc<MockLlmClient>,
+        crate::env_cfg::TestProviderFactoryGuard,
+    ) {
+        let (router, pm, repo, factory) = setup().await;
+        let orchestrator = WorkflowClient::new(replies);
+        let coder = WorkflowClient::new(&["implementation evidence"]);
+        let reviewer = WorkflowClient::new(&["review evidence: no findings"]);
+        let idle = Arc::new(MockLlmClient::new(vec![]));
+        let clients: Vec<(String, Arc<dyn llm_harness_loop::LlmClient>)> = vec![
+            ("orchestrator".into(), orchestrator.clone()),
+            ("coder".into(), coder.clone()),
+            ("reviewer".into(), reviewer),
+            ("idle".into(), idle.clone()),
+        ];
+        crate::env_cfg::install_provider_factory(Arc::new(move || clients.clone()));
+        let members = ["orchestrator", "coder", "reviewer-performance", "judge"]
+            .into_iter()
+            .filter(|id| !missing || *id != "orchestrator")
+            .map(|id| crate::team_spec::MemberSpec {
+                id: id.into(),
+                role_label: id.into(),
+                persona: "test member".into(),
+                model: crate::team_spec::ModelRef::Explicit(
+                    match id {
+                        "orchestrator" | "coder" => id,
+                        "reviewer-performance" => "reviewer",
+                        _ => "idle",
+                    }
+                    .into(),
+                ),
+                toolkits: vec![],
+                behaviors: vec![],
+                provider_override: None,
+                persona_file: None,
+            })
+            .collect();
+        let spec = crate::team_spec::TeamSpec {
+            id: "controlled".into(),
+            name: "controlled".into(),
+            template: Some(crate::team_spec::TemplateRef {
+                template_id: "coding-team".into(),
+                version: "test".into(),
+            }),
+            template_baseline: None,
+            repo_path: Some(repo.to_string_lossy().into()),
+            sandbox_mode: None,
+            members,
+        };
+        pm.write()
+            .await
+            .create(
+                spec,
+                Some(repo),
+                &crate::settings::Settings {
+                    models: tier(),
+                    scout_interval_secs: 0,
+                    base_url: String::new(),
+                },
+                "",
+            )
+            .await
+            .unwrap();
+        (router, pm, orchestrator, coder, idle, factory)
+    }
+
+    async fn wait_workflow_phase(pm: &SharedPm, id: &str, phase: &str) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let state = pm
+                    .read()
+                    .await
+                    .get("controlled")
+                    .unwrap()
+                    .workflow
+                    .as_ref()
+                    .unwrap()
+                    .state(id);
+                if state.as_ref().is_some_and(|state| state.phase == phase)
+                    && !pm
+                        .read()
+                        .await
+                        .get("controlled")
+                        .unwrap()
+                        .workflow_running()
+                {
+                    break;
+                }
+                let _ = &state;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("workflow did not reach expected phase");
+    }
+
+    #[tokio::test]
+    async fn controlled_chat_persists_and_publishes_once_and_activates_one_workflow() {
+        let (_router, pm, orchestrator, coder, idle, _factory) = controlled_fixture(
+            &["ACTION: FINISH\nFinal response.\nEvidence: done.\n"],
+            false,
+        )
+        .await;
+        // Reuse the route-test pattern with an inspectable event bus.
+        let bus = Arc::new(crate::events::EventBus::new());
+        let pumps = Arc::new(Mutex::new(HashMap::new()));
+        let data_root = pm.read().await.data_root().to_path_buf();
+        let grants = crate::workspace::WorkspaceGrants::load(&data_root).unwrap();
+        let router = team_router(AppState {
+            pm: pm.clone(),
+            data_root,
+            tier: Arc::new(RwLock::new(tier())),
+            scout_interval_secs: Arc::new(RwLock::new(0)),
+            events: bus.clone(),
+            registry: llm_harness_inspector::state::HarnessRegistry::new("default"),
+            operator_pumps: pumps.clone(),
+            thought_pumps: Arc::new(Mutex::new(HashMap::new())),
+            grants: Arc::new(RwLock::new(grants)),
+            startup_recovery: Arc::new(RwLock::new(crate::runtime::StartupRecovery::default())),
+        });
+        let ctx = pm
+            .read()
+            .await
+            .get("controlled")
+            .unwrap()
+            .team
+            .social_context()
+            .unwrap()
+            .clone();
+        super::spawn_operator_pump(bus.clone(), pumps, "controlled".into(), ctx);
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement the feature",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().unwrap();
+        wait_workflow_phase(&pm, workflow_id, "done").await;
+        let guard = pm.read().await;
+        let project = guard.get("controlled").unwrap();
+        let states = project.workflow.as_ref().unwrap().all_states();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].issue_id, workflow_id);
+        assert_eq!(orchestrator.tasks.lock().len(), 1);
+        assert!(coder.tasks.lock().is_empty());
+        assert_eq!(idle.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let ctx = project.team.social_context().unwrap().clone();
+        drop(guard);
+        assert_eq!(ctx.group_history_entries(100, None).unwrap().len(), 2);
+        for member in ["orchestrator", "coder", "reviewer-performance", "judge"] {
+            assert!(
+                ctx.drain_inbox(&llm_harness_agent_team::AgentId::new(member))
+                    .iter()
+                    .all(|message| {
+                        message.from.as_str() != reserved::OPERATOR
+                            && message.body != "Final response.\nEvidence: done.\n"
+                    })
+            );
+        }
+        let (status, history) =
+            get_json(&router, "/api/team/chat?project=controlled&agent=team").await;
+        assert_eq!(status, 200);
+        let user_messages: Vec<_> = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["from"] == reserved::OPERATOR)
+            .collect();
+        assert_eq!(user_messages.len(), 1);
+        let message = user_messages[0];
+        assert_eq!(message["to"], TEAM_TARGET);
+        assert_eq!(message["text"], "implement the feature");
+        assert_eq!(message["message_type"], "broadcast");
+        assert_eq!(message["view_kind"], "group_message");
+        assert_eq!(message["conversation"], TEAM_TARGET);
+        assert!(message["sequence"].as_i64().is_some());
+        assert!(message["broadcast_id"].as_str().is_some());
+        assert_eq!(message["broadcast_id"], workflow_id);
+        let final_messages: Vec<_> = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["from"] == crate::pipeline::ORCHESTRATOR_ID)
+            .collect();
+        assert_eq!(final_messages.len(), 1);
+        let final_message = final_messages[0];
+        let package = final_message["text"].as_str().unwrap();
+        assert!(package.contains("**Outcome:** FINISH"));
+        assert!(package.contains("Final response.\nEvidence: done.\n"));
+        assert_eq!(package.matches("## Human review package").count(), 1);
+        assert_eq!(final_message["to"], reserved::OPERATOR);
+        assert_eq!(final_message["conversation"], TEAM_TARGET);
+        assert_eq!(final_message["view_kind"], "group_reply");
+        assert_eq!(final_message["broadcast_id"], message["broadcast_id"]);
+        let (status, private_history) = get_json(
+            &router,
+            "/api/team/chat?project=controlled&agent=pipeline-controller",
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            private_history["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message["from"] != reserved::OPERATOR)
+        );
+        // Give the live operator pump a chance to expose any second terminal
+        // message; controlled workflows must publish only the journaled one.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let events: Vec<serde_json::Value> = bus
+            .replay()
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        // The two chat events plus the pipeline lifecycle fan-out (V0.6
+        // sink → EventBus): this one-shot FINISH workflow emits
+        // pipeline_started and pipeline_completed on top of the chat events.
+        let chat_events: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["type"] == "team_message")
+            .collect();
+        assert_eq!(
+            chat_events.len(),
+            2,
+            "exactly the journaled input and terminal chat messages may appear: {events:?}"
+        );
+        let lifecycle: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event["type"].as_str() {
+                Some(name) if name.starts_with("pipeline_") => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lifecycle,
+            ["pipeline_started", "pipeline_completed"],
+            "the workflow's lifecycle events must land on the project bus"
+        );
+        let input_event = chat_events
+            .iter()
+            .find(|event| event["from"] == reserved::OPERATOR)
+            .unwrap();
+        let final_event = chat_events
+            .iter()
+            .find(|event| event["from"] == crate::pipeline::ORCHESTRATOR_ID)
+            .unwrap();
+        assert_eq!(input_event["type"], "team_message");
+        assert_eq!(input_event["message_id"], message["message_id"]);
+        assert_eq!(input_event["conversation"], TEAM_TARGET);
+        assert_eq!(input_event["view_kind"], "group_message");
+        assert_eq!(input_event["broadcast_id"], message["broadcast_id"]);
+        assert_eq!(final_event["text"], package);
+        assert_eq!(final_event["message_id"], final_message["message_id"]);
+        assert_eq!(final_event["conversation"], TEAM_TARGET);
+        assert_eq!(final_event["view_kind"], "group_reply");
+        assert_eq!(final_event["broadcast_id"], message["broadcast_id"]);
+    }
+
+    /// A correlated orchestrator reply whose body is not a valid ACTION is
+    /// nonterminal progress: the workflow keeps waiting for a real ACTION and
+    /// only the bounded decision timeout can end the round. Regression for
+    /// chat-bb893129: an ACK used to be accepted as the decision and fatally
+    /// escalated as "malformed ACTION first line".
+    #[tokio::test]
+    async fn controlled_chat_malformed_reply_is_progress_not_terminal() {
+        let (router, pm, orchestrator, coder, _idle, _factory) =
+            controlled_fixture(&["ACTION: FINISH"], false).await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement the feature",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().unwrap();
+        // The malformed ACTION-shaped reply must NOT terminate the decision:
+        // no escalation within a bounded window, no worker activation.
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let state = pm
+                    .read()
+                    .await
+                    .get("controlled")
+                    .unwrap()
+                    .workflow
+                    .as_ref()
+                    .unwrap()
+                    .state(workflow_id);
+                if state.is_some_and(|state| state.phase != "deciding") {
+                    panic!("malformed reply must not terminalize the decision");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(coder.tasks.lock().is_empty());
+        assert_eq!(orchestrator.tasks.lock().len(), 1);
+    }
+
+    /// Regression for chat-bb893129: the orchestrator ACKs a decision
+    /// (task_kind=ack, no ACTION) and then sends a valid ACTION in a later
+    /// provider turn. The ACK must not terminalize the decision; the
+    /// subsequent valid ACTION seals the run and completes the workflow.
+    #[tokio::test]
+    async fn controlled_ack_reply_does_not_terminalize_then_action_finishes() {
+        let (router, pm, orchestrator, coder, _idle, _factory) = controlled_fixture(
+            &[
+                "ACK — decision in progress: closing the verification gap first.",
+                "ACTION: FINISH\nFinal response after the ACK.",
+            ],
+            false,
+        )
+        .await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement the feature",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().unwrap();
+        wait_workflow_phase(&pm, workflow_id, "done").await;
+        let state = pm
+            .read()
+            .await
+            .get("controlled")
+            .unwrap()
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state(workflow_id)
+            .unwrap();
+        assert_eq!(state.phase, "done");
+        let terminal = state.terminal_user_outcome.expect("terminal package");
+        assert_eq!(
+            terminal.attribution,
+            crate::pipeline::TerminalAttribution::Orchestrator
+        );
+        assert!(terminal.body.contains("**Outcome:** FINISH"));
+        assert!(terminal.body.contains("Final response after the ACK."));
+        assert_eq!(orchestrator.tasks.lock().len(), 1);
+        assert!(coder.tasks.lock().is_empty());
+    }
+
+    /// The ACK must not dispatch a worker or cancel the decision task: only
+    /// the subsequent valid ACTION advances the workflow.
+    #[tokio::test]
+    async fn controlled_ack_then_action_dispatches_coder_once() {
+        let (router, pm, _orchestrator, coder, _idle, _factory) = controlled_fixture(
+            &[
+                "ACK — decision in progress: closing the verification gap.",
+                "ACTION: DISPATCH coder\nimplement the feature now.",
+                "ACTION: FINISH\nAll work reviewed and complete.",
+            ],
+            false,
+        )
+        .await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().unwrap();
+        // Pre-fix, the ACK was accepted as the decision and escalated as
+        // "malformed ACTION first line" before any coder dispatch. Reaching
+        // done with exactly one coder assignment proves the ACK neither
+        // terminalized the decision nor dispatched a worker.
+        wait_workflow_phase(&pm, workflow_id, "done").await;
+        assert_eq!(
+            coder.tasks.lock().len(),
+            1,
+            "coder dispatched exactly once by the ACTION, never by the ACK"
+        );
+        let state = pm
+            .read()
+            .await
+            .get("controlled")
+            .unwrap()
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state(workflow_id)
+            .unwrap();
+        assert_eq!(state.phase, "done");
+    }
+
+    #[tokio::test]
+    async fn explicit_escalate_body_is_published_once_as_orchestrator_output() {
+        let (router, pm, orchestrator, coder, _idle, _factory) = controlled_fixture(
+            &["ACTION: ESCALATE\nA human must approve the unavailable credential."],
+            false,
+        )
+        .await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "perform guarded work",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().unwrap();
+        wait_workflow_phase(&pm, workflow_id, "escalated").await;
+
+        let state = pm
+            .read()
+            .await
+            .get("controlled")
+            .unwrap()
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state(workflow_id)
+            .unwrap();
+        let terminal = state.terminal_user_outcome.expect("terminal package");
+        assert_eq!(
+            terminal.attribution,
+            crate::pipeline::TerminalAttribution::Orchestrator
+        );
+        assert!(terminal.body.contains("**Outcome:** ESCALATE"));
+        assert!(
+            terminal
+                .body
+                .contains("A human must approve the unavailable credential.")
+        );
+
+        let (status, history) =
+            get_json(&router, "/api/team/chat?project=controlled&agent=team").await;
+        assert_eq!(status, 200);
+        let terminals = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["from"] != reserved::OPERATOR)
+            .collect::<Vec<_>>();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0]["from"], crate::pipeline::ORCHESTRATOR_ID);
+        assert_eq!(terminals[0]["text"], terminal.body);
+        assert_eq!(orchestrator.tasks.lock().len(), 1);
+        assert!(coder.tasks.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn controlled_workflow_missing_orchestrator_runs_zero_workers() {
+        let (router, pm, orchestrator, coder, idle, _factory) = controlled_fixture(&[], true).await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        wait_workflow_phase(&pm, body["workflow_id"].as_str().unwrap(), "escalated").await;
+        let (history_status, history) =
+            get_json(&router, "/api/team/chat?project=controlled&agent=team").await;
+        assert_eq!(history_status, 200);
+        let terminals: Vec<_> = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["from"] == crate::pipeline::WORKFLOW_STATUS_ID)
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        assert!(
+            terminals[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("requires orchestrator")
+        );
+        assert!(orchestrator.tasks.lock().is_empty());
+        assert!(coder.tasks.lock().is_empty());
+        assert_eq!(idle.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A: coding-team + target=team must enter the controlled workflow, never
+    /// broadcast to member inboxes.
+    #[tokio::test]
+    async fn controlled_team_target_ingresses_workflow_not_broadcast() {
+        let (router, pm, _orchestrator, _coder, idle, _factory) =
+            controlled_fixture(&[], true).await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement the feature",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        // workflow_id proves the controlled ingress, not a broadcast reply.
+        let workflow_id = body["workflow_id"].as_str().expect("controlled ingress");
+        wait_workflow_phase(&pm, workflow_id, "escalated").await;
+        let ctx = pm
+            .read()
+            .await
+            .get("controlled")
+            .unwrap()
+            .team
+            .social_context()
+            .unwrap()
+            .clone();
+        for member in ["coder", "reviewer-performance", "judge"] {
+            let drained = ctx.drain_inbox(&llm_harness_agent_team::AgentId::new(member));
+            assert!(
+                drained
+                    .iter()
+                    .all(|m| !m.body.contains("implement the feature")),
+                "{member} inbox must not receive user chat"
+            );
+        }
+        assert_eq!(idle.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// B: coding-team + target=<worker> must enter the controlled workflow,
+    /// never submit directly to that worker's inbox.
+    #[tokio::test]
+    async fn controlled_team_member_target_ingresses_workflow_not_worker_inbox() {
+        let (router, pm, _orchestrator, _coder, idle, _factory) =
+            controlled_fixture(&[], true).await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "coder", "text": "fix the bug",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().expect("controlled ingress");
+        wait_workflow_phase(&pm, workflow_id, "escalated").await;
+        let ctx = pm
+            .read()
+            .await
+            .get("controlled")
+            .unwrap()
+            .team
+            .social_context()
+            .unwrap()
+            .clone();
+        let drained = ctx.drain_inbox(&llm_harness_agent_team::AgentId::new("coder"));
+        assert!(
+            drained.iter().all(|m| !m.body.contains("fix the bug")),
+            "coder inbox must not receive direct user chat"
+        );
+        assert_eq!(idle.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn controlled_workflow_malformed_action_runs_zero_workers() {
+        let (router, pm, orchestrator, coder, idle, _factory) =
+            controlled_fixture(&["prose\nACTION: DISPATCH coder\nimplement"], false).await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "coder", "text": "implement",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().unwrap();
+        // A malformed first ACTION is nonterminal progress now: the workflow
+        // must keep waiting (bounded decision timeout later), never escalate
+        // as "malformed action" and never activate a worker.
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let state = pm
+                    .read()
+                    .await
+                    .get("controlled")
+                    .unwrap()
+                    .workflow
+                    .as_ref()
+                    .unwrap()
+                    .state(workflow_id);
+                if state.is_some_and(|state| state.phase != "deciding") {
+                    panic!("malformed ACTION must not terminalize the decision");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(orchestrator.tasks.lock().len(), 1);
+        assert!(coder.tasks.lock().is_empty());
+        assert_eq!(idle.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn controlled_workflow_coder_completion_is_reviewed_before_next_decision() {
+        let (router, pm, orchestrator, coder, idle, _factory) = controlled_fixture(
+            &[
+                "ACTION: DISPATCH coder\nimplement",
+                "ACTION: FINISH\nFinal response.",
+            ],
+            false,
+        )
+        .await;
+        orchestrator
+            .hold_second
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let id = body["workflow_id"].as_str().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while orchestrator.tasks.lock().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(coder.tasks.lock().len(), 1, "exactly one coder assignment");
+        assert_eq!(
+            idle.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "judge remains idle"
+        );
+        let phase = pm
+            .read()
+            .await
+            .get("controlled")
+            .unwrap()
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state(id)
+            .unwrap()
+            .phase;
+        assert_eq!(phase, "deciding");
+        let state = pm
+            .read()
+            .await
+            .get("controlled")
+            .unwrap()
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state(id)
+            .unwrap();
+        assert!(state.snapshot_id.is_some());
+        assert_eq!(state.reviewers_dispatched, ["reviewer-performance"]);
+        assert_eq!(state.reviewer_findings.len(), 1);
+        let (status, _) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "concurrent request",
+            }),
+        )
+        .await;
+        assert_eq!(status, 409, "one outstanding workflow per team");
+        let (history_status, history) =
+            get_json(&router, "/api/team/chat?project=controlled&agent=team").await;
+        assert_eq!(history_status, 200);
+        let user_messages: Vec<_> = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["from"] == reserved::OPERATOR)
+            .collect();
+        assert_eq!(user_messages.len(), 1);
+        assert_eq!(user_messages[0]["text"], "implement");
+        orchestrator.release.notify_one();
+        wait_workflow_phase(&pm, id, "done").await;
+        assert_eq!(coder.tasks.lock().len(), 1);
+        assert_eq!(idle.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn controlled_workflow_worker_tools_cannot_activate_peers() {
+        let (router, pm, _, coder, idle, _factory) = controlled_fixture(
+            &[
+                "ACTION: DISPATCH coder\nimplement",
+                "ACTION: FINISH\nFinal response.",
+            ],
+            false,
+        )
+        .await;
+        coder.attacks.lock().extend([
+            ("delegate_task".into(), serde_json::json!({"to": "reviewer-performance", "task": "review"})),
+            ("broadcast".into(), serde_json::json!({"message": "everyone work"})),
+            ("send_message".into(), serde_json::json!({"to": "judge", "body": "judge now"})),
+            ("send_message".into(), serde_json::json!({"to": "operator", "body": "public reply", "broadcast_id": "old-broadcast"})),
+        ]);
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202);
+        wait_workflow_phase(&pm, body["workflow_id"].as_str().unwrap(), "done").await;
+        assert!(
+            coder.attacks.lock().is_empty(),
+            "all bypasses were attempted"
+        );
+        assert_eq!(coder.tasks.lock().len(), 1);
+        assert_eq!(idle.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let harness = pm
+            .read()
+            .await
+            .get("controlled")
+            .unwrap()
+            .team
+            .harness(&AgentId::new("coder"))
+            .unwrap();
+        let entries = harness.read_active_path().await.unwrap();
+        let session = serde_json::to_string(&entries).unwrap();
+        assert!(
+            session
+                .matches("Only execute the current assignment.")
+                .count()
+                >= 4,
+            "tool calls must be denied, not merely ignored: {session}"
+        );
+    }
+
+    #[tokio::test]
+    async fn controlled_workflow_malformed_next_action_is_progress_after_coder() {
+        let (router, pm, orchestrator, coder, idle, _factory) = controlled_fixture(
+            &["ACTION: DISPATCH coder\nimplement", "VERDICT: PASS"],
+            false,
+        )
+        .await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202);
+        // The malformed second decision ("VERDICT: PASS") is nonterminal
+        // progress: no escalation/malformed-action failure, the coder has run
+        // exactly once, and the workflow remains owned (bounded decision
+        // timeout is the only way this round can still end).
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let state = pm
+                    .read()
+                    .await
+                    .get("controlled")
+                    .unwrap()
+                    .workflow
+                    .as_ref()
+                    .unwrap()
+                    .state(body["workflow_id"].as_str().unwrap());
+                if state.is_some_and(|state| {
+                    matches!(state.phase.as_str(), "done" | "failed" | "escalated")
+                }) {
+                    panic!("malformed next action must not terminalize the decision");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(orchestrator.tasks.lock().len(), 2);
+        assert_eq!(coder.tasks.lock().len(), 1);
+        assert_eq!(idle.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn controlled_workflow_confirmed_issue_uses_orchestrator() {
+        let (router, pm, orchestrator, coder, idle, _factory) =
+            controlled_fixture(&["ACTION: FINISH\nFinal response."], false).await;
+        let issue = pm
+            .read()
+            .await
+            .get("controlled")
+            .unwrap()
+            .issues
+            .create("operator", "objective", "body")
+            .unwrap();
+        let (status, body) = json_post(
+            &router,
+            &format!("/api/team/issue/{}/confirm", issue.id),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        wait_workflow_phase(&pm, &issue.id, "done").await;
+        assert_eq!(orchestrator.tasks.lock().len(), 1);
+        assert!(coder.tasks.lock().is_empty());
+        assert_eq!(idle.call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A2-2 regression: POST /api/team/workflow/stop cancels a running
+    /// controlled workflow — the issue lands in a terminal escalated state,
+    /// the workflow task stops, and the operator sees exactly one terminal
+    /// chat message.
+    #[tokio::test]
+    async fn controlled_workflow_stop_terminalizes_and_publishes_once() {
+        // The orchestrator never answers the first decision, so the workflow
+        // stays running until we stop it.
+        let (router, pm, _orchestrator, _coder, _idle, _factory) =
+            controlled_fixture(&[], false).await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().unwrap().to_string();
+        // Wait until the controller has tracked state for this issue.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if pm
+                    .read()
+                    .await
+                    .get("controlled")
+                    .unwrap()
+                    .workflow
+                    .as_ref()
+                    .unwrap()
+                    .state(&workflow_id)
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("workflow state never appeared");
+
+        let (status, body) = json_post(
+            &router,
+            "/api/team/workflow/stop?project=controlled",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["workflow_id"], workflow_id.as_str());
+        assert_eq!(body["phase"], "escalated");
+
+        wait_workflow_phase(&pm, &workflow_id, "escalated").await;
+        let guard = pm.read().await;
+        let project = guard.get("controlled").unwrap();
+        let state = project
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state(&workflow_id)
+            .unwrap();
+        assert_eq!(state.phase, "escalated");
+        let terminal = state.terminal_user_outcome.expect("terminal outcome set");
+        assert_eq!(
+            terminal.attribution,
+            crate::pipeline::TerminalAttribution::WorkflowStatus
+        );
+        assert!(terminal.body.contains("stopped by the operator"));
+        assert!(!project.workflow_running());
+        drop(guard);
+
+        // Exactly one journaled terminal message for this issue.
+        let (status, history) =
+            get_json(&router, "/api/team/chat?project=controlled&agent=team").await;
+        assert_eq!(status, 200);
+        let terminal_messages: Vec<_> = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["broadcast_id"] == workflow_id.as_str()
+                    && message["from"] == crate::pipeline::WORKFLOW_STATUS_ID
+            })
+            .collect();
+        assert_eq!(terminal_messages.len(), 1, "{history}");
+    }
+
+    /// A2-2 idempotence + race guard: a stop issued after the workflow has
+    /// already reached its own terminal state (here: FINISH racing the stop)
+    /// must not publish a second terminal outcome — the journaled terminal
+    /// message for the issue stays exactly one.
+    #[tokio::test]
+    async fn controlled_workflow_stop_racing_natural_finish_publishes_once() {
+        let (router, pm, _orchestrator, _coder, _idle, _factory) =
+            controlled_fixture(&["ACTION: FINISH\nFinal response."], false).await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().unwrap().to_string();
+        wait_workflow_phase(&pm, &workflow_id, "done").await;
+
+        // Stop arrives after natural completion: idempotent terminal, 200.
+        let (status, body) = json_post(
+            &router,
+            "/api/team/workflow/stop?project=controlled",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 409, "{body}");
+
+        let guard = pm.read().await;
+        let project = guard.get("controlled").unwrap();
+        let state = project
+            .workflow
+            .as_ref()
+            .unwrap()
+            .state(&workflow_id)
+            .unwrap();
+        // The natural FINISH owns the terminal outcome, not the operator stop.
+        assert!(state.terminal_user_outcome.is_some());
+        assert_ne!(state.phase, "escalated");
+        drop(guard);
+        let (status, history) =
+            get_json(&router, "/api/team/chat?project=controlled&agent=team").await;
+        assert_eq!(status, 200);
+        let terminal_messages: Vec<_> = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["broadcast_id"] == workflow_id.as_str())
+            .filter(|message| {
+                message["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("## Human review package"))
+            })
+            .collect();
+        assert_eq!(terminal_messages.len(), 1, "{history}");
+    }
+
+    /// Stopping a team that is not a controlled workflow team is a conflict.
+    #[tokio::test]
+    async fn workflow_stop_rejects_uncontrolled_team() {
+        // setup() pre-grants its repo, so registering an uncontrolled team
+        // succeeds without touching workspace grants.
+        let (router, _pm, repo, _factory) = setup().await;
+        let (status, json) = json_post(
+            &router,
+            "/api/team/projects",
+            serde_json::json!({
+                "id": "plain",
+                "repo_path": repo.to_string_lossy(),
+            }),
+        )
+        .await;
+        assert_eq!(status, 201, "{json}");
+        let (status, json) = json_post(
+            &router,
+            "/api/team/workflow/stop?project=plain",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 409, "{json}");
+    }
 
     fn tier() -> ModelTier {
         ModelTier {
@@ -2235,6 +3544,7 @@ mod tests {
             message_type: llm_harness_agent_team::MessageType::Direct,
             priority: 0,
             task_id: None,
+            task_kind: None,
             broadcast_id: None,
             message_id: None,
         };
@@ -2294,38 +3604,55 @@ mod tests {
         assert_eq!(pulse["timers"]["pending"], 0, "{pulse}");
     }
 
+    async fn create_generic_chat_team(pm: &SharedPm, repo: &std::path::Path) {
+        // Direct chat/broadcast remain generic-team features. Coding-team
+        // ingress now has the separate controlled_workflow_* contract tests.
+        let mut spec = crate::template_store::TemplateStore::new(None)
+            .load("coding-team")
+            .unwrap()
+            .spec;
+        spec.id = "p1".into();
+        spec.template = None;
+        spec.members
+            .retain(|m| matches!(m.id.as_str(), "coder" | "reviewer"));
+        for member in &mut spec.members {
+            member.model = crate::team_spec::ModelRef::Explicit("m".into());
+        }
+        pm.write()
+            .await
+            .create(
+                spec,
+                Some(repo.to_path_buf()),
+                &crate::settings::Settings {
+                    models: tier(),
+                    scout_interval_secs: 0,
+                    base_url: String::new(),
+                },
+                "",
+            )
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn chat_routes_by_explicit_target() {
         let (router, pm, repo, _factory) = setup().await;
-        // Register from the built-in template: members include planner and
-        // brainstormer (dynamic target whitelist is exercised against them).
-        let (status, json) = json_post(
-            &router,
-            "/api/team/projects",
-            serde_json::json!({
-                "id": "p1",
-                "repo_path": repo.to_string_lossy(),
-                "template_id": "coding-team",
-            }),
-        )
-        .await;
-        eprintln!("DEBUG register: {status} {json}");
-        assert_eq!(status, 201, "register: {json}");
+        create_generic_chat_team(&pm, &repo).await;
 
-        // planner route accepted.
+        // coder route accepted.
         let (status, json) = json_post(
             &router,
             "/api/team/chat",
-            serde_json::json!({ "project": "p1", "target": "planner", "text": "fix the bug" }),
+            serde_json::json!({ "project": "p1", "target": "coder", "text": "fix the bug" }),
         )
         .await;
-        assert_eq!(status, 202, "planner: {json}");
+        assert_eq!(status, 202, "coder: {json}");
 
-        // brainstormer route accepted.
+        // reviewer route accepted (second template member).
         let (status, _) = json_post(
             &router,
             "/api/team/chat",
-            serde_json::json!({ "project": "p1", "target": "brainstormer", "text": "I want a feature" }),
+            serde_json::json!({ "project": "p1", "target": "reviewer", "text": "review when ready" }),
         )
         .await;
         assert_eq!(status, 202);
@@ -2343,12 +3670,12 @@ mod tests {
         let (status, _) = json_post(
             &router,
             "/api/team/chat",
-            serde_json::json!({ "project": "ghost", "target": "planner", "text": "x" }),
+            serde_json::json!({ "project": "ghost", "target": "coder", "text": "x" }),
         )
         .await;
         assert_eq!(status, 404);
 
-        // The planner actually received the chat text in its inbox.
+        // The coder actually received the chat text in its inbox.
         let project = pm
             .read()
             .await
@@ -2358,30 +3685,20 @@ mod tests {
             .social_context()
             .unwrap()
             .clone();
-        let drained = project.drain_inbox(&llm_harness_agent_team::AgentId::new("planner"));
+        let drained = project.drain_inbox(&llm_harness_agent_team::AgentId::new("coder"));
         assert!(
             drained.iter().any(|m| m.body.contains("fix the bug")),
-            "planner inbox must carry the chat text"
+            "coder inbox must carry the chat text"
         );
-        // The brainstormer received its message too.
-        let drained = project.drain_inbox(&llm_harness_agent_team::AgentId::new("brainstormer"));
-        assert!(drained.iter().any(|m| m.body.contains("I want a feature")));
+        // The reviewer received its message too.
+        let drained = project.drain_inbox(&llm_harness_agent_team::AgentId::new("reviewer"));
+        assert!(drained.iter().any(|m| m.body.contains("review when ready")));
     }
 
     #[tokio::test]
     async fn group_mention_remains_visible_to_team() {
         let (router, pm, repo, _factory) = setup().await;
-        let (status, json) = json_post(
-            &router,
-            "/api/team/projects",
-            serde_json::json!({
-                "id": "p1",
-                "repo_path": repo.to_string_lossy(),
-                "template_id": "coding-team",
-            }),
-        )
-        .await;
-        assert_eq!(status, 201, "{json}");
+        create_generic_chat_team(&pm, &repo).await;
 
         let (status, json) = json_post(
             &router,
@@ -2389,7 +3706,7 @@ mod tests {
             serde_json::json!({
                 "project": "p1",
                 "target": "team",
-                "text": "@planner please investigate",
+                "text": "@coder please investigate",
             }),
         )
         .await;
@@ -2400,7 +3717,7 @@ mod tests {
         assert_eq!(group_messages.len(), 1, "{json}");
         assert_eq!(group_messages[0]["view_kind"], "group_message");
         assert_eq!(group_messages[0]["to"], "team");
-        assert_eq!(group_messages[0]["text"], "@planner please investigate");
+        assert_eq!(group_messages[0]["text"], "@coder please investigate");
 
         let context = pm
             .read()
@@ -2411,12 +3728,11 @@ mod tests {
             .social_context()
             .unwrap()
             .clone();
-        let planner_messages =
-            context.drain_inbox(&llm_harness_agent_team::AgentId::new("planner"));
+        let coder_messages = context.drain_inbox(&llm_harness_agent_team::AgentId::new("coder"));
         assert!(
-            planner_messages
+            coder_messages
                 .iter()
-                .any(|message| message.body == "@planner please investigate")
+                .any(|message| message.body == "@coder please investigate")
         );
     }
 
@@ -2444,12 +3760,12 @@ mod tests {
             .unwrap()
             .clone();
         let operator = llm_harness_agent_team::AgentId::new(reserved::OPERATOR);
-        let planner = llm_harness_agent_team::AgentId::new("planner");
+        let coder = llm_harness_agent_team::AgentId::new("coder");
         let broadcast = ctx
             .broadcast_with_message_id(&operator, "team prompt", None)
             .unwrap();
         ctx.send_direct_with_message_id(
-            &planner,
+            &coder,
             &operator,
             "group reply",
             0,
@@ -2460,7 +3776,7 @@ mod tests {
         .unwrap();
         ctx.send_direct_with_message_id(
             &operator,
-            &planner,
+            &coder,
             "private note",
             llm_harness_agent_team::priority::OPERATOR,
             None,
@@ -2502,7 +3818,7 @@ mod tests {
         assert_eq!(older_messages.len(), 1);
         assert_eq!(older_messages[0]["view_kind"], "group_message");
 
-        let (_, json) = get_json(&router, "/api/team/chat?project=p1&agent=planner").await;
+        let (_, json) = get_json(&router, "/api/team/chat?project=p1&agent=coder").await;
         let private_messages = json["messages"].as_array().unwrap();
         assert_eq!(private_messages.len(), 1);
         assert_eq!(private_messages[0]["view_kind"], "direct_message");
@@ -2515,7 +3831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirm_issue_submits_to_planner() {
+    async fn confirm_issue_changes_status_without_handoff() {
         let (router, pm, repo, _factory) = setup().await;
         json_post(
             &router,
@@ -2549,7 +3865,8 @@ mod tests {
         let listed = store.list().unwrap();
         assert_eq!(listed[0].status, IssueStatus::Confirmed);
 
-        // Planner received the handoff with the full issue body.
+        // V0 contract: confirm performs a status change only — the coding-team
+        // template defines no issue handoff route (planner removed).
         let ctx = pm
             .read()
             .await
@@ -2559,13 +3876,15 @@ mod tests {
             .social_context()
             .unwrap()
             .clone();
-        let drained = ctx.drain_inbox(&llm_harness_agent_team::AgentId::new("planner"));
-        assert!(
-            drained
-                .iter()
-                .any(|m| m.body.contains("操作员确认") && m.body.contains("现象：错误被吞")),
-            "planner must receive the confirmed issue body"
-        );
+        for member in ["coder", "reviewer", "judge"] {
+            let drained = ctx.drain_inbox(&llm_harness_agent_team::AgentId::new(member));
+            assert!(
+                !drained
+                    .iter()
+                    .any(|m| m.body.contains("操作员确认") && m.body.contains("现象：错误被吞")),
+                "no member may receive the confirmed issue body without a handoff route"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2893,6 +4212,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_wsl_unc_path_grants_then_creates_team() {
+        let (router, pm, _repo, _factory) = setup().await;
+        // A fresh workspace NOT pre-granted by setup(), addressed only via a
+        // raw WSL UNC spelling, never hard-coding runtime host values.
+        let workspace = _repo.parent().unwrap().join("unc-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(workspace.join(".git")).unwrap();
+        let canonical = std::fs::canonicalize(&workspace).unwrap();
+        let tail = canonical
+            .strip_prefix("/")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let unc = format!(r"\\wsl.localhost\TestDistro\{}", tail.replace('/', "\\"));
+        let unc_mixed = format!(r"\\WSL$/TestDistro/{}", tail.replace('/', "\\"));
+
+        // Project creation with the raw UNC fails before the grant.
+        let (status, json) = json_post(
+            &router,
+            "/api/team/projects",
+            serde_json::json!({ "id": "unc-team", "repo_path": unc.clone() }),
+        )
+        .await;
+        assert_eq!(status, 403, "{json}");
+
+        // Grant via the raw UNC.
+        let (status, json) = json_post(
+            &router,
+            "/api/team/fs/grants",
+            serde_json::json!({ "path": unc.clone(), "label": "unc" }),
+        )
+        .await;
+        assert_eq!(status, 201, "{json}");
+        assert_eq!(json["path"], canonical.to_string_lossy().as_ref());
+
+        // Case-insensitive / mixed-separator spelling is authorized too.
+        let (status, json) = get_json(
+            &router,
+            &format!(
+                "/api/team/fs?path={}",
+                enc(std::path::Path::new(&unc_mixed))
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(json["path"], canonical.to_string_lossy().as_ref());
+
+        // Project creation with the same raw UNC now succeeds, and the
+        // manager stores the canonical Linux identity.
+        let (status, json) = json_post(
+            &router,
+            "/api/team/projects",
+            serde_json::json!({ "id": "unc-team", "repo_path": unc.clone() }),
+        )
+        .await;
+        assert_eq!(status, 201, "{json}");
+        assert_eq!(
+            pm.read().await.get("unc-team").unwrap().repo_path,
+            Some(canonical.clone())
+        );
+        std::fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[tokio::test]
     async fn delete_project_removes_and_persists() {
         let (router, pm, repo, _factory) = setup().await;
         json_post(
@@ -3193,7 +4576,7 @@ mod tests {
         let templates = json["templates"].as_array().unwrap();
         assert!(
             templates.iter().any(
-                |t| t["id"] == "coding-team" && t["member_ids"].as_array().unwrap().len() == 11
+                |t| t["id"] == "coding-team" && t["member_ids"].as_array().unwrap().len() == 3
             ),
             "{templates:?}"
         );
@@ -3213,8 +4596,8 @@ mod tests {
         .await;
         assert_eq!(status, 200, "{json}");
         assert_eq!(json["overridden"].as_array().unwrap().len(), 0);
-        assert_eq!(json["would_follow"].as_array().unwrap().len(), 11);
-        assert_eq!(json["template_current_version"], "2");
+        assert_eq!(json["would_follow"].as_array().unwrap().len(), 3);
+        assert_eq!(json["template_current_version"], "6");
 
         // 改一个成员 persona → 该成员进入 overridden
         let (status, _) = json_put(
@@ -3233,7 +4616,7 @@ mod tests {
         let overridden = json["overridden"].as_array().unwrap();
         assert_eq!(overridden.len(), 1);
         assert_eq!(overridden[0], "coder");
-        assert_eq!(json["would_follow"].as_array().unwrap().len(), 10);
+        assert_eq!(json["would_follow"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -3355,5 +4738,212 @@ mod tests {
         )
         .await;
         assert_eq!(status, 201, "{json}");
+    }
+
+    /// Regression: after a workflow reaches its terminal path (FINISH here)
+    /// the spawned task handle must finish, so the next chat ingress starts a
+    /// NEW workflow instead of returning 409 "a workflow is already running".
+    #[tokio::test]
+    async fn workflow_ownership_released_after_finish() {
+        let (router, pm, _orchestrator, _coder, _idle, _factory) = controlled_fixture(
+            &[
+                "ACTION: FINISH\nFirst response.",
+                "ACTION: FINISH\nSecond response.",
+            ],
+            false,
+        )
+        .await;
+
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "first objective",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().expect("controlled ingress");
+        wait_workflow_phase(&pm, workflow_id, "done").await;
+
+        // The spawned task finishes asynchronously after run() returns; poll
+        // until the entry reports no live workflow task.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pm
+                .read()
+                .await
+                .get("controlled")
+                .unwrap()
+                .workflow_running()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("workflow ownership must release after FINISH");
+
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "second objective",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "second start must not 409: {body}");
+        let workflow_id2 = body["workflow_id"].as_str().expect("controlled ingress");
+        wait_workflow_phase(&pm, workflow_id2, "done").await;
+    }
+
+    /// Regression: an error terminal path (malformed orchestrator action →
+    /// ESCALATE) must release workflow ownership exactly like FINISH.
+    #[tokio::test]
+    async fn workflow_ownership_released_after_error_path() {
+        // A valid ACTION naming an unknown worker fails the controller fast
+        // ("invalid worker target") — the deterministic error path that
+        // releases workflow ownership. Malformed replies are progress now and
+        // can no longer drive this path.
+        let (router, pm, _orchestrator, _coder, _idle, _factory) = controlled_fixture(
+            &[
+                "ACTION: DISPATCH ghost\nimplement",
+                "ACTION: FINISH\nretry done.",
+            ],
+            false,
+        )
+        .await;
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "will error",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().expect("controlled ingress");
+        wait_workflow_phase(&pm, workflow_id, "escalated").await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pm
+                .read()
+                .await
+                .get("controlled")
+                .unwrap()
+                .workflow_running()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("error path must release workflow ownership");
+
+        // Next ingress must start a fresh workflow, not 409.
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "retry objective",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "retry must not 409: {body}");
+        let workflow_id2 = body["workflow_id"].as_str().expect("controlled ingress");
+        wait_workflow_phase(&pm, workflow_id2, "done").await;
+    }
+
+    /// R3: member-level `agent/abort` must not bypass controller-owned
+    /// cancellation for controlled teams. A rejected request must be a 409
+    /// BEFORE any harness.abort(), leaving the active task and the
+    /// controller waiter intact; the workflow then advances on a valid
+    /// correlated reply.
+    #[tokio::test]
+    async fn controlled_team_rejects_agent_abort_for_active_member() {
+        let (router, pm, orchestrator, coder, _idle, _factory) = controlled_fixture(
+            &[
+                "ACTION: DISPATCH coder\nimplement",
+                "ACTION: FINISH\nFinal response.",
+            ],
+            false,
+        )
+        .await;
+        // Park the orchestrator between its first (DISPATCH) and second
+        // (FINISH) decision so the coder is actively working.
+        orchestrator
+            .hold_second
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = json_post(
+            &router,
+            "/api/team/chat",
+            serde_json::json!({
+                "project": "controlled", "target": "team", "text": "implement",
+            }),
+        )
+        .await;
+        assert_eq!(status, 202, "{body}");
+        let workflow_id = body["workflow_id"].as_str().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while coder.tasks.lock().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("coder dispatch never arrived");
+        // Rejected for the active worker, the deciding orchestrator, the
+        // team target, and an unknown member — all before any harness
+        // abort runs.
+        for agent in ["coder", "orchestrator", "reviewer-performance", TEAM_TARGET] {
+            let (status, body) = json_post(
+                &router,
+                &format!("/api/team/agent/abort?project=controlled&agent={agent}"),
+                serde_json::json!({}),
+            )
+            .await;
+            assert_eq!(status, 409, "{agent}: {body}");
+        }
+
+        // The workflow is still live and controller-owned after every
+        // rejection: no fabricated terminal, no cancelled waiter. (The
+        // coder's single-assignment run may already have completed
+        // naturally; its reply's acceptance is proven below by the
+        // decision still being able to advance.)
+        {
+            let guard = pm.read().await;
+            let project = guard.get("controlled").unwrap();
+            let state = project
+                .workflow
+                .as_ref()
+                .unwrap()
+                .state(workflow_id)
+                .expect("workflow state survives rejected aborts");
+            assert!(
+                state.phase == "executing" || state.phase == "deciding",
+                "workflow must stay live, got {:?}",
+                state.phase
+            );
+        }
+
+        // The still-parked orchestrator decision (held across every
+        // rejected abort) completes the workflow: rejected aborts never
+        // sealed, cancelled, or terminalized the controller-owned run.
+        orchestrator.release.notify_one();
+        wait_workflow_phase(&pm, workflow_id, "done").await;
+    }
+
+    /// R3: `agent/abort` keeps working for ordinary (non-controlled) teams:
+    /// member-level abort is accepted, and the runner re-queues in-flight
+    /// work instead of losing it.
+    #[tokio::test]
+    async fn ordinary_team_agent_abort_still_works() {
+        let (router, pm, repo, _factory) = setup().await;
+        create_generic_chat_team(&pm, &repo).await;
+        // The generic team has no workflow; abort must be accepted (200).
+        let (status, body) = json_post(
+            &router,
+            "/api/team/agent/abort?project=p1&agent=coder",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["ok"], true);
     }
 }

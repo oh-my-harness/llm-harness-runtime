@@ -273,9 +273,18 @@ fn run_loop(
 
             // Drain steer messages between turns
             if turn_index > 0 && let Some(ref mut rx) = config.steer_rx {
+                let mut consumed = Vec::new();
                 while let Ok(msg) = rx.try_recv() {
                     ctx.messages.push(msg.clone());
-                    new_messages.push(msg);
+                    new_messages.push(msg.clone());
+                    consumed.push(msg);
+                }
+                if !consumed.is_empty() {
+                    // Surface the injected steers so the host can persist
+                    // them: only run-initial messages otherwise reach the
+                    // session, and a steer missing from history silently
+                    // diverges the transcript.
+                    yield AgentEvent::SteerConsumed { messages: consumed };
                 }
             }
 
@@ -322,8 +331,24 @@ fn run_loop(
                 }
             };
             let tool_defs = tools_to_defs(&current_tools);
-            let tool_choice =
-                if tool_defs.is_empty() { ToolChoice::None } else { ToolChoice::Auto };
+            let required_tool = (turn_index == 0)
+                .then(|| config.run.extension::<RequiredToolCall>())
+                .flatten()
+                .cloned();
+            let tool_choice = if let Some(required) = required_tool.as_ref() {
+                if !tool_defs.iter().any(|tool| tool.name == required.tool_name()) {
+                    yield AgentEvent::Error(AgentError::Internal(format!(
+                        "required run tool '{}' is not available",
+                        required.tool_name()
+                    )));
+                    break 'main;
+                }
+                ToolChoice::Specific(required.tool_name().to_string())
+            } else if tool_defs.is_empty() {
+                ToolChoice::None
+            } else {
+                ToolChoice::Auto
+            };
 
             let mut req_b = ChatRequest::builder(&config.model, config.max_tokens)
                 .messages(llm_messages)
@@ -936,6 +961,14 @@ fn run_loop(
                     );
                 }
 
+                if let Some(required) = required_tool.as_ref() {
+                    yield AgentEvent::Error(AgentError::Internal(format!(
+                        "required run tool '{}' was not called",
+                        required.tool_name()
+                    )));
+                    break 'main;
+                }
+
                 if let FinalAnswerMode::Tool(cfg) = &config.final_answer_mode
                     && cfg.missing_behavior == FinalAnswerMissingBehavior::Error
                 {
@@ -966,22 +999,23 @@ fn run_loop(
                 };
 
                 if should_stop {
-                    // Drain any steer messages that arrived after the last
-                    // turn boundary: the run is about to end, and leftover
-                    // steer messages would be lost with the channel. Treat
-                    // them like follow-ups — inject and continue for one
-                    // more turn so the model sees them.
-                    let mut steered = false;
+                    // Steers that arrived after the last turn boundary are
+                    // handed back to the host (SteerOrphaned below) instead
+                    // of being injected here: an injected user message is
+                    // never persisted (only run-initial messages are), so a
+                    // "one more turn" would consume them invisibly and the
+                    // conversation history would silently diverge. The host
+                    // requeues them for the next run, where they persist.
+                    let mut orphaned_steers = Vec::new();
                     if let Some(ref mut rx) = config.steer_rx {
                         while let Ok(steer_msg) = rx.try_recv() {
-                            ctx.messages.push(steer_msg.clone());
-                            new_messages.push(steer_msg);
-                            steered = true;
+                            orphaned_steers.push(steer_msg);
                         }
                     }
-                    if steered {
-                        turn_index += 1;
-                        continue 'main;
+                    if !orphaned_steers.is_empty() {
+                        yield AgentEvent::AgentEnd { new_messages };
+                        yield AgentEvent::SteerOrphaned { messages: orphaned_steers };
+                        return;
                     }
                     // Check follow_up channel
                     if let Some(ref mut rx) = config.follow_up_rx
@@ -1026,6 +1060,21 @@ fn run_loop(
         }
 
         yield AgentEvent::AgentEnd { new_messages };
+
+        // Final salvage: after the run has ended, drain any steers the loop
+        // never consumed (sent during teardown, or before an abort). The
+        // receiver dies with this generator; whatever remains here would be
+        // silently lost. Hand it to the host layer (harness) so the next run
+        // can process it.
+        if let Some(ref mut rx) = config.steer_rx {
+            let mut orphaned = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                orphaned.push(msg);
+            }
+            if !orphaned.is_empty() {
+                yield AgentEvent::SteerOrphaned { messages: orphaned };
+            }
+        }
     }
 }
 
@@ -1112,6 +1161,100 @@ mod tests {
             response_format: None,
         };
         (client, cfg)
+    }
+
+    #[tokio::test]
+    async fn required_run_tool_rejects_plain_text_and_uses_specific_choice() {
+        use llm_adapter::types::ToolChoice;
+
+        let (client, mut cfg) = make_config(vec![MockResponse::text("ACTION: FINISH\nroger")]);
+        cfg.tools = vec![Arc::new(NamedTool("send_message"))];
+        cfg.run = Arc::new(RunContext::new(
+            RunRequest::default().with_extension(RequiredToolCall::new("send_message")),
+        ));
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(AgentError::Internal(message))
+                if message == "required run tool 'send_message' was not called"
+        )));
+        let captured = client.captured_requests.lock();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].tool_choice(),
+            &ToolChoice::Specific("send_message".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_run_with_tools_keeps_auto_tool_choice() {
+        use llm_adapter::types::ToolChoice;
+
+        let (client, mut cfg) = make_config(vec![MockResponse::text("ordinary reply")]);
+        cfg.tools = vec![Arc::new(NamedTool("send_message"))];
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::Error(_)))
+        );
+        let captured = client.captured_requests.lock();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].tool_choice(), &ToolChoice::Auto);
+    }
+
+    #[tokio::test]
+    async fn required_run_tool_returns_to_auto_after_the_required_call() {
+        use llm_adapter::types::ToolChoice;
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::tool_use_end_turn("reply-1", "send_message", r#"{}"#),
+            MockResponse::text("reply delivered"),
+        ]);
+        cfg.tools = vec![Arc::new(NamedTool("send_message"))];
+        cfg.run = Arc::new(RunContext::new(
+            RunRequest::default().with_extension(RequiredToolCall::new("send_message")),
+        ));
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::Error(_)))
+        );
+        let captured = client.captured_requests.lock();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            captured[0].tool_choice(),
+            &ToolChoice::Specific("send_message".into())
+        );
+        assert_eq!(captured[1].tool_choice(), &ToolChoice::Auto);
     }
 
     #[test]
@@ -1946,11 +2089,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_loop_drains_steer_at_natural_stop() {
+    async fn agent_loop_hands_late_steer_to_host_at_natural_stop() {
         // Regression: a steer message arriving after the final turn's
         // boundary was previously dropped with the channel when the loop
-        // stopped. The stop path must drain steer_rx and run one more turn
-        // so the message reaches the model.
+        // stopped. The loop now hands it to the host via SteerOrphaned so
+        // the host can requeue it for the next run (an injected user message
+        // would never persist, silently diverging the conversation history).
         use tokio::sync::mpsc;
         let (steer_tx, steer_rx) = mpsc::channel(16);
         let steer_msg = AgentMessage::User(UserMessage {
@@ -1996,14 +2140,28 @@ mod tests {
                 }
             });
             assert!(
-                has_steer,
-                "steer message must survive the run: {new_messages:?}"
-            );
-            assert_eq!(
-                client.call_count.load(std::sync::atomic::Ordering::SeqCst),
-                2
+                !has_steer,
+                "late steer must NOT be consumed invisibly by a follow-up turn: {new_messages:?}"
             );
         }
+        let orphaned = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::SteerOrphaned { messages } => Some(messages.clone()),
+                _ => None,
+            })
+            .expect("late steer must be surfaced as SteerOrphaned");
+        assert_eq!(orphaned.len(), 1);
+        assert!(
+            matches!(&orphaned[0], AgentMessage::User(u) if u.content.iter().any(
+                |c| matches!(c, ContentBlock::Text { text } if text == "late steer")
+            ))
+        );
+        // Exactly one provider call: the run stopped instead of extending.
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]

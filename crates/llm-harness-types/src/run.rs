@@ -201,6 +201,30 @@ pub struct RunRequest {
     pub extensions: RunExtensions,
 }
 
+/// Require the first provider turn of this run to call one named tool.
+///
+/// This is a run-scoped request policy. Later turns return to the harness's
+/// normal automatic tool selection so the model can consume the tool result
+/// and finish the run without repeating the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequiredToolCall {
+    tool_name: String,
+}
+
+impl RequiredToolCall {
+    /// Create a first-turn requirement for `tool_name`.
+    pub fn new(tool_name: impl Into<String>) -> Self {
+        Self {
+            tool_name: tool_name.into(),
+        }
+    }
+
+    /// The exact tool the provider must select.
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+}
+
 impl RunRequest {
     /// 使用明确的初始消息创建请求。
     pub fn new(initial_messages: Vec<AgentMessage>) -> Self {
