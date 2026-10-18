@@ -2299,7 +2299,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -2317,19 +2316,14 @@ dependencies = [
  "llm-harness-inspector",
  "llm-harness-loop",
  "llm-harness-mcp",
- "llm-harness-platform",
  "llm-harness-sandbox",
- "llm-harness-strategy",
  "llm-harness-tools",
  "llm-harness-types",
  "parking_lot",
  "serde",
  "serde_json",
- "sha2",
- "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "tokio-util",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -2891,7 +2885,7 @@ dependencies = [
 [[package]]
 name = "llm_adapter"
 version = "0.1.0"
-source = "git+https://github.com/oh-my-harness/llm-api-adapter?rev=864050882254e12cbda33359debae40a03a4b35f#864050882254e12cbda33359debae40a03a4b35f"
+source = "git+https://github.com/oh-my-harness/llm-api-adapter?rev=33d34033cbc999667309f533bec198ce411efdc7#33d34033cbc999667309f533bec198ce411efdc7"
 dependencies = [
  "async-trait",
  "eventsource-stream",

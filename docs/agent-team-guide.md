@@ -163,9 +163,8 @@ let writer = IndividualSpec::new("writer", "把研究结论写成报告", "claud
 
 `llm-harness-agent-team-studio`（由 coding-team 演化而来）把团队变成
 **声明式配置 + 模板**：团队由 `TeamSpec`（成员 persona / model / 工具包 /
-行为）描述，从模板一键创建实例；内置 `coding-team` 模板（orchestrator /
-coder / reviewer，即 V0 冻结三成员设计：Orchestrator 独占下一步决策，
-reviewer 只产出 findings，无 judge 裁决层）是第一个官方模板。
+行为）描述，从模板一键创建实例；内置 `coding-team` 模板（brainstormer /
+planner / coder / 5×reviewer / judge / debugger / scout）是第一个官方模板。
 
 ```bash
 ./scripts/studio.sh            # 构建 → headless 启动

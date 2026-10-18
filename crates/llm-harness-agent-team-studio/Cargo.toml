@@ -12,7 +12,6 @@ llm-harness-tools.workspace = true
 llm-harness-loop.workspace = true
 llm-harness-mcp.workspace = true
 llm-harness-sandbox.workspace = true
-llm-harness-platform.workspace = true
 llm-harness-inspector = { workspace = true, features = ["inspect"] }
 axum.workspace = true
 tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "signal"] }
@@ -24,15 +23,11 @@ chrono.workspace = true
 tracing-subscriber.workspace = true
 parking_lot.workspace = true
 thiserror.workspace = true
-uuid = { workspace = true, features = ["serde"] }
-sha2.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-llm-harness-strategy.workspace = true
-tempfile.workspace = true
-tokio-util.workspace = true
 llm-harness-loop = { workspace = true, features = ["test-utils"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 

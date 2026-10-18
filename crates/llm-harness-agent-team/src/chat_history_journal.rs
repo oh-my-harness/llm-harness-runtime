@@ -245,7 +245,6 @@ mod tests {
             message_type: MessageType::Direct,
             priority: crate::inbox::priority::NORMAL,
             task_id: None,
-            task_kind: None,
             broadcast_id: broadcast_id.map(str::to_string),
             message_id: Some(message_id.into()),
         }
@@ -260,7 +259,6 @@ mod tests {
             message_type: MessageType::Broadcast,
             priority: 0,
             task_id: None,
-            task_kind: None,
             broadcast_id: Some(broadcast_id.to_string()),
             message_id: Some(message_id.into()),
         }
@@ -310,31 +308,6 @@ mod tests {
         assert_eq!(entries[0].message.body, "private");
         assert_eq!(entries[0].sequence, Some(1));
         assert!(entries[0].created_at.is_some());
-    }
-
-    #[test]
-    fn private_history_returns_both_directions() {
-        let temp = tempfile::tempdir().unwrap();
-        let journal = ChatHistoryJournal::open(temp.path().join("chat.sqlite3")).unwrap();
-        journal
-            .append(&direct("operator", "planner", "request", "request-1", None))
-            .unwrap();
-        journal
-            .append(&direct("planner", "operator", "reply", "reply-1", None))
-            .unwrap();
-        journal
-            .append(&direct("coder", "operator", "unrelated", "other-1", None))
-            .unwrap();
-        for (a, b) in [("operator", "planner"), ("planner", "operator")] {
-            let entries = journal
-                .private_history(&AgentId::new(a), &AgentId::new(b), 10, None)
-                .unwrap();
-            assert_eq!(entries.len(), 2);
-            assert_eq!(entries[0].message.from.as_str(), "operator");
-            assert_eq!(entries[0].message.body, "request");
-            assert_eq!(entries[1].message.from.as_str(), "planner");
-            assert_eq!(entries[1].message.body, "reply");
-        }
     }
 
     #[test]

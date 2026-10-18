@@ -30,49 +30,6 @@ pub struct WorkspaceGrants {
     grants: Vec<WorkspaceGrant>,
 }
 
-/// Strip a WSL UNC prefix (`\\wsl.localhost\<distro>\` or `\\wsl$\<distro>\`,
-/// case-insensitive, either slash style) and return the remaining Linux path.
-/// Returns `None` when the input is not such a UNC path; arbitrary Windows
-/// drive paths (`C:\...`) are deliberately not translated and keep failing.
-fn strip_wsl_unc_prefix(raw: &Path) -> Option<PathBuf> {
-    let text = raw.to_string_lossy();
-    if !(text.starts_with("\\\\") || text.starts_with("//")) {
-        return None;
-    }
-    let trimmed = text.trim_start_matches(['\\', '/']);
-    let mut parts = trimmed.split(['\\', '/']);
-    let host = parts.next()?;
-    if !host.eq_ignore_ascii_case("wsl.localhost") && !host.eq_ignore_ascii_case("wsl$") {
-        return None;
-    }
-    let distro = parts.next()?;
-    if distro.is_empty() {
-        return None;
-    }
-    let tail: Vec<&str> = parts.filter(|segment| !segment.is_empty()).collect();
-    if tail.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from("/").join(tail.join("/")))
-}
-
-/// Canonicalize a client-supplied workspace path into the single runtime
-/// identity used for grants and authorization.
-///
-/// WSL UNC spellings (`\\wsl.localhost\Ubuntu\home\...`, `//wsl$/Debian/...`)
-/// are normalized to their Linux form before canonicalizing; plain Linux
-/// paths pass through unchanged. Every workspace identity check must go
-/// through this helper so all client representations converge on one path.
-pub fn canonicalize_client_workspace_path(
-    raw: impl AsRef<Path>,
-) -> Result<PathBuf, std::io::Error> {
-    let raw = raw.as_ref();
-    match strip_wsl_unc_prefix(raw) {
-        Some(stripped) => std::fs::canonicalize(stripped),
-        None => std::fs::canonicalize(raw),
-    }
-}
-
 impl WorkspaceGrants {
     pub fn load(data_root: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
         let data_root = data_root.as_ref();
@@ -102,7 +59,7 @@ impl WorkspaceGrants {
         label: Option<String>,
     ) -> Result<WorkspaceGrant, WorkspaceError> {
         let requested_path = requested_path.as_ref();
-        let canonical_path = canonicalize_client_workspace_path(requested_path)
+        let canonical_path = std::fs::canonicalize(requested_path)
             .map_err(|_| WorkspaceError::InvalidPath(requested_path.to_path_buf()))?;
         if !canonical_path.is_dir() {
             return Err(WorkspaceError::InvalidPath(canonical_path));
@@ -133,7 +90,7 @@ impl WorkspaceGrants {
     }
 
     pub fn contains(&self, requested_path: impl AsRef<Path>) -> Result<bool, WorkspaceError> {
-        let canonical_path = match canonicalize_client_workspace_path(requested_path.as_ref()) {
+        let canonical_path = match std::fs::canonicalize(requested_path.as_ref()) {
             Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
@@ -153,7 +110,7 @@ impl WorkspaceGrants {
         &self,
         requested_path: impl AsRef<Path>,
     ) -> Result<Option<PathBuf>, WorkspaceError> {
-        let canonical_path = match canonicalize_client_workspace_path(requested_path.as_ref()) {
+        let canonical_path = match std::fs::canonicalize(requested_path.as_ref()) {
             Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -169,7 +126,7 @@ impl WorkspaceGrants {
         requested_path: impl AsRef<Path>,
         root: impl AsRef<Path>,
     ) -> Result<bool, WorkspaceError> {
-        let canonical_path = canonicalize_client_workspace_path(requested_path)?;
+        let canonical_path = std::fs::canonicalize(requested_path)?;
         Ok(canonical_path.starts_with(root))
     }
 
@@ -271,52 +228,6 @@ mod tests {
                 .resolve_if_authorized(root.join("workspace/escape"))
                 .unwrap()
                 .is_none()
-        );
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn wsl_unc_path_converges_to_canonical_linux_identity() {
-        let root = temp_root("wsl-unc");
-        let workspace = root.join("workspace");
-        std::fs::create_dir_all(workspace.join("sub")).unwrap();
-        let canonical = std::fs::canonicalize(&workspace).unwrap();
-
-        // Build the UNC spelling of the real canonical path: prefix the
-        // distro portion, never hard-coding the runtime's own host values.
-        let tail = canonical
-            .strip_prefix("/")
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let unc_host = r"\\wsl.localhost\TestDistro";
-        let unc_dollars = r"\\WSL$\Other-Distro".to_string();
-        let unc = format!("{unc_host}\\{}", tail.replace('/', "\\"));
-        let unc_slashes = format!("{unc_dollars}/{}", tail);
-
-        let mut grants = WorkspaceGrants::load(&root).unwrap();
-        // Raw UNC -> grant succeeds, stored path is canonical Linux.
-        let grant = grants.add(&unc, None).unwrap();
-        assert_eq!(grant.path, canonical);
-        assert!(grants.contains(&unc_slashes).unwrap());
-        assert!(grants.contains(workspace.join("sub")).unwrap());
-        assert!(grants.contains(&unc).unwrap());
-
-        // Same raw UNC authorizes resolution, converging to one identity.
-        assert_eq!(
-            grants.resolve_if_authorized(&unc_slashes).unwrap(),
-            Some(canonical.clone())
-        );
-        // Duplicate via a different spelling is rejected.
-        assert!(matches!(
-            grants.add(unc_slashes.clone(), None),
-            Err(WorkspaceError::InvalidPath(_))
-        ));
-
-        // Windows drive paths are deliberately not translated.
-        assert!(
-            canonicalize_client_workspace_path(r"C:\Users\demo\repo").is_err()
-                || cfg!(target_os = "windows")
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
