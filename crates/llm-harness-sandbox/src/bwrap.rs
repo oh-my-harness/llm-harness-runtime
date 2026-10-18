@@ -753,8 +753,10 @@ impl BwrapEnv {
         }
 
         // Trusted-profile host project binds (read-write at the guest path).
-        for bind in &self.config.host_binds {
-            BwrapEnv::push_bind(&mut args, &bind.host, &bind.guest);
+        if trusted {
+            for bind in &self.config.host_binds {
+                BwrapEnv::push_bind(&mut args, &bind.host, &bind.guest);
+            }
         }
 
         for path in &self.config.fs_denylist {
@@ -1697,6 +1699,7 @@ mod trust_profile_args_tests {
     use super::*;
     use llm_harness_platform::sandbox::HostBind;
     use llm_harness_platform::trust::TrustProfile;
+    use std::os::unix::fs::PermissionsExt;
 
     fn config_for(profile: TrustProfile) -> SandboxConfig {
         SandboxConfig {
@@ -1711,9 +1714,13 @@ mod trust_profile_args_tests {
 
     #[test]
     fn trusted_profile_args_share_net_and_bind_projects() {
+        let work_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(work_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         for profile in [TrustProfile::TrustedLan, TrustProfile::TrustedFull] {
-            let env = BwrapEnv::new_owned(config_for(profile), PathBuf::from("/tmp/tw")).unwrap();
-            let args = env.build_bwrap_args(Path::new("/tmp/tw"));
+            let env =
+                BwrapEnv::new_owned(config_for(profile), work_dir.path().to_path_buf()).unwrap();
+            let args = env.build_bwrap_args(work_dir.path());
+            eprintln!("{profile:?} bwrap args: {args:?}");
             assert!(
                 args.iter().any(|a| a == "--share-net"),
                 "{profile:?} args must share the network"
@@ -1729,12 +1736,15 @@ mod trust_profile_args_tests {
 
     #[test]
     fn restricted_profile_args_keep_net_unshared() {
+        let work_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(work_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let env = BwrapEnv::new_owned(
             config_for(TrustProfile::Restricted),
-            PathBuf::from("/tmp/tw"),
+            work_dir.path().to_path_buf(),
         )
         .unwrap();
-        let args = env.build_bwrap_args(Path::new("/tmp/tw"));
+        let args = env.build_bwrap_args(work_dir.path());
+        eprintln!("Restricted bwrap args: {args:?}");
         assert!(!args.iter().any(|a| a == "--share-net"));
         assert!(
             !args.iter().any(|a| a == "/Users/tester/proj"),
