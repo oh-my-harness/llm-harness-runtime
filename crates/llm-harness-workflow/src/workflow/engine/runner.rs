@@ -1882,18 +1882,6 @@ impl super::WorkflowEngine {
                                 settled = true;
                                 break;
                             }
-                            AgentHarnessEvent::CompactionStart { .. } => {
-                                let _ = self.event_tx.send(WorkflowEvent::StepProgress {
-                                    step_id: step.id().clone(),
-                                    progress: StepProgress::CompactionStart,
-                                });
-                            }
-                            AgentHarnessEvent::CompactionEnd { .. } => {
-                                let _ = self.event_tx.send(WorkflowEvent::StepProgress {
-                                    step_id: step.id().clone(),
-                                    progress: StepProgress::CompactionEnd,
-                                });
-                            }
                             _ => {}
                         },
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

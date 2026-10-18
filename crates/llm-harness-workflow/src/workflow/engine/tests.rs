@@ -1023,13 +1023,6 @@ fn step_progress_from_maps_coarse_events() {
         other => panic!("expected ToolExecutionEnd Err, got {other:?}"),
     }
 
-    // TurnStart
-    let ev = AgentEvent::TurnStart { index: 2 };
-    match step_progress_from(&ev) {
-        Some(StepProgress::TurnStart { index }) => assert_eq!(index, 2),
-        other => panic!("expected TurnStart, got {other:?}"),
-    }
-
     // TurnEnd
     let ev = AgentEvent::TurnEnd {
         index: 3,
@@ -1083,12 +1076,9 @@ fn step_progress_from_returns_none_for_filtered_events() {
     // AgentStart — filtered
     assert!(step_progress_from(&AgentEvent::AgentStart).is_none());
 
-    // TurnStart — coarse turn-boundary signal (pre-tool "waiting for model" window)
+    // TurnStart — filtered
     let ev = AgentEvent::TurnStart { index: 0 };
-    match step_progress_from(&ev) {
-        Some(StepProgress::TurnStart { index }) => assert_eq!(index, 0),
-        other => panic!("expected TurnStart, got {other:?}"),
-    }
+    assert!(step_progress_from(&ev).is_none());
 
     // MessageStart — filtered
     let ev = AgentEvent::MessageStart {
@@ -8448,25 +8438,13 @@ impl TaskStore for CrashBeforeStateSaveStore {
         let should_crash = self.should_crash.clone();
         let task_id = task_id.clone();
         let state = state.clone();
-        let crash_now = should_crash(&state) && {
-            // Avoid requiring try_update (Rust 1.95). Preserve fetch_update's
-            // checked decrement and SeqCst retry semantics.
-            let mut remaining = self.crashes_remaining.load(Ordering::SeqCst);
-            loop {
-                let Some(next) = remaining.checked_sub(1) else {
-                    break false;
-                };
-                match self.crashes_remaining.compare_exchange_weak(
-                    remaining,
-                    next,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
-                    Ok(_) => break true,
-                    Err(current) => remaining = current,
-                }
-            }
-        };
+        let crash_now = should_crash(&state)
+            && self
+                .crashes_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
         Box::pin(async move {
             if crash_now {
                 anyhow::bail!("simulated crash before state save");

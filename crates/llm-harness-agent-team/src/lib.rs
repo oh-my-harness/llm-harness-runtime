@@ -10,7 +10,6 @@ mod agent_id;
 mod agent_runner;
 mod chat_history_journal;
 mod contact;
-mod controlled;
 mod error;
 mod group_reply;
 mod hooks;
@@ -31,12 +30,11 @@ pub use agent_runner::{
 };
 pub use chat_history_journal::{ChatHistoryEntry, ChatHistoryJournal, ChatHistoryJournalError};
 pub use contact::{ContactIndex, ContactRecord, ContactStore};
-pub use controlled::terminal_task_report;
 pub use error::{Result, TeamError};
 pub use group_reply::GroupReplyContext;
 pub use hooks::TeamBeforeRunHook;
 pub use inbox::priority;
-pub use inbox::{ChatView, InboxMessage, InboxQueue, InboxStore, MessageType, TaskMessageKind};
+pub use inbox::{ChatView, InboxMessage, InboxQueue, InboxStore, MessageType};
 pub use inbox_journal::{InboxJournal, InboxJournalError};
 pub use individual_spec::IndividualSpec;
 pub use memory_store::{

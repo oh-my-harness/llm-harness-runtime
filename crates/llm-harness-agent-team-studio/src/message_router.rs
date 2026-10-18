@@ -190,7 +190,6 @@ mod tests {
             template_baseline: None,
             name: "T".into(),
             repo_path: None,
-            sandbox_mode: None,
             members: vec![m, member("verifier"), member("curriculum")],
         };
 

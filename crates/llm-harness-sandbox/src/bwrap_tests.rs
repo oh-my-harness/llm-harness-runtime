@@ -35,7 +35,6 @@ fn default_config(work_dir: PathBuf) -> SandboxConfig {
         },
         work_dir: Some(work_dir),
         trust_profile: Default::default(),
-        host_binds: vec![],
     }
 }
 
@@ -54,7 +53,6 @@ fn owned_config() -> SandboxConfig {
         },
         work_dir: None,
         trust_profile: Default::default(),
-        host_binds: vec![],
     }
 }
 
@@ -158,8 +156,6 @@ async fn file_api_enforces_fs_denylist() {
             timeout: None,
         },
         work_dir: Some(dir.path().to_path_buf()),
-        trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
-        host_binds: vec![],
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let error = sandbox
@@ -188,8 +184,6 @@ fn config_with_net_allowlist_rules_is_rejected() {
             timeout: None,
         },
         work_dir: Some(dir.path().to_path_buf()),
-        trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
-        host_binds: vec![],
     };
     let result = BwrapSandbox::new(config);
     assert!(result.is_err(), "net_allowlist rules must be rejected");
@@ -211,8 +205,6 @@ fn config_with_disk_limit_is_rejected() {
             timeout: None,
         },
         work_dir: Some(dir.path().to_path_buf()),
-        trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
-        host_binds: vec![],
     };
     let result = BwrapSandbox::new(config);
     assert!(result.is_err(), "max_disk_mb must be rejected");
@@ -335,8 +327,6 @@ async fn file_api_allows_fs_allowlist_paths() {
             timeout: None,
         },
         work_dir: Some(work_dir),
-        trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
-        host_binds: vec![],
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let env = sandbox.env.clone();
@@ -551,8 +541,6 @@ async fn reset_refuses_root_path() {
             timeout: None,
         },
         work_dir: Some(PathBuf::from("/")),
-        trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
-        host_binds: vec![],
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let result = sandbox.reset().await;
@@ -577,8 +565,6 @@ async fn reset_refuses_var_lib() {
             timeout: None,
         },
         work_dir: Some(PathBuf::from("/var/lib")),
-        trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
-        host_binds: vec![],
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let result = sandbox.reset().await;
@@ -604,8 +590,6 @@ async fn reset_refuses_tmp_directory() {
             timeout: None,
         },
         work_dir: Some(PathBuf::from("/tmp")),
-        trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
-        host_binds: vec![],
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let result = sandbox.reset().await;
@@ -627,8 +611,6 @@ async fn reset_refuses_dot_path() {
             timeout: None,
         },
         work_dir: Some(PathBuf::from(".")),
-        trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
-        host_binds: vec![],
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let result = sandbox.reset().await;
@@ -854,8 +836,6 @@ fn mapped_policy_paths_reject_symlink_escape() {
             timeout: None,
         },
         work_dir: None,
-        trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
-        host_binds: vec![],
     };
     let error = BwrapSandbox::new_mapped(config, work_dir, PathBuf::from("/workspace"))
         .expect_err("mapped policy paths must reject symlinks");
@@ -877,70 +857,6 @@ async fn shell_enforces_cgroup_process_limit() {
 
     let result = env.execute_shell("sleep 0.2 & wait", shell_opts()).await;
     assert!(result.is_err(), "pids.max=1 must reject descendant fork");
-    Box::new(sandbox).shutdown().await.unwrap();
-}
-
-#[tokio::test]
-#[ignore = "requires bwrap; run with --include-ignored"]
-async fn restricted_host_binds_do_not_expose_host_files() {
-    assert!(
-        bwrap_available(),
-        "this explicit isolation test requires working bwrap namespaces"
-    );
-    let dir = tempfile::tempdir().unwrap();
-    let work_dir = dir.path().join("workspace");
-    let allowed_dir = dir.path().join("allowed");
-    let host_dir = dir.path().join("extra-host-project");
-    for path in [&work_dir, &allowed_dir, &host_dir] {
-        std::fs::create_dir(path).unwrap();
-    }
-    std::fs::write(work_dir.join("readable.txt"), "workspace_content").unwrap();
-    let allowed_file = allowed_dir.join("readable.txt");
-    std::fs::write(&allowed_file, "allowlist_content").unwrap();
-    let host_file = host_dir.join("secret.txt");
-    std::fs::write(&host_file, "host_bind_secret").unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&host_file).unwrap(),
-        "host_bind_secret"
-    );
-    let guest_dir = PathBuf::from("/extra-host-project");
-    let guest_file = guest_dir.join("secret.txt");
-    let mut config = default_config(work_dir.clone());
-    config.fs_allowlist = vec![allowed_dir];
-    config.host_binds = vec![llm_harness_platform::sandbox::HostBind {
-        host: host_dir.clone(),
-        guest: guest_dir.clone(),
-    }];
-    let sandbox = BwrapSandbox::new(config).unwrap();
-    sandbox.start().await.unwrap();
-    let env = sandbox.env.clone();
-    let args = env.build_bwrap_args(&work_dir);
-    eprintln!("Restricted real isolation bwrap args: {args:?}");
-    assert!(!args.iter().any(|arg| arg == host_dir.to_str().unwrap()));
-    assert!(!args.iter().any(|arg| arg == guest_dir.to_str().unwrap()));
-    let mut opts = shell_opts();
-    opts.timeout = Some(Duration::from_secs(10));
-    opts.env = vec![
-        ("HOST_SECRET", host_file.to_str().unwrap()),
-        ("GUEST_SECRET", guest_file.to_str().unwrap()),
-        ("ALLOWED_FILE", allowed_file.to_str().unwrap()),
-    ];
-    let result = env
-        .execute_shell(
-            "test \"$(cat readable.txt)\" = workspace_content && \
-             test \"$(cat \"$ALLOWED_FILE\")\" = allowlist_content && \
-             echo INTERNAL_MOUNTS_OK; \
-             if cat \"$GUEST_SECRET\" 2>/dev/null; then echo GUEST_LEAK; else echo GUEST_BLOCKED; fi; \
-             if cat \"$HOST_SECRET\" 2>/dev/null; then echo HOST_LEAK; else echo HOST_BLOCKED; fi",
-            opts,
-        )
-        .await
-        .unwrap();
-    eprintln!("Restricted real isolation stdout: {:?}", result.stdout);
-    assert_eq!(
-        result.stdout.trim(),
-        "INTERNAL_MOUNTS_OK\nGUEST_BLOCKED\nHOST_BLOCKED"
-    );
     Box::new(sandbox).shutdown().await.unwrap();
 }
 
@@ -1216,8 +1132,6 @@ async fn config_timeout_enforced_as_upper_bound() {
             timeout: Some(Duration::from_secs(1)),
         },
         work_dir: Some(work_dir),
-        trust_profile: llm_harness_platform::trust::TrustProfile::Restricted,
-        host_binds: vec![],
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     sandbox.start().await.unwrap();

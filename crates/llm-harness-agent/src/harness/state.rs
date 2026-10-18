@@ -46,10 +46,6 @@ pub struct HarnessState {
     pub(crate) pending_session_writes: VecDeque<SessionEntryPayload>,
     /// Messages queued for injection at the start of the next `prompt()`.
     pub(crate) queued_next_turn: Vec<AgentMessage>,
-    /// Set when run-end salvage recovered steers the loop never consumed.
-    /// The owning scheduler (agent-team runner) reads and clears it to decide
-    /// whether the drained inbox messages must be requeued instead of acked.
-    pub(crate) salvaged_steers: bool,
     /// Error text from the most recent failed LLM call.
     pub error_message: Option<String>,
     /// Whether `set_tools` was called mid-run since the last `build_loop_config`.

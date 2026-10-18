@@ -159,7 +159,6 @@ impl TimeoutManager {
                     TimeoutKind::SelfReminder => crate::inbox::priority::SELF_REMINDER,
                 },
                 task_id: request.task_id.clone(),
-                task_kind: None,
                 broadcast_id: None,
                 message_id: None,
             }) {

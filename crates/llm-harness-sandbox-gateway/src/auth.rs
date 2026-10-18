@@ -249,7 +249,6 @@ impl GatewayConfig {
         &self.backend
     }
 
-    #[cfg(unix)]
     pub(crate) fn prepare_work_root(&mut self) -> anyhow::Result<PathBuf> {
         let candidate = self
             .work_root
@@ -283,11 +282,6 @@ impl GatewayConfig {
         }
         self.work_root = Some(canonical.clone());
         Ok(canonical)
-    }
-
-    #[cfg(not(unix))]
-    pub(crate) fn prepare_work_root(&mut self) -> anyhow::Result<PathBuf> {
-        anyhow::bail!("gateway work root requires Unix permission enforcement")
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
@@ -324,9 +318,6 @@ impl GatewayConfig {
                 }
             }
             GatewayBackend::Os => {
-                #[cfg(not(target_os = "macos"))]
-                anyhow::bail!("os backend is only available on macOS");
-                #[cfg(target_os = "macos")]
                 if self.work_root.is_none() {
                     anyhow::bail!("os backend requires an explicit work root");
                 }
@@ -375,7 +366,6 @@ impl GatewayConfig {
     }
 }
 
-#[cfg(unix)]
 fn validate_firecracker_backend(
     config: &FirecrackerBackendConfig,
     max_sandboxes: usize,
@@ -463,14 +453,6 @@ fn validate_firecracker_backend(
         anyhow::bail!("firecracker readiness_timeout must be positive");
     }
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_firecracker_backend(
-    _config: &FirecrackerBackendConfig,
-    _max_sandboxes: usize,
-) -> anyhow::Result<()> {
-    anyhow::bail!("firecracker backend requires Unix executable permission enforcement")
 }
 
 fn is_guest_workspace_path(value: &str) -> bool {

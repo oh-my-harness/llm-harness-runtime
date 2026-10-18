@@ -142,11 +142,7 @@ pub fn build_providers(
             continue;
         }
         let client: Arc<dyn llm_harness_loop::LlmClient> = if base_url.is_empty() {
-            Arc::new(
-                llm_harness_loop::OpenAIProvider::builder(key)
-                    .max_tokens_scheme(llm_harness_loop::MaxTokensScheme::MaxCompletionTokens)
-                    .build(),
-            )
+            Arc::new(llm_harness_loop::OpenAIProvider::builder(key).build())
         } else {
             Arc::new(llm_harness_loop::openai_compatible(key, base_url))
         };
