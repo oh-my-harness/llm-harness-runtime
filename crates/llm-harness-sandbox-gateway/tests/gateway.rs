@@ -1,8 +1,12 @@
+#![cfg(unix)]
+
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use llm_harness_platform::sandbox::NetRule;
 use llm_harness_platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_sandbox_gateway::{
     FirecrackerBackendConfig, GatewayBackend, GatewayConfig, GatewayPrincipalConfig, SandboxGateway,
@@ -2085,4 +2089,36 @@ async fn create_response_echoes_host_binds() {
         std::path::Path::new(&response.host_binds[0].host),
         project.path()
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gateway_rejects_os_backend_without_creating_a_work_root() {
+    let parent = tempfile::tempdir().expect("parent directory");
+    let work_root = parent.path().join("unsupported-os");
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.clone())
+        .with_backend(GatewayBackend::Os);
+    let error = match SandboxGateway::new(config) {
+        Ok(_) => panic!("Linux must not fall back to host execution"),
+        Err(error) => error,
+    };
+    assert_eq!(error.to_string(), "os backend is only available on macOS");
+    assert!(!work_root.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bwrap_create_response_only_echoes_configured_binds() {
+    let project = private_tempdir();
+    let mut tenant = principal("tenant-a", TOKEN_A);
+    tenant.host_project_dirs = vec![project.path().to_path_buf()];
+    let gateway = start_gateway(vec![tenant]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+    let response = client
+        .create_sandbox(sandbox_config())
+        .await
+        .expect("create");
+    assert!(response.host_binds.is_empty());
 }
