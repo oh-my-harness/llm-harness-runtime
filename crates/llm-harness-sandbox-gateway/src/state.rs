@@ -767,6 +767,7 @@ impl GatewayState {
         self.rate_limiter.check(principal, requests_per_minute)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn check_sandbox_capacity(
         &self,
         sandboxes: &HashMap<String, SandboxRecord>,
