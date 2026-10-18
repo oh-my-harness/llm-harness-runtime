@@ -8,6 +8,7 @@
 //! in the persisted team spec for comparability.
 
 use std::process::Stdio;
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 use std::time::Duration;
 
