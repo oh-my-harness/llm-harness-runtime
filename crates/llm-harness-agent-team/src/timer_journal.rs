@@ -259,6 +259,7 @@ mod tests {
                 message_type: MessageType::Timeout,
                 priority: crate::inbox::priority::TIMEOUT,
                 task_id: Some("task".into()),
+                task_kind: None,
                 broadcast_id: None,
                 message_id: None,
             })
@@ -341,6 +342,7 @@ mod tests {
             message_type: crate::inbox::MessageType::Direct,
             priority: crate::inbox::priority::NORMAL,
             task_id: Some("task".into()),
+            task_kind: None,
             broadcast_id: None,
             message_id: None,
         };

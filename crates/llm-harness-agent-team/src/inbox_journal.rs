@@ -145,7 +145,7 @@ impl InboxJournal {
 mod tests {
     use super::*;
     use crate::AgentId;
-    use crate::inbox::{MessageType, priority};
+    use crate::inbox::{MessageType, TaskMessageKind, priority};
 
     fn message(body: &str) -> InboxMessage {
         InboxMessage {
@@ -156,6 +156,7 @@ mod tests {
             message_type: MessageType::Direct,
             priority: priority::NORMAL,
             task_id: None,
+            task_kind: None,
             broadcast_id: None,
             message_id: None,
         }
@@ -197,6 +198,22 @@ mod tests {
         assert_eq!(
             recovered[0].message.message_id.as_deref(),
             Some("stable-message-id")
+        );
+    }
+
+    #[test]
+    fn task_kind_round_trips_for_restart_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = InboxJournal::open(temp.path().join("inbox.sqlite3")).unwrap();
+        let mut sent = message("typed result");
+        sent.task_kind = Some(TaskMessageKind::Result);
+        journal.enqueue(&sent).unwrap();
+
+        let recovered = journal.recover().unwrap();
+
+        assert_eq!(
+            recovered[0].message.task_kind,
+            Some(TaskMessageKind::Result)
         );
     }
 
