@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,7 +17,9 @@ use futures::future::BoxFuture;
 use llm_harness_platform::sandbox::{NetRule, ResourceLimits, Sandbox, SandboxConfig};
 #[cfg(target_os = "linux")]
 use llm_harness_sandbox::BwrapSandbox;
+#[cfg(target_os = "macos")]
 use llm_harness_sandbox::OsEnvSandbox;
+#[cfg(target_os = "macos")]
 use llm_harness_sandbox::SeatbeltSandbox;
 use llm_harness_sandbox_remote::RemoteSandboxConfig;
 use llm_harness_sandbox_remote::protocol::RemoteSandboxState;
@@ -829,6 +834,7 @@ impl GatewayState {
         if let crate::auth::GatewayBackend::Seatbelt = self.config.backend() {
             return self.create_seatbelt_sandbox(principal, request);
         }
+        #[cfg(target_os = "macos")]
         if let crate::auth::GatewayBackend::Os = self.config.backend() {
             return self.create_os_sandbox(principal, request);
         }
@@ -860,6 +866,11 @@ impl GatewayState {
             .map_err(GatewayStateError::InvalidConfig)?;
         let sandbox_config =
             build_sandbox_config(&request).map_err(GatewayStateError::InvalidConfig)?;
+        let host_binds = sandbox_config
+            .host_binds
+            .iter()
+            .map(|bind| (bind.host.clone(), bind.guest.clone()))
+            .collect();
         let sandbox_id = uuid::Uuid::new_v4().to_string();
         let work_dir = self.work_root.join("sandboxes").join(&sandbox_id);
         std::fs::DirBuilder::new()
@@ -1017,6 +1028,7 @@ impl GatewayState {
     /// No-isolation backend: per-sandbox work dir on the host, no isolation
     /// policy. Tools run with the gateway process's full host access — only
     /// appropriate for fully-trusted single-user setups.
+    #[cfg(target_os = "macos")]
     fn create_os_sandbox(
         &self,
         principal: &AuthenticatedPrincipal,
@@ -1659,6 +1671,7 @@ fn restore_sandbox(
     }
 }
 
+#[cfg(unix)]
 fn create_private_directory(path: &std::path::Path) -> anyhow::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -1677,6 +1690,12 @@ fn create_private_directory(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn create_private_directory(_path: &Path) -> anyhow::Result<()> {
+    anyhow::bail!("gateway private directories require Unix permission enforcement")
+}
+
+#[cfg(unix)]
 fn lock_work_root(work_root: &std::path::Path) -> anyhow::Result<File> {
     let lock_path = work_root.join(".gateway.lock");
     let file = std::fs::OpenOptions::new()
@@ -1702,11 +1721,17 @@ fn lock_work_root(work_root: &std::path::Path) -> anyhow::Result<File> {
     Ok(file)
 }
 
+#[cfg(not(unix))]
+fn lock_work_root(_work_root: &Path) -> anyhow::Result<File> {
+    anyhow::bail!("gateway work root locking is unavailable on this platform")
+}
+
 const REGISTRY_APPLICATION_ID: i64 = 0x4c_48_53_47;
 const REGISTRY_SCHEMA_VERSION: i64 = 2;
 const REGISTRY_VSOCK_CID_INDEX: &str = "idx_sandboxes_vsock_guest_cid";
 
-fn open_registry(path: &std::path::Path) -> anyhow::Result<Connection> {
+#[cfg(unix)]
+fn open_registry_file(path: &Path) -> anyhow::Result<File> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1721,7 +1746,16 @@ fn open_registry(path: &std::path::Path) -> anyhow::Result<Connection> {
     if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
         anyhow::bail!("gateway sandbox registry must have 0600 permissions");
     }
+    Ok(file)
+}
 
+#[cfg(not(unix))]
+fn open_registry_file(_path: &Path) -> anyhow::Result<File> {
+    anyhow::bail!("gateway sandbox registry requires Unix permission enforcement")
+}
+
+fn open_registry(path: &std::path::Path) -> anyhow::Result<Connection> {
+    let _file = open_registry_file(path)?;
     let connection = Connection::open(path)?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     let journal_mode = connection.query_row("PRAGMA journal_mode = WAL", [], |row| {
