@@ -35,6 +35,7 @@ fn default_config(work_dir: PathBuf) -> SandboxConfig {
         },
         work_dir: Some(work_dir),
         trust_profile: Default::default(),
+        host_binds: Vec::new(),
     }
 }
 
@@ -53,6 +54,7 @@ fn owned_config() -> SandboxConfig {
         },
         work_dir: None,
         trust_profile: Default::default(),
+        host_binds: Vec::new(),
     }
 }
 
@@ -156,6 +158,8 @@ async fn file_api_enforces_fs_denylist() {
             timeout: None,
         },
         work_dir: Some(dir.path().to_path_buf()),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let error = sandbox
@@ -184,6 +188,8 @@ fn config_with_net_allowlist_rules_is_rejected() {
             timeout: None,
         },
         work_dir: Some(dir.path().to_path_buf()),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     let result = BwrapSandbox::new(config);
     assert!(result.is_err(), "net_allowlist rules must be rejected");
@@ -205,6 +211,8 @@ fn config_with_disk_limit_is_rejected() {
             timeout: None,
         },
         work_dir: Some(dir.path().to_path_buf()),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     let result = BwrapSandbox::new(config);
     assert!(result.is_err(), "max_disk_mb must be rejected");
@@ -327,6 +335,8 @@ async fn file_api_allows_fs_allowlist_paths() {
             timeout: None,
         },
         work_dir: Some(work_dir),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let env = sandbox.env.clone();
@@ -541,6 +551,8 @@ async fn reset_refuses_root_path() {
             timeout: None,
         },
         work_dir: Some(PathBuf::from("/")),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let result = sandbox.reset().await;
@@ -565,6 +577,8 @@ async fn reset_refuses_var_lib() {
             timeout: None,
         },
         work_dir: Some(PathBuf::from("/var/lib")),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let result = sandbox.reset().await;
@@ -590,6 +604,8 @@ async fn reset_refuses_tmp_directory() {
             timeout: None,
         },
         work_dir: Some(PathBuf::from("/tmp")),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let result = sandbox.reset().await;
@@ -611,6 +627,8 @@ async fn reset_refuses_dot_path() {
             timeout: None,
         },
         work_dir: Some(PathBuf::from(".")),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     let result = sandbox.reset().await;
@@ -836,6 +854,8 @@ fn mapped_policy_paths_reject_symlink_escape() {
             timeout: None,
         },
         work_dir: None,
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     let error = BwrapSandbox::new_mapped(config, work_dir, PathBuf::from("/workspace"))
         .expect_err("mapped policy paths must reject symlinks");
@@ -1132,6 +1152,8 @@ async fn config_timeout_enforced_as_upper_bound() {
             timeout: Some(Duration::from_secs(1)),
         },
         work_dir: Some(work_dir),
+        trust_profile: Default::default(),
+        host_binds: Vec::new(),
     };
     let sandbox = BwrapSandbox::new(config).unwrap();
     sandbox.start().await.unwrap();
