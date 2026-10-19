@@ -1,5 +1,7 @@
 # llm-harness-runtime
 
+> **V0.1.1 同事入口**：[Studio 快速开始](https://github.com/oh-my-harness/senza-studio/blob/review/senza-studio-v011-20261019-658ae4bb/docs/v0-quickstart.md)。[本仓库 Agent Team 指南](docs/agent-team-guide.md) 区分 P2P SDK 与受控产品工作流。
+
 > **[MISSION.md](MISSION.md)** — 本仓库及 harness 小组的纲领文档。从第一性原理推导 harness 的本质与使命，所有开发/业务决策以此为准。
 
 Rust implementation of the oh-my-harness LLM agent orchestration runtime: workflow engine, agent harness, tools, event stream, and sandboxing.

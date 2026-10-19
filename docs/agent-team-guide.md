@@ -1,5 +1,12 @@
 # Agent Team 指南
 
+> **V0.1.1 首次使用入口**：[Senza Studio 快速开始](https://github.com/oh-my-harness/senza-studio/blob/review/senza-studio-v011-20261019-658ae4bb/docs/v0-quickstart.md)
+> 下方开头的 P2P/`delegate_task` 是通用 SDK 模式；产品内置 `coding-team` 是受控工作流，
+> 普通聊天统一经 Orchestrator，执行成员向 `pipeline-controller` 返回关联结果，不需要用户手工转发。
+> v0.1.1 新增 `POST /api/team/workflow/stop?project=<id>`，Studio 有“停止工作流”按钮；
+> 停止后要显式发起新目标，不会自动续跑。存储租约获取失败会报告 `Escalated` 终态，
+> TurnStart/Compaction 进度事件不等同任务完成。
+
 > `llm-harness-agent-team` 提供去中心化（P2P）的多 Agent 协作：成员之间直接委派任务、互发消息，无需中央调度器。人类操作员（operator）通过 `AgentTeam::submit` 派活、`AgentTeam::receive` 收结果。
 >
 > 与 `llm-harness-subagents` 的区别：subagents 是**主从模式**（main agent fork 子 agent、等待结果）；agent-team 是**对等模式**（每个成员是自驱动的 agent，可互相委派与通信，无主从关系）。
@@ -171,7 +178,8 @@ reviewer 只产出 findings，无 judge 裁决层）是第一个官方模板。
 ./scripts/studio.sh            # 构建 → headless 启动
 ```
 
-`llm-harness-app` 是 runtime headless 服务入口。它只提供 AgentTeam HTTP/WS
+本指南的实际源码入口是 `cargo run -p llm-harness-agent-team-studio --bin agent-studio`；
+`./scripts/studio.sh` 是其发布模式构建启动脚本。它提供 AgentTeam HTTP/WS
 API、生命周期和诊断接口；产品 UI 由 Senza Studio 承载。
 
 服务只绑定 loopback，并对所有 `/api/*` 请求启用 per-process bearer token。
