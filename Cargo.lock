@@ -2290,6 +2290,7 @@ dependencies = [
  "llm-harness-strategy",
  "llm-harness-subagents",
  "llm-harness-types",
+ "llm_adapter",
  "parking_lot",
  "rusqlite",
  "serde",
@@ -2322,6 +2323,7 @@ dependencies = [
  "llm-harness-strategy",
  "llm-harness-tools",
  "llm-harness-types",
+ "llm_adapter",
  "parking_lot",
  "serde",
  "serde_json",
@@ -2891,7 +2893,7 @@ dependencies = [
 [[package]]
 name = "llm_adapter"
 version = "0.1.0"
-source = "git+https://github.com/oh-my-harness/llm-api-adapter?rev=864050882254e12cbda33359debae40a03a4b35f#864050882254e12cbda33359debae40a03a4b35f"
+source = "git+https://github.com/oh-my-harness/llm-api-adapter?rev=de4abe1e3a3ff0f01daf758c729542b89c31ef37#de4abe1e3a3ff0f01daf758c729542b89c31ef37"
 dependencies = [
  "async-trait",
  "eventsource-stream",

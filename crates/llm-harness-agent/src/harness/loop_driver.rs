@@ -260,6 +260,12 @@ impl AgentHarness {
                     self.hooks.provider_error.clone(),
                 )) as Arc<dyn ProviderErrorHook>
             }),
+            // Hook-driven same-turn resends are hard-capped at 1 per turn:
+            // the adapter cannot yet distinguish a trusted 400 input
+            // rejection from an unknown-outcome gateway failure folded into
+            // `InvalidRequest`, so an unbounded repair retry would replay
+            // the request.
+            max_provider_error_retries: None,
             steer_rx: Some(steer_rx),
             follow_up_rx: Some(follow_up_rx),
             retry,
@@ -413,6 +419,16 @@ impl AgentHarness {
         let mut turn_messages: Vec<AgentMessage> = vec![];
 
         while let Some(event) = stream.next().await {
+            if matches!(
+                &event,
+                AgentEvent::MessageStart { .. } | AgentEvent::ToolExecutionStart { .. }
+            ) {
+                let mut inner = self.inner.lock().unwrap();
+                inner.state.replay_has_progress = true;
+                if matches!(&event, AgentEvent::ToolExecutionStart { .. }) {
+                    inner.state.replay_tool_started = true;
+                }
+            }
             match &event {
                 AgentEvent::AgentStart => {
                     self.emit(AgentHarnessEvent::Agent(event));
@@ -595,6 +611,7 @@ impl AgentHarness {
                     {
                         let mut inner = self.inner.lock().unwrap();
                         inner.state.error_message = Some(e.to_string());
+                        inner.state.last_error = Some(e.clone());
                     }
                     self.emit(AgentHarnessEvent::Agent(event));
                 }

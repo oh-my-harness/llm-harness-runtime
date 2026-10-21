@@ -55,16 +55,28 @@ pub(crate) struct ControlledWorkerRun {
 pub(crate) struct ControlledTaskRegistry {
     tasks: Mutex<HashMap<String, CancellationToken>>,
     completed: Mutex<HashSet<String>>,
+    replay_blocked: Mutex<HashMap<String, String>>,
 }
 
 impl ControlledTaskRegistry {
     pub(crate) fn begin(&self, task_id: &str) -> CancellationToken {
         let token = CancellationToken::new();
         self.completed.lock().remove(task_id);
+        self.replay_blocked.lock().remove(task_id);
         if let Some(previous) = self.tasks.lock().insert(task_id.to_owned(), token.clone()) {
             previous.cancel();
         }
         token
+    }
+
+    pub(crate) fn block_replay(&self, task_id: &str, reason: String) {
+        self.replay_blocked
+            .lock()
+            .insert(task_id.to_owned(), reason);
+    }
+
+    pub(crate) fn take_replay_block(&self, task_id: &str) -> Option<String> {
+        self.replay_blocked.lock().remove(task_id)
     }
 
     pub(crate) fn token(&self, task_id: &str) -> Option<CancellationToken> {
@@ -160,6 +172,11 @@ impl ControlledWorkerRun {
 pub(crate) struct DecisionWorkerRun {
     task_id: String,
     decided: Arc<AtomicBool>,
+    /// The model attempted a decision delivery to the controller for this
+    /// task (valid or malformed). A malformed attempt is nonterminal
+    /// progress already visible to the controller, so the runner must not
+    /// treat the run as silently missing an ACTION.
+    decision_attempted: Arc<AtomicBool>,
     decision_delivered: CancellationToken,
 }
 
@@ -168,25 +185,37 @@ impl DecisionWorkerRun {
         Self {
             task_id: task_id.into(),
             decided: Arc::new(AtomicBool::new(false)),
+            decision_attempted: Arc::new(AtomicBool::new(false)),
             decision_delivered: CancellationToken::new(),
         }
     }
 
     pub(crate) fn record_delivery(&self, to: &str, task_id: Option<&str>, body: &str) -> bool {
-        if to == "pipeline-controller"
-            && task_id == Some(self.task_id.as_str())
-            && parse_action(body).is_some()
-            && self
-                .decided
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            // Delivery is durable at this point; sealing cannot invalidate
-            // the authoritative decision.
-            self.decision_delivered.cancel();
-            return true;
+        if to == "pipeline-controller" && task_id == Some(self.task_id.as_str()) {
+            // Any correlated send_message attempt — including a malformed
+            // ACTION the controller grammar will reject — is visible
+            // progress at the controller; the decision timeout owns the
+            // terminal from there.
+            self.decision_attempted.store(true, Ordering::Release);
+            if parse_action(body).is_some()
+                && self
+                    .decided
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                // Delivery is durable at this point; sealing cannot invalidate
+                // the authoritative decision.
+                self.decision_delivered.cancel();
+                return true;
+            }
         }
         false
+    }
+
+    /// True when the model ended the decision run without attempting any
+    /// correlated controller delivery at all.
+    pub(crate) fn was_silent(&self) -> bool {
+        !self.decision_attempted.load(Ordering::Acquire)
     }
 
     pub(crate) fn was_decided(&self) -> bool {
@@ -344,5 +373,35 @@ mod tests {
             Some("task-pipe-d1"),
             "ACTION: FINISH\nlate",
         ));
+    }
+
+    #[test]
+    fn decision_silence_tracks_only_correlated_delivery_attempts() {
+        // A malformed ACTION is not a decision, but a correlated delivery
+        // attempt (even malformed) ends the silence: the controller has
+        // visible progress and the decision timeout owns the terminal.
+        let receipt = DecisionWorkerRun::new("task-pipe-d2");
+        assert!(receipt.was_silent());
+        // Uncorrelated deliveries never count as an attempt.
+        assert!(!receipt.record_delivery("operator", Some("task-pipe-d2"), "ACTION: FINISH\nx"));
+        assert!(!receipt.record_delivery(
+            "pipeline-controller",
+            Some("other"),
+            "ACTION: FINISH\nx"
+        ));
+        assert!(
+            receipt.was_silent(),
+            "uncorrelated deliveries are not attempts"
+        );
+        // A malformed correlated ACTION is not a decision, but it IS an
+        // attempt: the run is no longer silent.
+        assert!(!receipt.record_delivery(
+            "pipeline-controller",
+            Some("task-pipe-d2"),
+            "prose\nACTION: FINISH",
+        ));
+        assert!(!receipt.was_decided(), "malformed ACTION never seals");
+        assert!(!receipt.was_silent(), "correlated attempt ends the silence");
+        assert!(!receipt.decision_delivered().is_cancelled());
     }
 }

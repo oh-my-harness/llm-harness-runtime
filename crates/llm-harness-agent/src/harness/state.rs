@@ -52,6 +52,12 @@ pub struct HarnessState {
     pub(crate) salvaged_steers: bool,
     /// Error text from the most recent failed LLM call.
     pub error_message: Option<String>,
+    /// Structured error for scheduler replay decisions; never infer from text.
+    pub last_error: Option<AgentError>,
+    /// A response stream or a tool started during this run. Replaying the
+    /// assignment would discard known progress or repeat possible side effects.
+    pub replay_has_progress: bool,
+    pub replay_tool_started: bool,
     /// Whether `set_tools` was called mid-run since the last `build_loop_config`.
     /// Cleanup uses this to avoid rolling back the user's tool change together
     /// with the HookedTool unwrap.

@@ -122,6 +122,9 @@ impl AgentHarness {
             queued_next_turn: vec![],
             salvaged_steers: false,
             error_message: None,
+            last_error: None,
+            replay_has_progress: false,
+            replay_tool_started: false,
         };
 
         let inner = HarnessInner {
@@ -219,13 +222,28 @@ impl AgentHarness {
                 return Err(HarnessError::NotIdle(inner.state.phase));
             }
             inner.state.error_message = None;
+            inner.state.last_error = None;
+            inner.state.replay_has_progress = false;
+            inner.state.replay_tool_started = false;
             std::mem::take(&mut inner.state.queued_next_turn)
         };
 
-        self.try_auto_compact().await?;
-        let initial: Vec<AgentMessage> = queued.into_iter().chain(messages).collect();
-        let initial = self.run_before_run_hook(&run, initial).await?;
-        self.run_loop(run, initial).await
+        let result = async {
+            self.try_auto_compact().await?;
+            let initial: Vec<AgentMessage> = queued.into_iter().chain(messages).collect();
+            let initial = self.run_before_run_hook(&run, initial).await?;
+            self.run_loop(run, initial).await
+        }
+        .await;
+        if let Err(error) = &result {
+            let mut inner = self.inner.lock().unwrap();
+            inner.state.error_message = Some(error.to_string());
+            inner.state.last_error = Some(match error {
+                HarnessError::Agent(error) => error.clone(),
+                _ => AgentError::Internal(error.to_string()),
+            });
+        }
+        result
     }
 
     /// Expand `name` as a skill invocation and start a run.

@@ -1662,6 +1662,9 @@ impl PipelineController {
                     }
                     self.ctx.complete_controlled_task(task_id);
                     self.consume_obsolete_pipeline_messages();
+                    if let Some(reason) = self.ctx.take_task_replay_block(task_id) {
+                        return Err(reason);
+                    }
                     return Ok(messages[idx].clone());
                 }
                 None => {

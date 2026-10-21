@@ -211,11 +211,17 @@ fn handle_controlled_failure(
         ctx.ack_inbox_messages(&assignment_messages);
         ctx.return_messages(member, unrelated_messages);
         let body = format!(
-            "runtime execution failure: controlled task retry budget exhausted after {}/{} attempts; last_failure_category={}",
+            "runtime execution failure: controlled task retry budget exhausted after {}/{} attempts; last_failure_category={}; {detail}",
             attempt.number,
             MAX_CONTROLLED_ATTEMPTS,
             category.as_str(),
         );
+        let body = if member.as_str() == ORCHESTRATOR {
+            ctx.block_task_replay(&attempt.task_id, body.clone());
+            format!("ACTION: ESCALATE\n{body}")
+        } else {
+            body
+        };
         if let Err(delivery_error) = ctx.send_direct_with_task_kind(
             member,
             &AgentId::new(PIPELINE_CONTROLLER),
@@ -234,6 +240,63 @@ fn handle_controlled_failure(
             );
         }
         false
+    }
+}
+
+/// Consume uncertain work without replaying it. Runtime delivery is a message
+/// operation, not a new model generation. Preserve unrelated inbox work.
+fn stop_unsafe_replay(
+    ctx: &SocialContext,
+    member: &AgentId,
+    messages: &[InboxMessage],
+    task_id: Option<&str>,
+    detail: &str,
+) {
+    let reason = format!(
+        "runtime execution failure: automatic replay suppressed; manual verification required; {detail}"
+    );
+    error!(event = "task_replay_suppressed", member = %member, task_id, detail);
+    if let Some(task_id) = task_id {
+        ctx.block_task_replay(task_id, reason.clone());
+        let body = if member.as_str() == ORCHESTRATOR {
+            format!("ACTION: ESCALATE\n{reason}")
+        } else {
+            reason
+        };
+        if let Err(error) = ctx.send_direct_with_task_kind(
+            member,
+            &AgentId::new(PIPELINE_CONTROLLER),
+            body,
+            10_000,
+            Some(task_id.to_owned()),
+            None,
+            Some(crate::TaskMessageKind::Error),
+        ) {
+            error!(event = "task_replay_suppression_delivery_failed", %error, task_id);
+        }
+        let (owned, rest): (Vec<_>, Vec<_>) = messages.iter().cloned().partition(|m| {
+            m.from.as_str() == PIPELINE_CONTROLLER && m.task_id.as_deref() == Some(task_id)
+        });
+        ctx.ack_inbox_messages(&owned);
+        ctx.return_messages(member, rest);
+        ctx.complete_controlled_task(task_id);
+    } else {
+        // Ordinary assignments have no controller: notify their senders and
+        // consume the batch instead of creating a silent unbounded retry loop.
+        for message in messages {
+            if message.from != *member {
+                let _ = ctx.send_direct_with_task_kind(
+                    member,
+                    &message.from,
+                    reason.clone(),
+                    10_000,
+                    message.task_id.clone(),
+                    None,
+                    Some(crate::TaskMessageKind::Error),
+                );
+            }
+        }
+        ctx.ack_inbox_messages(messages);
     }
 }
 
@@ -878,8 +941,8 @@ impl AgentRunner {
                 let pipeline_task_id = controlled_pipeline_task(&messages).map(str::to_owned);
                 let controlled_worker = controlled_worker_run(&agent_id, &messages);
                 let decision_worker = decision_worker_run(&agent_id, &messages);
-                let controlled_attempt = controlled_worker.as_ref().map(|controlled| {
-                    let task_id = controlled.task_id().to_owned();
+                let controlled_attempt = pipeline_task_id.as_ref().map(|task_id| {
+                    let task_id = task_id.clone();
                     let number = controlled_attempts
                         .entry(task_id.clone())
                         .and_modify(|attempt| *attempt += 1)
@@ -1085,7 +1148,8 @@ impl AgentRunner {
 
                 // Preserve the work turn's outcome before a corrective
                 // finalization run can replace the harness state.
-                let initial_run_error = harness.state().error_message;
+                let initial_run_state = harness.state();
+                let initial_run_error = initial_run_state.error_message.clone();
 
                 let mut retry_delay_secs = None;
                 let mut controlled_reported = controlled_worker
@@ -1197,6 +1261,53 @@ impl AgentRunner {
                     probe.disposition(unconsumed_steers_salvaged, harness.has_queued_messages());
                 }
 
+                let final_state = harness.state();
+                let failed = initial_run_error.is_some()
+                    || final_state.error_message.is_some()
+                    || !matches!(&run_result, Some(Ok(Ok(()))));
+                let has_progress =
+                    initial_run_state.replay_has_progress || final_state.replay_has_progress;
+                let replay_error = final_state
+                    .last_error
+                    .as_ref()
+                    .or(initial_run_state.last_error.as_ref());
+                let tool_started =
+                    initial_run_state.replay_tool_started || final_state.replay_tool_started;
+                let safe_retry = (!has_progress
+                    && replay_error.is_some_and(|e| e.permits_generation_retry()))
+                    || (!tool_started
+                        && replay_error.is_some_and(|e| {
+                            matches!(
+                                e,
+                                llm_harness_types::AgentError::RequiredToolNotCalled(_)
+                                    | llm_harness_types::AgentError::FinalAnswerRejected { .. }
+                            )
+                        }));
+                // Tool progress then a silent decision end (no ACTION and no
+                // correlated controller delivery attempt at all) must not be
+                // replayed: the executed tools would run again. Orchestrator
+                // decision runs are covered in addition to workers; a run
+                // that already attempted a (possibly malformed) delivery has
+                // its progress at the controller, where the decision timeout
+                // owns the terminal.
+                let decision_silent = decision_worker
+                    .as_ref()
+                    .is_some_and(|decision| !decision_accepted && decision.was_silent());
+                let missing_after_tools = pipeline_task_id.is_some()
+                    && (controlled_worker.is_some() || decision_silent)
+                    && (initial_run_state.replay_tool_started || final_state.replay_tool_started);
+                // A decision run that DID attempt a correlated controller
+                // delivery (a malformed ACTION the grammar rejected) has its
+                // progress durably visible to the controller; the decision
+                // timeout owns the terminal. Requeueing here would replay the
+                // generation and re-run already-executed tools, and the
+                // controller timeout cannot prevent that requeue.
+                let decision_attempted_stalled = decision_worker
+                    .as_ref()
+                    .is_some_and(|decision| !decision_accepted && !decision.was_silent())
+                    && pipeline_task_id.is_some()
+                    && (initial_run_state.replay_tool_started || final_state.replay_tool_started);
+
                 if decision_accepted {
                     // A valid correlated ACTION is the decision terminal even
                     // if the sealed harness reported a later run-level error.
@@ -1231,6 +1342,61 @@ impl AgentRunner {
                     }
                     consecutive_failures = 0;
                     ctx.ack_inbox_messages(&messages);
+                } else if decision_attempted_stalled {
+                    // The decision delivery is already at the controller; the
+                    // decision timeout is the only terminal for this round.
+                    // Consume the assignment without requeueing (a replay
+                    // would re-run executed tools) and without a runner-
+                    // authored ESCALATE (which would preempt the deciding
+                    // phase and break the malformed-ACTION-as-progress
+                    // semantics). Block replay so a different task_id can
+                    // never re-dispatch the same uncertain work.
+                    let task_id = pipeline_task_id.as_deref().expect("gated on task id");
+                    let detail =
+                        replay_error
+                            .as_ref()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| {
+                                "decision run delivered a non-parsing ACTION and ended".into()
+                            });
+                    let reason = format!(
+                        "runtime execution failure: automatic replay suppressed; manual verification required; request_outcome=unknown; prior_progress={has_progress}; {detail}"
+                    );
+                    info!(
+                        event = "decision_stall_consumed",
+                        member = %agent_id,
+                        task_id = %task_id,
+                        "malformed decision delivery consumed without replay; decision timeout owns the terminal"
+                    );
+                    ctx.block_task_replay(task_id, reason);
+                    ctx.ack_inbox_messages(&messages);
+                    ctx.complete_controlled_task(task_id);
+                    controlled_attempts.remove(task_id);
+                    consecutive_failures = 0;
+                } else if (failed && !safe_retry) || missing_after_tools {
+                    let detail = if let Some(error) = replay_error {
+                        format!(
+                            "request_outcome={}; prior_progress={has_progress}; {error}",
+                            if error.is_request_rejected() {
+                                "rejected"
+                            } else {
+                                "unknown"
+                            }
+                        )
+                    } else {
+                        "request_outcome=unknown; harness failure or missing terminal after tool progress".into()
+                    };
+                    stop_unsafe_replay(
+                        &ctx,
+                        &agent_id,
+                        &messages,
+                        pipeline_task_id.as_deref(),
+                        &detail,
+                    );
+                    if let Some(task_id) = &pipeline_task_id {
+                        controlled_attempts.remove(task_id);
+                    }
+                    consecutive_failures = 0;
                 } else {
                     match run_result.expect("cancelled run handled above") {
                         Ok(Ok(())) => {
@@ -1331,8 +1497,28 @@ impl AgentRunner {
                                             internal_error = ?harness.state().error_message,
                                             "salvage continuation run failed; re-queuing batch"
                                         );
-                                        consecutive_failures += 1;
-                                        ctx.return_messages(&agent_id, messages);
+                                        let state = harness.state();
+                                        if !initial_run_state.replay_has_progress
+                                            && !state.replay_has_progress
+                                            && state
+                                                .last_error
+                                                .as_ref()
+                                                .is_some_and(|e| e.permits_generation_retry())
+                                        {
+                                            consecutive_failures += 1;
+                                            ctx.return_messages(&agent_id, messages);
+                                        } else {
+                                            stop_unsafe_replay(
+                                                &ctx,
+                                                &agent_id,
+                                                &messages,
+                                                pipeline_task_id.as_deref(),
+                                                &format!(
+                                                    "request_outcome=unknown; continuation failed: {:?}",
+                                                    state.error_message
+                                                ),
+                                            );
+                                        }
                                         ctx.update_status(&agent_id, AgentStatus::Idle);
                                         continue;
                                     }
@@ -2368,7 +2554,12 @@ mod tests {
                 let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async move {
                     if n == 0 {
-                        Err(llm_harness_types::AgentError::Internal("hook boom".into()))
+                        Err(llm_harness_types::AgentError::ProviderTyped {
+                            message: "explicit admission rejection".into(),
+                            kind: llm_harness_types::ProviderErrorKind::RateLimit {
+                                retry_after: None,
+                            },
+                        })
                     } else {
                         Ok(llm_harness_types::BeforeRunResult {
                             additional_messages: vec![],
@@ -2933,9 +3124,10 @@ mod tests {
             > {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async {
-                    Err(llm_harness_types::AgentError::Internal(
-                        "deterministic harness failure".into(),
-                    ))
+                    Err(llm_harness_types::AgentError::ProviderTyped {
+                        message: "explicit admission rejection".into(),
+                        kind: llm_harness_types::ProviderErrorKind::RateLimit { retry_after: None },
+                    })
                 })
             }
         }
@@ -3031,9 +3223,10 @@ mod tests {
             > {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async {
-                    Err(llm_harness_types::AgentError::Internal(
-                        "deterministic failure".into(),
-                    ))
+                    Err(llm_harness_types::AgentError::ProviderTyped {
+                        message: "explicit admission rejection".into(),
+                        kind: llm_harness_types::ProviderErrorKind::RateLimit { retry_after: None },
+                    })
                 })
             }
         }
@@ -3229,9 +3422,10 @@ mod tests {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async {
                     tokio::task::yield_now().await;
-                    Err(llm_harness_types::AgentError::Internal(
-                        "decision provider failed".into(),
-                    ))
+                    Err(llm_harness_types::AgentError::ProviderTyped {
+                        message: "explicit admission rejection".into(),
+                        kind: llm_harness_types::ProviderErrorKind::RateLimit { retry_after: None },
+                    })
                 })
             }
         }
@@ -3273,7 +3467,7 @@ mod tests {
         let runner =
             AgentRunner::new(orchestrator.clone(), harness, ctx.clone(), None, None).spawn();
 
-        for _ in 0..100 {
+        for _ in 0..20 {
             if attempts.load(std::sync::atomic::Ordering::SeqCst) >= 3
                 && ctx.has_messages(&orchestrator)
             {
@@ -3281,7 +3475,7 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(ctx.cancel_controlled_task(task_id));
         tokio::time::advance(std::time::Duration::from_secs(60)).await;
         for _ in 0..20 {
@@ -3289,7 +3483,7 @@ mod tests {
         }
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),
-            3,
+            1,
             "a cancelled decision must not start its scheduled retry"
         );
         assert_eq!(
@@ -3301,7 +3495,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn controlled_missing_terminal_uses_the_same_three_attempt_budget() {
+    async fn missing_terminal_with_unavailable_reporting_tool_stops_without_replay() {
         let client = Arc::new(llm_harness_loop::test_utils::MockLlmClient::new(vec![
             llm_harness_loop::test_utils::MockResponse::text("attempt one ended without report"),
             llm_harness_loop::test_utils::MockResponse::text("attempt one finalization failed"),
@@ -3347,7 +3541,7 @@ mod tests {
         }
         assert_eq!(
             client.call_count.load(std::sync::atomic::Ordering::SeqCst),
-            2
+            1
         );
         tokio::time::advance(std::time::Duration::from_secs(2)).await;
         for _ in 0..20 {
@@ -3356,7 +3550,7 @@ mod tests {
 
         assert_eq!(
             client.call_count.load(std::sync::atomic::Ordering::SeqCst),
-            3
+            1
         );
         let reply = ctx
             .drain_inbox(&controller)
@@ -3364,7 +3558,7 @@ mod tests {
             .next()
             .expect("missing terminal exhaustion must reach the controller");
         assert_eq!(reply.task_kind, Some(crate::TaskMessageKind::Error));
-        assert!(reply.body.contains("missing_terminal_report"));
+        assert!(reply.body.contains("automatic replay suppressed"));
         assert_eq!(
             ctx.get_agent_info(&coder).unwrap().status,
             AgentStatus::Idle
@@ -4007,7 +4201,12 @@ mod tests {
                 Box::pin(async move {
                     tokio::task::yield_now().await;
                     if fail {
-                        Err(llm_harness_types::AgentError::Internal("hook boom".into()))
+                        Err(llm_harness_types::AgentError::ProviderTyped {
+                            message: "explicit admission rejection".into(),
+                            kind: llm_harness_types::ProviderErrorKind::RateLimit {
+                                retry_after: None,
+                            },
+                        })
                     } else {
                         Ok(llm_harness_types::BeforeRunResult {
                             additional_messages: vec![],
@@ -4404,7 +4603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_panic_returns_messages_and_recovers_to_idle() {
+    async fn run_panic_stops_without_replay_and_recovers_to_idle() {
         // Regression: a panicking harness.run() used to kill the runner
         // task, permanently stranding the agent in Busy with its drained
         // messages lost. catch_unwind must contain the panic: the messages
@@ -4491,8 +4690,16 @@ mod tests {
             .filter(|t| t.contains("work to do"))
             .collect();
         assert!(
-            run_inputs.len() >= 2,
-            "the rolled-back message must be redelivered as a second run input; got {run_inputs:?}"
+            run_inputs.len() <= 1,
+            "panic must not replay the original input: {run_inputs:?}"
+        );
+        assert_eq!(
+            provider
+                .inner
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no retry may reach the inner provider after an uncertain panic"
         );
 
         task.abort();
@@ -5082,8 +5289,8 @@ mod tests {
             // the successful-redelivery boundary), r2 still pending for
             // restart recovery.
             wait_until(
-                || s.journal.pending_count().unwrap() == 1,
-                "runner to retry the requeued batch and ack r1",
+                || !s.journal.recover().unwrap().iter().any(|row| row.id == r1),
+                "runner to terminate uncertain work and ack r1 without replay",
             ).await;
             wait_until(
                 || {
@@ -5103,7 +5310,7 @@ mod tests {
                     Some("llm provider error: rate limited (retry after None)")
                 );
                 // Run 1 + failed continuation + successful retry.
-                assert_eq!(s.client.call_count.load(Ordering::SeqCst), 3);
+                assert_eq!(s.client.call_count.load(Ordering::SeqCst), 2);
                 assert_eq!(s.harness.state().phase, llm_harness_types::HarnessPhase::Idle);
             let mut orphaned_r2 = false;
             while let Ok(event) = s.events.try_recv() {
@@ -5147,7 +5354,7 @@ mod tests {
             // retry (the batch was redelivered to the model); the salvage
             // row r2 remains pending for crash/restart recovery.
             assert_eq!(
-                remaining.iter().map(|row| row.id).collect::<Vec<_>>(),
+                remaining.iter().filter(|row| row.message.to == s.alice).map(|row| row.id).collect::<Vec<_>>(),
                 vec![r2],
                 "r1 acked exactly at the successful-redelivery boundary; r2 stays pending for restart recovery: continuation={continuation:?}, provider_calls={}",
                 s.client.call_count.load(Ordering::SeqCst),

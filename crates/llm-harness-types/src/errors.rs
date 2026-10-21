@@ -126,6 +126,10 @@ pub enum AgentError {
     Tool { tool_name: String, message: String },
     #[error("final answer rejected ({code}): {message}")]
     FinalAnswerRejected { code: String, message: String },
+    /// The generation completed but violated the required reporting protocol.
+    /// This is a known semantic outcome, not an uncertain transport failure.
+    #[error("required run tool '{0}' was not called")]
+    RequiredToolNotCalled(String),
     #[error("aborted")]
     Aborted,
     #[error("agent is not idle")]
@@ -138,6 +142,22 @@ pub enum AgentError {
     ResourceLimitExceeded(String),
     #[error("stream idle timeout after {timeout_ms}ms")]
     StreamIdle { timeout_ms: u64 },
+}
+
+impl AgentError {
+    /// Only an explicit admission rejection permits a full task retry, and
+    /// only when the scheduler also proves there was no earlier run progress.
+    /// Network/connect errors carry no redirect/request-send provenance in the
+    /// current Adapter; timeout, overload and 5xx are deliberately unknown.
+    pub fn permits_generation_retry(&self) -> bool {
+        matches!(self, Self::ProviderTyped { kind: ProviderErrorKind::RateLimit { .. }, .. })
+    }
+
+    pub fn is_request_rejected(&self) -> bool {
+        matches!(self, Self::ProviderTyped { kind: ProviderErrorKind::InvalidRequest(_)
+            | ProviderErrorKind::Unauthorized | ProviderErrorKind::Forbidden
+            | ProviderErrorKind::RateLimit { .. }, .. })
+    }
 }
 
 // ── EnvError ──────────────────────────────────────────────────────────────────

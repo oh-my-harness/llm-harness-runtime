@@ -28,6 +28,7 @@ uuid = { workspace = true, features = ["serde"] }
 sha2.workspace = true
 
 [dev-dependencies]
+llm_adapter.workspace = true
 llm-harness-strategy.workspace = true
 tempfile.workspace = true
 tokio-util.workspace = true

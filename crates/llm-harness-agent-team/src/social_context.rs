@@ -551,6 +551,16 @@ impl SocialContext {
         self.controlled_tasks.begin(task_id)
     }
 
+    /// Runtime-only failure metadata: the controller must stop this workflow
+    /// instead of asking the model to redispatch uncertain work under a new ID.
+    pub fn block_task_replay(&self, task_id: &str, reason: String) {
+        self.controlled_tasks.block_replay(task_id, reason);
+    }
+
+    pub fn take_task_replay_block(&self, task_id: &str) -> Option<String> {
+        self.controlled_tasks.take_replay_block(task_id)
+    }
+
     /// Observe the controller-owned lifetime of a controlled assignment.
     pub fn controlled_task_token(
         &self,

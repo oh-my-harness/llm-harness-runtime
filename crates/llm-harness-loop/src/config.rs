@@ -9,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::convert::ConvertToLlmHook;
 use crate::final_answer::FinalAnswerMode;
 
-/// Retry configuration for transient LLM provider errors.
+/// Retry configuration for explicit rate-limit rejections (HTTP 429) — the
+/// only error class safe to replay without re-running accepted work.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts (not counting the original).
@@ -56,12 +57,13 @@ impl Default for RetryConfig {
     }
 }
 
-/// Returns `true` for errors that are safe to retry (server-side transient).
+/// Returns `true` for errors that are safe to replay the generation for.
+/// Only an explicit `RateLimit` (HTTP 429) qualifies: the provider rejected
+/// the request without running it. Connection/timeout/5xx/stream failures are
+/// deliberately excluded — the request may have been accepted upstream, so
+/// resending it could duplicate a generation or tool side effects.
 pub(crate) fn is_retryable(e: &LlmError) -> bool {
-    matches!(
-        e,
-        LlmError::RateLimit { .. } | LlmError::Overloaded { .. } | LlmError::Timeout
-    )
+    matches!(e, LlmError::RateLimit { .. })
 }
 
 /// Cap a retry delay to `max_retry_delay_ms` if set.
@@ -134,7 +136,16 @@ pub struct LoopConfig {
     ///
     /// 典型用途见 strategy crate 的 `VisionDegradeHook`：文本-only provider
     /// 拒绝携带 image/document 块的请求时剥离视觉块并同轮重试。
+    ///
+    /// 安全约束：hook 返回 `Retry` 会重新发送同轮请求。对结果未知的失败
+    /// （网关 5xx 等，adapter 可能折叠进 `InvalidRequest`）重发即重放，因此
+    /// 同一个 turn 内 hook 触发的重发次数有硬上限（`max_provider_error_repairs`）。
     pub provider_error: Option<Arc<dyn ProviderErrorHook>>,
+
+    /// 单 turn 内 `ProviderErrorHook` 触发的同轮修复重发上限。`None` = 1。
+    /// 这是对"仅凭错误类别无法判断请求是否已被 provider 接受"的兜底：上限
+    /// 与类别无关，任何 hook 驱动的重发都不能超过该次数。
+    pub max_provider_error_retries: Option<u32>,
 
     // === Reactive injection ===
     /// 在 turn 间注入的消息（转向）。turn 边界与自然停止时都会 drain；
@@ -185,6 +196,7 @@ mod tests {
             after_provider_response: None,
             final_answer_validator: None,
             provider_error: None,
+            max_provider_error_retries: None,
             steer_rx: None,
             follow_up_rx: None,
             retry: None,
@@ -223,6 +235,7 @@ mod tests {
             after_provider_response: None,
             final_answer_validator: None,
             provider_error: None,
+            max_provider_error_retries: None,
             steer_rx: None,
             follow_up_rx: None,
             retry: None,

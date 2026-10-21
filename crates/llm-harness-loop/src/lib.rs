@@ -91,16 +91,19 @@
 //! | Field | Default | Notes |
 //! |-------|---------|-------|
 //! | `timeout_ms` | `None` | Overall request timeout. `None` = no timeout. |
-//! | `stream_idle_timeout_ms` | `None` | Per-event idle watchdog. If no `StreamEvent` arrives within this window, the stream is dropped and retried. A partial `MessageEnd` is emitted before retry to close any open message. |
+//! | `stream_idle_timeout_ms` | `None` | Per-event idle watchdog. If no `StreamEvent` arrives within this window, the stream is dropped and the request errors as `StreamIdle` — it is NOT retried, because the provider may have accepted the request. A partial `MessageEnd` is emitted before the error to close any open message. |
 //! | `max_retries` | `None` | Overrides `RetryConfig.max_retries` if set. |
 //! | `max_retry_delay_ms` | `None` | Caps retry delay. |
 //! | `headers` / `metadata` / `cache_config` | empty | Require provider adapter support to pass through. |
 //!
 //! ### Retry (`retry: Option<RetryConfig>`)
 //!
-//! `None` disables retry. When set, the loop retries on transient provider
-//! errors (5xx, connection, timeout) with exponential backoff (`base_delay_ms`
-//! doubled per attempt). `stream_opts.max_retries` overrides
+//! `None` disables retry. When set, the loop retries only on `RateLimit`
+//! (HTTP 429) with exponential backoff (`base_delay_ms` doubled per attempt).
+//! Connection failures, timeouts, 5xx and mid-stream drops are NOT retried
+//! here: the request may already have been accepted, so replaying it could
+//! duplicate a generation or tool side effects — the caller (e.g. the team
+//! runner) decides on escalation instead. `stream_opts.max_retries` overrides
 //! `RetryConfig.max_retries` at runtime.
 //!
 //! ### Provider error repair (`provider_error: Option<Arc<dyn ProviderErrorHook>>`)

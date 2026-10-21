@@ -28,6 +28,7 @@ tracing.workspace = true
 rusqlite.workspace = true
 
 [dev-dependencies]
+llm_adapter.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 llm-harness-loop = { workspace = true, features = ["test-utils"] }
 llm-harness-sandbox.workspace = true
