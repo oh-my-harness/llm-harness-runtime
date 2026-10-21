@@ -3437,47 +3437,120 @@ mod uncertain_http;
 /// model decision and redispatch the same work under a fresh task ID.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncertain_http_failure_escalates_controller_without_redispatch() {
-    use uncertain_http::{Fault, server};
     use llm_harness_agent_team_studio::pipeline::{PipelineController, PipelinePhase};
+    use uncertain_http::{Fault, server};
     let _guard = FACTORY_LOCK.lock().await;
     for failed_member in ["orchestrator", "coder", "reviewer-robustness"] {
-        for fault in [Fault::DropPost, Fault::PartialSse, Fault::Http502, Fault::Invalid] {
+        for fault in [
+            Fault::DropPost,
+            Fault::PartialSse,
+            Fault::Http502,
+            Fault::Invalid,
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let repo = temp.path().join("repo");
             std::fs::create_dir(&repo).unwrap();
-            assert!(std::process::Command::new("git").args(["init", "--quiet"]).current_dir(&repo).status().unwrap().success());
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "--quiet"])
+                    .current_dir(&repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
             std::fs::write(repo.join("baseline.txt"), "baseline").unwrap();
             let http = server(fault, false, false, failed_member, "unused").await;
             let failing: Arc<dyn llm_harness_loop::LlmClient> = Arc::new(
-                llm_adapter::openai::OpenAIProvider::builder("mock-only").base_url(http.url.clone()).build());
-            let orchestrator = EchoClient::new(&["ACTION: DISPATCH coder\nimplement once", "ACTION: FINISH\nshould not be requested"]);
+                llm_adapter::openai::OpenAIProvider::builder("mock-only")
+                    .base_url(http.url.clone())
+                    .build(),
+            );
+            let orchestrator = EchoClient::new(&[
+                "ACTION: DISPATCH coder\nimplement once",
+                "ACTION: FINISH\nshould not be requested",
+            ]);
             let coder = EchoClient::new(&["implementation complete"]);
             let reviewer = EchoClient::new(&["no findings"]);
             let normal: Vec<(&str, Arc<dyn llm_harness_loop::LlmClient>)> = vec![
-                ("orchestrator", orchestrator.clone()), ("coder", coder.clone()),
-                ("reviewer-robustness", reviewer.clone()), ("judge", EchoClient::new(&[]))];
-            install_providers(normal.into_iter().map(|(id,p)| (id, if id == failed_member { failing.clone() } else { p })).collect());
+                ("orchestrator", orchestrator.clone()),
+                ("coder", coder.clone()),
+                ("reviewer-robustness", reviewer.clone()),
+                ("judge", EchoClient::new(&[])),
+            ];
+            install_providers(
+                normal
+                    .into_iter()
+                    .map(|(id, p)| {
+                        (
+                            id,
+                            if id == failed_member {
+                                failing.clone()
+                            } else {
+                                p
+                            },
+                        )
+                    })
+                    .collect(),
+            );
             let mut pm = TeamManager::new(temp.path().join("data"));
-            pm.create(decision_spec("uncertain-offline", &repo), Some(repo.clone()), &settings(), "").await.unwrap();
+            pm.create(
+                decision_spec("uncertain-offline", &repo),
+                Some(repo.clone()),
+                &settings(),
+                "",
+            )
+            .await
+            .unwrap();
             let entry = pm.get("uncertain-offline").unwrap();
             let ctx = entry.team.social_context().unwrap().clone();
-            let members = entry.spec.members.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
-            let controller = PipelineController::new("uncertain-offline", ctx.clone(), repo, &members, 3);
+            let members = entry
+                .spec
+                .members
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>();
+            let controller =
+                PipelineController::new("uncertain-offline", ctx.clone(), repo, &members, 3);
             let issue = llm_harness_agent_team_studio::issue::Issue {
-                id: "I-uncertain".into(), status: IssueStatus::Confirmed, source: "operator".into(),
-                created: "2026-10-20".into(), title: "isolated failure".into(), body: "do work once".into(),
+                id: "I-uncertain".into(),
+                status: IssueStatus::Confirmed,
+                source: "operator".into(),
+                created: "2026-10-20".into(),
+                title: "isolated failure".into(),
+                body: "do work once".into(),
             };
             let result = tokio::time::timeout(STAGE_BOUND, controller.run(&issue)).await;
             let state = controller.state(&issue.id).unwrap();
             let posts = http.posts.load(std::sync::atomic::Ordering::SeqCst);
             pm.shutdown("uncertain-offline").await.unwrap();
-            println!("CONTROLLER_CASE member={failed_member} fault={fault:?} POST={posts} phase={} result={result:?}",state.phase);
-            assert!(result.unwrap().unwrap_err().contains("automatic replay suppressed"));
+            println!(
+                "CONTROLLER_CASE member={failed_member} fault={fault:?} POST={posts} phase={} result={result:?}",
+                state.phase
+            );
+            assert!(
+                result
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("automatic replay suppressed")
+            );
             assert_eq!(state.phase, PipelinePhase::Escalated.as_str());
             assert_eq!(posts, 1);
-            assert!(state.terminal_reason.unwrap().contains("manual verification"));
-            assert_eq!(orchestrator.replies.load(std::sync::atomic::Ordering::SeqCst), usize::from(failed_member != "orchestrator"));
-            assert_eq!(state.snapshot_id.is_some(), failed_member == "reviewer-robustness");
+            assert!(
+                state
+                    .terminal_reason
+                    .unwrap()
+                    .contains("manual verification")
+            );
+            assert_eq!(
+                orchestrator
+                    .replies
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(failed_member != "orchestrator")
+            );
+            assert_eq!(
+                state.snapshot_id.is_some(),
+                failed_member == "reviewer-robustness"
+            );
         }
     }
 }

@@ -150,13 +150,26 @@ impl AgentError {
     /// Network/connect errors carry no redirect/request-send provenance in the
     /// current Adapter; timeout, overload and 5xx are deliberately unknown.
     pub fn permits_generation_retry(&self) -> bool {
-        matches!(self, Self::ProviderTyped { kind: ProviderErrorKind::RateLimit { .. }, .. })
+        matches!(
+            self,
+            Self::ProviderTyped {
+                kind: ProviderErrorKind::RateLimit { .. },
+                ..
+            }
+        )
     }
 
     pub fn is_request_rejected(&self) -> bool {
-        matches!(self, Self::ProviderTyped { kind: ProviderErrorKind::InvalidRequest(_)
-            | ProviderErrorKind::Unauthorized | ProviderErrorKind::Forbidden
-            | ProviderErrorKind::RateLimit { .. }, .. })
+        matches!(
+            self,
+            Self::ProviderTyped {
+                kind: ProviderErrorKind::InvalidRequest(_)
+                    | ProviderErrorKind::Unauthorized
+                    | ProviderErrorKind::Forbidden
+                    | ProviderErrorKind::RateLimit { .. },
+                ..
+            }
+        )
     }
 }
 
