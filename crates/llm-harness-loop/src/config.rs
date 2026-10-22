@@ -39,12 +39,16 @@ impl RetryConfig {
             }
             _ => None,
         };
-        hint.unwrap_or_else(|| {
-            // Full jitter: delay = random(0, base * 2^attempt]
-            let exp = self.base_delay_ms.saturating_mul(1u64 << attempt.min(10));
-            let jittered = fastrand::u64(0..=exp);
-            Duration::from_millis(jittered)
-        })
+        hint.unwrap_or_else(|| self.delay_for_attempt(attempt))
+    }
+
+    /// Full-jitter exponential backoff for callers that only have an
+    /// `AgentError` (e.g. a mid-stream transport drop).
+    pub(crate) fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        // Full jitter: delay = random(0, base * 2^attempt]
+        let exp = self.base_delay_ms.saturating_mul(1u64 << attempt.min(10));
+        let jittered = fastrand::u64(0..=exp);
+        Duration::from_millis(jittered)
     }
 }
 

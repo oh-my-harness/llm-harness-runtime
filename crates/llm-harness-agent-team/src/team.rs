@@ -21,7 +21,7 @@ use llm_harness_knowledge_local::{
     DocumentFileSystem, DocumentParserRegistry, DocumentRootConfig, LocalDocumentSource,
     LocalDocumentSourceConfig, OsDocumentFileSystem,
 };
-use llm_harness_loop::{DefaultConvertToLlm, LlmClient};
+use llm_harness_loop::{DefaultConvertToLlm, LlmClient, RetryConfig};
 use llm_harness_memory::{
     MemoryMutationGate, MemoryMutationGateError, MemoryMutationRequest, MemoryPlugin,
     MemoryService, MemoryStore, MemoryWritePolicy, SecureMemoryWritePolicy,
@@ -383,6 +383,11 @@ impl AgentTeam {
         let before_run_hook = Arc::new(TeamBeforeRunHook::new(todo_store.clone()));
         // Configure the builder: providers, plugins, hooks.
         let mut builder: HarnessBuilder = spec.into_builder();
+        // Request-level recovery for mid-stream transport drops. The loop
+        // discards the partial generation and resends the SAME request; no
+        // tool from that generation has executed, so this never replays a
+        // side effect. Task-level replay remains suppressed.
+        builder = builder.retry(Some(RetryConfig::new(2, 1_000)));
         for (pattern, client) in providers {
             builder = builder.provider(pattern.clone(), client.clone());
         }

@@ -38,9 +38,13 @@ fn llm_error_to_agent_error(e: LlmError) -> AgentError {
         LlmError::StreamIncomplete {
             received_chunks,
             finish_reason,
+            kind,
+            detail,
         } => ProviderErrorKind::StreamIncomplete {
             received_chunks: *received_chunks,
             finish_reason: finish_reason.clone(),
+            kind: *kind,
+            detail: detail.clone(),
         },
         LlmError::Decode(_) => ProviderErrorKind::Decode(e.to_string()),
         LlmError::Provider { code, .. } => ProviderErrorKind::Other { code: code.clone() },
@@ -49,6 +53,21 @@ fn llm_error_to_agent_error(e: LlmError) -> AgentError {
         message: e.to_string(),
         kind,
     }
+}
+
+/// Stream-consumption failures that are safe to retry at request level.
+///
+/// Only a generation that never reached `MessageStop` qualifies: its tool
+/// calls are not executed, so resending the request cannot duplicate a side
+/// effect. Admission failures keep their existing policy.
+fn is_retryable_stream(error: &AgentError) -> bool {
+    matches!(
+        error,
+        AgentError::ProviderTyped {
+            kind: ProviderErrorKind::StreamIncomplete { .. },
+            ..
+        }
+    )
 }
 
 fn active_tool_subset(
@@ -587,8 +606,7 @@ fn run_loop(
                         break 'main;
                     }
                     Err(e) => {
-                        // A stream was already accepted. Neither idle timeout nor
-                        // partial output proves the generation did not execute.
+                        // A stream was already accepted.
                         if had_visible_events {
                             let partial = state.discarded_message();
                             yield AgentEvent::MessageEnd {
@@ -596,6 +614,36 @@ fn run_loop(
                                 message: partial,
                                 discarded: true,
                             };
+                        }
+                        // A dropped stream is retryable at REQUEST level: no
+                        // tool from this generation has executed (tools run
+                        // only after a complete `MessageStop`), so resending
+                        // the same request cannot repeat a side effect. This
+                        // path previously broke out of the loop, despite the
+                        // retry loop's comment claiming it covered stream
+                        // consumption — that made every mid-stream drop
+                        // unrecoverable.
+                        if is_retryable_stream(&e) && retry.can_retry(attempt) {
+                            let delay = cap_delay(
+                                retry.delay_for_attempt(attempt),
+                                stream_opts.max_retry_delay_ms,
+                            );
+                            yield AgentEvent::RetryAttempt {
+                                attempt,
+                                max_retries: retry.max_retries,
+                                delay_ms: delay.as_millis() as u64,
+                                error: e.to_string(),
+                            };
+                            tokio::select! {
+                                biased;
+                                _ = config.abort.cancelled() => {
+                                    yield AgentEvent::Error(AgentError::Aborted);
+                                    break 'main;
+                                }
+                                _ = crate::time::sleep(delay) => {}
+                            }
+                            attempt += 1;
+                            continue;
                         }
                         yield AgentEvent::Error(e);
                         break 'main;
@@ -2242,6 +2290,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mid_stream_drop_retries_the_request_and_discards_the_partial() {
+        use crate::config::RetryConfig;
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stream_dropped_mid("partial", 1165),
+            MockResponse::text("recovered"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        tokio::time::pause();
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the dropped stream must resend the same request once"
+        );
+        let retries: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+            .collect();
+        assert_eq!(retries.len(), 1, "one retry must be announced");
+        let discarded = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::MessageEnd {
+                        discarded: true,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(discarded, 1, "the partial message must be discarded");
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "a recovered retry must not surface an error"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::MessageEnd {
+                discarded: false,
+                ..
+            }
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_drop_without_retry_budget_surfaces_the_error() {
+        let (client, cfg) = make_config(vec![MockResponse::stream_dropped_mid("partial", 7)]);
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "retry=None must not resend"
+        );
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+    }
+
+    /// The safety boundary for request-level retry: a tool call that was
+    /// streamed but never completed must not execute, and the retry must not
+    /// duplicate a tool that executes on the following attempt.
+    #[tokio::test]
+    async fn retried_stream_never_executes_a_partial_tool_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::config::RetryConfig;
+
+        struct CountingTool {
+            count: Arc<AtomicUsize>,
+        }
+        impl Tool for CountingTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> &serde_json::Value {
+                static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+                S.get_or_init(|| serde_json::json!({}))
+            }
+            fn execute<'a>(
+                &'a self,
+                _: serde_json::Value,
+                _: &'a ToolContext,
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
+            }
+        }
+
+        let dropped_tool = MockResponse {
+            model: "mock-model".into(),
+            stream_error: None,
+            stream_impl: None,
+            events: vec![
+                Ok(llm_adapter::types::StreamEvent::ContentStart {
+                    index: 0,
+                    kind: llm_adapter::types::ContentKind::ToolInvocation {
+                        id: "never-ran".into(),
+                        name: "echo".into(),
+                    },
+                }),
+                Ok(llm_adapter::types::StreamEvent::ToolDelta {
+                    index: 0,
+                    arguments: "{}".into(),
+                }),
+                Err(llm_adapter::LlmError::StreamIncomplete {
+                    received_chunks: 3,
+                    finish_reason: None,
+                    kind: llm_adapter::StreamEndKind::TransportError,
+                    detail: Some("cause=transport".into()),
+                }),
+            ],
+        };
+        let (client, mut cfg) = make_config(vec![
+            dropped_tool,
+            MockResponse::tool_use("real-call", "echo", "{}"),
+            MockResponse::text("done"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        tokio::time::pause();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        cfg.tools = vec![Arc::new(CountingTool {
+            count: calls.clone(),
+        })];
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "tool must execute once");
+        let executed_ids: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolExecutionStart { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(executed_ids, vec!["real-call".to_string()]);
+    }
+
+    #[tokio::test]
     async fn retry_attempt_event_precedes_message_start() {
         use crate::config::RetryConfig;
 
@@ -3197,14 +3429,18 @@ mod tests {
                 E::StreamIncomplete {
                     received_chunks: 3,
                     finish_reason: None,
+                    kind: llm_adapter::StreamEndKind::TransportError,
+                    detail: Some("cause=transport".into()),
                 },
                 |k| {
                     matches!(
                         k,
                         ProviderErrorKind::StreamIncomplete {
                             received_chunks: 3,
-                            finish_reason: None
-                        }
+                            finish_reason: None,
+                            detail: Some(detail),
+                            ..
+                        } if detail == "cause=transport"
                     )
                 },
             ),
@@ -3212,8 +3448,10 @@ mod tests {
                 E::StreamIncomplete {
                     received_chunks: 5,
                     finish_reason: Some("length".into()),
+                    kind: llm_adapter::StreamEndKind::DoneWithoutFinishReason,
+                    detail: None,
                 },
-                |k| matches!(k, ProviderErrorKind::StreamIncomplete { received_chunks: 5, finish_reason: Some(fr) } if fr == "length"),
+                |k| matches!(k, ProviderErrorKind::StreamIncomplete { received_chunks: 5, finish_reason: Some(fr), .. } if fr == "length"),
             ),
             (
                 E::Decode(serde_json::from_str::<i32>("not-an-int").unwrap_err()),

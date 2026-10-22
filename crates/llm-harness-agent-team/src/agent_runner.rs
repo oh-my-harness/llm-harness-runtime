@@ -1374,9 +1374,27 @@ impl AgentRunner {
                     controlled_attempts.remove(task_id);
                     consecutive_failures = 0;
                 } else if (failed && !safe_retry) || missing_after_tools {
+                    let mut tool_names: Vec<&str> = Vec::new();
+                    for name in initial_run_state
+                        .replay_tool_names
+                        .iter()
+                        .chain(final_state.replay_tool_names.iter())
+                    {
+                        if !tool_names.contains(&name.as_str()) {
+                            tool_names.push(name.as_str());
+                        }
+                    }
+                    let side_effects = if tool_started {
+                        format!(
+                            "tool_side_effects=possibly_started tools=[{}]",
+                            tool_names.join(",")
+                        )
+                    } else {
+                        "tool_side_effects=none".to_owned()
+                    };
                     let detail = if let Some(error) = replay_error {
                         format!(
-                            "request_outcome={}; prior_progress={has_progress}; {error}",
+                            "request_outcome={}; prior_progress={has_progress}; {side_effects}; {error}",
                             if error.is_request_rejected() {
                                 "rejected"
                             } else {
@@ -1384,7 +1402,9 @@ impl AgentRunner {
                             }
                         )
                     } else {
-                        "request_outcome=unknown; harness failure or missing terminal after tool progress".into()
+                        format!(
+                            "request_outcome=unknown; {side_effects}; harness failure or missing terminal after tool progress"
+                        )
                     };
                     stop_unsafe_replay(
                         &ctx,

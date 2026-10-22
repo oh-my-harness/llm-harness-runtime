@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::StreamEndKind;
+
 use serde::{Deserialize, Serialize};
 
 // ── StopReason ────────────────────────────────────────────────────────────────
@@ -98,11 +100,21 @@ pub enum ProviderErrorKind {
     #[error("stream error: {0}")]
     Stream(String),
     #[error(
-        "stream incomplete: {received_chunks} chunks received, finish_reason={finish_reason:?}"
+        "stream incomplete ({kind}): {received_chunks} chunks received, finish_reason={finish_reason:?}{suffix}",
+        suffix = match .detail {
+            Some(detail) => format!(", detail={detail}"),
+            None => String::new(),
+        }
     )]
     StreamIncomplete {
         received_chunks: u32,
         finish_reason: Option<String>,
+        /// Which layer observed the abnormal end (transport vs upstream
+        /// protocol omission vs clean EOF without `[DONE]`).
+        kind: StreamEndKind,
+        /// Redacted client-visible cause (HTTP status, request id, error
+        /// category flags and source chain). Never contains prompts or bodies.
+        detail: Option<String>,
     },
     #[error("network error")]
     Network,
@@ -381,5 +393,34 @@ mod tests {
     fn harness_phase_not_idle_in_error() {
         let e = HarnessError::NotIdle(HarnessPhase::Turning);
         assert!(e.to_string().contains("Turning"));
+    }
+
+    fn typed(kind: ProviderErrorKind) -> AgentError {
+        AgentError::ProviderTyped {
+            message: "llm provider error".into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn stream_incomplete_display_carries_kind_and_detail() {
+        let e = typed(ProviderErrorKind::StreamIncomplete {
+            received_chunks: 1165,
+            finish_reason: None,
+            kind: StreamEndKind::TransportError,
+            detail: Some("http=200 cause=transport flags=[decode] chain=x".into()),
+        });
+        let AgentError::ProviderTyped { kind, message } = &e else {
+            panic!("expected ProviderTyped");
+        };
+        // `message` is set from `LlmError::to_string()` by the loop; the kind's
+        // Display must therefore carry the classification the runtime persists.
+        assert!(
+            kind.to_string()
+                .contains("stream incomplete (transport_error)")
+        );
+        assert!(kind.to_string().contains("1165 chunks"));
+        assert!(kind.to_string().contains("detail=http=200"));
+        assert!(message.contains("llm provider error"));
     }
 }

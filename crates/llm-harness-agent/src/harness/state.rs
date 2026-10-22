@@ -58,6 +58,10 @@ pub struct HarnessState {
     /// assignment would discard known progress or repeat possible side effects.
     pub replay_has_progress: bool,
     pub replay_tool_started: bool,
+    /// Names of tools that started during this run (deduplicated, capped).
+    /// Persisted in the uncertainty error so a human can audit side effects
+    /// before deciding how to resume. Tool arguments are never recorded here.
+    pub replay_tool_names: Vec<String>,
     /// Whether `set_tools` was called mid-run since the last `build_loop_config`.
     /// Cleanup uses this to avoid rolling back the user's tool change together
     /// with the HookedTool unwrap.

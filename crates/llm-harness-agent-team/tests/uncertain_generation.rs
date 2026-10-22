@@ -152,6 +152,11 @@ async fn case(role: &str, fault: Fault, work: bool, success: bool, inner_retry: 
         // resent. (Pre-adapter-fix baseline: unbounded hook retry reached
         // 2640+ POSTs, then a loop-side cap allowed one resend.)
         1 + usize::from(work)
+    } else if matches!(fault, Fault::PartialSse) && inner_retry {
+        // A dropped SSE body is retried at request level (2 retries) because
+        // no tool from that generation executed. `work` counts the earlier
+        // successful tool turn, which is never replayed.
+        1 + usize::from(work) + 2
     } else {
         1 + usize::from(work)
     };

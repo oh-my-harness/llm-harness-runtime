@@ -125,6 +125,7 @@ impl AgentHarness {
             last_error: None,
             replay_has_progress: false,
             replay_tool_started: false,
+            replay_tool_names: Vec::new(),
         };
 
         let inner = HarnessInner {
@@ -225,6 +226,7 @@ impl AgentHarness {
             inner.state.last_error = None;
             inner.state.replay_has_progress = false;
             inner.state.replay_tool_started = false;
+            inner.state.replay_tool_names.clear();
             std::mem::take(&mut inner.state.queued_next_turn)
         };
 

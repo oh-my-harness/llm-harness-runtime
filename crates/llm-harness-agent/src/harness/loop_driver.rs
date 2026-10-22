@@ -425,8 +425,13 @@ impl AgentHarness {
             ) {
                 let mut inner = self.inner.lock().unwrap();
                 inner.state.replay_has_progress = true;
-                if matches!(&event, AgentEvent::ToolExecutionStart { .. }) {
+                if let AgentEvent::ToolExecutionStart { tool_name, .. } = &event {
                     inner.state.replay_tool_started = true;
+                    if inner.state.replay_tool_names.len() < 8
+                        && !inner.state.replay_tool_names.iter().any(|n| n == tool_name)
+                    {
+                        inner.state.replay_tool_names.push(tool_name.clone());
+                    }
                 }
             }
             match &event {

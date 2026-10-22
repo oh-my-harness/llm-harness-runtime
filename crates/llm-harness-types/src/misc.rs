@@ -5,6 +5,7 @@ use crate::{AgentMessage, Tool};
 // ThinkingLevel 直接沿用 llm-api-adapter 的定义（单一来源）。
 // adapter 的 ThinkingLevel 带 Copy/Eq/Serialize/Deserialize，满足 harness
 // session 持久化与状态快照需求。
+pub use llm_adapter::StreamEndKind;
 pub use llm_adapter::types::ThinkingLevel;
 
 /// Agent loop 的输入上下文。
