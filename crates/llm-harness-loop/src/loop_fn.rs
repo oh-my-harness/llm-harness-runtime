@@ -2473,6 +2473,203 @@ mod tests {
         assert_eq!(executed_ids, vec!["real-call".to_string()]);
     }
 
+    /// A completed earlier turn may execute tools. A later generation that
+    /// drops mid-stream is retried at request level, which must not replay the
+    /// already-executed tool turn.
+    #[tokio::test]
+    async fn retry_after_completed_tool_turn_does_not_repeat_the_tool() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::config::RetryConfig;
+
+        struct CountingTool {
+            count: Arc<AtomicUsize>,
+        }
+        impl Tool for CountingTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> &serde_json::Value {
+                static S: std::sync::LazyLock<serde_json::Value> =
+                    std::sync::LazyLock::new(|| serde_json::json!({}));
+                &S
+            }
+            fn execute<'a>(
+                &'a self,
+                _: serde_json::Value,
+                _: &'a ToolContext,
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
+            }
+        }
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::tool_use("first-call", "echo", "{}"),
+            MockResponse::stream_dropped_mid("partial", 7),
+            MockResponse::text("done"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        tokio::time::pause();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        cfg.tools = vec![Arc::new(CountingTool {
+            count: calls.clone(),
+        })];
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the completed tool turn must not be replayed"
+        );
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "tool turn + dropped generation + retried generation"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "the retry must recover without surfacing an error"
+        );
+    }
+
+    /// Once `MessageStop` completed the generation, a later stream error is
+    /// not a dropped generation and must not trigger a retry.
+    #[tokio::test]
+    async fn error_after_message_stop_does_not_retry_completed_generation() {
+        use crate::config::RetryConfig;
+
+        let completed_then_error = MockResponse {
+            model: "mock-model".into(),
+            stream_error: None,
+            stream_impl: None,
+            events: vec![
+                Ok(llm_adapter::types::StreamEvent::ContentStart {
+                    index: 0,
+                    kind: llm_adapter::types::ContentKind::Text,
+                }),
+                Ok(llm_adapter::types::StreamEvent::TextDelta {
+                    index: 0,
+                    text: "complete".into(),
+                }),
+                Ok(llm_adapter::types::StreamEvent::ContentStop {
+                    index: 0,
+                    signature: None,
+                }),
+                Ok(llm_adapter::types::StreamEvent::MessageStop {
+                    stop_reason: llm_adapter::types::StopReason::EndTurn,
+                    usage: llm_adapter::types::Usage::default(),
+                }),
+                Err(llm_adapter::LlmError::StreamIncomplete {
+                    received_chunks: 1,
+                    finish_reason: None,
+                    kind: llm_adapter::StreamEndKind::TransportError,
+                    detail: Some("cause=transport".into()),
+                }),
+            ],
+        };
+        let (client, mut cfg) = make_config(vec![
+            completed_then_error,
+            MockResponse::text("must-not-run"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        tokio::time::pause();
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a completed generation must never be resent"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+        );
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+    }
+
+    /// Cancelling during the retry backoff must abort immediately, before a
+    /// second request is sent.
+    #[tokio::test]
+    async fn stream_retry_backoff_is_cancellable() {
+        use crate::config::RetryConfig;
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stream_dropped_mid("partial", 7),
+            MockResponse::text("must-not-run"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 60_000));
+        let abort = cfg.abort.clone();
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+
+        let stream = agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg);
+        tokio::pin!(stream);
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let is_retry = matches!(event, AgentEvent::RetryAttempt { .. });
+            events.push(event);
+            if is_retry {
+                abort.cancel();
+            }
+        }
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancellation during backoff must not send a second request"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::Aborted))),
+            "cancelled backoff must surface Aborted"
+        );
+    }
+
     #[tokio::test]
     async fn retry_attempt_event_precedes_message_start() {
         use crate::config::RetryConfig;
