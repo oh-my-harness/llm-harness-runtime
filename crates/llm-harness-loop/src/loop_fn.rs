@@ -38,9 +38,13 @@ fn llm_error_to_agent_error(e: LlmError) -> AgentError {
         LlmError::StreamIncomplete {
             received_chunks,
             finish_reason,
+            kind,
+            detail,
         } => ProviderErrorKind::StreamIncomplete {
             received_chunks: *received_chunks,
             finish_reason: finish_reason.clone(),
+            kind: *kind,
+            detail: detail.clone(),
         },
         LlmError::Decode(_) => ProviderErrorKind::Decode(e.to_string()),
         LlmError::Provider { code, .. } => ProviderErrorKind::Other { code: code.clone() },
@@ -49,6 +53,21 @@ fn llm_error_to_agent_error(e: LlmError) -> AgentError {
         message: e.to_string(),
         kind,
     }
+}
+
+/// Stream-consumption failures that are safe to retry at request level.
+///
+/// Only a generation that never reached `MessageStop` qualifies: its tool
+/// calls are not executed, so resending the request cannot duplicate a side
+/// effect. Admission failures keep their existing policy.
+fn is_retryable_stream(error: &AgentError) -> bool {
+    matches!(
+        error,
+        AgentError::ProviderTyped {
+            kind: ProviderErrorKind::StreamIncomplete { .. },
+            ..
+        }
+    )
 }
 
 fn active_tool_subset(
@@ -263,6 +282,14 @@ fn run_loop(
         let mut turn_index: u32 = 0;
         let mut new_messages: Vec<AgentMessage> = vec![];
         let mut active_tools = config.active_tools.clone();
+        // Provider-error-hook repair resends for the CURRENT turn. The hook
+        // may only resend a request a bounded number of times: the adapter
+        // folds some outcome-unknown failures (e.g. HTTP 504 from a gateway)
+        // into `InvalidRequest`, so the loop cannot tell a trusted input
+        // rejection from an unknown-outcome failure — an unbounded hook
+        // retry would replay the request forever. Reset per turn.
+        let max_provider_error_repairs = config.max_provider_error_retries.unwrap_or(1);
+        let mut provider_error_repairs: u32 = 0;
 
         'main: loop {
             // Check abort
@@ -273,9 +300,18 @@ fn run_loop(
 
             // Drain steer messages between turns
             if turn_index > 0 && let Some(ref mut rx) = config.steer_rx {
+                let mut consumed = Vec::new();
                 while let Ok(msg) = rx.try_recv() {
                     ctx.messages.push(msg.clone());
-                    new_messages.push(msg);
+                    new_messages.push(msg.clone());
+                    consumed.push(msg);
+                }
+                if !consumed.is_empty() {
+                    // Surface the injected steers so the host can persist
+                    // them: only run-initial messages otherwise reach the
+                    // session, and a steer missing from history silently
+                    // diverges the transcript.
+                    yield AgentEvent::SteerConsumed { messages: consumed };
                 }
             }
 
@@ -322,8 +358,24 @@ fn run_loop(
                 }
             };
             let tool_defs = tools_to_defs(&current_tools);
-            let tool_choice =
-                if tool_defs.is_empty() { ToolChoice::None } else { ToolChoice::Auto };
+            let required_tool = (turn_index == 0)
+                .then(|| config.run.extension::<RequiredToolCall>())
+                .flatten()
+                .cloned();
+            let tool_choice = if let Some(required) = required_tool.as_ref() {
+                if !tool_defs.iter().any(|tool| tool.name == required.tool_name()) {
+                    yield AgentEvent::Error(AgentError::Internal(format!(
+                        "required run tool '{}' is not available",
+                        required.tool_name()
+                    )));
+                    break 'main;
+                }
+                ToolChoice::Specific(required.tool_name().to_string())
+            } else if tool_defs.is_empty() {
+                ToolChoice::None
+            } else {
+                ToolChoice::Auto
+            };
 
             let mut req_b = ChatRequest::builder(&config.model, config.max_tokens)
                 .messages(llm_messages)
@@ -420,7 +472,18 @@ fn run_loop(
                         // give the mounted `ProviderErrorHook` a chance to
                         // repair history and retry the same turn. Unmounted →
                         // the error surfaces unchanged (default behavior).
-                        if let Some(h) = &config.provider_error {
+                        //
+                        // Bound: the hook may resend the request at most
+                        // `max_provider_error_repairs` times per turn. The
+                        // pinned adapter folds outcome-unknown gateway
+                        // failures (504 and other unmapped 5xx) into
+                        // `InvalidRequest`, so the category alone cannot
+                        // prove the request was rejected without side
+                        // effects — the bound caps the replay surface until
+                        // the adapter exposes a structured status.
+                        if let Some(h) = &config.provider_error
+                            && matches!(e, LlmError::InvalidRequest(_))
+                        {
                             let directive = h
                                 .on_provider_error(ProviderErrorCtx {
                                     run: &config.run,
@@ -430,8 +493,13 @@ fn run_loop(
                                     new_messages: &mut new_messages,
                                 })
                                 .await;
-                            if matches!(directive, ErrorDirective::Retry) {
+                            if matches!(directive, ErrorDirective::Retry)
+                                && provider_error_repairs < max_provider_error_repairs
+                            {
+                                provider_error_repairs += 1;
                                 continue 'main;
+                                // Budget exhausted: surface the error instead
+                                // of replaying an unknown-outcome request.
                             }
                         }
                         yield AgentEvent::Error(llm_error_to_agent_error(e));
@@ -538,22 +606,26 @@ fn run_loop(
                         break 'main;
                     }
                     Err(e) => {
-                        // Idle timeout or stream error — check retry.
-                        let is_idle = matches!(e, AgentError::StreamIdle { .. });
-                        if is_idle && retry.can_retry(attempt) {
-                            // Close the orphaned partial message so consumers
-                            // pairing MessageStart→MessageEnd see a clean
-                            // boundary before the retry emits a new MessageStart.
-                            if had_visible_events {
-                                let partial = state.discarded_message();
-                                yield AgentEvent::MessageEnd {
-                                    message_id: partial.message_id.clone(),
-                                    message: partial,
-                                    discarded: true,
-                                };
-                            }
+                        // A stream was already accepted.
+                        if had_visible_events {
+                            let partial = state.discarded_message();
+                            yield AgentEvent::MessageEnd {
+                                message_id: partial.message_id.clone(),
+                                message: partial,
+                                discarded: true,
+                            };
+                        }
+                        // A dropped stream is retryable at REQUEST level: no
+                        // tool from this generation has executed (tools run
+                        // only after a complete `MessageStop`), so resending
+                        // the same request cannot repeat a side effect. This
+                        // path previously broke out of the loop, despite the
+                        // retry loop's comment claiming it covered stream
+                        // consumption — that made every mid-stream drop
+                        // unrecoverable.
+                        if is_retryable_stream(&e) && retry.can_retry(attempt) {
                             let delay = cap_delay(
-                                retry.delay_for(attempt, &llm_adapter::LlmError::Timeout),
+                                retry.delay_for_attempt(attempt),
                                 stream_opts.max_retry_delay_ms,
                             );
                             yield AgentEvent::RetryAttempt {
@@ -572,10 +644,9 @@ fn run_loop(
                             }
                             attempt += 1;
                             continue;
-                        } else {
-                            yield AgentEvent::Error(e);
-                            break 'main;
                         }
+                        yield AgentEvent::Error(e);
+                        break 'main;
                     }
                 }
             };
@@ -634,6 +705,13 @@ fn run_loop(
                     }
                 })
                 .collect();
+
+            if let Some(required) = required_tool.as_ref()
+                && !tool_calls.iter().any(|(_, name, _)| name == required.tool_name())
+            {
+                yield AgentEvent::Error(AgentError::RequiredToolNotCalled(required.tool_name().to_owned()));
+                break 'main;
+            }
 
             if !tool_calls.is_empty() {
                 if stop_reason != StopReason::ToolUse {
@@ -922,6 +1000,7 @@ fn run_loop(
                 }
 
                 turn_index += 1;
+                provider_error_repairs = 0;
                 continue 'main;
             } else {
                 // Non-tool turn. Covers two cases:
@@ -966,22 +1045,32 @@ fn run_loop(
                 };
 
                 if should_stop {
-                    // Drain any steer messages that arrived after the last
-                    // turn boundary: the run is about to end, and leftover
-                    // steer messages would be lost with the channel. Treat
-                    // them like follow-ups — inject and continue for one
-                    // more turn so the model sees them.
-                    let mut steered = false;
+                    // Steers that arrived after the last turn boundary are
+                    // handed back to the host (SteerOrphaned below) instead
+                    // of being injected here: an injected user message is
+                    // never persisted (only run-initial messages are), so a
+                    // "one more turn" would consume them invisibly and the
+                    // conversation history would silently diverge. The host
+                    // requeues them for the next run, where they persist.
+                    let mut orphaned_steers = Vec::new();
                     if let Some(ref mut rx) = config.steer_rx {
                         while let Ok(steer_msg) = rx.try_recv() {
-                            ctx.messages.push(steer_msg.clone());
-                            new_messages.push(steer_msg);
-                            steered = true;
+                            orphaned_steers.push(steer_msg);
                         }
                     }
-                    if steered {
-                        turn_index += 1;
-                        continue 'main;
+                    if !orphaned_steers.is_empty() {
+                        // This branch will return rather than consume a follow-up.
+                        // Stop accepting steers before either terminal yield,
+                        // then recover every message accepted before the close.
+                        if let Some(ref mut rx) = config.steer_rx {
+                            rx.close();
+                            while let Ok(steer_msg) = rx.try_recv() {
+                                orphaned_steers.push(steer_msg);
+                            }
+                        }
+                        yield AgentEvent::AgentEnd { new_messages };
+                        yield AgentEvent::SteerOrphaned { messages: orphaned_steers };
+                        return;
                     }
                     // Check follow_up channel
                     if let Some(ref mut rx) = config.follow_up_rx
@@ -990,6 +1079,7 @@ fn run_loop(
                         ctx.messages.push(follow_up_msg.clone());
                         new_messages.push(follow_up_msg);
                         turn_index += 1;
+                        provider_error_repairs = 0;
                         continue 'main;
                     }
                     break 'main;
@@ -1022,10 +1112,29 @@ fn run_loop(
                 }
 
                 turn_index += 1;
+                provider_error_repairs = 0;
             }
         }
 
         yield AgentEvent::AgentEnd { new_messages };
+
+        // Final salvage: after the run has ended, drain any steers the loop
+        // never consumed (sent during teardown, or before an abort). The
+        // receiver dies with this generator; whatever remains here would be
+        // silently lost. Hand it to the host layer (harness) so the next run
+        // can process it.
+        if let Some(ref mut rx) = config.steer_rx {
+            // A sender must not succeed while the final salvage event is
+            // yielded: no later drain exists after that yield.
+            rx.close();
+            let mut orphaned = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                orphaned.push(msg);
+            }
+            if !orphaned.is_empty() {
+                yield AgentEvent::SteerOrphaned { messages: orphaned };
+            }
+        }
     }
 }
 
@@ -1106,12 +1215,170 @@ mod tests {
             after_provider_response: None,
             final_answer_validator: None,
             provider_error: None,
+            max_provider_error_retries: None,
             steer_rx: None,
             follow_up_rx: None,
             retry: None,
             response_format: None,
         };
         (client, cfg)
+    }
+
+    #[tokio::test]
+    async fn required_run_tool_rejects_plain_text_and_uses_specific_choice() {
+        use llm_adapter::types::ToolChoice;
+
+        let (client, mut cfg) = make_config(vec![MockResponse::text("ACTION: FINISH\nroger")]);
+        cfg.tools = vec![Arc::new(NamedTool("send_message"))];
+        cfg.run = Arc::new(RunContext::new(
+            RunRequest::default().with_extension(RequiredToolCall::new("send_message")),
+        ));
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(AgentError::RequiredToolNotCalled(tool))
+                if tool == "send_message"
+        )));
+        let captured = client.captured_requests.lock();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].tool_choice(),
+            &ToolChoice::Specific("send_message".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn required_run_tool_rejects_other_registered_tool_without_executing_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SideEffectTool(Arc<AtomicUsize>);
+        impl Tool for SideEffectTool {
+            fn name(&self) -> &str {
+                "write"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> &serde_json::Value {
+                static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+                SCHEMA.get_or_init(|| serde_json::json!({}))
+            }
+            fn execute<'a>(
+                &'a self,
+                _: serde_json::Value,
+                _: &'a ToolContext,
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(ToolResult::full(vec![], serde_json::Value::Null, false))
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (client, mut cfg) = make_config(vec![MockResponse::tool_use_end_turn(
+            "wrong-tool",
+            "write",
+            r#"{}"#,
+        )]);
+        cfg.tools = vec![
+            Arc::new(NamedTool("send_message")),
+            Arc::new(SideEffectTool(calls.clone())),
+        ];
+        cfg.run = Arc::new(RunContext::new(
+            RunRequest::default().with_extension(RequiredToolCall::new("send_message")),
+        ));
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+
+        let events: Vec<_> = agent_loop(client.clone() as Arc<dyn Provider>, ctx, cfg)
+            .collect()
+            .await;
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(AgentError::RequiredToolNotCalled(tool))
+                if tool == "send_message"
+        )));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. }
+        )));
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ordinary_run_with_tools_keeps_auto_tool_choice() {
+        use llm_adapter::types::ToolChoice;
+
+        let (client, mut cfg) = make_config(vec![MockResponse::text("ordinary reply")]);
+        cfg.tools = vec![Arc::new(NamedTool("send_message"))];
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::Error(_)))
+        );
+        let captured = client.captured_requests.lock();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].tool_choice(), &ToolChoice::Auto);
+    }
+
+    #[tokio::test]
+    async fn required_run_tool_returns_to_auto_after_the_required_call() {
+        use llm_adapter::types::ToolChoice;
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::tool_use_end_turn("reply-1", "send_message", r#"{}"#),
+            MockResponse::text("reply delivered"),
+        ]);
+        cfg.tools = vec![Arc::new(NamedTool("send_message"))];
+        cfg.run = Arc::new(RunContext::new(
+            RunRequest::default().with_extension(RequiredToolCall::new("send_message")),
+        ));
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, AgentEvent::Error(_)))
+        );
+        let captured = client.captured_requests.lock();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            captured[0].tool_choice(),
+            &ToolChoice::Specific("send_message".into())
+        );
+        assert_eq!(captured[1].tool_choice(), &ToolChoice::Auto);
     }
 
     #[test]
@@ -1946,11 +2213,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_loop_drains_steer_at_natural_stop() {
+    async fn agent_loop_hands_late_steer_to_host_at_natural_stop() {
         // Regression: a steer message arriving after the final turn's
         // boundary was previously dropped with the channel when the loop
-        // stopped. The stop path must drain steer_rx and run one more turn
-        // so the message reaches the model.
+        // stopped. The loop now hands it to the host via SteerOrphaned so
+        // the host can requeue it for the next run (an injected user message
+        // would never persist, silently diverging the conversation history).
         use tokio::sync::mpsc;
         let (steer_tx, steer_rx) = mpsc::channel(16);
         let steer_msg = AgentMessage::User(UserMessage {
@@ -1996,14 +2264,124 @@ mod tests {
                 }
             });
             assert!(
-                has_steer,
-                "steer message must survive the run: {new_messages:?}"
-            );
-            assert_eq!(
-                client.call_count.load(std::sync::atomic::Ordering::SeqCst),
-                2
+                !has_steer,
+                "late steer must NOT be consumed invisibly by a follow-up turn: {new_messages:?}"
             );
         }
+        let orphaned = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::SteerOrphaned { messages } => Some(messages.clone()),
+                _ => None,
+            })
+            .expect("late steer must be surfaced as SteerOrphaned");
+        assert_eq!(orphaned.len(), 1);
+        assert!(
+            matches!(&orphaned[0], AgentMessage::User(u) if u.content.iter().any(
+                |c| matches!(c, ContentBlock::Text { text } if text == "late steer")
+            ))
+        );
+        // Exactly one provider call: the run stopped instead of extending.
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn natural_stop_with_orphaned_steer_closes_before_terminal_yields() {
+        use tokio::sync::mpsc;
+
+        let message = |text: &str| {
+            AgentMessage::User(UserMessage {
+                content: vec![ContentBlock::Text { text: text.into() }],
+                timestamp: chrono::Utc::now(),
+            })
+        };
+        let (steer_tx, steer_rx) = mpsc::channel(16);
+        let accepted = message("accepted before natural stop");
+        steer_tx.try_send(accepted.clone()).unwrap();
+        let (client, mut cfg) = make_config(vec![MockResponse::text("done")]);
+        cfg.steer_rx = Some(steer_rx);
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        let mut stream = Box::pin(agent_loop(client as Arc<dyn Provider>, ctx, cfg));
+
+        loop {
+            let event = stream.next().await.expect("must reach AgentEnd");
+            if matches!(event, AgentEvent::AgentEnd { .. }) {
+                break;
+            }
+        }
+        assert!(matches!(
+            steer_tx.try_send(message("during AgentEnd")),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        let event = stream
+            .next()
+            .await
+            .expect("accepted steer must be salvaged");
+        let AgentEvent::SteerOrphaned { messages } = event else {
+            panic!("expected SteerOrphaned, got {event:?}");
+        };
+        assert_eq!(
+            serde_json::to_value(messages).unwrap(),
+            serde_json::to_value(vec![accepted]).unwrap()
+        );
+        assert!(matches!(
+            steer_tx.try_send(message("during SteerOrphaned")),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn final_salvage_closes_before_yield_and_keeps_accepted_steer() {
+        use tokio::sync::mpsc;
+
+        let message = |text: &str| {
+            AgentMessage::User(UserMessage {
+                content: vec![ContentBlock::Text { text: text.into() }],
+                timestamp: chrono::Utc::now(),
+            })
+        };
+        let (steer_tx, steer_rx) = mpsc::channel(16);
+        let (client, mut cfg) = make_config(vec![MockResponse::text("done")]);
+        cfg.steer_rx = Some(steer_rx);
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        let mut stream = Box::pin(agent_loop(client as Arc<dyn Provider>, ctx, cfg));
+
+        loop {
+            let event = stream.next().await.expect("must reach AgentEnd");
+            if matches!(event, AgentEvent::AgentEnd { .. }) {
+                break;
+            }
+        }
+        // The final-drain path still accepts a steer at AgentEnd, but must
+        // include it in salvage and refuse new messages at the last yield.
+        let accepted = message("accepted during AgentEnd");
+        steer_tx.try_send(accepted.clone()).unwrap();
+        let event = stream
+            .next()
+            .await
+            .expect("accepted steer must be salvaged");
+        let AgentEvent::SteerOrphaned { messages } = event else {
+            panic!("expected SteerOrphaned, got {event:?}");
+        };
+        assert_eq!(
+            serde_json::to_value(messages).unwrap(),
+            serde_json::to_value(vec![accepted]).unwrap()
+        );
+        assert!(matches!(
+            steer_tx.try_send(message("during final SteerOrphaned")),
+            Err(mpsc::error::TrySendError::Closed(_))
+        ));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
@@ -2081,6 +2459,387 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
             "loop should complete after successful retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_drop_retries_the_request_and_discards_the_partial() {
+        use crate::config::RetryConfig;
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stream_dropped_mid("partial", 1165),
+            MockResponse::text("recovered"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        tokio::time::pause();
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the dropped stream must resend the same request once"
+        );
+        let retries: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+            .collect();
+        assert_eq!(retries.len(), 1, "one retry must be announced");
+        let discarded = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::MessageEnd {
+                        discarded: true,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(discarded, 1, "the partial message must be discarded");
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "a recovered retry must not surface an error"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::MessageEnd {
+                discarded: false,
+                ..
+            }
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_stream_drop_without_retry_budget_surfaces_the_error() {
+        let (client, cfg) = make_config(vec![MockResponse::stream_dropped_mid("partial", 7)]);
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "retry=None must not resend"
+        );
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+    }
+
+    /// The safety boundary for request-level retry: a tool call that was
+    /// streamed but never completed must not execute, and the retry must not
+    /// duplicate a tool that executes on the following attempt.
+    #[tokio::test]
+    async fn retried_stream_never_executes_a_partial_tool_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::config::RetryConfig;
+
+        struct CountingTool {
+            count: Arc<AtomicUsize>,
+        }
+        impl Tool for CountingTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> &serde_json::Value {
+                static S: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+                S.get_or_init(|| serde_json::json!({}))
+            }
+            fn execute<'a>(
+                &'a self,
+                _: serde_json::Value,
+                _: &'a ToolContext,
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
+            }
+        }
+
+        let dropped_tool = MockResponse {
+            model: "mock-model".into(),
+            stream_error: None,
+            stream_impl: None,
+            events: vec![
+                Ok(llm_adapter::types::StreamEvent::ContentStart {
+                    index: 0,
+                    kind: llm_adapter::types::ContentKind::ToolInvocation {
+                        id: "never-ran".into(),
+                        name: "echo".into(),
+                    },
+                }),
+                Ok(llm_adapter::types::StreamEvent::ToolDelta {
+                    index: 0,
+                    arguments: "{}".into(),
+                }),
+                Err(llm_adapter::LlmError::StreamIncomplete {
+                    received_chunks: 3,
+                    finish_reason: None,
+                    kind: llm_adapter::StreamEndKind::TransportError,
+                    detail: Some("cause=transport".into()),
+                }),
+            ],
+        };
+        let (client, mut cfg) = make_config(vec![
+            dropped_tool,
+            MockResponse::tool_use("real-call", "echo", "{}"),
+            MockResponse::text("done"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        tokio::time::pause();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        cfg.tools = vec![Arc::new(CountingTool {
+            count: calls.clone(),
+        })];
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "tool must execute once");
+        let executed_ids: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolExecutionStart { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(executed_ids, vec!["real-call".to_string()]);
+    }
+
+    /// A completed earlier turn may execute tools. A later generation that
+    /// drops mid-stream is retried at request level, which must not replay the
+    /// already-executed tool turn.
+    #[tokio::test]
+    async fn retry_after_completed_tool_turn_does_not_repeat_the_tool() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::config::RetryConfig;
+
+        struct CountingTool {
+            count: Arc<AtomicUsize>,
+        }
+        impl Tool for CountingTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> &serde_json::Value {
+                static S: std::sync::LazyLock<serde_json::Value> =
+                    std::sync::LazyLock::new(|| serde_json::json!({}));
+                &S
+            }
+            fn execute<'a>(
+                &'a self,
+                _: serde_json::Value,
+                _: &'a ToolContext,
+            ) -> BoxFuture<'a, Result<ToolResult, ToolFailure>> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(ToolResult::full(vec![], serde_json::Value::Null, false)) })
+            }
+        }
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::tool_use("first-call", "echo", "{}"),
+            MockResponse::stream_dropped_mid("partial", 7),
+            MockResponse::text("done"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        tokio::time::pause();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        cfg.tools = vec![Arc::new(CountingTool {
+            count: calls.clone(),
+        })];
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the completed tool turn must not be replayed"
+        );
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "tool turn + dropped generation + retried generation"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "the retry must recover without surfacing an error"
+        );
+    }
+
+    /// Once `MessageStop` completed the generation, a later stream error is
+    /// not a dropped generation and must not trigger a retry.
+    #[tokio::test]
+    async fn error_after_message_stop_does_not_retry_completed_generation() {
+        use crate::config::RetryConfig;
+
+        let completed_then_error = MockResponse {
+            model: "mock-model".into(),
+            stream_error: None,
+            stream_impl: None,
+            events: vec![
+                Ok(llm_adapter::types::StreamEvent::ContentStart {
+                    index: 0,
+                    kind: llm_adapter::types::ContentKind::Text,
+                }),
+                Ok(llm_adapter::types::StreamEvent::TextDelta {
+                    index: 0,
+                    text: "complete".into(),
+                }),
+                Ok(llm_adapter::types::StreamEvent::ContentStop {
+                    index: 0,
+                    signature: None,
+                }),
+                Ok(llm_adapter::types::StreamEvent::MessageStop {
+                    stop_reason: llm_adapter::types::StopReason::EndTurn,
+                    usage: llm_adapter::types::Usage::default(),
+                }),
+                Err(llm_adapter::LlmError::StreamIncomplete {
+                    received_chunks: 1,
+                    finish_reason: None,
+                    kind: llm_adapter::StreamEndKind::TransportError,
+                    detail: Some("cause=transport".into()),
+                }),
+            ],
+        };
+        let (client, mut cfg) = make_config(vec![
+            completed_then_error,
+            MockResponse::text("must-not-run"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        tokio::time::pause();
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a completed generation must never be resent"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+        );
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+    }
+
+    /// Cancelling during the retry backoff must abort immediately, before a
+    /// second request is sent.
+    #[tokio::test]
+    async fn stream_retry_backoff_is_cancellable() {
+        use crate::config::RetryConfig;
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stream_dropped_mid("partial", 7),
+            MockResponse::text("must-not-run"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 60_000));
+        let abort = cfg.abort.clone();
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+
+        let stream = agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg);
+        tokio::pin!(stream);
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let is_retry = matches!(event, AgentEvent::RetryAttempt { .. });
+            events.push(event);
+            if is_retry {
+                abort.cancel();
+            }
+        }
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancellation during backoff must not send a second request"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::Aborted))),
+            "cancelled backoff must surface Aborted"
         );
     }
 
@@ -2255,104 +3014,120 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn stream_idle_timeout_triggers_retry() {
-        use crate::config::RetryConfig;
-
-        // First response: stall after 1 event (stream stalls).
-        // Second response: normal text response (retry succeeds).
+    async fn stream_idle_timeout_does_not_retry_accepted_request() {
         let (client, mut cfg) = make_config(vec![
             MockResponse::stall_after(1),
-            MockResponse::text("recovered"),
+            MockResponse::text("must not be requested"),
         ]);
-        cfg.retry = Some(RetryConfig::new(2, 0)); // base_delay_ms=0
-        cfg.stream_options.stream_idle_timeout_ms = Some(100);
+        cfg.retry = Some(crate::config::RetryConfig::new(3, 10_000));
+        cfg.stream_options.stream_idle_timeout_ms = Some(30);
 
         let ctx = AgentContext {
             system_prompt: None,
-            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
-                content: vec![ContentBlock::Text { text: "hi".into() }],
-                timestamp: chrono::Utc::now(),
-            })],
+            messages: vec![],
         };
-
         tokio::time::pause();
         let events: Vec<AgentEvent> =
             agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
                 .collect()
                 .await;
-
-        // Must have a RetryAttempt from the idle timeout
-        let retry_count = events
-            .iter()
-            .filter(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
-            .count();
         assert_eq!(
-            retry_count, 1,
-            "expected one RetryAttempt from idle timeout"
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
-
-        // Must complete successfully after retry
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+        );
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
-            "loop should complete after successful retry"
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::StreamIdle { .. })))
         );
-
-        // Verify the RetryAttempt was triggered by an idle timeout (typed
-        // variant check — not a string substring match on the Display text).
-        // A RetryAttempt is only emitted on the idle-retry path (is_idle &&
-        // can_retry), so its presence after a stall confirms the typed
-        // dispatch contract.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::MessageStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    AgentEvent::MessageEnd {
+                        discarded: true,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. })),
-            "RetryAttempt should be present, confirming idle-timeout typed dispatch"
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
         );
     }
 
     #[tokio::test]
-    async fn stream_idle_timeout_exhausts_retries() {
-        use crate::config::RetryConfig;
-
-        // All responses stall — retries exhaust, loop emits Error.
+    async fn stream_idle_timeout_ignores_retry_budget() {
         let (client, mut cfg) = make_config(vec![
             MockResponse::stall_after(1),
-            MockResponse::stall_after(1),
-            MockResponse::stall_after(1),
+            MockResponse::text("must not be requested"),
         ]);
-        cfg.retry = Some(RetryConfig::new(2, 0)); // max_retries=2
-        cfg.stream_options.stream_idle_timeout_ms = Some(50);
-
+        cfg.retry = Some(crate::config::RetryConfig::new(3, 10_000));
+        cfg.stream_options.stream_idle_timeout_ms = Some(30);
+        cfg.stream_options.max_retries = Some(99);
         let ctx = AgentContext {
             system_prompt: None,
-            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
-                content: vec![ContentBlock::Text { text: "hi".into() }],
-                timestamp: chrono::Utc::now(),
-            })],
+            messages: vec![],
         };
-
         tokio::time::pause();
         let events: Vec<AgentEvent> =
             agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
                 .collect()
                 .await;
-
-        let retry_count = events
-            .iter()
-            .filter(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
-            .count();
         assert_eq!(
-            retry_count, 2,
-            "expected 2 RetryAttempt events (max_retries=2)"
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
-
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+        );
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::Error(AgentError::StreamIdle { .. }))),
-            "expected Error(StreamIdle) after retries exhausted"
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::StreamIdle { .. })))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::MessageStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    AgentEvent::MessageEnd {
+                        discarded: true,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
         );
     }
 
@@ -2492,287 +3267,238 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_after_idle_timeout_succeeds() {
-        use crate::config::RetryConfig;
-
-        // First: stall. Second: normal response. Retry should succeed.
+    async fn idle_timeout_does_not_consume_later_success() {
         let (client, mut cfg) = make_config(vec![
-            MockResponse::stall_after(1),
-            MockResponse::text("ok after retry"),
+            MockResponse::stall_after(0),
+            MockResponse::text("must not be requested"),
         ]);
-        cfg.retry = Some(RetryConfig::new(2, 0));
-        cfg.stream_options.stream_idle_timeout_ms = Some(100);
+        cfg.retry = Some(crate::config::RetryConfig::new(3, 10_000));
+        cfg.stream_options.stream_idle_timeout_ms = Some(30);
 
         let ctx = AgentContext {
             system_prompt: None,
-            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
-                content: vec![ContentBlock::Text { text: "hi".into() }],
-                timestamp: chrono::Utc::now(),
-            })],
+            messages: vec![],
         };
-
         tokio::time::pause();
         let events: Vec<AgentEvent> =
             agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
                 .collect()
                 .await;
-
-        // Should have exactly 1 RetryAttempt
-        let retry_count = events
-            .iter()
-            .filter(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
-            .count();
-        assert_eq!(retry_count, 1);
-
-        // Should complete with AgentEnd
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
-            "loop should complete after successful retry"
-        );
-
-        // new_messages should contain the assistant message
-        if let Some(AgentEvent::AgentEnd { new_messages }) = events
-            .iter()
-            .rev()
-            .find(|e| matches!(e, AgentEvent::AgentEnd { .. }))
-        {
-            assert!(
-                !new_messages.is_empty(),
-                "should have new messages after successful retry"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn idle_retry_emits_discard_message_end_for_partial_message() {
-        use crate::config::RetryConfig;
-
-        // stall_after(2) emits ContentStart + TextDelta (a visible partial),
-        // then stalls. On idle timeout the loop must emit a discard MessageEnd
-        // for the orphaned partial message before retrying with a fresh
-        // MessageStart.
-        let (client, mut cfg) = make_config(vec![
-            MockResponse::stall_after(2),
-            MockResponse::text("recovered"),
-        ]);
-        cfg.retry = Some(RetryConfig::new(2, 0));
-        cfg.stream_options.stream_idle_timeout_ms = Some(100);
-
-        let ctx = AgentContext {
-            system_prompt: None,
-            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
-                content: vec![ContentBlock::Text { text: "hi".into() }],
-                timestamp: chrono::Utc::now(),
-            })],
-        };
-
-        tokio::time::pause();
-        let events: Vec<AgentEvent> =
-            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
-                .collect()
-                .await;
-
-        // Collect message_ids seen in MessageStart order.
-        let starts: Vec<String> = events
-            .iter()
-            .filter_map(|e| match e {
-                AgentEvent::MessageStart { message_id } => Some(message_id.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            starts.len(),
-            2,
-            "expected two MessageStart events (stall + retry)"
-        );
-
-        // The first (stalled) message_id must have a matching MessageEnd
-        // emitted BEFORE the second MessageStart — the discard signal.
-        let stalled_id = &starts[0];
-        let retry_id = &starts[1];
-        assert_ne!(stalled_id, retry_id, "retry must start a fresh message_id");
-
-        let stalled_end_idx = events.iter().position(|e| {
-            matches!(
-                e,
-                AgentEvent::MessageEnd { message_id, .. } if message_id == stalled_id
-            )
-        });
-        let retry_start_idx = events.iter().position(|e| {
-            matches!(
-                e,
-                AgentEvent::MessageStart { message_id } if message_id == retry_id
-            )
-        });
-        assert!(
-            stalled_end_idx.is_some(),
-            "partial message must be closed with MessageEnd"
-        );
-        assert!(
-            retry_start_idx.is_some(),
-            "retry must emit a fresh MessageStart"
-        );
-        assert!(
-            stalled_end_idx.unwrap() < retry_start_idx.unwrap(),
-            "discard MessageEnd for partial message must precede the retry's MessageStart"
-        );
-
-        // The discard MessageEnd must carry a Progress (non-final) message,
-        // be marked discarded, and have cleared content.
-        if let Some(AgentEvent::MessageEnd {
-            message, discarded, ..
-        }) = events.iter().find(|e| {
-            matches!(
-                e,
-                AgentEvent::MessageEnd { message_id, .. } if message_id == stalled_id
-            )
-        }) {
-            assert_eq!(
-                message.kind,
-                AssistantMessageKind::Progress,
-                "discard MessageEnd should be a Progress partial, not FinalAnswer"
-            );
-            assert!(*discarded, "discard MessageEnd must have discarded: true");
-            assert!(
-                message.content.is_empty(),
-                "discard MessageEnd content must be cleared"
-            );
-        }
-
-        // Loop completes after successful retry.
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
-            "loop should complete after successful retry"
-        );
-    }
-
-    #[tokio::test]
-    async fn idle_retry_stall_after_one_event_emits_discard_message_end() {
-        use crate::config::RetryConfig;
-
-        // stall_after(1) emits only ContentStart (which produces no AgentEvent
-        // from state.process), then stalls. MessageStart was already emitted
-        // unconditionally, so the idle retry must still close it with a discard
-        // MessageEnd — even though no visible token-level event followed.
-        let (client, mut cfg) = make_config(vec![
-            MockResponse::stall_after(1),
-            MockResponse::text("recovered"),
-        ]);
-        cfg.retry = Some(RetryConfig::new(2, 0));
-        cfg.stream_options.stream_idle_timeout_ms = Some(100);
-
-        let ctx = AgentContext {
-            system_prompt: None,
-            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
-                content: vec![ContentBlock::Text { text: "hi".into() }],
-                timestamp: chrono::Utc::now(),
-            })],
-        };
-
-        tokio::time::pause();
-        let events: Vec<AgentEvent> =
-            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
-                .collect()
-                .await;
-
-        let starts: Vec<String> = events
-            .iter()
-            .filter_map(|e| match e {
-                AgentEvent::MessageStart { message_id } => Some(message_id.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            starts.len(),
-            2,
-            "expected two MessageStart events (stall + retry)"
-        );
-
-        let stalled_id = &starts[0];
-
-        // The stalled MessageStart must be closed by a discard MessageEnd
-        // before the retry's MessageStart.
-        let stalled_end_idx = events.iter().position(|e| matches!(
-            e,
-            AgentEvent::MessageEnd { message_id, discarded: true, .. } if message_id == stalled_id
-        ));
-        let retry_start_idx = events.iter().position(|e| {
-            matches!(
-                e,
-                AgentEvent::MessageStart { message_id } if message_id == &starts[1]
-            )
-        });
-        assert!(
-            stalled_end_idx.is_some(),
-            "stalled MessageStart must be closed with a discard MessageEnd even after ContentStart-only stall"
-        );
-        assert!(retry_start_idx.is_some());
-        assert!(
-            stalled_end_idx.unwrap() < retry_start_idx.unwrap(),
-            "discard MessageEnd must precede the retry's MessageStart"
-        );
-
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::AgentEnd { .. })),
-            "loop should complete after successful retry"
-        );
-    }
-
-    #[tokio::test]
-    async fn idle_timeout_with_aborted_retry_sleep() {
-        use crate::config::RetryConfig;
-
-        // Stall → idle timeout → retry sleep is long → abort during sleep.
-        let (client, mut cfg) = make_config(vec![
-            MockResponse::stall_after(1),
-            MockResponse::text("never reached"),
-        ]);
-        cfg.retry = Some(RetryConfig::new(2, 10_000)); // 10s backoff
-        cfg.stream_options.stream_idle_timeout_ms = Some(50);
-        let abort = cfg.abort.clone();
-
-        let ctx = AgentContext {
-            system_prompt: None,
-            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
-                content: vec![ContentBlock::Text { text: "hi".into() }],
-                timestamp: chrono::Utc::now(),
-            })],
-        };
-
-        tokio::time::pause();
-
-        let stream = agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg);
-        futures::pin_mut!(stream);
-        let mut events = Vec::new();
-
-        while let Some(ev) = stream.next().await {
-            let is_retry = matches!(ev, AgentEvent::RetryAttempt { .. });
-            let is_error = matches!(ev, AgentEvent::Error(_));
-            events.push(ev);
-            if is_retry {
-                abort.cancel();
-            }
-            if is_error {
-                break;
-            }
-        }
-
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::Error(AgentError::Aborted))),
-            "expected Error(Aborted) after abort during retry sleep"
-        );
         assert_eq!(
             client.call_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "provider should be called once before abort during retry sleep"
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::StreamIdle { .. })))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::MessageStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    AgentEvent::MessageEnd {
+                        discarded: true,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_failure_closes_partial_message_without_replay() {
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stall_after(2),
+            MockResponse::text("must not be requested"),
+        ]);
+        cfg.retry = Some(crate::config::RetryConfig::new(3, 10_000));
+        cfg.stream_options.stream_idle_timeout_ms = Some(30);
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        tokio::time::pause();
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::StreamIdle { .. })))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::MessageStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    AgentEvent::MessageEnd {
+                        discarded: true,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_failure_closes_started_message_without_replay() {
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stall_after(1),
+            MockResponse::text("must not be requested"),
+        ]);
+        cfg.retry = Some(crate::config::RetryConfig::new(3, 10_000));
+        cfg.stream_options.stream_idle_timeout_ms = Some(30);
+
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        tokio::time::pause();
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::StreamIdle { .. })))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::MessageStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    AgentEvent::MessageEnd {
+                        discarded: true,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_failure_has_no_retry_sleep() {
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stall_after(2),
+            MockResponse::text("must not be requested"),
+        ]);
+        cfg.retry = Some(crate::config::RetryConfig::new(3, 10_000));
+        cfg.stream_options.stream_idle_timeout_ms = Some(30);
+        cfg.stream_options.max_retries = Some(99);
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        tokio::time::pause();
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::StreamIdle { .. })))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::MessageStart { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    AgentEvent::MessageEnd {
+                        discarded: true,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
         );
     }
 
@@ -3073,14 +3799,18 @@ mod tests {
                 E::StreamIncomplete {
                     received_chunks: 3,
                     finish_reason: None,
+                    kind: llm_adapter::StreamEndKind::TransportError,
+                    detail: Some("cause=transport".into()),
                 },
                 |k| {
                     matches!(
                         k,
                         ProviderErrorKind::StreamIncomplete {
                             received_chunks: 3,
-                            finish_reason: None
-                        }
+                            finish_reason: None,
+                            detail: Some(detail),
+                            ..
+                        } if detail == "cause=transport"
                     )
                 },
             ),
@@ -3088,8 +3818,10 @@ mod tests {
                 E::StreamIncomplete {
                     received_chunks: 5,
                     finish_reason: Some("length".into()),
+                    kind: llm_adapter::StreamEndKind::DoneWithoutFinishReason,
+                    detail: None,
                 },
-                |k| matches!(k, ProviderErrorKind::StreamIncomplete { received_chunks: 5, finish_reason: Some(fr) } if fr == "length"),
+                |k| matches!(k, ProviderErrorKind::StreamIncomplete { received_chunks: 5, finish_reason: Some(fr), .. } if fr == "length"),
             ),
             (
                 E::Decode(serde_json::from_str::<i32>("not-an-int").unwrap_err()),

@@ -260,6 +260,12 @@ impl AgentHarness {
                     self.hooks.provider_error.clone(),
                 )) as Arc<dyn ProviderErrorHook>
             }),
+            // Hook-driven same-turn resends are hard-capped at 1 per turn:
+            // the adapter cannot yet distinguish a trusted 400 input
+            // rejection from an unknown-outcome gateway failure folded into
+            // `InvalidRequest`, so an unbounded repair retry would replay
+            // the request.
+            max_provider_error_retries: None,
             steer_rx: Some(steer_rx),
             follow_up_rx: Some(follow_up_rx),
             retry,
@@ -273,7 +279,7 @@ impl AgentHarness {
         initial: Vec<AgentMessage>,
     ) -> Result<(), HarnessError> {
         // 1. Setup: channels, abort token, system prompt, original tools.
-        let (steer_rx, follow_up_rx, abort, system_prompt, original_tools) = {
+        let (mut steer_rx, follow_up_rx, abort, system_prompt, original_tools) = {
             let mut inner = self.inner.lock().unwrap();
             inner.state.streaming_message = None;
             inner.state.pending_tool_calls.clear();
@@ -298,7 +304,7 @@ impl AgentHarness {
         let result = match std::panic::AssertUnwindSafe(self.drive_loop(
             run,
             initial,
-            steer_rx,
+            &mut steer_rx,
             follow_up_rx,
             abort,
             system_prompt,
@@ -333,6 +339,23 @@ impl AgentHarness {
         // Cleanup always runs, success or failure.
         {
             let mut inner = self.inner.lock().unwrap();
+            // Salvage steers the loop never consumed: agent_loop drains the
+            // steer channel one last time before it stops, but a steer sent
+            // after that final drain (e.g. the agent-team monitor racing the
+            // run's exit) still returns Ok from try_send and then dies with
+            // the receiver here. Buffer the leftovers as next-turn messages
+            // so the next run injects them instead of losing them silently.
+            // Once drive_loop has returned nothing else reads this receiver,
+            // so this drain owns whatever remains.
+            let salvaged = std::mem::take(&mut inner.state.queued_next_turn);
+            if !salvaged.is_empty() {
+                inner.state.salvaged_steers = true;
+                inner.state.queued_next_turn = salvaged;
+            }
+            while let Ok(leftover) = steer_rx.try_recv() {
+                inner.state.queued_next_turn.push(leftover);
+                inner.state.salvaged_steers = true;
+            }
             inner.state.streaming_message = None;
             inner.state.pending_tool_calls.clear();
             inner.active_tool_names.clear();
@@ -363,7 +386,7 @@ impl AgentHarness {
         &self,
         run: Arc<RunContext>,
         initial: Vec<AgentMessage>,
-        steer_rx: mpsc::Receiver<AgentMessage>,
+        steer_rx: &mut mpsc::Receiver<AgentMessage>,
         follow_up_rx: mpsc::Receiver<AgentMessage>,
         abort: CancellationToken,
         system_prompt: Option<String>,
@@ -378,8 +401,13 @@ impl AgentHarness {
             messages,
         };
 
-        // 3. Build LoopConfig.
-        let config = self.build_loop_config(run.clone(), steer_rx, follow_up_rx, abort.clone());
+        // 3. Build LoopConfig. The loop owns the receiver for its drains;
+        // the caller's binding gets a placeholder until the stream ends,
+        // then the real receiver is moved back so run_loop's salvage can
+        // recover any steer the loop never consumed.
+        let (_orphan_tx, orphan_rx) = mpsc::channel(1);
+        let real_rx = std::mem::replace(steer_rx, orphan_rx);
+        let config = self.build_loop_config(run.clone(), real_rx, follow_up_rx, abort.clone());
 
         // 4. Drive the stream. Push initial messages to pending before the loop starts
         //    (AgentStart is a signal-only event; initial messages are persisted here).
@@ -391,6 +419,21 @@ impl AgentHarness {
         let mut turn_messages: Vec<AgentMessage> = vec![];
 
         while let Some(event) = stream.next().await {
+            if matches!(
+                &event,
+                AgentEvent::MessageStart { .. } | AgentEvent::ToolExecutionStart { .. }
+            ) {
+                let mut inner = self.inner.lock().unwrap();
+                inner.state.replay_has_progress = true;
+                if let AgentEvent::ToolExecutionStart { tool_name, .. } = &event {
+                    inner.state.replay_tool_started = true;
+                    if inner.state.replay_tool_names.len() < 8
+                        && !inner.state.replay_tool_names.iter().any(|n| n == tool_name)
+                    {
+                        inner.state.replay_tool_names.push(tool_name.clone());
+                    }
+                }
+            }
             match &event {
                 AgentEvent::AgentStart => {
                     self.emit(AgentHarnessEvent::Agent(event));
@@ -519,7 +562,35 @@ impl AgentHarness {
                 AgentEvent::AgentEnd { .. } => {
                     self.emit(AgentHarnessEvent::Agent(event));
                     self.emit(AgentHarnessEvent::Settled);
+                    // The generator may still yield a final SteerOrphaned
+                    // (steers that died with the channel). Pull the tail so
+                    // the salvage is honored before the receiver drops.
+                    while let Some(trailing) = stream.next().await {
+                        if let AgentEvent::SteerOrphaned { messages } = &trailing {
+                            let mut inner = self.inner.lock().unwrap();
+                            inner.state.queued_next_turn.extend(messages.clone());
+                            inner.state.salvaged_steers = true;
+                        }
+                        self.emit(AgentHarnessEvent::Agent(trailing));
+                    }
                     break;
+                }
+                AgentEvent::SteerOrphaned { messages } => {
+                    // Steers the loop never consumed (teardown race, abort).
+                    // Buffer for the next run and flag the host scheduler so
+                    // it can requeue the originals if its wakeup is inbox-only.
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.state.queued_next_turn.extend(messages.clone());
+                    inner.state.salvaged_steers = true;
+                    self.emit(AgentHarnessEvent::Agent(event));
+                }
+                AgentEvent::SteerConsumed { messages } => {
+                    // Steers injected at a turn boundary: persist them so the
+                    // session transcript matches what the model actually saw.
+                    for msg in messages {
+                        self.push_pending_write(SessionEntryPayload::Message(msg.clone()));
+                    }
+                    self.emit(AgentHarnessEvent::Agent(event));
                 }
                 AgentEvent::Error(e) => {
                     // Clear pending writes so the failed turn's user message is not
@@ -537,11 +608,15 @@ impl AgentHarness {
                         // a signal, not a propagated error — so error_message must NOT
                         // be set (it is a pub field exposed via state()).
                         self.emit(AgentHarnessEvent::Aborted);
-                        break;
+                        // Keep pulling: the generator still owes AgentEnd and
+                        // possibly a SteerOrphaned salvage; the AgentEnd arm
+                        // below drains the tail and breaks.
+                        continue;
                     }
                     {
                         let mut inner = self.inner.lock().unwrap();
                         inner.state.error_message = Some(e.to_string());
+                        inner.state.last_error = Some(e.clone());
                     }
                     self.emit(AgentHarnessEvent::Agent(event));
                 }

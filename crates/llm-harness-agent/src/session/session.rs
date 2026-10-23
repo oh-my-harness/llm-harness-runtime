@@ -65,6 +65,22 @@ impl Session {
         &self.storage
     }
 
+    /// Remove every conversation entry and reset the active cursor.
+    ///
+    /// Used by controlled multi-run hosts to guarantee that a later run
+    /// cannot inherit an earlier run's transcript. Session metadata (id,
+    /// name, model, recall settings) is preserved; the recall revision is
+    /// advanced by storages that maintain one.
+    ///
+    /// Storages that do not support clearing fail closed with
+    /// [`SessionError::ClearUnsupported`] and leave the transcript intact.
+    /// Other storage errors may leave clearing partially applied. Do not
+    /// start another isolated run until a retry succeeds or the session is
+    /// recovered; an empty active path is not proof that all entries are gone.
+    pub async fn clear(&self) -> Result<(), SessionError> {
+        self.storage.clear().await
+    }
+
     // ── Raw path reads ─────────────────────────────────────────────────────
 
     /// Return all entries on the active cursor's path, ordered root-first.
@@ -416,6 +432,36 @@ mod tests {
             }]);
         m.stop_reason = Some(StopReason::EndTurn);
         AgentMessage::Assistant(m)
+    }
+
+    #[tokio::test]
+    async fn clear_removes_all_entries_and_resets_cursor() {
+        let session = make_session().await;
+        let before = session.storage().metadata().await.unwrap();
+        session.append_message(user_msg("first run")).await.unwrap();
+        assert_eq!(session.read_active_path().await.unwrap().len(), 1);
+
+        session.clear().await.unwrap();
+        assert!(session.read_active_path().await.unwrap().is_empty());
+        assert!(session.build_context().await.unwrap().messages.is_empty());
+        assert!(
+            session.storage().all_entries().await.unwrap().is_empty(),
+            "no detached entries may survive a clear"
+        );
+        let after = session.storage().metadata().await.unwrap();
+        assert_eq!(after.id, before.id, "clear must not recreate the session");
+        assert!(after.active_cursor.is_none());
+
+        session
+            .append_message(user_msg("second run"))
+            .await
+            .unwrap();
+        let path = session.read_active_path().await.unwrap();
+        assert_eq!(path.len(), 1);
+        assert!(matches!(
+            path[0].payload,
+            SessionEntryPayload::Message(AgentMessage::User(_))
+        ));
     }
 
     #[tokio::test]

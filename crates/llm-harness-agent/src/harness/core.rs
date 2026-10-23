@@ -120,7 +120,12 @@ impl AgentHarness {
             pending_tool_calls: HashSet::new(),
             pending_session_writes: VecDeque::new(),
             queued_next_turn: vec![],
+            salvaged_steers: false,
             error_message: None,
+            last_error: None,
+            replay_has_progress: false,
+            replay_tool_started: false,
+            replay_tool_names: Vec::new(),
         };
 
         let inner = HarnessInner {
@@ -218,13 +223,29 @@ impl AgentHarness {
                 return Err(HarnessError::NotIdle(inner.state.phase));
             }
             inner.state.error_message = None;
+            inner.state.last_error = None;
+            inner.state.replay_has_progress = false;
+            inner.state.replay_tool_started = false;
+            inner.state.replay_tool_names.clear();
             std::mem::take(&mut inner.state.queued_next_turn)
         };
 
-        self.try_auto_compact().await?;
-        let initial: Vec<AgentMessage> = queued.into_iter().chain(messages).collect();
-        let initial = self.run_before_run_hook(&run, initial).await?;
-        self.run_loop(run, initial).await
+        let result = async {
+            self.try_auto_compact().await?;
+            let initial: Vec<AgentMessage> = queued.into_iter().chain(messages).collect();
+            let initial = self.run_before_run_hook(&run, initial).await?;
+            self.run_loop(run, initial).await
+        }
+        .await;
+        if let Err(error) = &result {
+            let mut inner = self.inner.lock().unwrap();
+            inner.state.error_message = Some(error.to_string());
+            inner.state.last_error = Some(match error {
+                HarnessError::Agent(error) => error.clone(),
+                _ => AgentError::Internal(error.to_string()),
+            });
+        }
+        result
     }
 
     /// Expand `name` as a skill invocation and start a run.
@@ -896,12 +917,68 @@ impl AgentHarness {
         Ok(())
     }
 
+    /// Whether the last run salvaged steers the loop never consumed.
+    ///
+    /// Set by the run teardown paths when a steer that the loop never read
+    /// was buffered for recovery. The scheduling layer (agent-team's runner)
+    /// consumes this after a run to requeue the original inbox messages,
+    /// because its wakeup loop only observes the social inbox.
+    pub fn take_salvaged_steers(&self) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        std::mem::replace(&mut inner.state.salvaged_steers, false)
+    }
+
     /// Returns `true` if any queue is non-empty.
     pub fn has_queued_messages(&self) -> bool {
         let inner = self.inner.lock().unwrap();
         inner.steer_tx.max_capacity() != inner.steer_tx.capacity()
             || inner.follow_up_tx.max_capacity() != inner.follow_up_tx.capacity()
             || !inner.state.queued_next_turn.is_empty()
+    }
+
+    /// Clear the conversation transcript and every per-run transient.
+    ///
+    /// This is a controlled multi-run primitive: a host that reuses one
+    /// harness across isolated runs calls it at the run boundary so the next
+    /// run cannot inherit the previous run's messages, tool-call bookkeeping,
+    /// replay gates, queued steers, or error state. Model, tools, system
+    /// prompt, skills, and resource configuration are preserved.
+    ///
+    /// The `Idle → Resetting` transition ([`HarnessPhase::Resetting`]) is
+    /// atomic, so a run cannot start while the transcript is being cleared
+    /// (and a concurrent reset fails with `NotIdle`). Fails with [`HarnessError::NotIdle`] when
+    /// any other operation is in progress, and with the storage error when the
+    /// backend cannot clear. `NotIdle` and an unsupported storage leave the
+    /// transcript intact. Other storage errors may leave clearing partially
+    /// applied (for example, JSONL storage may already have detached the active
+    /// cursor). Per-run transient state is cleared only after storage succeeds.
+    /// On any storage error, do not start another run until a retry succeeds
+    /// or the session has been recovered; an empty active path alone is not
+    /// proof that clearing succeeded.
+    pub async fn reset_conversation(&self) -> Result<(), HarnessError> {
+        let _guard = self.enter_phase(HarnessPhase::Resetting)?;
+        self.session.clear().await?;
+
+        let mut inner = self.inner.lock().unwrap();
+        inner.state.streaming_message = None;
+        inner.state.pending_tool_calls.clear();
+        inner.state.pending_session_writes.clear();
+        inner.active_tool_names.clear();
+        inner.state.error_message = None;
+        inner.state.last_error = None;
+        inner.state.replay_has_progress = false;
+        inner.state.replay_tool_started = false;
+        inner.state.replay_tool_names.clear();
+        inner.state.tools_overwritten_mid_run = false;
+        inner.state.queued_next_turn.clear();
+        inner.state.salvaged_steers = false;
+        // Recreate the queues. Any message sent while the harness is resetting
+        // would otherwise be delivered to the next run.
+        let (steer_tx, _steer_rx) = mpsc::channel(inner.queue_capacity);
+        let (follow_up_tx, _follow_up_rx) = mpsc::channel(inner.queue_capacity);
+        inner.steer_tx = steer_tx;
+        inner.follow_up_tx = follow_up_tx;
+        Ok(())
     }
 
     /// Cancel the current run and all in-flight sub-agents.

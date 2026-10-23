@@ -169,6 +169,7 @@ fn phase_str(phase: HarnessPhase) -> &'static str {
         HarnessPhase::Turning => "Turning",
         HarnessPhase::Compacting => "Compacting",
         HarnessPhase::Branching => "Branching",
+        HarnessPhase::Resetting => "Resetting",
         _ => "Unknown",
     }
 }
