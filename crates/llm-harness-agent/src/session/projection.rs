@@ -24,10 +24,21 @@ pub struct SessionMutation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionMutationKind {
     Created,
-    Forked { source_session_id: String },
-    EntryAppended { entry_id: EntryId },
-    EntriesDeleted { entry_ids: Vec<EntryId> },
-    ActiveBranchChanged { entry_id: EntryId },
+    Forked {
+        source_session_id: String,
+    },
+    EntryAppended {
+        entry_id: EntryId,
+    },
+    EntriesDeleted {
+        entry_ids: Vec<EntryId>,
+    },
+    /// The whole transcript was cleared (active cursor reset to `None`).
+    /// Projectors must re-snapshot rather than apply an incremental delete.
+    Cleared,
+    ActiveBranchChanged {
+        entry_id: EntryId,
+    },
     MetadataChanged,
     RecallSettingsChanged,
     Deleted,
@@ -301,6 +312,14 @@ impl SessionStorage for ObservedSessionStorage {
 
     fn all_entries(&self) -> BoxFuture<'_, Result<Vec<SessionEntry>, SessionError>> {
         self.inner.all_entries()
+    }
+
+    fn clear(&self) -> BoxFuture<'_, Result<(), SessionError>> {
+        Box::pin(async move {
+            self.inner.clear().await?;
+            self.emit(SessionMutationKind::Cleared).await;
+            Ok(())
+        })
     }
 }
 

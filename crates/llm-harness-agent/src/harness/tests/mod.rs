@@ -15,6 +15,7 @@ mod metadata;
 mod phase_guard;
 mod prepare_next_turn;
 mod queues;
+mod reset;
 mod tools;
 
 // ── Shared helpers used by multiple test files ───────────────────────────────

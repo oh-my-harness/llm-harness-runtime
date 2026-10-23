@@ -377,6 +377,8 @@ impl MockResponse {
                 Err(LlmError::StreamIncomplete {
                     received_chunks,
                     finish_reason: None,
+                    kind: llm_adapter::StreamEndKind::TransportError,
+                    detail: Some("cause=transport flags=[decode]".into()),
                 }),
             ],
         }

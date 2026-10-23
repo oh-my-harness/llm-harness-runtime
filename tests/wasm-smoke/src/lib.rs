@@ -42,6 +42,7 @@ fn mock_config() -> LoopConfig {
         after_provider_response: None,
         final_answer_validator: None,
         provider_error: None,
+        max_provider_error_retries: None,
         steer_rx: None,
         follow_up_rx: None,
         retry: None,

@@ -46,8 +46,22 @@ pub struct HarnessState {
     pub(crate) pending_session_writes: VecDeque<SessionEntryPayload>,
     /// Messages queued for injection at the start of the next `prompt()`.
     pub(crate) queued_next_turn: Vec<AgentMessage>,
+    /// Set when run-end salvage recovered steers the loop never consumed.
+    /// The owning scheduler (agent-team runner) reads and clears it to decide
+    /// whether the drained inbox messages must be requeued instead of acked.
+    pub(crate) salvaged_steers: bool,
     /// Error text from the most recent failed LLM call.
     pub error_message: Option<String>,
+    /// Structured error for scheduler replay decisions; never infer from text.
+    pub last_error: Option<AgentError>,
+    /// A response stream or a tool started during this run. Replaying the
+    /// assignment would discard known progress or repeat possible side effects.
+    pub replay_has_progress: bool,
+    pub replay_tool_started: bool,
+    /// Names of tools that started during this run (deduplicated, capped).
+    /// Persisted in the uncertainty error so a human can audit side effects
+    /// before deciding how to resume. Tool arguments are never recorded here.
+    pub replay_tool_names: Vec<String>,
     /// Whether `set_tools` was called mid-run since the last `build_loop_config`.
     /// Cleanup uses this to avoid rolling back the user's tool change together
     /// with the HookedTool unwrap.

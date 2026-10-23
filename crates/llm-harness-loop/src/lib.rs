@@ -40,6 +40,7 @@
 //!     after_provider_response: None,
 //!     final_answer_validator: None,
 //!     provider_error: None,
+//!     max_provider_error_retries: None,
 //!     steer_rx: None,
 //!     follow_up_rx: None,
 //!     retry: None,
@@ -91,17 +92,21 @@
 //! | Field | Default | Notes |
 //! |-------|---------|-------|
 //! | `timeout_ms` | `None` | Overall request timeout. `None` = no timeout. |
-//! | `stream_idle_timeout_ms` | `None` | Per-event idle watchdog. If no `StreamEvent` arrives within this window, the stream is dropped and retried. A partial `MessageEnd` is emitted before retry to close any open message. |
+//! | `stream_idle_timeout_ms` | `None` | Per-event idle watchdog. If no `StreamEvent` arrives within this window, the incomplete generation is discarded. With a configured retry budget, the same request may be resent; otherwise the error surfaces to the caller. |
 //! | `max_retries` | `None` | Overrides `RetryConfig.max_retries` if set. |
 //! | `max_retry_delay_ms` | `None` | Caps retry delay. |
 //! | `headers` / `metadata` / `cache_config` | empty | Require provider adapter support to pass through. |
 //!
 //! ### Retry (`retry: Option<RetryConfig>`)
 //!
-//! `None` disables retry. When set, the loop retries on transient provider
-//! errors (5xx, connection, timeout) with exponential backoff (`base_delay_ms`
-//! doubled per attempt). `stream_opts.max_retries` overrides
-//! `RetryConfig.max_retries` at runtime.
+//! `None` disables retry. When configured, the loop retries `RateLimit`
+//! (HTTP 429) and incomplete streaming generations within the retry budget,
+//! with exponential backoff (`base_delay_ms` doubled per attempt). An
+//! incomplete generation is discarded before any of its tool calls execute;
+//! only that same provider request is resent. Completed turns and their
+//! executed tools are not replayed. Admission-time connection failures,
+//! timeouts and 5xx errors surface to the caller. `stream_opts.max_retries`
+//! overrides `RetryConfig.max_retries` at runtime.
 //!
 //! ### Provider error repair (`provider_error: Option<Arc<dyn ProviderErrorHook>>`)
 //!
@@ -305,7 +310,7 @@ pub use loop_fn::{agent_loop, agent_loop_continue};
 pub use llm_adapter::LlmError;
 pub use llm_adapter::StreamHandle;
 pub use llm_adapter::anthropic::AnthropicProvider;
-pub use llm_adapter::openai::{OpenAIProvider, ThinkingScheme};
+pub use llm_adapter::openai::{MaxTokensScheme, OpenAIProvider, ThinkingScheme};
 pub use llm_adapter::provider::Provider as LlmClient;
 pub use llm_adapter::provider::ProviderCapabilities;
 pub use llm_adapter::types::ChatRequest;

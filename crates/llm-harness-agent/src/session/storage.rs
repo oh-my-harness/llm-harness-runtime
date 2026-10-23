@@ -100,6 +100,30 @@ pub trait SessionStorage: Send + Sync {
         Box::pin(async { Err(SessionError::RecallMetadataUnsupported) })
     }
 
+    /// Remove every entry and reset the active cursor to `None`.
+    ///
+    /// This is the storage-level primitive behind
+    /// [`Session::clear`](crate::session::Session::clear). Implementations
+    /// MUST erase all entries (including the children index and the active
+    /// cursor) before returning `Ok(())`. An I/O error can leave clearing
+    /// partially applied; it does not guarantee rollback. Callers must not
+    /// begin another isolated run until clearing is retried successfully or
+    /// the session is recovered. In particular, an empty active path does not
+    /// prove that detached entries have been removed.
+    ///
+    /// Implementations that advance recall authority metadata MUST do so
+    /// before removing content, so an interrupted clear can only leave a
+    /// conservative (invalidated) index, never one that references erased
+    /// entries.
+    ///
+    /// The default returns `ClearUnsupported` without changing any state, so
+    /// existing third-party storages remain source-compatible and cannot
+    /// silently accept a clear they do not implement. Implementations that
+    /// return `ClearUnsupported` must do so before changing state.
+    fn clear(&self) -> BoxFuture<'_, Result<(), SessionError>> {
+        Box::pin(async { Err(SessionError::ClearUnsupported) })
+    }
+
     /// Delete the given entries and remove them from the children index.
     ///
     /// If the active cursor is among the deleted IDs it is reset to `None`.
@@ -317,6 +341,25 @@ impl SessionStorage for InMemorySessionStorage {
                 .values()
                 .cloned()
                 .collect())
+        })
+    }
+
+    fn clear(&self) -> BoxFuture<'_, Result<(), SessionError>> {
+        Box::pin(async move {
+            let mut st = self.inner.lock().unwrap();
+            let changed = !st.entries.is_empty() || st.metadata.active_cursor.is_some();
+            // Advance recall authority first: if the revision budget is
+            // exhausted the clear fails without touching any state.
+            if changed {
+                st.metadata.mark_recall_content_changed()?;
+            }
+            st.entries.clear();
+            st.children.clear();
+            st.metadata.active_cursor = None;
+            if changed {
+                st.metadata.updated_at = chrono::Utc::now();
+            }
+            Ok(())
         })
     }
 }

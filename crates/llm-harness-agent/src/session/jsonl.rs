@@ -352,6 +352,34 @@ impl SessionStorage for JsonlSessionStorage {
             Ok(inner.entry_map.values().cloned().collect())
         })
     }
+
+    fn clear(&self) -> BoxFuture<'_, Result<(), SessionError>> {
+        Box::pin(async move {
+            let mut inner = self.inner.lock().await;
+            Self::ensure_loaded(&mut inner).await?;
+            let changed = !inner.entry_map.is_empty() || inner.metadata.active_cursor.is_some();
+            // Ordering: make `active_cursor = None` durable before erasing
+            // content. A crash after the truncation therefore cannot leave a
+            // cursor pointing at an entry that no longer exists; the worst
+            // intermediate state is unreachable entries on disk. Recall
+            // authority is advanced in the same write, so an interrupted
+            // clear can only leave a conservative index.
+            // This is not a two-file transaction: an I/O error may leave the
+            // cursor detached while entries remain. Only Ok authorizes the
+            // caller to begin a new isolated run; retry after fixing the I/O
+            // error to finish removing the entries.
+            if changed {
+                inner.metadata.mark_recall_content_changed()?;
+                inner.metadata.active_cursor = None;
+                inner.metadata.updated_at = chrono::Utc::now();
+            }
+            Self::persist_meta(&inner).await?;
+            Self::atomic_write(&inner.entries_path, b"").await?;
+            inner.entry_map.clear();
+            inner.children_map.clear();
+            Ok(())
+        })
+    }
 }
 
 // ── JsonlSessionRepo ───────────────────────────────────────────────────────────
