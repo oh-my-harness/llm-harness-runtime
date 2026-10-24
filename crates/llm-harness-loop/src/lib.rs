@@ -92,7 +92,7 @@
 //! | Field | Default | Notes |
 //! |-------|---------|-------|
 //! | `timeout_ms` | `None` | Overall request timeout. `None` = no timeout. |
-//! | `stream_idle_timeout_ms` | `None` | Per-event idle watchdog. If no `StreamEvent` arrives within this window, the incomplete generation is discarded. With a configured retry budget, the same request may be resent; otherwise the error surfaces to the caller. |
+//! | `stream_idle_timeout_ms` | `None` | Per-event idle watchdog. If no `StreamEvent` arrives within this window, the stream stops with `StreamIdle`. This local timeout is not retried, even with a retry budget; it does not establish the provider's outcome. |
 //! | `max_retries` | `None` | Overrides `RetryConfig.max_retries` if set. |
 //! | `max_retry_delay_ms` | `None` | Caps retry delay. |
 //! | `headers` / `metadata` / `cache_config` | empty | Require provider adapter support to pass through. |
@@ -122,8 +122,12 @@
 //!
 //! | Field | Type | Notes |
 //! |-------|------|-------|
-//! | `steer_rx` | `Option<Receiver<AgentMessage>>` | Injects messages between turns to redirect the agent mid-run. Drained at turn boundaries and at natural stop (leftovers run one more turn instead of being lost). |
-//! | `follow_up_rx` | `Option<Receiver<AgentMessage>>` | Queued messages processed after the loop naturally stops. Each triggers a new run. |
+//! | `steer_rx` | `Option<Receiver<AgentMessage>>` | Injects messages at turn boundaries, emitting `SteerConsumed` for the host to persist. If no follow-up continues the run at natural stop, remaining steers are returned as `SteerOrphaned` for the host to recover. |
+//! | `follow_up_rx` | `Option<Receiver<AgentMessage>>` | At natural stop, an already queued follow-up continues the same run with another provider turn. Queued steers are consumed at that turn boundary, so both messages reach the next request. |
+//!
+//! Send reactive messages while generation is active. `AgentEnd` marks a
+//! terminal boundary; callers must not rely on new follow-ups sent during
+//! terminal event delivery being consumed by that run.
 //!
 //! ## Final Answer Modes
 //!

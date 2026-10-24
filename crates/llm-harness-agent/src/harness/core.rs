@@ -610,13 +610,8 @@ impl AgentHarness {
 
     /// Update the session name.
     pub async fn set_session_name(&self, name: String) -> Result<(), HarnessError> {
+        let _guard = self.enter_phase(HarnessPhase::Branching)?;
         let payload = SessionEntryPayload::SessionInfo { name: name.clone() };
-        {
-            let inner = self.inner.lock().unwrap();
-            if inner.state.phase != HarnessPhase::Idle {
-                return Err(HarnessError::NotIdle(inner.state.phase));
-            }
-        }
         self.session.append(payload).await?;
         self.emit(AgentHarnessEvent::SessionInfoUpdate { name });
         Ok(())
@@ -626,12 +621,9 @@ impl AgentHarness {
 
     /// Append an `AgentMessage` to the session and return its entry ID.
     pub async fn append_message(&self, msg: AgentMessage) -> Result<EntryId, HarnessError> {
-        {
-            let inner = self.inner.lock().unwrap();
-            if inner.state.phase != HarnessPhase::Idle {
-                return Err(HarnessError::NotIdle(inner.state.phase));
-            }
-        }
+        // Hold the same exclusive phase as other direct tree mutations until
+        // both the entry append and the cursor update have completed.
+        let _guard = self.enter_phase(HarnessPhase::Branching)?;
         Ok(self.session.append_message(msg).await?)
     }
 
@@ -641,12 +633,7 @@ impl AgentHarness {
         custom_type: String,
         data: serde_json::Value,
     ) -> Result<EntryId, HarnessError> {
-        {
-            let inner = self.inner.lock().unwrap();
-            if inner.state.phase != HarnessPhase::Idle {
-                return Err(HarnessError::NotIdle(inner.state.phase));
-            }
-        }
+        let _guard = self.enter_phase(HarnessPhase::Branching)?;
         Ok(self
             .session
             .append(SessionEntryPayload::Custom { custom_type, data })
@@ -701,6 +688,7 @@ impl AgentHarness {
     ///
     /// This is the runtime-facing counterpart to `Session::delete_entries`.
     pub async fn delete_entries(&self, ids: Vec<EntryId>) -> Result<(), HarnessError> {
+        let _guard = self.enter_phase(HarnessPhase::Branching)?;
         Ok(self.session.delete_entries(ids).await?)
     }
 

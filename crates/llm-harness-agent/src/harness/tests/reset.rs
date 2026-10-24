@@ -223,12 +223,19 @@ async fn reset_conversation_rejected_when_not_idle_without_side_effects() {
 
 // ── 3b. Reset claims the harness atomically ────────────────────────────────
 
-/// Storage that parks inside `clear`, so the test can observe the harness
-/// while the transcript is being erased.
+#[derive(Clone, Copy)]
+enum GatedMutation {
+    Append,
+    Clear,
+}
+
+/// Storage that parks at a controlled mutation boundary. Append pauses after
+/// the entry is stored but before Session can advance the active cursor.
 struct GatedClearStorage {
     inner: Arc<dyn SessionStorage>,
     entered: Arc<tokio::sync::Notify>,
     release: Arc<tokio::sync::Notify>,
+    mutation: GatedMutation,
 }
 
 impl SessionStorage for GatedClearStorage {
@@ -244,7 +251,14 @@ impl SessionStorage for GatedClearStorage {
         &self,
         entry: SessionEntry,
     ) -> futures::future::BoxFuture<'_, Result<(), SessionError>> {
-        self.inner.append_entry(entry)
+        Box::pin(async move {
+            self.inner.append_entry(entry).await?;
+            if matches!(self.mutation, GatedMutation::Append) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        })
     }
 
     fn get_entry(
@@ -349,8 +363,10 @@ impl SessionStorage for GatedClearStorage {
 
     fn clear(&self) -> futures::future::BoxFuture<'_, Result<(), SessionError>> {
         Box::pin(async move {
-            self.entered.notify_one();
-            self.release.notified().await;
+            if matches!(self.mutation, GatedMutation::Clear) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
             self.inner.clear().await
         })
     }
@@ -372,6 +388,7 @@ async fn reset_claims_the_harness_against_concurrent_runs() {
         inner: inner.clone(),
         entered: Arc::new(tokio::sync::Notify::new()),
         release: Arc::new(tokio::sync::Notify::new()),
+        mutation: GatedMutation::Clear,
     });
     let harness = Arc::new(AgentHarness::with_session(
         Arc::new(MockLlmClient::new(vec![MockResponse::text("must not run")]))
@@ -405,6 +422,228 @@ async fn reset_claims_the_harness_against_concurrent_runs() {
     assert!(harness.read_active_path().await.unwrap().is_empty());
     assert_eq!(harness.state().phase, HarnessPhase::Idle);
     assert!(!harness.state().replay_tool_started);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DirectSessionWrite {
+    Message,
+    Custom,
+    Name,
+}
+
+impl DirectSessionWrite {
+    async fn apply(self, harness: &AgentHarness) -> Result<(), HarnessError> {
+        match self {
+            Self::Message => harness
+                .append_message(user_msg("direct write"))
+                .await
+                .map(|_| ()),
+            Self::Custom => harness
+                .append_custom_entry("direct".into(), serde_json::json!({"value": 1}))
+                .await
+                .map(|_| ()),
+            Self::Name => harness.set_session_name("direct name".into()).await,
+        }
+    }
+}
+
+async fn harness_with_gated_mutation(
+    mutation: GatedMutation,
+) -> (Arc<AgentHarness>, Arc<GatedClearStorage>) {
+    let repo = InMemorySessionRepo::new();
+    let gated = Arc::new(GatedClearStorage {
+        inner: repo.create(CreateSessionOptions::default()).await.unwrap(),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+        mutation,
+    });
+    let harness = Arc::new(AgentHarness::with_session(
+        Arc::new(MockLlmClient::new(vec![])) as Arc<dyn LlmClient>,
+        Arc::new(NoOpEnv),
+        Session::new(gated.clone() as Arc<dyn SessionStorage>),
+        AgentHarnessOptions::new("test-model"),
+    ));
+    (harness, gated)
+}
+
+#[tokio::test]
+async fn direct_session_writes_hold_phase_until_cursor_is_updated() {
+    for operation in [
+        DirectSessionWrite::Message,
+        DirectSessionWrite::Custom,
+        DirectSessionWrite::Name,
+    ] {
+        let (harness, gated) = harness_with_gated_mutation(GatedMutation::Append).await;
+        let writer = harness.clone();
+        let write = tokio::spawn(async move { operation.apply(&writer).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gated.entered.notified())
+            .await
+            .expect("direct write must reach the entry/cursor boundary");
+        assert_eq!(gated.inner.all_entries().await.unwrap().len(), 1);
+        assert!(gated.inner.active_cursor().await.unwrap().is_none());
+
+        assert!(
+            matches!(
+                harness.reset_conversation().await,
+                Err(HarnessError::NotIdle(HarnessPhase::Branching))
+            ),
+            "{operation:?} must exclude reset until its cursor write completes"
+        );
+        assert!(matches!(
+            harness.prompt("must not run").await,
+            Err(HarnessError::NotIdle(HarnessPhase::Branching))
+        ));
+        assert_eq!(gated.inner.all_entries().await.unwrap().len(), 1);
+
+        gated.release.notify_one();
+        write.await.unwrap().unwrap();
+        let cursor = gated.inner.active_cursor().await.unwrap().unwrap();
+        assert!(gated.inner.get_entry(cursor).await.unwrap().is_some());
+        assert_eq!(harness.state().phase, HarnessPhase::Idle);
+        harness.reset_conversation().await.unwrap();
+        assert!(gated.inner.all_entries().await.unwrap().is_empty());
+        assert!(gated.inner.active_cursor().await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn reset_excludes_all_direct_session_writes_until_clear_completes() {
+    let (harness, gated) = harness_with_gated_mutation(GatedMutation::Clear).await;
+    let resetter = harness.clone();
+    let reset = tokio::spawn(async move { resetter.reset_conversation().await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gated.entered.notified())
+        .await
+        .expect("reset must reach the storage clear boundary");
+    for operation in [
+        DirectSessionWrite::Message,
+        DirectSessionWrite::Custom,
+        DirectSessionWrite::Name,
+    ] {
+        assert!(
+            matches!(
+                operation.apply(&harness).await,
+                Err(HarnessError::NotIdle(HarnessPhase::Resetting))
+            ),
+            "{operation:?} must not mutate storage during reset"
+        );
+    }
+    assert!(matches!(
+        harness.delete_entries(vec![]).await,
+        Err(HarnessError::NotIdle(HarnessPhase::Resetting))
+    ));
+    assert!(gated.inner.all_entries().await.unwrap().is_empty());
+    assert!(gated.inner.active_cursor().await.unwrap().is_none());
+    gated.release.notify_one();
+    reset.await.unwrap().unwrap();
+    assert_eq!(harness.state().phase, HarnessPhase::Idle);
+    for operation in [
+        DirectSessionWrite::Message,
+        DirectSessionWrite::Custom,
+        DirectSessionWrite::Name,
+    ] {
+        operation.apply(&harness).await.unwrap();
+    }
+    let cursor = gated.inner.active_cursor().await.unwrap().unwrap();
+    assert!(gated.inner.get_entry(cursor).await.unwrap().is_some());
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConfigurationSessionWrite {
+    Model,
+    ClientAndModel,
+    Thinking,
+    Tools,
+}
+
+impl ConfigurationSessionWrite {
+    async fn apply(self, harness: &AgentHarness) -> Result<(), HarnessError> {
+        match self {
+            Self::Model => harness.set_model("next-model".into(), None).await,
+            Self::ClientAndModel => {
+                harness
+                    .switch_llm(
+                        Arc::new(MockLlmClient::new(vec![])) as Arc<dyn LlmClient>,
+                        "switched-model".into(),
+                        None,
+                        Some("test-provider".into()),
+                    )
+                    .await
+            }
+            Self::Thinking => {
+                harness
+                    .set_thinking_level(harness.state().thinking_level)
+                    .await
+            }
+            Self::Tools => harness.set_tools(vec![]).await,
+        }
+    }
+}
+
+#[tokio::test]
+async fn idle_configuration_appends_finish_before_reset_clears_entries() {
+    for operation in [
+        ConfigurationSessionWrite::Model,
+        ConfigurationSessionWrite::ClientAndModel,
+        ConfigurationSessionWrite::Thinking,
+        ConfigurationSessionWrite::Tools,
+    ] {
+        let (harness, gated) = harness_with_gated_mutation(GatedMutation::Append).await;
+        let writer = harness.clone();
+        let write = tokio::spawn(async move { operation.apply(&writer).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gated.entered.notified())
+            .await
+            .expect("configuration write must reach the entry/cursor boundary");
+        assert_eq!(gated.inner.all_entries().await.unwrap().len(), 1);
+        assert!(gated.inner.active_cursor().await.unwrap().is_none());
+
+        // Poll reset to its first suspension point. It must claim the harness
+        // and then wait for the whole in-flight append, not clear its entry
+        // before that append advances the cursor to it.
+        let mut reset = Box::pin(harness.reset_conversation());
+        assert!(
+            futures::poll!(reset.as_mut()).is_pending(),
+            "{operation:?}: reset must wait for the cursor update"
+        );
+        assert_eq!(harness.state().phase, HarnessPhase::Resetting);
+        assert_eq!(gated.inner.all_entries().await.unwrap().len(), 1);
+        assert!(matches!(
+            harness.prompt("must not run").await,
+            Err(HarnessError::NotIdle(HarnessPhase::Resetting))
+        ));
+
+        gated.release.notify_one();
+        write.await.unwrap().unwrap();
+        reset.await.unwrap();
+        assert_eq!(harness.state().phase, HarnessPhase::Idle);
+        assert!(gated.inner.active_cursor().await.unwrap().is_none());
+        assert!(gated.inner.all_entries().await.unwrap().is_empty());
+        assert!(harness.read_active_path().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn configuration_updates_during_reset_remain_allowed_without_direct_appends() {
+    let (harness, gated) = harness_with_gated_mutation(GatedMutation::Clear).await;
+    let resetter = harness.clone();
+    let reset = tokio::spawn(async move { resetter.reset_conversation().await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gated.entered.notified())
+        .await
+        .expect("reset must reach the storage clear boundary");
+    for operation in [
+        ConfigurationSessionWrite::Model,
+        ConfigurationSessionWrite::ClientAndModel,
+        ConfigurationSessionWrite::Thinking,
+        ConfigurationSessionWrite::Tools,
+    ] {
+        operation.apply(&harness).await.unwrap();
+    }
+    assert!(gated.inner.all_entries().await.unwrap().is_empty());
+    assert!(gated.inner.active_cursor().await.unwrap().is_none());
+    gated.release.notify_one();
+    reset.await.unwrap().unwrap();
+    assert_eq!(harness.state().phase, HarnessPhase::Idle);
+    assert_eq!(harness.state().model, "switched-model");
+    assert!(gated.inner.all_entries().await.unwrap().is_empty());
 }
 
 // ── 3b2. Queued cross-run state is cleared ────────────────────────────────

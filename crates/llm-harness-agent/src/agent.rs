@@ -65,6 +65,8 @@ struct AgentInner {
     state: AgentState,
     steer_tx: mpsc::Sender<AgentMessage>,
     follow_up_tx: mpsc::Sender<AgentMessage>,
+    /// Steers accepted by a completed run but not consumed by its provider turns.
+    pending_steers: Vec<AgentMessage>,
     max_tokens: u32,
     queue_capacity: usize,
     /// CancellationToken for the currently running loop; `None` when idle.
@@ -186,6 +188,7 @@ impl Agent {
             state,
             steer_tx,
             follow_up_tx,
+            pending_steers: vec![],
             max_tokens: opts.max_tokens,
             queue_capacity: cap,
             current_abort: None,
@@ -203,7 +206,7 @@ impl Agent {
 
     // ── Structural operations (Idle only) ─────────────────────────────────
 
-    /// Start a new run from a text prompt.
+    /// Start a new run from a text prompt, after any unconsumed steers.
     pub async fn prompt(&self, text: impl Into<String>) -> Result<(), AgentError> {
         let text = text.into();
         let user_msg = AgentMessage::User(UserMessage {
@@ -213,7 +216,8 @@ impl Agent {
         self.run_with_initial(vec![user_msg], false, false).await
     }
 
-    /// Start a new run with an explicit message list, replacing the current transcript.
+    /// Start a new run with an explicit message list, replacing the current transcript
+    /// and discarding unconsumed steers from previous runs.
     pub async fn prompt_with_messages(
         &self,
         messages: Vec<AgentMessage>,
@@ -221,10 +225,11 @@ impl Agent {
         self.run_with_initial(messages, false, true).await
     }
 
-    /// Continue the current transcript without injecting new messages.
+    /// Continue the current transcript, first appending any unconsumed steers.
     ///
     /// Uses `agent_loop_continue` which drains stale steer messages before the
-    /// first LLM call.
+    /// first LLM call. Steers recovered from an earlier run are appended to the
+    /// transcript before that drain, so they are preserved.
     pub async fn continue_run(&self) -> Result<(), AgentError> {
         self.run_with_initial(vec![], true, false).await
     }
@@ -236,6 +241,7 @@ impl Agent {
         inner.state.streaming_message = None;
         inner.state.pending_tool_calls.clear();
         inner.state.error_message = None;
+        inner.pending_steers.clear();
     }
 
     // ── Runtime configuration (any phase) ─────────────────────────────────
@@ -304,6 +310,8 @@ impl Agent {
     /// Enqueue a full message as a steer.
     ///
     /// Returns `Err` if the steer channel is full or closed.
+    /// An accepted message not consumed before the run ends is retained for
+    /// the next `prompt` or `continue_run`, unless explicitly cleared or replaced.
     pub fn steer_message(&self, msg: AgentMessage) -> Result<(), ChannelError> {
         let inner = self.inner.lock().unwrap();
         inner.steer_tx.try_send(msg).map_err(ChannelError::from)
@@ -322,7 +330,7 @@ impl Agent {
         inner.follow_up_tx.try_send(msg).map_err(ChannelError::from)
     }
 
-    /// Drain the steer queue. Only callable when Idle.
+    /// Drain the steer queue, including recovered unconsumed steers. Only callable when Idle.
     pub fn clear_steering_queue(&self) -> Result<(), AgentError> {
         let mut inner = self.inner.lock().unwrap();
         if inner.state.phase != AgentPhase::Idle {
@@ -331,6 +339,7 @@ impl Agent {
         let cap = inner.queue_capacity;
         let (new_tx, _) = mpsc::channel(cap);
         inner.steer_tx = new_tx;
+        inner.pending_steers.clear();
         Ok(())
     }
 
@@ -352,14 +361,16 @@ impl Agent {
         self.clear_follow_up_queue()
     }
 
-    /// Returns `true` if either the steer or follow-up channel has capacity used.
+    /// Returns `true` if recovered steers are pending or either channel has capacity used.
     ///
-    /// Note: this checks sender capacity, not whether the running loop will process them.
+    /// Channel occupancy uses sender capacity; it does not promise the current
+    /// loop will consume the queued messages.
     pub fn has_queued_messages(&self) -> bool {
         let inner = self.inner.lock().unwrap();
         // max_capacity - available_permits gives approximate occupancy
         inner.steer_tx.max_capacity() != inner.steer_tx.capacity()
             || inner.follow_up_tx.max_capacity() != inner.follow_up_tx.capacity()
+            || !inner.pending_steers.is_empty()
     }
 
     /// Cancel the currently running loop, if any.
@@ -414,10 +425,21 @@ impl Agent {
             inner.state.streaming_message = None;
             inner.state.pending_tool_calls.clear();
 
-            // Extend transcript with initial messages (or replace for prompt_with_messages).
-            if is_continue {
-                // continue_run: use existing messages as-is
-            } else if replace_transcript {
+            // Promote recovered steers into the transcript exactly once. They
+            // must not enter the new steer channel: agent_loop_continue drains
+            // that channel before its first provider request. If this run fails,
+            // the messages remain in the transcript rather than being requeued
+            // and duplicated on the next prompt/continue.
+            let initial = if replace_transcript {
+                inner.pending_steers.clear();
+                initial
+            } else {
+                std::mem::take(&mut inner.pending_steers)
+                    .into_iter()
+                    .chain(initial)
+                    .collect::<Vec<_>>()
+            };
+            if replace_transcript {
                 inner.state.messages = initial.clone();
             } else if !initial.is_empty() {
                 inner.state.messages.extend(initial.iter().cloned());
@@ -534,6 +556,9 @@ impl Agent {
             AgentEvent::AgentEnd { new_messages: msgs } => {
                 new_messages.extend(msgs.iter().cloned());
             }
+            AgentEvent::SteerOrphaned { messages } => {
+                inner.pending_steers.extend(messages.iter().cloned());
+            }
             _ => {}
         }
     }
@@ -554,6 +579,187 @@ mod tests {
             client as Arc<dyn LlmClient>,
             AgentOptions::new("test-model"),
         )
+    }
+
+    fn user_message(text: &str) -> AgentMessage {
+        AgentMessage::User(UserMessage {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            timestamp: chrono::Utc::now(),
+        })
+    }
+
+    /// Pause after the first text delta, before the first response can stop.
+    /// This keeps the public steer sender alive at a deterministic point.
+    fn gated_agent(
+        later_responses: Vec<MockResponse>,
+    ) -> (
+        Agent,
+        Arc<MockLlmClient>,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut first = MockResponse::text("first answer");
+        let mut events = std::mem::take(&mut first.events).into_iter();
+        let prefix: Vec<_> = events.by_ref().take(2).collect();
+        let paused_event = events.next().unwrap();
+        let entered_stream = entered.clone();
+        let release_stream = release.clone();
+        first.stream_impl = Some(Box::pin(
+            futures::stream::iter(prefix)
+                .chain(futures::stream::once(async move {
+                    entered_stream.notify_one();
+                    release_stream.notified().await;
+                    paused_event
+                }))
+                .chain(futures::stream::iter(events)),
+        ));
+        let responses = std::iter::once(first).chain(later_responses).collect();
+        let client = Arc::new(MockLlmClient::new(responses));
+        let agent = Agent::new(
+            client.clone() as Arc<dyn LlmClient>,
+            AgentOptions::new("test-model"),
+        );
+        (agent, client, entered, release)
+    }
+
+    async fn finish_first_run_with_orphaned_steer(
+        agent: &Agent,
+        entered: &tokio::sync::Notify,
+        release: &tokio::sync::Notify,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(agent.prompt("first prompt"), async {
+                entered.notified().await;
+                assert!(agent.state().streaming_message.is_some());
+                agent
+                    .steer_message(user_message("late steer"))
+                    .expect("streaming run must accept the steer");
+                release.notify_one();
+            });
+            result.unwrap();
+        })
+        .await
+        .expect("gated first run must finish");
+        assert!(
+            agent.has_queued_messages(),
+            "accepted late steer must be recoverable"
+        );
+    }
+
+    fn request_user_texts(client: &MockLlmClient, index: usize) -> Vec<String> {
+        use llm_adapter::types::{Message, RequestContent};
+        client.captured_requests.lock()[index]
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(content) => Some(content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|content| match content {
+                RequestContent::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn orphaned_steer_reaches_next_prompt_request_once_before_new_prompt() {
+        let (agent, client, entered, release) = gated_agent(vec![
+            MockResponse::text("second answer"),
+            MockResponse::text("third answer"),
+        ]);
+        finish_first_run_with_orphaned_steer(&agent, &entered, &release).await;
+        assert_eq!(request_user_texts(&client, 0), ["first prompt"]);
+
+        agent.prompt("second prompt").await.unwrap();
+        assert_eq!(
+            request_user_texts(&client, 1),
+            ["first prompt", "late steer", "second prompt"]
+        );
+        assert!(!agent.has_queued_messages());
+        agent.prompt("third prompt").await.unwrap();
+        assert_eq!(
+            request_user_texts(&client, 2),
+            [
+                "first prompt",
+                "late steer",
+                "second prompt",
+                "third prompt"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_steer_reaches_continue_request_without_stale_channel_loss() {
+        let (agent, client, entered, release) = gated_agent(vec![MockResponse::text("continued")]);
+        finish_first_run_with_orphaned_steer(&agent, &entered, &release).await;
+
+        agent.continue_run().await.unwrap();
+        assert_eq!(
+            request_user_texts(&client, 1),
+            ["first prompt", "late steer"]
+        );
+        assert!(!agent.has_queued_messages());
+    }
+
+    #[tokio::test]
+    async fn orphaned_steer_is_not_duplicated_after_failed_next_run() {
+        let (agent, client, entered, release) = gated_agent(vec![
+            MockResponse::rate_limit_error(),
+            MockResponse::text("recovered"),
+        ]);
+        finish_first_run_with_orphaned_steer(&agent, &entered, &release).await;
+
+        assert!(agent.prompt("second prompt").await.is_err());
+        assert_eq!(
+            request_user_texts(&client, 1),
+            ["first prompt", "late steer", "second prompt"]
+        );
+        agent.continue_run().await.unwrap();
+        assert_eq!(
+            request_user_texts(&client, 2),
+            ["first prompt", "late steer", "second prompt"]
+        );
+        assert!(!agent.has_queued_messages());
+    }
+
+    #[tokio::test]
+    async fn explicit_reset_replacement_and_queue_clear_discard_orphaned_steers() {
+        for action in ["reset", "replace", "clear"] {
+            let (agent, client, entered, release) = gated_agent(vec![MockResponse::text("next")]);
+            finish_first_run_with_orphaned_steer(&agent, &entered, &release).await;
+            match action {
+                "reset" => {
+                    agent.reset();
+                    assert!(!agent.has_queued_messages());
+                    agent.prompt("new prompt").await.unwrap();
+                }
+                "replace" => {
+                    agent
+                        .prompt_with_messages(vec![user_message("new prompt")])
+                        .await
+                        .unwrap();
+                }
+                "clear" => {
+                    agent.clear_steering_queue().unwrap();
+                    assert!(!agent.has_queued_messages());
+                    agent.prompt("new prompt").await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let texts = request_user_texts(&client, 1);
+            assert!(
+                !texts.iter().any(|text| text == "late steer"),
+                "{action}: {texts:?}"
+            );
+            assert_eq!(texts.last().map(String::as_str), Some("new prompt"));
+            if action != "clear" {
+                assert_eq!(texts, ["new prompt"]);
+            }
+        }
     }
 
     #[tokio::test]
