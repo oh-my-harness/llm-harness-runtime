@@ -152,10 +152,12 @@ pub struct LoopConfig {
     pub max_provider_error_retries: Option<u32>,
 
     // === Reactive injection ===
-    /// 在 turn 间注入的消息（转向）。turn 边界与自然停止时都会 drain；
-    /// 停止时剩余消息会触发额外一轮，而不是随 channel 一起丢失。
+    /// 在 turn 边界注入的转向消息，消费时发出 `SteerConsumed`。
+    /// 自然停止且没有 follow-up 继续时，剩余消息通过 `SteerOrphaned`
+    /// 返回给 host，供后续 run 恢复，不会自行增加一轮。
     pub steer_rx: Option<mpsc::Receiver<AgentMessage>>,
-    /// loop 自然停止后逐个处理的后续消息；每条触发一次新的 run。
+    /// 自然停止时，已经入队的 follow-up 继续当前 run 的下一 turn。
+    /// host 应在生成期间投递，不依赖终端事件 yield 期间继续接收。
     pub follow_up_rx: Option<mpsc::Receiver<AgentMessage>>,
 
     // === Retry ===

@@ -10,10 +10,11 @@ use super::types::*;
 /// and manages branch operations.
 ///
 /// Wraps a [`SessionStorage`] and provides tree semantics on top.
-/// All methods take `&self`. Single storage calls are thread-safe, but
-/// multi-step operations like [`Session::append`] and [`Session::fork_branch`]
-/// are NOT atomic — concurrent callers must serialize themselves (e.g. via
-/// `AgentHarness`'s phase guard). See [`SessionStorage`] docs.
+/// All methods take `&self`. Appends and clearing are serialized within this
+/// `Session`, including the append's active-cursor update. Other composite
+/// operations such as [`Session::fork_branch`], raw storage calls, and separate
+/// `Session` wrappers sharing one storage still require caller serialization
+/// (e.g. via `AgentHarness`'s phase guard). See [`SessionStorage`] docs.
 ///
 /// # Entry tree model
 ///
@@ -52,12 +53,16 @@ use super::types::*;
 /// [`navigate_to`]: Session::navigate_to
 pub struct Session {
     storage: Arc<dyn SessionStorage>,
+    append_clear: tokio::sync::Mutex<()>,
 }
 
 impl Session {
     /// Wrap a storage backend in the high-level `Session` interface.
     pub fn new(storage: Arc<dyn SessionStorage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            append_clear: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// Return the underlying storage (for Harness-level writes).
@@ -78,6 +83,7 @@ impl Session {
     /// start another isolated run until a retry succeeds or the session is
     /// recovered; an empty active path is not proof that all entries are gone.
     pub async fn clear(&self) -> Result<(), SessionError> {
+        let _guard = self.append_clear.lock().await;
         self.storage.clear().await
     }
 
@@ -134,6 +140,7 @@ impl Session {
         payload: SessionEntryPayload,
         compaction_policy: Option<CompactionPolicy>,
     ) -> Result<EntryId, SessionError> {
+        let _guard = self.append_clear.lock().await;
         let id = self.storage.create_entry_id();
         let parent_id = self.storage.active_cursor().await?;
 

@@ -1045,13 +1045,23 @@ fn run_loop(
                 };
 
                 if should_stop {
-                    // Steers that arrived after the last turn boundary are
-                    // handed back to the host (SteerOrphaned below) instead
-                    // of being injected here: an injected user message is
-                    // never persisted (only run-initial messages are), so a
-                    // "one more turn" would consume them invisibly and the
-                    // conversation history would silently diverge. The host
-                    // requeues them for the next run, where they persist.
+                    // A queued follow-up keeps this run alive. Leave steers
+                    // queued until the next turn boundary, where they are
+                    // included in the request and surfaced as SteerConsumed.
+                    // Draining steers first would terminate here and discard
+                    // an already accepted follow-up with its receiver.
+                    if let Some(ref mut rx) = config.follow_up_rx
+                        && let Ok(follow_up_msg) = rx.try_recv()
+                    {
+                        ctx.messages.push(follow_up_msg.clone());
+                        new_messages.push(follow_up_msg);
+                        turn_index += 1;
+                        provider_error_repairs = 0;
+                        continue 'main;
+                    }
+
+                    // Without a follow-up, return remaining steers to the
+                    // host for the next run rather than extending this one.
                     let mut orphaned_steers = Vec::new();
                     if let Some(ref mut rx) = config.steer_rx {
                         while let Ok(steer_msg) = rx.try_recv() {
@@ -1071,16 +1081,6 @@ fn run_loop(
                         yield AgentEvent::AgentEnd { new_messages };
                         yield AgentEvent::SteerOrphaned { messages: orphaned_steers };
                         return;
-                    }
-                    // Check follow_up channel
-                    if let Some(ref mut rx) = config.follow_up_rx
-                        && let Ok(follow_up_msg) = rx.try_recv()
-                    {
-                        ctx.messages.push(follow_up_msg.clone());
-                        new_messages.push(follow_up_msg);
-                        turn_index += 1;
-                        provider_error_repairs = 0;
-                        continue 'main;
                     }
                     break 'main;
                 }
@@ -2285,6 +2285,100 @@ mod tests {
         assert_eq!(
             client.call_count.load(std::sync::atomic::Ordering::SeqCst),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn natural_stop_continues_accepted_follow_up_and_steer_in_next_request() {
+        use llm_adapter::types::{Message, RequestContent};
+        use std::sync::atomic::Ordering;
+        use tokio::sync::mpsc;
+
+        let message = |text: &str| {
+            AgentMessage::User(UserMessage {
+                content: vec![ContentBlock::Text { text: text.into() }],
+                timestamp: chrono::Utc::now(),
+            })
+        };
+        let (steer_tx, steer_rx) = mpsc::channel(16);
+        let (follow_up_tx, follow_up_rx) = mpsc::channel(16);
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::text("first answer"),
+            MockResponse::text("second answer"),
+        ]);
+        cfg.steer_rx = Some(steer_rx);
+        cfg.follow_up_rx = Some(follow_up_rx);
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![],
+        };
+        let mut stream = Box::pin(agent_loop(client.clone() as Arc<dyn Provider>, ctx, cfg));
+        let mut events = Vec::new();
+        loop {
+            let event = stream.next().await.expect("first generation must start");
+            let started = matches!(event, AgentEvent::MessageStart { .. });
+            events.push(event);
+            if started {
+                break;
+            }
+        }
+        assert_eq!(client.call_count.load(Ordering::SeqCst), 1);
+
+        // Both sends succeed while the first generation is active. Natural
+        // stop must not return orphaned steers before checking this follow-up.
+        let steer = message("steer accepted during generation");
+        steer_tx.try_send(steer.clone()).unwrap();
+        follow_up_tx
+            .try_send(message("follow-up accepted during generation"))
+            .unwrap();
+        events.extend(stream.collect::<Vec<_>>().await);
+
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(_) | AgentEvent::SteerOrphaned { .. }
+        )));
+        let consumed: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::SteerConsumed { messages } => Some(messages),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(
+            serde_json::to_value(consumed[0]).unwrap(),
+            serde_json::to_value(vec![steer]).unwrap()
+        );
+
+        let captured = client.captured_requests.lock();
+        assert_eq!(captured.len(), 2, "the follow-up must reach the provider");
+        let second_user_texts: Vec<_> = captured[1]
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(content) => Some(content),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|content| match content {
+                RequestContent::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            second_user_texts,
+            vec![
+                "follow-up accepted during generation",
+                "steer accepted during generation",
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+                .count(),
+            1,
+            "both messages must continue the same run"
         );
     }
 

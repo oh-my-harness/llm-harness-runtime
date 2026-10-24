@@ -178,12 +178,17 @@ impl AgentError {
         )
     }
 
+    /// Whether the provider error proves an explicit admission rejection.
+    ///
+    /// `InvalidRequest` is deliberately excluded: the pinned adapter also
+    /// uses it for otherwise unclassified HTTP errors, including 504. Without
+    /// trusted HTTP status evidence those outcomes remain unknown, even if
+    /// the error text looks like a client-side rejection.
     pub fn is_request_rejected(&self) -> bool {
         matches!(
             self,
             Self::ProviderTyped {
-                kind: ProviderErrorKind::InvalidRequest(_)
-                    | ProviderErrorKind::Unauthorized
+                kind: ProviderErrorKind::Unauthorized
                     | ProviderErrorKind::Forbidden
                     | ProviderErrorKind::RateLimit { .. },
                 ..
@@ -408,6 +413,59 @@ mod tests {
         AgentError::ProviderTyped {
             message: "llm provider error".into(),
             kind,
+        }
+    }
+
+    #[test]
+    fn unclassified_http_errors_do_not_prove_request_rejection() {
+        // The pinned Responses adapter's catch-all HTTP mapping produces
+        // InvalidRequest for 504 as well as client errors. Text is not trusted
+        // status provenance and must not enable a "rejected" outcome.
+        for detail in ["HTTP 504 gateway timeout", "HTTP 400 bad request", ""] {
+            let error = typed(ProviderErrorKind::InvalidRequest(detail.into()));
+            assert!(!error.is_request_rejected(), "{detail:?}");
+            assert!(!error.permits_generation_retry(), "{detail:?}");
+        }
+    }
+
+    #[test]
+    fn rejection_and_retry_require_explicit_provider_evidence() {
+        let cases = [
+            (ProviderErrorKind::Unauthorized, true, false),
+            (ProviderErrorKind::Forbidden, true, false),
+            (
+                ProviderErrorKind::RateLimit { retry_after: None },
+                true,
+                true,
+            ),
+            (
+                ProviderErrorKind::Overloaded { retry_after: None },
+                false,
+                false,
+            ),
+            (ProviderErrorKind::ServerError("503".into()), false, false),
+            (ProviderErrorKind::Timeout, false, false),
+            (ProviderErrorKind::Network, false, false),
+            (
+                ProviderErrorKind::Stream("transport lost".into()),
+                false,
+                false,
+            ),
+            (
+                ProviderErrorKind::Decode("invalid response".into()),
+                false,
+                false,
+            ),
+            (
+                ProviderErrorKind::Other { code: "504".into() },
+                false,
+                false,
+            ),
+        ];
+        for (kind, rejected, retryable) in cases {
+            let error = typed(kind);
+            assert_eq!(error.is_request_rejected(), rejected, "{error:?}");
+            assert_eq!(error.permits_generation_retry(), retryable, "{error:?}");
         }
     }
 
