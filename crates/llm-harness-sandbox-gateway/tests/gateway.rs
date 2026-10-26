@@ -1,8 +1,12 @@
+#![cfg(unix)]
+
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use llm_harness_platform::sandbox::NetRule;
 use llm_harness_platform::sandbox::{ResourceLimits, Sandbox, SandboxConfig};
 use llm_harness_sandbox_gateway::{
     FirecrackerBackendConfig, GatewayBackend, GatewayConfig, GatewayPrincipalConfig, SandboxGateway,
@@ -2015,6 +2019,31 @@ async fn bwrap_gateway_aborts_running_shell_promptly() {
     );
 }
 
+/// Capacity rejections must be the gateway's HTTP 503 with the dedicated
+/// `sandbox_limit_reached` code — never a transport error, an invalid config,
+/// or a different server failure that merely happens to co-occur.
+fn assert_capacity_rejection(error: &RemoteSandboxError) {
+    match error {
+        RemoteSandboxError::Gateway {
+            status,
+            code,
+            message,
+            ..
+        } => {
+            assert_eq!(
+                *status,
+                reqwest::StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                "capacity rejection must be HTTP 503: {message}"
+            );
+            assert_eq!(
+                code, "sandbox_limit_reached",
+                "capacity rejection must use the sandbox_limit_reached code"
+            );
+        }
+        other => panic!("expected an HTTP 503 sandbox_limit_reached rejection, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn gateway_enforces_sandbox_capacity_under_concurrent_creation() {
     if !bwrap_available() {
@@ -2024,17 +2053,69 @@ async fn gateway_enforces_sandbox_capacity_under_concurrent_creation() {
         .expect("gateway config")
         .with_max_sandboxes(1);
     let gateway = start_gateway_with_config(config).await;
+    let work_root = gateway.work_root().to_path_buf();
     let client = remote_client(&gateway.base_url, TOKEN_A);
-    let first = client.create_sandbox(sandbox_config());
-    let second = client.create_sandbox(sandbox_config());
-    let (first, second) = tokio::join!(first, second);
-    let first = first.expect("first sandbox");
-    let error = second.expect_err("second sandbox must be rejected");
-    assert!(error.to_string().contains("sandbox limit reached"));
+
+    // `tokio::join!` does not order the two requests as they arrive at the
+    // gateway, so either arm may win the single slot. The invariant is that
+    // exactly one creation is admitted.
+    let (first, second) = tokio::join!(
+        client.create_sandbox(sandbox_config()),
+        client.create_sandbox(sandbox_config())
+    );
+    let (created, rejected) = match (first, second) {
+        (Ok(created), Err(rejected)) | (Err(rejected), Ok(created)) => (created, rejected),
+        (Ok(first), Ok(second)) => panic!(
+            "max_sandboxes=1 admitted two concurrent creations: {} and {}",
+            first.sandbox_id, second.sandbox_id
+        ),
+        (Err(first), Err(second)) => {
+            panic!("max_sandboxes=1 rejected both concurrent creations: {first}; {second}")
+        }
+    };
+    assert_capacity_rejection(&rejected);
+    assert_eq!(
+        registry_record_count(&work_root),
+        1,
+        "only the admitted sandbox may be registered"
+    );
+
+    // With the only slot occupied, a third creation must be rejected the same
+    // way and must not register anything.
+    let third = client
+        .create_sandbox(sandbox_config())
+        .await
+        .expect_err("third creation must be rejected while the slot is occupied");
+    assert_capacity_rejection(&third);
+    assert_eq!(
+        registry_record_count(&work_root),
+        1,
+        "a rejected creation must not add a registry record"
+    );
+
+    // Deleting the admitted sandbox releases the slot.
     client
-        .delete_sandbox(&first.sandbox_id)
+        .delete_sandbox(&created.sandbox_id)
         .await
         .expect("delete sandbox");
+    assert_eq!(
+        registry_record_count(&work_root),
+        0,
+        "deleting the admitted sandbox must remove its registry record"
+    );
+    let replacement = client
+        .create_sandbox(sandbox_config())
+        .await
+        .expect("capacity must recover after the admitted sandbox is deleted");
+    client
+        .delete_sandbox(&replacement.sandbox_id)
+        .await
+        .expect("delete replacement sandbox");
+    assert_eq!(
+        registry_record_count(&work_root),
+        0,
+        "replacement deletion must leave no registry records"
+    );
 }
 
 #[tokio::test]
@@ -2085,4 +2166,239 @@ async fn create_response_echoes_host_binds() {
         std::path::Path::new(&response.host_binds[0].host),
         project.path()
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gateway_rejects_os_backend_without_creating_a_work_root() {
+    let parent = tempfile::tempdir().expect("parent directory");
+    let work_root = parent.path().join("unsupported-os");
+    let config = GatewayConfig::new(vec![principal("tenant-a", TOKEN_A)])
+        .expect("gateway config")
+        .with_work_root(work_root.clone())
+        .with_backend(GatewayBackend::Os);
+    let error = match SandboxGateway::new(config) {
+        Ok(_) => panic!("Linux must not fall back to host execution"),
+        Err(error) => error,
+    };
+    assert_eq!(error.to_string(), "os backend is only available on macOS");
+    assert!(!work_root.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bwrap_create_response_only_echoes_configured_binds() {
+    let project = private_tempdir();
+    let mut tenant = principal("tenant-a", TOKEN_A);
+    tenant.host_project_dirs = vec![project.path().to_path_buf()];
+    let gateway = start_gateway(vec![tenant]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+    let response = client
+        .create_sandbox(sandbox_config())
+        .await
+        .expect("create");
+    assert!(response.host_binds.is_empty());
+}
+
+/// Refuse to run (rather than silently skipping) unless this kernel can
+/// actually create an unprivileged bwrap namespace. `bwrap --version` only
+/// proves the binary exists, so execute a real sandboxed process.
+#[cfg(target_os = "linux")]
+fn require_bwrap_namespace_isolation() {
+    if !bwrap_available() {
+        panic!("BLOCKED: bwrap is not installed, so real sandbox isolation cannot be verified");
+    }
+    let output = std::process::Command::new("bwrap")
+        .args([
+            "--unshare-all",
+            "--die-with-parent",
+            "--new-session",
+            "--ro-bind",
+            "/",
+            "/",
+            "--",
+            "/bin/true",
+        ])
+        .output()
+        .expect("run bwrap namespace probe");
+    assert!(
+        output.status.success(),
+        "BLOCKED: bwrap cannot create an unprivileged namespace on this kernel: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_gateway_error(
+    error: &RemoteSandboxError,
+    expected_status: reqwest::StatusCode,
+    expected_code: &str,
+    context: &str,
+) {
+    match error {
+        RemoteSandboxError::Gateway {
+            status,
+            code,
+            message,
+            ..
+        } => {
+            assert_eq!(*status, expected_status.as_u16(), "{context}: {message}");
+            assert_eq!(code, expected_code, "{context}: {message}");
+        }
+        other => panic!("{context}: expected an HTTP gateway error, got {other:?}"),
+    }
+}
+
+/// End-to-end negative isolation check for the Linux bwrap backend.
+///
+/// A trusted-profile principal is configured with a host project dir and the
+/// sandbox is created with `TrustedFull`, which must not accidentally expose
+/// that (unauthorized) host path. The sentinel must be unreadable both through
+/// the gateway file API and from inside the real bwrap namespace, while the
+/// sandbox's own work dir stays readable.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bwrap_trusted_profile_cannot_reach_unauthorized_host_paths() {
+    require_bwrap_namespace_isolation();
+
+    let host_secret = private_tempdir();
+    let sentinel = host_secret.path().join("sentinel.txt");
+    let secret_contents = "host-only-sentinel-7f3c1a";
+    std::fs::write(&sentinel, secret_contents).expect("write host sentinel");
+    // The sentinel must genuinely exist and be readable on the host; otherwise
+    // the negative assertions below would pass vacuously.
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).expect("read host sentinel"),
+        secret_contents
+    );
+
+    let mut trusted = principal("tenant-a", TOKEN_A);
+    trusted.host_project_dirs = vec![host_secret.path().to_path_buf()];
+    trusted.max_trust_profile = llm_harness_platform::trust::TrustProfile::TrustedFull;
+    let gateway = start_gateway(vec![trusted]).await;
+    let client = remote_client(&gateway.base_url, TOKEN_A);
+
+    let mut request = sandbox_config();
+    request.trust_profile = llm_harness_platform::trust::TrustProfile::TrustedFull;
+    let sandbox = RemoteSandbox::connect(request, Arc::clone(&client))
+        .await
+        .expect("trusted-profile sandbox creation");
+    assert!(
+        sandbox.host_binds().is_empty(),
+        "bwrap must not bind principal host project dirs: {:?}",
+        sandbox.host_binds()
+    );
+    let sandbox_id = sandbox.sandbox_id().to_owned();
+    let env = sandbox.env();
+
+    // 1. The gateway file API never accepts raw host paths.
+    let error = client
+        .read_file(&sandbox_id, &sentinel, false)
+        .await
+        .expect_err("file API must reject an absolute host path");
+    assert_gateway_error(
+        &error,
+        reqwest::StatusCode::FORBIDDEN,
+        "path_outside_workspace",
+        "raw host path through the file API",
+    );
+
+    // 2. The host path is genuinely invisible from inside the bwrap namespace.
+    //    A failed command is surfaced as an error rather than an exit status.
+    let command = format!("cat -- {}", sentinel.to_string_lossy());
+    let error = match env
+        .execute_shell(&command, shell_options(Duration::from_secs(5)))
+        .await
+    {
+        Ok(output) => panic!(
+            "shell must not read the host sentinel: exit={} stdout={} stderr={}",
+            output.exit_code, output.stdout, output.stderr
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        !matches!(
+            error,
+            EnvError::ShellTimeout { .. } | EnvError::ShellAborted { .. }
+        ),
+        "host read must fail as a denied command, not a timeout/abort: {error}"
+    );
+    assert!(
+        !error.to_string().contains(secret_contents),
+        "host sentinel leaked through the shell error: {error}"
+    );
+    let visible = env
+        .execute_shell(
+            &format!(
+                "test -e {} && echo VISIBLE || echo INVISIBLE",
+                sentinel.to_string_lossy()
+            ),
+            shell_options(Duration::from_secs(5)),
+        )
+        .await
+        .expect("execute shell");
+    assert!(
+        visible.stdout.contains("INVISIBLE"),
+        "host path must not exist inside the namespace: exit={} stdout={} stderr={}",
+        visible.exit_code,
+        visible.stdout,
+        visible.stderr
+    );
+
+    // 3. Even a guest-visible symlink to the host path is blocked by cap-std:
+    //    `/workspace/host-link` passes gateway path validation, so the denial
+    //    must come from the sandbox filesystem layer.
+    let link = "/workspace/host-link";
+    let linked = env
+        .execute_shell(
+            &format!("ln -s {} {link} && echo LINKED", sentinel.to_string_lossy()),
+            shell_options(Duration::from_secs(5)),
+        )
+        .await
+        .expect("execute shell");
+    assert!(
+        linked.stdout.contains("LINKED"),
+        "failed to create the escape symlink: exit={} stdout={} stderr={}",
+        linked.exit_code,
+        linked.stdout,
+        linked.stderr
+    );
+    let error = client
+        .read_file(&sandbox_id, Path::new(link), false)
+        .await
+        .expect_err("file API must block a symlink escaping the work dir");
+    assert_gateway_error(
+        &error,
+        reqwest::StatusCode::FORBIDDEN,
+        "forbidden",
+        "symlink escape through the file API",
+    );
+
+    // 4. Positive control: the same shell and file API do work for the
+    //    sandbox's own work dir, so the denials above are not a broken sandbox.
+    let own_file = Path::new("/workspace/visible.txt");
+    client
+        .write_file(&sandbox_id, own_file, b"sandbox-visible", false)
+        .await
+        .expect("write sandbox file");
+    let output = env
+        .execute_shell(
+            "cat -- /workspace/visible.txt",
+            shell_options(Duration::from_secs(5)),
+        )
+        .await
+        .expect("execute shell");
+    assert_eq!(output.exit_code, 0, "sandbox work dir must be readable");
+    assert_eq!(output.stdout, "sandbox-visible");
+
+    // The sentinel stays intact and host-only throughout.
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).expect("read host sentinel"),
+        secret_contents
+    );
+
+    client
+        .delete_sandbox(&sandbox_id)
+        .await
+        .expect("delete sandbox");
 }
