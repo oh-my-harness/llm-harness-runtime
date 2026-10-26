@@ -8441,7 +8441,7 @@ impl TaskStore for CrashBeforeStateSaveStore {
         let crash_now = should_crash(&state)
             && self
                 .crashes_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok();

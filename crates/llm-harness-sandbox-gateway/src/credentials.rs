@@ -1,9 +1,13 @@
 use std::{
     collections::HashMap,
-    fs::OpenOptions,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    fs::File,
     path::Path,
     sync::{Mutex, RwLock},
+};
+#[cfg(unix)]
+use std::{
+    fs::OpenOptions,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
 };
 
 use anyhow::anyhow;
@@ -28,20 +32,7 @@ pub(crate) struct CredentialStore {
 
 impl CredentialStore {
     pub(crate) fn new(path: &Path, principals: &[(String, [u8; 32])]) -> anyhow::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)?;
-        if !file.metadata()?.is_file() {
-            anyhow::bail!("gateway credential store must be a regular file");
-        }
-        if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
-            anyhow::bail!("gateway credential store permissions must be 0600");
-        }
+        let _file = open_credential_file(path)?;
 
         let database = Connection::open(path)?;
         database.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -148,6 +139,30 @@ impl CredentialStore {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn open_credential_file(path: &Path) -> anyhow::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("gateway credential store must be a regular file");
+    }
+    if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+        anyhow::bail!("gateway credential store permissions must be 0600");
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_credential_file(_path: &Path) -> anyhow::Result<File> {
+    anyhow::bail!("gateway credential store requires Unix permission enforcement")
 }
 
 fn initialize_schema(database: &Connection) -> anyhow::Result<()> {
