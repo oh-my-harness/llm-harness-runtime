@@ -29,7 +29,7 @@ wasm-bindgen-futures = "0.4"
 test-utils = ["dep:parking_lot"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "net", "io-util"] }
 
 [dev-dependencies.parking_lot]
 workspace = true

@@ -70,6 +70,77 @@ fn is_retryable_stream(error: &AgentError) -> bool {
     )
 }
 
+/// Where a provider failure surfaced and which budget decision ended it.
+///
+/// Grouped into one value so the annotation call stays readable and within
+/// clippy's argument limit.
+struct RetryOutcome<'a> {
+    /// 0-based `RetryConfig` budget index; never an HTTP POST ordinal.
+    retry_attempt: u32,
+    max_retries: u32,
+    phase: &'a str,
+    response: &'a str,
+    stop: &'a str,
+}
+
+/// Append a compact, durable summary of the request retry decision to the
+/// surfaced provider error.
+///
+/// `AgentEvent::RetryAttempt` is only serialized by the inspector's live
+/// WebSocket projection (`llm-harness-inspector::event_ser`); it never reaches
+/// the team journal, chat history or Studio's persisted session. Where a
+/// journal does record `AgentEvent::Error`'s Display text, the retry
+/// coordinates have to ride on that text to survive a failure.
+///
+/// `retry_attempt` is the **0-based index into the `RetryConfig` budget**
+/// (`can_retry` admits while `retry_attempt < max_retries`). It is *not* an
+/// HTTP POST ordinal and must not be read as one:
+///
+/// * a request abandoned by local validation never reaches `chat_stream`, so no
+///   POST is associated with that attempt;
+/// * a mounted `ProviderErrorHook` repair restarts the turn, which resets the
+///   budget while resending the same turn's request;
+/// * consequently `AgentEvent::RetryAttempt` is not evidence of a real request
+///   either — it announces a budget decision, not a round trip.
+///
+/// `phase` names where the surfaced failure happened: `provider_call` means the
+/// provider call failed before a `StreamHandle` existed — neither a `POST` on
+/// the wire nor a response header is proven at that point (pre-send validation
+/// failures land here too); `stream_body` means a `StreamHandle` was already
+/// accepted and its body was being consumed.
+///
+/// `response` is `received` only when a response is provable: always for
+/// `stream_body`, and for `provider_call` only for `LlmError::RateLimit`
+/// (HTTP 429 can only be classified from a response); every other error stays
+/// `unknown` rather than being guessed.
+///
+/// `stop` names the decision that surfaced the error. Non-provider errors
+/// (e.g. a runtime `StreamIdle`) keep their existing variant and text: their
+/// kind already carries the cause and callers match on it.
+fn annotate_retry_outcome(
+    error: AgentError,
+    run_id: llm_harness_types::RunId,
+    turn_index: u32,
+    outcome: RetryOutcome<'_>,
+) -> AgentError {
+    let RetryOutcome {
+        retry_attempt,
+        max_retries,
+        phase,
+        response,
+        stop,
+    } = outcome;
+    let mut error = error;
+    if let AgentError::ProviderTyped { message, .. } = &mut error {
+        message.push_str(&format!(
+            " [retry retry_attempt={retry_attempt} max_retries={max_retries} \
+             stop={stop} phase={phase} response={response} run={run_id} \
+             turn={turn_index}]"
+        ));
+    }
+    error
+}
+
 fn active_tool_subset(
     tools: &[Arc<dyn Tool>],
     active: &Option<HashSet<String>>,
@@ -450,6 +521,24 @@ fn run_loop(
                             retry.delay_for(attempt, &e),
                             stream_opts.max_retry_delay_ms,
                         );
+                        // A 429 is the only admission error that proves an HTTP
+                        // response arrived; everything else stays unproven.
+                        let response = if matches!(e, LlmError::RateLimit { .. }) {
+                            "received"
+                        } else {
+                            "unknown"
+                        };
+                        tracing::warn!(
+                            run_id = %config.run.id(),
+                            turn_index,
+                            attempt,
+                            max_retries = retry.max_retries,
+                            delay_ms = delay.as_millis() as u64,
+                            phase = "provider_call",
+                            response,
+                            error = %e,
+                            "provider retry scheduled"
+                        );
                         yield AgentEvent::RetryAttempt {
                             attempt,
                             max_retries: retry.max_retries,
@@ -502,7 +591,35 @@ fn run_loop(
                                 // of replaying an unknown-outcome request.
                             }
                         }
-                        yield AgentEvent::Error(llm_error_to_agent_error(e));
+                        // Retryable-but-exhausted errors still report the budget
+                        // decision; InvalidRequest falls through here only after
+                        // the repair hook declined or exhausted its own bound.
+                        let stop = if is_retryable(&e) {
+                            "retry_budget_exhausted"
+                        } else if matches!(e, LlmError::InvalidRequest(_)) {
+                            "invalid_request"
+                        } else {
+                            "not_retryable"
+                        };
+                        // Only `RateLimit` (HTTP 429) proves a response was
+                        // received at this phase; do not guess for the rest.
+                        let response = if matches!(e, LlmError::RateLimit { .. }) {
+                            "received"
+                        } else {
+                            "unknown"
+                        };
+                        yield AgentEvent::Error(annotate_retry_outcome(
+                            llm_error_to_agent_error(e),
+                            config.run.id(),
+                            turn_index,
+                            RetryOutcome {
+                                retry_attempt: attempt,
+                                max_retries: retry.max_retries,
+                                phase: "provider_call",
+                                response,
+                                stop,
+                            },
+                        ));
                         break 'main;
                     }
                 };
@@ -628,6 +745,18 @@ fn run_loop(
                                 retry.delay_for_attempt(attempt),
                                 stream_opts.max_retry_delay_ms,
                             );
+                            tracing::warn!(
+                                run_id = %config.run.id(),
+                                turn_index,
+                                attempt,
+                                max_retries = retry.max_retries,
+                                delay_ms = delay.as_millis() as u64,
+                                phase = "stream_body",
+                                response = "received",
+                                status_code = ?handle_status_code,
+                                error = %e,
+                                "stream retry scheduled"
+                            );
                             yield AgentEvent::RetryAttempt {
                                 attempt,
                                 max_retries: retry.max_retries,
@@ -645,7 +774,23 @@ fn run_loop(
                             attempt += 1;
                             continue;
                         }
-                        yield AgentEvent::Error(e);
+                        let stop = if is_retryable_stream(&e) {
+                            "retry_budget_exhausted"
+                        } else {
+                            "not_retryable"
+                        };
+                        yield AgentEvent::Error(annotate_retry_outcome(
+                            e,
+                            config.run.id(),
+                            turn_index,
+                            RetryOutcome {
+                                retry_attempt: attempt,
+                                max_retries: retry.max_retries,
+                                phase: "stream_body",
+                                response: "received",
+                                stop,
+                            },
+                        ));
                         break 'main;
                     }
                 }
@@ -2624,6 +2769,7 @@ mod tests {
     #[tokio::test]
     async fn mid_stream_drop_without_retry_budget_surfaces_the_error() {
         let (client, cfg) = make_config(vec![MockResponse::stream_dropped_mid("partial", 7)]);
+        let run_id = cfg.run.id();
         let ctx = AgentContext {
             system_prompt: None,
             messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
@@ -2643,7 +2789,357 @@ mod tests {
             1,
             "retry=None must not resend"
         );
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+        // The surfaced Error is the only durable channel (the team journal
+        // records its Display text), so the retry decision must be on it.
+        let surfaced = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::Error(_)))
+            .expect("error must surface");
+        let AgentEvent::Error(AgentError::ProviderTyped { message, .. }) = surfaced else {
+            panic!("expected a provider-typed error");
+        };
+        let expected = [
+            "retry_attempt=0".to_string(),
+            "max_retries=0".to_string(),
+            "stop=retry_budget_exhausted".to_string(),
+            "phase=stream_body".to_string(),
+            "response=received".to_string(),
+            format!("run={run_id}"),
+            "turn=0".to_string(),
+        ];
+        for expected in &expected {
+            assert!(
+                message.contains(expected),
+                "surfaced error must carry {expected:?}: {message}"
+            );
+        }
+        // The stream diagnostic prefix is preserved verbatim.
+        assert!(message.contains("stream incomplete"), "{message}");
+    }
+
+    /// Exhausting the request retry budget must persist the final attempt
+    /// number, the budget and the stop reason on the surfaced error.
+    #[tokio::test]
+    async fn retry_budget_exhaustion_is_persisted_on_the_error() {
+        use crate::config::RetryConfig;
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::stream_dropped_mid("a", 3),
+            MockResponse::stream_dropped_mid("b", 3),
+            MockResponse::stream_dropped_mid("c", 3),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        tokio::time::pause();
+        let run_id = cfg.run.id();
+        let ctx = AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        };
+        let events: Vec<AgentEvent> =
+            agent_loop(Arc::clone(&client) as Arc<dyn Provider>, ctx, cfg)
+                .collect()
+                .await;
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "initial request plus max_retries=2 replays"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+                .count(),
+            2,
+            "both retries must be announced"
+        );
+        let surfaced = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::Error(_)))
+            .expect("error must surface");
+        let AgentEvent::Error(AgentError::ProviderTyped { message, kind }) = surfaced else {
+            panic!("expected a provider-typed error");
+        };
+        assert!(
+            matches!(kind, ProviderErrorKind::StreamIncomplete { .. }),
+            "unexpected kind: {kind:?}"
+        );
+        let expected = [
+            "retry_attempt=2".to_string(),
+            "max_retries=2".to_string(),
+            "stop=retry_budget_exhausted".to_string(),
+            "phase=stream_body".to_string(),
+            "response=received".to_string(),
+            format!("run={run_id}"),
+            "turn=0".to_string(),
+        ];
+        for expected in &expected {
+            assert!(
+                message.contains(expected),
+                "surfaced error must carry {expected:?}: {message}"
+            );
+        }
+    }
+
+    fn single_user_turn_ctx() -> AgentContext {
+        AgentContext {
+            system_prompt: None,
+            messages: vec![AgentMessage::User(llm_harness_types::UserMessage {
+                content: vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+                timestamp: chrono::Utc::now(),
+            })],
+        }
+    }
+
+    fn surfaced_message(events: &[AgentEvent]) -> &str {
+        let surfaced = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::Error(_)))
+            .expect("error must surface");
+        let AgentEvent::Error(AgentError::ProviderTyped { message, .. }) = surfaced else {
+            panic!("expected a provider-typed error");
+        };
+        message
+    }
+
+    fn retry_attempts(events: &[AgentEvent]) -> Vec<u32> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::RetryAttempt { attempt, .. } => Some(*attempt),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A 429 and a mid-stream drop draw from the *same* `RetryConfig` budget:
+    /// `attempt` is the budget index, not a per-phase counter.
+    #[tokio::test]
+    async fn rate_limit_and_stream_drop_share_one_budget_and_recover() {
+        use crate::config::RetryConfig;
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::rate_limit_error(),
+            MockResponse::stream_dropped_mid("partial", 8),
+            MockResponse::text("ok"),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        tokio::time::pause();
+
+        let events: Vec<AgentEvent> = agent_loop(
+            Arc::clone(&client) as Arc<dyn Provider>,
+            single_user_turn_ctx(),
+            cfg,
+        )
+        .collect()
+        .await;
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "429 then drop then success must use all three slots"
+        );
+        assert_eq!(retry_attempts(&events), vec![0, 1]);
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+            "a fully recovered budget must not surface an error"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::MessageEnd {
+                    discarded: false,
+                    ..
+                }
+            )),
+            "the final generation must land"
+        );
+    }
+
+    /// When the same budget runs out mid-stream, the 429 consumed one unit, so
+    /// the stream phase only gets the remaining retry; the terminal annotation
+    /// reports the exhausted budget index and the stream phase.
+    #[tokio::test]
+    async fn mixed_429_and_stream_drops_exhaust_the_shared_budget() {
+        use crate::config::RetryConfig;
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::rate_limit_error(),
+            MockResponse::stream_dropped_mid("a", 3),
+            MockResponse::stream_dropped_mid("b", 3),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        tokio::time::pause();
+        let run_id = cfg.run.id();
+
+        let events: Vec<AgentEvent> = agent_loop(
+            Arc::clone(&client) as Arc<dyn Provider>,
+            single_user_turn_ctx(),
+            cfg,
+        )
+        .collect()
+        .await;
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the 429 used one budget unit, leaving a single stream retry"
+        );
+        assert_eq!(retry_attempts(&events), vec![0, 1]);
+        let message = surfaced_message(&events);
+        let expected = [
+            "retry_attempt=2".to_string(),
+            "max_retries=2".to_string(),
+            "stop=retry_budget_exhausted".to_string(),
+            "phase=stream_body".to_string(),
+            "response=received".to_string(),
+            format!("run={run_id}"),
+            "turn=0".to_string(),
+        ];
+        for expected in &expected {
+            assert!(
+                message.contains(expected),
+                "surfaced error must carry {expected:?}: {message}"
+            );
+        }
+    }
+
+    /// A 429 can only be classified from an HTTP response, so an exhausted
+    /// 429 budget is the one `provider_call` case that may claim `received`.
+    #[tokio::test]
+    async fn exhausted_429_budget_reports_a_proven_response() {
+        use crate::config::RetryConfig;
+
+        let (client, mut cfg) = make_config(vec![
+            MockResponse::rate_limit_error(),
+            MockResponse::rate_limit_error(),
+            MockResponse::rate_limit_error(),
+        ]);
+        cfg.retry = Some(RetryConfig::new(2, 0));
+        tokio::time::pause();
+        let run_id = cfg.run.id();
+
+        let events: Vec<AgentEvent> = agent_loop(
+            Arc::clone(&client) as Arc<dyn Provider>,
+            single_user_turn_ctx(),
+            cfg,
+        )
+        .collect()
+        .await;
+
+        assert_eq!(
+            client.call_count.load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+        assert_eq!(retry_attempts(&events), vec![0, 1]);
+        let surfaced = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::Error(_)))
+            .expect("error must surface");
+        let AgentEvent::Error(AgentError::ProviderTyped { message, kind }) = surfaced else {
+            panic!("expected a provider-typed error");
+        };
+        assert!(
+            matches!(kind, ProviderErrorKind::RateLimit { .. }),
+            "unexpected kind: {kind:?}"
+        );
+        let expected = [
+            "retry_attempt=2".to_string(),
+            "max_retries=2".to_string(),
+            "stop=retry_budget_exhausted".to_string(),
+            "phase=provider_call".to_string(),
+            "response=received".to_string(),
+            format!("run={run_id}"),
+            "turn=0".to_string(),
+        ];
+        for expected in &expected {
+            assert!(
+                message.contains(expected),
+                "surfaced error must carry {expected:?}: {message}"
+            );
+        }
+    }
+
+    /// Errors that arrive without a provable response must not claim one.
+    #[tokio::test]
+    async fn unproven_provider_call_failures_report_unknown_response() {
+        use crate::config::RetryConfig;
+        use llm_adapter::LlmError;
+
+        struct FixedStreamErrorClient(&'static str);
+
+        impl FixedStreamErrorClient {
+            fn error(&self) -> LlmError {
+                match self.0 {
+                    "invalid_request" => LlmError::InvalidRequest("bad".into()),
+                    "server_error" => LlmError::ServerError("boom".into()),
+                    other => unreachable!("unexpected fixture {other}"),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for FixedStreamErrorClient {
+            fn capabilities(&self) -> llm_adapter::provider::ProviderCapabilities {
+                llm_adapter::provider::ProviderCapabilities::new(false, false, false)
+            }
+            async fn chat(
+                &self,
+                _: &llm_adapter::types::ChatRequest,
+            ) -> Result<llm_adapter::types::ChatResponse, LlmError> {
+                Err(self.error())
+            }
+            async fn chat_stream(
+                &self,
+                _: &llm_adapter::types::ChatRequest,
+            ) -> Result<llm_adapter::stream_handle::StreamHandle, LlmError> {
+                Err(self.error())
+            }
+        }
+
+        for (fixture, stop) in [
+            ("invalid_request", "stop=invalid_request"),
+            ("server_error", "stop=not_retryable"),
+        ] {
+            let (_, mut cfg) = make_config(vec![]);
+            cfg.retry = Some(RetryConfig::new(2, 0));
+            let run_id = cfg.run.id();
+            let events: Vec<AgentEvent> = agent_loop(
+                Arc::new(FixedStreamErrorClient(fixture)),
+                single_user_turn_ctx(),
+                cfg,
+            )
+            .collect()
+            .await;
+
+            assert!(
+                retry_attempts(&events).is_empty(),
+                "{fixture} must not schedule a retry"
+            );
+            let message = surfaced_message(&events);
+            let expected = [
+                "retry_attempt=0".to_string(),
+                "max_retries=2".to_string(),
+                stop.to_string(),
+                "phase=provider_call".to_string(),
+                "response=unknown".to_string(),
+                format!("run={run_id}"),
+                "turn=0".to_string(),
+            ];
+            for expected in &expected {
+                assert!(
+                    message.contains(expected),
+                    "{fixture} surfaced error must carry {expected:?}: {message}"
+                );
+            }
+        }
     }
 
     /// The safety boundary for request-level retry: a tool call that was
