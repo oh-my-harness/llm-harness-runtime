@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 llm-harness-agent.workspace = true
-llm-harness-agent-team.workspace = true
+llm-harness-agent-team = { workspace = true, features = ["sqlite-bundled"] }
 llm-harness-types.workspace = true
 llm-harness-tools.workspace = true
 llm-harness-loop.workspace = true
