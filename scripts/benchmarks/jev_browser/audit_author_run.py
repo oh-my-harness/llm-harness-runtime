@@ -34,6 +34,22 @@ def usage_summary(events):
     return result
 
 
+def timing_summary(events):
+    summed = lambda component: sum(e.get("elapsed_ms", 0) for e in events if e["component"] == component) / 1000
+    requests = [e for e in events if e["component"] == "qwen_http"]
+    return {"model_call_seconds": summed("qwen_http") + summed("decision_http"),
+            "flash_http_seconds": summed("qwen_http"), "decision_http_seconds": summed("decision_http"),
+            "tool_seconds": summed("tool"), "browser_start_seconds": summed("browser_start"),
+            "backoff_seconds": summed("provider_backoff"),
+            "http_200": sum(e.get("http_status") == 200 for e in requests),
+            "http_non_200": sum("http_status" in e and e["http_status"] != 200 for e in requests),
+            "http_transport_error": sum("http_status" not in e for e in requests),
+            "kev_service_model_seconds": sum(e.get("server_model_ms", 0) for e in events if e["component"] == "kev_predict") / 1000,
+            "kev_native_input_tokens": sum(e.get("native_usage", {}).get("input_tokens", 0)
+                                           for e in events if e["component"] == "kev_predict"),
+            "tokens": usage_summary(events)}
+
+
 def paired_totals(pairs):
     a, b = (sum(p[f"{arm}_seconds"] for p in pairs) for arm in ("A", "B"))
     return {"pairs": len(pairs), "A_seconds": a, "B_seconds": b, "speed_ratio_A_over_B": a / b if b else None,
@@ -61,6 +77,38 @@ def audit(directory):
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     events = [json.loads(line) for line in (directory / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     rows = report["rows"]
+    kev = manifest.get("decision_backend") == "kev"
+    components = {**COMPONENTS, **({"kev_rpc": "kev_rpc_start", "kev_predict": "kev_predict_start",
+                                  "kev_forward": "kev_forward"} if kev else {})}
+    if kev:
+        from kev_service import MODEL, preflight
+        ledger = [json.loads(line) for line in (directory / "kev-events.jsonl").read_text(encoding="utf-8").splitlines()]
+        imported = [{k: v for k, v in e.items()} for e in events if "service_seq" in e]
+        if imported != ledger or [r["service_seq"] for r in ledger] != list(range(1, len(ledger) + 1)):
+            raise ValueError("Kev service ledger mismatch")
+        if any(r["counts"]["laya_rpc"] or (r["arm"] != "B" and r["counts"]["kev_rpc"]) for r in rows):
+            raise ValueError("Unexpected decision model arm")
+        for event in events:
+            if event["component"] == "kev_forward" and event.get("device") != "cuda:0":
+                raise ValueError("Kev CPU fallback")
+            if event["component"] == "decision_http" and event.get("http_status") == 200 and event.get("model") != MODEL:
+                raise ValueError("Kev model identity drift")
+        if manifest["kev"]["model"] != MODEL:
+            raise ValueError("Kev manifest model drift")
+        starts = [e for e in events if e["component"] == "kev_rpc_start" and e["task"] in manifest["tasks"]]
+        requests = [e for e in events if e["component"] == "decision_http" and e["task"] in manifest["tasks"]]
+        if [e["request_sha256"] for e in starts] != [preflight.digest(e["request_body"]) for e in requests]:
+            raise ValueError("Kev client/service request mismatch")
+        incomplete = {kind: sum(e["component"] == kind + "_start" for e in events) -
+                            sum(e["component"] == kind for e in events) for kind in ("kev_rpc", "kev_predict")}
+        if any(n < 0 for n in incomplete.values()) or (any(incomplete.values()) and
+                not any(r.get("status") == "error:KevUnavailable" for r in rows)):
+            raise ValueError("Unexplained unfinished Kev requests")
+        if not any(incomplete.values()) and sum(e.get("forward_count", 0) for e in events if e["component"] == "kev_predict") != sum(e["component"] == "kev_forward" for e in events):
+            raise ValueError("Kev predict/forward count mismatch")
+    attempts = [json.loads(line) for line in (directory / "attempts.jsonl").read_text(encoding="utf-8").splitlines()]
+    if attempts != rows:
+        raise ValueError("Attempt ledger mismatch")
     if len(rows) != report["completed"] or report["completed"] + report["unstarted"] != len(manifest["order"]):
         raise ValueError("Attempt count mismatch")
     keys = ("task", "arm", "repeat") if "repeat" in manifest["order"][0] else ("task", "arm")
@@ -71,12 +119,12 @@ def audit(directory):
     for row in rows:
         attempt = [e for e in events if e["task"] == row["task"] and e.get("arm") == row["arm"]
                    and e.get("repeat", 1) == row.get("repeat", 1)]
-        for key, component in COMPONENTS.items():
+        for key, component in components.items():
             if row["counts"][key] != sum(e["component"] == component for e in attempt):
                 raise ValueError(f"Counter mismatch: {row['task']} {row['arm']} {key}")
         if row["arm"] == "A" and row["counts"]["laya_forward"]:
             raise ValueError("Pure text-model arm used Laya")
-    for key, component in COMPONENTS.items():
+    for key, component in components.items():
         if report["counts_including_warmup"][key] != sum(e["component"] == component for e in events):
             raise ValueError(f"Session counter mismatch: {key}")
     for arm in ("A", "B"):
@@ -103,11 +151,13 @@ def audit(directory):
             "text_model": manifest.get("text_model", manifest.get("qwen")),
             "round_analysis": complete_round_analysis(rows, events, manifest["tasks"]),
             "token_usage_from_events": {arm: usage_summary([e for e in events if e.get("arm") == arm]) for arm in ("A", "B")},
+            "timing_and_usage": {arm: timing_summary([e for e in events if e.get("arm") == arm and e["task"] in manifest["tasks"]]) for arm in ("A", "B")},
+            "unfinished_kev_requests": incomplete if kev else None,
             "matching_initial_tasks": matched_initial,
             "exclude_first_pair_speed_ratio": sensitivity["paired_speed_ratio_A_over_B"],
             "exclude_first_pair_both_pass": sensitivity["quality_pairs"]["both_pass"],
             "raw_sha256": {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-                           for name in ("report.json", "events.jsonl", "attempts.jsonl", "manifest.json")}}
+                           for name in ("report.json", "events.jsonl", "attempts.jsonl", "manifest.json", *(["kev-events.jsonl"] if kev else []))}}
 
 
 if __name__ == "__main__":
