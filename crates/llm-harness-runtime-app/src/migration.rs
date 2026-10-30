@@ -125,7 +125,7 @@ struct PathGuard {
 }
 
 #[cfg(windows)]
-const WINDOWS_FILE_SHARE_DELETE: u32 = 0x0000_0001;
+const WINDOWS_FILE_SHARE_DELETE: u32 = 0x0000_0004;
 
 pub fn parse_data_command(arguments: &[String]) -> Result<Option<DataCommand>, MigrationError> {
     let Some(command_name) = arguments.first() else {
@@ -353,7 +353,7 @@ fn commit_migrate(
             && !path_exists(&journal.backup)
             && !path_exists(&journal.destination)
         {
-            rename_durable(&journal.source, &journal.backup)
+            rename_data_root(&journal.source, &journal.backup)
                 .map_err(|error| cleanup_prepared_migration(&staging, &journal_path, error))?;
         } else if !path_exists(&journal.source)
             && path_exists(&journal.backup)
@@ -462,7 +462,7 @@ fn commit_rollback(
             && !path_exists(&journal.backup)
             && path_exists(&preserved);
         if rollback_not_started && journal.phase == MigrationPhase::Prepared {
-            rename_durable(&journal.destination, &preserved)
+            rename_data_root(&journal.destination, &preserved)
                 .map_err(|_| MigrationError::RecoveryRequired(journal_path.clone()))?;
             destination_is_preserved = true;
         } else if source_is_restored || destination_is_preserved {
@@ -470,7 +470,7 @@ fn commit_rollback(
             return Err(MigrationError::InconsistentJournal(journal_path));
         }
         if destination_is_preserved {
-            rename_durable(&journal.backup, &journal.source).map_err(|error| {
+            rename_data_root(&journal.backup, &journal.source).map_err(|error| {
                 restore_rollback_destination(&journal.destination, &preserved, &journal_path, error)
             })?;
         }
@@ -522,7 +522,7 @@ fn rollback_committed_migration(
     staging: &Path,
     error: io::Error,
 ) -> MigrationError {
-    let restore_result = rename_durable(&journal.backup, &journal.source);
+    let restore_result = rename_data_root(&journal.backup, &journal.source);
     if let Err(restore_error) = restore_result {
         return MigrationError::RollbackFailed {
             backup: journal.backup.clone(),
@@ -573,7 +573,7 @@ fn restore_rollback_destination(
 ) -> MigrationError {
     if !path_exists(destination)
         && path_exists(preserved)
-        && let Err(restore_error) = rename_durable(preserved, destination)
+        && let Err(restore_error) = rename_data_root(preserved, destination)
     {
         return MigrationError::RollbackFailed {
             backup: preserved.to_path_buf(),
@@ -653,6 +653,38 @@ fn rename_durable(source: &Path, destination: &Path) -> io::Result<()> {
         sync_directory(parent)?;
     }
     Ok(())
+}
+
+/// Rename a data root that may contain our open `studio.lock`.
+///
+/// Windows refuses to rename a directory with an open file underneath, even
+/// when the handle allows deletion. Move the lock file to a sibling, rename
+/// the directory, then delete the now-orphaned lock entry. The open handle
+/// keeps the lock for the duration; the only visible change is the lock
+/// file's transient path.
+#[cfg(windows)]
+fn rename_data_root(source: &Path, destination: &Path) -> io::Result<()> {
+    let lock = source.join("studio.lock");
+    if !path_exists(&lock) {
+        return rename_durable(source, destination);
+    }
+    let aside = unique_sibling(source, "llm-harness-app-studio-lock");
+    std::fs::rename(&lock, &aside)?;
+    match rename_durable(source, destination) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&aside);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::rename(&aside, &lock);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_data_root(source: &Path, destination: &Path) -> io::Result<()> {
+    rename_durable(source, destination)
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
@@ -1035,7 +1067,13 @@ mod tests {
     use std::time::SystemTime;
 
     fn temp_root(test: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        // Migration canonicalizes every input. On macOS the temp dir is
+        // behind /var -> /private/var; without canonicalizing the base the
+        // test's journal key and report_path use a different prefix.
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        base.join(format!(
             "runtime-app-migration-{test}-{}-{}",
             std::process::id(),
             SystemTime::now()
