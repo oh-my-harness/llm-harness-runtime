@@ -8438,13 +8438,25 @@ impl TaskStore for CrashBeforeStateSaveStore {
         let should_crash = self.should_crash.clone();
         let task_id = task_id.clone();
         let state = state.clone();
-        let crash_now = should_crash(&state)
-            && self
-                .crashes_remaining
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok();
+        let crash_now = should_crash(&state) && {
+            // Avoid requiring try_update (Rust 1.95). Preserve fetch_update's
+            // checked decrement and SeqCst retry semantics.
+            let mut remaining = self.crashes_remaining.load(Ordering::SeqCst);
+            loop {
+                let Some(next) = remaining.checked_sub(1) else {
+                    break false;
+                };
+                match self.crashes_remaining.compare_exchange_weak(
+                    remaining,
+                    next,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break true,
+                    Err(current) => remaining = current,
+                }
+            }
+        };
         Box::pin(async move {
             if crash_now {
                 anyhow::bail!("simulated crash before state save");
