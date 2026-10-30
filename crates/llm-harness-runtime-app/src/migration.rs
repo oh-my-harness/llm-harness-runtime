@@ -1079,6 +1079,9 @@ mod tests {
     }
 
     #[test]
+    // The Windows cleanup block restores writability only so TempDir can be
+    // removed; it never changes product permissions.
+    #[allow(clippy::permissions_set_readonly_false)]
     fn copied_files_are_synced_before_read_only_permissions() {
         let root = test_case("copy-sync");
         let source = root.join("source.txt");
