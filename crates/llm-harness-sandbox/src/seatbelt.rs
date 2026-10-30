@@ -328,6 +328,10 @@ pub struct SeatbeltEnv {
     /// is the main workspace (`/workspace` → work_dir_canon); trusted
     /// profiles append host project binds.
     guest_mappings: Vec<(PathBuf, PathBuf)>,
+    /// Canonical host roots of trusted-profile binds. Empty for restricted
+    /// profiles, so both the lexical and canonical containment checks reject
+    /// host paths even if a caller populated `config.host_binds`.
+    host_bind_roots: Vec<PathBuf>,
     allowlist_canon: Vec<PathBuf>,
     config: SandboxConfig,
     owned: bool,
@@ -372,10 +376,24 @@ impl SeatbeltEnv {
         owned: bool,
         policy_path: PathBuf,
     ) -> Self {
+        let trusted = matches!(
+            config.trust_profile,
+            TrustProfile::TrustedLan | TrustProfile::TrustedFull
+        );
+        let host_bind_roots = if trusted {
+            config
+                .host_binds
+                .iter()
+                .filter_map(|bind| std::fs::canonicalize(&bind.host).ok())
+                .collect()
+        } else {
+            Vec::new()
+        };
         Self {
             work_dir,
             work_dir_canon,
             guest_mappings,
+            host_bind_roots,
             allowlist_canon,
             config,
             owned,
@@ -533,22 +551,16 @@ impl SeatbeltEnv {
 
         // Lexical containment check — fast path to reject obvious escapes
         // before touching the filesystem.
-        let trusted = matches!(
-            self.config.trust_profile,
-            TrustProfile::TrustedLan | TrustProfile::TrustedFull
-        );
         let lex_ok = normalized == self.work_dir_canon
             || normalized.starts_with(&self.work_dir_canon)
             || self
                 .allowlist_canon
                 .iter()
                 .any(|root| normalized == *root || normalized.starts_with(root))
-            || (trusted
-                && self
-                    .config
-                    .host_binds
-                    .iter()
-                    .any(|bind| normalized == bind.host || normalized.starts_with(&bind.host)));
+            || self
+                .host_bind_roots
+                .iter()
+                .any(|root| normalized == *root || normalized.starts_with(root));
         if !lex_ok {
             return Err(EnvError::PermissionDenied(normalized));
         }
@@ -579,11 +591,9 @@ impl SeatbeltEnv {
                 return Ok(canonical);
             }
         }
-        if trusted {
-            for bind in &self.config.host_binds {
-                if canonical == bind.host || canonical.starts_with(&bind.host) {
-                    return Ok(canonical);
-                }
+        for root in &self.host_bind_roots {
+            if canonical == *root || canonical.starts_with(root) {
+                return Ok(canonical);
             }
         }
         Err(EnvError::PermissionDenied(canonical))
@@ -947,11 +957,12 @@ impl ExecutionEnv for SeatbeltEnv {
                         c.to_path_buf()
                     }
                 })
-                // When the caller gives no cwd, prefer the first host bind
-                // (the user's real workspace) over the empty transient work
-                // dir: agents invoke bash without a cwd and expect to land
-                // in the repo.
-                .or_else(|| self.config.host_binds.first().map(|bind| bind.host.clone()))
+                // When the caller gives no cwd, prefer the first trusted host
+                // bind (the user's real workspace) over the empty transient
+                // work dir: agents invoke bash without a cwd and expect to land
+                // in the repo. Restricted profiles have no bind roots, so they
+                // always start in the sandbox work dir.
+                .or_else(|| self.host_bind_roots.first().cloned())
                 .unwrap_or_else(|| self.work_dir_canon.clone());
 
             let mut shell_cmd = tokio::process::Command::new("sandbox-exec");
