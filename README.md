@@ -24,10 +24,6 @@ graph TD
         RT[llm-harness-subagents + llm-harness-workflow<br/>spawn / workflow / lifecycle / rules]
     end
 
-    subgraph "多 Agent 协作"
-        TEAM[llm-harness-agent-team<br/>AgentTeam / SocialContext / 社交工具]
-    end
-
     subgraph "调试观测"
         INSP[llm-harness-inspector<br/>REST + WebSocket 事件流]
     end
@@ -91,7 +87,6 @@ graph TD
 | `llm-harness-agent` | HarnessBuilder、AgentHarness、Session、Compaction、Skills | crate 内 lib.rs |
 | `llm-harness-subagents` | Sub-agent spawn、async delivery、main↔sub 通信（SpawnPlugin） | [runtime-framework.md](docs/runtime-framework.md) · [ORCHESTRATION.md](docs/ORCHESTRATION.md) |
 | `llm-harness-workflow` | Workflow 引擎、task 持久化、规则匹配 | [runtime-framework.md](docs/runtime-framework.md) · [ORCHESTRATION.md](docs/ORCHESTRATION.md) |
-| `llm-harness-agent-team` | 去中心化多 Agent 协作（AgentTeam、社交工具、团队记忆） | **[agent-team-guide.md](docs/agent-team-guide.md)** |
 | `llm-harness-inspector` | Agent 调试 Web API（REST + WebSocket 事件流） | **[inspector-guide.md](docs/inspector-guide.md)** |
 | `llm-harness-platform` | 横切 trait（Sandbox/AuditSink/TraceExporter/PromptSource） | [crate-reference.md](docs/crate-reference.md) |
 | `llm-harness-strategy` | 策略层：safety、loop-safety、status-panel、event-stream、injection-filter、observation-shielding、memory-defense、notify、budget | **[strategy-guide.md](docs/strategy-guide.md)** |
@@ -152,7 +147,6 @@ cargo run --features live-llm -p llm-harness-live-tests --example 02_tool_callin
 | 23 | `infra_integration` | 基础设施集成 |
 | 24 | `otlp_jaeger` | OTLP 追踪导出 |
 | 25 | `inspector_interact` | Inspector Web UI 交互（steer/abort/usage） |
-| 26 | `agent_team` | 多 Agent 团队协作（delegate/reflection/团队记忆） |
 | 27 | `multimodal` | 多模态（图片/PDF，base64 与 URL） |
 
 ### 运行全部测试
@@ -177,9 +171,6 @@ ReAct 循环（思考→调工具→看结果→再思考），支持 streaming�
 
 ### Sub-Agent Spawn
 主 Agent 派生子 Agent：同步/异步 spawn、消息总线（MessageBus）双向通信、abort 传播。通过 `SpawnPlugin` 一行接入。详见 [runtime-framework.md](docs/runtime-framework.md)。
-
-### Agent Team
-去中心化多 Agent 协作：声明式组队（`IndividualSpec` → `AgentTeam`）、P2P 社交工具（delegate_task/send_message/broadcast/search_contacts/set_reminder）、SQLite 团队记忆 + 反思循环。详见 [agent-team-guide.md](docs/agent-team-guide.md)。
 
 ### Strategy Layer
 16 个策略 Plugin：安全防护、循环安全（5 个 Hook）、状态栏+TODO、事件流（timer/heartbeat/filter/webhook/shell_monitor）、注入防御、来源标记、记忆防线、通知、工具输出保护、观察屏蔽、MCP 凭证保护、compaction prompt、项目指令注入、审计、预算控制。详见 [strategy-guide.md](docs/strategy-guide.md)。
@@ -217,7 +208,6 @@ Linux（bubblewrap）、macOS（seatbelt）、跨平台（OS 原生 + 路径限�
 | [strategy-guide.md](docs/strategy-guide.md) | 策略层 16 个模块使用指南 |
 | [mcp-guide.md](docs/mcp-guide.md) | MCP 集成指南 |
 | [tools-guide.md](docs/tools-guide.md) | 内置工具使用指南 |
-| [agent-team-guide.md](docs/agent-team-guide.md) | 多 Agent 团队协作指南 |
 | [inspector-guide.md](docs/inspector-guide.md) | Agent Inspector 调试指南 |
 | [crate-reference.md](docs/crate-reference.md) | 基础设施 crate 参考（types/platform/audit/trace/knowledge/memory） |
 | [runtime-framework.md](docs/runtime-framework.md) | 编排层框架文档（subagents + workflow） |

@@ -43,7 +43,6 @@ llm-harness-memory.workspace = true
 llm-harness-session-recall.workspace = true
 llm-harness-audit-jsonl.workspace = true
 llm-harness-trace-otel.workspace = true
-llm-harness-agent-team.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 futures.workspace = true

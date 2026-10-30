@@ -3,7 +3,6 @@ members = [
     "crates/llm-harness-types",
     "crates/llm-harness-loop",
     "crates/llm-harness-agent",
-    "crates/llm-harness-agent-team",
     # runtime
     "crates/llm-harness-platform",
     "crates/llm-harness-subagents",
@@ -32,9 +31,6 @@ members = [
     "crates/session-viewer",
     "crates/llm-harness-live-tests",
     "crates/llm-harness-inspector",
-    "crates/llm-harness-agent-team-studio",
-    "crates/llm-harness-runtime-app",
-    "crates/llm-harness-runtime-app-shell",
     # examples
     # coding-agent is now a separate repo: https://github.com/oh-my-harness/coding-agent.git
     # It depends on this workspace's crates via git rev.
@@ -74,9 +70,6 @@ llm-harness-vm-agent-transport = { path = "crates/llm-harness-vm-agent-transport
 llm-harness-vm-agent-env = { path = "crates/llm-harness-vm-agent-env" }
 llm-harness-vm-agent-service = { path = "crates/llm-harness-vm-agent-service" }
 llm-harness-vm-firecracker = { path = "crates/llm-harness-vm-firecracker" }
-llm-harness-agent-team-studio = { path = "crates/llm-harness-agent-team-studio" }
-llm-harness-runtime-app = { path = "crates/llm-harness-runtime-app" }
-llm-harness-agent-team = { path = "crates/llm-harness-agent-team" }
 # API adapter — separate repo
 llm_adapter        = { git = "https://github.com/oh-my-harness/llm-api-adapter", rev = "abe4cefb70ea2ed5cd1dbe57c778a87e9fa87ce9" }
 

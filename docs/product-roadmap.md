@@ -87,14 +87,6 @@ Agent 执行命令（特别是 bash）时需要安全隔离。运行时提供沙
 - **配置定制**：`SpawnOptions` 支持 provider 继承/别名、context 传递（父对话摘要/文件/用户指令）、system prompt 与 thinking level 覆盖；`builder_customize` 闭包为所有子 Agent 统一注入插件
 - **完成通知**：`SpawnPlugin` 把子 Agent 完成事件接回主 Agent 的通用 hook 流（空闲时唤醒主 Agent 继续）
 
-#### 多 Agent 团队（Agent Team）
-
-去中心化的多 Agent 协作（`llm-harness-agent-team`）：
-- **声明式组队**：`IndividualSpec`（id/专长/模型/反思间隔）→ `AgentTeam::build` 物化为自驱动 runner
-- **P2P 社交工具**：`delegate_task`（任务委派路由）、`send_message`、`broadcast`、`search_contacts`（通讯录搜索）、`set_reminder`
-- **操作员交互**：人类通过 `AgentTeam::submit` 派活、`AgentTeam::receive` 收结果
-- **团队记忆**：SQLite 团队记忆（`TeamSqliteMemoryStore`），反思循环把可复用经验沉淀下来，跨进程重启存活
-
 #### Agent Inspector（调试观测）
 
 开发者的 Web 调试工具（`llm-harness-inspector`）：
