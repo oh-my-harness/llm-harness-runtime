@@ -1113,7 +1113,10 @@ mod desktop_host_tests {
     async fn host_surfaces_backend_exit_before_readiness() {
         let root = temp_root("unexpected-exit");
         std::fs::create_dir_all(&root).unwrap();
-        let result = StudioBackendHost::spawn(StudioHostConfig::new("/bin/false", &root))
+        // Resolve `false` through PATH: macOS has no /bin/false, so a
+        // hard-coded Linux path turns the spawn into an Io(NotFound) error
+        // instead of the backend-exit path under test.
+        let result = StudioBackendHost::spawn(StudioHostConfig::new("false", &root))
             .unwrap()
             .wait_ready()
             .await;

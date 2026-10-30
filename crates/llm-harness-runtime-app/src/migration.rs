@@ -603,7 +603,7 @@ fn copy_tree(source: &Path, destination: &Path, stats: &mut CopyStats) -> io::Re
         stats.files += 1;
         stats.bytes += metadata.len();
         std::fs::copy(source, destination)?;
-        File::open(destination)?.sync_all()?;
+        sync_file(destination)?;
     } else {
         return Err(io::Error::other(format!(
             "unsupported non-regular entry: {}",
@@ -664,6 +664,28 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
+}
+
+/// Flush a regular file to stable storage.
+///
+/// `FlushFileBuffers` on Windows requires a handle with write access;
+/// `File::open` produces a read-only handle and fails with
+/// `ERROR_ACCESS_DENIED`. Reopen for writing so the durability call works on
+/// every platform. A read-only destination cannot be reopened for writing, so
+/// its flush is best-effort (the data was already written by the copy).
+fn sync_file(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(file) => file.sync_all(),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)?.sync_all()
+    }
 }
 
 #[cfg(unix)]
@@ -752,7 +774,7 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
     }
-    File::open(&temporary)?.sync_all()?;
+    sync_file(&temporary)?;
     rename_durable(&temporary, path)
 }
 
@@ -1055,6 +1077,19 @@ mod tests {
         fs::create_dir_all(root.join("logs")).unwrap();
         fs::write(root.join("logs/runtime.jsonl"), "{\"event\":\"startup\"}\n").unwrap();
         root
+    }
+
+    #[test]
+    fn copied_files_are_synced_with_a_writable_handle() {
+        let root = test_case("copy-sync");
+        let source = root.join("source.txt");
+        let destination = root.join("destination.txt");
+        fs::write(&source, b"payload").unwrap();
+        let mut stats = CopyStats::default();
+        copy_tree(&source, &destination, &mut stats).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"payload");
+        assert_eq!(stats.files, 1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
