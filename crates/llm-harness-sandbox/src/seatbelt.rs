@@ -368,6 +368,10 @@ impl SeatbeltEnv {
         )
     }
 
+    // The constructor mirrors the sandbox fields and is internal to this
+    // module; bundling them would add a second struct for no call-site
+    // clarity. Keep the lint exception local to the constructor.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_binds(
         work_dir: PathBuf,
         work_dir_canon: PathBuf,
