@@ -73,6 +73,7 @@ jobs:
       - name: Enable bwrap namespaces (Linux only)
         if: runner.os == 'Linux'
         run: |
+          set -euo pipefail
           # Ubuntu 24.04 defaults to
           # kernel.apparmor_restrict_unprivileged_userns=1, and the restricted
           # user namespace bwrap creates lacks the netlink capability bwrap
@@ -83,7 +84,9 @@ jobs:
           # capability so the test job fails here with a clear diagnostic
           # instead of inside unrelated sandbox tests.
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            echo "apparmor_restrict_unprivileged_userns before: $(sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            echo "apparmor_restrict_unprivileged_userns after: $(sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns)"
           fi
           bwrap --unshare-all --die-with-parent --new-session \
             --ro-bind-try /usr /usr \
