@@ -602,8 +602,7 @@ fn copy_tree(source: &Path, destination: &Path, stats: &mut CopyStats) -> io::Re
     } else if metadata.is_file() {
         stats.files += 1;
         stats.bytes += metadata.len();
-        std::fs::copy(source, destination)?;
-        sync_file(destination)?;
+        copy_file_synced(source, destination, &metadata)?;
     } else {
         return Err(io::Error::other(format!(
             "unsupported non-regular entry: {}",
@@ -666,26 +665,23 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Flush a regular file to stable storage.
-///
-/// `FlushFileBuffers` on Windows requires a handle with write access;
-/// `File::open` produces a read-only handle and fails with
-/// `ERROR_ACCESS_DENIED`. Reopen for writing so the durability call works on
-/// every platform. A read-only destination cannot be reopened for writing, so
-/// its flush is best-effort (the data was already written by the copy).
-fn sync_file(path: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        match std::fs::OpenOptions::new().write(true).open(path) {
-            Ok(file) => file.sync_all(),
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        File::open(path)?.sync_all()
-    }
+/// Copy a regular file and flush the write handle before restoring the
+/// source permissions. `FlushFileBuffers` on Windows requires a writable
+/// handle, so syncing a read-only `File::open` handle (the previous
+/// implementation) fails with `ERROR_ACCESS_DENIED`. Creating the
+/// destination writable also lets us flush a read-only source without a
+/// best-effort fallback.
+fn copy_file_synced(
+    source: &Path,
+    destination: &Path,
+    metadata: &std::fs::Metadata,
+) -> io::Result<()> {
+    let mut input = File::open(source)?;
+    let mut output = File::create(destination)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    drop(output);
+    std::fs::set_permissions(destination, metadata.permissions())
 }
 
 #[cfg(unix)]
@@ -774,7 +770,6 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
     }
-    sync_file(&temporary)?;
     rename_durable(&temporary, path)
 }
 
@@ -1080,15 +1075,33 @@ mod tests {
     }
 
     #[test]
-    fn copied_files_are_synced_with_a_writable_handle() {
+    fn copied_files_are_synced_before_read_only_permissions() {
         let root = test_case("copy-sync");
         let source = root.join("source.txt");
         let destination = root.join("destination.txt");
         fs::write(&source, b"payload").unwrap();
+        let mut permissions = fs::metadata(&source).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&source, permissions).unwrap();
         let mut stats = CopyStats::default();
         copy_tree(&source, &destination, &mut stats).unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"payload");
         assert_eq!(stats.files, 1);
+        assert!(
+            fs::metadata(&destination).unwrap().permissions().readonly(),
+            "destination must preserve the source read-only attribute"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let mut writable = fs::metadata(&destination).unwrap().permissions();
+            writable.set_readonly(false);
+            fs::set_permissions(&destination, writable).unwrap();
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
