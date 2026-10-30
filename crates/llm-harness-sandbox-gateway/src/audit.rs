@@ -333,15 +333,13 @@ fn read_head(path: &Path) -> Result<AuditHead> {
 
 fn write_head(path: &Path, head: &AuditHead) -> Result<()> {
     let content = serde_json::to_string(head)?;
+    let mut open_options = OpenOptions::new();
+    open_options.write(true).create(true).truncate(true);
     #[cfg(unix)]
-    let open_options = {
+    {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true).mode(0o600);
-        options
-    };
-    #[cfg(not(unix))]
-    let open_options = OpenOptions::new();
+        open_options.mode(0o600);
+    }
     let mut file = open_options
         .open(path)
         .with_context(|| format!("open gateway audit head {path:?}"))?;
