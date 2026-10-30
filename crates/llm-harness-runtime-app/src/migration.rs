@@ -1301,12 +1301,15 @@ mod tests {
         fs::remove_dir_all(parent).unwrap();
     }
 
+    // A symlink is the portable way to construct a non-regular entry on Unix.
+    // Windows symlink creation needs Developer Mode or elevation, so the test
+    // would otherwise "pass" by never creating the unsupported entry.
+    #[cfg(unix)]
     #[test]
     fn unsupported_entry_fails_before_source_is_changed() {
         let source = source_with_data();
         let parent = source.parent().unwrap().to_path_buf();
         let destination = parent.join("migrated-root");
-        #[cfg(unix)]
         std::os::unix::fs::symlink("settings.json", source.join("symlink")).unwrap();
 
         let error = migrate_data_root(
