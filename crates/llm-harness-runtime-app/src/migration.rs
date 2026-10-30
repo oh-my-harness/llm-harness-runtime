@@ -679,9 +679,13 @@ fn copy_file_synced(
     let mut input = File::open(source)?;
     let mut output = File::create(destination)?;
     std::io::copy(&mut input, &mut output)?;
+    // Restore the source permissions before the final flush so the mode
+    // change is part of the same durability barrier. The handle still has
+    // write access even when the source was read-only.
+    output.set_permissions(metadata.permissions())?;
     output.sync_all()?;
     drop(output);
-    std::fs::set_permissions(destination, metadata.permissions())
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -759,16 +763,16 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let write_result = (|| {
         let mut file = File::create(&temporary)?;
         file.write_all(&contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.sync_all()
     })();
     if let Err(error) = write_result {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
     }
     rename_durable(&temporary, path)
 }
