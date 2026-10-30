@@ -91,8 +91,15 @@ async fn upload_session_files_through_control_service() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), 201);
-    let created = read_json(response).await;
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        201,
+        "create session body: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let session_id = created["id"].as_str().unwrap().to_owned();
 
     let request = UploadFilesRequest {
@@ -348,8 +355,15 @@ async fn full_e2e_create_prompt_events_steer_abort_delete() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), 201, "create session should return 201");
-    let created = read_json(response).await;
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        201,
+        "create session should return 201; body: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let session_id = created["id"].as_str().expect("session id").to_owned();
     assert_eq!(created["state"], "idle");
     let sandbox_id = created["sandbox_id"]
