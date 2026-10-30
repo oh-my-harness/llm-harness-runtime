@@ -135,6 +135,85 @@ fn trusted_lan_profile_still_resolves_host_bind_guest_paths() {
 }
 
 #[test]
+fn trusted_lan_resolves_symlinked_host_bind() {
+    use llm_harness_platform::sandbox::HostBind;
+
+    let work = tempfile::tempdir().expect("work dir");
+    let real = tempfile::tempdir().expect("real host dir");
+    std::fs::write(real.path().join("sentinel.txt"), "host-only").expect("sentinel");
+    let alias_parent = tempfile::tempdir().expect("alias parent");
+    let alias = alias_parent.path().join("alias");
+    std::os::unix::fs::symlink(real.path(), &alias).expect("symlink");
+    let work_canon = std::fs::canonicalize(work.path()).expect("work canon");
+    let real_canon = std::fs::canonicalize(real.path()).expect("real canon");
+
+    let mut config = default_config(work.path().to_path_buf());
+    config.trust_profile = TrustProfile::TrustedLan;
+    config.host_binds = vec![HostBind {
+        host: alias,
+        guest: PathBuf::from("/workspace/project"),
+    }];
+    let env = SeatbeltEnv::new_with_binds(
+        work.path().to_path_buf(),
+        work_canon.clone(),
+        vec![
+            (PathBuf::from("/workspace"), work_canon),
+            (PathBuf::from("/workspace/project"), real_canon.clone()),
+        ],
+        vec![],
+        config,
+        false,
+        work.path().join("policy.sb"),
+    );
+
+    let resolved = env
+        .resolve_path(Path::new("/workspace/project/sentinel.txt"))
+        .expect("trusted-lan must resolve a symlinked host bind");
+    assert_eq!(resolved, real_canon.join("sentinel.txt"));
+}
+
+#[tokio::test]
+async fn restricted_shell_defaults_to_work_dir_not_host_bind() {
+    use llm_harness_platform::sandbox::HostBind;
+
+    let work = tempfile::tempdir().expect("work dir");
+    let host = tempfile::tempdir().expect("host dir");
+    std::fs::write(host.path().join("marker"), "host").expect("marker");
+    let work_canon = std::fs::canonicalize(work.path()).expect("work canon");
+    let host_canon = std::fs::canonicalize(host.path()).expect("host canon");
+
+    let mut config = default_config(work_canon.clone());
+    config.trust_profile = TrustProfile::Restricted;
+    config.host_binds = vec![HostBind {
+        host: host.path().to_path_buf(),
+        guest: PathBuf::from("/workspace/project"),
+    }];
+    let policy = generate_policy(&config, &work_canon, &[]);
+    let policy_path = work.path().join("policy.sb");
+    std::fs::write(&policy_path, policy).expect("policy");
+    let env = SeatbeltEnv::new_with_binds(
+        work.path().to_path_buf(),
+        work_canon.clone(),
+        vec![
+            (PathBuf::from("/workspace"), work_canon.clone()),
+            (PathBuf::from("/workspace/project"), host_canon.clone()),
+        ],
+        vec![],
+        config,
+        false,
+        policy_path,
+    );
+
+    let output = env
+        .execute_shell("pwd", shell_opts())
+        .await
+        .expect("pwd in restricted sandbox");
+    let cwd = std::fs::canonicalize(output.stdout.trim()).expect("cwd");
+    assert_eq!(cwd, work_canon);
+    assert_ne!(cwd, host_canon);
+}
+
+#[test]
 fn policy_denies_network() {
     let config = default_config(PathBuf::from("/tmp/test"));
     let policy = generate_policy(&config, &PathBuf::from("/tmp/test"), &[]);
