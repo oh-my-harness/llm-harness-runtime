@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +9,7 @@ use futures::future::{BoxFuture, FutureExt, join_all};
 use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -22,12 +23,51 @@ use crate::version_lock::{
     McpLockFile, ServerInfoSnapshot, ServerLockEntry, compute_tool_hashes, diff_tool_snapshots,
 };
 
-pub const STARTUP_TIMEOUT_MS: u64 = 250;
+/// Default startup budget for `discover_and_connect`.
+///
+/// This is the total time the manager waits for MCP servers to finish
+/// `initialize` + `tools/list` before returning. It is intentionally much
+/// larger than a local process handshake: remote HTTP/SSE servers (and
+/// proxies) can take hundreds of milliseconds. Override with
+/// `OMP_MCP_STARTUP_TIMEOUT_MS`; `0` disables the extra budget and falls back
+/// to each connection attempt's own timeout.
+pub const STARTUP_TIMEOUT_MS: u64 = 10_000;
+/// Grace period used by the legacy "cached tools are deferred" test path.
+pub const CACHED_TOOL_GRACE_MS: u64 = 250;
+const STARTUP_TIMEOUT_ENV: &str = "OMP_MCP_STARTUP_TIMEOUT_MS";
 const RECONNECT_WINDOW: Duration = Duration::from_secs(30);
 const MAX_RECONNECTS_IN_WINDOW: usize = 5;
 const RECONNECT_BACKOFF_MS: [u64; 5] = [0, 500, 1_000, 2_000, 4_000];
 
-pub(crate) type SessionConnector = Arc<
+/// Resolve the startup budget from an optional environment value.
+///
+/// Kept pure for tests; the manager reads the real environment once at
+/// construction so concurrent teams share a stable value.
+pub fn resolve_startup_timeout_ms(env_override: Option<&str>) -> u64 {
+    if let Some(raw) = env_override {
+        match raw.parse::<u64>() {
+            Ok(value) => return value,
+            Err(error) => {
+                tracing::warn!(
+                    value = raw,
+                    %error,
+                    "ignoring invalid OMP_MCP_STARTUP_TIMEOUT_MS"
+                );
+            }
+        }
+    }
+    STARTUP_TIMEOUT_MS
+}
+
+fn default_startup_timeout_ms() -> u64 {
+    resolve_startup_timeout_ms(std::env::var(STARTUP_TIMEOUT_ENV).ok().as_deref())
+}
+
+/// Factory used to open an MCP session for a server config.
+///
+/// Public so test code in downstream crates can inject a fake connector via
+/// the `test-utils`-gated constructors.
+pub type SessionConnector = Arc<
     dyn Fn(McpServerConfig) -> BoxFuture<'static, SessionResult<Arc<McpSession>>> + Send + Sync,
 >;
 
@@ -222,10 +262,32 @@ struct ManagerInner {
     reconnection_tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     connector: SessionConnector,
     shutting_down: AtomicBool,
-    lock_file: RwLock<McpLockFile>,
+    lock_file: Arc<RwLock<McpLockFile>>,
     lock_file_path: Option<PathBuf>,
+    /// Serializes lock-file persistence. Each writer snapshots the in-memory
+    /// lock *after* acquiring this gate, so out-of-order writer scheduling can
+    /// never roll the file back to an older snapshot.
+    lock_persist_gate: Arc<AsyncMutex<()>>,
     credential_provider: Arc<dyn crate::credential::CredentialProvider>,
     credential_scopes: RwLock<HashMap<String, HashMap<String, Vec<String>>>>,
+    startup_timeout_ms: u64,
+    /// Internal upper bound applied to a single connection attempt when the
+    /// resolved attempt timeout (`OMP_MCP_TIMEOUT_MS` / `config.timeout`) is
+    /// `0`, i.e. explicitly disabled. Without it, `startup_timeout_ms == 0`
+    /// plus a disabled attempt timeout would wait forever. Defaults to
+    /// [`crate::transport::DEFAULT_TIMEOUT_MS`] and is only overridden by
+    /// test constructors.
+    attempt_safety_timeout_ms: u64,
+    /// Serializes connection publication (session + live tools + Ready) with
+    /// startup-timeout settlement. Without this gate, a timeout could abort a
+    /// task between publishing tools and publishing the session, or replace
+    /// freshly published live tools with deferred cache entries.
+    ///
+    /// Lock order: `startup_gate` → `tools` → `connections` →
+    /// `pending_connections` → `failures`. The gate is the only async lock;
+    /// every `parking_lot` guard acquired under it is dropped before the gate
+    /// is released, so no await point ever observes a held sync guard.
+    startup_gate: AsyncMutex<()>,
 }
 
 pub struct McpManager {
@@ -239,6 +301,8 @@ impl McpManager {
             Arc::new(default_connector),
             Some(PathBuf::from(".mcp-lock.json")),
             Arc::new(crate::credential::EnvCredentialProvider),
+            default_startup_timeout_ms(),
+            crate::transport::DEFAULT_TIMEOUT_MS,
         )
     }
 
@@ -248,21 +312,41 @@ impl McpManager {
             Arc::new(default_connector),
             Some(PathBuf::from(".mcp-lock.json")),
             Arc::new(crate::credential::EnvCredentialProvider),
+            default_startup_timeout_ms(),
+            crate::transport::DEFAULT_TIMEOUT_MS,
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_connector(cache_path: Option<PathBuf>, connector: SessionConnector) -> Self {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_connector(cache_path: Option<PathBuf>, connector: SessionConnector) -> Self {
         Self::build_inner(
             cache_path,
             connector,
             None,
             Arc::new(crate::credential::EnvCredentialProvider),
+            default_startup_timeout_ms(),
+            crate::transport::DEFAULT_TIMEOUT_MS,
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_connector_and_lock(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_connector_and_startup_timeout(
+        cache_path: Option<PathBuf>,
+        connector: SessionConnector,
+        startup_timeout_ms: u64,
+    ) -> Self {
+        Self::build_inner(
+            cache_path,
+            connector,
+            None,
+            Arc::new(crate::credential::EnvCredentialProvider),
+            startup_timeout_ms,
+            crate::transport::DEFAULT_TIMEOUT_MS,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_connector_and_lock(
         cache_path: Option<PathBuf>,
         connector: SessionConnector,
         lock_file_path: PathBuf,
@@ -272,6 +356,48 @@ impl McpManager {
             connector,
             Some(lock_file_path),
             Arc::new(crate::credential::EnvCredentialProvider),
+            default_startup_timeout_ms(),
+            crate::transport::DEFAULT_TIMEOUT_MS,
+        )
+    }
+
+    /// Construct a manager with injected startup budget and attempt safety
+    /// bound. Test-only: lets tests exercise the `startup=0` / `timeout=0`
+    /// combinations with small, deterministic values.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_connector_and_timeouts(
+        cache_path: Option<PathBuf>,
+        connector: SessionConnector,
+        startup_timeout_ms: u64,
+        attempt_safety_timeout_ms: u64,
+    ) -> Self {
+        Self::build_inner(
+            cache_path,
+            connector,
+            None,
+            Arc::new(crate::credential::EnvCredentialProvider),
+            startup_timeout_ms,
+            attempt_safety_timeout_ms,
+        )
+    }
+
+    /// Test-only constructor that also injects the credential provider, so a
+    /// stalled provider can be exercised against the attempt deadline.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_credential_provider_and_timeouts(
+        cache_path: Option<PathBuf>,
+        connector: SessionConnector,
+        provider: Arc<dyn crate::credential::CredentialProvider>,
+        startup_timeout_ms: u64,
+        attempt_safety_timeout_ms: u64,
+    ) -> Self {
+        Self::build_inner(
+            cache_path,
+            connector,
+            None,
+            provider,
+            startup_timeout_ms,
+            attempt_safety_timeout_ms,
         )
     }
 
@@ -284,7 +410,14 @@ impl McpManager {
         lock_file_path: Option<PathBuf>,
         provider: Arc<dyn crate::credential::CredentialProvider>,
     ) -> Self {
-        Self::build_inner(cache_path, connector, lock_file_path, provider)
+        Self::build_inner(
+            cache_path,
+            connector,
+            lock_file_path,
+            provider,
+            default_startup_timeout_ms(),
+            crate::transport::DEFAULT_TIMEOUT_MS,
+        )
     }
 
     fn build_inner(
@@ -292,6 +425,8 @@ impl McpManager {
         connector: SessionConnector,
         lock_file_path: Option<PathBuf>,
         credential_provider: Arc<dyn crate::credential::CredentialProvider>,
+        startup_timeout_ms: u64,
+        attempt_safety_timeout_ms: u64,
     ) -> Self {
         Self {
             inner: Arc::new(ManagerInner {
@@ -306,10 +441,17 @@ impl McpManager {
                 reconnection_tasks: Mutex::new(HashMap::new()),
                 connector,
                 shutting_down: AtomicBool::new(false),
-                lock_file: RwLock::new(McpLockFile::default()),
+                lock_file: Arc::new(RwLock::new(McpLockFile::default())),
                 lock_file_path,
+                lock_persist_gate: Arc::new(AsyncMutex::new(())),
                 credential_provider,
                 credential_scopes: RwLock::new(HashMap::new()),
+                startup_timeout_ms,
+                // A safety bound of zero would defeat its purpose; keep a
+                // one-millisecond floor so the `0/0` combination can never
+                // wait forever even if a caller injects zero.
+                attempt_safety_timeout_ms: attempt_safety_timeout_ms.max(1),
+                startup_gate: AsyncMutex::new(()),
             }),
         }
     }
@@ -357,17 +499,107 @@ impl McpManager {
             .iter_mut()
             .map(|(_, receiver)| wait_until_settled(receiver))
             .collect::<Vec<_>>();
-        let _ =
-            tokio::time::timeout(Duration::from_millis(STARTUP_TIMEOUT_MS), join_all(settle)).await;
-
-        for (name, receiver) in waiters {
-            if matches!(*receiver.borrow(), ConnectionAttempt::Pending)
-                && let Some(tools) = self.inner.tool_cache.get(&name)
+        let startup_timeout_ms = self.inner.startup_timeout_ms;
+        let timed_out = if startup_timeout_ms == 0 {
+            join_all(settle).await;
+            false
+        } else {
+            match tokio::time::timeout(Duration::from_millis(startup_timeout_ms), join_all(settle))
+                .await
             {
-                replace_server_tools(&self.inner, &name, tools, true);
+                Ok(_) => false,
+                Err(_) => true,
+            }
+        };
+        if timed_out {
+            self.handle_startup_timeout(&waiters, startup_timeout_ms)
+                .await;
+        }
+
+        {
+            // Keep the check-and-replace atomic with connection publication:
+            // a task that publishes live tools must never be overwritten by a
+            // stale deferred cache entry.
+            let _gate = self.inner.startup_gate.lock().await;
+            for (name, receiver) in waiters {
+                if matches!(*receiver.borrow(), ConnectionAttempt::Pending)
+                    && self.get_connection_status(&name) != ConnectionStatus::Connected
+                    && let Some(tools) = self.inner.tool_cache.get(&name)
+                {
+                    replace_server_tools(&self.inner, &name, tools, true);
+                }
             }
         }
         Ok(())
+    }
+
+    /// Settle connections that are still handshaking when the startup budget
+    /// expires.
+    ///
+    /// - A connection that already published a session wins the race; keep it
+    ///   and do not overwrite its live tools with cached definitions.
+    /// - A pending connection with cached tools keeps running in the
+    ///   background and exposes deferred tools, matching the historical
+    ///   fast-gate contract. It records a diagnostic failure while it
+    ///   continues, and clears it on success.
+    /// - A pending connection without cached tools is aborted, its future is
+    ///   awaited for a bounded grace period, and a terminal failure is
+    ///   recorded. This is the path that prevents `Connecting` zombies and
+    ///   orphan tasks for slow remote servers.
+    async fn handle_startup_timeout(
+        &self,
+        waiters: &[(String, watch::Receiver<ConnectionAttempt>)],
+        timeout_ms: u64,
+    ) {
+        let message = format!("startup timed out after {timeout_ms}ms");
+        let cached_message =
+            format!("startup still connecting after {timeout_ms}ms; cached tools are deferred");
+        let mut aborted = Vec::new();
+        {
+            let _gate = self.inner.startup_gate.lock().await;
+            for (name, receiver) in waiters {
+                if !matches!(*receiver.borrow(), ConnectionAttempt::Pending) {
+                    continue;
+                }
+                if self.inner.connections.read().contains_key(name) {
+                    // The task published a session before the gate was taken.
+                    // Keep the live connection and its tools.
+                    continue;
+                }
+                if self.inner.tool_cache.get(name).is_some() {
+                    // Cached-tools grace: the attempt stays tracked in
+                    // pending_connections and continues in the background.
+                    self.inner
+                        .failures
+                        .write()
+                        .insert(name.clone(), cached_message.clone());
+                    continue;
+                }
+                let handle = self.inner.connection_tasks.lock().remove(name);
+                if let Some(handle) = handle {
+                    handle.abort();
+                    aborted.push((name.clone(), handle));
+                }
+                self.inner.pending_connections.write().remove(name);
+                if !self.inner.connections.read().contains_key(name) {
+                    self.inner
+                        .failures
+                        .write()
+                        .insert(name.clone(), message.clone());
+                }
+            }
+        }
+        for (name, handle) in aborted {
+            if tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    server = name,
+                    "MCP connection task did not stop within cleanup grace period"
+                );
+            }
+        }
     }
 
     pub async fn add_server(&self, name: String, config: McpServerConfig) -> ManagerResult<()> {
@@ -470,6 +702,20 @@ impl McpManager {
         } else {
             ConnectionStatus::Disconnected
         }
+    }
+
+    /// Read the connection status and its failure reason as one consistent
+    /// snapshot.
+    ///
+    /// Startup transitions (publish, defer, terminal failure) happen under
+    /// `startup_gate`, so callers that must render a user-facing reason use
+    /// this instead of two independent reads that could pair a fresh
+    /// `Disconnected` with a stale deferred diagnostic.
+    pub async fn connection_snapshot(&self, name: &str) -> (ConnectionStatus, Option<String>) {
+        let _gate = self.inner.startup_gate.lock().await;
+        let status = self.get_connection_status(name);
+        let reason = self.inner.failures.read().get(name).cloned();
+        (status, reason)
     }
 
     pub fn get_tools(&self) -> Vec<ExposedTool> {
@@ -815,12 +1061,25 @@ async fn verify_and_lock(
 }
 
 async fn persist_lock_file(inner: &Arc<ManagerInner>) {
-    if let Some(path) = &inner.lock_file_path {
-        let lock = inner.lock_file.read().clone();
-        if let Err(error) = lock.save_to_disk(path).await {
+    let Some(path) = inner.lock_file_path.clone() else {
+        return;
+    };
+    let lock_file = Arc::clone(&inner.lock_file);
+    let persist_gate = Arc::clone(&inner.lock_persist_gate);
+    // Run the write in a spawned task and await its handle. A caller-side
+    // attempt / verification timeout can drop the handle, but the write task
+    // keeps running to completion, so cancellation never truncates the file.
+    // The task snapshots the in-memory lock *after* taking the persistence
+    // gate: out-of-order scheduling therefore cannot write an older snapshot
+    // over a newer one, and `save_to_disk` uses write-then-rename.
+    let handle = tokio::spawn(async move {
+        let _serial = persist_gate.lock().await;
+        let lock = lock_file.read().clone();
+        if let Err(error) = lock.save_to_disk(&path).await {
             tracing::warn!(%error, "failed to persist MCP lock file");
         }
-    }
+    });
+    let _ = handle.await;
 }
 
 /// Resolves all credential references (`${ENV:...}`, `vault://...`) in a
@@ -920,29 +1179,87 @@ async fn resolve_scoped_credentials(
     Ok(resolved)
 }
 
+/// Outcome of one attempt phase under the shared absolute deadline.
+enum PhaseOutcome<T> {
+    Done(T),
+    TimedOut,
+}
+
+/// Run one phase only while the shared attempt deadline has budget left.
+///
+/// `tokio::time::timeout` polls its inner future before checking the timer, so
+/// a zero-duration timeout could still let an already-ready phase run (and
+/// publish) after the deadline. Checking the absolute deadline first makes an
+/// expired attempt fail without polling the next phase.
+async fn run_phase<F, T>(deadline: tokio::time::Instant, phase: F) -> PhaseOutcome<T>
+where
+    F: Future<Output = T>,
+{
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return PhaseOutcome::TimedOut;
+    }
+    match tokio::time::timeout(remaining, phase).await {
+        Ok(value) => PhaseOutcome::Done(value),
+        Err(_) => PhaseOutcome::TimedOut,
+    }
+}
+
 async fn run_connection_attempt(
     inner: Arc<ManagerInner>,
     name: String,
     config: McpServerConfig,
     sender: watch::Sender<ConnectionAttempt>,
 ) {
-    let config = match resolve_config_credentials(&inner, &name, &config).await {
-        Ok(config) => config,
-        Err(error) => {
-            let error_msg = error.to_string();
-            inner
-                .failures
-                .write()
-                .insert(name.clone(), error_msg.clone());
-            let _ = sender.send(ConnectionAttempt::Failed(Arc::new(error_msg)));
-            inner.pending_connections.write().remove(&name);
-            return;
-        }
-    };
     let timeout_ms = resolve_timeout_ms(
         std::env::var("OMP_MCP_TIMEOUT_MS").ok().as_deref(),
         config.timeout_ms(),
     );
+    // A resolved timeout of `0` explicitly disables the per-attempt deadline
+    // (`OMP_MCP_TIMEOUT_MS=0` or `config.timeout: 0`). That must not make an
+    // attempt unbounded: combined with `startup_timeout_ms == 0` it would
+    // otherwise wait forever. Fall back to the internal safety bound and make
+    // the reason visible in the failure message.
+    let (attempt_timeout_ms, timeout_note) = if timeout_ms == 0 {
+        (
+            inner.attempt_safety_timeout_ms,
+            " (attempt timeout disabled; safety bound)",
+        )
+    } else {
+        (timeout_ms, "")
+    };
+    let attempt_timeout = Duration::from_millis(attempt_timeout_ms);
+    // One absolute deadline for the whole attempt. Credential resolution,
+    // connect + tools/list and verification each get only the time that is
+    // left, so a slow phase cannot multiply the configured budget. An already
+    // expired deadline fails the phase without polling it (see `run_phase`).
+    let attempt_deadline = tokio::time::Instant::now() + attempt_timeout;
+    let credential_timeout_message =
+        format!("credential resolution timed out after {attempt_timeout_ms}ms{timeout_note}");
+    let connect_timeout_message =
+        format!("connection timed out after {attempt_timeout_ms}ms{timeout_note}");
+    let verify_timeout_message =
+        format!("connection verification timed out after {attempt_timeout_ms}ms{timeout_note}");
+
+    // Credential resolution is part of the attempt: a stalled provider must
+    // not keep the attempt (or a `startup_timeout_ms == 0` wait) alive after
+    // the attempt deadline.
+    let config = match run_phase(
+        attempt_deadline,
+        resolve_config_credentials(&inner, &name, &config),
+    )
+    .await
+    {
+        PhaseOutcome::TimedOut => {
+            settle_connection_failure(&inner, &name, &sender, credential_timeout_message).await;
+            return;
+        }
+        PhaseOutcome::Done(Err(error)) => {
+            settle_connection_failure(&inner, &name, &sender, error.to_string()).await;
+            return;
+        }
+        PhaseOutcome::Done(Ok(config)) => config,
+    };
     let policy = config.version_policy().clone();
     let credential_scopes: Option<HashMap<String, Vec<String>>> = config
         .credentials()
@@ -970,28 +1287,34 @@ async fn run_connection_attempt(
         let tools = session.list_tools().await?;
         SessionResult::Ok((session, tools))
     };
-    let result = if timeout_ms == 0 {
-        connect.await.map_err(|error| error.to_string())
-    } else {
-        tokio::time::timeout(Duration::from_millis(timeout_ms), connect)
-            .await
-            .map_err(|_| format!("connection timed out after {timeout_ms}ms"))
-            .and_then(|result| result.map_err(|error| error.to_string()))
+    let result = match run_phase(attempt_deadline, connect).await {
+        PhaseOutcome::TimedOut => Err(connect_timeout_message),
+        PhaseOutcome::Done(result) => result.map_err(|error| error.to_string()),
     };
 
     match result {
         Ok((session, tools)) => {
-            if let Err(error) = verify_and_lock(&inner, &name, &session, &tools, &policy).await {
-                let error_msg = error.to_string();
-                inner
-                    .failures
-                    .write()
-                    .insert(name.clone(), error_msg.clone());
-                if let Err(disconnect_error) = session.disconnect().await {
-                    tracing::debug!(server = name, %disconnect_error, "failed to disconnect rejected MCP server");
+            let verification_error = match run_phase(
+                attempt_deadline,
+                verify_and_lock(&inner, &name, &session, &tools, &policy),
+            )
+            .await
+            {
+                PhaseOutcome::TimedOut => Some(verify_timeout_message),
+                PhaseOutcome::Done(Ok(())) => None,
+                PhaseOutcome::Done(Err(error)) => Some(error.to_string()),
+            };
+            if let Some(error_msg) = verification_error {
+                if tokio::time::timeout(Duration::from_secs(1), session.disconnect())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        server = name,
+                        "rejected MCP session did not disconnect within cleanup grace period"
+                    );
                 }
-                let _ = sender.send(ConnectionAttempt::Failed(Arc::new(error_msg)));
-                inner.pending_connections.write().remove(&name);
+                settle_connection_failure(&inner, &name, &sender, error_msg).await;
                 return;
             }
             // Register credential scopes
@@ -1001,22 +1324,61 @@ async fn run_connection_attempt(
                     .write()
                     .insert(name.clone(), scopes.clone());
             }
+            // Publish live tools, then the session, then Ready under the
+            // startup gate. No awaits may happen inside this section.
+            //
+            // Invariant (and why this order): an external observer that sees
+            // `ConnectionStatus::Connected` must already see the live tools
+            // for that server. `get_connection_status` only checks
+            // `connections`, so publishing tools first makes the "tools
+            // visible, not yet Connected" window safe; the reverse order
+            // would expose a Connected session with old/deferred tools.
+            // During that window `call_tool` still resolves the fresh tool,
+            // then `wait_for_connection` sees the still-pending attempt and
+            // waits for this same critical section to publish `Ready`.
+            // Status is derived from `connections` alone, so clearing
+            // `failures`/`pending_connections` and sending `Ready` after the
+            // insert cannot expose a half-settled Connected state.
+            //
+            // Lock order: startup_gate → tools → connections →
+            // pending_connections → failures. Guards are released before the
+            // gate is dropped; no sync guard is held across an await.
+            let gate = inner.startup_gate.lock().await;
             wire_session(&inner, &name, &session);
+            replace_server_tools(&inner, &name, tools.clone(), false);
             inner
                 .connections
                 .write()
                 .insert(name.clone(), Arc::clone(&session));
             inner.failures.write().remove(&name);
-            replace_server_tools(&inner, &name, tools.clone(), false);
-            inner.tool_cache.set(&name, tools).await;
+            inner.pending_connections.write().remove(&name);
             let _ = sender.send(ConnectionAttempt::Ready(session));
+            drop(gate);
+            inner.tool_cache.set(&name, tools).await;
         }
         Err(message) => {
-            inner.failures.write().insert(name.clone(), message.clone());
-            let _ = sender.send(ConnectionAttempt::Failed(Arc::new(message)));
+            settle_connection_failure(&inner, &name, &sender, message).await;
         }
     }
-    inner.pending_connections.write().remove(&name);
+}
+
+/// Record a terminal attempt failure and wake every waiter.
+///
+/// Status, failure and pending state are updated under `startup_gate` so an
+/// observer can never read a Linked failure with pending still set.
+async fn settle_connection_failure(
+    inner: &Arc<ManagerInner>,
+    name: &str,
+    sender: &watch::Sender<ConnectionAttempt>,
+    message: String,
+) {
+    let _gate = inner.startup_gate.lock().await;
+    inner
+        .failures
+        .write()
+        .insert(name.to_owned(), message.clone());
+    inner.pending_connections.write().remove(name);
+    let _ = sender.send(ConnectionAttempt::Failed(Arc::new(message)));
 }
 
 fn wire_session(inner: &Arc<ManagerInner>, name: &str, session: &Arc<McpSession>) {
@@ -1385,7 +1747,8 @@ mod tests {
                 unreachable!()
             })
         });
-        let manager = McpManager::with_connector(None, connector);
+        let manager =
+            McpManager::with_connector_and_startup_timeout(None, connector, CACHED_TOOL_GRACE_MS);
         manager.inner.tool_cache.entries.write().insert(
             "slow".to_owned(),
             vec![
@@ -1409,6 +1772,84 @@ mod tests {
         assert_eq!(tools[0].full_name, "mcp__slow_cached");
         assert!(tools[0].deferred);
         manager.cancel_background_tasks();
+    }
+
+    struct SetOnDrop(Arc<AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_waits_for_slow_handshake() {
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let transport: Arc<dyn McpTransport> = Arc::new(FixtureTransport::new("slow_tool"));
+                Ok(Arc::new(McpSession::connect(transport).await?))
+            })
+        });
+        let manager = McpManager::with_connector_and_startup_timeout(None, connector, 2_000);
+        let started = Instant::now();
+        manager
+            .discover_and_connect(HashMap::from([("slow".to_owned(), stdio_config("slow"))]))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(400));
+        assert!(elapsed < Duration::from_secs(2));
+        assert_eq!(
+            manager.get_connection_status("slow"),
+            ConnectionStatus::Connected
+        );
+        assert_eq!(manager.get_tools()[0].full_name, "mcp__slow_slow_tool");
+        assert!(!manager.get_tools()[0].deferred);
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_cancels_pending_connection() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&dropped);
+        let connector: SessionConnector = Arc::new(move |_config| {
+            let flag = Arc::clone(&flag);
+            Box::pin(async move {
+                let _guard = SetOnDrop(flag);
+                std::future::pending::<SessionResult<Arc<McpSession>>>().await
+            })
+        });
+        let manager = McpManager::with_connector_and_startup_timeout(None, connector, 100);
+        let started = Instant::now();
+        manager
+            .discover_and_connect(HashMap::from([("never".to_owned(), stdio_config("never"))]))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            manager.get_connection_status("never"),
+            ConnectionStatus::Disconnected
+        );
+        assert!(
+            manager
+                .errors()
+                .get("never")
+                .is_some_and(|message| message.contains("startup timed out"))
+        );
+        assert!(manager.inner.pending_connections.read().is_empty());
+        assert!(manager.inner.connection_tasks.lock().is_empty());
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn startup_timeout_resolution() {
+        assert_eq!(resolve_startup_timeout_ms(Some("20000")), 20_000);
+        assert_eq!(resolve_startup_timeout_ms(Some("0")), 0);
+        assert_eq!(
+            resolve_startup_timeout_ms(Some("invalid")),
+            STARTUP_TIMEOUT_MS
+        );
+        assert_eq!(resolve_startup_timeout_ms(None), STARTUP_TIMEOUT_MS);
     }
 
     #[tokio::test]
@@ -1999,5 +2440,531 @@ mod tests {
             ConnectionStatus::Disconnected
         );
         assert!(manager.errors().contains_key("srv"));
+    }
+
+    // ------------------------------------------------------------------
+    // Startup-gate hardening regressions.
+    // ------------------------------------------------------------------
+
+    fn tool_definition(name: &str) -> McpToolDefinition {
+        serde_json::from_value(json!({
+            "name": name,
+            "description": name,
+            "inputSchema": {"type": "object"}
+        }))
+        .unwrap()
+    }
+
+    /// Poll a condition with a fixed small period and a hard upper bound.
+    /// Never relies on random sleeps or on a single arbitrary sleep long
+    /// enough to "probably" cover the transition.
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if condition() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Settlement must never downgrade an already-published session to
+    /// cached/deferred tools. The fabricated `Pending` waiter models the
+    /// race window where a timeout settlement observes a waiter that has not
+    /// yet been updated even though the connection is already published.
+    #[tokio::test]
+    async fn startup_timeout_settlement_keeps_published_live_tools() {
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move {
+                let transport: Arc<dyn McpTransport> = Arc::new(FixtureTransport::new("live_tool"));
+                Ok(Arc::new(McpSession::connect(transport).await?))
+            })
+        });
+        let manager = McpManager::with_connector_and_startup_timeout(None, connector, 2_000);
+        manager
+            .discover_and_connect(HashMap::from([("srv".to_owned(), stdio_config("srv"))]))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_connection_status("srv"),
+            ConnectionStatus::Connected
+        );
+        assert!(manager.errors().is_empty());
+
+        manager
+            .inner
+            .tool_cache
+            .set("srv", vec![tool_definition("cached")])
+            .await;
+
+        // Fabricate a still-Pending waiter for an already-published server.
+        let (_sender, receiver) = watch::channel(ConnectionAttempt::Pending);
+        manager
+            .handle_startup_timeout(&[("srv".to_owned(), receiver)], 25)
+            .await;
+
+        assert_eq!(
+            manager.get_connection_status("srv"),
+            ConnectionStatus::Connected
+        );
+        let tools = manager.get_tools();
+        assert_eq!(tools.len(), 1, "cached tools must not be added: {tools:?}");
+        assert_eq!(tools[0].full_name, "mcp__srv_live_tool");
+        assert!(!tools[0].deferred, "published tools must stay live");
+        assert!(
+            manager.errors().is_empty(),
+            "settlement of a published connection must not record a failure"
+        );
+        assert!(manager.inner.pending_connections.read().is_empty());
+        // The cache is kept for the next cold start but did not overwrite
+        // the live tools.
+        assert_eq!(
+            manager.inner.tool_cache.get("srv").unwrap()[0].name,
+            "cached"
+        );
+    }
+
+    /// Cached-grace path: startup budget expires, deferred cached tools are
+    /// exposed with a Connecting status, then the late connector success must
+    /// replace them with live tools and clear pending/failures.
+    #[tokio::test]
+    async fn cached_grace_late_success_replaces_deferred_tools() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let connector: SessionConnector = {
+            let release = Arc::clone(&release);
+            Arc::new(move |_config| {
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    release.notified().await;
+                    let transport: Arc<dyn McpTransport> =
+                        Arc::new(FixtureTransport::new("live_tool"));
+                    Ok(Arc::new(McpSession::connect(transport).await?))
+                })
+            })
+        };
+        let manager =
+            McpManager::with_connector_and_startup_timeout(None, connector, CACHED_TOOL_GRACE_MS);
+        manager
+            .inner
+            .tool_cache
+            .set("slow", vec![tool_definition("cached")])
+            .await;
+
+        let started = Instant::now();
+        manager
+            .discover_and_connect(HashMap::from([("slow".to_owned(), stdio_config("slow"))]))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        assert_eq!(
+            manager.get_connection_status("slow"),
+            ConnectionStatus::Connecting
+        );
+        let deferred = manager.get_tools();
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].full_name, "mcp__slow_cached");
+        assert!(deferred[0].deferred);
+        assert!(
+            manager.errors()["slow"].contains("cached tools are deferred"),
+            "diagnostic failure expected: {:?}",
+            manager.errors()
+        );
+
+        release.notify_one();
+
+        // Publication order is tools → Connected → failure/pending cleanup.
+        // Wait for the fully settled state, not just the Connected flag, so
+        // the test cannot observe the transient "stale deferred failure"
+        // window between `connections.insert` and `failures.remove`.
+        wait_until("late success to settle", || {
+            manager.get_connection_status("slow") == ConnectionStatus::Connected
+                && !manager.errors().contains_key("slow")
+                && manager.inner.pending_connections.read().is_empty()
+        })
+        .await;
+
+        let tools = manager.get_tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].full_name, "mcp__slow_live_tool");
+        assert!(!tools[0].deferred, "deferred cached tools must be replaced");
+        assert!(manager.errors().is_empty(), "{:?}", manager.errors());
+        assert!(manager.inner.pending_connections.read().is_empty());
+    }
+
+    /// Cached-grace path where the late attempt fails: the deferred window
+    /// must settle to a terminal Disconnected failure, not stay Connecting.
+    #[tokio::test]
+    async fn cached_grace_late_failure_is_terminal() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let connector: SessionConnector = {
+            let release = Arc::clone(&release);
+            Arc::new(move |_config| {
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    release.notified().await;
+                    Err(McpSessionError::InvalidResponse("late failure".to_owned()))
+                })
+            })
+        };
+        let manager =
+            McpManager::with_connector_and_startup_timeout(None, connector, CACHED_TOOL_GRACE_MS);
+        manager
+            .inner
+            .tool_cache
+            .set("slow", vec![tool_definition("cached")])
+            .await;
+
+        manager
+            .discover_and_connect(HashMap::from([("slow".to_owned(), stdio_config("slow"))]))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_connection_status("slow"),
+            ConnectionStatus::Connecting
+        );
+
+        release.notify_one();
+
+        wait_until("late failure to settle", || {
+            manager.get_connection_status("slow") == ConnectionStatus::Disconnected
+        })
+        .await;
+
+        assert!(
+            manager.errors()["slow"].contains("late failure"),
+            "late error must be recorded: {:?}",
+            manager.errors()
+        );
+        assert!(manager.inner.pending_connections.read().is_empty());
+    }
+
+    /// `startup = 0` means "no extra budget", so the attempt timeout is the
+    /// only bound. A pending connector must therefore settle at 150ms, not
+    /// hang in `discover_and_connect`.
+    #[tokio::test]
+    async fn startup_timeout_zero_defers_to_attempt_timeout() {
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move { std::future::pending::<SessionResult<Arc<McpSession>>>().await })
+        });
+        let manager = McpManager::with_connector_and_timeouts(None, connector, 0, 30_000);
+        let config = McpServerConfig::Stdio {
+            command: "slow".to_owned(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            timeout: Some(150),
+            version_policy: Default::default(),
+            credentials: None,
+        };
+
+        let started = Instant::now();
+        manager
+            .discover_and_connect(HashMap::from([("slow".to_owned(), config)]))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "discover must not wait for the unbounded connector"
+        );
+
+        assert_eq!(
+            manager.get_connection_status("slow"),
+            ConnectionStatus::Disconnected
+        );
+        assert!(
+            manager.errors()["slow"].contains("connection timed out after 150ms"),
+            "{:?}",
+            manager.errors()
+        );
+        assert!(manager.inner.pending_connections.read().is_empty());
+    }
+
+    /// `startup = 0` and `config.timeout = 0` (both deadlines disabled) must
+    /// still terminate via the internal attempt safety bound.
+    #[tokio::test]
+    async fn zero_timeouts_apply_attempt_safety_bound() {
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move { std::future::pending::<SessionResult<Arc<McpSession>>>().await })
+        });
+        let manager = McpManager::with_connector_and_timeouts(None, connector, 0, 100);
+        let config = McpServerConfig::Stdio {
+            command: "never".to_owned(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            timeout: Some(0),
+            version_policy: Default::default(),
+            credentials: None,
+        };
+
+        let started = Instant::now();
+        manager
+            .discover_and_connect(HashMap::from([("never".to_owned(), config)]))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "safety bound must terminate the attempt"
+        );
+
+        assert_eq!(
+            manager.get_connection_status("never"),
+            ConnectionStatus::Disconnected
+        );
+        let message = &manager.errors()["never"];
+        assert!(
+            message.contains("connection timed out after 100ms")
+                && message.contains("safety bound"),
+            "safety-bound timeout must be identifiable: {message}"
+        );
+        assert!(manager.inner.pending_connections.read().is_empty());
+    }
+
+    struct HangingCredentialProvider;
+
+    impl crate::credential::CredentialProvider for HangingCredentialProvider {
+        fn resolve(&self, _reference: &str) -> futures::future::BoxFuture<'_, Option<String>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// The safety bound must also cover credential resolution: with both
+    /// startup and attempt deadlines disabled, a stalled provider must not
+    /// keep `discover_and_connect` or the pending attempt alive forever.
+    #[tokio::test]
+    async fn zero_timeouts_bound_stalled_credential_resolution() {
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move {
+                Err(McpSessionError::InvalidResponse(
+                    "connector must not run".to_owned(),
+                ))
+            })
+        });
+        let manager = McpManager::with_credential_provider_and_timeouts(
+            None,
+            connector,
+            Arc::new(HangingCredentialProvider),
+            0,
+            100,
+        );
+        let config = McpServerConfig::HttpOrSse {
+            url: "http://127.0.0.1:9/mcp".to_owned(),
+            transport_type: Some("http".to_owned()),
+            headers: HashMap::from([(
+                "Authorization".to_owned(),
+                "vault://stalled-secret".to_owned(),
+            )]),
+            timeout: Some(0),
+            version_policy: Default::default(),
+            credentials: None,
+        };
+
+        let started = Instant::now();
+        manager
+            .discover_and_connect(HashMap::from([("never".to_owned(), config)]))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stalled credential resolution must be bounded"
+        );
+
+        assert_eq!(
+            manager.get_connection_status("never"),
+            ConnectionStatus::Disconnected
+        );
+        let message = &manager.errors()["never"];
+        assert!(
+            message.contains("credential resolution timed out after 100ms")
+                && message.contains("safety bound"),
+            "stalled credential resolution must report a bounded failure: {message}"
+        );
+        assert!(manager.inner.pending_connections.read().is_empty());
+    }
+
+    /// An expired absolute deadline must fail the phase without polling it:
+    /// `tokio::time::timeout` polls the inner future first, so an already-ready
+    /// phase could otherwise run (and publish) after the deadline.
+    #[tokio::test]
+    async fn expired_phase_is_not_polled() {
+        let polled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&polled);
+        let outcome = run_phase(tokio::time::Instant::now(), async move {
+            flag.store(true, Ordering::Release);
+            1u8
+        })
+        .await;
+        assert!(matches!(outcome, PhaseOutcome::TimedOut));
+        assert!(
+            !polled.load(Ordering::Acquire),
+            "an expired deadline must not poll the next phase"
+        );
+
+        let outcome = run_phase(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            async { 2u8 },
+        )
+        .await;
+        assert!(matches!(outcome, PhaseOutcome::Done(2)));
+    }
+
+    fn lock_entry(name: &str) -> ServerLockEntry {
+        ServerLockEntry {
+            server_info: ServerInfoSnapshot {
+                name: name.to_owned(),
+                version: "1".to_owned(),
+            },
+            protocol_version: crate::session::PREFERRED_PROTOCOL_VERSION.to_owned(),
+            tools_snapshot: Vec::new(),
+        }
+    }
+
+    /// Persistence writers snapshot the in-memory lock *after* taking the
+    /// persistence gate, so a writer scheduled out of order cannot roll the
+    /// file back to an older snapshot. The atomic write must not leave temp
+    /// files behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lock_persistence_writes_latest_snapshot_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock.json");
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move { Err(McpSessionError::InvalidResponse("unused".to_owned())) })
+        });
+        let manager = Arc::new(McpManager::with_connector_and_lock(
+            None,
+            connector,
+            path.clone(),
+        ));
+        manager
+            .inner
+            .lock_file
+            .write()
+            .upsert_entry("first".to_owned(), lock_entry("first"));
+
+        let gate = manager.inner.lock_persist_gate.lock().await;
+        let inner = Arc::clone(&manager.inner);
+        let persist = tokio::spawn(async move { persist_lock_file(&inner).await });
+
+        // Give the writer time to run and block on the persistence gate, so a
+        // regression that snapshots before acquiring it would write "first".
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        manager
+            .inner
+            .lock_file
+            .write()
+            .upsert_entry("second".to_owned(), lock_entry("second"));
+        drop(gate);
+        persist.await.unwrap();
+
+        let lock = McpLockFile::load_from_disk(&path).await.unwrap();
+        assert!(lock.get_entry("first").is_some());
+        assert!(
+            lock.get_entry("second").is_some(),
+            "writer must snapshot state after acquiring the persistence gate"
+        );
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic write must not leave temp files: {leftovers:?}"
+        );
+    }
+
+    /// Publication-order invariant: at every instant an observer sampling
+    /// `status` before `tools` sees live tools whenever it sees Connected.
+    /// Deterministic delays (0/5/10/15ms) sweep the race window instead of
+    /// relying on randomness.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connected_implies_tools_published() {
+        for delay_ms in [0u64, 5, 10, 15] {
+            let connector: SessionConnector = Arc::new(move |_config| {
+                Box::pin(async move {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    let transport: Arc<dyn McpTransport> =
+                        Arc::new(FixtureTransport::new("live_tool"));
+                    Ok(Arc::new(McpSession::connect(transport).await?))
+                })
+            });
+            let manager = Arc::new(McpManager::with_connector_and_startup_timeout(
+                None, connector, 1_000,
+            ));
+
+            let done = Arc::new(AtomicBool::new(false));
+            let violation = Arc::new(AtomicBool::new(false));
+            let saw_connected = Arc::new(AtomicBool::new(false));
+            let samples = Arc::new(AtomicUsize::new(0));
+            let ready = Arc::new(tokio::sync::Notify::new());
+
+            let observer = {
+                let manager = Arc::clone(&manager);
+                let done = Arc::clone(&done);
+                let violation = Arc::clone(&violation);
+                let saw_connected = Arc::clone(&saw_connected);
+                let samples = Arc::clone(&samples);
+                let ready = Arc::clone(&ready);
+                tokio::spawn(async move {
+                    ready.notify_one();
+                    loop {
+                        // Sample status first: if it is Connected, the live
+                        // tools must already be visible.
+                        let status = manager.get_connection_status("srv");
+                        if status == ConnectionStatus::Connected {
+                            saw_connected.store(true, Ordering::Release);
+                            let tools = manager.get_tools();
+                            let live = tools
+                                .iter()
+                                .any(|tool| tool.server_name == "srv" && !tool.deferred);
+                            if !live {
+                                violation.store(true, Ordering::Release);
+                            }
+                        }
+                        samples.fetch_add(1, Ordering::Relaxed);
+                        // Require one Connected sample so the test cannot pass
+                        // by only observing pre-publication states.
+                        if done.load(Ordering::Acquire) && saw_connected.load(Ordering::Acquire) {
+                            break;
+                        }
+                        if samples.load(Ordering::Relaxed) > 1_000_000 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            ready.notified().await;
+
+            manager
+                .discover_and_connect(HashMap::from([("srv".to_owned(), stdio_config("srv"))]))
+                .await
+                .unwrap();
+            done.store(true, Ordering::Release);
+            observer.await.unwrap();
+
+            assert!(
+                !violation.load(Ordering::Acquire),
+                "delay {delay_ms}ms: observed Connected before live tools were published"
+            );
+            assert_eq!(
+                manager.get_connection_status("srv"),
+                ConnectionStatus::Connected
+            );
+            assert!(
+                samples.load(Ordering::Relaxed) > 0,
+                "observer must have sampled at least once"
+            );
+            assert!(
+                saw_connected.load(Ordering::Acquire),
+                "delay {delay_ms}ms: observer never sampled the Connected state"
+            );
+        }
     }
 }

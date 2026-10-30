@@ -64,16 +64,15 @@ async fn mcp_tool_discovery() {
     );
 
     // Discover and connect — this spawns the server process and
-    // initializes the MCP session. STARTUP_TIMEOUT_MS is 250ms by
-    // default, but `discover_and_connect` returns Ok even if the
-    // connection is still pending; tool discovery may be deferred.
+    // initializes the MCP session. `discover_and_connect` waits for the
+    // configured startup budget (`OMP_MCP_STARTUP_TIMEOUT_MS`, 10s default)
+    // before returning; a timed-out server is reported as disconnected.
     manager
         .discover_and_connect(servers)
         .await
         .expect("discover_and_connect should not error");
 
-    // Give the server a moment to finish initializing. The manager's
-    // default startup timeout is very short (250ms); allow extra time
+    // A server that finishes just after the budget may still need a moment
     // for `npx` to resolve and spawn the process.
     with_timeout(SINGLE_TURN, async {
         loop {
