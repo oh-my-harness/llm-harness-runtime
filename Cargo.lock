@@ -2306,6 +2306,7 @@ dependencies = [
 name = "llm-harness-agent-team-studio"
 version = "0.5.0"
 dependencies = [
+ "async-trait",
  "axum",
  "chrono",
  "futures",
@@ -2322,6 +2323,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tower",

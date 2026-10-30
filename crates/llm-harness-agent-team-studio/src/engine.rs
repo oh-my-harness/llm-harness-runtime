@@ -266,6 +266,41 @@ impl Tool for McpStudioTool {
     }
 }
 
+/// Map the manager's connection status to the assembly decision.
+///
+/// Only a fully published connection is accepted. Assembling a team from
+/// deferred cached tool definitions would freeze that cached snapshot into the
+/// agent tool table: tools added by the server after the background attempt
+/// succeeds stay invisible, removed tools stay advertised until the call
+/// fails, and changed schemas stay stale. Both non-connected states therefore
+/// fail closed with the manager's actual reason, so callers see an explicit
+/// startup-timeout/deferred diagnostic instead of a bare status string.
+fn resolve_mcp_startup(
+    server: &str,
+    status: llm_harness_mcp::manager::ConnectionStatus,
+    reason: Option<&str>,
+) -> Result<(), AssembleError> {
+    use llm_harness_mcp::manager::ConnectionStatus;
+
+    let terminal_fallback = "no failure reason recorded by the MCP manager";
+    match status {
+        ConnectionStatus::Connected => Ok(()),
+        ConnectionStatus::Connecting => Err(AssembleError::McpConnection(
+            server.to_owned(),
+            reason.map(str::to_owned).unwrap_or_else(|| {
+                "server is still handshaking after the startup budget; cached tools are deferred"
+                    .to_owned()
+            }),
+        )),
+        ConnectionStatus::Disconnected => Err(AssembleError::McpConnection(
+            server.to_owned(),
+            reason
+                .map(str::to_owned)
+                .unwrap_or_else(|| terminal_fallback.to_owned()),
+        )),
+    }
+}
+
 /// Connect to required MCP servers and return (server_name, tools) pairs.
 async fn prepare_mcp_tools(
     spec: &TeamSpec,
@@ -309,27 +344,31 @@ async fn prepare_mcp_tools(
     }
 
     let manager = McpManager::with_cache_path(data_dir.join(".mcp-lock.json"));
+    connect_mcp_servers(manager, &server_entries, configs).await
+}
+
+/// Drive one startup attempt and build the per-server tool lists.
+async fn connect_mcp_servers(
+    manager: McpManager,
+    server_entries: &[(String, String)],
+    configs: std::collections::HashMap<String, llm_harness_mcp::config::McpServerConfig>,
+) -> Result<(Vec<(String, Vec<Arc<dyn Tool>>)>, McpManagerLifecycle), AssembleError> {
     manager
         .discover_and_connect(configs)
         .await
         .map_err(|e| AssembleError::McpConnection(server_entries[0].0.clone(), e.to_string()))?;
 
     let manager = Arc::new(manager);
-    for (server, _) in &server_entries {
-        let status = manager.get_connection_status(server);
-        if status != llm_harness_mcp::manager::ConnectionStatus::Connected {
-            return Err(AssembleError::McpConnection(
-                server.clone(),
-                format!("server did not connect (status: {status:?})"),
-            ));
-        }
+    for (server, _) in server_entries {
+        let (status, reason) = manager.connection_snapshot(server).await;
+        resolve_mcp_startup(server, status, reason.as_deref())?;
     }
     let lifecycle = McpManagerLifecycle {
         manager: Arc::clone(&manager),
     };
     let exposed_tools = manager.get_tools();
     let mut result = Vec::new();
-    for (server, _) in &server_entries {
+    for (server, _) in server_entries {
         let tools: Vec<Arc<dyn Tool>> = exposed_tools
             .iter()
             .filter(|t| t.server_name == *server)
@@ -1004,5 +1043,249 @@ mod tests {
             .map(|(name, _)| name)
             .collect();
         assert_eq!(names, vec!["x".to_string(), "y".to_string()]);
+    }
+
+    // ---- MCP startup semantics ----
+    //
+    // These tests drive `connect_mcp_servers` (the code path shared with
+    // `prepare_mcp_tools`) through the manager's test connector, so the
+    // assertions cover the real handshake, timeout settlement, deferred tool
+    // publication and the engine's user-visible error text.
+
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use async_trait::async_trait;
+    use llm_harness_mcp::config::McpServerConfig;
+    use llm_harness_mcp::manager::{ConnectionStatus, McpManager, SessionConnector};
+    use llm_harness_mcp::session::{McpSession, McpSessionError, PREFERRED_PROTOCOL_VERSION};
+    use llm_harness_mcp::transport::{
+        CloseHandler, McpTransport, NotificationHandler, RequestHandler, TransportResult,
+    };
+    use parking_lot::Mutex;
+    use serde_json::{Value, json};
+
+    struct FixtureTransport {
+        connected: AtomicBool,
+        responses: Mutex<VecDeque<Value>>,
+    }
+
+    impl FixtureTransport {
+        fn new(tool_name: &str) -> Self {
+            Self {
+                connected: AtomicBool::new(true),
+                responses: Mutex::new(VecDeque::from([
+                    json!({
+                        "protocolVersion": PREFERRED_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fixture", "version": "1"}
+                    }),
+                    json!({
+                        "tools": [{
+                            "name": tool_name,
+                            "description": "fixture",
+                            "inputSchema": {"type": "object"}
+                        }]
+                    }),
+                ])),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpTransport for FixtureTransport {
+        async fn request(&self, _method: &str, _params: Value) -> TransportResult<Value> {
+            Ok(self.responses.lock().pop_front().unwrap_or(json!({
+                "content": [{"type": "text", "text": "ok"}]
+            })))
+        }
+
+        async fn notify(&self, _method: &str, _params: Value) -> TransportResult<()> {
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected.load(Ordering::Acquire)
+        }
+
+        async fn close(&self) -> TransportResult<()> {
+            self.connected.store(false, Ordering::Release);
+            Ok(())
+        }
+
+        fn set_protocol_version(&self, _version: &str) {}
+
+        fn on_request(&self, _handler: RequestHandler) {}
+
+        fn on_notification(&self, _handler: NotificationHandler) {}
+
+        fn on_close(&self, _handler: CloseHandler) {}
+
+        fn clear_on_close(&self) {}
+    }
+
+    async fn fixture_session(
+        tool_name: &str,
+    ) -> llm_harness_mcp::session::SessionResult<Arc<McpSession>> {
+        let transport: Arc<dyn McpTransport> = Arc::new(FixtureTransport::new(tool_name));
+        Ok(Arc::new(McpSession::connect(transport).await?))
+    }
+
+    fn mcp_config(name: &str) -> McpServerConfig {
+        McpServerConfig::Stdio {
+            command: name.to_owned(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            timeout: Some(5_000),
+            version_policy: Default::default(),
+            credentials: None,
+        }
+    }
+
+    fn entries_for(server: &str) -> Vec<(String, String)> {
+        vec![(server.to_owned(), "worker".to_owned())]
+    }
+
+    fn configs_for(server: &str) -> HashMap<String, McpServerConfig> {
+        HashMap::from([(server.to_owned(), mcp_config(server))])
+    }
+
+    fn cache_file(dir: &std::path::Path, tool_name: &str, servers: &[&str]) -> std::path::PathBuf {
+        let mut entries = serde_json::Map::new();
+        for server in servers {
+            entries.insert(
+                (*server).to_owned(),
+                json!([{
+                    "name": tool_name,
+                    "description": "cached",
+                    "inputSchema": {"type": "object"}
+                }]),
+            );
+        }
+        let path = dir.join("mcp-cache.json");
+        std::fs::write(&path, serde_json::to_vec(&entries).unwrap()).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn mcp_slow_handshake_is_awaited_before_assembly() {
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                fixture_session("slow_tool").await
+            })
+        });
+        let manager = McpManager::with_connector_and_startup_timeout(None, connector, 2_000);
+        let started = Instant::now();
+        let (tools, lifecycle) =
+            connect_mcp_servers(manager, &entries_for("slow"), configs_for("slow"))
+                .await
+                .expect("slow MCP server should connect within the startup budget");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, "slow");
+        assert_eq!(tools[0].1.len(), 1);
+        assert_eq!(tools[0].1[0].name(), "mcp__slow_slow_tool");
+        assert_eq!(
+            lifecycle.manager.get_connection_status("slow"),
+            ConnectionStatus::Connected
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_connection_failure_surfaces_manager_reason() {
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async move {
+                Err(McpSessionError::InvalidResponse(
+                    "handshake boom".to_owned(),
+                ))
+            })
+        });
+        let manager = McpManager::with_connector_and_startup_timeout(None, connector, 2_000);
+        let error =
+            match connect_mcp_servers(manager, &entries_for("broken"), configs_for("broken")).await
+            {
+                Ok(_) => panic!("failed handshake must abort assembly"),
+                Err(error) => error,
+            };
+        match error {
+            AssembleError::McpConnection(server, message) => {
+                assert_eq!(server, "broken");
+                assert!(
+                    message.contains("handshake boom"),
+                    "expected the manager's actual failure reason, got: {message}"
+                );
+                assert!(
+                    !message.contains("status:"),
+                    "status-only errors hide the real cause: {message}"
+                );
+            }
+            other => panic!("expected McpConnection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_startup_timeout_surfaces_timeout_reason() {
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async {
+                std::future::pending::<llm_harness_mcp::session::SessionResult<Arc<McpSession>>>()
+                    .await
+            })
+        });
+        let manager = McpManager::with_connector_and_startup_timeout(None, connector, 100);
+        let error =
+            match connect_mcp_servers(manager, &entries_for("never"), configs_for("never")).await {
+                Ok(_) => panic!("startup timeout must abort assembly"),
+                Err(error) => error,
+            };
+        match error {
+            AssembleError::McpConnection(server, message) => {
+                assert_eq!(server, "never");
+                assert!(
+                    message.contains("startup timed out after 100ms"),
+                    "expected explicit startup timeout, got: {message}"
+                );
+            }
+            other => panic!("expected McpConnection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_deferred_cached_tools_fail_with_explicit_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = cache_file(temp.path(), "cached_tool", &["slow"]);
+        let connector: SessionConnector = Arc::new(|_config| {
+            Box::pin(async {
+                std::future::pending::<llm_harness_mcp::session::SessionResult<Arc<McpSession>>>()
+                    .await
+            })
+        });
+        let manager = McpManager::with_connector_and_startup_timeout(Some(cache), connector, 100);
+
+        // Deferred cached tools would freeze a stale snapshot into the agent
+        // tool table, so assembly must fail closed with the manager's explicit
+        // deferred/timeout state rather than the old bare `status: Connecting`.
+        let error = match connect_mcp_servers(manager, &entries_for("slow"), configs_for("slow"))
+            .await
+        {
+            Ok(_) => panic!("still-connecting MCP server must not be assembled from cached tools"),
+            Err(error) => error,
+        };
+        match error {
+            AssembleError::McpConnection(server, message) => {
+                assert_eq!(server, "slow");
+                assert!(
+                    message.contains("cached tools are deferred"),
+                    "expected an explicit deferred/timeout diagnostic, got: {message}"
+                );
+                assert!(
+                    !message.contains("status:"),
+                    "status-only errors hide the real cause: {message}"
+                );
+            }
+            other => panic!("expected McpConnection, got {other:?}"),
+        }
     }
 }

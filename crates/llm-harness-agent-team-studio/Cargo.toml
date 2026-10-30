@@ -27,7 +27,10 @@ uuid.workspace = true
 
 [dev-dependencies]
 llm-harness-loop = { workspace = true, features = ["test-utils"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+llm-harness-mcp = { workspace = true, features = ["test-utils"] }
+async-trait.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 

@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Exposes the test-only `McpManager::with_connector*` constructors so
+# downstream crates (e.g. Studio engine tests) can inject a fake
+# `SessionConnector` without touching runtime behavior.
+test-utils = []
+
 [dependencies]
 llm-harness-platform.workspace = true
 llm-harness-agent.workspace   = true
