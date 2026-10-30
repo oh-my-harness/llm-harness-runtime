@@ -36,6 +36,13 @@ impl ForgeCrate {
         );
         std::fs::write(dir.join("Cargo.toml"), cargo_toml).expect("write forge Cargo.toml");
 
+        // Reuse the workspace lock so the offline probe resolves the same
+        // dependency versions as the real build. A fresh resolution can fail
+        // once crates.io yanks a version that the workspace already locks.
+        let workspace_lock = crate_path.join("../../Cargo.lock");
+        std::fs::copy(&workspace_lock, dir.join("Cargo.lock"))
+            .unwrap_or_else(|error| panic!("copy {}: {error}", workspace_lock.display()));
+
         Self {
             _tmp: tmp,
             dir,
