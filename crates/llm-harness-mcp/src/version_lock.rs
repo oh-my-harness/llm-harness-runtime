@@ -142,7 +142,21 @@ impl McpLockFile {
             tokio::fs::create_dir_all(parent).await?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        tokio::fs::write(path, text).await?;
+        // Write-then-rename keeps readers from observing a truncated file if
+        // the process is interrupted or two managers persist the same path
+        // concurrently. The unique suffix avoids temp-file collisions between
+        // managers in the same process.
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let suffix = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp-{}-{suffix}", std::process::id()));
+        if let Err(error) = tokio::fs::write(&tmp, text).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(error.into());
+        }
+        if let Err(error) = tokio::fs::rename(&tmp, path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(error.into());
+        }
         Ok(())
     }
 

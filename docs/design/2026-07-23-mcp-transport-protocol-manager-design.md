@@ -644,8 +644,46 @@ impl McpManager {
 
 ### 4.2 快速启动 gate + deferred fallback
 
+> **2026-10-29 实现更新**：`discover_and_connect` 默认等待完整的启动预算
+> `10_000ms`（`OMP_MCP_STARTUP_TIMEOUT_MS` 可覆盖，`0` 表示只受单次 attempt
+> 超时约束）。预算到期仍处于 Pending 的连接会被 abort、等待 future 释放，并写入
+> `failures`（`startup timed out after …`），不会留下 `Connecting` 状态或孤儿任务。
+> 有缓存的 Pending 连接不 abort：保留后台 attempt，发布 `deferred = true` 的缓存
+> 工具并写入诊断失败（`… cached tools are deferred`），attempt 真正结束后由发布
+> 路径清除该诊断。下面的 250ms 仅保留为“缓存工具 deferred”测试路径的 grace。
+>
+> **发布顺序不变量**：连接 attempt 成功时，在同一个 `startup_gate` 临界区内按
+> `replace_server_tools(live)` → `connections.insert` → 清理
+> `failures`/`pending_connections` → 发送 `ConnectionAttempt::Ready` 的顺序发布，
+> 临界区内不允许任何 `await`。因此外部观察者看到 `Connected`（只由
+> `connections` 决定）时，该 server 的 live 工具必然已经可见；反过来“工具已可见、
+> 尚未 Connected”的窗口是安全的——`call_tool` 找到工具后会经
+> `wait_for_connection` 等待仍处于 Pending 的 attempt 结算。锁序固定为
+> `startup_gate → tools → connections → pending_connections → failures`，所有
+> `parking_lot` guard 在释放 gate 前 drop，不会跨越 await。
+>
+> **0/0 组合**：`OMP_MCP_STARTUP_TIMEOUT_MS=0` 且 attempt 超时也为 `0`
+> （`OMP_MCP_TIMEOUT_MS=0` 或 `config.timeout: 0`）时，attempt 仍受内部安全上限
+> `attempt_safety_timeout_ms`（默认 `transport::DEFAULT_TIMEOUT_MS` = 30s）约束，
+> 失败消息形如 `connection timed out after {ms}ms (attempt timeout disabled;
+> safety bound)`。这样“两个 deadline 都禁用”也不会无限等待。安全上限覆盖凭据解析、
+> 连接 + `tools/list`、版本校验三个阶段；凭据解析或校验超时同样进入终态
+> failure，不会残留 Pending。
+>
+> **Studio engine 语义（fail closed）**：`prepare_mcp_tools` 仅在
+> `ConnectionStatus::Connected` 时建队。`Connecting`（启动预算到期、缓存工具已
+> deferred）和 `Disconnected` 都返回 `McpConnection(server, manager 的具体
+> reason)`，不再输出裸 `status: Connecting`。不能接受 deferred 快照：engine 会
+> 把当时的工具名/schema 固化进 agent 工具表，后台晚成功后新增工具不可见、删除的
+> 工具仍被广告、schema 仍旧。诊断通过
+> `McpManager::connection_snapshot`（status + failure 一致快照）读取。
+> 该快照的一致性覆盖启动期转换（发布、deferred、终态失败都在 `startup_gate`
+> 内）；自动重连对 `connections`/`failures`/`reconnection_tasks` 的变更不在 gate
+> 内，因此建队之后的重连状态不保证是同一瞬间的快照。Studio 只在新建 manager 的
+> 启动期使用该快照，不会遇到重连转换。
+
 ```rust
-const STARTUP_TIMEOUT_MS: u64 = 250;
+const STARTUP_TIMEOUT_MS: u64 = 10_000;   // legacy pseudocode: 250 = CACHED_TOOL_GRACE_MS
 
 impl McpManager {
     async fn connect_servers(&self) -> ConnectResult {
@@ -1324,6 +1362,18 @@ pub fn resolve_timeout_ms(env_override: Option<&str>, config_timeout: Option<u64
 ```
 
 环境变量名沿用 `OMP_MCP_TIMEOUT_MS` 以保持生态一致。`0` 禁用客户端超时。
+
+启动预算独立于请求超时：`OMP_MCP_STARTUP_TIMEOUT_MS` 控制
+`discover_and_connect` 等待 `initialize` + `tools/list` 的总时长，默认
+`10_000ms`；`0` 表示不设额外预算，退化为每个连接 attempt 自身的
+`OMP_MCP_TIMEOUT_MS` / `config.timeout` 上限。无效值忽略并记录 warning。
+
+当 attempt 超时本身也被禁用（解析结果为 `0`）时，manager 不会无限等待：单次
+attempt 改用内部安全上限 `attempt_safety_timeout_ms`，默认复用
+`transport::DEFAULT_TIMEOUT_MS`（30s）。超时消息带有
+`(attempt timeout disabled; safety bound)` 后缀以便与显式超时区分。安全上限
+只在 `timeout == 0` 时生效，不改变 `OMP_MCP_TIMEOUT_MS > 0` 的语义；测试构造器
+（`test-utils` feature）可注入更小的值。
 
 ## 10. 测试策略
 
