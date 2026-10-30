@@ -504,12 +504,9 @@ impl McpManager {
             join_all(settle).await;
             false
         } else {
-            match tokio::time::timeout(Duration::from_millis(startup_timeout_ms), join_all(settle))
+            tokio::time::timeout(Duration::from_millis(startup_timeout_ms), join_all(settle))
                 .await
-            {
-                Ok(_) => false,
-                Err(_) => true,
-            }
+                .is_err()
         };
         if timed_out {
             self.handle_startup_timeout(&waiters, startup_timeout_ms)
