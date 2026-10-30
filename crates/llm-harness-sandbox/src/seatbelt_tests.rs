@@ -65,6 +65,76 @@ fn shell_opts() -> ShellOptions<'static> {
 // ── Policy compilation tests ───────────────────────────────────────────────
 
 #[test]
+fn restricted_profile_rejects_host_bind_guest_paths() {
+    use llm_harness_platform::sandbox::HostBind;
+
+    let work = tempfile::tempdir().expect("work dir");
+    let host = tempfile::tempdir().expect("host dir");
+    std::fs::write(host.path().join("sentinel.txt"), "host-only").expect("sentinel");
+    let work_canon = std::fs::canonicalize(work.path()).expect("work canon");
+    let host_canon = std::fs::canonicalize(host.path()).expect("host canon");
+
+    let mut config = default_config(work.path().to_path_buf());
+    config.trust_profile = TrustProfile::Restricted;
+    config.host_binds = vec![HostBind {
+        host: host.path().to_path_buf(),
+        guest: PathBuf::from("/workspace/project"),
+    }];
+    let env = SeatbeltEnv::new_with_binds(
+        work.path().to_path_buf(),
+        work_canon.clone(),
+        vec![
+            (PathBuf::from("/workspace"), work_canon),
+            (PathBuf::from("/workspace/project"), host_canon),
+        ],
+        vec![],
+        config,
+        false,
+        work.path().join("policy.sb"),
+    );
+
+    let error = env
+        .resolve_path(Path::new("/workspace/project/sentinel.txt"))
+        .expect_err("restricted profile must not resolve host binds");
+    assert!(matches!(error, EnvError::PermissionDenied(_)), "{error:?}");
+}
+
+#[test]
+fn trusted_lan_profile_still_resolves_host_bind_guest_paths() {
+    use llm_harness_platform::sandbox::HostBind;
+
+    let work = tempfile::tempdir().expect("work dir");
+    let host = tempfile::tempdir().expect("host dir");
+    std::fs::write(host.path().join("sentinel.txt"), "host-only").expect("sentinel");
+    let work_canon = std::fs::canonicalize(work.path()).expect("work canon");
+    let host_canon = std::fs::canonicalize(host.path()).expect("host canon");
+
+    let mut config = default_config(work.path().to_path_buf());
+    config.trust_profile = TrustProfile::TrustedLan;
+    config.host_binds = vec![HostBind {
+        host: host.path().to_path_buf(),
+        guest: PathBuf::from("/workspace/project"),
+    }];
+    let env = SeatbeltEnv::new_with_binds(
+        work.path().to_path_buf(),
+        work_canon.clone(),
+        vec![
+            (PathBuf::from("/workspace"), work_canon),
+            (PathBuf::from("/workspace/project"), host_canon.clone()),
+        ],
+        vec![],
+        config,
+        false,
+        work.path().join("policy.sb"),
+    );
+
+    let resolved = env
+        .resolve_path(Path::new("/workspace/project/sentinel.txt"))
+        .expect("trusted-lan profile must resolve host binds");
+    assert_eq!(resolved, host_canon.join("sentinel.txt"));
+}
+
+#[test]
 fn policy_denies_network() {
     let config = default_config(PathBuf::from("/tmp/test"));
     let policy = generate_policy(&config, &PathBuf::from("/tmp/test"), &[]);

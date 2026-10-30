@@ -24,6 +24,7 @@ use anyhow::Result;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use llm_harness_platform::sandbox::{Sandbox, SandboxConfig};
+use llm_harness_platform::trust::TrustProfile;
 use llm_harness_types::{EnvError, ExecutionEnv, FileInfo, ShellOptions, ShellOutput};
 use tokio_util::sync::CancellationToken;
 
@@ -532,17 +533,22 @@ impl SeatbeltEnv {
 
         // Lexical containment check — fast path to reject obvious escapes
         // before touching the filesystem.
+        let trusted = matches!(
+            self.config.trust_profile,
+            TrustProfile::TrustedLan | TrustProfile::TrustedFull
+        );
         let lex_ok = normalized == self.work_dir_canon
             || normalized.starts_with(&self.work_dir_canon)
             || self
                 .allowlist_canon
                 .iter()
                 .any(|root| normalized == *root || normalized.starts_with(root))
-            || self
-                .config
-                .host_binds
-                .iter()
-                .any(|bind| normalized == bind.host || normalized.starts_with(&bind.host));
+            || (trusted
+                && self
+                    .config
+                    .host_binds
+                    .iter()
+                    .any(|bind| normalized == bind.host || normalized.starts_with(&bind.host)));
         if !lex_ok {
             return Err(EnvError::PermissionDenied(normalized));
         }
@@ -573,9 +579,11 @@ impl SeatbeltEnv {
                 return Ok(canonical);
             }
         }
-        for bind in &self.config.host_binds {
-            if canonical == bind.host || canonical.starts_with(&bind.host) {
-                return Ok(canonical);
+        if trusted {
+            for bind in &self.config.host_binds {
+                if canonical == bind.host || canonical.starts_with(&bind.host) {
+                    return Ok(canonical);
+                }
             }
         }
         Err(EnvError::PermissionDenied(canonical))
@@ -1113,17 +1121,22 @@ impl SeatbeltSandbox {
         let mut guest_mappings: Vec<(PathBuf, PathBuf)> =
             vec![(guest_root.clone(), work_dir_canon.clone())];
         let mut bind_allows = Vec::new();
-        for bind in &config.host_binds {
-            if !bind.host.is_absolute() {
-                anyhow::bail!("host bind {:?} must be absolute", bind.host);
+        if matches!(
+            config.trust_profile,
+            TrustProfile::TrustedLan | TrustProfile::TrustedFull
+        ) {
+            for bind in &config.host_binds {
+                if !bind.host.is_absolute() {
+                    anyhow::bail!("host bind {:?} must be absolute", bind.host);
+                }
+                if !bind.guest.is_absolute() {
+                    anyhow::bail!("host bind guest path {:?} must be absolute", bind.guest);
+                }
+                let host_canon = std::fs::canonicalize(&bind.host)
+                    .map_err(|e| anyhow::anyhow!("host bind {:?}: {e}", bind.host))?;
+                bind_allows.push(host_canon.clone());
+                guest_mappings.push((bind.guest.clone(), host_canon));
             }
-            if !bind.guest.is_absolute() {
-                anyhow::bail!("host bind guest path {:?} must be absolute", bind.guest);
-            }
-            let host_canon = std::fs::canonicalize(&bind.host)
-                .map_err(|e| anyhow::anyhow!("host bind {:?}: {e}", bind.host))?;
-            bind_allows.push(host_canon.clone());
-            guest_mappings.push((bind.guest.clone(), host_canon));
         }
 
         let policy_path =

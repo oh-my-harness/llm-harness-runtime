@@ -953,25 +953,34 @@ impl GatewayState {
         let mut sandbox_config = sandbox_config;
         sandbox_config.work_dir = Some(work_dir.clone());
         // Trusted profiles bind the principal's host project directories at
-        // guest /workspace/<basename>. Ignored by restricted (floors hold).
+        // guest /workspace/<basename>. Restricted profiles must not receive
+        // them: the seatbelt file API resolves guest paths directly against
+        // the host, so relying on the policy alone would leave a bypass.
+        let trusted = matches!(
+            request.trust_profile,
+            llm_harness_platform::trust::TrustProfile::TrustedLan
+                | llm_harness_platform::trust::TrustProfile::TrustedFull
+        );
         let mut host_binds: Vec<(PathBuf, PathBuf)> = Vec::new();
-        for dir in principal.host_project_dirs.iter() {
-            let base = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .ok_or_else(|| {
-                    GatewayStateError::InvalidConfig(anyhow::anyhow!(
-                        "host project dir {dir:?} has no file name"
-                    ))
-                })?;
-            let guest = std::path::PathBuf::from(GUEST_WORK_DIR).join(base);
-            sandbox_config
-                .host_binds
-                .push(llm_harness_platform::sandbox::HostBind {
-                    host: dir.clone(),
-                    guest: guest.clone(),
-                });
-            host_binds.push((dir.clone(), guest));
+        if trusted {
+            for dir in principal.host_project_dirs.iter() {
+                let base = dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .ok_or_else(|| {
+                        GatewayStateError::InvalidConfig(anyhow::anyhow!(
+                            "host project dir {dir:?} has no file name"
+                        ))
+                    })?;
+                let guest = std::path::PathBuf::from(GUEST_WORK_DIR).join(base);
+                sandbox_config
+                    .host_binds
+                    .push(llm_harness_platform::sandbox::HostBind {
+                        host: dir.clone(),
+                        guest: guest.clone(),
+                    });
+                host_binds.push((dir.clone(), guest));
+            }
         }
         let sandbox = match llm_harness_sandbox::SeatbeltSandbox::new(sandbox_config) {
             Ok(sandbox) => GatewaySandbox::Seatbelt(sandbox),
@@ -1629,14 +1638,22 @@ fn restore_sandbox(
             .join(&persisted.sandbox_id);
         let mut sandbox_config = sandbox_config;
         sandbox_config.work_dir = Some(work_dir);
-        let host_binds: Vec<(PathBuf, PathBuf)> = principal
-            .host_project_dirs
-            .iter()
-            .filter_map(|dir| {
-                dir.file_name()
-                    .map(|base| (dir.clone(), PathBuf::from(GUEST_WORK_DIR).join(base)))
-            })
-            .collect();
+        let host_binds: Vec<(PathBuf, PathBuf)> = if matches!(
+            persisted_config.trust_profile,
+            llm_harness_platform::trust::TrustProfile::TrustedLan
+                | llm_harness_platform::trust::TrustProfile::TrustedFull
+        ) {
+            principal
+                .host_project_dirs
+                .iter()
+                .filter_map(|dir| {
+                    dir.file_name()
+                        .map(|base| (dir.clone(), PathBuf::from(GUEST_WORK_DIR).join(base)))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         sandbox_config.host_binds = host_binds
             .iter()
             .map(|(host, guest)| llm_harness_platform::sandbox::HostBind {
