@@ -104,8 +104,7 @@ Strong success criteria let the LLM loop independently. Weak criteria ("make it 
 5. **平台层 trait**：Sandbox/AuditSink/TraceExporter/PromptSource trait 定义（`llm-harness-platform`）
 6. **策略层**：safety、loop-safety、status panel、event streams、injection filter、memory defense、notify、compaction prompt、budget（`llm-harness-strategy`）
 7. **后端 crate**（各独立可选）：tools（bash/read/write/edit/grep/glob/code_exec/web_search/web_fetch）、mcp、knowledge/knowledge-local、memory、session-recall、sandbox、audit-jsonl、trace-otel
-8. **多 Agent 协作**：去中心化 Agent 团队（AgentTeam、社交工具、团队记忆、反思循环）（`llm-harness-agent-team`）
-9. **调试观测**：Agent Inspector Web API（REST + WebSocket 事件流）（`llm-harness-inspector`）
+8. **调试观测**：Agent Inspector Web API（REST + WebSocket 事件流）（`llm-harness-inspector`）
 
 ## Crate 结构与依赖规则
 
@@ -119,7 +118,6 @@ llm-harness-runtime/          ← 本仓库根
 │   ├── llm-harness-agent/              # AgentHarness, Session, skills, HarnessBuilder
 │   ├── llm-harness-subagents/          # spawn: sub-agent fork, async delivery, main↔sub 通信 (SpawnPlugin)
 │   ├── llm-harness-workflow/           # workflow engine, lifecycle, rules (依赖 subagents)
-│   ├── llm-harness-agent-team/         # 去中心化多 Agent 协作: AgentTeam, 社交工具, 团队记忆
 │   ├── llm-harness-inspector/          # Agent Inspector Web API (REST + WebSocket)
 │   ├── llm-harness-platform/           # 横切 trait + adapter (sandbox/audit/prompt/tracer/env)
 │   ├── llm-harness-strategy/           # 策略层: safety, loop-safety, status panel,
@@ -145,8 +143,6 @@ llm-harness-runtime/          ← 本仓库根
 依赖方向（A → B 表示 A 依赖 B）：
 
 ```
-llm-harness-agent-team   → llm-harness-subagents, llm-harness-agent, llm-harness-strategy,
-                           llm-harness-memory, llm-harness-knowledge(-local), llm-harness-sandbox
 llm-harness-strategy     → llm-harness-agent, llm-harness-types
 llm-harness-workflow      → llm-harness-subagents, llm-harness-agent, llm-harness-platform
 llm-harness-subagents     → llm-harness-agent, llm-harness-platform
@@ -170,7 +166,7 @@ llm-harness-session-recall → llm-harness-agent, llm-harness-knowledge
 - `llm-harness-types` 不依赖其他内部 crate，保持纯类型/trait 声明。可依赖外部 git crate（如 `llm_adapter`）用于 re-export 共享类型。
 - `llm-harness-platform` 定义横切 trait（Sandbox/AuditSink/TraceExporter/PromptSource 等），不依赖 subagents/workflow。
 - `llm-harness-sandbox` 不依赖其他后端 crate；其他后端 crate（`-audit-jsonl`/`-trace-otel`/`-mcp`/`-knowledge-*`/`-memory`/`-session-recall`）互不依赖（可单独使用）。
-- `llm-harness-inspector` 只依赖 agent/types（调试器不反向侵入运行时）；`llm-harness-agent-team` 是最上层组合 crate，可依赖全部协作设施。
+- `llm-harness-inspector` 只依赖 agent/types（调试器不反向侵入运行时）。
 - `llm-harness-py` 已迁移到 Senza 仓库，通过 git 依赖引用本仓库 crate，不再在本 workspace 内。
 - 依赖方向不允许反转（下层不依赖上层）。
 
@@ -187,7 +183,6 @@ llm-harness-session-recall → llm-harness-agent, llm-harness-knowledge
 | `docs/crate-reference.md` | 基础设施 crate 参考（types/platform/audit-jsonl/trace-otel/knowledge/knowledge-local/memory） |
 | `docs/runtime-framework.md` | 编排层框架文档（subagents + workflow：目录结构、核心 trait、数据流） |
 | `docs/ORCHESTRATION.md` | WorkflowEngine 编排能力总览 |
-| `docs/agent-team-guide.md` | 多 Agent 团队协作指南（AgentTeam/社交工具/团队记忆） |
 | `docs/inspector-guide.md` | Agent Inspector 调试指南（REST/WebSocket/交互端点） |
 | `docs/product-roadmap.md` | 产品路线图（当前能力 + 规划） |
 | `docs/session-recall-integration.md` | Session Recall 集成指南 |
