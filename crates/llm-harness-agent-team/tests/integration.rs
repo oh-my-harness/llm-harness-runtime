@@ -522,30 +522,34 @@ async fn broadcast_two_phase_aggregation() {
         || {
             // Two-phase aggregation, integration-level: the broadcast
             // reaches volunteers end-to-end, their replies come back
-            // through the monitor steer path, and a1's session accumulates
-            // them. Under cross-test parallel load the SECOND steered reply
-            // may land after a1's run ended (rolled back to the inbox for
-            // the next run) — a runner-lifecycle timing property the mock
-            // layer cannot pin deterministically here; the one-drain-window
-            // rendering is unit-pinned by the format_inbox_messages
-            // grouping tests. The end-to-end contract asserted here: both
-            // volunteers completed their reply runs AND a1's conversation
-            // engaged the steer path (>= 3 LLM calls: task turn, steered
-            // reply turn, follow-up turn).
+            // through the monitor steer path, and a1's conversation
+            // accumulates both. Replies may drain together inside a1's
+            // running turn or be rolled back to the inbox and consumed by a
+            // later run, so we only require that each reply body appears in
+            // some request after the initial task turn. Pinning a specific
+            // call count here used to require the rollback race (task turn,
+            // steered reply turn, follow-up turn) and failed whenever both
+            // replies were steered into the running turn instead.
             let a1_calls = a1_client.call_count.load(std::sync::atomic::Ordering::SeqCst);
             let a2_calls = a2_client.call_count.load(std::sync::atomic::Ordering::SeqCst);
             let a3_calls = a3_client.call_count.load(std::sync::atomic::Ordering::SeqCst);
-            let seen = a1_client
-                .captured_requests
-                .lock()
-                .iter()
-                .flat_map(|req| req.messages().iter())
-                .any(|m| {
-                    matches!(m, llm_harness_loop::LlmMessage::User(content) if content
-                        .iter()
-                        .any(|c| matches!(c, llm_harness_loop::RequestContent::Text(t) if t.contains("reply from"))))
-                });
-            a1_calls >= 3 && a2_calls >= 2 && a3_calls >= 2 && seen
+            let seen_reply = |body: &str| {
+                a1_client
+                    .captured_requests
+                    .lock()
+                    .iter()
+                    .flat_map(|req| req.messages().iter())
+                    .any(|m| {
+                        matches!(m, llm_harness_loop::LlmMessage::User(content) if content
+                            .iter()
+                            .any(|c| matches!(c, llm_harness_loop::RequestContent::Text(t) if t.contains(body))))
+                    })
+            };
+            a1_calls >= 2
+                && a2_calls >= 2
+                && a3_calls >= 2
+                && seen_reply("reply from a2")
+                && seen_reply("reply from a3")
         },
         Duration::from_secs(30),
         "both broadcast replies to reach a1's conversation",
