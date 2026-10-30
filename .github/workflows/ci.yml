@@ -70,6 +70,30 @@ jobs:
           librsvg2-dev
           wget
 
+      - name: Enable bwrap namespaces (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          # Ubuntu 24.04 defaults to
+          # kernel.apparmor_restrict_unprivileged_userns=1, and the restricted
+          # user namespace bwrap creates lacks the netlink capability bwrap
+          # needs to bring up loopback inside --unshare-all. Every sandbox then
+          # dies with:
+          #   bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted
+          # Relax the restriction on this ephemeral runner, then prove the
+          # capability so the test job fails here with a clear diagnostic
+          # instead of inside unrelated sandbox tests.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-all --die-with-parent --new-session \
+            --ro-bind-try /usr /usr \
+            --ro-bind-try /bin /bin \
+            --ro-bind-try /lib /lib \
+            --ro-bind-try /lib64 /lib64 \
+            --ro-bind-try /sbin /sbin \
+            --proc /proc --dev /dev --tmpfs /tmp \
+            -- /usr/bin/env -i PATH=/usr/bin:/bin true
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
