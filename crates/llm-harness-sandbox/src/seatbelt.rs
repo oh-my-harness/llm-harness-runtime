@@ -360,6 +360,7 @@ impl SeatbeltEnv {
             work_dir,
             work_dir_canon,
             guest_mappings,
+            Vec::new(),
             allowlist_canon,
             config,
             owned,
@@ -371,24 +372,12 @@ impl SeatbeltEnv {
         work_dir: PathBuf,
         work_dir_canon: PathBuf,
         guest_mappings: Vec<(PathBuf, PathBuf)>,
+        host_bind_roots: Vec<PathBuf>,
         allowlist_canon: Vec<PathBuf>,
         config: SandboxConfig,
         owned: bool,
         policy_path: PathBuf,
     ) -> Self {
-        let trusted = matches!(
-            config.trust_profile,
-            TrustProfile::TrustedLan | TrustProfile::TrustedFull
-        );
-        let host_bind_roots = if trusted {
-            config
-                .host_binds
-                .iter()
-                .filter_map(|bind| std::fs::canonicalize(&bind.host).ok())
-                .collect()
-        } else {
-            Vec::new()
-        };
         Self {
             work_dir,
             work_dir_canon,
@@ -1156,6 +1145,7 @@ impl SeatbeltSandbox {
             work_dir,
             work_dir_canon,
             guest_mappings,
+            bind_allows,
             allowlist_canon,
             config.clone(),
             owned,
