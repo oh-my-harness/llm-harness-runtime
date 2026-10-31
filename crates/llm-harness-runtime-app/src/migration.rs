@@ -232,7 +232,9 @@ pub fn migrate_data_root(
     let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
     let mut stats = CopyStats::default();
     copy_data_root(&source, &staging, &mut stats).map_err(|error| {
-        remove_path(&staging);
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            remove_path(&staging);
+        }
         MigrationError::Preparation(error)
     })?;
     let report_path = staging.join("migration-report.json");
@@ -588,11 +590,41 @@ fn path_exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
+/// Create a directory that is private to the current user while its contents
+/// are copied. Migration restores the source directory mode once everything
+/// below it is complete, so the final tree keeps the source permissions.
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// Create a file with mode 0600 from its first byte. The migration later
+/// restores the source mode, but the bytes must never be visible to other
+/// users while they are being written.
+///
+/// `create_new` also refuses to reuse a pre-existing entry (including a
+/// symlink): callers only write into a freshly created staging tree.
+fn create_private_output(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 fn copy_tree(source: &Path, destination: &Path, stats: &mut CopyStats) -> io::Result<()> {
     let metadata = std::fs::symlink_metadata(source)?;
     if metadata.is_dir() {
         stats.directories += 1;
-        std::fs::create_dir_all(destination)?;
+        create_private_directory(destination)?;
         for entry in std::fs::read_dir(source)? {
             let entry = entry?;
             copy_tree(&entry.path(), &destination.join(entry.file_name()), stats)?;
@@ -621,7 +653,7 @@ fn copy_data_root(source: &Path, destination: &Path, stats: &mut CopyStats) -> i
         )));
     }
     stats.directories += 1;
-    std::fs::create_dir_all(destination)?;
+    create_private_directory(destination)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         if entry.file_name() == std::ffi::OsStr::new("studio.lock") {
@@ -703,13 +735,17 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 /// implementation) fails with `ERROR_ACCESS_DENIED`. Creating the
 /// destination writable also lets us flush a read-only source without a
 /// best-effort fallback.
+///
+/// The destination must not exist: it is always a path inside a freshly
+/// created staging tree, and `create_private_output` relies on that to open
+/// with `O_CREAT | O_EXCL` instead of following a pre-existing entry.
 fn copy_file_synced(
     source: &Path,
     destination: &Path,
     metadata: &std::fs::Metadata,
 ) -> io::Result<()> {
     let mut input = File::open(source)?;
-    let mut output = File::create(destination)?;
+    let mut output = create_private_output(destination)?;
     std::io::copy(&mut input, &mut output)?;
     // Restore the source permissions before the final flush so the mode
     // change is part of the same durability barrier. The handle still has
@@ -793,13 +829,13 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let mut contents = serde_json::to_vec_pretty(value)?;
     contents.push(b'\n');
     let write_result = (|| {
-        let mut file = File::create(&temporary)?;
-        file.write_all(&contents)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        // A previous crash may have left the deterministic temp path behind;
+        // create_new would otherwise refuse to reuse it.
+        if path_exists(&temporary) {
+            std::fs::remove_file(&temporary)?;
         }
+        let mut file = create_private_output(&temporary)?;
+        file.write_all(&contents)?;
         file.sync_all()
     })();
     if let Err(error) = write_result {
@@ -1147,6 +1183,141 @@ mod tests {
             writable.set_readonly(false);
             fs::set_permissions(&destination, writable).unwrap();
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_output_is_0600_before_content_is_written() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_case("private-output");
+        let path = root.join("secret");
+        let mut file = create_private_output(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "file must be private before any byte is written"
+        );
+        file.write_all(b"secret-key").unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        file.sync_all().unwrap();
+        drop(file);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_directory_rejects_existing_directory() {
+        let root = test_case("private-directory-existing");
+        let existing = root.join("existing");
+        fs::create_dir(&existing).unwrap();
+        assert_eq!(
+            create_private_directory(&existing).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_root_stays_private_when_copy_fails() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = test_case("staging-private");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(source.join("apikey"), "secret-key").unwrap();
+        // A non-regular entry fails the copy after the staging root (and the
+        // regular file) were created, so the root mode is observed before any
+        // final permission restore.
+        symlink("apikey", source.join("unsupported-link")).unwrap();
+
+        let staging = root.join("staging");
+        let mut stats = CopyStats::default();
+        let error = copy_data_root(&source, &staging, &mut stats).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported non-regular entry"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            fs::metadata(&staging).unwrap().permissions().mode() & 0o077,
+            0,
+            "staging root must stay private after a failed copy"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_json_replaces_a_stale_temporary_file() {
+        let root = test_case("private-json-stale");
+        let path = root.join("journal.json");
+        let temporary = path.with_extension("json.tmp");
+        fs::write(&temporary, b"stale").unwrap();
+
+        write_private_json(&path, &serde_json::json!({ "ok": true })).unwrap();
+        assert!(!temporary.exists(), "temporary file must be renamed away");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_tree_restores_source_modes_after_private_copy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_case("copy-modes");
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::write(source.join("settings.json"), b"{}").unwrap();
+        fs::set_permissions(
+            source.join("settings.json"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+
+        let copied = root.join("copied");
+        let mut stats = CopyStats::default();
+        copy_data_root(&source, &copied, &mut stats).unwrap();
+
+        assert_eq!(
+            fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(copied.join("settings.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_json_does_not_follow_a_stale_temporary_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_case("private-json-symlink");
+        let victim = root.join("victim");
+        fs::write(&victim, b"do not touch").unwrap();
+        let path = root.join("journal.json");
+        let temporary = path.with_extension("json.tmp");
+        symlink(&victim, &temporary).unwrap();
+
+        write_private_json(&path, &serde_json::json!({ "ok": true })).unwrap();
+
+        assert_eq!(fs::read(&victim).unwrap(), b"do not touch");
+        assert!(path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
