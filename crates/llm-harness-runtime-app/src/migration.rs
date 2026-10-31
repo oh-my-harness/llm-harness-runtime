@@ -595,6 +595,7 @@ fn path_exists(path: &Path) -> bool {
 /// below it is complete, so the final tree keeps the source permissions.
 fn create_private_directory(path: &Path) -> io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
