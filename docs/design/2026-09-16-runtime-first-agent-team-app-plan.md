@@ -1,7 +1,9 @@
 # Runtime-first AgentTeam 应用计划
 
+> 历史设计：本文保留当时的方案与进度，不代表当前仓库状态。Agent Team 产品已拆至独立仓库，见 [迁移说明](../agent-team-guide.md)。
+
 > 日期：2026-09-16
-> 状态：已接受，实施中（M1/M2 已合并；M3 React 工作区已迁入 runtime app 并完成浏览器模式验证）
+> 当时状态：已接受，实施中（M1/M2 已合并；M3 React 工作区已迁入 runtime app 并完成浏览器模式验证）
 > 范围：`llm-harness-runtime` 的应用化演进，以及 AgentTeam 在 runtime 应用中的集成方式
 
 ## 1. 结论
