@@ -1,9 +1,7 @@
-use std::collections::HashMap;
-use std::io::Read;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path as AxumPath, Request, State};
@@ -33,6 +31,14 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 pub const GATEWAY_TOKEN: &str = "test-gateway-token";
 
+pub const STREAM_OUTPUT_COMMAND: &str = r#"{
+  "stdout": "out",
+  "stderr": "err",
+  "require_env": {"REMOTE_TEST": "1"}
+}"#;
+pub const WAITING_COMMAND: &str = r#"{"wait": true}"#;
+pub const BOUNDED_OUTPUT_COMMAND: &str = r#"{"stdout": "0123456789"}"#;
+
 type GatewayPathResult = Result<PathBuf, Box<Response>>;
 
 pub fn test_sandbox_config() -> SandboxConfig {
@@ -60,7 +66,7 @@ struct GatewayState {
     token: String,
     root: tempfile::TempDir,
     sandboxes: Mutex<HashMap<String, TestSandbox>>,
-    executions: Mutex<HashMap<String, Arc<Mutex<Child>>>>,
+    executions: Mutex<HashMap<String, Arc<TestExecution>>>,
     create_status: StatusCode,
     read_delay: Option<Duration>,
     create_work_dir: Option<String>,
@@ -73,6 +79,37 @@ struct TestSandbox {
     backend: String,
     state: RemoteSandboxState,
     config: RemoteSandboxConfig,
+}
+
+struct TestExecution {
+    cancelled: AtomicBool,
+}
+
+impl TestExecution {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TestCommand {
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    stderr: String,
+    #[serde(default)]
+    exit_code: i32,
+    #[serde(default)]
+    wait: bool,
+    #[serde(default)]
+    require_env: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -565,73 +602,33 @@ async fn exec_shell(
     AxumPath(id): AxumPath<String>,
     Json(request): Json<ShellExecRequest>,
 ) -> Response {
-    let sandbox = {
+    let timeout_ms = {
         let sandboxes = state.0.sandboxes.lock().unwrap();
         let Some(sandbox) = sandboxes.get(&id) else {
             return not_found(&id);
         };
-        (
-            sandbox.root.clone(),
-            sandbox.work_dir.clone(),
-            sandbox.config.resource_limits.timeout_ms,
-        )
+        sandbox.config.resource_limits.timeout_ms
     };
-    let host_work_dir = match guest_to_host(&sandbox.0, &sandbox.1) {
-        Ok(path) => path,
-        Err(error) => return *error,
-    };
-
-    let execution_id = uuid::Uuid::new_v4().to_string();
-    let mut command = if cfg!(windows) {
-        let mut command = Command::new("bash");
-        command.arg("-c");
-        command
-    } else {
-        let mut command = Command::new("sh");
-        command.arg("-c");
-        command
-    };
-    command.arg(&request.command).current_dir(&host_work_dir);
-    if !cfg!(windows) {
-        command.env_clear().env("PATH", "/usr/bin:/bin");
-    }
-    if cfg!(windows) && !request.env.is_empty() {
-        let wslenv = request
-            .env
-            .keys()
-            .map(|key| format!("{key}/u"))
-            .collect::<Vec<_>>()
-            .join(":");
-        command.env("WSLENV", wslenv);
-    }
-    if cfg!(windows) {
-        command.env("WSL_UTF8", "1");
-    }
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    for (key, value) in request.env {
-        command.env(key, value);
-    }
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    let command = match serde_json::from_str::<TestCommand>(&request.command) {
+        Ok(command) => command,
         Err(error) => {
             return gateway_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "spawn_failed",
+                StatusCode::BAD_REQUEST,
+                "invalid_test_command",
                 error.to_string(),
                 None,
             );
         }
     };
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let child = Arc::new(Mutex::new(child));
+
+    let execution_id = uuid::Uuid::new_v4().to_string();
+    let execution = Arc::new(TestExecution::new());
     state
         .0
         .executions
         .lock()
         .unwrap()
-        .insert(execution_id.clone(), Arc::clone(&child));
+        .insert(execution_id.clone(), Arc::clone(&execution));
 
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let started = RemoteExecEvent::Started {
@@ -641,80 +638,61 @@ async fn exec_shell(
 
     let stdout_collector = Arc::new(Mutex::new(BoundedOutput::new(request.max_output_bytes)));
     let stderr_collector = Arc::new(Mutex::new(BoundedOutput::new(request.max_output_bytes)));
-    let mut readers = Vec::new();
-    if let Some(stdout) = stdout {
-        readers.push(spawn_pipe_reader(
-            stdout,
-            stdout_collector.clone(),
-            sender.clone(),
-            false,
-        ));
-    }
-    if let Some(stderr) = stderr {
-        readers.push(spawn_pipe_reader(
-            stderr,
-            stderr_collector.clone(),
-            sender.clone(),
-            true,
-        ));
-    }
-
-    let timeout_ms = request.timeout_ms.or(sandbox.2).unwrap_or(5_000);
+    let timeout_ms = request.timeout_ms.or(timeout_ms).unwrap_or(5_000);
     let wait_sender = sender.clone();
     let state_for_wait = state.0.clone();
     let execution_id_for_wait = execution_id.clone();
     std::thread::spawn(move || {
-        let mut readers = readers;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let env_matches = command
+            .require_env
+            .iter()
+            .all(|(key, expected)| request.env.get(key) == Some(expected));
+        let mut exit_code = if env_matches { command.exit_code } else { 1 };
+        if env_matches {
+            emit_exec_output(
+                wait_sender.clone(),
+                &stdout_collector,
+                &command.stdout,
+                false,
+            );
+            emit_exec_output(
+                wait_sender.clone(),
+                &stderr_collector,
+                &command.stderr,
+                true,
+            );
+        }
+
         let mut timed_out = false;
-        loop {
-            let status = {
-                let mut guard = child.lock().unwrap();
-                match guard.try_wait() {
-                    Ok(Some(status)) => Some(status),
-                    Ok(None) => None,
-                    Err(error) => {
-                        for reader in readers.drain(..) {
-                            let _ = reader.join();
-                        }
-                        let _ = wait_sender.send(sse_event(
-                            "error",
-                            &RemoteExecEvent::Error {
-                                code: "wait_failed".to_owned(),
-                                message: error.to_string(),
-                            },
-                        ));
-                        break;
-                    }
+        if command.wait {
+            loop {
+                if execution.cancelled.load(Ordering::SeqCst) {
+                    exit_code = -1;
+                    break;
                 }
-            };
-            if let Some(status) = status {
-                for reader in readers.drain(..) {
-                    let _ = reader.join();
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    exit_code = -1;
+                    break;
                 }
-                let stdout = stdout_collector.lock().unwrap().snapshot();
-                let stderr = stderr_collector.lock().unwrap().snapshot();
-                let result = ShellExecResponse {
-                    exit_code: status.code().unwrap_or(-1),
-                    stdout: stdout.0,
-                    stderr: stderr.0,
-                    stdout_truncated_bytes: stdout.1,
-                    stderr_truncated_bytes: stderr.1,
-                };
-                if timed_out {
-                    let _ = wait_sender
-                        .send(sse_event("timeout", &RemoteExecEvent::Timeout { result }));
-                } else {
-                    let _ = wait_sender.send(sse_event("exit", &RemoteExecEvent::Exit { result }));
-                }
-                break;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.lock().unwrap().kill();
-                timed_out = true;
-            } else {
                 std::thread::sleep(Duration::from_millis(10));
             }
+        }
+
+        let stdout = stdout_collector.lock().unwrap().snapshot();
+        let stderr = stderr_collector.lock().unwrap().snapshot();
+        let result = ShellExecResponse {
+            exit_code,
+            stdout: stdout.0,
+            stderr: stderr.0,
+            stdout_truncated_bytes: stdout.1,
+            stderr_truncated_bytes: stderr.1,
+        };
+        if timed_out {
+            let _ = wait_sender.send(sse_event("timeout", &RemoteExecEvent::Timeout { result }));
+        } else {
+            let _ = wait_sender.send(sse_event("exit", &RemoteExecEvent::Exit { result }));
         }
         state_for_wait
             .executions
@@ -740,7 +718,7 @@ async fn kill_execution(
         return not_found(&id);
     }
     let executions = state.0.executions.lock().unwrap();
-    let Some(child) = executions.get(&execution_id) else {
+    let Some(execution) = executions.get(&execution_id) else {
         return gateway_error(
             StatusCode::NOT_FOUND,
             "execution_not_found",
@@ -748,61 +726,33 @@ async fn kill_execution(
             None,
         );
     };
-    if let Err(error) = child.lock().unwrap().kill() {
-        return gateway_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "kill_failed",
-            error.to_string(),
-            None,
-        );
-    }
+    execution.cancel();
     StatusCode::NO_CONTENT.into_response()
 }
 
-fn spawn_pipe_reader<R: Read + Send + 'static>(
-    mut reader: R,
-    collector: Arc<Mutex<BoundedOutput>>,
+fn emit_exec_output(
     sender: tokio::sync::mpsc::UnboundedSender<Result<Event, std::convert::Infallible>>,
+    collector: &Arc<Mutex<BoundedOutput>>,
+    chunk: &str,
     is_stderr: bool,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut buffer = [0u8; 4096];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read_len) => {
-                    let mut bytes = buffer[..read_len].to_vec();
-                    if cfg!(windows)
-                        && is_stderr
-                        && let Ok(text) = std::str::from_utf8(&bytes)
-                    {
-                        let mut filtered = text
-                            .lines()
-                            .filter(|line| !line.starts_with("wsl: "))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if text.ends_with('\n') {
-                            filtered.push('\n');
-                        }
-                        let filtered = filtered.trim_start_matches('\n').to_owned();
-                        bytes = filtered.into_bytes();
-                    }
-                    let chunk = String::from_utf8_lossy(&bytes).into_owned();
-                    collector.lock().unwrap().push(&bytes);
-                    let event = if is_stderr {
-                        RemoteExecEvent::Stderr { chunk }
-                    } else {
-                        RemoteExecEvent::Stdout { chunk }
-                    };
-                    let _ = sender.send(sse_event(
-                        if is_stderr { "stderr" } else { "stdout" },
-                        &event,
-                    ));
-                }
-                Err(_) => break,
-            }
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    collector.lock().unwrap().push(chunk.as_bytes());
+    let event = if is_stderr {
+        RemoteExecEvent::Stderr {
+            chunk: chunk.to_owned(),
         }
-    })
+    } else {
+        RemoteExecEvent::Stdout {
+            chunk: chunk.to_owned(),
+        }
+    };
+    let _ = sender.send(sse_event(
+        if is_stderr { "stderr" } else { "stdout" },
+        &event,
+    ));
 }
 
 fn sse_event<T: serde::Serialize>(
