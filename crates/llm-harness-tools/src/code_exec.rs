@@ -234,8 +234,19 @@ mod tests {
         }
     }
 
+    fn python_available() -> bool {
+        std::process::Command::new(python_command())
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
     #[tokio::test]
     async fn python_hello_world() {
+        if !python_available() {
+            eprintln!("Python runtime not available, skipping");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let tool = CodeExecTool::new();
         let args = serde_json::json!({
@@ -253,6 +264,10 @@ mod tests {
 
     #[tokio::test]
     async fn nonzero_exit_is_not_tool_error() {
+        if !python_available() {
+            eprintln!("Python runtime not available, skipping");
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let tool = CodeExecTool::new();
         let args = serde_json::json!({

@@ -212,6 +212,7 @@ mod tests {
         assert_eq!(value["vsock"]["guest_cid"], 3);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn config_generates_jailed_machine_json() {
         let jail_root = PathBuf::from("/srv/jailer/firecracker/sandbox-1/root");
@@ -234,6 +235,7 @@ mod tests {
         assert_eq!(value["vsock"]["uds_path"], "/guest-agent.sock");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn config_rejects_jailed_resources_outside_the_jail_root() {
         let jail_root = PathBuf::from("/srv/jailer/firecracker/sandbox-1/root");
