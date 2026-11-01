@@ -122,10 +122,7 @@ async fn remote_sandbox_supports_filesystem_and_streaming_shell() {
         max_output_bytes: Some(64 * 1024),
     };
     let output = env
-        .execute_shell(
-            "printf 'out'; printf 'err' >&2; test \"$REMOTE_TEST\" = 1",
-            options,
-        )
+        .execute_shell(common::STREAM_OUTPUT_COMMAND, options)
         .await
         .expect("execute shell");
     let stdout_chunks = stdout_sender.lock().unwrap().clone();
@@ -232,7 +229,7 @@ async fn remote_sandbox_maps_timeout_to_env_timeout() {
         on_stderr: None,
         max_output_bytes: Some(64 * 1024),
     };
-    let result = env.execute_shell("sleep 5", options).await;
+    let result = env.execute_shell(common::WAITING_COMMAND, options).await;
     match result {
         Err(EnvError::ShellTimeout { .. }) => {}
         other => panic!("expected shell timeout, got success: {}", other.is_ok()),
@@ -260,7 +257,7 @@ async fn remote_sandbox_applies_client_timeout_cap_to_gateway_requests() {
         on_stderr: None,
         max_output_bytes: Some(64 * 1024),
     };
-    let result = env.execute_shell("sleep 5", options).await;
+    let result = env.execute_shell(common::WAITING_COMMAND, options).await;
     match result {
         Err(EnvError::ShellTimeout { .. }) => {}
         other => panic!("expected shell timeout, got success: {}", other.is_ok()),
@@ -288,7 +285,7 @@ async fn remote_sandbox_uses_timeout_cap_when_no_timeout_is_requested() {
         on_stderr: None,
         max_output_bytes: Some(64 * 1024),
     };
-    let result = env.execute_shell("sleep 5", options).await;
+    let result = env.execute_shell(common::WAITING_COMMAND, options).await;
     match result {
         Err(EnvError::ShellTimeout { .. }) => {}
         other => panic!("expected shell timeout, got success: {}", other.is_ok()),
@@ -309,7 +306,9 @@ async fn remote_sandbox_bounds_final_shell_output() {
         on_stderr: None,
         max_output_bytes: Some(6),
     };
-    let output = env.execute_shell("printf 0123456789", options).await;
+    let output = env
+        .execute_shell(common::BOUNDED_OUTPUT_COMMAND, options)
+        .await;
     let output = output.expect("execute bounded shell");
     assert_eq!(output.stdout, "012789");
     assert_eq!(output.stdout_truncated_bytes, 4);
@@ -335,7 +334,7 @@ async fn remote_sandbox_maps_abort_to_shell_abort() {
         on_stderr: None,
         max_output_bytes: Some(64 * 1024),
     };
-    let result = env.execute_shell("sleep 5", options).await;
+    let result = env.execute_shell(common::WAITING_COMMAND, options).await;
     match result {
         Err(EnvError::ShellAborted { .. }) => {}
         other => panic!("expected shell abort, got success: {}", other.is_ok()),
