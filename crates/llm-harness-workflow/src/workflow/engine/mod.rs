@@ -167,6 +167,11 @@ pub struct WorkflowEngine {
     /// Test-only gate before fail_task persistence admission.
     #[cfg(test)]
     fail_task_admission_gate: Option<Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
+    /// Test-only override for fail_task's persistence deadline. The normal
+    /// startup save keeps the production timeout even when a test needs to
+    /// exercise fail_task's degraded admission path quickly.
+    #[cfg(test)]
+    fail_task_persistence_timeout: Option<Duration>,
     /// task 标识。由引擎内部生成（uuid）。
     task_id: TaskId,
     /// workflow 状态（步骤推进 + 生命周期状态，统一表达）。
