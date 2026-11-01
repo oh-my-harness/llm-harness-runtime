@@ -1,0 +1,9 @@
+verification:
+  ci:
+    configured: true
+    provider: github
+    workflow_file: .github/workflows/ci.yml
+    job_allowlist:
+      - "Rust (ubuntu-latest)"
+      - "Rust (windows-latest)"
+      - "Rust (macos-latest)"
