@@ -332,6 +332,8 @@ impl super::WorkflowEngine {
             pause_admission_gate: None,
             #[cfg(test)]
             fail_task_admission_gate: None,
+            #[cfg(test)]
+            fail_task_persistence_timeout: None,
             task_id,
             workflow_state: Arc::new(Mutex::new(state)),
             context,
@@ -1123,10 +1125,18 @@ impl super::WorkflowEngine {
         // 持锁期间的入队不允许 await：先取 admission permit + context 快照。
         // 14C：绝对持久化 deadline 从本操作入口起算，覆盖 admission、
         // context snapshot 与 workflow_state 锁等待，中途不重置。
-        let deadline = tokio::time::Instant::now() + self.persistence_timeout;
-        let timeout_error = || WorkflowError::StoreTimeout {
-            timeout_ms: self.persistence_timeout_ms(),
-        };
+        #[cfg(test)]
+        let persistence_timeout = self
+            .fail_task_persistence_timeout
+            .unwrap_or(self.persistence_timeout);
+        #[cfg(not(test))]
+        let persistence_timeout = self.persistence_timeout;
+        let deadline = tokio::time::Instant::now() + persistence_timeout;
+        let timeout_ms = persistence_timeout
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let timeout_error = || WorkflowError::StoreTimeout { timeout_ms };
         let admission = async {
             let permit = self.acquire_persistence_permit(deadline).await?;
             let context = tokio::time::timeout_at(deadline, async {
