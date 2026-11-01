@@ -9551,54 +9551,26 @@ async fn fail_task_admission_timeout_preserves_failure_and_replay_dead_ends() {
     .unwrap()
     .with_task_store(store.clone())
     .with_executor("gated-flaky", executor.clone());
-    // Only shrink fail_task's deadline. A 20ms global timeout also applies to
-    // startup persistence and can make the runner exit before the executor
-    // starts, leaving the test waiting on an event that will never arrive.
-    engine.fail_task_persistence_timeout = Some(std::time::Duration::from_millis(20));
-    let gate = Arc::new((Notify::new(), Notify::new()));
-    engine.fail_task_admission_gate = Some(gate.clone());
+    // Shrink the persistence deadline so the congested fail_task admission
+    // times out promptly instead of hanging the test.
+    engine.persistence_timeout = std::time::Duration::from_millis(20);
     let permits_lane = engine.persistence_permits.clone();
     let engine = Arc::new(engine);
 
-    let mut runner = {
+    let runner = {
         let engine = engine.clone();
         tokio::spawn(async move { engine.run().await })
     };
-    // Park the step mid-execution, release it, then wait until fail_task is
-    // parked before admission. Saturating the lane at that point is
-    // deterministic: no startup/step save can still own a permit.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        tokio::select! {
-            _ = executor.entered.notified() => {}
-            result = &mut runner => {
-                panic!("runner exited before the executor started: {result:?}")
-            }
-        }
-    })
-    .await
-    .expect("executor must start before the test can congest persistence");
-    executor.release.notify_one();
-    tokio::time::timeout(std::time::Duration::from_secs(30), gate.0.notified())
-        .await
-        .expect("fail_task must reach the admission gate");
+    // Park the step mid-execution, then exhaust every persistence permit so
+    // the subsequent fail_task admission cannot acquire one.
+    executor.entered.notified().await;
     let mut held: Vec<tokio::sync::OwnedSemaphorePermit> =
         Vec::with_capacity(DEFAULT_PERSISTENCE_CAPACITY);
     for _ in 0..DEFAULT_PERSISTENCE_CAPACITY {
-        held.push(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                permits_lane.clone().acquire_owned(),
-            )
-            .await
-            .expect("persistence permit must be available before admission")
-            .unwrap(),
-        );
+        held.push(permits_lane.clone().acquire_owned().await.unwrap());
     }
-    gate.1.notify_one();
-    let first = tokio::time::timeout(std::time::Duration::from_secs(30), runner)
-        .await
-        .expect("congested fail_task must reach its persistence timeout")
-        .unwrap();
+    executor.release.notify_one();
+    let first = runner.await.unwrap();
     drop(held);
     assert!(
         matches!(&first, Err(WorkflowError::TaskFailed(message)) if message.contains("transient executor failure")),
