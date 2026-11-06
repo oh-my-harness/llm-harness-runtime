@@ -494,15 +494,23 @@ fn run_loop(
             let (assistant_msg, handle_status_code, handle_latency_ms) = loop {
                 // === Connection establishment ===
                 let call = client.chat_stream(&req);
-                let response = if let Some(timeout_ms) = stream_opts.timeout_ms {
-                    match crate::time::timeout(
-                        std::time::Duration::from_millis(timeout_ms),
-                        call,
-                    )
-                    .await
-                    {
+                let response = tokio::select! {
+                    biased;
+                    _ = config.abort.cancelled() => {
+                        yield AgentEvent::Error(AgentError::Aborted);
+                        break 'main;
+                    }
+                    result = async {
+                        if let Some(timeout_ms) = stream_opts.timeout_ms {
+                            crate::time::timeout(std::time::Duration::from_millis(timeout_ms), call)
+                                .await
+                        } else {
+                            Ok(call.await)
+                        }
+                    } => match result {
                         Ok(result) => result,
                         Err(_) => {
+                            let timeout_ms = stream_opts.timeout_ms.expect("timeout is configured");
                             yield AgentEvent::Error(AgentError::ProviderTyped {
                                 message: format!("provider request timed out after {timeout_ms}ms"),
                                 kind: ProviderErrorKind::Timeout,
@@ -510,8 +518,6 @@ fn run_loop(
                             break 'main;
                         }
                     }
-                } else {
-                    call.await
                 };
 
                 let mut handle = match response {
@@ -2287,6 +2293,95 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
         );
+    }
+
+    #[tokio::test]
+    async fn abort_drops_pending_provider_connection_with_or_without_timeout() {
+        use crate::config::RetryConfig;
+        use llm_adapter::LlmError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        struct PendingProvider {
+            started: Notify,
+            calls: AtomicUsize,
+            dropped: Arc<AtomicUsize>,
+        }
+        struct DropGuard(Arc<AtomicUsize>);
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        #[async_trait::async_trait]
+        impl Provider for PendingProvider {
+            fn capabilities(&self) -> llm_adapter::provider::ProviderCapabilities {
+                llm_adapter::provider::ProviderCapabilities::new(false, false, false)
+            }
+            async fn chat(
+                &self,
+                _: &llm_adapter::types::ChatRequest,
+            ) -> Result<llm_adapter::types::ChatResponse, LlmError> {
+                unreachable!()
+            }
+            async fn chat_stream(
+                &self,
+                _: &llm_adapter::types::ChatRequest,
+            ) -> Result<llm_adapter::stream_handle::StreamHandle, LlmError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _guard = DropGuard(self.dropped.clone());
+                self.started.notify_one();
+                std::future::pending().await
+            }
+        }
+        for timeout_ms in [None, Some(60_000)] {
+            let (_, mut cfg) = make_config(vec![]);
+            cfg.stream_options.timeout_ms = timeout_ms;
+            cfg.retry = Some(RetryConfig::new(2, 0));
+            let abort = cfg.abort.clone();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let provider = Arc::new(PendingProvider {
+                started: Notify::new(),
+                calls: AtomicUsize::new(0),
+                dropped: dropped.clone(),
+            });
+            let handle = tokio::spawn({
+                let provider = provider.clone();
+                async move {
+                    agent_loop(provider, single_user_turn_ctx(), cfg)
+                        .collect::<Vec<_>>()
+                        .await
+                }
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                provider.started.notified(),
+            )
+            .await
+            .expect("provider request must start");
+            abort.cancel();
+            let events = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+                .await
+                .expect("abort must interrupt provider connection")
+                .unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::Error(AgentError::Aborted)))
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::RetryAttempt { .. }))
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]
