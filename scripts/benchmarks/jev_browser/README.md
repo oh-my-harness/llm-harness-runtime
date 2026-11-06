@@ -1,5 +1,11 @@
 # jev-browser 研究入口
 
+## Kev：先验收环境
+
+2026-09-30，固定旧版 `jaredpalmer/kev-4b@qwen3` 的独立 WSL2 环境和原 Windows 客户端接口已通过预检，尚未运行正式 A/B。18 条历史输入共 72 次回放、96 次真实前向，保留原作者 `LayaBrowser` 预处理及候选分块；未调用 Flash 或访问实验网站。
+
+入口为 `kev_preflight.py run --corpus CORPUS --output NEW_OUTPUT`；完成回放后，Windows 用现有浏览器环境执行 `python -X utf8 kev_preflight.py probe --output NEW_OUTPUT`。模型权重须提前缓存，执行时离线，输出目录必须新建。详细版本、计量口径、结果及仍待接入的整场预算见 [Kev 环境准备记录](../../../docs/research/kev-environment-readiness-20260930.md)。不得将预检用时当作正式任务提速，也不把旧版温度 1.0 冒称新版校准结果。
+
 ## Decider-2B 三组对照
 
 2026-09-30 经 lqj 确认，`--with-decider` 在原受控 Flash 场次加入 C 组；A/B 原决策及 helper 路径不改。C 以 `Mapika/decider-2b@533964dae8be954c5b5e19fa4948e48408094c1e` v11 代替本地决策打分器，B/C 共用原作者页面/候选压缩和分块。模型原生分词和编码不同，不是参数量的因果消融。
@@ -64,6 +70,8 @@ python scripts/benchmarks/jev_browser/author_suite.py --paired --controlled --re
 实测范围及结论见[固定条件重跑报告](../../../docs/research/laya-browser-controlled-comparison-20260929.md)：当前 89/96 次，预算停止。只读审计输出 `round_analysis`，按任务覆盖度提取完整轮次，并列给出全部成功配对与无 HTTP 失败成功配对，不从原始文件删除记录。
 
 ### DeepSeek Flash 同条件替换
+
+Kev 对照可在该命令增加 `--decision-backend kev`，替换 B 的 Laya，不增加 C 组。须先按 [Kev 环境记录](../../../docs/research/kev-environment-readiness-20260930.md)完成固定 WSL 环境，将 `KEV_WSL_PYTHON` 与 `KEV_HF_HOME` 设为 WSL 中已验收的绝对路径；`KEV_WSL_DISTRO` 默认为 Ubuntu-24.04。运行前可用 `python -X utf8 scripts/benchmarks/jev_browser/kev_service.py --smoke --output logs/benchmarks/NEW_KEV_SMOKE --port 18792` 检查原 Windows 客户端、错误计量和进程关闭，不调用 Flash。正式入口自动启动/关闭本地服务并保存 `kev-events.jsonl`；`audit_author_run.py` 对账独立服务日志和任务计数。失联停止场次，失败与未执行项不删除。`qwen_*` 仍是 Flash 的历史计数字段；Kev 单独使用 `kev_rpc/predict/forward`，不会计成 Laya。
 
 按 lqj 授权，以 `--text-backend deepseek-flash` 只替换两组的远端文本模型，保持上述作者模型、任务、提示、执行器和验收不变。密钥从 `DEEPSEEK_API_KEY` 读取；仅使用官方 `https://api.deepseek.com`，两组均显式 `thinking.type=disabled`，其余受控请求参数、代理和重试不变。原 Qwen 模式仍是默认值。
 
