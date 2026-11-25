@@ -19,7 +19,7 @@ use crate::json_rpc::{
 
 pub use http::{AuthRefresh, HttpTransport};
 pub use sse::LegacySseTransport;
-pub use stdio::StdioTransport;
+pub use stdio::{StdioEnvPolicy, StdioTransport};
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -138,8 +138,20 @@ pub trait McpTransport: Send + Sync {
 }
 
 pub async fn create_transport(config: &McpServerConfig) -> TransportResult<Arc<dyn McpTransport>> {
+    create_transport_with_env_policy(config, StdioEnvPolicy::Inherit).await
+}
+
+/// Create a transport, applying `env_policy` to stdio transports.
+///
+/// The policy is ignored for HTTP/SSE transports, which spawn no process.
+pub async fn create_transport_with_env_policy(
+    config: &McpServerConfig,
+    env_policy: StdioEnvPolicy,
+) -> TransportResult<Arc<dyn McpTransport>> {
     match config {
-        McpServerConfig::Stdio { .. } => Ok(Arc::new(StdioTransport::connect(config).await?)),
+        McpServerConfig::Stdio { .. } => Ok(Arc::new(
+            StdioTransport::connect_with_env_policy(config, env_policy).await?,
+        )),
         McpServerConfig::HttpOrSse { .. } if config.is_sse() => {
             Ok(Arc::new(LegacySseTransport::connect(config).await?))
         }

@@ -38,12 +38,15 @@ jobs:
           PRIVATE_DEPS_TOKEN: ${{ secrets.OH_MY_HARNESS_READ_TOKEN }}
         run: |
           set -euo pipefail
-          if [[ -z "${PRIVATE_DEPS_TOKEN:-}" ]]; then
-            echo "::error title=Missing OH_MY_HARNESS_READ_TOKEN::Create a repository secret named OH_MY_HARNESS_READ_TOKEN with read access to private git dependencies such as oh-my-harness/llm-api-adapter."
-            exit 1
+          if [[ -n "${PRIVATE_DEPS_TOKEN:-}" ]]; then
+            echo "::add-mask::${PRIVATE_DEPS_TOKEN}"
+            git config --global url."https://x-access-token:${PRIVATE_DEPS_TOKEN}@github.com/".insteadOf "https://github.com/"
+          else
+            # All git dependencies are public (oh-my-harness/llm-api-adapter),
+            # so anonymous HTTPS access is sufficient. Fork pull requests never
+            # receive repository secrets; allow them to build instead of failing.
+            echo "No private dependency token configured; using anonymous Git access."
           fi
-          echo "::add-mask::${PRIVATE_DEPS_TOKEN}"
-          git config --global url."https://x-access-token:${PRIVATE_DEPS_TOKEN}@github.com/".insteadOf "https://github.com/"
 
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy

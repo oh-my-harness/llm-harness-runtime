@@ -25,6 +25,19 @@ use crate::json_rpc::{
 
 type PendingResponse = oneshot::Sender<TransportResult<Value>>;
 
+/// How a stdio MCP child receives its environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StdioEnvPolicy {
+    /// Inherit the host process environment and overlay the configured `env`.
+    /// This is the historical behavior and remains the default.
+    #[default]
+    Inherit,
+    /// Start from an empty environment. The child receives exactly the
+    /// configured `env`, after credential resolution has merged the scoped
+    /// credential values into it.
+    Explicit,
+}
+
 struct StdioInner {
     child: Mutex<Option<Child>>,
     stdin: Mutex<Option<ChildStdin>>,
@@ -131,6 +144,20 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     pub async fn connect(config: &McpServerConfig) -> TransportResult<Self> {
+        Self::connect_with_env_policy(config, StdioEnvPolicy::Inherit).await
+    }
+
+    /// Open a stdio transport with an explicit environment policy.
+    ///
+    /// `StdioEnvPolicy::Explicit` clears the inherited environment before the
+    /// configured `env` map is applied, so the child receives exactly the
+    /// environment the caller validated. Callers that need a reproducible
+    /// child environment (for example, an operator-approved MCP server) should
+    /// use this constructor; the default remains [`StdioEnvPolicy::Inherit`].
+    pub async fn connect_with_env_policy(
+        config: &McpServerConfig,
+        env_policy: StdioEnvPolicy,
+    ) -> TransportResult<Self> {
         let McpServerConfig::Stdio {
             command,
             args,
@@ -150,6 +177,9 @@ impl StdioTransport {
             .map_err(|error| McpTransportError::InvalidConfig(error.to_string()))?;
 
         let mut process = Command::new(command);
+        if env_policy == StdioEnvPolicy::Explicit {
+            process.env_clear();
+        }
         process
             .args(args)
             .envs(env)
@@ -458,5 +488,79 @@ mod tests {
         // If we reach here without hanging, the child was cleaned up.
         // Verify child is None.
         assert!(transport.inner.child.lock().await.is_none());
+    }
+
+    #[cfg(unix)]
+    fn recording_env_config(
+        out: &std::path::Path,
+        env: HashMap<String, String>,
+        parent_var: &str,
+    ) -> McpServerConfig {
+        let script = r#"printf '%s|%s' "${__PARENT__-unset}" "${OMP_TEST_STDIO_EXPLICIT-unset}" > __OUT__; while IFS= read -r line; do printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'; done"#
+            .replace("__OUT__", &out.display().to_string())
+            .replace("__PARENT__", parent_var);
+        let mut config = fixture_config(script);
+        if let McpServerConfig::Stdio {
+            env: config_env, ..
+        } = &mut config
+        {
+            *config_env = env;
+        }
+        config
+    }
+
+    #[cfg(unix)]
+    async fn read_recorded_env(out: &std::path::Path) -> String {
+        for _ in 0..200 {
+            if let Ok(text) = tokio::fs::read_to_string(out).await
+                && !text.is_empty()
+            {
+                return text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("env fixture did not write {}", out.display());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_env_policy_does_not_inherit_parent_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("env.txt");
+        let config = recording_env_config(
+            &out,
+            HashMap::from([("OMP_TEST_STDIO_EXPLICIT".to_owned(), "ok".to_owned())]),
+            "OMP_TEST_STDIO_PARENT_EXPLICIT",
+        );
+
+        unsafe { std::env::set_var("OMP_TEST_STDIO_PARENT_EXPLICIT", "leaked") };
+        let transport = StdioTransport::connect_with_env_policy(&config, StdioEnvPolicy::Explicit)
+            .await
+            .unwrap();
+        let recorded = read_recorded_env(&out).await;
+        unsafe { std::env::remove_var("OMP_TEST_STDIO_PARENT_EXPLICIT") };
+
+        assert_eq!(recorded, "unset|ok");
+        assert_eq!(
+            transport.request("fixture", json!({})).await.unwrap(),
+            json!({"ok": true})
+        );
+        transport.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inherit_policy_keeps_parent_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("env.txt");
+        let config = recording_env_config(&out, HashMap::new(), "OMP_TEST_STDIO_PARENT_INHERIT");
+
+        unsafe { std::env::set_var("OMP_TEST_STDIO_PARENT_INHERIT", "leaked") };
+        let transport = StdioTransport::connect(&config).await.unwrap();
+        let recorded = read_recorded_env(&out).await;
+        unsafe { std::env::remove_var("OMP_TEST_STDIO_PARENT_INHERIT") };
+
+        assert_eq!(recorded, "leaked|unset");
+        transport.close().await.unwrap();
     }
 }

@@ -16,7 +16,9 @@ use tokio_util::sync::CancellationToken;
 use crate::config::McpServerConfig;
 use crate::config::{MismatchPolicy, ToolChangePolicy, VersionPolicy};
 use crate::session::{McpSession, McpSessionError, SessionResult};
-use crate::transport::{create_transport, resolve_timeout_ms};
+use crate::transport::{
+    StdioEnvPolicy, create_transport, create_transport_with_env_policy, resolve_timeout_ms,
+};
 use crate::types::{McpToolCallResult, McpToolDefinition, notification_methods};
 use crate::utils::sanitize_name;
 use crate::version_lock::{
@@ -310,6 +312,39 @@ impl McpManager {
         Self::build_inner(
             Some(cache_path.into()),
             Arc::new(default_connector),
+            Some(PathBuf::from(".mcp-lock.json")),
+            Arc::new(crate::credential::EnvCredentialProvider),
+            default_startup_timeout_ms(),
+            crate::transport::DEFAULT_TIMEOUT_MS,
+        )
+    }
+
+    /// Construct a manager whose default connector uses `env_policy` for every
+    /// stdio spawn (initial connection, manual reconnect and automatic
+    /// reconnect).
+    pub fn with_env_policy(env_policy: StdioEnvPolicy) -> Self {
+        Self::build_inner(
+            None,
+            default_connector_with_env_policy(env_policy),
+            Some(PathBuf::from(".mcp-lock.json")),
+            Arc::new(crate::credential::EnvCredentialProvider),
+            default_startup_timeout_ms(),
+            crate::transport::DEFAULT_TIMEOUT_MS,
+        )
+    }
+
+    /// [`Self::with_cache_path`] with an explicit stdio environment policy.
+    ///
+    /// The policy is closed over by the manager's default connector, so every
+    /// connection attempt uses it. Existing constructors keep
+    /// [`StdioEnvPolicy::Inherit`].
+    pub fn with_cache_path_and_env_policy(
+        cache_path: impl Into<PathBuf>,
+        env_policy: StdioEnvPolicy,
+    ) -> Self {
+        Self::build_inner(
+            Some(cache_path.into()),
+            default_connector_with_env_policy(env_policy),
             Some(PathBuf::from(".mcp-lock.json")),
             Arc::new(crate::credential::EnvCredentialProvider),
             default_startup_timeout_ms(),
@@ -954,6 +989,15 @@ pub(crate) fn default_connector(
     })
 }
 
+fn default_connector_with_env_policy(env_policy: StdioEnvPolicy) -> SessionConnector {
+    Arc::new(move |config| {
+        Box::pin(async move {
+            let transport = create_transport_with_env_policy(&config, env_policy).await?;
+            Ok(Arc::new(McpSession::connect(transport).await?))
+        })
+    })
+}
+
 async fn verify_and_lock(
     inner: &Arc<ManagerInner>,
     server_name: &str,
@@ -1176,6 +1220,21 @@ async fn resolve_scoped_credentials(
     Ok(resolved)
 }
 
+/// Remove credential declarations from a config whose scoped values have
+/// already been resolved and merged into `env`/`headers`.
+///
+/// The merged config would otherwise fail `check_env_credential_mutex` in the
+/// transport, because each scoped key would appear in both maps. Authorization
+/// scopes are captured by the manager before this function runs.
+fn clear_transport_credentials(config: &mut McpServerConfig) {
+    match config {
+        McpServerConfig::Stdio { credentials, .. }
+        | McpServerConfig::HttpOrSse { credentials, .. } => {
+            *credentials = None;
+        }
+    }
+}
+
 /// Outcome of one attempt phase under the shared absolute deadline.
 enum PhaseOutcome<T> {
     Done(T),
@@ -1241,7 +1300,7 @@ async fn run_connection_attempt(
     // Credential resolution is part of the attempt: a stalled provider must
     // not keep the attempt (or a `startup_timeout_ms == 0` wait) alive after
     // the attempt deadline.
-    let config = match run_phase(
+    let mut config = match run_phase(
         attempt_deadline,
         resolve_config_credentials(&inner, &name, &config),
     )
@@ -1273,6 +1332,12 @@ async fn run_connection_attempt(
                 .collect::<HashMap<String, Vec<String>>>()
         })
         .filter(|scopes| !scopes.is_empty());
+    // The resolved config already carries the scoped credential values in
+    // `env`/`headers`. Keeping the declarations there would make the transport
+    // reject the config (`check_env_credential_mutex`: the same key appears in
+    // both maps). The scopes needed for authorization are captured above and
+    // registered after a successful connection, so remove the transport copy.
+    clear_transport_credentials(&mut config);
     // When the timeout cancels `connect`, the future is dropped.
     // Transport cleanup happens via transport Drop impls:
     // - StdioTransport::Drop calls start_kill on the child process
@@ -2963,5 +3028,206 @@ mod tests {
                 "delay {delay_ms}ms: observer never sampled the Connected state"
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn recording_mcp_script(out: &std::path::Path, parent_var: &str, exit_after: usize) -> String {
+        r#"printf '%s|%s|%s\n' "${__PARENT__-unset}" "${OMP_TEST_MGR_EXPLICIT-unset}" "${TOKEN-unset}" >> __OUT__
+n=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -nE 's/.*"id":([0-9]+).*/\1/p')
+  if [ -n "$id" ]; then
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"},"tools":[]}}\n' "$id"
+    n=$((n+1))
+    if [ "$n" -ge __EXIT__ ]; then sleep 1; exit 0; fi
+  fi
+done"#
+            .replace("__OUT__", &out.display().to_string())
+            .replace("__PARENT__", parent_var)
+            .replace("__EXIT__", &exit_after.to_string())
+    }
+
+    #[cfg(unix)]
+    fn recording_config(
+        script: String,
+        credentials: Option<crate::credential::CredentialDeclarations>,
+    ) -> McpServerConfig {
+        let mut config = stdio_config("sh");
+        if let McpServerConfig::Stdio {
+            args,
+            env,
+            timeout,
+            credentials: config_credentials,
+            ..
+        } = &mut config
+        {
+            *args = vec!["-c".to_owned(), script];
+            env.insert("OMP_TEST_MGR_EXPLICIT".to_owned(), "ok".to_owned());
+            *timeout = Some(10_000);
+            *config_credentials = credentials;
+        }
+        config
+    }
+
+    #[cfg(unix)]
+    fn policy_manager(
+        dir: &std::path::Path,
+        policy: StdioEnvPolicy,
+        explicit_default: bool,
+    ) -> McpManager {
+        let connector = if explicit_default {
+            Arc::new(default_connector)
+        } else {
+            default_connector_with_env_policy(policy)
+        };
+        McpManager::build_inner(
+            Some(dir.join("tools-cache.json")),
+            connector,
+            Some(dir.join(".mcp-lock.json")),
+            Arc::new(crate::credential::EnvCredentialProvider),
+            default_startup_timeout_ms(),
+            crate::transport::DEFAULT_TIMEOUT_MS,
+        )
+    }
+
+    #[cfg(unix)]
+    async fn read_spawn_lines(out: &std::path::Path, minimum: usize) -> Vec<String> {
+        for _ in 0..1000 {
+            if let Ok(text) = tokio::fs::read_to_string(out).await {
+                let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+                if lines.len() >= minimum {
+                    return lines;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("expected at least {minimum} MCP spawns");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_env_policy_applies_to_initial_connection_and_manual_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("spawns.txt");
+        let script = recording_mcp_script(&out, "OMP_TEST_MGR_PARENT_MANUAL", 1_000_000);
+        let config = recording_config(script, None);
+        let manager = policy_manager(dir.path(), StdioEnvPolicy::Explicit, false);
+
+        unsafe { std::env::set_var("OMP_TEST_MGR_PARENT_MANUAL", "leaked-before") };
+        manager
+            .discover_and_connect(HashMap::from([("srv".to_owned(), config)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_connection_status("srv"),
+            ConnectionStatus::Connected
+        );
+
+        unsafe { std::env::set_var("OMP_TEST_MGR_PARENT_MANUAL", "leaked-after") };
+        manager.reconnect("srv").await.unwrap();
+        let lines = read_spawn_lines(&out, 2).await;
+        unsafe { std::env::remove_var("OMP_TEST_MGR_PARENT_MANUAL") };
+
+        assert!(lines.len() >= 2, "manual reconnect must spawn again");
+        for line in &lines {
+            assert_eq!(line, "unset|ok|unset");
+        }
+        manager.cancel_background_tasks();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_env_policy_applies_to_automatic_reconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("spawns.txt");
+        // The child exits after initialize + tools/list, so the manager's
+        // close callback schedules an automatic reconnect.
+        let script = recording_mcp_script(&out, "OMP_TEST_MGR_PARENT_AUTO", 2);
+        let config = recording_config(script, None);
+        let manager = policy_manager(dir.path(), StdioEnvPolicy::Explicit, false);
+
+        unsafe { std::env::set_var("OMP_TEST_MGR_PARENT_AUTO", "leaked-before") };
+        manager
+            .discover_and_connect(HashMap::from([("srv".to_owned(), config)]))
+            .await
+            .unwrap();
+        unsafe { std::env::set_var("OMP_TEST_MGR_PARENT_AUTO", "leaked-after") };
+
+        let lines = read_spawn_lines(&out, 2).await;
+        unsafe { std::env::remove_var("OMP_TEST_MGR_PARENT_AUTO") };
+
+        assert!(lines.len() >= 2, "automatic reconnect must spawn again");
+        for line in &lines {
+            assert_eq!(line, "unset|ok|unset");
+        }
+        manager.cancel_background_tasks();
+    }
+
+    #[test]
+    fn resolved_http_config_passes_transport_validation_after_scope_capture() {
+        let mut config = McpServerConfig::HttpOrSse {
+            url: "https://example.com/mcp".to_owned(),
+            transport_type: None,
+            headers: HashMap::from([("AUTH".to_owned(), "resolved".to_owned())]),
+            timeout: Some(5_000),
+            version_policy: Default::default(),
+            credentials: Some(crate::credential::CredentialDeclarations {
+                scoped_env: HashMap::from([(
+                    "AUTH".to_owned(),
+                    crate::credential::ScopedCredential {
+                        value: "resolved".to_owned(),
+                        allowed_tools: Some(vec!["tool_a".to_owned()]),
+                    },
+                )]),
+            }),
+        };
+        // The merged config is invalid while the declaration remains.
+        assert!(config.validate().is_err());
+        clear_transport_credentials(&mut config);
+        assert!(config.validate().is_ok());
+        assert!(config.credentials().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_credentials_reach_child_and_default_connector_accepts_resolved_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("spawns.txt");
+        let script = recording_mcp_script(&out, "OMP_TEST_MGR_PARENT_SCOPED", 1_000_000);
+        let credentials = crate::credential::CredentialDeclarations {
+            scoped_env: HashMap::from([(
+                "TOKEN".to_owned(),
+                crate::credential::ScopedCredential {
+                    value: "secret123".to_owned(),
+                    allowed_tools: Some(vec!["tool_a".to_owned()]),
+                },
+            )]),
+        };
+        let config = recording_config(script, Some(credentials));
+        // `explicit_default = true` uses the historical default connector,
+        // which must now accept the resolved config after the declarations are
+        // removed.
+        let manager = policy_manager(dir.path(), StdioEnvPolicy::Inherit, true);
+
+        manager
+            .discover_and_connect(HashMap::from([("srv".to_owned(), config)]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.get_connection_status("srv"),
+            ConnectionStatus::Connected
+        );
+        assert_eq!(
+            manager.authorized_credentials_for("srv", "tool_a"),
+            vec!["TOKEN".to_owned()]
+        );
+        let lines = read_spawn_lines(&out, 1).await;
+        assert!(
+            lines[0].ends_with("|secret123"),
+            "scoped credential must reach the child environment: {:?}",
+            lines[0]
+        );
+        manager.cancel_background_tasks();
     }
 }
